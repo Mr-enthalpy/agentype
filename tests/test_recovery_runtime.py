@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from local_agent_scheduler.config import ExecutionTargetConfig, load_config
+from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
+from local_agent_scheduler.core import Scheduler
+from local_agent_scheduler.enums import (
+    ExecutionState,
+    FailureClass,
+    Retention,
+    TaskState,
+)
+from local_agent_scheduler.errors import ConfigurationError
+from local_agent_scheduler.models import (
+    ExecutionObservation,
+    ExecutionOutcome,
+    PartitionSpec,
+    RetryPolicy,
+    StartObservation,
+    TaskSpec,
+)
+from local_agent_scheduler.root_bridge import (
+    CodexAppServerRootBridge,
+    FilesystemRootBridge,
+    OutboxDispatcher,
+)
+from local_agent_scheduler.runtime import Dispatcher
+from local_agent_scheduler.storage import Database
+
+
+class FakeAdapter:
+    def __init__(self) -> None:
+        self.handles: dict[str, str] = {}
+
+    def start_execution(self, request):
+        handle = {"request_id": request.request_id, "execution_id": request.execution_id}
+        self.handles[request.execution_id] = "running"
+        return StartObservation(ExecutionState.RUNNING, handle)
+
+    def observe_execution(self, runtime_handle):
+        return ExecutionObservation(
+            ExecutionState.SUCCEEDED, terminal_confirmed=True, quiescent_confirmed=True
+        )
+
+    def collect_outcome(self, runtime_handle):
+        return ExecutionOutcome(
+            ExecutionState.SUCCEEDED,
+            payload={"adapter": "ok"},
+            summary="ok",
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(ExecutionState.UNKNOWN, runtime_handle, ambiguous=True)
+
+    def interrupt_execution(self, runtime_handle):
+        return ExecutionObservation(ExecutionState.TERMINATED, True, True)
+
+    def terminate_execution(self, runtime_handle):
+        return ExecutionObservation(ExecutionState.TERMINATED, True, True)
+
+
+class BrokenBridge:
+    def deliver(self, event_id, event_type, payload):
+        raise OSError("root unavailable")
+
+
+class RecoveredAdapter(FakeAdapter):
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(ExecutionState.SUCCEEDED, runtime_handle)
+
+
+class FakeProcess:
+    def poll(self):
+        return None
+
+
+class FakeRootSession:
+    instances = []
+
+    def __init__(self, command, process_cwd, timeout):
+        self.process = FakeProcess()
+        self.requests = []
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
+        return {"turn": {"id": "root-turn"}}
+
+    def notifications(self):
+        return [
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "root-turn", "status": "completed"}},
+            }
+        ]
+
+    def close(self):
+        self.closed = True
+        return True
+
+
+class FakeStoredSession(FakeRootSession):
+    def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "status": "completed",
+                    "turns": [
+                        {
+                            "id": "stored-turn",
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": '{"restored": true}'}],
+                        }
+                    ],
+                }
+            }
+        return super().request(method, params)
+
+
+class RuntimeCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.db_path = self.root / "scheduler.db"
+        self.scheduler = Scheduler(Database(self.db_path), lease_seconds=5)
+        self.scheduler.initialize()
+        self.scheduler.upsert_partition(
+            PartitionSpec("general", 1, Retention.RESIDENT, "codex", "default")
+        )
+        self.scheduler.reconcile_pool()
+        self.target = ExecutionTargetConfig("codex", "codex_app_server", False, True)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_dispatcher_completes_real_sqlite_flow(self) -> None:
+        batch_id, ids = self.scheduler.submit_batch([TaskSpec("run", {"work": True})])
+        adapter = FakeAdapter()
+        bridge = FilesystemRootBridge(self.root / "events")
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": adapter},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+            outbox=OutboxDispatcher(self.scheduler.db, bridge),
+        )
+        dispatcher.recover()
+        first = dispatcher.tick()
+        self.assertEqual(first["dispatched"], 1)
+        second = dispatcher.tick()
+        self.assertGreaterEqual(second["observed"], 1)
+        self.assertEqual(self.scheduler.get("tasks", ids["run"])["state"], TaskState.COMPLETED)
+        self.assertEqual(self.scheduler.get("batches", batch_id)["state"], "COMPLETED")
+        dispatcher.tick()
+        envelopes = list((self.root / "events").glob("*.json"))
+        self.assertGreaterEqual(len(envelopes), 2)
+
+    def test_restart_after_claim_reconciles_without_losing_task(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("claimed", {}, retry_policy=policy)]
+        )
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"], now=100)
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        result = restarted.expire_leases(now=106)
+        self.assertEqual(result["retried"], 1)
+        restarted.promote_retry_wait(now=106)
+        self.assertEqual(restarted.get("tasks", ids["claimed"])["state"], TaskState.QUEUED)
+
+    def test_restart_reconciles_completed_execution_before_notification(self) -> None:
+        batch_id, ids = self.scheduler.submit_batch([TaskSpec("recovered", {})])
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"])
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id, "thread_id": "stored"},
+            detail="response lost after start",
+        )
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        adapter = RecoveredAdapter()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": adapter},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        recovery = dispatcher.recover()
+        self.assertGreaterEqual(recovery["observed"], 1)
+        self.assertEqual(restarted.get("tasks", ids["recovered"])["state"], "COMPLETED")
+        self.assertEqual(restarted.get("batches", batch_id)["state"], "COMPLETED")
+
+    def test_root_failure_does_not_change_result_or_batch(self) -> None:
+        batch, ids = self.scheduler.submit_batch([TaskSpec("done", {})])
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"])
+        result = self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={"durable": True}
+        )
+        dispatcher = OutboxDispatcher(self.scheduler.db, BrokenBridge())
+        self.assertEqual(dispatcher.deliver_pending(), 0)
+        self.assertEqual(self.scheduler.get("results", result)["state"], "AVAILABLE")
+        self.assertEqual(self.scheduler.get("batches", batch)["state"], "COMPLETED")
+        pending = self.scheduler.list("notification_outbox", state="PENDING")
+        self.assertTrue(all(row["delivery_attempts"] == 1 for row in pending))
+
+    def test_filesystem_delivery_is_idempotent_and_acknowledgeable(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("done", {})])
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"])
+        self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
+        )
+        bridge = FilesystemRootBridge(self.root / "events")
+        dispatcher = OutboxDispatcher(self.scheduler.db, bridge)
+        delivered = dispatcher.deliver_pending()
+        self.assertEqual(delivered, 2)
+        files_before = sorted(path.name for path in (self.root / "events").glob("*.json"))
+        self.assertEqual(dispatcher.deliver_pending(), 0)
+        self.assertEqual(files_before, sorted(path.name for path in (self.root / "events").glob("*.json")))
+        event = self.scheduler.list("notification_outbox", state="DELIVERED")[0]
+        dispatcher.acknowledge(event["id"])
+        self.assertEqual(self.scheduler.get("notification_outbox", event["id"])["state"], "ACKED")
+
+    def test_configuration_is_strict(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "config" / "scheduler.example.toml"
+        config = load_config(source)
+        self.assertEqual(config.schema_version, 1)
+        self.assertEqual(config.partitions[0].name, "general")
+        invalid = self.root / "invalid.toml"
+        invalid.write_text("schema_version=1\nunknown=true\n", encoding="utf-8")
+        with self.assertRaises(ConfigurationError):
+            load_config(invalid)
+        wrong_bool = self.root / "wrong-bool.toml"
+        wrong_bool.write_text(
+            """
+schema_version = 1
+[execution_profiles.default]
+[[execution_targets]]
+name = "codex"
+adapter = "codex_app_server"
+attempt_isolation = "false"
+termination_confirmation = true
+""",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ConfigurationError):
+            load_config(wrong_bool)
+        unsafe_cadence = self.root / "unsafe-cadence.toml"
+        unsafe_cadence.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "heartbeat_seconds = 30", "heartbeat_seconds = 120"
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ConfigurationError):
+            load_config(unsafe_cadence)
+
+    def test_codex_failure_classification_is_adapter_local(self) -> None:
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure("HTTP 429 rate limit"),
+            FailureClass.TRANSIENT_EXTERNAL,
+        )
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure("permission denied"),
+            FailureClass.PERMISSION_FAILURE,
+        )
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure("HTTP 502 bad gateway"),
+            FailureClass.RESOURCE_UNAVAILABLE,
+        )
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure("connection reset by upstream"),
+            FailureClass.TRANSIENT_EXTERNAL,
+        )
+
+    def test_codex_root_bridge_wakes_existing_thread_without_result_transport(self) -> None:
+        FakeRootSession.instances.clear()
+        bridge = CodexAppServerRootBridge(
+            root_thread_id="root-thread",
+            session_factory=FakeRootSession,
+        )
+        outcome = bridge.deliver(
+            "event-1",
+            "RESULT_AVAILABLE",
+            {"result_id": "result-1", "result_body": "must-not-be-transported"},
+        )
+        self.assertTrue(outcome.delivered)
+        session = FakeRootSession.instances[-1]
+        self.assertEqual(session.requests[0], ("thread/resume", {"threadId": "root-thread"}))
+        notice = session.requests[1][1]["input"][0]["text"]
+        self.assertIn("event-1", notice)
+        self.assertIn("result-1", notice)
+        self.assertNotIn("must-not-be-transported", notice)
+        self.assertTrue(session.closed)
+
+    def test_initialize_does_not_regress_ready_lifecycle(self) -> None:
+        self.scheduler.set_lifecycle("READY")
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        self.assertEqual(restarted.status()["lifecycle"]["state"], "READY")
+
+    def test_codex_root_bridge_configuration_is_strict(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "config" / "scheduler.example.toml"
+        configured = self.root / "codex-root.toml"
+        text = source.read_text(encoding="utf-8").replace(
+            'kind = "filesystem"',
+            'kind = "codex_app_server"\nroot_thread_id = "root-thread"',
+        )
+        configured.write_text(text, encoding="utf-8")
+        config = load_config(configured)
+        self.assertEqual(config.root_bridge.kind, "codex_app_server")
+        self.assertEqual(config.root_bridge.root_thread_id, "root-thread")
+
+    def test_codex_adapter_recovers_outcome_from_persisted_thread(self) -> None:
+        adapter = CodexAppServerAdapter(session_factory=FakeStoredSession)
+        outcome = adapter.collect_outcome(
+            {"thread_id": "persisted-thread", "turn_id": "stored-turn"}
+        )
+        self.assertEqual(outcome.state, ExecutionState.SUCCEEDED)
+        self.assertEqual(outcome.payload, {"restored": True})
+        self.assertTrue(FakeStoredSession.instances[-1].closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

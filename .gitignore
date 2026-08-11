@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.scheduler-root-events/
+.venv/
+build/
+dist/
+*.egg-info/

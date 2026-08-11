@@ -1,0 +1,43 @@
+schema_version = 1
+database_path = ".local-agent-scheduler.db"
+lease_seconds = 120
+heartbeat_seconds = 30
+continuity_max_bytes = 16384
+dispatcher_poll_seconds = 1.0
+
+[retry_defaults]
+max_attempts = 3
+retry_classes = ["TRANSIENT_EXTERNAL", "TIMEOUT", "EXECUTION_LOST", "RESOURCE_UNAVAILABLE"]
+base_backoff_seconds = 1.0
+max_backoff_seconds = 60.0
+
+[execution_profiles.default]
+
+[[partitions]]
+name = "general"
+desired_capacity = 1
+retention = "resident"
+execution_target = "local_codex"
+execution_profile = "default"
+tags = []
+
+[[execution_targets]]
+name = "local_codex"
+adapter = "codex_app_server"
+attempt_isolation = false
+termination_confirmation = true
+
+[adapters.codex_app_server]
+command = ["codex", "app-server"]
+cwd = "."
+approval_policy = "never"
+sandbox = "workspaceWrite"
+
+[root_bridge]
+# Provider-free/local testing. For an actual Codex Root wakeup use:
+# kind = "codex_app_server"
+# root_thread_id = "<existing-root-thread-id>"
+kind = "filesystem"
+inbox = ".scheduler-root-events"
+request_timeout = 30
+completion_timeout = 120

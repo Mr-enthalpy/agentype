@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "purpose": "provider-free shape example"
+  },
+  "tasks": [
+    {
+      "name": "inspect",
+      "payload": {
+        "objective": "Inspect the bounded target and return evidence."
+      },
+      "acceptance": {
+        "requires": ["facts", "evidence"]
+      },
+      "partition": "general",
+      "workspace_mode": "read_only"
+    },
+    {
+      "name": "verify",
+      "payload": {
+        "objective": "Independently verify the inspection result."
+      },
+      "acceptance": {
+        "requires": ["verdict"]
+      },
+      "partition": "general",
+      "workspace_mode": "read_only",
+      "dependencies": ["inspect"]
+    }
+  ]
+}
