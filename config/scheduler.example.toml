@@ -31,7 +31,7 @@ termination_confirmation = true
 command = ["codex", "app-server"]
 cwd = "."
 approval_policy = "never"
-sandbox = "workspaceWrite"
+sandbox = "workspace-write"
 
 [root_bridge]
 # Provider-free/local testing. For an actual Codex Root wakeup use:

@@ -183,13 +183,21 @@ def load_config(path: str | Path) -> SchedulerConfig:
     command = tuple(_nonempty(part, "adapters.codex_app_server.command") for part in command_value)
     if not command:
         raise ConfigurationError("Codex adapter command cannot be empty")
+    sandbox = _nonempty(
+        codex.get("sandbox", "workspace-write"), "adapters.codex_app_server.sandbox"
+    )
+    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise ConfigurationError(
+            "adapters.codex_app_server.sandbox must be read-only, workspace-write, "
+            "or danger-full-access"
+        )
     codex_config = CodexAdapterConfig(
         command=command,
         cwd=_nonempty(codex.get("cwd", "."), "adapters.codex_app_server.cwd"),
         approval_policy=_nonempty(
             codex.get("approval_policy", "never"), "adapters.codex_app_server.approval_policy"
         ),
-        sandbox=_nonempty(codex.get("sandbox", "workspaceWrite"), "adapters.codex_app_server.sandbox"),
+        sandbox=sandbox,
     )
 
     raw_profiles = raw.get("execution_profiles", {})

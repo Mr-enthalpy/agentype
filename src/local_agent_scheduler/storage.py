@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def new_id(prefix: str) -> str:
@@ -284,36 +284,214 @@ CREATE INDEX IF NOT EXISTS executions_attempt_idx ON executions(attempt_id, upda
 """
 
 
+def _legacy_incarnation_terminal(
+    execution: sqlite3.Row, migration_time: float
+) -> tuple[str, float | None]:
+    """Derive conservative physical-presence state for a V0.1 Execution."""
+
+    state = str(execution["state"])
+    if state == "RUNNING":
+        return "WARM", None
+    if state in {"STARTING", "UNKNOWN"}:
+        return "LOST", execution["ended_at"] or migration_time
+    if (
+        state in {"SUCCEEDED", "FAILED", "TERMINATED"}
+        and bool(execution["terminal_confirmed"])
+        and bool(execution["quiescent_confirmed"])
+    ):
+        return "TERMINATED", execution["ended_at"] or migration_time
+    return "LOST", execution["ended_at"] or migration_time
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = FULL")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            conn.execute("PRAGMA synchronous = FULL")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def initialize(self) -> None:
         conn = self.connect()
         try:
             conn.executescript(SCHEMA)
-            row = conn.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()
-            current = row["version"] if row and row["version"] is not None else 0
-            if current > SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema {current} is newer than supported {SCHEMA_VERSION}"
-                )
-            if current < SCHEMA_VERSION:
-                conn.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (SCHEMA_VERSION, utc_now()),
-                )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT MAX(version) AS version FROM schema_migrations"
+                ).fetchone()
+                current = row["version"] if row and row["version"] is not None else 0
+                if current > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"database schema {current} is newer than supported {SCHEMA_VERSION}"
+                    )
+                if current == 0:
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (1, utc_now()),
+                    )
+                    current = 1
+                if current < 2:
+                    self._migrate_v1_to_v2(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (2, utc_now()),
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+        """Make one Incarnation represent exactly one physical Execution.
+
+        V0.1 allowed an Incarnation to be reused after its Codex app-server
+        session had closed.  Preserve the historical rows by assigning every
+        additional Execution a new generation, then close orphaned legacy
+        presence before installing the V0.1.1 uniqueness constraints.
+        """
+
+        reused = conn.execute(
+            "SELECT incarnation_id FROM executions GROUP BY incarnation_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        duplicate_attempt = conn.execute(
+            "SELECT attempt_id FROM executions GROUP BY attempt_id HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate_attempt:
+            raise RuntimeError(
+                "schema v2 migration cannot normalize multiple Executions for one Attempt"
+            )
+        now = utc_now()
+        for group in reused:
+            incarnation_id = str(group["incarnation_id"])
+            incarnation = conn.execute(
+                "SELECT * FROM incarnations WHERE id=?", (incarnation_id,)
+            ).fetchone()
+            executions = conn.execute(
+                "SELECT * FROM executions WHERE incarnation_id=? "
+                "ORDER BY started_at,id",
+                (incarnation_id,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE incarnations SET state=?,ended_at=? WHERE id=?",
+                (*_legacy_incarnation_terminal(executions[0], now), incarnation_id),
+            )
+            generation = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(generation),0) FROM incarnations "
+                    "WHERE logical_agent_id=?",
+                    (incarnation["logical_agent_id"],),
+                ).fetchone()[0]
+            )
+            for execution in executions[1:]:
+                generation += 1
+                replacement_id = new_id("inc")
+                state, ended_at = _legacy_incarnation_terminal(execution, now)
+                conn.execute(
+                    "INSERT INTO incarnations(id,logical_agent_id,generation,execution_target,state,"
+                    "runtime_handle_json,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        replacement_id,
+                        incarnation["logical_agent_id"],
+                        generation,
+                        execution["execution_target"],
+                        state,
+                        execution["runtime_handle_json"],
+                        execution["started_at"],
+                        ended_at,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE executions SET incarnation_id=? WHERE id=?",
+                    (replacement_id, execution["id"]),
+                )
+                conn.execute(
+                    "UPDATE attempts SET incarnation_id=? WHERE id=?",
+                    (replacement_id, execution["attempt_id"]),
+                )
+
+        # A v1 STARTING/UNKNOWN Execution never proves attachable physical
+        # presence after upgrade, even when its Attempt is still authoritative.
+        # Startup reconciliation may later confirm that exact Execution and
+        # move its LOST Incarnation back to WARM through the fenced path.
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE state IN ('STARTING','WARM','COLD') AND EXISTS ("
+            "SELECT 1 FROM executions e WHERE e.incarnation_id=incarnations.id "
+            "AND e.state IN ('STARTING','UNKNOWN'))",
+            (now,),
+        )
+
+        # A reservation that never started can close at the migration
+        # boundary.  An unconfirmed historical Execution is conservatively
+        # LOST instead: inactive authority does not prove physical quiescence.
+        conn.execute(
+            "UPDATE incarnations SET state='TERMINATED',ended_at=COALESCE(ended_at,?) "
+            "WHERE state IN ('STARTING','WARM','COLD') AND NOT EXISTS ("
+            "SELECT 1 FROM attempts a WHERE a.incarnation_id=incarnations.id "
+            "AND a.state='ACTIVE') AND NOT EXISTS ("
+            "SELECT 1 FROM executions e WHERE e.incarnation_id=incarnations.id)",
+            (now,),
+        )
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE state IN ('STARTING','WARM','COLD') AND NOT EXISTS ("
+            "SELECT 1 FROM attempts a WHERE a.incarnation_id=incarnations.id "
+            "AND a.state='ACTIVE') AND EXISTS ("
+            "SELECT 1 FROM executions e WHERE e.incarnation_id=incarnations.id)",
+            (now,),
+        )
+
+        # Corrupt/legacy target switching could leave more than one active
+        # embodiment.  Retain the newest generation and fence older presence
+        # as LOST; do not claim physical quiescence that was never observed.
+        active = conn.execute(
+            "SELECT logical_agent_id FROM incarnations "
+            "WHERE state IN ('STARTING','WARM','COLD') GROUP BY logical_agent_id "
+            "HAVING COUNT(*) > 1"
+        ).fetchall()
+        for group in active:
+            rows = conn.execute(
+                "SELECT id FROM incarnations WHERE logical_agent_id=? "
+                "AND state IN ('STARTING','WARM','COLD') ORDER BY generation DESC,id DESC",
+                (group["logical_agent_id"],),
+            ).fetchall()
+            for stale in rows[1:]:
+                conn.execute(
+                    "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) WHERE id=?",
+                    (now, stale["id"]),
+                )
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_active_incarnation_per_agent "
+            "ON incarnations(logical_agent_id) "
+            "WHERE state IN ('STARTING','WARM','COLD')"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_incarnation "
+            "ON executions(incarnation_id)"
+        )
 
     @contextlib.contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:

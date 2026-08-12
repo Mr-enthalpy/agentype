@@ -268,8 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             _print(dispatcher.recover())
             return 0
         if args.once:
-            dispatcher.recover()
-            _print(dispatcher.tick())
+            _print(daemon.run_until_idle(max_wait_seconds=config.lease_seconds))
             return 0
         daemon.run()
         return 0

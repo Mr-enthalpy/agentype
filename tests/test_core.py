@@ -13,6 +13,7 @@ from local_agent_scheduler.enums import (
     BatchState,
     ContinuityPreference,
     FailureClass,
+    IncarnationState,
     ResultState,
     Retention,
     TaskState,
@@ -79,6 +80,111 @@ class SchedulerCase(unittest.TestCase):
         self.assertEqual(self.scheduler.get("batches", batch_id)["state"], BatchState.COMPLETED)
         event_types = {row["event_type"] for row in self.scheduler.list("notification_outbox")}
         self.assertEqual(event_types, {"RESULT_AVAILABLE", "BATCH_RESULTS_READY"})
+
+    def test_each_sequential_execution_gets_a_fresh_incarnation(self) -> None:
+        _batch, _task, first, first_execution = self.running_claim(TaskSpec("first", {}))
+        self.scheduler.ack_success(
+            first.attempt_id,
+            first.lease_epoch,
+            execution_id=first_execution,
+            payload={"first": True},
+        )
+        first_incarnation = self.scheduler.get("incarnations", first.incarnation_id)
+        self.assertEqual(first_incarnation["state"], IncarnationState.TERMINATED)
+
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("second", {})])
+        second = self.scheduler.claim_next(first.logical_agent_id)
+        second_execution, _ = self.scheduler.create_execution(second)
+        self.assertNotEqual(second.incarnation_id, first.incarnation_id)
+        self.assertGreater(
+            self.scheduler.get("incarnations", second.incarnation_id)["generation"],
+            first_incarnation["generation"],
+        )
+        self.assertEqual(
+            self.scheduler.get("executions", second_execution)["incarnation_id"],
+            second.incarnation_id,
+        )
+        with self.assertRaises(InvalidTransition):
+            self.scheduler.create_execution(second)
+
+    def test_stale_terminal_outcome_closes_only_the_old_incarnation(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, _task, old, old_execution = self.running_claim(
+            TaskSpec("replace", {}, retry_policy=policy)
+        )
+        retry_time = old.lease_expires_at + 1
+        self.scheduler.expire_leases(now=retry_time)
+        self.scheduler.promote_retry_wait(now=retry_time)
+        replacement = self.scheduler.claim_next(old.logical_agent_id, now=retry_time)
+        self.assertNotEqual(old.incarnation_id, replacement.incarnation_id)
+
+        self.scheduler.record_physical_outcome(
+            old_execution,
+            state=ExecutionState.SUCCEEDED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+        self.assertEqual(
+            self.scheduler.get("incarnations", old.incarnation_id)["state"],
+            IncarnationState.TERMINATED,
+        )
+        self.assertEqual(
+            self.scheduler.get("incarnations", replacement.incarnation_id)["state"],
+            IncarnationState.STARTING,
+        )
+        self.assertEqual(
+            self.scheduler.get("tasks", replacement.task_id)["current_attempt_id"],
+            replacement.attempt_id,
+        )
+
+    def test_late_terminal_confirmation_refines_lost_physical_history(self) -> None:
+        _batch, _task, claim, execution_id = self.running_claim(TaskSpec("late", {}))
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=ExecutionState.LOST,
+            terminal_confirmed=False,
+            quiescent_confirmed=False,
+        )
+        self.assertEqual(
+            self.scheduler.get("incarnations", claim.incarnation_id)["state"],
+            IncarnationState.LOST,
+        )
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=ExecutionState.TERMINATED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+        execution = self.scheduler.get("executions", execution_id)
+        self.assertEqual(execution["state"], ExecutionState.TERMINATED)
+        self.assertEqual(execution["terminal_confirmed"], 1)
+        self.assertEqual(execution["quiescent_confirmed"], 1)
+        self.assertEqual(
+            self.scheduler.get("incarnations", claim.incarnation_id)["state"],
+            IncarnationState.TERMINATED,
+        )
+
+    def test_cold_presence_blocks_duplicate_incarnation_and_target_switch(self) -> None:
+        agent_id = self.ready_agent()
+        with self.scheduler.db.transaction() as conn:
+            incarnation_id = self.scheduler._ensure_incarnation(conn, agent_id, "local", 100)
+            conn.execute(
+                "UPDATE incarnations SET state='COLD' WHERE id=?", (incarnation_id,)
+            )
+        self.assertEqual(self.scheduler.revive_eligible_agents(), 0)
+        with self.scheduler.db.transaction() as conn:
+            self.assertEqual(
+                self.scheduler._ensure_incarnation(conn, agent_id, "local", 101),
+                incarnation_id,
+            )
+        with self.assertRaises(InvalidTransition):
+            with self.scheduler.db.transaction() as conn:
+                self.scheduler._ensure_incarnation(conn, agent_id, "other", 102)
 
     def test_dependency_is_not_claimable_until_parent_completes(self) -> None:
         batch_id, ids = self.scheduler.submit_batch(

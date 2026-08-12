@@ -187,6 +187,12 @@ class Dispatcher:
             if observation.state in (ExecutionState.UNKNOWN, ExecutionState.STARTING):
                 continue
             outcome = adapter.collect_outcome(handle)
+            terminal_confirmed = (
+                observation.terminal_confirmed or outcome.terminal_confirmed
+            )
+            quiescent_confirmed = (
+                observation.quiescent_confirmed or outcome.quiescent_confirmed
+            )
             try:
                 attempt = self.scheduler.get("attempts", execution["attempt_id"])
                 epoch = int(attempt["lease_epoch"])
@@ -198,6 +204,7 @@ class Dispatcher:
                         payload=outcome.payload or {},
                         summary=outcome.summary,
                         continuity_capsule=outcome.checkpoint,
+                        quiescent_confirmed=quiescent_confirmed,
                     )
                 else:
                     target = self.targets[execution["execution_target"]]
@@ -208,8 +215,8 @@ class Dispatcher:
                         execution_id=execution["id"],
                         failure_code=outcome.failure_code,
                         failure_signature=outcome.failure_signature,
-                        terminal_confirmed=outcome.terminal_confirmed,
-                        quiescent_confirmed=outcome.quiescent_confirmed,
+                        terminal_confirmed=terminal_confirmed,
+                        quiescent_confirmed=quiescent_confirmed,
                         attempt_isolation=target.attempt_isolation,
                     )
             except StaleAuthority:
@@ -220,8 +227,8 @@ class Dispatcher:
                     failure_class=outcome.failure_class,
                     failure_code=outcome.failure_code,
                     failure_signature=outcome.failure_signature,
-                    terminal_confirmed=outcome.terminal_confirmed,
-                    quiescent_confirmed=outcome.quiescent_confirmed,
+                    terminal_confirmed=terminal_confirmed,
+                    quiescent_confirmed=quiescent_confirmed,
                 )
             count += 1
         return count
@@ -301,4 +308,36 @@ class SchedulerDaemon:
         self.dispatcher.recover()
         while not self._stopping:
             self.dispatcher.tick()
+            time.sleep(self.poll_seconds)
+
+    def run_until_idle(self, *, max_wait_seconds: float) -> dict[str, int]:
+        """Run one bounded work cycle without orphaning live adapter sessions."""
+
+        if max_wait_seconds <= 0:
+            raise ValueError("max_wait_seconds must be positive")
+
+        self.dispatcher.recover()
+        totals: dict[str, int] = {}
+        deadline = time.monotonic() + max_wait_seconds
+        while True:
+            snapshot = self.dispatcher.tick()
+            for key, value in snapshot.items():
+                totals[key] = totals.get(key, 0) + value
+            active = []
+            for state in (
+                ExecutionState.STARTING.value,
+                ExecutionState.RUNNING.value,
+                ExecutionState.UNKNOWN.value,
+            ):
+                active.extend(self.dispatcher.scheduler.list("executions", state=state))
+            if not active:
+                return totals
+            if time.monotonic() >= deadline:
+                totals["timed_out"] = len(active)
+                for execution in active:
+                    self.dispatcher.interrupt_execution(execution["id"], terminate=True)
+                final = self.dispatcher.tick()
+                for key, value in final.items():
+                    totals[key] = totals.get(key, 0) + value
+                return totals
             time.sleep(self.poll_seconds)

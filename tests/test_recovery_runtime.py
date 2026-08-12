@@ -31,7 +31,7 @@ from local_agent_scheduler.root_bridge import (
     FilesystemRootBridge,
     OutboxDispatcher,
 )
-from local_agent_scheduler.runtime import Dispatcher
+from local_agent_scheduler.runtime import Dispatcher, SchedulerDaemon
 from local_agent_scheduler.storage import Database
 
 
@@ -78,9 +78,39 @@ class RecoveredAdapter(FakeAdapter):
         return StartObservation(ExecutionState.SUCCEEDED, runtime_handle)
 
 
+class ObservationConfirmedAdapter(FakeAdapter):
+    def observe_execution(self, runtime_handle):
+        return ExecutionObservation(
+            ExecutionState.TERMINATED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+
+    def collect_outcome(self, runtime_handle):
+        return ExecutionOutcome(
+            ExecutionState.FAILED,
+            failure_class=FailureClass.UNKNOWN,
+            terminal_confirmed=False,
+            quiescent_confirmed=False,
+        )
+
+
+class HangingAdapter(FakeAdapter):
+    def observe_execution(self, runtime_handle):
+        return ExecutionObservation(ExecutionState.RUNNING)
+
+    def collect_outcome(self, runtime_handle):
+        return ExecutionOutcome(ExecutionState.RUNNING)
+
+
 class FakeProcess:
     def poll(self):
         return None
+
+
+class FakeExitedProcess:
+    def poll(self):
+        return 1
 
 
 class FakeRootSession:
@@ -92,7 +122,7 @@ class FakeRootSession:
         self.closed = False
         self.__class__.instances.append(self)
 
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
         if method == "thread/resume":
             return {"thread": {"id": params["threadId"]}}
@@ -125,6 +155,21 @@ class FakeStoredSession(FakeRootSession):
                             "status": "completed",
                             "items": [{"type": "agentMessage", "text": '{"restored": true}'}],
                         }
+                    ],
+                }
+            }
+        return super().request(method, params)
+
+
+class FakeInterruptedSession(FakeRootSession):
+    def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "turns": [
+                        {"id": "interrupted-turn", "status": "interrupted", "error": None}
                     ],
                 }
             }
@@ -168,6 +213,55 @@ class RuntimeCase(unittest.TestCase):
         dispatcher.tick()
         envelopes = list((self.root / "events").glob("*.json"))
         self.assertGreaterEqual(len(envelopes), 2)
+
+    def test_daemon_once_runs_until_live_execution_is_idle(self) -> None:
+        _batch, ids = self.scheduler.submit_batch([TaskSpec("one-shot", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": FakeAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        totals = SchedulerDaemon(dispatcher, poll_seconds=0.001).run_until_idle(
+            max_wait_seconds=1
+        )
+        self.assertEqual(totals["dispatched"], 1)
+        self.assertGreaterEqual(totals["observed"], 1)
+        self.assertEqual(self.scheduler.get("tasks", ids["one-shot"])["state"], "COMPLETED")
+
+    def test_daemon_once_timeout_terminates_instead_of_waiting_forever(self) -> None:
+        _batch, ids = self.scheduler.submit_batch([TaskSpec("bounded-one-shot", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": HangingAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        totals = SchedulerDaemon(dispatcher, poll_seconds=0.001).run_until_idle(
+            max_wait_seconds=0.01
+        )
+        self.assertEqual(totals["timed_out"], 1)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["bounded-one-shot"])["state"], "CANCELLED"
+        )
+        self.assertEqual(self.scheduler.list("executions", state="RUNNING"), [])
+
+    def test_observation_quiescence_is_preserved_when_collect_omits_it(self) -> None:
+        _batch, ids = self.scheduler.submit_batch([TaskSpec("terminal", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": ObservationConfirmedAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        dispatcher.tick()
+        execution = self.scheduler.list("executions")[0]
+        dispatcher.tick()
+        self.assertEqual(self.scheduler.get("tasks", ids["terminal"])["state"], "SUSPENDED")
+        self.assertEqual(
+            self.scheduler.get("incarnations", execution["incarnation_id"])["state"],
+            "TERMINATED",
+        )
 
     def test_restart_after_claim_reconciles_without_losing_task(self) -> None:
         policy = RetryPolicy(
@@ -270,6 +364,15 @@ termination_confirmation = true
         )
         with self.assertRaises(ConfigurationError):
             load_config(wrong_bool)
+        invalid_sandbox = self.root / "invalid-sandbox.toml"
+        invalid_sandbox.write_text(
+            source.read_text(encoding="utf-8").replace(
+                'sandbox = "workspace-write"', 'sandbox = "workspaceWrite"'
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ConfigurationError):
+            load_config(invalid_sandbox)
         unsafe_cadence = self.root / "unsafe-cadence.toml"
         unsafe_cadence.write_text(
             source.read_text(encoding="utf-8").replace(
@@ -344,6 +447,47 @@ termination_confirmation = true
         self.assertEqual(outcome.state, ExecutionState.SUCCEEDED)
         self.assertEqual(outcome.payload, {"restored": True})
         self.assertTrue(FakeStoredSession.instances[-1].closed)
+
+    def test_codex_adapter_classifies_persisted_interruption_as_execution_lost(self) -> None:
+        adapter = CodexAppServerAdapter(session_factory=FakeInterruptedSession)
+        outcome = adapter.collect_outcome(
+            {"thread_id": "persisted-thread", "turn_id": "interrupted-turn"}
+        )
+        self.assertEqual(outcome.state, ExecutionState.FAILED)
+        self.assertEqual(outcome.failure_class, FailureClass.EXECUTION_LOST)
+        self.assertEqual(outcome.failure_code, "CODEX_STORED_TURN_INTERRUPTED")
+
+    def test_codex_interrupt_closes_and_detaches_physical_session(self) -> None:
+        adapter = CodexAppServerAdapter(session_factory=FakeRootSession)
+        session = FakeRootSession((), None, 1)
+        adapter._sessions["physical-session"] = session
+        observation = adapter.interrupt_execution(
+            {
+                "adapter_session_id": "physical-session",
+                "thread_id": "thread",
+                "turn_id": "root-turn",
+            }
+        )
+        self.assertEqual(observation.state, ExecutionState.TERMINATED)
+        self.assertTrue(observation.quiescent_confirmed)
+        self.assertTrue(session.closed)
+        self.assertNotIn("physical-session", adapter._sessions)
+
+    def test_codex_exited_session_is_detached_before_outcome_recovery(self) -> None:
+        adapter = CodexAppServerAdapter(session_factory=FakeRootSession)
+        session = FakeRootSession((), None, 1)
+        session.process = FakeExitedProcess()
+        adapter._sessions["exited-session"] = session
+        observation = adapter.observe_execution(
+            {
+                "adapter_session_id": "exited-session",
+                "thread_id": "thread",
+                "turn_id": "missing-turn",
+            }
+        )
+        self.assertEqual(observation.state, ExecutionState.LOST)
+        self.assertTrue(session.closed)
+        self.assertNotIn("exited-session", adapter._sessions)
 
 
 if __name__ == "__main__":

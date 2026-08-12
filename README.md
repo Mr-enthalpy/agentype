@@ -5,12 +5,13 @@ plane for durable agent work. It owns Tasks, Attempts, Leases, Results,
 LogicalAgents, Batches, pool topology, recovery, escalation, and durable Root
 notifications. Physical execution belongs to replaceable adapters.
 
-V0.1 uses SQLite WAL and ships a Codex `app-server` adapter. Codex, CCR,
+V0.1.1 uses SQLite WAL and ships a Codex `app-server` adapter. Codex, CCR,
 TokenRhythm, DeepSeek, credentials, and provider routing are not Scheduler Core
 semantics.
 
 The long-term architecture is in [ARCHITECTURE.md](ARCHITECTURE.md). The frozen
-V0.1 contracts are in [docs/V0.1_SPEC.md](docs/V0.1_SPEC.md).
+V0.1 contracts and V0.1.1 physical-incarnation amendment are in
+[docs/V0.1_SPEC.md](docs/V0.1_SPEC.md).
 
 ## Development
 

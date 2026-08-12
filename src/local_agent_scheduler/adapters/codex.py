@@ -51,7 +51,7 @@ class AppServerSession:
                 "clientInfo": {
                     "name": "local_agent_scheduler",
                     "title": "Local Agent Scheduler",
-                    "version": "0.1.0",
+                    "version": "0.1.1",
                 }
             },
         )
@@ -135,7 +135,7 @@ class CodexAppServerAdapter:
         command: tuple[str, ...] = ("codex", "app-server"),
         process_cwd: str | None = None,
         approval_policy: str = "never",
-        sandbox: str = "workspaceWrite",
+        sandbox: str = "workspace-write",
         request_timeout: float = 30.0,
         profile_options: Mapping[str, Mapping[str, Any]] | None = None,
         session_factory: Callable[..., AppServerSession] = AppServerSession,
@@ -219,6 +219,7 @@ class CodexAppServerAdapter:
                 state = ExecutionState.SUCCEEDED if status == "completed" else ExecutionState.FAILED
                 return ExecutionObservation(state, terminal_confirmed=True, quiescent_confirmed=True)
             if session.process.poll() is not None:
+                self._close_live_session(runtime_handle)
                 return ExecutionObservation(
                     ExecutionState.LOST,
                     terminal_confirmed=True,
@@ -340,10 +341,11 @@ class CodexAppServerAdapter:
             while time.monotonic() < deadline:
                 terminal = self._terminal_notification(session, runtime_handle)
                 if terminal:
+                    process_stopped = self._close_live_session(runtime_handle)
                     return ExecutionObservation(
                         ExecutionState.TERMINATED,
                         terminal_confirmed=True,
-                        quiescent_confirmed=True,
+                        quiescent_confirmed=process_stopped,
                     )
                 time.sleep(0.05)
             return ExecutionObservation(
@@ -357,9 +359,11 @@ class CodexAppServerAdapter:
 
     def terminate_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
         interrupted = self.interrupt_execution(runtime_handle)
+        if interrupted.terminal_confirmed and interrupted.quiescent_confirmed:
+            return interrupted
         session = self._live_session(runtime_handle)
-        process_stopped = session.close() if session else False
-        if interrupted.terminal_confirmed and process_stopped:
+        process_stopped = self._close_live_session(runtime_handle) if session else False
+        if process_stopped:
             return ExecutionObservation(
                 ExecutionState.TERMINATED,
                 terminal_confirmed=True,
@@ -376,13 +380,12 @@ class CodexAppServerAdapter:
         session_id = runtime_handle.get("adapter_session_id")
         return self._sessions.get(str(session_id)) if session_id else None
 
-    def _close_live_session(self, runtime_handle: Mapping[str, object]) -> None:
+    def _close_live_session(self, runtime_handle: Mapping[str, object]) -> bool:
         session_id = runtime_handle.get("adapter_session_id")
         if not session_id:
-            return
+            return False
         session = self._sessions.pop(str(session_id), None)
-        if session is not None:
-            session.close()
+        return session.close() if session is not None else False
 
     @staticmethod
     def _turn_status(notification: Mapping[str, Any]) -> str:
@@ -482,11 +485,23 @@ class CodexAppServerAdapter:
             return None
         status = str(turn.get("status", ""))
         if status in {"failed", "interrupted"}:
-            detail = json.dumps(turn.get("error", {}), ensure_ascii=False, sort_keys=True)
+            detail = json.dumps(
+                {"status": status, "error": turn.get("error")},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             return ExecutionOutcome(
                 ExecutionState.FAILED,
-                failure_class=self._classify_failure(detail),
-                failure_code="CODEX_STORED_TURN_FAILED",
+                failure_class=(
+                    FailureClass.EXECUTION_LOST
+                    if status == "interrupted"
+                    else self._classify_failure(detail)
+                ),
+                failure_code=(
+                    "CODEX_STORED_TURN_INTERRUPTED"
+                    if status == "interrupted"
+                    else "CODEX_STORED_TURN_FAILED"
+                ),
                 failure_signature=self._normalized_signature(detail),
                 terminal_confirmed=True,
                 quiescent_confirmed=True,

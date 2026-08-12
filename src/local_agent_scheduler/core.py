@@ -507,11 +507,16 @@ class Scheduler:
         self, conn: sqlite3.Connection, logical_agent_id: str, target: str, now: float
     ) -> str:
         current = conn.execute(
-            "SELECT * FROM incarnations WHERE logical_agent_id=? AND execution_target=? "
-            "AND state IN ('STARTING','WARM') ORDER BY generation DESC LIMIT 1",
-            (logical_agent_id, target),
+            "SELECT * FROM incarnations WHERE logical_agent_id=? "
+            "AND state IN ('STARTING','WARM','COLD') ORDER BY generation DESC LIMIT 1",
+            (logical_agent_id,),
         ).fetchone()
         if current:
+            if current["execution_target"] != target:
+                raise InvalidTransition(
+                    f"logical agent {logical_agent_id} already has active incarnation "
+                    f"{current['id']} on target {current['execution_target']}"
+                )
             return str(current["id"])
         generation = int(
             conn.execute(
@@ -534,6 +539,53 @@ class Scheduler:
         )
         return incarnation_id
 
+    @staticmethod
+    def _record_incarnation_presence(
+        conn: sqlite3.Connection,
+        incarnation_id: str,
+        execution_state: ExecutionState,
+        *,
+        terminal_confirmed: bool,
+        quiescent_confirmed: bool,
+        now: float,
+    ) -> None:
+        """Update physical presence without granting Task/Lease authority."""
+
+        if execution_state is ExecutionState.RUNNING:
+            conn.execute(
+                "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=? "
+                "AND state IN ('STARTING','WARM','COLD')",
+                (incarnation_id,),
+            )
+            return
+        if execution_state not in {
+            ExecutionState.SUCCEEDED,
+            ExecutionState.FAILED,
+            ExecutionState.LOST,
+            ExecutionState.TERMINATED,
+        }:
+            return
+        confirmed_end = (
+            execution_state is not ExecutionState.LOST
+            and terminal_confirmed
+            and quiescent_confirmed
+        )
+        next_state = (
+            IncarnationState.TERMINATED.value
+            if confirmed_end
+            else IncarnationState.LOST.value
+        )
+        allowed = (
+            "('STARTING','WARM','COLD','LOST')"
+            if confirmed_end
+            else "('STARTING','WARM','COLD')"
+        )
+        conn.execute(
+            f"UPDATE incarnations SET state=?,ended_at=COALESCE(ended_at,?) WHERE id=? "
+            f"AND state IN {allowed}",
+            (next_state, now, incarnation_id),
+        )
+
     # ------------------------------------------------------------------
     # Execution, fencing, result flow
 
@@ -543,6 +595,12 @@ class Scheduler:
         now = utc_now()
         with self.db.transaction() as conn:
             self._validate_authority(conn, claim.attempt_id, claim.lease_epoch)
+            if conn.execute(
+                "SELECT 1 FROM executions WHERE incarnation_id=?", (claim.incarnation_id,)
+            ).fetchone():
+                raise InvalidTransition(
+                    f"incarnation {claim.incarnation_id} already owns an Execution"
+                )
             conn.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,"
                 "execution_profile,state,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -646,13 +704,16 @@ class Scheduler:
             execution = self._required(conn, "executions", execution_id)
             allowed = {
                 ExecutionState.STARTING.value: {
+                    ExecutionState.STARTING,
                     ExecutionState.RUNNING,
+                    ExecutionState.SUCCEEDED,
                     ExecutionState.FAILED,
                     ExecutionState.LOST,
                     ExecutionState.UNKNOWN,
                     ExecutionState.TERMINATED,
                 },
                 ExecutionState.UNKNOWN.value: {
+                    ExecutionState.UNKNOWN,
                     ExecutionState.RUNNING,
                     ExecutionState.SUCCEEDED,
                     ExecutionState.FAILED,
@@ -660,21 +721,38 @@ class Scheduler:
                     ExecutionState.TERMINATED,
                 },
                 ExecutionState.RUNNING.value: {
+                    ExecutionState.RUNNING,
                     ExecutionState.SUCCEEDED,
                     ExecutionState.FAILED,
                     ExecutionState.LOST,
                     ExecutionState.TERMINATED,
                 },
+                ExecutionState.LOST.value: {
+                    ExecutionState.SUCCEEDED,
+                    ExecutionState.FAILED,
+                    ExecutionState.LOST,
+                    ExecutionState.TERMINATED,
+                },
+                ExecutionState.SUCCEEDED.value: {
+                    ExecutionState.SUCCEEDED,
+                    ExecutionState.TERMINATED,
+                },
+                ExecutionState.FAILED.value: {
+                    ExecutionState.FAILED,
+                    ExecutionState.TERMINATED,
+                },
+                ExecutionState.TERMINATED.value: {ExecutionState.TERMINATED},
             }
-            if execution["state"] == state.value:
-                return
             if state not in allowed.get(execution["state"], set()):
                 raise InvalidTransition(
                     f"execution {execution_id} cannot transition from {execution['state']} to {state.value}"
                 )
             conn.execute(
-                "UPDATE executions SET state=?,outcome_json=?,failure_class=?,failure_code=?,"
-                "failure_signature=?,terminal_confirmed=?,quiescent_confirmed=?,updated_at=?,"
+                "UPDATE executions SET state=?,outcome_json=COALESCE(?,outcome_json),"
+                "failure_class=COALESCE(?,failure_class),failure_code=COALESCE(?,failure_code),"
+                "failure_signature=COALESCE(?,failure_signature),"
+                "terminal_confirmed=MAX(terminal_confirmed,?),"
+                "quiescent_confirmed=MAX(quiescent_confirmed,?),updated_at=?,"
                 "ended_at=CASE WHEN ? THEN ? ELSE ended_at END WHERE id=?",
                 (
                     state.value,
@@ -689,6 +767,14 @@ class Scheduler:
                     now,
                     execution_id,
                 ),
+            )
+            self._record_incarnation_presence(
+                conn,
+                execution["incarnation_id"],
+                state,
+                terminal_confirmed=terminal_confirmed,
+                quiescent_confirmed=quiescent_confirmed,
+                now=now,
             )
 
     def heartbeat(
@@ -717,6 +803,7 @@ class Scheduler:
         continuity_capsule: Mapping[str, Any] | None = None,
         project_state_ref: str | None = None,
         workspace_state_ref: str | None = None,
+        quiescent_confirmed: bool = True,
     ) -> str:
         now = utc_now()
         result_id = new_id("result")
@@ -747,13 +834,17 @@ class Scheduler:
                     )
                 conn.execute(
                     "UPDATE executions SET state='SUCCEEDED',outcome_json=?,terminal_confirmed=1,"
-                    "quiescent_confirmed=1,updated_at=?,ended_at=? WHERE id=?",
-                    (json_dumps(payload), now, now, execution_id),
+                    "quiescent_confirmed=?,updated_at=?,ended_at=? WHERE id=?",
+                    (json_dumps(payload), int(quiescent_confirmed), now, now, execution_id),
                 )
-                conn.execute(
-                    "UPDATE incarnations SET state='WARM' WHERE id=? AND state IN ('STARTING','WARM')",
-                    (attempt["incarnation_id"],),
-                )
+            self._record_incarnation_presence(
+                conn,
+                attempt["incarnation_id"],
+                ExecutionState.SUCCEEDED,
+                terminal_confirmed=True,
+                quiescent_confirmed=quiescent_confirmed,
+                now=now,
+            )
             conn.execute(
                 "UPDATE attempts SET state='SUCCEEDED',ended_at=? WHERE id=?",
                 (now, attempt_id),
@@ -856,12 +947,18 @@ class Scheduler:
                         execution_id,
                     ),
                 )
-                if failure_class is FailureClass.EXECUTION_LOST:
-                    conn.execute(
-                        "UPDATE incarnations SET state='LOST',ended_at=? WHERE id=? "
-                        "AND state IN ('STARTING','WARM','COLD')",
-                        (now, attempt["incarnation_id"]),
-                    )
+            self._record_incarnation_presence(
+                conn,
+                attempt["incarnation_id"],
+                (
+                    ExecutionState.LOST
+                    if failure_class is FailureClass.EXECUTION_LOST
+                    else ExecutionState.FAILED
+                ),
+                terminal_confirmed=terminal_confirmed,
+                quiescent_confirmed=quiescent_confirmed,
+                now=now,
+            )
             retry_classes = set(json_loads(task["retry_classes_json"], []))
             attempts_remaining = int(attempt["attempt_number"]) < int(task["max_attempts"])
             retry_allowed = failure_class.value in retry_classes and attempts_remaining
@@ -1160,7 +1257,7 @@ class Scheduler:
             "JOIN pool_partitions p ON p.name=a.partition_name "
             "WHERE a.state IN ('READY','REVIVING') AND p.active=1 "
             "AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id=a.id "
-            "AND i.state IN ('STARTING','WARM')) ORDER BY a.id"
+            "AND i.state IN ('STARTING','WARM','COLD')) ORDER BY a.id"
         )
         revived = 0
         for candidate in candidates:
@@ -1194,6 +1291,21 @@ class Scheduler:
                         or attempt_isolation
                         or bool(execution["quiescent_confirmed"])
                     )
+                )
+                physical_quiescent = execution is None or quiescence_confirmed or bool(
+                    execution["quiescent_confirmed"]
+                )
+                self._record_incarnation_presence(
+                    conn,
+                    attempt["incarnation_id"],
+                    (
+                        ExecutionState.TERMINATED
+                        if physical_quiescent
+                        else ExecutionState.LOST
+                    ),
+                    terminal_confirmed=physical_quiescent,
+                    quiescent_confirmed=physical_quiescent,
+                    now=now,
                 )
                 conn.execute(
                     "UPDATE attempts SET state='CANCELLED',ended_at=? WHERE id=? AND state='ACTIVE'",
@@ -1235,7 +1347,8 @@ class Scheduler:
             if batch["state"] == BatchState.CANCELLED.value:
                 return
             active = conn.execute(
-                "SELECT a.id,a.logical_agent_id,t.id AS task_id,t.workspace_mode,t.workstream_id "
+                "SELECT a.id,a.logical_agent_id,a.incarnation_id,t.id AS task_id,"
+                "t.workspace_mode,t.workstream_id "
                 "FROM attempts a JOIN tasks t ON t.id=a.task_id "
                 "WHERE t.batch_id=? AND a.state='ACTIVE'",
                 (batch_id,),
@@ -1253,6 +1366,21 @@ class Scheduler:
                     attempt["workspace_mode"] == WorkspaceMode.WRITE.value
                     and execution is not None
                     and not bool(execution["quiescent_confirmed"])
+                )
+                physical_quiescent = execution is None or bool(
+                    execution["quiescent_confirmed"]
+                )
+                self._record_incarnation_presence(
+                    conn,
+                    attempt["incarnation_id"],
+                    (
+                        ExecutionState.TERMINATED
+                        if physical_quiescent
+                        else ExecutionState.LOST
+                    ),
+                    terminal_confirmed=physical_quiescent,
+                    quiescent_confirmed=physical_quiescent,
+                    now=now,
                 )
                 conn.execute(
                     "UPDATE attempts SET state='CANCELLED',ended_at=? WHERE id=?",
@@ -1328,7 +1456,7 @@ class Scheduler:
                     next_state = "TERMINATED" if quiescence_confirmed else "LOST"
                     conn.execute(
                         "UPDATE incarnations SET state=?,ended_at=? WHERE id=? "
-                        "AND state IN ('STARTING','WARM','COLD')",
+                        "AND state IN ('STARTING','WARM','COLD','LOST')",
                         (next_state, now, latest["incarnation_id"]),
                     )
                 if escalation["logical_agent_id"]:
@@ -1370,7 +1498,7 @@ class Scheduler:
                     if latest and quiescence_confirmed:
                         conn.execute(
                             "UPDATE incarnations SET state='TERMINATED',ended_at=? WHERE id=? "
-                            "AND state IN ('STARTING','WARM','COLD')",
+                            "AND state IN ('STARTING','WARM','COLD','LOST')",
                             (now, latest["incarnation_id"]),
                         )
                     elif latest and attempt_isolation:
