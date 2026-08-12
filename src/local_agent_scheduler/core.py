@@ -116,6 +116,57 @@ class Scheduler:
             )
         return revision
 
+    def bootstrap_partitions(self, specs: Sequence[PartitionSpec]) -> bool:
+        """Apply human configuration once; SQLite owns topology thereafter."""
+
+        now = utc_now()
+        with self.db.transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM scheduler_meta WHERE key='topology_bootstrapped'"
+            ).fetchone():
+                return False
+            if conn.execute("SELECT 1 FROM pool_partitions LIMIT 1").fetchone():
+                raise InvalidTransition(
+                    "topology exists without a bootstrap marker; explicit repair is required"
+                )
+            for spec in specs:
+                if spec.desired_capacity < 0:
+                    raise ValueError("desired_capacity must be non-negative")
+                payload = {
+                    "name": spec.name,
+                    "desired_capacity": spec.desired_capacity,
+                    "retention": spec.retention.value,
+                    "execution_target": spec.execution_target,
+                    "execution_profile": spec.execution_profile,
+                    "tags": list(spec.tags),
+                }
+                cursor = conn.execute(
+                    "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) "
+                    "VALUES(?,?,?)",
+                    ("BOOTSTRAP", json_dumps(payload), now),
+                )
+                conn.execute(
+                    "INSERT INTO pool_partitions(name,desired_capacity,retention,execution_target,"
+                    "execution_profile,tags_json,active,topology_revision,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,1,?,?,?)",
+                    (
+                        spec.name,
+                        spec.desired_capacity,
+                        spec.retention.value,
+                        spec.execution_target,
+                        spec.execution_profile,
+                        json_dumps(list(spec.tags)),
+                        int(cursor.lastrowid),
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?,?,?)",
+                ("topology_bootstrapped", json_dumps({"source": "configuration"}), now),
+            )
+        return True
+
     def birth_agent(
         self,
         partition_name: str,
@@ -176,7 +227,8 @@ class Scheduler:
             ).fetchall()
             for partition in partitions:
                 members = conn.execute(
-                    "SELECT * FROM logical_agents WHERE partition_name=? AND state<>'RETIRED' "
+                    "SELECT * FROM logical_agents WHERE partition_name=? "
+                    "AND state IN ('INITIALIZING','READY','ASSIGNED','REVIVING') "
                     "ORDER BY created_at,id",
                     (partition["name"],),
                 ).fetchall()
@@ -212,12 +264,14 @@ class Scheduler:
         born = 0
         with self.db.transaction() as conn:
             tasks = conn.execute(
-                "SELECT * FROM tasks WHERE state='QUEUED' ORDER BY priority DESC,created_at,id"
+                "SELECT t.* FROM tasks t JOIN batches b ON b.id=t.batch_id "
+                "WHERE t.state='QUEUED' AND b.state='ACTIVE' "
+                "ORDER BY t.priority DESC,t.created_at,t.id"
             ).fetchall()
             for task in tasks:
                 required_tags = set(json_loads(task["affinity_tags_json"], []))
                 agents = conn.execute(
-                    "SELECT * FROM logical_agents WHERE partition_name=? AND state<>'RETIRED'",
+                    "SELECT * FROM logical_agents WHERE partition_name=? AND state='READY'",
                     (task["partition_name"],),
                 ).fetchall()
                 compatible = False
@@ -253,12 +307,29 @@ class Scheduler:
         now = utc_now()
         with self.db.transaction() as conn:
             agent = self._required(conn, "logical_agents", agent_id)
-            self._required(conn, "pool_partitions", target_partition, key="name", active=True)
+            target = self._required(
+                conn, "pool_partitions", target_partition, key="name", active=True
+            )
             if agent["state"] == AgentState.RETIRED.value:
                 raise InvalidTransition("a retired LogicalAgent cannot move")
+            active_presence = conn.execute(
+                "SELECT execution_target FROM incarnations WHERE logical_agent_id=? "
+                "AND state IN ('STARTING','WARM','COLD') ORDER BY generation DESC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+            target_boundary = bool(
+                active_presence
+                and active_presence["execution_target"] != target["execution_target"]
+            )
             if agent["state"] in (AgentState.ASSIGNED.value, AgentState.DRAINING.value):
                 conn.execute(
                     "UPDATE logical_agents SET pending_partition_name=?,updated_at=? WHERE id=?",
+                    (target_partition, now, agent_id),
+                )
+            elif target_boundary:
+                conn.execute(
+                    "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
+                    "available_since=NULL,updated_at=? WHERE id=?",
                     (target_partition, now, agent_id),
                 )
             else:
@@ -273,13 +344,25 @@ class Scheduler:
             raise ValueError("source and target partitions must differ")
         now = utc_now()
         with self.db.transaction() as conn:
-            self._required(conn, "pool_partitions", source, key="name", active=True)
-            self._required(conn, "pool_partitions", target, key="name", active=True)
+            source_partition = self._required(
+                conn, "pool_partitions", source, key="name", active=True
+            )
+            target_partition = self._required(
+                conn, "pool_partitions", target, key="name", active=True
+            )
             cursor = conn.execute(
                 "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
                 ("MERGE", json_dumps({"source": source, "target": target}), now),
             )
             revision = int(cursor.lastrowid)
+            if source_partition["execution_target"] != target_partition["execution_target"]:
+                conn.execute(
+                    "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
+                    "available_since=NULL,updated_at=? WHERE partition_name=? AND state='READY' "
+                    "AND EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id=logical_agents.id "
+                    "AND i.state IN ('STARTING','WARM','COLD'))",
+                    (target, now, source),
+                )
             conn.execute(
                 "UPDATE logical_agents SET partition_name=?,updated_at=? "
                 "WHERE partition_name=? AND state IN ('READY','INITIALIZING','SUSPENDED')",
@@ -412,9 +495,10 @@ class Scheduler:
                 conn, "pool_partitions", agent["partition_name"], key="name", active=True
             )
             candidates = conn.execute(
-                "SELECT * FROM tasks WHERE state='QUEUED' AND partition_name=? "
+                "SELECT t.* FROM tasks t JOIN batches b ON b.id=t.batch_id "
+                "WHERE t.state='QUEUED' AND b.state='ACTIVE' AND t.partition_name=? "
                 "AND (next_eligible_at IS NULL OR next_eligible_at<=?) "
-                "ORDER BY priority DESC,created_at,id",
+                "ORDER BY priority DESC,t.created_at,t.id",
                 (agent["partition_name"], now),
             ).fetchall()
             agent_tags = json_loads(agent["tags_json"], [])
@@ -434,16 +518,75 @@ class Scheduler:
             if not eligible:
                 return None
             eligible.sort(key=lambda item: (item[0], -item[1]["priority"], item[1]["created_at"], item[1]["id"]))
-            task = eligible[0][1]
+            return self._claim_selected(conn, agent, partition, eligible[0][1], now)
+
+    def claim_next_available(self, *, now: float | None = None) -> Claim | None:
+        """Transactionally select the highest-priority Task and its best consumer."""
+
+        now = utc_now() if now is None else now
+        with self.db.transaction() as conn:
+            tasks = conn.execute(
+                "SELECT t.* FROM tasks t JOIN batches b ON b.id=t.batch_id "
+                "JOIN pool_partitions p ON p.name=t.partition_name "
+                "WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1 "
+                "AND (t.next_eligible_at IS NULL OR t.next_eligible_at<=?) "
+                "ORDER BY t.priority DESC,t.created_at,t.id",
+                (now,),
+            ).fetchall()
+            for task in tasks:
+                agents = conn.execute(
+                    "SELECT * FROM logical_agents WHERE partition_name=? AND state='READY' "
+                    "AND current_task_id IS NULL ORDER BY available_since,id",
+                    (task["partition_name"],),
+                ).fetchall()
+                task_tags = json_loads(task["affinity_tags_json"], [])
+                eligible: list[tuple[int, float, str, sqlite3.Row]] = []
+                for agent in agents:
+                    if not tags_match(task_tags, json_loads(agent["tags_json"], [])):
+                        continue
+                    same_workstream = bool(
+                        task["workstream_id"]
+                        and task["workstream_id"] == agent["workstream_id"]
+                    )
+                    continuity = ContinuityPreference(task["continuity"])
+                    if continuity is ContinuityPreference.REQUIRED and not same_workstream:
+                        continue
+                    continuity_rank = (
+                        0
+                        if continuity is not ContinuityPreference.NONE and same_workstream
+                        else 1
+                    )
+                    eligible.append(
+                        (
+                            continuity_rank,
+                            float(agent["available_since"] or agent["created_at"]),
+                            str(agent["id"]),
+                            agent,
+                        )
+                    )
+                if eligible:
+                    eligible.sort(key=lambda item: item[:3])
+                    agent = eligible[0][3]
+                    partition = self._required(
+                        conn, "pool_partitions", task["partition_name"], key="name", active=True
+                    )
+                    return self._claim_selected(conn, agent, partition, task, now)
+            return None
+
+    def _claim_selected(
+        self,
+        conn: sqlite3.Connection,
+        agent: sqlite3.Row,
+        partition: sqlite3.Row,
+        task: sqlite3.Row,
+        now: float,
+    ) -> Claim:
             epoch = int(task["fencing_epoch"]) + 1
             attempt_number = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM attempts WHERE task_id=?", (task["id"],)
                 ).fetchone()[0]
             ) + 1
-            incarnation_id = self._ensure_incarnation(
-                conn, logical_agent_id, partition["execution_target"], now
-            )
             attempt_id = new_id("attempt")
             lease_id = new_id("lease")
             expires_at = now + self.lease_seconds
@@ -453,8 +596,8 @@ class Scheduler:
                 (
                     attempt_id,
                     task["id"],
-                    logical_agent_id,
-                    incarnation_id,
+                    agent["id"],
+                    None,
                     attempt_number,
                     epoch,
                     AttemptState.ACTIVE.value,
@@ -483,7 +626,7 @@ class Scheduler:
             conn.execute(
                 "UPDATE logical_agents SET state='ASSIGNED',current_task_id=?,workstream_id=COALESCE(?,workstream_id),"
                 "available_since=NULL,updated_at=? WHERE id=? AND state='READY'",
-                (task["id"], task["workstream_id"], now, logical_agent_id),
+                (task["id"], task["workstream_id"], now, agent["id"]),
             )
             return Claim(
                 task_id=task["id"],
@@ -493,8 +636,8 @@ class Scheduler:
                 lease_id=lease_id,
                 lease_epoch=epoch,
                 lease_expires_at=expires_at,
-                logical_agent_id=logical_agent_id,
-                incarnation_id=incarnation_id,
+                logical_agent_id=agent["id"],
+                incarnation_id=None,
                 execution_target=partition["execution_target"],
                 execution_profile=partition["execution_profile"],
                 workspace_mode=WorkspaceMode(task["workspace_mode"]),
@@ -542,14 +685,18 @@ class Scheduler:
     @staticmethod
     def _record_incarnation_presence(
         conn: sqlite3.Connection,
-        incarnation_id: str,
+        incarnation_id: str | None,
         execution_state: ExecutionState,
         *,
         terminal_confirmed: bool,
         quiescent_confirmed: bool,
+        incarnation_reusable: bool = False,
         now: float,
     ) -> None:
         """Update physical presence without granting Task/Lease authority."""
+
+        if incarnation_id is None:
+            return
 
         if execution_state is ExecutionState.RUNNING:
             conn.execute(
@@ -564,6 +711,13 @@ class Scheduler:
             ExecutionState.LOST,
             ExecutionState.TERMINATED,
         }:
+            return
+        if incarnation_reusable and terminal_confirmed and quiescent_confirmed:
+            conn.execute(
+                "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=? "
+                "AND state IN ('STARTING','WARM','COLD')",
+                (incarnation_id,),
+            )
             return
         confirmed_end = (
             execution_state is not ExecutionState.LOST
@@ -589,18 +743,31 @@ class Scheduler:
     # ------------------------------------------------------------------
     # Execution, fencing, result flow
 
-    def create_execution(self, claim: Claim, *, request_id: str | None = None) -> tuple[str, str]:
+    def create_execution(
+        self, claim: Claim, *, request_id: str | None = None
+    ) -> tuple[str, str]:
         execution_id = new_id("exec")
         request_id = request_id or new_id("request")
         now = utc_now()
         with self.db.transaction() as conn:
-            self._validate_authority(conn, claim.attempt_id, claim.lease_epoch)
+            attempt, _lease, _task = self._validate_authority(
+                conn, claim.attempt_id, claim.lease_epoch
+            )
+            incarnation_id = attempt["incarnation_id"] or self._ensure_incarnation(
+                conn, claim.logical_agent_id, claim.execution_target, now
+            )
             if conn.execute(
-                "SELECT 1 FROM executions WHERE incarnation_id=?", (claim.incarnation_id,)
+                "SELECT 1 FROM executions WHERE incarnation_id=? "
+                "AND state IN ('STARTING','RUNNING','UNKNOWN')",
+                (incarnation_id,),
             ).fetchone():
                 raise InvalidTransition(
-                    f"incarnation {claim.incarnation_id} already owns an Execution"
+                    f"incarnation {incarnation_id} already owns an active Execution"
                 )
+            conn.execute(
+                "UPDATE attempts SET incarnation_id=? WHERE id=? AND incarnation_id IS NULL",
+                (incarnation_id, claim.attempt_id),
+            )
             conn.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,"
                 "execution_profile,state,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -609,7 +776,7 @@ class Scheduler:
                     request_id,
                     claim.task_id,
                     claim.attempt_id,
-                    claim.incarnation_id,
+                    incarnation_id,
                     claim.execution_target,
                     claim.execution_profile,
                     ExecutionState.STARTING.value,
@@ -792,6 +959,21 @@ class Scheduler:
             )
         return expires_at
 
+    def renew_active_leases(self, *, now: float | None = None) -> int:
+        """Renew authority owned by this Scheduler process during blocking adapter I/O."""
+
+        now = utc_now() if now is None else now
+        expires_at = now + self.lease_seconds
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE leases SET heartbeat_at=?,expires_at=? WHERE state='ACTIVE' "
+                "AND attempt_id IN (SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id "
+                "WHERE a.state='ACTIVE' AND t.current_attempt_id=a.id "
+                "AND t.fencing_epoch=a.lease_epoch)",
+                (now, expires_at),
+            )
+            return cursor.rowcount
+
     def ack_success(
         self,
         attempt_id: str,
@@ -804,11 +986,56 @@ class Scheduler:
         project_state_ref: str | None = None,
         workspace_state_ref: str | None = None,
         quiescent_confirmed: bool = True,
-    ) -> str:
+        attempt_isolation: bool = False,
+        incarnation_reusable: bool = False,
+    ) -> str | None:
         now = utc_now()
         result_id = new_id("result")
         with self.db.transaction() as conn:
             attempt, lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
+            if (
+                task["workspace_mode"] == WorkspaceMode.WRITE.value
+                and execution_id is not None
+                and not (quiescent_confirmed or attempt_isolation)
+            ):
+                execution = self._required(conn, "executions", execution_id)
+                if execution["attempt_id"] != attempt_id:
+                    raise StaleAuthority("execution does not belong to current attempt")
+                conn.execute(
+                    "UPDATE executions SET state='SUCCEEDED',outcome_json=?,terminal_confirmed=1,"
+                    "quiescent_confirmed=0,updated_at=?,ended_at=? WHERE id=?",
+                    (json_dumps(payload), now, now, execution_id),
+                )
+                self._record_incarnation_presence(
+                    conn,
+                    attempt["incarnation_id"],
+                    ExecutionState.SUCCEEDED,
+                    terminal_confirmed=True,
+                    quiescent_confirmed=False,
+                    now=now,
+                )
+                self._record_failure(
+                    conn,
+                    task["id"],
+                    attempt_id,
+                    execution_id,
+                    FailureClass.WRITER_QUIESCENCE_UNKNOWN,
+                    "WRITER_SUCCESS_NOT_QUIESCENT",
+                    "WRITER_SUCCESS_NOT_QUIESCENT",
+                    "writer reported success but physical quiescence is unknown",
+                    now,
+                )
+                self._suspend_current(
+                    conn,
+                    attempt,
+                    lease,
+                    task,
+                    FailureClass.WRITER_QUIESCENCE_UNKNOWN,
+                    "WRITER_SUCCESS_NOT_QUIESCENT",
+                    "writer reported success but physical quiescence is unknown",
+                    now,
+                )
+                return None
             checkpoint_id = None
             if continuity_capsule is not None:
                 checkpoint_id = self._promote_checkpoint(
@@ -843,6 +1070,7 @@ class Scheduler:
                 ExecutionState.SUCCEEDED,
                 terminal_confirmed=True,
                 quiescent_confirmed=quiescent_confirmed,
+                incarnation_reusable=incarnation_reusable,
                 now=now,
             )
             conn.execute(
@@ -879,14 +1107,6 @@ class Scheduler:
             )
             self._release_agent(conn, attempt["logical_agent_id"], now)
             self._release_dependencies(conn, task["batch_id"], now)
-            self._enqueue_event(
-                conn,
-                "RESULT_AVAILABLE",
-                "result",
-                result_id,
-                {"result_id": result_id, "task_id": task["id"], "batch_id": task["batch_id"]},
-                now,
-            )
             self._recompute_batch(conn, task["batch_id"], now)
         return result_id
 
@@ -903,6 +1123,7 @@ class Scheduler:
         terminal_confirmed: bool = True,
         quiescent_confirmed: bool = True,
         attempt_isolation: bool = False,
+        incarnation_reusable: bool = False,
         now: float | None = None,
     ) -> TaskState:
         now = utc_now() if now is None else now
@@ -957,6 +1178,7 @@ class Scheduler:
                 ),
                 terminal_confirmed=terminal_confirmed,
                 quiescent_confirmed=quiescent_confirmed,
+                incarnation_reusable=incarnation_reusable,
                 now=now,
             )
             retry_classes = set(json_loads(task["retry_classes_json"], []))
@@ -1067,7 +1289,7 @@ class Scheduler:
                 )
                 writer_safe = (
                     row["workspace_mode"] != WorkspaceMode.WRITE.value
-                    or bool(row["terminal_confirmed"])
+                    or row["execution_id"] is None
                     or bool(row["quiescent_confirmed"])
                     or row["execution_target"] in isolated
                 )
@@ -1203,6 +1425,14 @@ class Scheduler:
             agent = self._required(conn, "logical_agents", logical_agent_id)
             if agent["state"] == AgentState.RETIRED.value:
                 raise InvalidTransition("a semantically retired LogicalAgent cannot revive")
+            if conn.execute(
+                "SELECT 1 FROM escalations WHERE logical_agent_id=? AND state='OPEN' "
+                "AND failure_class=? LIMIT 1",
+                (logical_agent_id, FailureClass.WRITER_QUIESCENCE_UNKNOWN.value),
+            ).fetchone():
+                raise InvalidTransition(
+                    "writer physical-safety obligation must be resolved before revival"
+                )
             active_attempt = conn.execute(
                 "SELECT a.id FROM attempts a WHERE a.logical_agent_id=? AND a.state='ACTIVE' LIMIT 1",
                 (logical_agent_id,),
@@ -1211,24 +1441,16 @@ class Scheduler:
                 raise InvalidTransition(
                     "an assigned LogicalAgent must close or fence its active Attempt before revival"
                 )
-            conn.execute(
-                "UPDATE incarnations SET state='LOST',ended_at=? WHERE logical_agent_id=? "
-                "AND state IN ('STARTING','WARM','COLD')",
-                (now, logical_agent_id),
+            partition = self._required(
+                conn, "pool_partitions", agent["partition_name"], key="name", active=True
             )
-            prior_state = agent["state"]
+            if partition["execution_target"] != execution_target:
+                raise InvalidTransition("revival target must match the active partition")
             conn.execute(
-                "UPDATE logical_agents SET state='REVIVING',updated_at=? WHERE id=?",
-                (now, logical_agent_id),
+                "UPDATE logical_agents SET state='READY',available_since=?,updated_at=? WHERE id=?",
+                (now, now, logical_agent_id),
             )
-            incarnation_id = self._ensure_incarnation(conn, logical_agent_id, execution_target, now)
-            restored_state = AgentState.ASSIGNED.value if prior_state == AgentState.ASSIGNED.value else AgentState.READY.value
-            conn.execute(
-                "UPDATE logical_agents SET state=?,available_since=CASE WHEN ?='READY' THEN ? ELSE NULL END,"
-                "updated_at=? WHERE id=?",
-                (restored_state, restored_state, now, now, logical_agent_id),
-            )
-            return incarnation_id
+            return logical_agent_id
 
     def mark_incarnation_lost(self, incarnation_id: str) -> None:
         now = utc_now()
@@ -1249,15 +1471,23 @@ class Scheduler:
                     "UPDATE logical_agents SET state='REVIVING',available_since=NULL,updated_at=? WHERE id=?",
                     (now, agent["id"]),
                 )
+            elif (
+                agent["state"] == AgentState.DRAINING.value
+                and not agent["current_task_id"]
+                and agent["pending_partition_name"]
+            ):
+                conn.execute(
+                    "UPDATE logical_agents SET state='READY',partition_name=pending_partition_name,"
+                    "pending_partition_name=NULL,available_since=?,updated_at=? WHERE id=?",
+                    (now, now, agent["id"]),
+                )
 
     def revive_eligible_agents(self) -> int:
-        """Create replacement Incarnations for idle live identities with lost presence."""
+        """Restore logical availability without inventing physical presence."""
         candidates = self.db.fetch_all(
             "SELECT a.id,p.execution_target FROM logical_agents a "
             "JOIN pool_partitions p ON p.name=a.partition_name "
-            "WHERE a.state IN ('READY','REVIVING') AND p.active=1 "
-            "AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id=a.id "
-            "AND i.state IN ('STARTING','WARM','COLD')) ORDER BY a.id"
+            "WHERE a.state='REVIVING' AND p.active=1 ORDER BY a.id"
         )
         revived = 0
         for candidate in candidates:
@@ -1354,8 +1584,9 @@ class Scheduler:
                 (batch_id,),
             ).fetchall()
             conn.execute(
-                "UPDATE escalations SET state='CANCELLED',resolved_at=? WHERE batch_id=? AND state='OPEN'",
-                (now, batch_id),
+                "UPDATE escalations SET state='CANCELLED',resolved_at=? WHERE batch_id=? "
+                "AND state='OPEN' AND failure_class<>?",
+                (now, batch_id, FailureClass.WRITER_QUIESCENCE_UNKNOWN.value),
             )
             for attempt in active:
                 execution = conn.execute(
@@ -1517,6 +1748,12 @@ class Scheduler:
                     "UPDATE tasks SET state='CANCELLED',updated_at=? WHERE id=?",
                     (now, task["id"]),
                 )
+                if (
+                    escalation["failure_class"]
+                    == FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
+                ):
+                    self._recompute_batch(conn, task["batch_id"], now)
+                    return
             conn.execute(
                 "UPDATE escalations SET state='RESOLVED',resolved_at=? WHERE id=?",
                 (now, escalation_id),

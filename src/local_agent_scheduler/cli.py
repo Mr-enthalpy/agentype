@@ -33,8 +33,7 @@ def _load_context(args: argparse.Namespace) -> tuple[Scheduler, SchedulerConfig 
 
 
 def _apply_config(scheduler: Scheduler, config: SchedulerConfig) -> None:
-    for partition in config.partitions:
-        scheduler.upsert_partition(partition)
+    scheduler.bootstrap_partitions(config.partitions)
     scheduler.reconcile_pool()
 
 
@@ -69,7 +68,11 @@ def _build_dispatcher(
         workspace_root=process_cwd,
         outbox=outbox,
     )
-    return dispatcher, SchedulerDaemon(dispatcher, poll_seconds=config.dispatcher_poll_seconds)
+    return dispatcher, SchedulerDaemon(
+        dispatcher,
+        poll_seconds=config.dispatcher_poll_seconds,
+        heartbeat_seconds=config.heartbeat_seconds,
+    )
 
 
 def _task_specs(

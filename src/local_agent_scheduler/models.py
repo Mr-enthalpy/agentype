@@ -57,7 +57,7 @@ class Claim:
     lease_epoch: int
     lease_expires_at: float
     logical_agent_id: str
-    incarnation_id: str
+    incarnation_id: str | None
     execution_target: str
     execution_profile: str
     workspace_mode: WorkspaceMode
@@ -114,6 +114,7 @@ class ExecutionOutcome:
     retry_hint: bool | None = None
     terminal_confirmed: bool = True
     quiescent_confirmed: bool = True
+    incarnation_reusable: bool = False
 
 
 @dataclass(frozen=True)

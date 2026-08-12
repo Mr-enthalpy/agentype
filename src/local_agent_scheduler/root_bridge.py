@@ -67,17 +67,21 @@ class CodexAppServerRootBridge:
         process_cwd: str | None = None,
         request_timeout: float = 30.0,
         completion_timeout: float = 120.0,
+        reconcile_interval: float = 1.0,
         session_factory: Callable[..., AppServerSession] = AppServerSession,
     ) -> None:
         if not root_thread_id.strip():
             raise ValueError("root_thread_id cannot be empty")
         if request_timeout <= 0 or completion_timeout <= 0:
             raise ValueError("RootBridge timeouts must be positive")
+        if reconcile_interval <= 0:
+            raise ValueError("RootBridge reconcile_interval must be positive")
         self.root_thread_id = root_thread_id
         self.command = command
         self.process_cwd = process_cwd
         self.request_timeout = request_timeout
         self.completion_timeout = completion_timeout
+        self.reconcile_interval = reconcile_interval
         self.session_factory = session_factory
 
     def deliver(
@@ -96,24 +100,71 @@ class CodexAppServerRootBridge:
             )
             turn_id = str(started["turn"]["id"])
             deadline = time.monotonic() + self.completion_timeout
+            next_reconcile = time.monotonic()
             while time.monotonic() < deadline:
-                for message in reversed(session.notifications()):
-                    if message.get("method") != "turn/completed":
-                        continue
-                    params = message.get("params", {})
-                    turn = params.get("turn", {}) if isinstance(params, Mapping) else {}
-                    if str(turn.get("id", "")) != turn_id:
-                        continue
-                    status = str(turn.get("status", "failed"))
-                    if status == "completed":
-                        return DeliveryObservation(True)
-                    return DeliveryObservation(False, f"Codex Root turn ended as {status}")
+                status = self._notification_status(session.notifications(), turn_id)
+                terminal = self._terminal_observation(status)
+                if terminal is not None:
+                    return terminal
                 if session.process.poll() is not None:
                     return DeliveryObservation(False, "Codex Root app-server exited before completion")
+                now = time.monotonic()
+                if now >= next_reconcile:
+                    remaining = max(0.001, deadline - now)
+                    try:
+                        document = session.request(
+                            "thread/read",
+                            {"threadId": self.root_thread_id, "includeTurns": True},
+                            timeout=min(self.request_timeout, remaining),
+                        )
+                    except Exception:
+                        # The notification stream remains authoritative while a
+                        # bounded persisted-state read is temporarily unavailable.
+                        pass
+                    else:
+                        status = self._stored_turn_status(document, turn_id)
+                        terminal = self._terminal_observation(
+                            status, source="persisted reconciliation"
+                        )
+                        if terminal is not None:
+                            return terminal
+                    next_reconcile = time.monotonic() + self.reconcile_interval
                 time.sleep(0.05)
             return DeliveryObservation(False, "Codex Root notification turn timed out")
         finally:
             session.close()
+
+    @staticmethod
+    def _notification_status(
+        notifications: list[Mapping[str, Any]], turn_id: str
+    ) -> str | None:
+        for message in reversed(notifications):
+            if message.get("method") != "turn/completed":
+                continue
+            params = message.get("params", {})
+            turn = params.get("turn", {}) if isinstance(params, Mapping) else {}
+            if str(turn.get("id", "")) == turn_id:
+                return str(turn.get("status", "failed"))
+        return None
+
+    @staticmethod
+    def _stored_turn_status(document: Mapping[str, Any], turn_id: str) -> str | None:
+        thread = document.get("thread", {})
+        turns = thread.get("turns", []) if isinstance(thread, Mapping) else []
+        for turn in turns:
+            if isinstance(turn, Mapping) and str(turn.get("id", "")) == turn_id:
+                return str(turn.get("status", ""))
+        return None
+
+    @staticmethod
+    def _terminal_observation(
+        status: str | None, *, source: str = "live notification"
+    ) -> DeliveryObservation | None:
+        if status == "completed":
+            return DeliveryObservation(True, f"confirmed by {source}")
+        if status in {"failed", "interrupted"}:
+            return DeliveryObservation(False, f"Codex Root turn ended as {status} ({source})")
+        return None
 
     @staticmethod
     def _notification_text(

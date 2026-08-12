@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..enums import ExecutionState, FailureClass
+from ..enums import ExecutionState, FailureClass, WorkspaceMode
 from ..errors import AdapterError
 from ..models import (
     ExecutionObservation,
@@ -51,7 +51,7 @@ class AppServerSession:
                 "clientInfo": {
                     "name": "local_agent_scheduler",
                     "title": "Local Agent Scheduler",
-                    "version": "0.1.1",
+                    "version": "0.1.2",
                 }
             },
         )
@@ -156,12 +156,20 @@ class CodexAppServerAdapter:
             "execution_id": request.execution_id,
         }
         try:
+            if request.workspace_mode is WorkspaceMode.READ_ONLY:
+                task_sandbox = "read-only"
+            elif self.sandbox in {"workspace-write", "danger-full-access"}:
+                task_sandbox = "workspace-write"
+            else:
+                raise RuntimeError(
+                    "write Task exceeds the configured Codex adapter sandbox ceiling"
+                )
             session = self.session_factory(self.command, self.process_cwd, self.request_timeout)
             runtime_handle["adapter_session_id"] = session.session_id
             thread_params: dict[str, Any] = {
                 "cwd": request.cwd,
                 "approvalPolicy": self.approval_policy,
-                "sandbox": self.sandbox,
+                "sandbox": task_sandbox,
                 "serviceName": "local_agent_scheduler",
             }
             options = self.profile_options.get(request.execution_profile, {})
@@ -213,6 +221,19 @@ class CodexAppServerAdapter:
     def observe_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
         session = self._live_session(runtime_handle)
         if session:
+            if not runtime_handle.get("thread_id") or not runtime_handle.get("turn_id"):
+                if session.process.poll() is not None:
+                    self._close_live_session(runtime_handle)
+                    return ExecutionObservation(
+                        ExecutionState.LOST,
+                        terminal_confirmed=True,
+                        quiescent_confirmed=True,
+                        detail="app-server exited before execution identity was established",
+                    )
+                return ExecutionObservation(
+                    ExecutionState.UNKNOWN,
+                    detail="live ambiguous start lacks exact thread/turn identity",
+                )
             terminal = self._terminal_notification(session, runtime_handle)
             if terminal:
                 status = self._turn_status(terminal)
@@ -397,13 +418,16 @@ class CodexAppServerAdapter:
     def _terminal_notification(
         session: AppServerSession, runtime_handle: Mapping[str, object]
     ) -> Mapping[str, Any] | None:
-        expected_turn = str(runtime_handle.get("turn_id", ""))
+        expected_turn = runtime_handle.get("turn_id")
+        if not expected_turn:
+            return None
+        expected_turn = str(expected_turn)
         for message in reversed(session.notifications()):
             if message.get("method") != "turn/completed":
                 continue
             params = message.get("params", {})
             turn = params.get("turn", {}) if isinstance(params, Mapping) else {}
-            if not expected_turn or str(turn.get("id", "")) == expected_turn:
+            if str(turn.get("id", "")) == expected_turn:
                 return message
         return None
 

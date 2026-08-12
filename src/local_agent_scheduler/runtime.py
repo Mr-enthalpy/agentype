@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import signal
+import threading
 import time
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .adapters.base import ExecutionAdapter
 from .config import ExecutionTargetConfig
@@ -32,10 +33,12 @@ class Dispatcher:
         self.workspace_root = str(Path(workspace_root).resolve())
         self.outbox = outbox
 
-    def recover(self) -> dict[str, int]:
+    def recover(self, *, after_expiry: Callable[[], None] | None = None) -> dict[str, int]:
         self.scheduler.set_lifecycle("RECOVERY")
         isolated = {name for name, target in self.targets.items() if target.attempt_isolation}
         lease_result = self.scheduler.expire_leases(attempt_isolated_targets=isolated)
+        if after_expiry is not None:
+            after_expiry()
         observed = self.poll_executions(recovery=True)
         self.scheduler.promote_retry_wait()
         pool_result = self.scheduler.reconcile_pool()
@@ -74,14 +77,16 @@ class Dispatcher:
 
     def dispatch_ready(self) -> int:
         dispatched = 0
-        agents = self.scheduler.list("logical_agents", state=AgentState.READY.value)
-        for agent in agents:
-            claim = self.scheduler.claim_next(agent["id"])
+        while True:
+            claim = self.scheduler.claim_next_available()
             if claim is None:
-                continue
+                break
+            agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
             execution_id, request_id = self.scheduler.create_execution(claim)
+            execution = self.scheduler.get("executions", execution_id)
+            incarnation_id = execution["incarnation_id"]
             adapter = self.adapters[claim.execution_target]
-            incarnation = self.scheduler.get("incarnations", claim.incarnation_id)
+            incarnation = self.scheduler.get("incarnations", incarnation_id)
             request = ExecutionRequest(
                 request_id=request_id,
                 execution_id=execution_id,
@@ -89,7 +94,7 @@ class Dispatcher:
                 attempt_id=claim.attempt_id,
                 lease_epoch=claim.lease_epoch,
                 logical_agent_id=claim.logical_agent_id,
-                incarnation_id=claim.incarnation_id,
+                incarnation_id=incarnation_id,
                 execution_target=claim.execution_target,
                 execution_profile=claim.execution_profile,
                 cwd=self.workspace_root,
@@ -205,6 +210,10 @@ class Dispatcher:
                         summary=outcome.summary,
                         continuity_capsule=outcome.checkpoint,
                         quiescent_confirmed=quiescent_confirmed,
+                        attempt_isolation=self.targets[
+                            execution["execution_target"]
+                        ].attempt_isolation,
+                        incarnation_reusable=outcome.incarnation_reusable,
                     )
                 else:
                     target = self.targets[execution["execution_target"]]
@@ -218,6 +227,7 @@ class Dispatcher:
                         terminal_confirmed=terminal_confirmed,
                         quiescent_confirmed=quiescent_confirmed,
                         attempt_isolation=target.attempt_isolation,
+                        incarnation_reusable=outcome.incarnation_reusable,
                     )
             except StaleAuthority:
                 self.scheduler.record_physical_outcome(
@@ -293,22 +303,64 @@ class Dispatcher:
 
 
 class SchedulerDaemon:
-    def __init__(self, dispatcher: Dispatcher, *, poll_seconds: float = 1.0):
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        poll_seconds: float = 1.0,
+        heartbeat_seconds: float = 30.0,
+    ):
         self.dispatcher = dispatcher
         self.poll_seconds = poll_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self._stopping = False
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def stop(self, *_args) -> None:
         self._stopping = True
+        self._heartbeat_stop.set()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(self.heartbeat_seconds):
+            try:
+                self.dispatcher.scheduler.renew_active_leases()
+            except Exception:
+                # A transient SQLite contention must not permanently disable
+                # supervision; the next bounded heartbeat retries.
+                continue
+
+    def _start_supervision(self) -> None:
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        # Close the startup window before any immediately-following adapter or
+        # RootBridge call can block the dispatcher longer than the old expiry.
+        self.dispatcher.scheduler.renew_active_leases()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="scheduler-lease-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_supervision(self) -> None:
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=max(1.0, self.heartbeat_seconds * 2))
+            self._heartbeat_thread = None
 
     def run(self) -> None:
         signal.signal(signal.SIGINT, self.stop)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self.stop)
-        self.dispatcher.recover()
-        while not self._stopping:
-            self.dispatcher.tick()
-            time.sleep(self.poll_seconds)
+        self.dispatcher.recover(after_expiry=self._start_supervision)
+        try:
+            while not self._stopping:
+                self.dispatcher.tick()
+                time.sleep(self.poll_seconds)
+        finally:
+            self._stop_supervision()
 
     def run_until_idle(self, *, max_wait_seconds: float) -> dict[str, int]:
         """Run one bounded work cycle without orphaning live adapter sessions."""
@@ -316,28 +368,31 @@ class SchedulerDaemon:
         if max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
 
-        self.dispatcher.recover()
-        totals: dict[str, int] = {}
-        deadline = time.monotonic() + max_wait_seconds
-        while True:
-            snapshot = self.dispatcher.tick()
-            for key, value in snapshot.items():
-                totals[key] = totals.get(key, 0) + value
-            active = []
-            for state in (
-                ExecutionState.STARTING.value,
-                ExecutionState.RUNNING.value,
-                ExecutionState.UNKNOWN.value,
-            ):
-                active.extend(self.dispatcher.scheduler.list("executions", state=state))
-            if not active:
-                return totals
-            if time.monotonic() >= deadline:
-                totals["timed_out"] = len(active)
-                for execution in active:
-                    self.dispatcher.interrupt_execution(execution["id"], terminate=True)
-                final = self.dispatcher.tick()
-                for key, value in final.items():
+        self.dispatcher.recover(after_expiry=self._start_supervision)
+        try:
+            totals: dict[str, int] = {}
+            deadline = time.monotonic() + max_wait_seconds
+            while True:
+                snapshot = self.dispatcher.tick()
+                for key, value in snapshot.items():
                     totals[key] = totals.get(key, 0) + value
-                return totals
-            time.sleep(self.poll_seconds)
+                active = []
+                for state in (
+                    ExecutionState.STARTING.value,
+                    ExecutionState.RUNNING.value,
+                    ExecutionState.UNKNOWN.value,
+                ):
+                    active.extend(self.dispatcher.scheduler.list("executions", state=state))
+                if not active:
+                    return totals
+                if time.monotonic() >= deadline:
+                    totals["timed_out"] = len(active)
+                    for execution in active:
+                        self.dispatcher.interrupt_execution(execution["id"], terminate=True)
+                    final = self.dispatcher.tick()
+                    for key, value in final.items():
+                        totals[key] = totals.get(key, 0) + value
+                    return totals
+                time.sleep(self.poll_seconds)
+        finally:
+            self._stop_supervision()

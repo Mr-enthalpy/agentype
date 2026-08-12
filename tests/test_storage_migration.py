@@ -18,9 +18,9 @@ class IncarnationMigrationCase(unittest.TestCase):
     @staticmethod
     def _downgrade_schema_markers(database: Database) -> None:
         with database.transaction() as conn:
-            conn.execute("DROP INDEX one_execution_per_incarnation")
+            conn.execute("DROP INDEX IF EXISTS one_active_execution_per_incarnation")
             conn.execute("DROP INDEX one_active_incarnation_per_agent")
-            conn.execute("DELETE FROM schema_migrations WHERE version=2")
+            conn.execute("DELETE FROM schema_migrations WHERE version>=2")
 
     def test_v1_reused_incarnation_is_split_without_losing_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -52,35 +52,41 @@ class IncarnationMigrationCase(unittest.TestCase):
             _batch, _ids = scheduler.submit_batch([TaskSpec("second", {})])
             second = scheduler.claim_next(agent_id)
             second_execution, _ = scheduler.create_execution(second)
+            first_incarnation_id = scheduler.get("executions", first_execution)[
+                "incarnation_id"
+            ]
+            second_incarnation_id = scheduler.get("executions", second_execution)[
+                "incarnation_id"
+            ]
 
             # Reconstruct the V0.1 defect: both Executions and Attempts point
             # at one WARM Incarnation, and the database reports schema v1.
             with database.transaction() as conn:
-                conn.execute("DROP INDEX one_execution_per_incarnation")
+                conn.execute("DROP INDEX IF EXISTS one_active_execution_per_incarnation")
                 conn.execute("DROP INDEX one_active_incarnation_per_agent")
                 conn.execute(
                     "UPDATE executions SET incarnation_id=? WHERE id=?",
-                    (first.incarnation_id, second_execution),
+                    (first_incarnation_id, second_execution),
                 )
                 conn.execute(
                     "UPDATE attempts SET incarnation_id=? WHERE id=?",
-                    (first.incarnation_id, second.attempt_id),
+                    (first_incarnation_id, second.attempt_id),
                 )
-                conn.execute("DELETE FROM incarnations WHERE id=?", (second.incarnation_id,))
+                conn.execute("DELETE FROM incarnations WHERE id=?", (second_incarnation_id,))
                 conn.execute(
                     "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=?",
-                    (first.incarnation_id,),
+                    (first_incarnation_id,),
                 )
-                conn.execute("DELETE FROM schema_migrations WHERE version=2")
+                conn.execute("DELETE FROM schema_migrations WHERE version>=2")
 
             database.initialize()
 
-            self.assertEqual(SCHEMA_VERSION, 2)
+            self.assertEqual(SCHEMA_VERSION, 3)
             self.assertEqual(
                 database.fetch_one(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 )["version"],
-                2,
+                3,
             )
             migrated_first = database.fetch_one(
                 "SELECT incarnation_id FROM executions WHERE id=?", (first_execution,)
@@ -120,6 +126,7 @@ class IncarnationMigrationCase(unittest.TestCase):
             _batch, _ids = scheduler.submit_batch([TaskSpec("unknown", {})])
             claim = scheduler.claim_next(agent_id)
             execution_id, request_id = scheduler.create_execution(claim)
+            incarnation_id = scheduler.get("executions", execution_id)["incarnation_id"]
             scheduler.record_start_ambiguity(
                 claim.attempt_id,
                 claim.lease_epoch,
@@ -132,7 +139,7 @@ class IncarnationMigrationCase(unittest.TestCase):
 
             self.assertEqual(
                 database.fetch_one(
-                    "SELECT state FROM incarnations WHERE id=?", (claim.incarnation_id,)
+                    "SELECT state FROM incarnations WHERE id=?", (incarnation_id,)
                 )["state"],
                 "LOST",
             )

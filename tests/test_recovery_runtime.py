@@ -176,6 +176,35 @@ class FakeInterruptedSession(FakeRootSession):
         return super().request(method, params)
 
 
+class FakePersistedRootSession(FakeRootSession):
+    persisted_status = "completed"
+
+    def request(self, method, params, **_kwargs):
+        self.requests.append((method, params))
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
+        if method == "turn/start":
+            return {"turn": {"id": "root-turn"}}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "turns": [
+                        {"id": "unrelated-turn", "status": "completed"},
+                        {"id": "root-turn", "status": self.persisted_status},
+                    ],
+                }
+            }
+        raise AssertionError(f"unexpected method: {method}")
+
+    def notifications(self):
+        return []
+
+
+class FakePersistedInterruptedRootSession(FakePersistedRootSession):
+    persisted_status = "interrupted"
+
+
 class RuntimeCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -212,7 +241,7 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(self.scheduler.get("batches", batch_id)["state"], "COMPLETED")
         dispatcher.tick()
         envelopes = list((self.root / "events").glob("*.json"))
-        self.assertGreaterEqual(len(envelopes), 2)
+        self.assertEqual(len(envelopes), 1)
 
     def test_daemon_once_runs_until_live_execution_is_idle(self) -> None:
         _batch, ids = self.scheduler.submit_batch([TaskSpec("one-shot", {})])
@@ -332,7 +361,7 @@ class RuntimeCase(unittest.TestCase):
         bridge = FilesystemRootBridge(self.root / "events")
         dispatcher = OutboxDispatcher(self.scheduler.db, bridge)
         delivered = dispatcher.deliver_pending()
-        self.assertEqual(delivered, 2)
+        self.assertEqual(delivered, 1)
         files_before = sorted(path.name for path in (self.root / "events").glob("*.json"))
         self.assertEqual(dispatcher.deliver_pending(), 0)
         self.assertEqual(files_before, sorted(path.name for path in (self.root / "events").glob("*.json")))
@@ -409,7 +438,7 @@ termination_confirmation = true
         )
         outcome = bridge.deliver(
             "event-1",
-            "RESULT_AVAILABLE",
+            "BATCH_RESULTS_READY",
             {"result_id": "result-1", "result_body": "must-not-be-transported"},
         )
         self.assertTrue(outcome.delivered)
@@ -420,6 +449,40 @@ termination_confirmation = true
         self.assertIn("result-1", notice)
         self.assertNotIn("must-not-be-transported", notice)
         self.assertTrue(session.closed)
+
+    def test_codex_root_bridge_reconciles_completed_persisted_exact_turn(self) -> None:
+        FakePersistedRootSession.instances.clear()
+        bridge = CodexAppServerRootBridge(
+            root_thread_id="root-thread",
+            completion_timeout=0.1,
+            reconcile_interval=0.001,
+            session_factory=FakePersistedRootSession,
+        )
+        outcome = bridge.deliver("event-1", "BATCH_RESULTS_READY", {"batch_id": "batch-1"})
+        self.assertTrue(outcome.delivered)
+        self.assertIn("persisted reconciliation", outcome.detail)
+        session = FakePersistedRootSession.instances[-1]
+        self.assertIn(
+            ("thread/read", {"threadId": "root-thread", "includeTurns": True}),
+            session.requests,
+        )
+        self.assertTrue(session.closed)
+
+    def test_codex_root_bridge_reconciles_interrupted_persisted_exact_turn(self) -> None:
+        FakePersistedInterruptedRootSession.instances.clear()
+        bridge = CodexAppServerRootBridge(
+            root_thread_id="root-thread",
+            completion_timeout=0.1,
+            reconcile_interval=0.001,
+            session_factory=FakePersistedInterruptedRootSession,
+        )
+        outcome = bridge.deliver("event-1", "BATCH_RESULTS_READY", {"batch_id": "batch-1"})
+        self.assertFalse(outcome.delivered)
+        self.assertEqual(
+            outcome.detail,
+            "Codex Root turn ended as interrupted (persisted reconciliation)",
+        )
+        self.assertTrue(FakePersistedInterruptedRootSession.instances[-1].closed)
 
     def test_initialize_does_not_regress_ready_lifecycle(self) -> None:
         self.scheduler.set_lifecycle("READY")

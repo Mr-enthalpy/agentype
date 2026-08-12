@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def new_id(prefix: str) -> str:
@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
     logical_agent_id TEXT NOT NULL REFERENCES logical_agents(id) ON DELETE RESTRICT,
-    incarnation_id TEXT NOT NULL REFERENCES incarnations(id) ON DELETE RESTRICT,
+    incarnation_id TEXT REFERENCES incarnations(id) ON DELETE RESTRICT,
     attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
     lease_epoch INTEGER NOT NULL CHECK (lease_epoch >= 1),
     state TEXT NOT NULL CHECK (state IN ('ACTIVE','SUCCEEDED','FAILED','EXPIRED','CANCELLED')),
@@ -281,6 +281,9 @@ CREATE INDEX IF NOT EXISTS leases_expiry_idx ON leases(state, expires_at);
 CREATE INDEX IF NOT EXISTS outbox_delivery_idx
 ON notification_outbox(state, next_delivery_at, created_at);
 CREATE INDEX IF NOT EXISTS executions_attempt_idx ON executions(attempt_id, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_incarnation
+ON executions(incarnation_id)
+WHERE state IN ('STARTING','RUNNING','UNKNOWN');
 """
 
 
@@ -332,6 +335,15 @@ class Database:
         conn = self.connect()
         try:
             conn.executescript(SCHEMA)
+            row = conn.execute(
+                "SELECT MAX(version) AS version FROM schema_migrations"
+            ).fetchone()
+            discovered = row["version"] if row and row["version"] is not None else 0
+            if discovered < 3:
+                # v3 may rebuild Attempts.  Foreign keys must be disabled
+                # before BEGIN so dependent table declarations retain the
+                # authoritative `attempts` name during the swap.
+                conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -354,7 +366,20 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (2, utc_now()),
                     )
+                    current = 2
+                if current < 3:
+                    self._migrate_v2_to_v3(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (3, utc_now()),
+                    )
                 conn.execute("COMMIT")
+                conn.execute("PRAGMA foreign_keys = ON")
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise RuntimeError(
+                        f"database migration produced foreign-key violations: {violations}"
+                    )
             except BaseException:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
@@ -492,6 +517,70 @@ class Database:
             "CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_incarnation "
             "ON executions(incarnation_id)"
         )
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        """Detach claim authority from physical presence and permit sequential reuse."""
+
+        conn.execute("DROP INDEX IF EXISTS one_execution_per_incarnation")
+        duplicate_active = conn.execute(
+            "SELECT incarnation_id FROM executions "
+            "WHERE state IN ('STARTING','RUNNING','UNKNOWN') "
+            "GROUP BY incarnation_id HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate_active:
+            raise RuntimeError(
+                "schema v3 migration found multiple active Executions for one Incarnation"
+            )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_incarnation "
+            "ON executions(incarnation_id) "
+            "WHERE state IN ('STARTING','RUNNING','UNKNOWN')"
+        )
+
+        # SQLite cannot drop a NOT NULL constraint in place.  Keep child FKs
+        # aimed at the stable table name while rebuilding Attempts.
+        incarnation_column = next(
+            row for row in conn.execute("PRAGMA table_info(attempts)").fetchall()
+            if row["name"] == "incarnation_id"
+        )
+        if bool(incarnation_column["notnull"]):
+            conn.execute("DROP INDEX IF EXISTS one_active_attempt_per_task")
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE attempts RENAME TO attempts_v2")
+            conn.execute(
+                "CREATE TABLE attempts ("
+                "id TEXT PRIMARY KEY,"
+                "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,"
+                "logical_agent_id TEXT NOT NULL REFERENCES logical_agents(id) ON DELETE RESTRICT,"
+                "incarnation_id TEXT REFERENCES incarnations(id) ON DELETE RESTRICT,"
+                "attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),"
+                "lease_epoch INTEGER NOT NULL CHECK (lease_epoch >= 1),"
+                "state TEXT NOT NULL CHECK (state IN "
+                "('ACTIVE','SUCCEEDED','FAILED','EXPIRED','CANCELLED')),"
+                "created_at REAL NOT NULL,ended_at REAL,"
+                "UNIQUE (task_id, attempt_number))"
+            )
+            conn.execute(
+                "INSERT INTO attempts SELECT id,task_id,logical_agent_id,incarnation_id,"
+                "attempt_number,lease_epoch,state,created_at,ended_at FROM attempts_v2"
+            )
+            conn.execute("DROP TABLE attempts_v2")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute(
+                "CREATE UNIQUE INDEX one_active_attempt_per_task "
+                "ON attempts(task_id) WHERE state='ACTIVE'"
+            )
+
+        # Existing SQLite topology is authoritative after upgrade.  Fresh
+        # databases remain unmarked until configuration bootstraps them.
+        if conn.execute("SELECT 1 FROM pool_partitions LIMIT 1").fetchone():
+            now = utc_now()
+            conn.execute(
+                "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO NOTHING",
+                ("topology_bootstrapped", json_dumps({"source": "sqlite-v2"}), now),
+            )
 
     @contextlib.contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:

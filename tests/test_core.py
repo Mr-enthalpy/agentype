@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -53,6 +54,8 @@ class SchedulerCase(unittest.TestCase):
         claim = self.scheduler.claim_next(self.ready_agent())
         self.assertIsNotNone(claim)
         execution_id, _ = self.scheduler.create_execution(claim)
+        execution = self.scheduler.get("executions", execution_id)
+        claim = replace(claim, incarnation_id=execution["incarnation_id"])
         self.scheduler.confirm_execution_running(
             claim.attempt_id,
             claim.lease_epoch,
@@ -79,7 +82,7 @@ class SchedulerCase(unittest.TestCase):
         self.assertEqual(self.scheduler.get("results", result_id)["state"], ResultState.ACKED)
         self.assertEqual(self.scheduler.get("batches", batch_id)["state"], BatchState.COMPLETED)
         event_types = {row["event_type"] for row in self.scheduler.list("notification_outbox")}
-        self.assertEqual(event_types, {"RESULT_AVAILABLE", "BATCH_RESULTS_READY"})
+        self.assertEqual(event_types, {"BATCH_RESULTS_READY"})
 
     def test_each_sequential_execution_gets_a_fresh_incarnation(self) -> None:
         _batch, _task, first, first_execution = self.running_claim(TaskSpec("first", {}))
@@ -95,6 +98,12 @@ class SchedulerCase(unittest.TestCase):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("second", {})])
         second = self.scheduler.claim_next(first.logical_agent_id)
         second_execution, _ = self.scheduler.create_execution(second)
+        second = replace(
+            second,
+            incarnation_id=self.scheduler.get("executions", second_execution)[
+                "incarnation_id"
+            ],
+        )
         self.assertNotEqual(second.incarnation_id, first.incarnation_id)
         self.assertGreater(
             self.scheduler.get("incarnations", second.incarnation_id)["generation"],
@@ -121,6 +130,13 @@ class SchedulerCase(unittest.TestCase):
         self.scheduler.expire_leases(now=retry_time)
         self.scheduler.promote_retry_wait(now=retry_time)
         replacement = self.scheduler.claim_next(old.logical_agent_id, now=retry_time)
+        replacement_execution, _ = self.scheduler.create_execution(replacement)
+        replacement = replace(
+            replacement,
+            incarnation_id=self.scheduler.get("executions", replacement_execution)[
+                "incarnation_id"
+            ],
+        )
         self.assertNotEqual(old.incarnation_id, replacement.incarnation_id)
 
         self.scheduler.record_physical_outcome(
@@ -488,11 +504,14 @@ class TopologyCase(SchedulerCase):
         self.scheduler.ack_success(
             claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
         )
-        incarnation = self.scheduler.revive_agent(agent_id, "local")
+        revived = self.scheduler.revive_agent(agent_id, "local")
         agent = self.scheduler.get("logical_agents", agent_id)
         self.assertEqual(agent["id"], agent_id)
         self.assertIn("identity", agent["continuity_json"])
-        self.assertEqual(self.scheduler.get("incarnations", incarnation)["logical_agent_id"], agent_id)
+        self.assertEqual(revived, agent_id)
+        self.assertEqual(
+            self.scheduler.list("incarnations", state=IncarnationState.STARTING.value), []
+        )
 
     def test_busy_move_and_merge_apply_only_at_assignment_boundary(self) -> None:
         self.scheduler.upsert_partition(
