@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -239,7 +240,12 @@ class RuntimeCase(unittest.TestCase):
         self.assertGreaterEqual(second["observed"], 1)
         self.assertEqual(self.scheduler.get("tasks", ids["run"])["state"], TaskState.COMPLETED)
         self.assertEqual(self.scheduler.get("batches", batch_id)["state"], "COMPLETED")
-        dispatcher.tick()
+        daemon = SchedulerDaemon(dispatcher, poll_seconds=0.001)
+        daemon._start_notifier()
+        deadline = time.monotonic() + 1
+        while not list((self.root / "events").glob("*.json")) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        daemon._stop_notifier()
         envelopes = list((self.root / "events").glob("*.json"))
         self.assertEqual(len(envelopes), 1)
 
@@ -423,6 +429,12 @@ termination_confirmation = true
         )
         self.assertEqual(
             CodexAppServerAdapter._classify_failure("HTTP 502 bad gateway"),
+            FailureClass.RESOURCE_UNAVAILABLE,
+        )
+        self.assertEqual(
+            CodexAppServerAdapter._classify_failure(
+                '{"codexErrorInfo":"usageLimitExceeded"}'
+            ),
             FailureClass.RESOURCE_UNAVAILABLE,
         )
         self.assertEqual(

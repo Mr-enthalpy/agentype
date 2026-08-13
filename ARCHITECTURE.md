@@ -587,7 +587,7 @@ COMPLETED
 CANCELLED
 ```
 
-A normal batch completes when all required Tasks have durably completed and their authoritative Results have entered the Result Queue.
+A normal batch completes when all required Tasks have durably completed and their authoritative Results have entered the Result Queue. V0.1 exposes no optional Task path, so every submitted Task is required at this barrier.
 
 Root consumption of those Results is not required for Scheduler completion.
 
@@ -1100,6 +1100,8 @@ Shared state should be communicated through Workstream/project/checkpoint state.
 
 A merge therefore affects scheduling classification, not agent minds.
 
+For V0.1, MERGE also moves every nonterminal source Task's future scheduling classification to the target. An already-active Attempt keeps its frozen LogicalAgent, ExecutionTarget/Profile, and lease epoch; only later retry/dispatch observes the target partition. Desired target capacity is the sum of the two declared capacities at the topology revision boundary, never a function of instantaneous runtime population.
+
 ---
 
 # 23. Partition Removal and Semantic Death
@@ -1524,6 +1526,8 @@ The actual data remains in:
 Notifications should use a durable outbox so Scheduler crashes do not silently lose wakeups.
 
 At-least-once notification plus event-ID deduplication is sufficient.
+
+Notification delivery should run independently from execution supervision and lease renewal. A notifier owns only outbox delivery state and bounded RootBridge calls; it does not consume Results or assume scheduling authority.
 
 ---
 

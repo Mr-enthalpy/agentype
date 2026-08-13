@@ -240,10 +240,19 @@ class Scheduler:
                 if excess:
                     candidates = sorted(
                         members,
-                        key=lambda row: (row["state"] != AgentState.READY.value, -row["created_at"], row["id"]),
+                        key=lambda row: (
+                            row["state"] == AgentState.ASSIGNED.value,
+                            row["state"] != AgentState.READY.value,
+                            -row["created_at"],
+                            row["id"],
+                        ),
                     )
                     for member in candidates[:excess]:
-                        if member["state"] == AgentState.READY.value:
+                        if member["state"] in (
+                            AgentState.READY.value,
+                            AgentState.INITIALIZING.value,
+                            AgentState.REVIVING.value,
+                        ) and not member["current_task_id"]:
                             conn.execute(
                                 "UPDATE logical_agents SET state='RETIRED',available_since=NULL,updated_at=? "
                                 "WHERE id=?",
@@ -339,6 +348,109 @@ class Scheduler:
                     (target_partition, now, agent_id),
                 )
 
+    def resize_partition(self, name: str, desired_capacity: int) -> int:
+        if desired_capacity < 0:
+            raise ValueError("desired_capacity must be non-negative")
+        now = utc_now()
+        with self.db.transaction() as conn:
+            self._required(conn, "pool_partitions", name, key="name", active=True)
+            cursor = conn.execute(
+                "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
+                (
+                    "RESIZE",
+                    json_dumps({"name": name, "desired_capacity": desired_capacity}),
+                    now,
+                ),
+            )
+            revision = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE pool_partitions SET desired_capacity=?,topology_revision=?,updated_at=? "
+                "WHERE name=?",
+                (desired_capacity, revision, now, name),
+            )
+        return revision
+
+    def move_capacity(self, source: str, target: str, count: int) -> int:
+        """Move desired capacity and deterministically selected identities.
+
+        READY identities move first.  ASSIGNED identities receive a pending
+        transition that is applied only at their assignment boundary.  A
+        source deficit is allowed: target reconciliation births any identity
+        not available to move without inventing runtime population as desired
+        topology.
+        """
+
+        if source == target:
+            raise ValueError("source and target partitions must differ")
+        if count <= 0:
+            raise ValueError("count must be positive")
+        now = utc_now()
+        with self.db.transaction() as conn:
+            source_partition = self._required(
+                conn, "pool_partitions", source, key="name", active=True
+            )
+            target_partition = self._required(
+                conn, "pool_partitions", target, key="name", active=True
+            )
+            source_capacity = int(source_partition["desired_capacity"])
+            target_capacity = int(target_partition["desired_capacity"])
+            if count > source_capacity:
+                raise InvalidTransition(
+                    "cannot move more capacity than the source desired capacity"
+                )
+            cursor = conn.execute(
+                "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
+                (
+                    "MOVE_CAPACITY",
+                    json_dumps({"source": source, "target": target, "count": count}),
+                    now,
+                ),
+            )
+            revision = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE pool_partitions SET desired_capacity=?,topology_revision=?,updated_at=? "
+                "WHERE name=?",
+                (source_capacity - count, revision, now, source),
+            )
+            conn.execute(
+                "UPDATE pool_partitions SET desired_capacity=?,topology_revision=?,updated_at=? "
+                "WHERE name=?",
+                (target_capacity + count, revision, now, target),
+            )
+
+            members = conn.execute(
+                "SELECT * FROM logical_agents WHERE partition_name=? "
+                "AND state IN ('READY','ASSIGNED') "
+                "ORDER BY CASE state WHEN 'READY' THEN 0 ELSE 1 END,"
+                "COALESCE(available_since,created_at),id",
+                (source,),
+            ).fetchall()
+            for agent in members[:count]:
+                active_presence = conn.execute(
+                    "SELECT execution_target FROM incarnations WHERE logical_agent_id=? "
+                    "AND state IN ('STARTING','WARM','COLD') "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (agent["id"],),
+                ).fetchone()
+                target_boundary = bool(
+                    active_presence
+                    and active_presence["execution_target"]
+                    != target_partition["execution_target"]
+                )
+                if agent["state"] == AgentState.ASSIGNED.value or target_boundary:
+                    conn.execute(
+                        "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
+                        "available_since=NULL,updated_at=? WHERE id=?",
+                        (target, now, agent["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE logical_agents SET partition_name=?,pending_partition_name=NULL,"
+                        "updated_at=? WHERE id=?",
+                        (target, now, agent["id"]),
+                    )
+        return revision
+
     def merge_partitions(self, source: str, target: str) -> int:
         if source == target:
             raise ValueError("source and target partitions must differ")
@@ -352,9 +464,31 @@ class Scheduler:
             )
             cursor = conn.execute(
                 "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
-                ("MERGE", json_dumps({"source": source, "target": target}), now),
+                (
+                    "MERGE",
+                    json_dumps(
+                        {
+                            "source": source,
+                            "target": target,
+                            "source_capacity": int(source_partition["desired_capacity"]),
+                            "target_capacity": int(target_partition["desired_capacity"]),
+                        }
+                    ),
+                    now,
+                ),
             )
             revision = int(cursor.lastrowid)
+            merged_capacity = int(source_partition["desired_capacity"]) + int(
+                target_partition["desired_capacity"]
+            )
+            # Task.partition_name is future scheduling classification.  An
+            # already-active Attempt keeps its frozen agent, target, profile,
+            # and lease authority; only a later retry observes this migration.
+            conn.execute(
+                "UPDATE tasks SET partition_name=?,updated_at=? WHERE partition_name=? "
+                "AND state NOT IN ('COMPLETED','CANCELLED')",
+                (target, now, source),
+            )
             if source_partition["execution_target"] != target_partition["execution_target"]:
                 conn.execute(
                     "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
@@ -365,12 +499,13 @@ class Scheduler:
                 )
             conn.execute(
                 "UPDATE logical_agents SET partition_name=?,updated_at=? "
-                "WHERE partition_name=? AND state IN ('READY','INITIALIZING','SUSPENDED')",
+                "WHERE partition_name=? "
+                "AND state IN ('READY','INITIALIZING','REVIVING','SUSPENDED')",
                 (target, now, source),
             )
             conn.execute(
                 "UPDATE logical_agents SET pending_partition_name=?,updated_at=? "
-                "WHERE partition_name=? AND state IN ('ASSIGNED','DRAINING','REVIVING')",
+                "WHERE partition_name=? AND state IN ('ASSIGNED','DRAINING')",
                 (target, now, source),
             )
             conn.execute(
@@ -378,12 +513,27 @@ class Scheduler:
                 "topology_revision=?,updated_at=? WHERE name=?",
                 (target, revision, now, source),
             )
+            conn.execute(
+                "UPDATE pool_partitions SET desired_capacity=?,topology_revision=?,updated_at=? "
+                "WHERE name=?",
+                (merged_capacity, revision, now, target),
+            )
         return revision
 
     def retire_partition(self, name: str) -> int:
         now = utc_now()
         with self.db.transaction() as conn:
             self._required(conn, "pool_partitions", name, key="name", active=True)
+            nonterminal = conn.execute(
+                "SELECT id,state FROM tasks WHERE partition_name=? "
+                "AND state NOT IN ('COMPLETED','CANCELLED') ORDER BY created_at,id LIMIT 1",
+                (name,),
+            ).fetchone()
+            if nonterminal:
+                raise InvalidTransition(
+                    f"cannot retire partition with nonterminal Task {nonterminal['id']} "
+                    f"in state {nonterminal['state']}"
+                )
             cursor = conn.execute(
                 "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
                 ("RETIRE", json_dumps({"name": name}), now),
@@ -445,6 +595,9 @@ class Scheduler:
                 (batch_id, BatchState.ACTIVE.value, json_dumps(metadata or {}), now, now),
             )
             for task in tasks:
+                self._required(
+                    conn, "pool_partitions", task.partition, key="name", active=True
+                )
                 task_id = ids[task.name]
                 state = TaskState.BLOCKED if dependencies[task_id] else TaskState.QUEUED
                 policy = task.retry_policy
@@ -465,7 +618,7 @@ class Scheduler:
                         task.continuity.value,
                         json_dumps(list(task.affinity_tags)),
                         task.workspace_mode.value,
-                        int(task.required),
+                        1,
                         task.priority,
                         state.value,
                         policy.max_attempts,
@@ -1928,9 +2081,9 @@ class Scheduler:
             return
         summary = conn.execute(
             "SELECT "
-            "SUM(CASE WHEN required=1 AND state='SUSPENDED' THEN 1 ELSE 0 END) suspended,"
-            "SUM(CASE WHEN required=1 AND state='CANCELLED' THEN 1 ELSE 0 END) cancelled,"
-            "SUM(CASE WHEN required=1 AND state<>'COMPLETED' THEN 1 ELSE 0 END) incomplete "
+            "SUM(CASE WHEN state='SUSPENDED' THEN 1 ELSE 0 END) suspended,"
+            "SUM(CASE WHEN state='CANCELLED' THEN 1 ELSE 0 END) cancelled,"
+            "SUM(CASE WHEN state<>'COMPLETED' THEN 1 ELSE 0 END) incomplete "
             "FROM tasks WHERE batch_id=?",
             (batch_id,),
         ).fetchone()

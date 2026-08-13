@@ -62,7 +62,6 @@ class Dispatcher:
         affinity_births = self.scheduler.ensure_task_consumers()
         observed = self.poll_executions()
         dispatched = self.dispatch_ready()
-        delivered = self.outbox.deliver_pending() if self.outbox else 0
         return {
             "dispatched": dispatched,
             "observed": observed,
@@ -72,7 +71,10 @@ class Dispatcher:
             "retired": pool["retired"],
             "revived": revived,
             "affinity_births": affinity_births,
-            "notifications": delivered,
+            # Root notification delivery is deliberately isolated in the
+            # daemon notifier thread.  A slow bridge must never stall this
+            # execution-supervision control loop.
+            "notifications": 0,
         }
 
     def dispatch_ready(self) -> int:
@@ -316,10 +318,13 @@ class SchedulerDaemon:
         self._stopping = False
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._notifier_stop = threading.Event()
+        self._notifier_thread: threading.Thread | None = None
 
     def stop(self, *_args) -> None:
         self._stopping = True
         self._heartbeat_stop.set()
+        self._notifier_stop.set()
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_seconds):
@@ -350,16 +355,72 @@ class SchedulerDaemon:
             self._heartbeat_thread.join(timeout=max(1.0, self.heartbeat_seconds * 2))
             self._heartbeat_thread = None
 
+    def _notifier_loop(self) -> None:
+        """Deliver only durable wakeup events and persist delivery outcome."""
+
+        outbox = self.dispatcher.outbox
+        if outbox is None:
+            return
+        while not self._notifier_stop.is_set():
+            try:
+                outbox.deliver_pending()
+            except Exception:
+                # OutboxDispatcher normally records bridge failures itself.
+                # Unexpected notifier failures remain isolated from scheduler
+                # supervision and are retried on the next bounded iteration.
+                pass
+            self._notifier_stop.wait(self.poll_seconds)
+
+    def _start_notifier(self) -> None:
+        if self.dispatcher.outbox is None:
+            return
+        if self._notifier_thread and self._notifier_thread.is_alive():
+            return
+        self._notifier_stop.clear()
+        self._notifier_thread = threading.Thread(
+            target=self._notifier_loop,
+            name="scheduler-root-notifier",
+            daemon=True,
+        )
+        self._notifier_thread.start()
+
+    def _stop_notifier(self) -> None:
+        self._notifier_stop.set()
+        if self._notifier_thread:
+            # Concrete RootBridge implementations must bound each deliver()
+            # call.  This bounded join keeps daemon shutdown responsive while
+            # leaving the durable row PENDING if the process exits first.
+            self._notifier_thread.join(timeout=max(1.0, self.poll_seconds * 2))
+            if not self._notifier_thread.is_alive():
+                self._notifier_thread = None
+
+    def _wait_for_due_notifications(self, deadline: float) -> None:
+        """Give the independent notifier a chance to finish an idle cycle."""
+
+        if self.dispatcher.outbox is None:
+            return
+        while time.monotonic() < deadline:
+            pending = self.dispatcher.scheduler.db.fetch_one(
+                "SELECT 1 FROM notification_outbox WHERE state='PENDING' "
+                "AND next_delivery_at<=? LIMIT 1",
+                (time.time(),),
+            )
+            if not pending:
+                return
+            time.sleep(min(self.poll_seconds, 0.05))
+
     def run(self) -> None:
         signal.signal(signal.SIGINT, self.stop)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self.stop)
         self.dispatcher.recover(after_expiry=self._start_supervision)
+        self._start_notifier()
         try:
             while not self._stopping:
                 self.dispatcher.tick()
                 time.sleep(self.poll_seconds)
         finally:
+            self._stop_notifier()
             self._stop_supervision()
 
     def run_until_idle(self, *, max_wait_seconds: float) -> dict[str, int]:
@@ -369,6 +430,7 @@ class SchedulerDaemon:
             raise ValueError("max_wait_seconds must be positive")
 
         self.dispatcher.recover(after_expiry=self._start_supervision)
+        self._start_notifier()
         try:
             totals: dict[str, int] = {}
             deadline = time.monotonic() + max_wait_seconds
@@ -384,6 +446,7 @@ class SchedulerDaemon:
                 ):
                     active.extend(self.dispatcher.scheduler.list("executions", state=state))
                 if not active:
+                    self._wait_for_due_notifications(deadline)
                     return totals
                 if time.monotonic() >= deadline:
                     totals["timed_out"] = len(active)
@@ -395,4 +458,5 @@ class SchedulerDaemon:
                     return totals
                 time.sleep(self.poll_seconds)
         finally:
+            self._stop_notifier()
             self._stop_supervision()

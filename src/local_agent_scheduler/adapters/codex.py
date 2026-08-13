@@ -599,6 +599,10 @@ class CodexAppServerAdapter:
         if (
             "unavailable" in lowered
             or "overloaded" in lowered
+            or "usagelimit" in lowered
+            or "usage limit" in lowered
+            or "quota exceeded" in lowered
+            or "insufficient quota" in lowered
             or any(code in lowered for code in ("502", "503", "504"))
         ):
             return FailureClass.RESOURCE_UNAVAILABLE

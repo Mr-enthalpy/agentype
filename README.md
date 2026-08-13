@@ -40,7 +40,9 @@ local-agent-scheduler --config config/scheduler.example.toml daemon
 Diagnostics are available through `status` and each entity's `list`/`show`
 commands. Explicit controls include Task/Batch cancellation, Result ACK,
 Escalation resolution, Execution interrupt/terminate, pool reconciliation,
-MOVE, MERGE, and partition retirement.
+partition upsert/resize/capacity movement, MERGE, and guarded partition
+retirement. `pool move-agent` remains an explicit diagnostic/admin primitive;
+normal Root orchestration uses the partition-level topology surface.
 
 The example configuration uses the filesystem RootBridge so local testing does
 not wake a real Codex task. Set `root_bridge.kind = "codex_app_server"` and a
@@ -49,6 +51,8 @@ event IDs and entity indexes only; Results remain in SQLite.
 The bridge may reconcile its own exact notification turn against persisted
 Codex state when a live terminal event is missed. Root remains notification-
 driven and does not poll Scheduler state.
+Outbox delivery runs in a narrow notifier thread independently of execution
+supervision and Lease heartbeat renewal.
 
 See [docs/V0.1_COMPLETION_REPORT.md](docs/V0.1_COMPLETION_REPORT.md) for the
 implemented boundaries, recovery procedure, test evidence, and limitations.

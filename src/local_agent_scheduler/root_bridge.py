@@ -14,6 +14,12 @@ from .storage import Database, json_loads, utc_now
 
 
 class RootBridge(Protocol):
+    """Bounded wakeup side channel.
+
+    Implementations must return within their configured delivery timeout.  The
+    notifier may retry at least once; Result transport remains in SQLite.
+    """
+
     def deliver(
         self, event_id: str, event_type: str, payload: Mapping[str, Any]
     ) -> DeliveryObservation: ...

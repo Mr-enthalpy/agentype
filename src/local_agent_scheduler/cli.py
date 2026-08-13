@@ -9,8 +9,8 @@ from typing import Any
 from .adapters.codex import CodexAppServerAdapter
 from .config import SchedulerConfig, load_config
 from .core import Scheduler
-from .enums import ContinuityPreference, FailureClass, WorkspaceMode
-from .models import RetryPolicy, TaskSpec
+from .enums import ContinuityPreference, FailureClass, Retention, WorkspaceMode
+from .models import PartitionSpec, RetryPolicy, TaskSpec
 from .root_bridge import CodexAppServerRootBridge, FilesystemRootBridge, OutboxDispatcher
 from .runtime import Dispatcher, SchedulerDaemon
 from .storage import Database
@@ -80,6 +80,11 @@ def _task_specs(
 ) -> list[TaskSpec]:
     specs: list[TaskSpec] = []
     for item in document.get("tasks", []):
+        if "required" in item:
+            raise ValueError(
+                "optional Tasks are not supported: remove the 'required' field; "
+                "every Batch Task participates in the completion barrier"
+            )
         retry = item.get("retry_policy", {})
         defaults = default_retry or RetryPolicy()
         policy = RetryPolicy(
@@ -109,7 +114,6 @@ def _task_specs(
                 affinity_tags=tuple(item.get("affinity_tags", [])),
                 workspace_mode=WorkspaceMode(item.get("workspace_mode", "read_only")),
                 dependencies=tuple(item.get("dependencies", [])),
-                required=bool(item.get("required", True)),
                 priority=int(item.get("priority", 0)),
                 retry_policy=policy,
                 supersedes_task_id=item.get("supersedes_task_id"),
@@ -163,7 +167,24 @@ def build_parser() -> argparse.ArgumentParser:
     pool = commands.add_parser("pool").add_subparsers(dest="action", required=True)
     pool.add_parser("show")
     pool.add_parser("reconcile")
-    move = pool.add_parser("move")
+    upsert = pool.add_parser("upsert")
+    upsert.add_argument("name")
+    upsert.add_argument("desired_capacity", type=int)
+    upsert.add_argument("retention", choices=("resident", "ephemeral"))
+    upsert.add_argument("execution_target")
+    upsert.add_argument("execution_profile")
+    upsert.add_argument("--tag", action="append", default=[])
+    resize = pool.add_parser("resize")
+    resize.add_argument("name")
+    resize.add_argument("desired_capacity", type=int)
+    move_capacity = pool.add_parser("move-capacity")
+    move_capacity.add_argument("source")
+    move_capacity.add_argument("target")
+    move_capacity.add_argument("count", type=int)
+    move = pool.add_parser(
+        "move-agent",
+        help="diagnostic/admin primitive; normal orchestration should move capacity",
+    )
     move.add_argument("agent_id")
     move.add_argument("target_partition")
     merge = pool.add_parser("merge")
@@ -253,7 +274,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.action == "reconcile":
             _print(scheduler.reconcile_pool())
-        elif args.action == "move":
+        elif args.action == "upsert":
+            revision = scheduler.upsert_partition(
+                PartitionSpec(
+                    args.name,
+                    args.desired_capacity,
+                    Retention(args.retention),
+                    args.execution_target,
+                    args.execution_profile,
+                    tuple(args.tag),
+                )
+            )
+            _print({"revision": revision})
+        elif args.action == "resize":
+            _print({"revision": scheduler.resize_partition(args.name, args.desired_capacity)})
+        elif args.action == "move-capacity":
+            _print(
+                {
+                    "revision": scheduler.move_capacity(
+                        args.source, args.target, args.count
+                    )
+                }
+            )
+        elif args.action == "move-agent":
             scheduler.move_agent(args.agent_id, args.target_partition)
             _print(scheduler.get("logical_agents", args.agent_id))
         elif args.action == "retire":

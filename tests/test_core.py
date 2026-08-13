@@ -529,23 +529,25 @@ class TopologyCase(SchedulerCase):
         self.assertEqual(after["partition_name"], "target")
         self.assertIsNone(after["pending_partition_name"])
 
-    def test_partition_retirement_drains_busy_agents(self) -> None:
+    def test_partition_retirement_rejects_nonterminal_tasks_atomically(self) -> None:
         _batch, _task, claim, _execution = self.running_claim(TaskSpec("busy-retire", {}))
-        revision = self.scheduler.retire_partition("general")
-        self.assertGreater(revision, 0)
+        revisions_before = self.scheduler.db.fetch_one(
+            "SELECT COUNT(*) count FROM pool_topology_revisions"
+        )["count"]
+        with self.assertRaises(InvalidTransition):
+            self.scheduler.retire_partition("general")
+        self.assertEqual(
+            self.scheduler.db.fetch_one(
+                "SELECT COUNT(*) count FROM pool_topology_revisions"
+            )["count"],
+            revisions_before,
+        )
         during = self.scheduler.get("logical_agents", claim.logical_agent_id)
-        self.assertEqual(during["state"], AgentState.DRAINING)
+        self.assertEqual(during["state"], AgentState.ASSIGNED)
         partition = next(
             row for row in self.scheduler.list("pool_partitions") if row["name"] == "general"
         )
-        self.assertEqual(partition["active"], 0)
-        self.scheduler.ack_success(
-            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
-        )
-        self.assertEqual(
-            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
-            AgentState.RETIRED,
-        )
+        self.assertEqual(partition["active"], 1)
 
     def test_required_affinity_births_new_identity_from_project_state(self) -> None:
         workstream = self.scheduler.create_workstream(
