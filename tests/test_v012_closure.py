@@ -161,6 +161,69 @@ class ClosureCase(unittest.TestCase):
             "SUSPENDED",
         )
 
+    def test_writer_success_uses_frozen_execution_isolation(self):
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("isolated-writer", {}, workspace_mode=WorkspaceMode.WRITE)]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution, _ = self.scheduler.create_execution(
+            claim, attempt_isolation=True
+        )
+
+        result = self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=execution,
+            payload={"reported": "success"},
+            quiescent_confirmed=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["isolated-writer"])["state"],
+            "COMPLETED",
+        )
+        self.assertEqual(
+            self.scheduler.get("executions", execution)["attempt_isolation"], 1
+        )
+
+    def test_writer_nack_uses_frozen_execution_isolation(self):
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "isolated-writer-failure",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution, _ = self.scheduler.create_execution(
+            claim, attempt_isolation=True
+        )
+
+        state = self.scheduler.nack(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=execution,
+            failure_class=FailureClass.EXECUTION_LOST,
+            quiescent_confirmed=False,
+            terminal_confirmed=False,
+        )
+
+        self.assertEqual(state.value, "RETRY_WAIT")
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["isolated-writer-failure"])["state"],
+            "RETRY_WAIT",
+        )
+
     def test_writer_claim_before_execution_is_safe_to_retry(self):
         policy = RetryPolicy(
             max_attempts=2,
@@ -1124,6 +1187,37 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(
             self.scheduler.list("notification_outbox")[0]["state"], "DELIVERED"
         )
+
+    def test_scheduler_daemon_is_single_run_when_notifier_is_still_stopping(self):
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("notify-once", {})])
+        claim = self.scheduler.claim_next_available()
+        self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=None,
+            payload={"done": True},
+        )
+        bridge = BlockingBridge()
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={},
+            targets={},
+            workspace_root=self.temp.name,
+            outbox=OutboxDispatcher(self.scheduler.db, bridge),
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.01, heartbeat_seconds=0.03
+        )
+
+        daemon.run_until_idle(max_wait_seconds=0.05)
+        self.assertTrue(bridge.started.is_set())
+        self.assertIsNotNone(daemon._notifier_thread)
+        self.assertTrue(daemon._notifier_thread.is_alive())
+        with self.assertRaisesRegex(RuntimeError, "single-run"):
+            daemon.run_until_idle(max_wait_seconds=0.05)
+
+        bridge.release.set()
+        daemon._notifier_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

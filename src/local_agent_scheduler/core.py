@@ -1027,7 +1027,11 @@ class Scheduler:
     # Execution, fencing, result flow
 
     def create_execution(
-        self, claim: Claim, *, request_id: str | None = None
+        self,
+        claim: Claim,
+        *,
+        request_id: str | None = None,
+        attempt_isolation: bool = False,
     ) -> tuple[str, str]:
         execution_id = new_id("exec")
         request_id = request_id or new_id("request")
@@ -1053,7 +1057,8 @@ class Scheduler:
             )
             conn.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,"
-                "execution_profile,state,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "execution_profile,attempt_isolation,state,started_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     execution_id,
                     request_id,
@@ -1062,6 +1067,7 @@ class Scheduler:
                     incarnation_id,
                     claim.execution_target,
                     claim.execution_profile,
+                    int(attempt_isolation),
                     ExecutionState.STARTING.value,
                     now,
                     now,
@@ -1290,21 +1296,22 @@ class Scheduler:
         project_state_ref: str | None = None,
         workspace_state_ref: str | None = None,
         quiescent_confirmed: bool = True,
-        attempt_isolation: bool = False,
         incarnation_reusable: bool = False,
     ) -> str | None:
         now = utc_now()
         result_id = new_id("result")
         with self.db.transaction() as conn:
             attempt, lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
-            if (
-                task["workspace_mode"] == WorkspaceMode.WRITE.value
-                and execution_id is not None
-                and not (quiescent_confirmed or attempt_isolation)
-            ):
+            execution = None
+            if execution_id is not None:
                 execution = self._required(conn, "executions", execution_id)
                 if execution["attempt_id"] != attempt_id:
                     raise StaleAuthority("execution does not belong to current attempt")
+            if (
+                task["workspace_mode"] == WorkspaceMode.WRITE.value
+                and execution is not None
+                and not (quiescent_confirmed or bool(execution["attempt_isolation"]))
+            ):
                 conn.execute(
                     "UPDATE executions SET state='SUCCEEDED',outcome_json=?,terminal_confirmed=1,"
                     "quiescent_confirmed=0,updated_at=?,ended_at=? WHERE id=?",
@@ -1351,10 +1358,7 @@ class Scheduler:
                     project_state_ref,
                     now,
                 )
-            if execution_id:
-                execution = self._required(conn, "executions", execution_id)
-                if execution["attempt_id"] != attempt_id:
-                    raise StaleAuthority("execution does not belong to current attempt")
+            if execution is not None:
                 if execution["state"] not in {
                     ExecutionState.STARTING.value,
                     ExecutionState.RUNNING.value,
@@ -1426,13 +1430,17 @@ class Scheduler:
         detail: str | None = None,
         terminal_confirmed: bool = True,
         quiescent_confirmed: bool = True,
-        attempt_isolation: bool = False,
         incarnation_reusable: bool = False,
         now: float | None = None,
     ) -> TaskState:
         now = utc_now() if now is None else now
         with self.db.transaction() as conn:
             attempt, lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
+            execution = None
+            if execution_id is not None:
+                execution = self._required(conn, "executions", execution_id)
+                if execution["attempt_id"] != attempt_id:
+                    raise StaleAuthority("execution does not belong to current attempt")
             self._record_failure(
                 conn,
                 task["id"],
@@ -1444,10 +1452,7 @@ class Scheduler:
                 detail,
                 now,
             )
-            if execution_id:
-                execution = self._required(conn, "executions", execution_id)
-                if execution["attempt_id"] != attempt_id:
-                    raise StaleAuthority("execution does not belong to current attempt")
+            if execution is not None:
                 if execution["state"] not in {
                     ExecutionState.STARTING.value,
                     ExecutionState.RUNNING.value,
@@ -1490,8 +1495,9 @@ class Scheduler:
             retry_allowed = failure_class.value in retry_classes and attempts_remaining
             writer_safe = (
                 task["workspace_mode"] != WorkspaceMode.WRITE.value
+                or execution is None
                 or quiescent_confirmed
-                or attempt_isolation
+                or bool(execution["attempt_isolation"])
             )
             if retry_allowed and writer_safe:
                 delay = min(
@@ -1545,18 +1551,16 @@ class Scheduler:
         self,
         *,
         now: float | None = None,
-        attempt_isolated_targets: set[str] | None = None,
         recover_unstarted: bool = False,
     ) -> dict[str, int]:
         now = utc_now() if now is None else now
-        isolated = attempt_isolated_targets or set()
         retried = suspended = 0
         with self.db.transaction() as conn:
             rows = conn.execute(
                 "SELECT l.*,a.logical_agent_id,a.attempt_number,a.incarnation_id,"
                 "t.batch_id,t.workspace_mode,t.max_attempts,t.retry_classes_json,"
                 "t.base_backoff_seconds,t.max_backoff_seconds,t.workstream_id,"
-                "e.id AS execution_id,e.execution_target,e.terminal_confirmed,e.quiescent_confirmed "
+                "e.id AS execution_id,e.attempt_isolation,e.terminal_confirmed,e.quiescent_confirmed "
                 "FROM leases l JOIN attempts a ON a.id=l.attempt_id JOIN tasks t ON t.id=l.task_id "
                 "LEFT JOIN executions e ON e.attempt_id=a.id "
                 "WHERE l.state='ACTIVE' AND (l.expires_at<=? OR (?=1 AND e.id IS NULL)) "
@@ -1602,7 +1606,7 @@ class Scheduler:
                     row["workspace_mode"] != WorkspaceMode.WRITE.value
                     or row["execution_id"] is None
                     or bool(row["quiescent_confirmed"])
-                    or row["execution_target"] in isolated
+                    or bool(row["attempt_isolation"])
                 )
                 retry_classes = set(json_loads(row["retry_classes_json"], []))
                 retry_allowed = (
@@ -1807,7 +1811,6 @@ class Scheduler:
         task_id: str,
         *,
         quiescence_confirmed: bool = False,
-        attempt_isolation: bool = False,
     ) -> None:
         now = utc_now()
         with self.db.transaction() as conn:
@@ -1825,7 +1828,7 @@ class Scheduler:
                     and execution is not None
                     and not (
                         quiescence_confirmed
-                        or attempt_isolation
+                        or bool(execution["attempt_isolation"])
                         or bool(execution["quiescent_confirmed"])
                     )
                 )
@@ -1903,7 +1906,10 @@ class Scheduler:
                 writer_unknown = (
                     attempt["workspace_mode"] == WorkspaceMode.WRITE.value
                     and execution is not None
-                    and not bool(execution["quiescent_confirmed"])
+                    and not (
+                        bool(execution["quiescent_confirmed"])
+                        or bool(execution["attempt_isolation"])
+                    )
                 )
                 physical_quiescent = execution is None or bool(
                     execution["quiescent_confirmed"]
@@ -1963,7 +1969,6 @@ class Scheduler:
         *,
         operation: str,
         quiescence_confirmed: bool = False,
-        attempt_isolation: bool = False,
     ) -> None:
         if operation not in {"retry", "cancel_task", "release_cancelled_writer"}:
             raise ValueError(
@@ -1975,21 +1980,23 @@ class Scheduler:
             if escalation["state"] != EscalationState.OPEN.value:
                 raise InvalidTransition("escalation is not open")
             task = self._required(conn, "tasks", escalation["task_id"])
+            latest = conn.execute(
+                "SELECT a.incarnation_id,e.attempt_isolation FROM attempts a "
+                "LEFT JOIN executions e ON e.attempt_id=a.id WHERE a.task_id=? "
+                "ORDER BY a.attempt_number DESC LIMIT 1",
+                (task["id"],),
+            ).fetchone()
+            frozen_isolation = bool(latest and latest["attempt_isolation"])
             if operation == "release_cancelled_writer":
                 if (
                     task["state"] != TaskState.CANCELLED.value
                     or escalation["failure_class"]
                     != FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
-                    or not (quiescence_confirmed or attempt_isolation)
+                    or not (quiescence_confirmed or frozen_isolation)
                 ):
                     raise InvalidTransition(
                         "cancelled writer release requires confirmed quiescence or attempt isolation"
                     )
-                latest = conn.execute(
-                    "SELECT incarnation_id FROM attempts WHERE task_id=? "
-                    "ORDER BY attempt_number DESC LIMIT 1",
-                    (task["id"],),
-                ).fetchone()
                 if latest:
                     next_state = "TERMINATED" if quiescence_confirmed else "LOST"
                     conn.execute(
@@ -2010,7 +2017,7 @@ class Scheduler:
                     task["workspace_mode"] == WorkspaceMode.WRITE.value
                     and escalation["failure_class"]
                     == FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
-                    and not (quiescence_confirmed or attempt_isolation)
+                    and not (quiescence_confirmed or frozen_isolation)
                 ):
                     raise InvalidTransition(
                         "writer retry requires confirmed quiescence or attempt isolation"
@@ -2028,18 +2035,13 @@ class Scheduler:
                     == FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
                     and escalation["logical_agent_id"]
                 ):
-                    latest = conn.execute(
-                        "SELECT incarnation_id FROM attempts WHERE task_id=? "
-                        "ORDER BY attempt_number DESC LIMIT 1",
-                        (task["id"],),
-                    ).fetchone()
                     if latest and quiescence_confirmed:
                         conn.execute(
                             "UPDATE incarnations SET state='TERMINATED',ended_at=? WHERE id=? "
                             "AND state IN ('STARTING','WARM','COLD','LOST')",
                             (now, latest["incarnation_id"]),
                         )
-                    elif latest and attempt_isolation:
+                    elif latest and frozen_isolation:
                         conn.execute(
                             "UPDATE incarnations SET state='LOST',ended_at=? WHERE id=? "
                             "AND state IN ('STARTING','WARM','COLD')",

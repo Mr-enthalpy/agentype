@@ -20,6 +20,7 @@ from local_agent_scheduler.enums import (
     FailureClass,
     Retention,
     TaskState,
+    WorkspaceMode,
 )
 from local_agent_scheduler.errors import ConfigurationError, StaleAuthority
 from local_agent_scheduler.models import (
@@ -437,6 +438,78 @@ completion_timeout = 1
         self.assertEqual(result["retried"], 1)
         restarted.promote_retry_wait(now=106)
         self.assertEqual(restarted.get("tasks", ids["claimed"])["state"], TaskState.QUEUED)
+
+    def _expired_writer_after_isolation_config_change(
+        self, *, frozen_isolation: bool, current_isolation: bool
+    ) -> tuple[Scheduler, str]:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-isolation-snapshot",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request_id = self.scheduler.create_execution(
+            claim, attempt_isolation=frozen_isolation
+        )
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"writer": True},
+        )
+        with self.scheduler.db.transaction() as conn:
+            conn.execute(
+                "UPDATE leases SET expires_at=? WHERE id=?",
+                (time.time() - 1, claim.lease_id),
+            )
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": FakeAdapter()},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", current_isolation, True
+                )
+            },
+            workspace_root=self.root,
+        )
+        dispatcher.tick()
+        return restarted, ids["writer-isolation-snapshot"]
+
+    def test_restart_cannot_retroactively_grant_writer_attempt_isolation(self) -> None:
+        restarted, task_id = self._expired_writer_after_isolation_config_change(
+            frozen_isolation=False,
+            current_isolation=True,
+        )
+
+        self.assertEqual(restarted.get("tasks", task_id)["state"], "SUSPENDED")
+        escalation = restarted.list("escalations", state="OPEN")[-1]
+        self.assertEqual(
+            escalation["failure_class"],
+            FailureClass.WRITER_QUIESCENCE_UNKNOWN.value,
+        )
+
+    def test_restart_preserves_writer_isolation_when_current_config_removes_it(self) -> None:
+        restarted, task_id = self._expired_writer_after_isolation_config_change(
+            frozen_isolation=True,
+            current_isolation=False,
+        )
+
+        self.assertEqual(restarted.get("tasks", task_id)["state"], "RETRY_WAIT")
+        self.assertEqual(restarted.list("escalations", state="OPEN"), [])
 
     def test_restart_fences_unexpired_claim_without_execution_before_heartbeat(self) -> None:
         policy = RetryPolicy(

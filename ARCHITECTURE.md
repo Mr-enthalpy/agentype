@@ -1408,7 +1408,7 @@ the old physical writer has stopped mutating files.
 
 Therefore fencing protects Scheduler state but cannot alone protect a shared filesystem.
 
-A replacement writer must not be started against the same mutable workspace until the previous writer is positively quiescent, unless stronger attempt isolation exists.
+A replacement writer must not be started against the same mutable workspace until the previous writer is positively quiescent, unless stronger attempt isolation exists. Any isolation fact used for this proof belongs to the concrete Execution created under it and must be durably frozen before physical start; current ExecutionTarget configuration cannot retroactively grant or revoke that fact after restart.
 
 Read-only duplicate attempts may be tolerated where appropriate.
 

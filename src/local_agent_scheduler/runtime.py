@@ -42,9 +42,7 @@ class Dispatcher:
     def recover(self, *, after_expiry: Callable[[], None] | None = None) -> dict[str, int]:
         self.clear_supervision_admissions()
         self.scheduler.set_lifecycle("RECOVERY")
-        isolated = {name for name, target in self.targets.items() if target.attempt_isolation}
         lease_result = self.scheduler.expire_leases(
-            attempt_isolated_targets=isolated,
             recover_unstarted=True,
         )
         if after_expiry is not None:
@@ -65,8 +63,7 @@ class Dispatcher:
 
     def tick(self) -> dict[str, int]:
         self.scheduler.promote_retry_wait()
-        isolated = {name for name, target in self.targets.items() if target.attempt_isolation}
-        expired = self.scheduler.expire_leases(attempt_isolated_targets=isolated)
+        expired = self.scheduler.expire_leases()
         pool = self.scheduler.reconcile_pool()
         revived = self.scheduler.revive_eligible_agents()
         affinity_births = self.scheduler.ensure_task_consumers()
@@ -139,7 +136,10 @@ class Dispatcher:
                 )
                 continue
             agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
-            execution_id, request_id = self.scheduler.create_execution(claim)
+            execution_id, request_id = self.scheduler.create_execution(
+                claim,
+                attempt_isolation=target.attempt_isolation,
+            )
             execution = self.scheduler.get("executions", execution_id)
             incarnation_id = execution["incarnation_id"]
             incarnation = self.scheduler.get("incarnations", incarnation_id)
@@ -194,7 +194,6 @@ class Dispatcher:
                     detail=start.detail,
                     terminal_confirmed=True,
                     quiescent_confirmed=True,
-                    attempt_isolation=target.attempt_isolation,
                 )
         return dispatched
 
@@ -207,7 +206,6 @@ class Dispatcher:
             adapter = self.adapters.get(execution["execution_target"])
             if adapter is None:
                 self._revoke_supervision(execution["id"])
-                target = self.targets.get(execution["execution_target"])
                 try:
                     attempt = self.scheduler.get("attempts", execution["attempt_id"])
                     self.scheduler.nack(
@@ -222,7 +220,6 @@ class Dispatcher:
                         ),
                         terminal_confirmed=False,
                         quiescent_confirmed=False,
-                        attempt_isolation=bool(target and target.attempt_isolation),
                     )
                 except StaleAuthority:
                     self.scheduler.record_physical_outcome(
@@ -301,8 +298,6 @@ class Dispatcher:
             quiescent_confirmed = (
                 observation.quiescent_confirmed or outcome.quiescent_confirmed
             )
-            target = self.targets.get(execution["execution_target"])
-            attempt_isolation = bool(target and target.attempt_isolation)
             try:
                 attempt = self.scheduler.get("attempts", execution["attempt_id"])
                 epoch = int(attempt["lease_epoch"])
@@ -315,7 +310,6 @@ class Dispatcher:
                         summary=outcome.summary,
                         continuity_capsule=outcome.checkpoint,
                         quiescent_confirmed=quiescent_confirmed,
-                        attempt_isolation=attempt_isolation,
                         incarnation_reusable=outcome.incarnation_reusable,
                     )
                 else:
@@ -328,7 +322,6 @@ class Dispatcher:
                         failure_signature=outcome.failure_signature,
                         terminal_confirmed=terminal_confirmed,
                         quiescent_confirmed=quiescent_confirmed,
-                        attempt_isolation=attempt_isolation,
                         incarnation_reusable=outcome.incarnation_reusable,
                     )
             except StaleAuthority:
@@ -353,7 +346,6 @@ class Dispatcher:
             raise ConfigurationError(
                 f"execution target {execution['execution_target']!r} is unavailable"
             )
-        target = self.targets.get(execution["execution_target"])
         handle = json_loads(execution["runtime_handle_json"], {})
         observation = (
             adapter.terminate_execution(handle)
@@ -375,7 +367,6 @@ class Dispatcher:
         self.scheduler.cancel_task(
             execution["task_id"],
             quiescence_confirmed=observation.quiescent_confirmed,
-            attempt_isolation=bool(target and target.attempt_isolation),
         )
         return {
             "execution_id": execution_id,
@@ -426,6 +417,18 @@ class SchedulerDaemon:
         self._heartbeat_thread: threading.Thread | None = None
         self._notifier_stop = threading.Event()
         self._notifier_thread: threading.Thread | None = None
+        self._run_lock = threading.Lock()
+        self._run_started = False
+
+    def _begin_single_run(self) -> None:
+        """Claim this daemon object for its one supported run lifecycle."""
+
+        with self._run_lock:
+            if self._run_started:
+                raise RuntimeError(
+                    "SchedulerDaemon objects are single-run; construct a new daemon"
+                )
+            self._run_started = True
 
     def stop(self, *_args) -> None:
         self._stopping = True
@@ -517,6 +520,7 @@ class SchedulerDaemon:
             time.sleep(min(self.poll_seconds, 0.05))
 
     def run(self) -> None:
+        self._begin_single_run()
         signal.signal(signal.SIGINT, self.stop)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self.stop)
@@ -535,6 +539,7 @@ class SchedulerDaemon:
 
         if max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
+        self._begin_single_run()
 
         self.dispatcher.recover(after_expiry=self._start_supervision)
         self._start_notifier()

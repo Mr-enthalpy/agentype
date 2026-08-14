@@ -82,12 +82,12 @@ class IncarnationMigrationCase(unittest.TestCase):
 
             database.initialize()
 
-            self.assertEqual(SCHEMA_VERSION, 4)
+            self.assertEqual(SCHEMA_VERSION, 5)
             self.assertEqual(
                 database.fetch_one(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 )["version"],
-                4,
+                5,
             )
             migrated_first = database.fetch_one(
                 "SELECT incarnation_id FROM executions WHERE id=?", (first_execution,)
@@ -279,6 +279,52 @@ class IncarnationMigrationCase(unittest.TestCase):
                 ],
                 0,
             )
+
+    def test_v5_defaults_legacy_execution_isolation_to_false(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database, scheduler = self._legacy_scheduler(Path(temporary) / "isolation.db")
+            _batch, _ids = scheduler.submit_batch([TaskSpec("legacy", {})])
+            claim = scheduler.claim_next_available()
+            execution_id, _request = scheduler.create_execution(
+                claim, attempt_isolation=True
+            )
+            with database.transaction() as conn:
+                conn.execute("DELETE FROM schema_migrations WHERE version>=5")
+                conn.execute("ALTER TABLE executions DROP COLUMN attempt_isolation")
+
+            database.initialize()
+
+            execution = database.fetch_one(
+                "SELECT attempt_isolation FROM executions WHERE id=?", (execution_id,)
+            )
+            self.assertEqual(execution["attempt_isolation"], 0)
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT MAX(version) version FROM schema_migrations"
+                )["version"],
+                5,
+            )
+
+    def test_v5_retires_legacy_unassigned_retirement_drain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database, scheduler = self._legacy_scheduler(Path(temporary) / "drain.db")
+            agent_id = scheduler.list("logical_agents", state="READY")[0]["id"]
+            with database.transaction() as conn:
+                conn.execute("DELETE FROM schema_migrations WHERE version>=5")
+                conn.execute(
+                    "UPDATE logical_agents SET state='DRAINING',current_task_id=NULL,"
+                    "pending_partition_name=NULL,retirement_requested=1 WHERE id=?",
+                    (agent_id,),
+                )
+
+            database.initialize()
+
+            agent = database.fetch_one(
+                "SELECT state,retirement_requested FROM logical_agents WHERE id=?",
+                (agent_id,),
+            )
+            self.assertEqual(agent["state"], "RETIRED")
+            self.assertEqual(agent["retirement_requested"], 0)
 
 
 if __name__ == "__main__":

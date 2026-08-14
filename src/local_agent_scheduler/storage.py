@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def new_id(prefix: str) -> str:
@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS executions (
     incarnation_id TEXT NOT NULL REFERENCES incarnations(id) ON DELETE RESTRICT,
     execution_target TEXT NOT NULL,
     execution_profile TEXT NOT NULL,
+    attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
     outcome_json TEXT,
@@ -380,10 +381,19 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (4, utc_now()),
                     )
+                    current = 4
                 else:
                     # Reassert correctness indexes/triggers if an operator
                     # removed one without changing the schema marker.
                     self._migrate_v3_to_v4(conn)
+                if current < 5:
+                    self._migrate_v4_to_v5(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (5, utc_now()),
+                    )
+                else:
+                    self._migrate_v4_to_v5(conn)
                 conn.execute("COMMIT")
                 conn.execute("PRAGMA foreign_keys = ON")
                 violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -650,6 +660,35 @@ class Database:
             "CREATE TRIGGER IF NOT EXISTS tasks_required_update_only "
             "BEFORE UPDATE OF required ON tasks WHEN NEW.required<>1 BEGIN "
             "SELECT RAISE(ABORT,'optional Tasks are not supported'); END"
+        )
+
+    @staticmethod
+    def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+        """Freeze writer isolation per Execution and close legacy drain residue.
+
+        Existing Executions are conservatively marked non-isolated.  Current
+        target configuration is not evidence about the safety properties under
+        which a historical physical Execution was started.
+        """
+
+        execution_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(executions)")
+        }
+        if "attempt_isolation" not in execution_columns:
+            conn.execute(
+                "ALTER TABLE executions ADD COLUMN attempt_isolation INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1))"
+            )
+
+        # V0.1.1 could leave excess unassigned agents permanently DRAINING.
+        # retirement_requested=1 is already an explicit semantic-retirement
+        # decision, so completing it does not invent a new lifecycle choice.
+        conn.execute(
+            "UPDATE logical_agents SET state='RETIRED',retirement_requested=0,"
+            "available_since=NULL,updated_at=? "
+            "WHERE state='DRAINING' AND current_task_id IS NULL "
+            "AND pending_partition_name IS NULL AND retirement_requested=1",
+            (utc_now(),),
         )
 
     @contextlib.contextmanager
