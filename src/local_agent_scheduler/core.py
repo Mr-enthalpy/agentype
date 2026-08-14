@@ -521,7 +521,7 @@ class Scheduler:
             members = conn.execute(
                 "SELECT * FROM logical_agents "
                 "WHERE COALESCE(pending_partition_name,partition_name)=? "
-                "AND state IN ('READY','ASSIGNED','DRAINING') "
+                "AND state IN ('INITIALIZING','READY','ASSIGNED','DRAINING','REVIVING') "
                 "AND retirement_requested=0 "
                 "ORDER BY CASE WHEN state='READY' AND current_task_id IS NULL "
                 "THEN 0 ELSE 1 END,"

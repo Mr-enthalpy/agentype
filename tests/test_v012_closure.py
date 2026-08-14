@@ -289,6 +289,52 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(partitions["general"]["desired_capacity"], 0)
         self.assertEqual(partitions["target"]["desired_capacity"], 2)
 
+    def test_move_capacity_preserves_unassigned_initializing_identity(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        agent_id = self.agent()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE logical_agents SET state='INITIALIZING',current_task_id=NULL,"
+                "available_since=NULL WHERE id=?",
+                (agent_id,),
+            )
+
+        self.scheduler.move_capacity("general", "target", 1)
+
+        moved = self.scheduler.get("logical_agents", agent_id)
+        self.assertEqual(moved["state"], "INITIALIZING")
+        self.assertEqual(moved["partition_name"], "target")
+        self.assertIsNone(moved["pending_partition_name"])
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+        self.assertNotEqual(
+            self.scheduler.get("logical_agents", agent_id)["state"], "RETIRED"
+        )
+
+    def test_move_capacity_preserves_unassigned_reviving_identity(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        agent_id = self.agent()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE logical_agents SET state='REVIVING',current_task_id=NULL,"
+                "available_since=NULL WHERE id=?",
+                (agent_id,),
+            )
+
+        self.scheduler.move_capacity("general", "target", 1)
+
+        moved = self.scheduler.get("logical_agents", agent_id)
+        self.assertEqual(moved["state"], "REVIVING")
+        self.assertEqual(moved["partition_name"], "target")
+        self.assertIsNone(moved["pending_partition_name"])
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+        self.assertNotEqual(
+            self.scheduler.get("logical_agents", agent_id)["state"], "RETIRED"
+        )
+
     def test_pending_membership_composes_across_merge_and_reconciliation(self):
         self.scheduler.upsert_partition(
             PartitionSpec("queued-target", 0, Retention.RESIDENT, "codex", "default")

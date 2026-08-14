@@ -61,6 +61,10 @@ supervision and Lease heartbeat renewal. Failed delivery backoff is measured
 from delivery completion, so a slow timeout cannot trigger an immediate retry.
 Heartbeat renewal is restricted to active Executions whose adapter is available
 to the current daemon; restart recovery fences unstarted claims before renewal.
+Persisted unavailable partitions do not abort daemon startup: unhealthy work is
+normalized while healthy work and notification delivery continue. Every
+ExecutionAdapter call is contractually bounded by the adapter's configured
+operation deadline.
 
 See [docs/V0.1_COMPLETION_REPORT.md](docs/V0.1_COMPLETION_REPORT.md) for the
 implemented boundaries, recovery procedure, test evidence, and limitations.

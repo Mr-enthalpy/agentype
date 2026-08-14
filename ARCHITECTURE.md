@@ -1314,7 +1314,13 @@ collect_outcome(...)
 reconcile_start(...)
 ```
 
-The exact API is not yet frozen.
+These are synchronous Scheduler-facing operations. Every Adapter implementation
+must bound each call with its own configured operation deadline, including all
+underlying process, transport, and stream I/O, and translate timeout into the
+standard outcome vocabulary. The Scheduler does not provide a generic watchdog
+for a non-conforming Adapter.
+
+The exact API is not yet frozen beyond this bounded-call correctness contract.
 
 The Adapter receives enough input to instantiate one physical execution.
 

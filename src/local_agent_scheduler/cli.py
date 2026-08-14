@@ -65,21 +65,7 @@ def _partition_spec_for_upsert(
 def _build_dispatcher(
     scheduler: Scheduler, config: SchedulerConfig
 ) -> tuple[Dispatcher, SchedulerDaemon]:
-    target_names = {target.name for target in config.execution_targets}
     profile_names = set(config.execution_profiles)
-    for partition in scheduler.list("pool_partitions"):
-        if not partition["active"]:
-            continue
-        if partition["execution_target"] not in target_names:
-            raise ConfigurationError(
-                f"active partition {partition['name']!r} references unavailable "
-                f"execution target {partition['execution_target']!r}"
-            )
-        if partition["execution_profile"] not in profile_names:
-            raise ConfigurationError(
-                f"active partition {partition['name']!r} references unavailable "
-                f"execution profile {partition['execution_profile']!r}"
-            )
     process_cwd = config.resolve(config.codex_adapter.cwd)
     adapter = CodexAppServerAdapter(
         command=config.codex_adapter.command,

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from local_agent_scheduler.cli import main as cli_main
 from local_agent_scheduler.config import ExecutionTargetConfig, load_config
 from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
 from local_agent_scheduler.core import Scheduler
@@ -263,6 +266,115 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(totals["dispatched"], 1)
         self.assertGreaterEqual(totals["observed"], 1)
         self.assertEqual(self.scheduler.get("tasks", ids["one-shot"])["state"], "COMPLETED")
+
+    def test_cli_daemon_starts_with_mixed_available_and_unavailable_topology(self) -> None:
+        _seed_batch, _seed_ids = self.scheduler.submit_batch(
+            [TaskSpec("pending-notification", {})]
+        )
+        seed_claim = self.scheduler.claim_next_available()
+        self.scheduler.ack_success(
+            seed_claim.attempt_id,
+            seed_claim.lease_epoch,
+            execution_id=None,
+            payload={"seed": True},
+        )
+        self.assertTrue(self.scheduler.list("notification_outbox", state="PENDING"))
+
+        self.scheduler.upsert_partition(
+            PartitionSpec(
+                "unavailable",
+                1,
+                Retention.RESIDENT,
+                "missing-target",
+                "missing-profile",
+            )
+        )
+        self.scheduler.reconcile_pool()
+        _healthy_batch, healthy_ids = self.scheduler.submit_batch(
+            [TaskSpec("healthy", {}, partition="general")]
+        )
+        _bad_batch, bad_ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "unavailable",
+                    {},
+                    partition="unavailable",
+                    retry_policy=RetryPolicy(max_attempts=1, retry_classes=()),
+                )
+            ]
+        )
+        with self.scheduler.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?,?,?)",
+                ("topology_bootstrapped", "{}", time.time()),
+            )
+        config_path = self.root / "scheduler.toml"
+        config_path.write_text(
+            """schema_version = 1
+database_path = "scheduler.db"
+lease_seconds = 5
+heartbeat_seconds = 1
+continuity_max_bytes = 65536
+dispatcher_poll_seconds = 0.001
+
+[retry_defaults]
+max_attempts = 1
+retry_classes = []
+base_backoff_seconds = 0
+max_backoff_seconds = 0
+
+[execution_profiles.default]
+
+[[execution_targets]]
+name = "codex"
+adapter = "codex_app_server"
+attempt_isolation = false
+termination_confirmation = true
+
+[adapters.codex_app_server]
+command = ["codex", "app-server"]
+cwd = "."
+approval_policy = "never"
+sandbox = "workspace-write"
+
+[root_bridge]
+kind = "filesystem"
+inbox = "events"
+request_timeout = 1
+completion_timeout = 1
+""",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "local_agent_scheduler.cli.CodexAppServerAdapter",
+            side_effect=lambda **_kwargs: FakeAdapter(),
+        ), patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(
+                cli_main(["--config", str(config_path), "daemon", "--once"]),
+                0,
+            )
+
+        self.assertEqual(
+            self.scheduler.get("tasks", healthy_ids["healthy"])["state"],
+            "COMPLETED",
+        )
+        self.assertEqual(
+            self.scheduler.get("tasks", bad_ids["unavailable"])["state"],
+            "SUSPENDED",
+        )
+        bad_failure = next(
+            failure
+            for failure in self.scheduler.list("failures")
+            if failure["task_id"] == bad_ids["unavailable"]
+        )
+        self.assertEqual(
+            bad_failure["failure_code"], "EXECUTION_CONFIGURATION_UNAVAILABLE"
+        )
+        self.assertEqual(
+            self.scheduler.list("notification_outbox", state="PENDING"), []
+        )
+        self.assertTrue(list((self.root / "events").glob("*.json")))
 
     def test_daemon_once_timeout_terminates_instead_of_waiting_forever(self) -> None:
         _batch, ids = self.scheduler.submit_batch([TaskSpec("bounded-one-shot", {})])
