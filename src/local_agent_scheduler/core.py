@@ -1268,12 +1268,13 @@ class Scheduler:
         with self.db.transaction() as conn:
             cursor = conn.execute(
                 "UPDATE leases SET heartbeat_at=?,expires_at=? WHERE state='ACTIVE' "
+                "AND expires_at>? "
                 "AND attempt_id IN (SELECT a.id FROM attempts a JOIN tasks t ON t.id=a.task_id "
                 "JOIN executions e ON e.attempt_id=a.id "
                 "WHERE a.state='ACTIVE' AND t.current_attempt_id=a.id "
                 "AND e.state IN ('STARTING','RUNNING','UNKNOWN') "
                 f"AND t.fencing_epoch=a.lease_epoch AND a.id IN ({placeholders}))",
-                (now, expires_at, *supervised),
+                (now, expires_at, now, *supervised),
             )
             return cursor.rowcount
 

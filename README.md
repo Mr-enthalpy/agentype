@@ -59,8 +59,10 @@ driven and does not poll Scheduler state.
 Outbox delivery runs in a narrow notifier thread independently of execution
 supervision and Lease heartbeat renewal. Failed delivery backoff is measured
 from delivery completion, so a slow timeout cannot trigger an immediate retry.
-Heartbeat renewal is restricted to active Executions whose adapter is available
-to the current daemon; restart recovery fences unstarted claims before renewal.
+Heartbeat renewal is restricted to Executions positively admitted as RUNNING by
+the current daemon; adapter presence or UNKNOWN database state is insufficient.
+Restart recovery fences unstarted claims, and ambiguous reconciliation cannot
+roll a Lease forward forever.
 Persisted unavailable partitions do not abort daemon startup: unhealthy work is
 normalized while healthy work and notification delivery continue. Every
 ExecutionAdapter call is contractually bounded by the adapter's configured

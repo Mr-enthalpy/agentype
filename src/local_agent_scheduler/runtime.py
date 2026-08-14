@@ -31,11 +31,16 @@ class Dispatcher:
         self.scheduler = scheduler
         self.adapters = dict(adapters)
         self.targets = dict(targets)
-        self.execution_profiles = set(execution_profiles or ())
+        self.execution_profiles = (
+            None if execution_profiles is None else set(execution_profiles)
+        )
         self.workspace_root = str(Path(workspace_root).resolve())
         self.outbox = outbox
+        self._supervision_lock = threading.Lock()
+        self._supervision_admissions: dict[str, str] = {}
 
     def recover(self, *, after_expiry: Callable[[], None] | None = None) -> dict[str, int]:
+        self.clear_supervision_admissions()
         self.scheduler.set_lifecycle("RECOVERY")
         isolated = {name for name, target in self.targets.items() if target.attempt_isolation}
         lease_result = self.scheduler.expire_leases(
@@ -82,19 +87,25 @@ class Dispatcher:
             "notifications": 0,
         }
 
-    def supervised_attempt_ids(self) -> set[str]:
-        """Return active physical work this process can actually observe."""
+    def _admit_supervision(self, execution_id: str, attempt_id: str) -> None:
+        """Admit only work this daemon has positively observed as RUNNING."""
 
-        supervised: set[str] = set()
-        for state in (
-            ExecutionState.STARTING.value,
-            ExecutionState.RUNNING.value,
-            ExecutionState.UNKNOWN.value,
-        ):
-            for execution in self.scheduler.list("executions", state=state):
-                if execution["execution_target"] in self.adapters:
-                    supervised.add(str(execution["attempt_id"]))
-        return supervised
+        with self._supervision_lock:
+            self._supervision_admissions[execution_id] = attempt_id
+
+    def _revoke_supervision(self, execution_id: str) -> None:
+        with self._supervision_lock:
+            self._supervision_admissions.pop(execution_id, None)
+
+    def clear_supervision_admissions(self) -> None:
+        with self._supervision_lock:
+            self._supervision_admissions.clear()
+
+    def supervised_attempt_ids(self) -> set[str]:
+        """Return authority positively admitted by this daemon instance."""
+
+        with self._supervision_lock:
+            return set(self._supervision_admissions.values())
 
     def renew_supervised_leases(self) -> int:
         return self.scheduler.renew_active_leases(self.supervised_attempt_ids())
@@ -108,7 +119,7 @@ class Dispatcher:
             adapter = self.adapters.get(claim.execution_target)
             target = self.targets.get(claim.execution_target)
             profile_unavailable = bool(
-                self.execution_profiles
+                self.execution_profiles is not None
                 and claim.execution_profile not in self.execution_profiles
             )
             if adapter is None or target is None or profile_unavailable:
@@ -150,13 +161,21 @@ class Dispatcher:
             )
             start = adapter.start_execution(request)
             if start.state == ExecutionState.RUNNING:
-                self.scheduler.confirm_execution_running(
-                    claim.attempt_id,
-                    claim.lease_epoch,
-                    execution_id,
-                    runtime_handle=start.runtime_handle,
-                )
-                dispatched += 1
+                try:
+                    self.scheduler.confirm_execution_running(
+                        claim.attempt_id,
+                        claim.lease_epoch,
+                        execution_id,
+                        runtime_handle=start.runtime_handle,
+                    )
+                except StaleAuthority:
+                    self._revoke_supervision(execution_id)
+                    self.scheduler.record_physical_outcome(
+                        execution_id, state=ExecutionState.RUNNING
+                    )
+                else:
+                    self._admit_supervision(execution_id, claim.attempt_id)
+                    dispatched += 1
             elif start.ambiguous or start.state == ExecutionState.UNKNOWN:
                 self.scheduler.record_start_ambiguity(
                     claim.attempt_id,
@@ -187,6 +206,7 @@ class Dispatcher:
         for execution in executions:
             adapter = self.adapters.get(execution["execution_target"])
             if adapter is None:
+                self._revoke_supervision(execution["id"])
                 target = self.targets.get(execution["execution_target"])
                 try:
                     attempt = self.scheduler.get("attempts", execution["attempt_id"])
@@ -225,13 +245,21 @@ class Dispatcher:
                             execution["id"],
                             runtime_handle=start.runtime_handle,
                         )
+                        self.scheduler.heartbeat(
+                            execution["attempt_id"], int(attempt["lease_epoch"])
+                        )
+                        self._admit_supervision(
+                            execution["id"], execution["attempt_id"]
+                        )
                     except StaleAuthority:
+                        self._revoke_supervision(execution["id"])
                         self.scheduler.record_physical_outcome(
                             execution["id"], state=ExecutionState.RUNNING
                         )
                     count += 1
                     continue
                 if start.ambiguous:
+                    self._revoke_supervision(execution["id"])
                     continue
                 if start.state in {
                     ExecutionState.SUCCEEDED,
@@ -255,12 +283,17 @@ class Dispatcher:
                     self.scheduler.heartbeat(
                         execution["attempt_id"], int(attempt["lease_epoch"])
                     )
+                    self._admit_supervision(
+                        execution["id"], execution["attempt_id"]
+                    )
                 except StaleAuthority:
-                    pass
+                    self._revoke_supervision(execution["id"])
                 count += 1
                 continue
             if observation.state in (ExecutionState.UNKNOWN, ExecutionState.STARTING):
+                self._revoke_supervision(execution["id"])
                 continue
+            self._revoke_supervision(execution["id"])
             outcome = adapter.collect_outcome(handle)
             terminal_confirmed = (
                 observation.terminal_confirmed or outcome.terminal_confirmed
@@ -314,6 +347,7 @@ class Dispatcher:
 
     def interrupt_execution(self, execution_id: str, *, terminate: bool = False) -> dict[str, object]:
         execution = self.scheduler.get("executions", execution_id)
+        self._revoke_supervision(execution_id)
         adapter = self.adapters.get(execution["execution_target"])
         if adapter is None:
             raise ConfigurationError(
@@ -426,6 +460,7 @@ class SchedulerDaemon:
         if self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=max(1.0, self.heartbeat_seconds * 2))
             self._heartbeat_thread = None
+        self.dispatcher.clear_supervision_admissions()
 
     def _notifier_loop(self) -> None:
         """Deliver only durable wakeup events and persist delivery outcome."""

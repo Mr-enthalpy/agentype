@@ -21,7 +21,7 @@ from local_agent_scheduler.enums import (
     Retention,
     TaskState,
 )
-from local_agent_scheduler.errors import ConfigurationError
+from local_agent_scheduler.errors import ConfigurationError, StaleAuthority
 from local_agent_scheduler.models import (
     ExecutionObservation,
     ExecutionOutcome,
@@ -105,6 +105,15 @@ class HangingAdapter(FakeAdapter):
 
     def collect_outcome(self, runtime_handle):
         return ExecutionOutcome(ExecutionState.RUNNING)
+
+
+class AlwaysAmbiguousAdapter(FakeAdapter):
+    def start_execution(self, request):
+        handle = {"request_id": request.request_id, "execution_id": request.execution_id}
+        return StartObservation(ExecutionState.UNKNOWN, handle, ambiguous=True)
+
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(ExecutionState.UNKNOWN, runtime_handle, ambiguous=True)
 
 
 class FakeProcess:
@@ -466,6 +475,123 @@ completion_timeout = 1
         self.assertEqual(lease["expires_at"], original_expiry)
         failure = restarted.list("failures")[-1]
         self.assertEqual(failure["failure_code"], "CLAIM_ORPHANED")
+
+    def test_restart_ambiguous_execution_is_not_admitted_for_renewal(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("ambiguous-restart", {}, retry_policy=policy)]
+        )
+        claim = self.scheduler.claim_next_available(now=time.time())
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id},
+            detail="start identity remains ambiguous",
+        )
+        original_expiry = self.scheduler.get("leases", claim.lease_id)["expires_at"]
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+        try:
+            dispatcher.recover(after_expiry=daemon._start_supervision)
+            time.sleep(0.02)
+            dispatcher.poll_executions(recovery=True)
+            self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+            self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(
+            restarted.get("leases", claim.lease_id)["expires_at"], original_expiry
+        )
+        expired = restarted.expire_leases(now=original_expiry + 1)
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(restarted.get("leases", claim.lease_id)["state"], "EXPIRED")
+        self.assertEqual(
+            restarted.get("tasks", ids["ambiguous-restart"])["state"], "RETRY_WAIT"
+        )
+
+    def test_same_daemon_ambiguous_start_is_not_admitted_for_renewal(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("ambiguous-local", {}, retry_policy=policy)]
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+        daemon._start_supervision()
+        try:
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+            execution = self.scheduler.list("executions", state="UNKNOWN")[0]
+            lease = self.scheduler.list("leases", state="ACTIVE")[0]
+            original_expiry = lease["expires_at"]
+            time.sleep(0.02)
+            dispatcher.poll_executions()
+            self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+            self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(
+            self.scheduler.get("leases", lease["id"])["expires_at"], original_expiry
+        )
+        expired = self.scheduler.expire_leases(now=original_expiry + 1)
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(self.scheduler.get("leases", lease["id"])["state"], "EXPIRED")
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["ambiguous-local"])["state"], "RETRY_WAIT"
+        )
+        self.assertEqual(
+            self.scheduler.get("executions", execution["id"])["state"], "UNKNOWN"
+        )
+
+    def test_stale_running_start_does_not_escape_or_gain_admission(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("stale-start", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": FakeAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+
+        with patch.object(
+            self.scheduler,
+            "confirm_execution_running",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "RUNNING")
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+        self.assertEqual(dispatcher.renew_supervised_leases(), 0)
 
     def test_restart_reconciles_completed_execution_before_notification(self) -> None:
         batch_id, ids = self.scheduler.submit_batch([TaskSpec("recovered", {})])

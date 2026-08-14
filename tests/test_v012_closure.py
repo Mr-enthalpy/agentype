@@ -101,6 +101,15 @@ class SuccessfulTerminalAdapter:
         return ExecutionOutcome(ExecutionState.SUCCEEDED, payload={"ok": True})
 
 
+class ForbiddenStartAdapter:
+    def __init__(self):
+        self.start_calls = 0
+
+    def start_execution(self, _request):
+        self.start_calls += 1
+        raise AssertionError("unavailable execution profile reached adapter start")
+
+
 class ClosureCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -186,6 +195,12 @@ class ClosureCase(unittest.TestCase):
             claim.lease_epoch,
             execution_id,
             runtime_handle={"live": True},
+        )
+        self.assertEqual(
+            self.scheduler.renew_active_leases(
+                {claim.attempt_id}, now=claim.lease_expires_at + 1
+            ),
+            0,
         )
         self.assertEqual(
             self.scheduler.renew_active_leases({claim.attempt_id}),
@@ -885,6 +900,40 @@ class ClosureCase(unittest.TestCase):
         failure = self.scheduler.list("failures")[-1]
         self.assertEqual(failure["failure_class"], "RESOURCE_UNAVAILABLE")
 
+    def test_empty_profile_registry_rejects_removed_persisted_profile(self):
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE pool_partitions SET execution_profile='removed-profile' "
+                "WHERE name='general'"
+            )
+        policy = RetryPolicy(max_attempts=1, retry_classes=())
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("removed-profile", {}, retry_policy=policy)]
+        )
+        adapter = ForbiddenStartAdapter()
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": adapter},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", False, True
+                )
+            },
+            execution_profiles=set(),
+            workspace_root=self.temp.name,
+        )
+
+        self.assertEqual(dispatcher.dispatch_ready(), 0)
+        self.assertEqual(adapter.start_calls, 0)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["removed-profile"])["state"], "SUSPENDED"
+        )
+        failure = self.scheduler.list("failures")[-1]
+        self.assertEqual(failure["failure_class"], "RESOURCE_UNAVAILABLE")
+        self.assertEqual(
+            failure["failure_code"], "EXECUTION_CONFIGURATION_UNAVAILABLE"
+        )
+
     def test_poll_terminal_outcome_tolerates_missing_target_configuration(self):
         _batch, ids = self.scheduler.submit_batch([TaskSpec("already-running", {})])
         claim = self.scheduler.claim_next(self.agent())
@@ -1019,11 +1068,6 @@ class ClosureCase(unittest.TestCase):
         self.scheduler.confirm_execution_running(
             claim.attempt_id, claim.lease_epoch, execution_id, runtime_handle={"live": True}
         )
-        with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE leases SET expires_at=? WHERE id=?",
-                (time.time() + 0.1, claim.lease_id),
-            )
         bridge = BlockingBridge()
         dispatcher = Dispatcher(
             self.scheduler,
@@ -1051,6 +1095,13 @@ class ClosureCase(unittest.TestCase):
             workspace_root=self.temp.name,
             outbox=OutboxDispatcher(self.scheduler.db, bridge),
         )
+        self.assertEqual(dispatcher.poll_executions(), 1)
+        self.assertEqual(dispatcher.supervised_attempt_ids(), {claim.attempt_id})
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE leases SET expires_at=? WHERE id=?",
+                (time.time() + 0.1, claim.lease_id),
+            )
         daemon = SchedulerDaemon(
             dispatcher, poll_seconds=0.01, heartbeat_seconds=0.03
         )

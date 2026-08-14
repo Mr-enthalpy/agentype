@@ -1446,6 +1446,13 @@ If start state is ambiguous:
 * apply stricter rules to writer tasks
 * suspend if correctness cannot be mechanically established
 
+An Execution row and a configured Adapter do not themselves prove that the
+current daemon supervises that physical work. Lease renewal requires
+daemon-owned admission after a bounded start/reconciliation positively confirms
+the exact Execution as RUNNING. UNKNOWN/ambiguous reconciliation never rolls
+that admission deadline forward; when the existing Lease expires, ordinary
+fencing and writer-quiescence rules apply.
+
 The Core should understand standardized ambiguity, not frontend-specific exception text.
 
 ---
