@@ -38,7 +38,10 @@ class Dispatcher:
     def recover(self, *, after_expiry: Callable[[], None] | None = None) -> dict[str, int]:
         self.scheduler.set_lifecycle("RECOVERY")
         isolated = {name for name, target in self.targets.items() if target.attempt_isolation}
-        lease_result = self.scheduler.expire_leases(attempt_isolated_targets=isolated)
+        lease_result = self.scheduler.expire_leases(
+            attempt_isolated_targets=isolated,
+            recover_unstarted=True,
+        )
         if after_expiry is not None:
             after_expiry()
         observed = self.poll_executions(recovery=True)
@@ -78,6 +81,23 @@ class Dispatcher:
             # execution-supervision control loop.
             "notifications": 0,
         }
+
+    def supervised_attempt_ids(self) -> set[str]:
+        """Return active physical work this process can actually observe."""
+
+        supervised: set[str] = set()
+        for state in (
+            ExecutionState.STARTING.value,
+            ExecutionState.RUNNING.value,
+            ExecutionState.UNKNOWN.value,
+        ):
+            for execution in self.scheduler.list("executions", state=state):
+                if execution["execution_target"] in self.adapters:
+                    supervised.add(str(execution["attempt_id"]))
+        return supervised
+
+    def renew_supervised_leases(self) -> int:
+        return self.scheduler.renew_active_leases(self.supervised_attempt_ids())
 
     def dispatch_ready(self) -> int:
         dispatched = 0
@@ -167,6 +187,31 @@ class Dispatcher:
         for execution in executions:
             adapter = self.adapters.get(execution["execution_target"])
             if adapter is None:
+                target = self.targets.get(execution["execution_target"])
+                try:
+                    attempt = self.scheduler.get("attempts", execution["attempt_id"])
+                    self.scheduler.nack(
+                        execution["attempt_id"],
+                        int(attempt["lease_epoch"]),
+                        failure_class=FailureClass.RESOURCE_UNAVAILABLE,
+                        execution_id=execution["id"],
+                        failure_code="EXECUTION_ADAPTER_UNAVAILABLE",
+                        detail=(
+                            f"execution adapter for target "
+                            f"{execution['execution_target']!r} is unavailable"
+                        ),
+                        terminal_confirmed=False,
+                        quiescent_confirmed=False,
+                        attempt_isolation=bool(target and target.attempt_isolation),
+                    )
+                except StaleAuthority:
+                    self.scheduler.record_physical_outcome(
+                        execution["id"],
+                        state=ExecutionState.LOST,
+                        failure_class=FailureClass.RESOURCE_UNAVAILABLE,
+                        failure_code="EXECUTION_ADAPTER_UNAVAILABLE",
+                    )
+                count += 1
                 continue
             handle = json_loads(execution["runtime_handle_json"], {})
             if execution["state"] in (ExecutionState.STARTING.value, ExecutionState.UNKNOWN.value):
@@ -356,7 +401,7 @@ class SchedulerDaemon:
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_seconds):
             try:
-                self.dispatcher.scheduler.renew_active_leases()
+                self.dispatcher.renew_supervised_leases()
             except Exception:
                 # A transient SQLite contention must not permanently disable
                 # supervision; the next bounded heartbeat retries.
@@ -368,7 +413,7 @@ class SchedulerDaemon:
         self._heartbeat_stop.clear()
         # Close the startup window before any immediately-following adapter or
         # RootBridge call can block the dispatcher longer than the old expiry.
-        self.dispatcher.scheduler.renew_active_leases()
+        self.dispatcher.renew_supervised_leases()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
             name="scheduler-lease-heartbeat",

@@ -1082,6 +1082,12 @@ A successful MOVE preserves:
 
 For BUSY agents, V0.1 should normally apply the move at an assignment/drain boundary.
 
+Current and desired scheduling membership are distinct during that boundary:
+`partition_name` records current membership, while `pending_partition_name`
+records desired membership. Pool reconciliation and later topology revisions
+must compose against desired membership so consecutive MOVE/MERGE operations do
+not strand an identity in an inactive partition.
+
 An idle READY agent has no future assignment boundary.  If a MOVE crosses
 ExecutionTarget and its previous Incarnation has no active Execution, the
 topology transaction fences that old reusable binding as LOST and immediately
@@ -1110,7 +1116,12 @@ For V0.1, MERGE also moves every nonterminal source Task's future scheduling cla
 
 The same idle cross-target cutover rule applies during MERGE: inactive reusable
 presence is fenced, while only an actually ASSIGNED identity uses a pending
-drain transition.
+drain transition. MERGE rebases pending inbound references to the canonical
+target and preserves an already-different desired destination. At an immediate
+or assignment-boundary cutover, the LogicalAgent adopts the destination
+partition's retention policy. If the destination changes ExecutionTarget, any
+terminal/quiescent reusable presence on the old target is fenced before the
+membership commit.
 
 ---
 
@@ -1128,6 +1139,10 @@ BUSY members
 ```
 
 This is semantic death.
+
+RETIRE must reject a partition that still has nonterminal Tasks or inbound
+desired LogicalAgents. It cannot leave a pending transition pointing at a
+retired partition.
 
 A later deficit for a similar role should create newborn agents rather than silently reviving semantically retired ones.
 

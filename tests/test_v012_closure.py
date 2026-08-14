@@ -23,7 +23,12 @@ from local_agent_scheduler.enums import (
     Retention,
     WorkspaceMode,
 )
-from local_agent_scheduler.errors import ConfigurationError, InvalidTransition, NotFound
+from local_agent_scheduler.errors import (
+    ConfigurationError,
+    InvalidTransition,
+    NotFound,
+    StaleAuthority,
+)
 from local_agent_scheduler.models import (
     ExecutionOutcome,
     ExecutionRequest,
@@ -164,6 +169,43 @@ class ClosureCase(unittest.TestCase):
         self.scheduler.promote_retry_wait(now=13)
         self.assertEqual(self.scheduler.get("tasks", ids["writer"])["state"], "QUEUED")
 
+    def test_core_lease_renewal_requires_an_active_execution(self):
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("supervised-only", {})])
+        claim = self.scheduler.claim_next(self.agent())
+
+        self.assertEqual(
+            self.scheduler.renew_active_leases({claim.attempt_id}),
+            0,
+        )
+        with self.assertRaises(StaleAuthority):
+            self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.assertEqual(
+            self.scheduler.renew_active_leases({claim.attempt_id}),
+            1,
+        )
+        self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=ExecutionState.TERMINATED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+        self.assertEqual(
+            self.scheduler.renew_active_leases({claim.attempt_id}),
+            0,
+        )
+        with self.assertRaises(StaleAuthority):
+            self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+
     def test_cancelled_writer_keeps_safety_escalation_open(self):
         _batch, ids = self.scheduler.submit_batch(
             [TaskSpec("writer", {}, workspace_mode=WorkspaceMode.WRITE)]
@@ -246,6 +288,217 @@ class ClosureCase(unittest.TestCase):
         partitions = {row["name"]: row for row in self.scheduler.list("pool_partitions")}
         self.assertEqual(partitions["general"]["desired_capacity"], 0)
         self.assertEqual(partitions["target"]["desired_capacity"], 2)
+
+    def test_pending_membership_composes_across_merge_and_reconciliation(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("queued-target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        self.scheduler.upsert_partition(
+            PartitionSpec("final-target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("busy-chain", {})])
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+
+        self.scheduler.move_capacity("general", "queued-target", 1)
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)[
+                "pending_partition_name"
+            ],
+            "queued-target",
+        )
+        self.scheduler.merge_partitions("queued-target", "final-target")
+
+        desired = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(desired["partition_name"], "general")
+        self.assertEqual(desired["pending_partition_name"], "final-target")
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+        self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=execution_id,
+            payload={},
+        )
+        committed = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(committed["partition_name"], "final-target")
+        self.assertIsNone(committed["pending_partition_name"])
+
+    def test_pending_membership_composes_across_consecutive_capacity_moves(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("middle", 0, Retention.RESIDENT, "codex", "default")
+        )
+        self.scheduler.upsert_partition(
+            PartitionSpec("final", 0, Retention.RESIDENT, "codex", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("busy-moves", {})])
+        claim = self.scheduler.claim_next_available()
+
+        self.scheduler.move_capacity("general", "middle", 1)
+        self.scheduler.move_capacity("middle", "final", 1)
+
+        desired = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(desired["partition_name"], "general")
+        self.assertEqual(desired["pending_partition_name"], "final")
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+        self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
+        )
+        committed = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(committed["partition_name"], "final")
+        self.assertIsNone(committed["pending_partition_name"])
+
+    def test_merge_does_not_overwrite_an_existing_different_desired_partition(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("existing-desired", 0, Retention.RESIDENT, "codex", "default")
+        )
+        self.scheduler.upsert_partition(
+            PartitionSpec("merge-target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("busy-preserve", {})])
+        claim = self.scheduler.claim_next_available()
+        self.scheduler.move_agent(claim.logical_agent_id, "existing-desired")
+
+        self.scheduler.merge_partitions("general", "merge-target")
+
+        desired = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(desired["partition_name"], "general")
+        self.assertEqual(desired["pending_partition_name"], "existing-desired")
+        self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
+        )
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)[
+                "partition_name"
+            ],
+            "existing-desired",
+        )
+
+    def test_retire_rejects_inbound_desired_membership_atomically(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("busy-retire-target", {})])
+        claim = self.scheduler.claim_next_available()
+        self.scheduler.move_capacity("general", "target", 1)
+        revisions = int(
+            self.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM pool_topology_revisions"
+            )["count"]
+        )
+
+        with self.assertRaisesRegex(InvalidTransition, "desired LogicalAgent"):
+            self.scheduler.retire_partition("target")
+
+        self.assertEqual(
+            int(
+                self.db.fetch_one(
+                    "SELECT COUNT(*) AS count FROM pool_topology_revisions"
+                )["count"]
+            ),
+            revisions,
+        )
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["pending_partition_name"], "target")
+        target = next(
+            row
+            for row in self.scheduler.list("pool_partitions")
+            if row["name"] == "target"
+        )
+        self.assertEqual(target["active"], 1)
+
+    def test_assignment_boundary_adopts_target_retention_policy(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("ephemeral", 0, Retention.EPHEMERAL, "codex", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("to-ephemeral", {})])
+        claim = self.scheduler.claim_next_available()
+        self.scheduler.move_capacity("general", "ephemeral", 1)
+        self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
+        )
+        moved = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(moved["partition_name"], "ephemeral")
+        self.assertEqual(moved["retention"], Retention.EPHEMERAL.value)
+        self.assertEqual(moved["state"], "RETIRED")
+
+        self.scheduler.upsert_partition(
+            PartitionSpec("ephemeral-source", 1, Retention.EPHEMERAL, "codex", "default")
+        )
+        self.scheduler.upsert_partition(
+            PartitionSpec("resident-target", 0, Retention.RESIDENT, "codex", "default")
+        )
+        self.scheduler.reconcile_pool()
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("to-resident", {}, partition="ephemeral-source")]
+        )
+        source_agent = next(
+            row
+            for row in self.scheduler.list("logical_agents", state="READY")
+            if row["partition_name"] == "ephemeral-source"
+        )
+        resident_claim = self.scheduler.claim_next(source_agent["id"])
+        self.scheduler.move_capacity("ephemeral-source", "resident-target", 1)
+        self.scheduler.ack_success(
+            resident_claim.attempt_id,
+            resident_claim.lease_epoch,
+            execution_id=None,
+            payload={},
+        )
+        resident = self.scheduler.get(
+            "logical_agents", resident_claim.logical_agent_id
+        )
+        self.assertEqual(resident["partition_name"], "resident-target")
+        self.assertEqual(resident["retention"], Retention.RESIDENT.value)
+        self.assertEqual(resident["state"], "READY")
+
+    def test_busy_cross_target_cutover_fences_reusable_presence(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("cross-target", {})])
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        execution = self.scheduler.get("executions", execution_id)
+        old_incarnation = execution["incarnation_id"]
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.scheduler.move_capacity("general", "other", 1)
+        self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=execution_id,
+            payload={},
+            incarnation_reusable=True,
+        )
+
+        moved = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(moved["partition_name"], "other")
+        self.assertEqual(
+            self.scheduler.get("incarnations", old_incarnation)["state"], "LOST"
+        )
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("after-cutover", {}, partition="other")]
+        )
+        replacement = self.scheduler.claim_next(claim.logical_agent_id)
+        replacement_execution, _request = self.scheduler.create_execution(replacement)
+        new_incarnation = self.scheduler.get("executions", replacement_execution)[
+            "incarnation_id"
+        ]
+        self.assertNotEqual(new_incarnation, old_incarnation)
+        self.assertEqual(
+            self.scheduler.get("incarnations", new_incarnation)["execution_target"],
+            "other",
+        )
 
     def test_cross_target_move_capacity_cuts_over_idle_presence_immediately(self):
         self.scheduler.resize_partition("general", 3)
@@ -605,6 +858,94 @@ class ClosureCase(unittest.TestCase):
         )
         self.assertEqual(dispatcher.poll_executions(), 1)
         self.assertEqual(self.scheduler.get("tasks", ids["already-running"])["state"], "COMPLETED")
+
+    def test_missing_adapter_closes_read_only_authority_instead_of_renewing(self):
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.RESOURCE_UNAVAILABLE,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("adapter-gone", {}, retry_policy=policy)]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        lease_before = self.scheduler.get("leases", claim.lease_id)["expires_at"]
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", False, True
+                )
+            },
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+
+        self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+        self.assertEqual(
+            self.scheduler.get("leases", claim.lease_id)["expires_at"], lease_before
+        )
+        self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["adapter-gone"])["state"], "RETRY_WAIT"
+        )
+        self.assertEqual(self.scheduler.get("leases", claim.lease_id)["state"], "RELEASED")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "FAILED")
+
+    def test_missing_adapter_suspends_unknown_physical_writer(self):
+        policy = RetryPolicy(max_attempts=1, retry_classes=())
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-adapter-gone",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", False, True
+                )
+            },
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+
+        self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["writer-adapter-gone"])["state"],
+            "SUSPENDED",
+        )
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "SUSPENDED",
+        )
+        escalation = self.scheduler.list("escalations", state="OPEN")[0]
+        self.assertEqual(
+            escalation["failure_class"], FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
+        )
 
     def test_notifier_backoff_is_measured_from_delivery_completion(self):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("notify-later", {})])

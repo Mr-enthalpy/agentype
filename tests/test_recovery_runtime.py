@@ -317,6 +317,44 @@ class RuntimeCase(unittest.TestCase):
         restarted.promote_retry_wait(now=106)
         self.assertEqual(restarted.get("tasks", ids["claimed"])["state"], TaskState.QUEUED)
 
+    def test_restart_fences_unexpired_claim_without_execution_before_heartbeat(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("unstarted", {}, retry_policy=policy)]
+        )
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"], now=time.time())
+        original_expiry = self.scheduler.get("leases", claim.lease_id)["expires_at"]
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": FakeAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.01, heartbeat_seconds=0.02
+        )
+        try:
+            recovery = dispatcher.recover(after_expiry=daemon._start_supervision)
+        finally:
+            daemon._stop_supervision()
+
+        self.assertEqual(recovery["retried"], 1)
+        self.assertEqual(restarted.get("tasks", ids["unstarted"])["state"], "QUEUED")
+        lease = restarted.get("leases", claim.lease_id)
+        self.assertEqual(lease["state"], "EXPIRED")
+        self.assertEqual(lease["expires_at"], original_expiry)
+        failure = restarted.list("failures")[-1]
+        self.assertEqual(failure["failure_code"], "CLAIM_ORPHANED")
+
     def test_restart_reconciles_completed_execution_before_notification(self) -> None:
         batch_id, ids = self.scheduler.submit_batch([TaskSpec("recovered", {})])
         agent = self.scheduler.list("logical_agents", state="READY")[0]

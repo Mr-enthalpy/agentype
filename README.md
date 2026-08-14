@@ -45,7 +45,9 @@ MERGE, and guarded partition retirement. Existing partition structure
 (`retention`, target, profile, and tags) is immutable in V0.1; use `resize` for
 capacity and MOVE/MERGE for classification changes. `pool move-agent` remains
 an explicit diagnostic/admin primitive; normal Root orchestration uses the
-partition-level topology surface.
+partition-level topology surface. Busy topology changes track current and
+desired membership separately; reconciliation counts pending inbound capacity,
+and cutover adopts the destination retention policy.
 
 The example configuration uses the filesystem RootBridge so local testing does
 not wake a real Codex task. Set `root_bridge.kind = "codex_app_server"` and a
@@ -57,6 +59,8 @@ driven and does not poll Scheduler state.
 Outbox delivery runs in a narrow notifier thread independently of execution
 supervision and Lease heartbeat renewal. Failed delivery backoff is measured
 from delivery completion, so a slow timeout cannot trigger an immediate retry.
+Heartbeat renewal is restricted to active Executions whose adapter is available
+to the current daemon; restart recovery fences unstarted claims before renewal.
 
 See [docs/V0.1_COMPLETION_REPORT.md](docs/V0.1_COMPLETION_REPORT.md) for the
 implemented boundaries, recovery procedure, test evidence, and limitations.
