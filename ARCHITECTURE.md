@@ -1082,6 +1082,12 @@ A successful MOVE preserves:
 
 For BUSY agents, V0.1 should normally apply the move at an assignment/drain boundary.
 
+An idle READY agent has no future assignment boundary.  If a MOVE crosses
+ExecutionTarget and its previous Incarnation has no active Execution, the
+topology transaction fences that old reusable binding as LOST and immediately
+moves the same LogicalAgent identity.  It must not create an unassigned,
+permanently DRAINING identity.
+
 A topology change must not silently mutate the role contract governing an already-active Attempt.
 
 ---
@@ -1101,6 +1107,10 @@ Shared state should be communicated through Workstream/project/checkpoint state.
 A merge therefore affects scheduling classification, not agent minds.
 
 For V0.1, MERGE also moves every nonterminal source Task's future scheduling classification to the target. An already-active Attempt keeps its frozen LogicalAgent, ExecutionTarget/Profile, and lease epoch; only later retry/dispatch observes the target partition. Desired target capacity is the sum of the two declared capacities at the topology revision boundary, never a function of instantaneous runtime population.
+
+The same idle cross-target cutover rule applies during MERGE: inactive reusable
+presence is fenced, while only an actually ASSIGNED identity uses a pending
+drain transition.
 
 ---
 

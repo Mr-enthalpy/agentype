@@ -7,12 +7,13 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
-from local_agent_scheduler.cli import _task_specs, build_parser
-from local_agent_scheduler.config import ExecutionTargetConfig
+from local_agent_scheduler.cli import _partition_spec_for_upsert, _task_specs, build_parser
+from local_agent_scheduler.config import ExecutionTargetConfig, load_config
 from local_agent_scheduler.core import Scheduler
 from local_agent_scheduler.enums import (
     AgentState,
@@ -22,8 +23,9 @@ from local_agent_scheduler.enums import (
     Retention,
     WorkspaceMode,
 )
-from local_agent_scheduler.errors import InvalidTransition, NotFound
+from local_agent_scheduler.errors import ConfigurationError, InvalidTransition, NotFound
 from local_agent_scheduler.models import (
+    ExecutionOutcome,
     ExecutionRequest,
     PartitionSpec,
     RetryPolicy,
@@ -66,6 +68,32 @@ class BlockingBridge:
         if not self.release.wait(2):
             raise TimeoutError("test bridge was not released")
         return type("Delivery", (), {"delivered": True, "detail": None})()
+
+
+class AdvancingFailureBridge:
+    def __init__(self, clock):
+        self.clock = clock
+
+    def deliver(self, *_args):
+        self.clock[0] += 100
+        return type("Delivery", (), {"delivered": False, "detail": "slow failure"})()
+
+
+class SuccessfulTerminalAdapter:
+    def observe_execution(self, _handle):
+        return type(
+            "Observation",
+            (),
+            {
+                "state": ExecutionState.SUCCEEDED,
+                "terminal_confirmed": True,
+                "quiescent_confirmed": True,
+                "detail": None,
+            },
+        )()
+
+    def collect_outcome(self, _handle):
+        return ExecutionOutcome(ExecutionState.SUCCEEDED, payload={"ok": True})
 
 
 class ClosureCase(unittest.TestCase):
@@ -219,6 +247,36 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(partitions["general"]["desired_capacity"], 0)
         self.assertEqual(partitions["target"]["desired_capacity"], 2)
 
+    def test_cross_target_move_capacity_cuts_over_idle_presence_immediately(self):
+        self.scheduler.resize_partition("general", 3)
+        self.scheduler.upsert_partition(
+            PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
+        )
+        self.scheduler.reconcile_pool()
+        agents = self.scheduler.list("logical_agents", state="READY")
+        incarnation_ids = []
+        with self.db.transaction() as conn:
+            for agent, state in zip(agents, ("STARTING", "WARM", "COLD"), strict=True):
+                incarnation = self.scheduler._ensure_incarnation(
+                    conn, agent["id"], "codex", time.time()
+                )
+                incarnation_ids.append(incarnation)
+                conn.execute(
+                    "UPDATE incarnations SET state=? WHERE id=?", (state, incarnation)
+                )
+
+        self.scheduler.move_capacity("general", "other", 3)
+
+        for agent, incarnation in zip(agents, incarnation_ids, strict=True):
+            moved = self.scheduler.get("logical_agents", agent["id"])
+            self.assertEqual(moved["state"], "READY")
+            self.assertEqual(moved["partition_name"], "other")
+            self.assertIsNone(moved["pending_partition_name"])
+            self.assertEqual(
+                self.scheduler.get("incarnations", incarnation)["state"], "LOST"
+            )
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+
     def test_cli_rejects_optional_tasks_and_exposes_partition_surface(self):
         with self.assertRaisesRegex(ValueError, "optional Tasks are not supported"):
             _task_specs({"tasks": [{"name": "optional", "payload": {}, "required": False}]})
@@ -233,6 +291,32 @@ class ClosureCase(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(parser.parse_args(command).command, "pool")
+
+    def test_pool_upsert_cli_rejects_unknown_target_and_profile(self):
+        config = load_config(
+            Path(__file__).resolve().parents[1] / "config" / "scheduler.example.toml"
+        )
+        parser = build_parser()
+        valid = parser.parse_args(
+            ["pool", "upsert", "new", "1", "resident", "local_codex", "default"]
+        )
+        self.assertEqual(_partition_spec_for_upsert(valid, config).name, "new")
+        with self.assertRaisesRegex(ConfigurationError, "unknown execution target"):
+            _partition_spec_for_upsert(
+                parser.parse_args(
+                    ["pool", "upsert", "new", "1", "resident", "missing", "default"]
+                ),
+                config,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "unknown execution profile"):
+            _partition_spec_for_upsert(
+                parser.parse_args(
+                    ["pool", "upsert", "new", "1", "resident", "local_codex", "missing"]
+                ),
+                config,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "--config is required"):
+            _partition_spec_for_upsert(valid, None)
 
     def test_preferred_workstream_agent_wins_global_match(self):
         ws = self.scheduler.create_workstream("same")
@@ -306,6 +390,8 @@ class ClosureCase(unittest.TestCase):
             partition = restarted.list("pool_partitions")[0]
             self.assertEqual(partition["active"], 0)
             self.assertEqual(partition["desired_capacity"], 0)
+            with self.assertRaisesRegex(InvalidTransition, "cannot reactivate"):
+                restarted.upsert_partition(spec)
 
     def test_merge_migrates_future_task_classification_not_active_authority(self):
         self.scheduler.upsert_partition(
@@ -409,7 +495,7 @@ class ClosureCase(unittest.TestCase):
         events = self.scheduler.list("notification_outbox")
         self.assertEqual([event["event_type"] for event in events], ["BATCH_RESULTS_READY"])
 
-    def test_cross_target_move_waits_for_physical_presence_boundary(self):
+    def test_cross_target_move_agent_cuts_over_idle_presence_immediately(self):
         self.scheduler.upsert_partition(
             PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
         )
@@ -418,13 +504,121 @@ class ClosureCase(unittest.TestCase):
             incarnation = self.scheduler._ensure_incarnation(conn, agent, "codex", time.time())
             conn.execute("UPDATE incarnations SET state='WARM' WHERE id=?", (incarnation,))
         self.scheduler.move_agent(agent, "other")
-        draining = self.scheduler.get("logical_agents", agent)
-        self.assertEqual(draining["state"], "DRAINING")
-        self.assertEqual(draining["partition_name"], "general")
-        self.scheduler.mark_incarnation_lost(incarnation)
         moved = self.scheduler.get("logical_agents", agent)
         self.assertEqual(moved["state"], "READY")
         self.assertEqual(moved["partition_name"], "other")
+        self.assertEqual(self.scheduler.get("incarnations", incarnation)["state"], "LOST")
+
+    def test_cross_target_merge_preserves_idle_identity_without_replacement_birth(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
+        )
+        agent = self.agent()
+        with self.db.transaction() as conn:
+            incarnation = self.scheduler._ensure_incarnation(
+                conn, agent, "codex", time.time()
+            )
+            conn.execute(
+                "UPDATE incarnations SET state='WARM' WHERE id=?", (incarnation,)
+            )
+
+        self.scheduler.merge_partitions("general", "other")
+
+        moved = self.scheduler.get("logical_agents", agent)
+        self.assertEqual(moved["state"], "READY")
+        self.assertEqual(moved["partition_name"], "other")
+        self.assertIsNone(moved["pending_partition_name"])
+        self.assertEqual(self.scheduler.get("incarnations", incarnation)["state"], "LOST")
+        reconciled = self.scheduler.reconcile_pool()
+        self.assertEqual(reconciled["born"], 0)
+        self.assertEqual(reconciled["retired"], 0)
+
+    def test_upsert_is_create_or_idempotent_structural_redeclaration(self):
+        original = next(
+            row
+            for row in self.scheduler.list("pool_partitions")
+            if row["name"] == "general"
+        )
+        revision_count = int(
+            self.db.fetch_one("SELECT COUNT(*) AS count FROM pool_topology_revisions")[
+                "count"
+            ]
+        )
+        same = PartitionSpec("general", 1, Retention.RESIDENT, "codex", "default")
+        self.assertEqual(
+            self.scheduler.upsert_partition(same), original["topology_revision"]
+        )
+        self.assertEqual(
+            int(
+                self.db.fetch_one(
+                    "SELECT COUNT(*) AS count FROM pool_topology_revisions"
+                )["count"]
+            ),
+            revision_count,
+        )
+        mutations = (
+            PartitionSpec("general", 2, Retention.RESIDENT, "codex", "default"),
+            PartitionSpec("general", 1, Retention.EPHEMERAL, "codex", "default"),
+            PartitionSpec("general", 1, Retention.RESIDENT, "other", "default"),
+            PartitionSpec("general", 1, Retention.RESIDENT, "codex", "other"),
+            PartitionSpec(
+                "general", 1, Retention.RESIDENT, "codex", "default", ("new",)
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(InvalidTransition):
+                self.scheduler.upsert_partition(mutation)
+
+    def test_unavailable_execution_target_is_normalized_not_raised(self):
+        policy = RetryPolicy(max_attempts=1, retry_classes=())
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("unavailable", {}, retry_policy=policy)]
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={},
+            targets={},
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+        self.assertEqual(dispatcher.dispatch_ready(), 0)
+        self.assertEqual(self.scheduler.get("tasks", ids["unavailable"])["state"], "SUSPENDED")
+        failure = self.scheduler.list("failures")[-1]
+        self.assertEqual(failure["failure_class"], "RESOURCE_UNAVAILABLE")
+
+    def test_poll_terminal_outcome_tolerates_missing_target_configuration(self):
+        _batch, ids = self.scheduler.submit_batch([TaskSpec("already-running", {})])
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": SuccessfulTerminalAdapter()},
+            targets={},
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+        self.assertEqual(dispatcher.poll_executions(), 1)
+        self.assertEqual(self.scheduler.get("tasks", ids["already-running"])["state"], "COMPLETED")
+
+    def test_notifier_backoff_is_measured_from_delivery_completion(self):
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("notify-later", {})])
+        claim = self.scheduler.claim_next(self.agent())
+        self.scheduler.ack_success(
+            claim.attempt_id, claim.lease_epoch, execution_id=None, payload={}
+        )
+        clock = [time.time() + 1]
+        dispatcher = OutboxDispatcher(self.scheduler.db, AdvancingFailureBridge(clock))
+        with patch("local_agent_scheduler.root_bridge.utc_now", side_effect=lambda: clock[0]):
+            self.assertEqual(dispatcher.deliver_pending(now=clock[0]), 0)
+        event = self.scheduler.list("notification_outbox")[0]
+        self.assertEqual(event["delivery_attempts"], 1)
+        self.assertEqual(event["next_delivery_at"], clock[0] + 2)
 
     def test_slow_notifier_does_not_block_dispatcher_or_lease_supervision(self):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("notify", {})])

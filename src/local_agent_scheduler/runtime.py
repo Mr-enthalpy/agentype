@@ -11,7 +11,7 @@ from .adapters.base import ExecutionAdapter
 from .config import ExecutionTargetConfig
 from .core import Scheduler
 from .enums import AgentState, ExecutionState, FailureClass, WorkspaceMode
-from .errors import StaleAuthority
+from .errors import ConfigurationError, StaleAuthority
 from .models import ExecutionObservation, ExecutionRequest
 from .root_bridge import OutboxDispatcher
 from .storage import json_loads
@@ -24,12 +24,14 @@ class Dispatcher:
         *,
         adapters: Mapping[str, ExecutionAdapter],
         targets: Mapping[str, ExecutionTargetConfig],
+        execution_profiles: set[str] | None = None,
         workspace_root: str | Path,
         outbox: OutboxDispatcher | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.adapters = dict(adapters)
         self.targets = dict(targets)
+        self.execution_profiles = set(execution_profiles or ())
         self.workspace_root = str(Path(workspace_root).resolve())
         self.outbox = outbox
 
@@ -83,11 +85,32 @@ class Dispatcher:
             claim = self.scheduler.claim_next_available()
             if claim is None:
                 break
+            adapter = self.adapters.get(claim.execution_target)
+            target = self.targets.get(claim.execution_target)
+            profile_unavailable = bool(
+                self.execution_profiles
+                and claim.execution_profile not in self.execution_profiles
+            )
+            if adapter is None or target is None or profile_unavailable:
+                detail = (
+                    f"execution target {claim.execution_target!r} is unavailable"
+                    if adapter is None or target is None
+                    else f"execution profile {claim.execution_profile!r} is unavailable"
+                )
+                self.scheduler.nack(
+                    claim.attempt_id,
+                    claim.lease_epoch,
+                    failure_class=FailureClass.RESOURCE_UNAVAILABLE,
+                    failure_code="EXECUTION_CONFIGURATION_UNAVAILABLE",
+                    detail=detail,
+                    terminal_confirmed=True,
+                    quiescent_confirmed=True,
+                )
+                continue
             agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
             execution_id, request_id = self.scheduler.create_execution(claim)
             execution = self.scheduler.get("executions", execution_id)
             incarnation_id = execution["incarnation_id"]
-            adapter = self.adapters[claim.execution_target]
             incarnation = self.scheduler.get("incarnations", incarnation_id)
             request = ExecutionRequest(
                 request_id=request_id,
@@ -132,7 +155,7 @@ class Dispatcher:
                     detail=start.detail,
                     terminal_confirmed=True,
                     quiescent_confirmed=True,
-                    attempt_isolation=self.targets[claim.execution_target].attempt_isolation,
+                    attempt_isolation=target.attempt_isolation,
                 )
         return dispatched
 
@@ -200,6 +223,8 @@ class Dispatcher:
             quiescent_confirmed = (
                 observation.quiescent_confirmed or outcome.quiescent_confirmed
             )
+            target = self.targets.get(execution["execution_target"])
+            attempt_isolation = bool(target and target.attempt_isolation)
             try:
                 attempt = self.scheduler.get("attempts", execution["attempt_id"])
                 epoch = int(attempt["lease_epoch"])
@@ -212,13 +237,10 @@ class Dispatcher:
                         summary=outcome.summary,
                         continuity_capsule=outcome.checkpoint,
                         quiescent_confirmed=quiescent_confirmed,
-                        attempt_isolation=self.targets[
-                            execution["execution_target"]
-                        ].attempt_isolation,
+                        attempt_isolation=attempt_isolation,
                         incarnation_reusable=outcome.incarnation_reusable,
                     )
                 else:
-                    target = self.targets[execution["execution_target"]]
                     self.scheduler.nack(
                         execution["attempt_id"],
                         epoch,
@@ -228,7 +250,7 @@ class Dispatcher:
                         failure_signature=outcome.failure_signature,
                         terminal_confirmed=terminal_confirmed,
                         quiescent_confirmed=quiescent_confirmed,
-                        attempt_isolation=target.attempt_isolation,
+                        attempt_isolation=attempt_isolation,
                         incarnation_reusable=outcome.incarnation_reusable,
                     )
             except StaleAuthority:
@@ -247,7 +269,12 @@ class Dispatcher:
 
     def interrupt_execution(self, execution_id: str, *, terminate: bool = False) -> dict[str, object]:
         execution = self.scheduler.get("executions", execution_id)
-        adapter = self.adapters[execution["execution_target"]]
+        adapter = self.adapters.get(execution["execution_target"])
+        if adapter is None:
+            raise ConfigurationError(
+                f"execution target {execution['execution_target']!r} is unavailable"
+            )
+        target = self.targets.get(execution["execution_target"])
         handle = json_loads(execution["runtime_handle_json"], {})
         observation = (
             adapter.terminate_execution(handle)
@@ -269,7 +296,7 @@ class Dispatcher:
         self.scheduler.cancel_task(
             execution["task_id"],
             quiescence_confirmed=observation.quiescent_confirmed,
-            attempt_isolation=self.targets[execution["execution_target"]].attempt_isolation,
+            attempt_isolation=bool(target and target.attempt_isolation),
         )
         return {
             "execution_id": execution_id,

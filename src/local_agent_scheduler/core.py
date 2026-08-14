@@ -88,6 +88,33 @@ class Scheduler:
             "tags": list(spec.tags),
         }
         with self.db.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM pool_partitions WHERE name=?", (spec.name,)
+            ).fetchone()
+            if existing:
+                if not existing["active"]:
+                    raise InvalidTransition(
+                        "pool upsert cannot reactivate an inactive partition"
+                    )
+                structural_mismatches = []
+                if existing["retention"] != spec.retention.value:
+                    structural_mismatches.append("retention")
+                if existing["execution_target"] != spec.execution_target:
+                    structural_mismatches.append("execution_target")
+                if existing["execution_profile"] != spec.execution_profile:
+                    structural_mismatches.append("execution_profile")
+                if sorted(json_loads(existing["tags_json"], [])) != sorted(spec.tags):
+                    structural_mismatches.append("tags")
+                if structural_mismatches:
+                    raise InvalidTransition(
+                        "pool upsert cannot mutate an existing partition's structural "
+                        f"definition: {', '.join(structural_mismatches)}"
+                    )
+                if int(existing["desired_capacity"]) != spec.desired_capacity:
+                    raise InvalidTransition(
+                        "pool upsert cannot resize an existing partition; use pool resize"
+                    )
+                return int(existing["topology_revision"])
             cursor = conn.execute(
                 "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) VALUES(?,?,?)",
                 ("UPSERT", json_dumps(payload), now),
@@ -96,12 +123,7 @@ class Scheduler:
             conn.execute(
                 "INSERT INTO pool_partitions(name,desired_capacity,retention,execution_target,"
                 "execution_profile,tags_json,active,topology_revision,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,1,?,?,?) "
-                "ON CONFLICT(name) DO UPDATE SET desired_capacity=excluded.desired_capacity,"
-                "retention=excluded.retention,execution_target=excluded.execution_target,"
-                "execution_profile=excluded.execution_profile,tags_json=excluded.tags_json,"
-                "active=1,merged_into=NULL,topology_revision=excluded.topology_revision,"
-                "updated_at=excluded.updated_at",
+                "VALUES(?,?,?,?,?,?,1,?,?,?)",
                 (
                     spec.name,
                     spec.desired_capacity,
@@ -115,6 +137,43 @@ class Scheduler:
                 ),
             )
         return revision
+
+    @staticmethod
+    def _cutover_idle_presence(
+        conn: sqlite3.Connection,
+        agent: sqlite3.Row,
+        execution_target: str,
+        now: float,
+    ) -> None:
+        """Abandon an idle cross-target binding at a topology cutover.
+
+        An unassigned identity has no assignment boundary to finish a pending
+        transition.  It is safe to fence its old reusable physical binding
+        only when no Attempt or Execution is active; the LogicalAgent identity
+        then moves immediately and may acquire a fresh Incarnation on demand.
+        """
+
+        if agent["current_task_id"] or conn.execute(
+            "SELECT 1 FROM attempts WHERE logical_agent_id=? AND state='ACTIVE' LIMIT 1",
+            (agent["id"],),
+        ).fetchone():
+            raise InvalidTransition("an assigned LogicalAgent must use a drain boundary")
+        active_execution = conn.execute(
+            "SELECT e.id FROM executions e JOIN incarnations i ON i.id=e.incarnation_id "
+            "WHERE i.logical_agent_id=? AND e.state IN ('STARTING','RUNNING','UNKNOWN') "
+            "LIMIT 1",
+            (agent["id"],),
+        ).fetchone()
+        if active_execution:
+            raise InvalidTransition(
+                "an idle topology cutover cannot abandon an active Execution"
+            )
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE logical_agent_id=? AND execution_target<>? "
+            "AND state IN ('STARTING','WARM','COLD')",
+            (now, agent["id"], execution_target),
+        )
 
     def bootstrap_partitions(self, specs: Sequence[PartitionSpec]) -> bool:
         """Apply human configuration once; SQLite owns topology thereafter."""
@@ -330,22 +389,34 @@ class Scheduler:
                 active_presence
                 and active_presence["execution_target"] != target["execution_target"]
             )
-            if agent["state"] in (AgentState.ASSIGNED.value, AgentState.DRAINING.value):
+            if agent["state"] == AgentState.ASSIGNED.value or agent["current_task_id"]:
                 conn.execute(
                     "UPDATE logical_agents SET pending_partition_name=?,updated_at=? WHERE id=?",
                     (target_partition, now, agent_id),
                 )
-            elif target_boundary:
-                conn.execute(
-                    "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
-                    "available_since=NULL,updated_at=? WHERE id=?",
-                    (target_partition, now, agent_id),
-                )
             else:
+                if target_boundary:
+                    self._cutover_idle_presence(
+                        conn, agent, target["execution_target"], now
+                    )
+                next_state = (
+                    AgentState.READY.value
+                    if agent["state"] == AgentState.DRAINING.value
+                    else agent["state"]
+                )
                 conn.execute(
-                    "UPDATE logical_agents SET partition_name=?,pending_partition_name=NULL,updated_at=? "
-                    "WHERE id=?",
-                    (target_partition, now, agent_id),
+                    "UPDATE logical_agents SET state=?,partition_name=?,"
+                    "pending_partition_name=NULL,retirement_requested=0,"
+                    "available_since=CASE WHEN ?='READY' THEN COALESCE(available_since,?) "
+                    "ELSE available_since END,updated_at=? WHERE id=?",
+                    (
+                        next_state,
+                        target_partition,
+                        next_state,
+                        now,
+                        now,
+                        agent_id,
+                    ),
                 )
 
     def resize_partition(self, name: str, desired_capacity: int) -> int:
@@ -437,13 +508,17 @@ class Scheduler:
                     and active_presence["execution_target"]
                     != target_partition["execution_target"]
                 )
-                if agent["state"] == AgentState.ASSIGNED.value or target_boundary:
+                if agent["state"] == AgentState.ASSIGNED.value:
                     conn.execute(
                         "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
                         "available_since=NULL,updated_at=? WHERE id=?",
                         (target, now, agent["id"]),
                     )
                 else:
+                    if target_boundary:
+                        self._cutover_idle_presence(
+                            conn, agent, target_partition["execution_target"], now
+                        )
                     conn.execute(
                         "UPDATE logical_agents SET partition_name=?,pending_partition_name=NULL,"
                         "updated_at=? WHERE id=?",
@@ -490,13 +565,14 @@ class Scheduler:
                 (target, now, source),
             )
             if source_partition["execution_target"] != target_partition["execution_target"]:
-                conn.execute(
-                    "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?,"
-                    "available_since=NULL,updated_at=? WHERE partition_name=? AND state='READY' "
-                    "AND EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id=logical_agents.id "
-                    "AND i.state IN ('STARTING','WARM','COLD'))",
-                    (target, now, source),
-                )
+                ready_members = conn.execute(
+                    "SELECT * FROM logical_agents WHERE partition_name=? AND state='READY'",
+                    (source,),
+                ).fetchall()
+                for agent in ready_members:
+                    self._cutover_idle_presence(
+                        conn, agent, target_partition["execution_target"], now
+                    )
             conn.execute(
                 "UPDATE logical_agents SET partition_name=?,updated_at=? "
                 "WHERE partition_name=? "

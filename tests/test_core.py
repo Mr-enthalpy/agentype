@@ -331,9 +331,7 @@ class SchedulerCase(unittest.TestCase):
         )
 
     def test_execution_ownership_and_state_transitions_are_closed(self) -> None:
-        self.scheduler.upsert_partition(
-            PartitionSpec("general", 2, Retention.RESIDENT, "local", "default")
-        )
+        self.scheduler.resize_partition("general", 2)
         self.scheduler.reconcile_pool()
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("a", {}), TaskSpec("b", {})])
         agents = self.scheduler.list("logical_agents", state="READY")
@@ -413,9 +411,7 @@ class SchedulerCase(unittest.TestCase):
         self.assertEqual(self.scheduler.get("logical_agents", agent_id)["state"], AgentState.RETIRED)
 
     def test_batch_cancellation_revokes_authority_and_preserves_completed_result(self) -> None:
-        self.scheduler.upsert_partition(
-            PartitionSpec("general", 2, Retention.RESIDENT, "local", "default")
-        )
+        self.scheduler.resize_partition("general", 2)
         self.scheduler.reconcile_pool()
         batch_id, ids = self.scheduler.submit_batch(
             [TaskSpec("done", {}), TaskSpec("active", {})]
@@ -484,9 +480,7 @@ class TopologyCase(SchedulerCase):
         )
         self.scheduler.merge_partitions("a", "b")
         self.assertEqual(self.scheduler.get("logical_agents", other["id"])["partition_name"], "b")
-        self.scheduler.upsert_partition(
-            PartitionSpec("b", 0, Retention.RESIDENT, "local", "default")
-        )
+        self.scheduler.resize_partition("b", 0)
         self.scheduler.reconcile_pool()
         retired = [
             row for row in self.scheduler.list("logical_agents") if row["state"] == AgentState.RETIRED

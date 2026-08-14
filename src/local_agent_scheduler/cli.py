@@ -10,6 +10,7 @@ from .adapters.codex import CodexAppServerAdapter
 from .config import SchedulerConfig, load_config
 from .core import Scheduler
 from .enums import ContinuityPreference, FailureClass, Retention, WorkspaceMode
+from .errors import ConfigurationError
 from .models import PartitionSpec, RetryPolicy, TaskSpec
 from .root_bridge import CodexAppServerRootBridge, FilesystemRootBridge, OutboxDispatcher
 from .runtime import Dispatcher, SchedulerDaemon
@@ -37,9 +38,48 @@ def _apply_config(scheduler: Scheduler, config: SchedulerConfig) -> None:
     scheduler.reconcile_pool()
 
 
+def _partition_spec_for_upsert(
+    args: argparse.Namespace, config: SchedulerConfig | None
+) -> PartitionSpec:
+    if not config:
+        raise ConfigurationError("--config is required for pool upsert")
+    target_names = {target.name for target in config.execution_targets}
+    if args.execution_target not in target_names:
+        raise ConfigurationError(
+            f"unknown execution target {args.execution_target!r}"
+        )
+    if args.execution_profile not in config.execution_profiles:
+        raise ConfigurationError(
+            f"unknown execution profile {args.execution_profile!r}"
+        )
+    return PartitionSpec(
+        args.name,
+        args.desired_capacity,
+        Retention(args.retention),
+        args.execution_target,
+        args.execution_profile,
+        tuple(args.tag),
+    )
+
+
 def _build_dispatcher(
     scheduler: Scheduler, config: SchedulerConfig
 ) -> tuple[Dispatcher, SchedulerDaemon]:
+    target_names = {target.name for target in config.execution_targets}
+    profile_names = set(config.execution_profiles)
+    for partition in scheduler.list("pool_partitions"):
+        if not partition["active"]:
+            continue
+        if partition["execution_target"] not in target_names:
+            raise ConfigurationError(
+                f"active partition {partition['name']!r} references unavailable "
+                f"execution target {partition['execution_target']!r}"
+            )
+        if partition["execution_profile"] not in profile_names:
+            raise ConfigurationError(
+                f"active partition {partition['name']!r} references unavailable "
+                f"execution profile {partition['execution_profile']!r}"
+            )
     process_cwd = config.resolve(config.codex_adapter.cwd)
     adapter = CodexAppServerAdapter(
         command=config.codex_adapter.command,
@@ -65,6 +105,7 @@ def _build_dispatcher(
         scheduler,
         adapters=adapters,
         targets=targets,
+        execution_profiles=profile_names,
         workspace_root=process_cwd,
         outbox=outbox,
     )
@@ -276,14 +317,7 @@ def main(argv: list[str] | None = None) -> int:
             _print(scheduler.reconcile_pool())
         elif args.action == "upsert":
             revision = scheduler.upsert_partition(
-                PartitionSpec(
-                    args.name,
-                    args.desired_capacity,
-                    Retention(args.retention),
-                    args.execution_target,
-                    args.execution_profile,
-                    tuple(args.tag),
-                )
+                _partition_spec_for_upsert(args, config)
             )
             _print({"revision": revision})
         elif args.action == "resize":

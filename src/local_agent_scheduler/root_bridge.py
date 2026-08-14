@@ -213,6 +213,7 @@ class OutboxDispatcher:
                 )
             except Exception as exc:  # RootBridge failure is data, not Task failure.
                 observation = DeliveryObservation(False, str(exc))
+            delivery_finished_at = utc_now()
             with self.db.transaction() as conn:
                 current = conn.execute(
                     "SELECT state,delivery_attempts FROM notification_outbox WHERE id=?",
@@ -225,7 +226,7 @@ class OutboxDispatcher:
                     conn.execute(
                         "UPDATE notification_outbox SET state='DELIVERED',delivery_attempts=?,"
                         "delivered_at=?,last_error=NULL WHERE id=?",
-                        (attempts, now, row["id"]),
+                        (attempts, delivery_finished_at, row["id"]),
                     )
                     delivered += 1
                 else:
@@ -233,7 +234,12 @@ class OutboxDispatcher:
                     conn.execute(
                         "UPDATE notification_outbox SET delivery_attempts=?,next_delivery_at=?,"
                         "last_error=? WHERE id=?",
-                        (attempts, now + delay, observation.detail, row["id"]),
+                        (
+                            attempts,
+                            delivery_finished_at + delay,
+                            observation.detail,
+                            row["id"],
+                        ),
                     )
         return delivered
 
