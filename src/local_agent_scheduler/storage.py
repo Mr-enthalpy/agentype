@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def new_id(prefix: str) -> str:
@@ -392,8 +392,17 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (5, utc_now()),
                     )
+                    current = 5
                 else:
                     self._migrate_v4_to_v5(conn)
+                if current < 6:
+                    self._migrate_v5_to_v6(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (6, utc_now()),
+                    )
+                else:
+                    self._migrate_v5_to_v6(conn)
                 conn.execute("COMMIT")
                 conn.execute("PRAGMA foreign_keys = ON")
                 violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -689,6 +698,23 @@ class Database:
             "WHERE state='DRAINING' AND current_task_id IS NULL "
             "AND pending_partition_name IS NULL AND retirement_requested=1",
             (utc_now(),),
+        )
+
+    @staticmethod
+    def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+        """Preserve unresolved physical work and close semantic retirement presence."""
+
+        now = utc_now()
+        conn.execute(
+            "UPDATE executions SET state='UNKNOWN',ended_at=NULL,updated_at=? "
+            "WHERE state='FAILED' AND terminal_confirmed=0",
+            (now,),
+        )
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE state IN ('STARTING','WARM','COLD') "
+            "AND logical_agent_id IN (SELECT id FROM logical_agents WHERE state='RETIRED')",
+            (now,),
         )
 
     @contextlib.contextmanager

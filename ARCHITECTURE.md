@@ -819,6 +819,10 @@ semantic retirement
 → requires new birth if capacity is later needed
 ```
 
+Semantic retirement also fences every reusable STARTING/WARM/COLD Incarnation.
+An identity that is terminal at the LogicalAgent layer cannot retain an
+authoritative warm physical presence outside Scheduler lifecycle ownership.
+
 ---
 
 # 15. Logical Agent Memory
@@ -1512,6 +1516,12 @@ retry_hint
 ```
 
 Scheduler policy operates on these standardized facts.
+
+Supervisor or adapter unavailability is not evidence that a physical Execution
+failed or became quiescent. When Task authority must be revoked while physical
+termination remains unconfirmed, the Execution stays UNKNOWN and reconcilable.
+In particular, a non-isolated writer with unknown quiescence continues to block
+cross-target physical detachment until the safety obligation is resolved.
 
 Scheduler must not parse CCR-, Codex-, TokenRhythm-, OpenCode-, or provider-specific error strings.
 

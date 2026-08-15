@@ -278,6 +278,24 @@ class Scheduler:
             return target
         return self._commit_partition_cutover(conn, agent, str(target["name"]), now)
 
+    @staticmethod
+    def _retire_logical_agent(
+        conn: sqlite3.Connection, agent_id: str, now: float
+    ) -> None:
+        """Commit semantic death and fence every reusable physical presence."""
+
+        conn.execute(
+            "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?) "
+            "WHERE logical_agent_id=? AND state IN ('STARTING','WARM','COLD')",
+            (now, agent_id),
+        )
+        conn.execute(
+            "UPDATE logical_agents SET state='RETIRED',current_task_id=NULL,"
+            "pending_partition_name=NULL,retirement_requested=0,available_since=NULL,"
+            "updated_at=? WHERE id=?",
+            (now, agent_id),
+        )
+
     def bootstrap_partitions(self, specs: Sequence[PartitionSpec]) -> bool:
         """Apply human configuration once; SQLite owns topology thereafter."""
 
@@ -424,11 +442,7 @@ class Scheduler:
                             AgentState.INITIALIZING.value,
                             AgentState.REVIVING.value,
                         ) and not member["current_task_id"]:
-                            conn.execute(
-                                "UPDATE logical_agents SET state='RETIRED',available_since=NULL,updated_at=? "
-                                "WHERE id=?",
-                                (now, member["id"]),
-                            )
+                            self._retire_logical_agent(conn, member["id"], now)
                             retired += 1
                         else:
                             conn.execute(
@@ -737,12 +751,14 @@ class Scheduler:
                 ("RETIRE", json_dumps({"name": name}), now),
             )
             revision = int(cursor.lastrowid)
-            conn.execute(
-                "UPDATE logical_agents SET state='RETIRED',available_since=NULL,updated_at=? "
-                "WHERE partition_name=? AND pending_partition_name IS NULL "
+            idle_retirements = conn.execute(
+                "SELECT id FROM logical_agents WHERE partition_name=? "
+                "AND pending_partition_name IS NULL "
                 "AND state IN ('READY','INITIALIZING','SUSPENDED','REVIVING')",
-                (now, name),
-            )
+                (name,),
+            ).fetchall()
+            for agent in idle_retirements:
+                self._retire_logical_agent(conn, agent["id"], now)
             conn.execute(
                 "UPDATE logical_agents SET state='DRAINING',retirement_requested=1,updated_at=? "
                 "WHERE partition_name=? AND pending_partition_name IS NULL AND state='ASSIGNED'",
@@ -1570,10 +1586,15 @@ class Scheduler:
                         f"execution {execution_id} cannot fail from {execution['state']}"
                     )
                 conn.execute(
-                    "UPDATE executions SET state='FAILED',failure_class=?,failure_code=?,"
+                    "UPDATE executions SET state=?,failure_class=?,failure_code=?,"
                     "failure_signature=?,terminal_confirmed=?,quiescent_confirmed=?,updated_at=?,"
                     "ended_at=CASE WHEN ? THEN ? ELSE ended_at END WHERE id=?",
                     (
+                        (
+                            ExecutionState.FAILED.value
+                            if terminal_confirmed
+                            else ExecutionState.UNKNOWN.value
+                        ),
                         failure_class.value,
                         failure_code,
                         failure_signature,
@@ -2314,22 +2335,17 @@ class Scheduler:
         agent = self._required(conn, "logical_agents", agent_id)
         pending = agent["pending_partition_name"]
         if agent["retirement_requested"]:
-            conn.execute(
-                "UPDATE logical_agents SET state='RETIRED',current_task_id=NULL,"
-                "pending_partition_name=NULL,available_since=NULL,updated_at=? WHERE id=?",
-                (now, agent_id),
-            )
+            self._retire_logical_agent(conn, agent_id, now)
             return
 
         target_name = pending or agent["partition_name"]
         target = self._commit_partition_cutover(conn, agent, target_name, now)
         retire = target["retention"] == Retention.EPHEMERAL.value
         if retire:
-            state = AgentState.RETIRED.value
-            available_since = None
-        else:
-            state = AgentState.READY.value
-            available_since = now
+            self._retire_logical_agent(conn, agent_id, now)
+            return
+        state = AgentState.READY.value
+        available_since = now
         conn.execute(
             "UPDATE logical_agents SET state=?,current_task_id=NULL,"
             "pending_partition_name=NULL,available_since=?,updated_at=? WHERE id=?",
@@ -2483,13 +2499,14 @@ class Scheduler:
             "UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL,updated_at=? WHERE id=?",
             (now, task["id"]),
         )
-        self._release_agent(conn, attempt["logical_agent_id"], now)
         if failure_class is FailureClass.WRITER_QUIESCENCE_UNKNOWN:
             conn.execute(
                 "UPDATE logical_agents SET state='SUSPENDED',current_task_id=NULL,"
                 "available_since=NULL,updated_at=? WHERE id=? AND state<>'RETIRED'",
                 (now, attempt["logical_agent_id"]),
             )
+        else:
+            self._release_agent(conn, attempt["logical_agent_id"], now)
         self._create_escalation(
             conn,
             task_id=task["id"],

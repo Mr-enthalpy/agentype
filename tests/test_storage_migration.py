@@ -82,12 +82,12 @@ class IncarnationMigrationCase(unittest.TestCase):
 
             database.initialize()
 
-            self.assertEqual(SCHEMA_VERSION, 5)
+            self.assertEqual(SCHEMA_VERSION, 6)
             self.assertEqual(
                 database.fetch_one(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 )["version"],
-                5,
+                6,
             )
             migrated_first = database.fetch_one(
                 "SELECT incarnation_id FROM executions WHERE id=?", (first_execution,)
@@ -302,7 +302,64 @@ class IncarnationMigrationCase(unittest.TestCase):
                 database.fetch_one(
                     "SELECT MAX(version) version FROM schema_migrations"
                 )["version"],
-                5,
+                6,
+            )
+
+    def test_v6_preserves_unresolved_execution_and_fences_retired_presence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database, scheduler = self._legacy_scheduler(
+                Path(temporary) / "physical-closure.db"
+            )
+            _batch, ids = scheduler.submit_batch([TaskSpec("legacy-unresolved", {})])
+            claim = scheduler.claim_next_available()
+            execution_id, _request = scheduler.create_execution(claim)
+            scheduler.confirm_execution_running(
+                claim.attempt_id,
+                claim.lease_epoch,
+                execution_id,
+                runtime_handle={"thread_id": "legacy", "turn_id": "unresolved"},
+            )
+            execution = scheduler.get("executions", execution_id)
+            with database.transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET state='FAILED',terminal_confirmed=0,"
+                    "quiescent_confirmed=0,ended_at=NULL WHERE id=?",
+                    (execution_id,),
+                )
+                conn.execute(
+                    "UPDATE attempts SET state='FAILED' WHERE id=?", (claim.attempt_id,)
+                )
+                conn.execute(
+                    "UPDATE leases SET state='REVOKED' WHERE id=?", (claim.lease_id,)
+                )
+                conn.execute(
+                    "UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL WHERE id=?",
+                    (ids["legacy-unresolved"],),
+                )
+                conn.execute(
+                    "UPDATE logical_agents SET state='RETIRED',current_task_id=NULL WHERE id=?",
+                    (claim.logical_agent_id,),
+                )
+                conn.execute(
+                    "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=?",
+                    (execution["incarnation_id"],),
+                )
+                conn.execute("DELETE FROM schema_migrations WHERE version>=6")
+
+            database.initialize()
+
+            self.assertEqual(
+                scheduler.get("executions", execution_id)["state"], "UNKNOWN"
+            )
+            self.assertEqual(
+                scheduler.get("incarnations", execution["incarnation_id"])["state"],
+                "LOST",
+            )
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT MAX(version) version FROM schema_migrations"
+                )["version"],
+                6,
             )
 
     def test_v5_retires_legacy_unassigned_retirement_drain(self):

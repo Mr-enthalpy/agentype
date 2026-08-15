@@ -37,6 +37,13 @@ class AppServerSession:
             errors="replace",
             bufsize=1,
         )
+        try:
+            self._initialize(initialization_deadline)
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
+
+    def _initialize(self, initialization_deadline: float) -> None:
         if not self.process.stdin or not self.process.stdout or not self.process.stderr:
             raise AdapterError("failed to open Codex app-server stdio")
         self._responses: dict[int, Mapping[str, Any]] = {}
@@ -65,6 +72,22 @@ class AppServerSession:
             {},
             timeout=self._remaining(initialization_deadline, "initialized"),
         )
+
+    def _cleanup_failed_initialization(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=min(self.timeout, 1.0))
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                self.process.kill()
+            except OSError:
+                return
+            try:
+                self.process.wait(timeout=min(self.timeout, 1.0))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     @staticmethod
     def _remaining(deadline: float, operation: str) -> float:
@@ -133,7 +156,9 @@ class AppServerSession:
             daemon=True,
         ).start()
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or not completed.wait(remaining):
+        if not completed.is_set() and (
+            remaining <= 0 or not completed.wait(remaining)
+        ):
             self._abort()
             raise TimeoutError(
                 f"Codex app-server request timed out while writing: {operation}"
@@ -262,8 +287,8 @@ class CodexAppServerAdapter:
                 self.process_cwd,
                 self._remaining(method_deadline, "start_execution/session"),
             )
-            self._remaining(method_deadline, "start_execution/session")
             runtime_handle["adapter_session_id"] = session.session_id
+            self._remaining(method_deadline, "start_execution/session")
             thread_params: dict[str, Any] = {
                 "cwd": request.cwd,
                 "approvalPolicy": self.approval_policy,
@@ -279,9 +304,9 @@ class CodexAppServerAdapter:
                 thread_params,
                 timeout=self._remaining(method_deadline, "start_execution/thread"),
             )
-            self._remaining(method_deadline, "start_execution/thread")
             thread_id = thread_result["thread"]["id"]
             runtime_handle["thread_id"] = thread_id
+            self._remaining(method_deadline, "start_execution/thread")
             turn_params: dict[str, Any] = {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": request.prompt}],
@@ -295,9 +320,9 @@ class CodexAppServerAdapter:
                 turn_params,
                 timeout=self._remaining(method_deadline, "start_execution/turn"),
             )
-            self._remaining(method_deadline, "start_execution/turn")
             turn_id = turn_result["turn"]["id"]
             runtime_handle["turn_id"] = turn_id
+            self._remaining(method_deadline, "start_execution/turn")
             self._sessions[session.session_id] = session
             return StartObservation(
                 ExecutionState.RUNNING,

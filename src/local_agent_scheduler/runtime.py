@@ -278,7 +278,10 @@ class Dispatcher:
                 except StaleAuthority:
                     self.scheduler.record_physical_outcome(
                         execution["id"],
-                        state=ExecutionState.LOST,
+                        state=ExecutionState.UNKNOWN,
+                        runtime_handle=json_loads(
+                            execution["runtime_handle_json"], {}
+                        ),
                         failure_class=FailureClass.RESOURCE_UNAVAILABLE,
                         failure_code="EXECUTION_ADAPTER_UNAVAILABLE",
                     )

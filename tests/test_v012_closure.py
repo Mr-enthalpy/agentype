@@ -25,6 +25,7 @@ from local_agent_scheduler.enums import (
     WorkspaceMode,
 )
 from local_agent_scheduler.errors import (
+    AdapterError,
     ConfigurationError,
     InvalidTransition,
     NotFound,
@@ -86,6 +87,35 @@ class AdvancingDeadlineSession:
         return []
 
     def close(self, **_kwargs):
+        return True
+
+
+class BoundaryDeadlineSession:
+    clock = [0.0]
+    expire_after = "session"
+    closed: list[str] = []
+
+    def __init__(self, _command, _process_cwd, _timeout):
+        self.session_id = f"boundary-{self.expire_after}"
+        self.process = type("Process", (), {"poll": lambda self: None})()
+        self.__class__.clock[0] += 1.0 if self.expire_after == "session" else 0.1
+
+    def request(self, method, _params, *, timeout):
+        if method == "thread/start":
+            result = {"thread": {"id": "boundary-thread"}}
+            self.__class__.clock[0] += (
+                0.9 if self.expire_after == "thread" else 0.1
+            )
+            return result
+        result = {"turn": {"id": "boundary-turn"}}
+        self.__class__.clock[0] += 0.8 if self.expire_after == "turn" else 0.1
+        return result
+
+    def notifications(self):
+        return []
+
+    def close(self, **_kwargs):
+        self.__class__.closed.append(self.session_id)
         return True
 
 
@@ -158,6 +188,20 @@ class BlockingStdioProcess:
 
 
 class SuccessfulTerminalAdapter:
+    def reconcile_start(self, _request_id, runtime_handle):
+        return type(
+            "Start",
+            (),
+            {
+                "state": ExecutionState.TERMINATED,
+                "runtime_handle": runtime_handle,
+                "ambiguous": False,
+                "failure_class": None,
+                "failure_code": None,
+                "detail": None,
+            },
+        )()
+
     def observe_execution(self, _handle):
         return type(
             "Observation",
@@ -408,6 +452,56 @@ class ClosureCase(unittest.TestCase):
                 )
                 self.scheduler.resize_partition("general", 1)
                 self.scheduler.reconcile_pool()
+
+    def test_semantic_retirement_fences_idle_reusable_incarnation(self):
+        agent_id = self.agent()
+        with self.db.transaction() as conn:
+            incarnation_id = self.scheduler._ensure_incarnation(
+                conn, agent_id, "codex", time.time()
+            )
+            conn.execute(
+                "UPDATE incarnations SET state='WARM' WHERE id=?", (incarnation_id,)
+            )
+
+        self.scheduler.resize_partition("general", 0)
+        self.assertEqual(self.scheduler.reconcile_pool()["retired"], 1)
+
+        self.assertEqual(
+            self.scheduler.get("logical_agents", agent_id)["state"], "RETIRED"
+        )
+        self.assertEqual(
+            self.scheduler.get("incarnations", incarnation_id)["state"], "LOST"
+        )
+
+    def test_assignment_boundary_retirement_fences_reusable_incarnation(self):
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("retiring-busy", {})])
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        incarnation_id = self.scheduler.get("executions", execution_id)["incarnation_id"]
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.scheduler.resize_partition("general", 0)
+        self.assertEqual(self.scheduler.reconcile_pool()["draining"], 1)
+
+        self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=execution_id,
+            payload={},
+            incarnation_reusable=True,
+        )
+
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "RETIRED",
+        )
+        self.assertEqual(
+            self.scheduler.get("incarnations", incarnation_id)["state"], "LOST"
+        )
 
     def test_excess_prefers_unassigned_identity_over_busy_agent(self):
         self.scheduler.resize_partition("general", 2)
@@ -934,6 +1028,14 @@ class ClosureCase(unittest.TestCase):
         )
         self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
 
+        replacement_result = self.scheduler.reconcile_pool()
+        self.assertEqual(replacement_result["born"], 1)
+        replacement = next(
+            agent
+            for agent in self.scheduler.list("logical_agents", state="READY")
+            if agent["partition_name"] == "unsafe-move-after-expiry"
+        )
+
         self.scheduler.resolve_escalation(
             escalation["id"], operation="retry", quiescence_confirmed=True
         )
@@ -941,6 +1043,21 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(committed["partition_name"], "unsafe-move-after-expiry")
         self.assertEqual(committed["state"], "REVIVING")
         self.assertIsNone(committed["pending_partition_name"])
+
+        convergence = self.scheduler.reconcile_pool()
+        self.assertEqual(convergence["retired"], 1)
+        self.assertEqual(
+            self.scheduler.get("logical_agents", replacement["id"])["state"],
+            "RETIRED",
+        )
+        self.assertEqual(self.scheduler.revive_eligible_agents(), 1)
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "READY",
+        )
+        self.assertEqual(
+            self.scheduler.reconcile_pool(), {"born": 0, "retired": 0, "draining": 0}
+        )
 
     def test_suspended_nonisolated_writer_merge_defers_cutover_until_quiescent(self):
         self.scheduler.upsert_partition(
@@ -1178,6 +1295,59 @@ class ClosureCase(unittest.TestCase):
         self.assertGreater(thread_timeout, turn_timeout)
         self.assertAlmostEqual(thread_timeout, 0.8)
         self.assertAlmostEqual(turn_timeout, 0.6)
+
+    def test_start_deadline_captures_every_successful_stage_before_timeout(self):
+        expected = {
+            "session": {"adapter_session_id"},
+            "thread": {"adapter_session_id", "thread_id"},
+            "turn": {"adapter_session_id", "thread_id", "turn_id"},
+        }
+        for boundary, locators in expected.items():
+            with self.subTest(boundary=boundary):
+                BoundaryDeadlineSession.clock = [0.0]
+                BoundaryDeadlineSession.expire_after = boundary
+                BoundaryDeadlineSession.closed = []
+                adapter = CodexAppServerAdapter(
+                    request_timeout=1.0, session_factory=BoundaryDeadlineSession
+                )
+                request = ExecutionRequest(
+                    f"request-{boundary}",
+                    f"execution-{boundary}",
+                    "task",
+                    "attempt",
+                    1,
+                    "agent",
+                    "inc",
+                    "codex",
+                    "default",
+                    self.temp.name,
+                    "inspect",
+                    WorkspaceMode.READ_ONLY,
+                    {},
+                    {},
+                )
+                with patch(
+                    "local_agent_scheduler.adapters.codex.time.monotonic",
+                    side_effect=lambda: BoundaryDeadlineSession.clock[0],
+                ):
+                    started = adapter.start_execution(request)
+
+                self.assertEqual(started.state, ExecutionState.UNKNOWN)
+                self.assertTrue(started.ambiguous)
+                self.assertTrue(locators.issubset(started.runtime_handle))
+                session_id = started.runtime_handle["adapter_session_id"]
+                self.assertIn(session_id, adapter._sessions)
+                self.assertEqual(BoundaryDeadlineSession.closed, [])
+
+    def test_app_server_constructor_failure_cleans_created_process(self):
+        process = BlockingStdioProcess("none")
+        process.stdin = None
+        with patch(
+            "local_agent_scheduler.adapters.codex.subprocess.Popen",
+            return_value=process,
+        ), self.assertRaisesRegex(AdapterError, "failed to open"):
+            AppServerSession(("codex", "app-server"), None, 0.05)
+        self.assertIsNotNone(process.poll())
 
     def test_running_confirmation_atomically_renews_near_deadline_lease(self):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("near-deadline", {})])
@@ -1524,7 +1694,20 @@ class ClosureCase(unittest.TestCase):
             self.scheduler.get("tasks", ids["adapter-gone"])["state"], "RETRY_WAIT"
         )
         self.assertEqual(self.scheduler.get("leases", claim.lease_id)["state"], "RELEASED")
-        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "FAILED")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "UNKNOWN")
+
+        recovered = Dispatcher(
+            self.scheduler,
+            adapters={"codex": SuccessfulTerminalAdapter()},
+            targets={},
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+        self.assertEqual(recovered.poll_executions(recovery=True), 1)
+        execution = self.scheduler.get("executions", execution_id)
+        self.assertEqual(execution["state"], "SUCCEEDED")
+        self.assertEqual(execution["terminal_confirmed"], 1)
+        self.assertEqual(execution["quiescent_confirmed"], 1)
 
     def test_missing_adapter_suspends_unknown_physical_writer(self):
         policy = RetryPolicy(max_attempts=1, retry_classes=())
@@ -1571,6 +1754,58 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(
             escalation["failure_class"], FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
         )
+
+    def test_missing_adapter_writer_keeps_pending_cutover_until_quiescent(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("adapter-recovery-target", 0, Retention.RESIDENT, "other", "default")
+        )
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("moving-writer-adapter-gone", {}, workspace_mode=WorkspaceMode.WRITE)]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"thread_id": "physical", "turn_id": "writer"},
+        )
+        self.scheduler.move_capacity("general", "adapter-recovery-target", 1)
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", False, True
+                )
+            },
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+
+        self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+        execution = self.scheduler.get("executions", execution_id)
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(execution["state"], "UNKNOWN")
+        self.assertEqual(execution["terminal_confirmed"], 0)
+        self.assertEqual(execution["quiescent_confirmed"], 0)
+        self.assertEqual(agent["state"], "SUSPENDED")
+        self.assertEqual(agent["partition_name"], "general")
+        self.assertEqual(agent["pending_partition_name"], "adapter-recovery-target")
+
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=ExecutionState.TERMINATED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+        escalation = self.scheduler.list("escalations", state="OPEN")[-1]
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+        recovered = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(recovered["partition_name"], "adapter-recovery-target")
+        self.assertEqual(recovered["state"], "REVIVING")
 
     def test_notifier_backoff_is_measured_from_delivery_completion(self):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("notify-later", {})])

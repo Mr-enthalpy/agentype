@@ -71,6 +71,10 @@ The cutover safety proof is caller-independent and therefore does not depend on
 whether expiry or topology mutation happened first. Late start observations
 retain their runtime locator through physical-only history, while Core heartbeat
 accepts RUNNING Executions only.
+Each successful Codex start stage captures its newly earned session/thread/turn
+locator before the next deadline gate. Semantic retirement fences every reusable
+Incarnation, and unavailable adapters leave unconfirmed physical work UNKNOWN
+and reconcilable rather than declaring it physically failed.
 Persisted unavailable partitions do not abort daemon startup: unhealthy work is
 normalized while healthy work and notification delivery continue. Every
 ExecutionAdapter call is contractually bounded by the adapter's configured
