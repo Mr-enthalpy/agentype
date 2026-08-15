@@ -63,6 +63,9 @@ Heartbeat renewal is restricted to Executions positively admitted as RUNNING by
 the current daemon; adapter presence or UNKNOWN database state is insufficient.
 Restart recovery fences unstarted claims, and ambiguous reconciliation cannot
 roll a Lease forward forever.
+Schema v7 also rejects ambiguous pre-closure MERGE/RETIRE residue with
+`LEGACY_TOPOLOGY_REPAIR_REQUIRED`; it never guesses lost declared capacity or
+silently moves nonterminal Tasks from an inactive partition.
 Positive RUNNING confirmation atomically renews the Lease before daemon-owned
 supervision admission. Read-only or frozen-isolated expired work can detach
 logically across a target cutover while its old Execution remains available for

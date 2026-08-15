@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from local_agent_scheduler.core import Scheduler
 from local_agent_scheduler.enums import AgentState, Retention
 from local_agent_scheduler.models import PartitionSpec, TaskSpec
-from local_agent_scheduler.storage import Database, SCHEMA_VERSION
+from local_agent_scheduler.storage import Database, SCHEMA_VERSION, json_dumps
 
 
 class IncarnationMigrationCase(unittest.TestCase):
@@ -82,12 +82,12 @@ class IncarnationMigrationCase(unittest.TestCase):
 
             database.initialize()
 
-            self.assertEqual(SCHEMA_VERSION, 6)
+            self.assertEqual(SCHEMA_VERSION, 7)
             self.assertEqual(
                 database.fetch_one(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 )["version"],
-                6,
+                7,
             )
             migrated_first = database.fetch_one(
                 "SELECT incarnation_id FROM executions WHERE id=?", (first_execution,)
@@ -302,7 +302,7 @@ class IncarnationMigrationCase(unittest.TestCase):
                 database.fetch_one(
                     "SELECT MAX(version) version FROM schema_migrations"
                 )["version"],
-                6,
+                7,
             )
 
     def test_v6_preserves_unresolved_execution_and_fences_retired_presence(self):
@@ -359,7 +359,153 @@ class IncarnationMigrationCase(unittest.TestCase):
                 database.fetch_one(
                     "SELECT MAX(version) version FROM schema_migrations"
                 )["version"],
-                6,
+                7,
+            )
+
+    def test_v7_rejects_legacy_merge_without_guessing_capacity_or_moving_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database, scheduler = self._legacy_scheduler(
+                Path(temporary) / "legacy-merge.db"
+            )
+            scheduler.upsert_partition(
+                PartitionSpec("source", 2, Retention.RESIDENT, "local", "default")
+            )
+            scheduler.upsert_partition(
+                PartitionSpec("target", 3, Retention.RESIDENT, "local", "default")
+            )
+            scheduler.reconcile_pool()
+            _batch, ids = scheduler.submit_batch(
+                [TaskSpec("stranded", {}, partition="source")]
+            )
+            self._downgrade_v4_constraints(database)
+            with database.transaction() as conn:
+                revision = conn.execute(
+                    "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) "
+                    "VALUES(?,?,?)",
+                    (
+                        "MERGE",
+                        json_dumps({"source": "source", "target": "target"}),
+                        time.time(),
+                    ),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE logical_agents SET partition_name='target' "
+                    "WHERE partition_name='source'"
+                )
+                conn.execute(
+                    "UPDATE pool_partitions SET active=0,desired_capacity=0,"
+                    "merged_into='target',topology_revision=? WHERE name='source'",
+                    (revision,),
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "LEGACY_TOPOLOGY_REPAIR_REQUIRED: MERGE revision .*declared-capacity",
+            ):
+                database.initialize()
+
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT MAX(version) version FROM schema_migrations"
+                )["version"],
+                3,
+            )
+            self.assertEqual(
+                dict(
+                    database.fetch_one(
+                        "SELECT active,desired_capacity,merged_into FROM pool_partitions "
+                        "WHERE name='source'"
+                    )
+                ),
+                {"active": 0, "desired_capacity": 0, "merged_into": "target"},
+            )
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT desired_capacity FROM pool_partitions WHERE name='target'"
+                )["desired_capacity"],
+                3,
+            )
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT partition_name FROM tasks WHERE id=?", (ids["stranded"],)
+                )["partition_name"],
+                "source",
+            )
+
+    def test_v7_rejects_legacy_retire_with_nonterminal_tasks_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database, scheduler = self._legacy_scheduler(
+                Path(temporary) / "legacy-retire.db"
+            )
+            scheduler.upsert_partition(
+                PartitionSpec("retired", 1, Retention.RESIDENT, "local", "default")
+            )
+            _batch, ids = scheduler.submit_batch(
+                [
+                    TaskSpec("queued", {}, partition="retired"),
+                    TaskSpec(
+                        "blocked",
+                        {},
+                        partition="retired",
+                        dependencies=("queued",),
+                    ),
+                    TaskSpec("retry", {}, partition="retired"),
+                ]
+            )
+            self._downgrade_v4_constraints(database)
+            with database.transaction() as conn:
+                conn.execute(
+                    "UPDATE tasks SET state='RETRY_WAIT',next_eligible_at=? WHERE id=?",
+                    (time.time() + 60, ids["retry"]),
+                )
+                revision = conn.execute(
+                    "INSERT INTO pool_topology_revisions(operation,payload_json,created_at) "
+                    "VALUES(?,?,?)",
+                    ("RETIRE", json_dumps({"name": "retired"}), time.time()),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE pool_partitions SET active=0,desired_capacity=0,"
+                    "topology_revision=? WHERE name='retired'",
+                    (revision,),
+                )
+
+            before = {
+                row["id"]: (row["state"], row["partition_name"])
+                for row in database.fetch_all(
+                    "SELECT id,state,partition_name FROM tasks WHERE id IN (?,?,?)",
+                    (ids["queued"], ids["blocked"], ids["retry"]),
+                )
+            }
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "LEGACY_TOPOLOGY_REPAIR_REQUIRED: nonterminal Task .*inactive partition retired",
+            ):
+                database.initialize()
+
+            self.assertEqual(
+                database.fetch_one(
+                    "SELECT MAX(version) version FROM schema_migrations"
+                )["version"],
+                3,
+            )
+            self.assertEqual(
+                {
+                    row["id"]: (row["state"], row["partition_name"])
+                    for row in database.fetch_all(
+                        "SELECT id,state,partition_name FROM tasks WHERE id IN (?,?,?)",
+                        (ids["queued"], ids["blocked"], ids["retry"]),
+                    )
+                },
+                before,
+            )
+            self.assertEqual(
+                dict(
+                    database.fetch_one(
+                        "SELECT active,desired_capacity FROM pool_partitions "
+                        "WHERE name='retired'"
+                    )
+                ),
+                {"active": 0, "desired_capacity": 0},
             )
 
     def test_v5_retires_legacy_unassigned_retirement_drain(self):

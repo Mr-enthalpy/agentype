@@ -1774,6 +1774,12 @@ Future isolation into another process should preserve the logical contract.
 
 Scheduler restart must be recovery-aware.
 
+Migration must not invent historical topology intent. If an older topology
+operation omitted the declared-capacity facts needed to reconstruct MERGE, or
+left nonterminal work on an inactive partition, startup rejects the database
+atomically and requires explicit operator repair instead of guessing from the
+current agent population.
+
 Normal dispatch should not begin immediately after process startup.
 
 Conceptually:

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def new_id(prefix: str) -> str:
@@ -401,8 +401,17 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (6, utc_now()),
                     )
+                    current = 6
                 else:
                     self._migrate_v5_to_v6(conn)
+                if current < 7:
+                    self._migrate_v6_to_v7(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (7, utc_now()),
+                    )
+                else:
+                    self._migrate_v6_to_v7(conn)
                 conn.execute("COMMIT")
                 conn.execute("PRAGMA foreign_keys = ON")
                 violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -716,6 +725,59 @@ class Database:
             "AND logical_agent_id IN (SELECT id FROM logical_agents WHERE state='RETIRED')",
             (now,),
         )
+
+    @staticmethod
+    def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+        """Reject ambiguous topology damage created before MERGE/RETIRE closure.
+
+        Pre-closure MERGE revisions did not snapshot either partition's declared
+        capacity, so lost desired topology cannot be reconstructed from runtime
+        population.  Pre-closure MERGE and RETIRE could also strand nonterminal
+        Tasks on inactive partitions.  Both conditions require an explicit
+        operator repair rather than a guessed migration.
+        """
+
+        revisions = conn.execute(
+            "SELECT revision,payload_json FROM pool_topology_revisions "
+            "WHERE operation='MERGE' ORDER BY revision"
+        ).fetchall()
+        for revision in revisions:
+            try:
+                payload = json_loads(revision["payload_json"], {})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            source_capacity = (
+                payload.get("source_capacity") if isinstance(payload, dict) else None
+            )
+            target_capacity = (
+                payload.get("target_capacity") if isinstance(payload, dict) else None
+            )
+            valid_snapshot = (
+                isinstance(source_capacity, int)
+                and not isinstance(source_capacity, bool)
+                and source_capacity >= 0
+                and isinstance(target_capacity, int)
+                and not isinstance(target_capacity, bool)
+                and target_capacity >= 0
+            )
+            if not valid_snapshot:
+                raise RuntimeError(
+                    "LEGACY_TOPOLOGY_REPAIR_REQUIRED: MERGE revision "
+                    f"{revision['revision']} lacks valid declared-capacity snapshots"
+                )
+
+        stranded = conn.execute(
+            "SELECT t.id,t.state,t.partition_name FROM tasks t "
+            "JOIN pool_partitions p ON p.name=t.partition_name "
+            "WHERE t.state NOT IN ('COMPLETED','CANCELLED') AND p.active=0 "
+            "ORDER BY t.created_at,t.id LIMIT 1"
+        ).fetchone()
+        if stranded:
+            raise RuntimeError(
+                "LEGACY_TOPOLOGY_REPAIR_REQUIRED: nonterminal Task "
+                f"{stranded['id']} in state {stranded['state']} remains on inactive "
+                f"partition {stranded['partition_name']}"
+            )
 
     @contextlib.contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
