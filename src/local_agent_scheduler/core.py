@@ -172,6 +172,8 @@ class Scheduler:
         agent: sqlite3.Row,
         target_partition: str,
         now: float,
+        *,
+        allow_stale_execution_detach: bool = False,
     ) -> sqlite3.Row:
         """Commit desired membership and lifecycle policy at a safe boundary.
 
@@ -187,12 +189,13 @@ class Scheduler:
             (agent["id"],),
         ).fetchone():
             raise InvalidTransition("an assigned LogicalAgent must use a drain boundary")
-        if conn.execute(
+        active_cross_target_execution = conn.execute(
             "SELECT e.id FROM executions e JOIN incarnations i ON i.id=e.incarnation_id "
             "WHERE i.logical_agent_id=? AND e.state IN ('STARTING','RUNNING','UNKNOWN') "
             "AND e.execution_target<>? LIMIT 1",
             (agent["id"], target["execution_target"]),
-        ).fetchone():
+        ).fetchone()
+        if active_cross_target_execution and not allow_stale_execution_detach:
             raise InvalidTransition(
                 "a topology cutover cannot abandon an active Execution"
             )
@@ -593,7 +596,7 @@ class Scheduler:
             )
             immediate_members = conn.execute(
                 "SELECT * FROM logical_agents WHERE partition_name=? "
-                "AND (state IN ('READY','INITIALIZING','REVIVING','SUSPENDED') "
+                "AND (state IN ('READY','INITIALIZING','REVIVING') "
                 "OR (state='DRAINING' AND current_task_id IS NULL))",
                 (source,),
             ).fetchall()
@@ -611,7 +614,7 @@ class Scheduler:
                     self._commit_partition_cutover(conn, agent, desired, now)
             conn.execute(
                 "UPDATE logical_agents SET pending_partition_name=?,updated_at=? "
-                "WHERE partition_name=? AND state IN ('ASSIGNED','DRAINING') "
+                "WHERE partition_name=? AND state IN ('ASSIGNED','DRAINING','SUSPENDED') "
                 "AND (pending_partition_name IS NULL OR pending_partition_name=?)",
                 (target, now, source, source),
             )
@@ -1083,15 +1086,35 @@ class Scheduler:
         *,
         runtime_handle: Mapping[str, Any],
     ) -> None:
-        now = utc_now()
+        self.confirm_running_and_renew_authority(
+            attempt_id,
+            lease_epoch,
+            execution_id,
+            runtime_handle=runtime_handle,
+        )
+
+    def confirm_running_and_renew_authority(
+        self,
+        attempt_id: str,
+        lease_epoch: int,
+        execution_id: str,
+        *,
+        runtime_handle: Mapping[str, Any],
+        now: float | None = None,
+    ) -> float:
+        """Confirm RUNNING and establish the first supervision lease atomically."""
+
+        now = utc_now() if now is None else now
+        expires_at = now + self.lease_seconds
         with self.db.transaction() as conn:
-            attempt, _lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
+            attempt, lease, task = self._validate_authority(
+                conn, attempt_id, lease_epoch, now=now
+            )
             execution = self._required(conn, "executions", execution_id)
             if execution["attempt_id"] != attempt_id:
                 raise StaleAuthority("execution does not belong to current attempt")
-            if execution["state"] == ExecutionState.RUNNING.value:
-                return
             if execution["state"] not in {
+                ExecutionState.RUNNING.value,
                 ExecutionState.STARTING.value,
                 ExecutionState.UNKNOWN.value,
             }:
@@ -1110,6 +1133,14 @@ class Scheduler:
                 "UPDATE incarnations SET state='WARM',runtime_handle_json=? WHERE id=?",
                 (json_dumps(runtime_handle), attempt["incarnation_id"]),
             )
+            cursor = conn.execute(
+                "UPDATE leases SET heartbeat_at=?,expires_at=? WHERE id=? AND state='ACTIVE' "
+                "AND expires_at>?",
+                (now, expires_at, lease["id"], now),
+            )
+            if cursor.rowcount != 1:
+                raise StaleAuthority("lease expired before RUNNING supervision was established")
+        return expires_at
 
     def record_start_ambiguity(
         self,
@@ -1614,7 +1645,12 @@ class Scheduler:
                     and int(row["attempt_number"]) < int(row["max_attempts"])
                 )
                 if retry_allowed and writer_safe:
-                    self._release_agent(conn, row["logical_agent_id"], now)
+                    self._release_agent(
+                        conn,
+                        row["logical_agent_id"],
+                        now,
+                        allow_stale_execution_detach=True,
+                    )
                     delay = min(
                         float(row["max_backoff_seconds"]),
                         float(row["base_backoff_seconds"])
@@ -1643,7 +1679,12 @@ class Scheduler:
                             (now, row["logical_agent_id"]),
                         )
                     else:
-                        self._release_agent(conn, row["logical_agent_id"], now)
+                        self._release_agent(
+                            conn,
+                            row["logical_agent_id"],
+                            now,
+                            allow_stale_execution_detach=True,
+                        )
                     self._create_escalation(
                         conn,
                         task_id=row["task_id"],
@@ -2197,7 +2238,14 @@ class Scheduler:
             raise StaleAuthority("attempt no longer owns authoritative task state")
         return attempt, lease, task
 
-    def _release_agent(self, conn: sqlite3.Connection, agent_id: str, now: float) -> None:
+    def _release_agent(
+        self,
+        conn: sqlite3.Connection,
+        agent_id: str,
+        now: float,
+        *,
+        allow_stale_execution_detach: bool = False,
+    ) -> None:
         agent = self._required(conn, "logical_agents", agent_id)
         pending = agent["pending_partition_name"]
         if agent["retirement_requested"]:
@@ -2209,7 +2257,13 @@ class Scheduler:
             return
 
         target_name = pending or agent["partition_name"]
-        target = self._commit_partition_cutover(conn, agent, target_name, now)
+        target = self._commit_partition_cutover(
+            conn,
+            agent,
+            target_name,
+            now,
+            allow_stale_execution_detach=allow_stale_execution_detach,
+        )
         retire = target["retention"] == Retention.EPHEMERAL.value
         if retire:
             state = AgentState.RETIRED.value

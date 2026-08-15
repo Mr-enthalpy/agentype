@@ -51,7 +51,7 @@ class CapturingSession:
         self.process = type("Process", (), {"poll": lambda self: None})()
         self.instances.append(self)
 
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread": {"id": "thread"}}
@@ -60,7 +60,32 @@ class CapturingSession:
     def notifications(self):
         return []
 
-    def close(self):
+    def close(self, **_kwargs):
+        return True
+
+
+class AdvancingDeadlineSession:
+    clock = [0.0]
+    constructor_timeouts: list[float] = []
+    request_timeouts: list[tuple[str, float]] = []
+
+    def __init__(self, _command, _process_cwd, timeout):
+        self.session_id = "deadline-session"
+        self.process = type("Process", (), {"poll": lambda self: None})()
+        self.__class__.constructor_timeouts.append(timeout)
+        self.__class__.clock[0] += 0.2
+
+    def request(self, method, _params, *, timeout):
+        self.__class__.request_timeouts.append((method, timeout))
+        self.__class__.clock[0] += 0.2
+        if method == "thread/start":
+            return {"thread": {"id": "thread"}}
+        return {"turn": {"id": "turn"}}
+
+    def notifications(self):
+        return []
+
+    def close(self, **_kwargs):
         return True
 
 
@@ -758,6 +783,103 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(agent["state"], "READY")
         self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "TERMINATED")
 
+    def _expire_cross_target_execution(self, *, workspace_mode, isolated):
+        self.scheduler.upsert_partition(
+            PartitionSpec("expiry-target", 0, Retention.RESIDENT, "other", "default")
+        )
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("expiry-cutover", {}, workspace_mode=workspace_mode, retry_policy=policy)]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(
+            claim, attempt_isolation=isolated
+        )
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.scheduler.move_capacity("general", "expiry-target", 1)
+        expired = self.scheduler.expire_leases(now=claim.lease_expires_at + 10)
+        return ids["expiry-cutover"], claim, execution_id, expired
+
+    def test_read_only_expiry_detaches_topology_but_keeps_stale_execution_history(self):
+        task_id, claim, execution_id, expired = self._expire_cross_target_execution(
+            workspace_mode=WorkspaceMode.READ_ONLY, isolated=False
+        )
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(self.scheduler.get("tasks", task_id)["state"], "RETRY_WAIT")
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "expiry-target")
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=ExecutionState.TERMINATED,
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "TERMINATED")
+        self.assertEqual(self.scheduler.get("tasks", task_id)["state"], "RETRY_WAIT")
+
+    def test_isolated_writer_expiry_detaches_topology_safely(self):
+        task_id, claim, execution_id, expired = self._expire_cross_target_execution(
+            workspace_mode=WorkspaceMode.WRITE, isolated=True
+        )
+        self.assertEqual(expired["retried"], 1)
+        self.assertEqual(self.scheduler.get("tasks", task_id)["state"], "RETRY_WAIT")
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["partition_name"],
+            "expiry-target",
+        )
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+
+    def test_suspended_nonisolated_writer_merge_defers_cutover_until_quiescent(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("merge-after-suspend", 0, Retention.RESIDENT, "other", "default")
+        )
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("unsafe-writer", {}, workspace_mode=WorkspaceMode.WRITE, retry_policy=policy)]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.scheduler.expire_leases(now=claim.lease_expires_at + 10)
+        escalation = self.scheduler.list("escalations", state="OPEN")[-1]
+
+        self.scheduler.merge_partitions("general", "merge-after-suspend")
+        suspended = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(suspended["state"], "SUSPENDED")
+        self.assertEqual(suspended["partition_name"], "general")
+        self.assertEqual(suspended["pending_partition_name"], "merge-after-suspend")
+
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+        committed = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(committed["partition_name"], "merge-after-suspend")
+        self.assertIsNone(committed["pending_partition_name"])
+        self.assertEqual(committed["state"], "REVIVING")
+
     def test_busy_cross_target_cutover_fences_reusable_presence(self):
         self.scheduler.upsert_partition(
             PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
@@ -927,6 +1049,59 @@ class ClosureCase(unittest.TestCase):
             "thread_id": "thread",
         }
         self.assertEqual(adapter.observe_execution(incomplete).state, ExecutionState.UNKNOWN)
+
+    def test_start_execution_uses_one_method_deadline_across_all_stages(self):
+        AdvancingDeadlineSession.clock = [0.0]
+        AdvancingDeadlineSession.constructor_timeouts = []
+        AdvancingDeadlineSession.request_timeouts = []
+        adapter = CodexAppServerAdapter(
+            request_timeout=1.0, session_factory=AdvancingDeadlineSession
+        )
+        request = ExecutionRequest(
+            "request", "execution", "task", "attempt", 1, "agent", "inc", "codex",
+            "default", self.temp.name, "inspect", WorkspaceMode.READ_ONLY, {}, {}
+        )
+        with patch(
+            "local_agent_scheduler.adapters.codex.time.monotonic",
+            side_effect=lambda: AdvancingDeadlineSession.clock[0],
+        ):
+            started = adapter.start_execution(request)
+
+        self.assertEqual(started.state, ExecutionState.RUNNING)
+        self.assertAlmostEqual(AdvancingDeadlineSession.constructor_timeouts[0], 1.0)
+        self.assertEqual(
+            [name for name, _timeout in AdvancingDeadlineSession.request_timeouts],
+            ["thread/start", "turn/start"],
+        )
+        thread_timeout = AdvancingDeadlineSession.request_timeouts[0][1]
+        turn_timeout = AdvancingDeadlineSession.request_timeouts[1][1]
+        self.assertGreater(thread_timeout, turn_timeout)
+        self.assertAlmostEqual(thread_timeout, 0.8)
+        self.assertAlmostEqual(turn_timeout, 0.6)
+
+    def test_running_confirmation_atomically_renews_near_deadline_lease(self):
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("near-deadline", {})])
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE leases SET heartbeat_at=90,expires_at=100 WHERE id=?",
+                (claim.lease_id,),
+            )
+
+        renewed_until = self.scheduler.confirm_running_and_renew_authority(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+            now=99.99,
+        )
+
+        lease = self.scheduler.get("leases", claim.lease_id)
+        self.assertAlmostEqual(renewed_until, 101.99)
+        self.assertAlmostEqual(lease["heartbeat_at"], 99.99)
+        self.assertAlmostEqual(lease["expires_at"], 101.99)
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
 
     def test_app_server_stdio_write_and_flush_share_request_deadline(self):
         for block_at in ("write", "flush"):

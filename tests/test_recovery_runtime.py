@@ -157,13 +157,13 @@ class FakeRootSession:
             }
         ]
 
-    def close(self):
+    def close(self, **_kwargs):
         self.closed = True
         return True
 
 
 class FakeStoredSession(FakeRootSession):
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
         if method == "thread/read":
             return {
@@ -183,7 +183,7 @@ class FakeStoredSession(FakeRootSession):
 
 
 class FakeInterruptedSession(FakeRootSession):
-    def request(self, method, params):
+    def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
         if method == "thread/read":
             return {
@@ -710,7 +710,7 @@ completion_timeout = 1
 
         with patch.object(
             self.scheduler,
-            "confirm_execution_running",
+            "confirm_running_and_renew_authority",
             side_effect=StaleAuthority("lease expired during bounded start"),
         ):
             self.assertEqual(dispatcher.dispatch_ready(), 0)

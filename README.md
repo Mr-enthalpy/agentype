@@ -63,10 +63,15 @@ Heartbeat renewal is restricted to Executions positively admitted as RUNNING by
 the current daemon; adapter presence or UNKNOWN database state is insufficient.
 Restart recovery fences unstarted claims, and ambiguous reconciliation cannot
 roll a Lease forward forever.
+Positive RUNNING confirmation atomically renews the Lease before daemon-owned
+supervision admission. Read-only or frozen-isolated expired work can detach
+logically across a target cutover while its old Execution remains available for
+stale physical reconciliation; unsafe writers remain suspended.
 Persisted unavailable partitions do not abort daemon startup: unhealthy work is
 normalized while healthy work and notification delivery continue. Every
 ExecutionAdapter call is contractually bounded by the adapter's configured
-operation deadline.
+operation deadline; the Codex adapter uses one shared method budget across its
+multi-stage start sequence.
 
 See [docs/V0.1_COMPLETION_REPORT.md](docs/V0.1_COMPLETION_REPORT.md) for the
 implemented boundaries, recovery procedure, test evidence, and limitations.

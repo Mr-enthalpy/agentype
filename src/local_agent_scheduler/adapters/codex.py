@@ -21,6 +21,9 @@ from ..models import (
 
 class AppServerSession:
     def __init__(self, command: tuple[str, ...], process_cwd: str | None, timeout: float):
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        initialization_deadline = time.monotonic() + timeout
         self.session_id = uuid.uuid4().hex
         self.timeout = timeout
         self.process = subprocess.Popen(
@@ -55,8 +58,20 @@ class AppServerSession:
                     "version": "0.1.2",
                 }
             },
+            timeout=self._remaining(initialization_deadline, "initialize"),
         )
-        self.notify("initialized", {})
+        self.notify(
+            "initialized",
+            {},
+            timeout=self._remaining(initialization_deadline, "initialized"),
+        )
+
+    @staticmethod
+    def _remaining(deadline: float, operation: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Codex app-server operation timed out: {operation}")
+        return remaining
 
     def _read_stdout(self) -> None:
         assert self.process.stdout is not None
@@ -212,12 +227,22 @@ class CodexAppServerAdapter:
         self.process_cwd = process_cwd
         self.approval_policy = approval_policy
         self.sandbox = sandbox
+        if request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
         self.request_timeout = request_timeout
         self.profile_options = dict(profile_options or {})
         self.session_factory = session_factory
         self._sessions: dict[str, AppServerSession] = {}
 
+    @staticmethod
+    def _remaining(deadline: float, operation: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Codex adapter method timed out: {operation}")
+        return remaining
+
     def start_execution(self, request: ExecutionRequest) -> StartObservation:
+        method_deadline = time.monotonic() + self.request_timeout
         session: AppServerSession | None = None
         runtime_handle: dict[str, Any] = {
             "request_id": request.request_id,
@@ -232,7 +257,12 @@ class CodexAppServerAdapter:
                 raise RuntimeError(
                     "write Task exceeds the configured Codex adapter sandbox ceiling"
                 )
-            session = self.session_factory(self.command, self.process_cwd, self.request_timeout)
+            session = self.session_factory(
+                self.command,
+                self.process_cwd,
+                self._remaining(method_deadline, "start_execution/session"),
+            )
+            self._remaining(method_deadline, "start_execution/session")
             runtime_handle["adapter_session_id"] = session.session_id
             thread_params: dict[str, Any] = {
                 "cwd": request.cwd,
@@ -244,7 +274,12 @@ class CodexAppServerAdapter:
             for key in ("model", "personality"):
                 if key in options:
                     thread_params[key] = options[key]
-            thread_result = session.request("thread/start", thread_params)
+            thread_result = session.request(
+                "thread/start",
+                thread_params,
+                timeout=self._remaining(method_deadline, "start_execution/thread"),
+            )
+            self._remaining(method_deadline, "start_execution/thread")
             thread_id = thread_result["thread"]["id"]
             runtime_handle["thread_id"] = thread_id
             turn_params: dict[str, Any] = {
@@ -255,7 +290,12 @@ class CodexAppServerAdapter:
             }
             if "effort" in options:
                 turn_params["effort"] = options["effort"]
-            turn_result = session.request("turn/start", turn_params)
+            turn_result = session.request(
+                "turn/start",
+                turn_params,
+                timeout=self._remaining(method_deadline, "start_execution/turn"),
+            )
+            self._remaining(method_deadline, "start_execution/turn")
             turn_id = turn_result["turn"]["id"]
             runtime_handle["turn_id"] = turn_id
             self._sessions[session.session_id] = session
@@ -287,11 +327,21 @@ class CodexAppServerAdapter:
             )
 
     def observe_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
+        return self._observe_until(
+            runtime_handle, time.monotonic() + self.request_timeout
+        )
+
+    def _observe_until(
+        self, runtime_handle: Mapping[str, object], deadline: float
+    ) -> ExecutionObservation:
         session = self._live_session(runtime_handle)
         if session:
             if not runtime_handle.get("thread_id") or not runtime_handle.get("turn_id"):
                 if session.process.poll() is not None:
-                    self._close_live_session(runtime_handle)
+                    self._close_live_session(
+                        runtime_handle,
+                        timeout=self._remaining(deadline, "observe_execution/close"),
+                    )
                     return ExecutionObservation(
                         ExecutionState.LOST,
                         terminal_confirmed=True,
@@ -308,7 +358,10 @@ class CodexAppServerAdapter:
                 state = ExecutionState.SUCCEEDED if status == "completed" else ExecutionState.FAILED
                 return ExecutionObservation(state, terminal_confirmed=True, quiescent_confirmed=True)
             if session.process.poll() is not None:
-                self._close_live_session(runtime_handle)
+                self._close_live_session(
+                    runtime_handle,
+                    timeout=self._remaining(deadline, "observe_execution/close"),
+                )
                 return ExecutionObservation(
                     ExecutionState.LOST,
                     terminal_confirmed=True,
@@ -321,24 +374,29 @@ class CodexAppServerAdapter:
             return ExecutionObservation(ExecutionState.UNKNOWN, detail="no thread handle")
         turn_id = runtime_handle.get("turn_id")
         return self._read_stored_thread(
-            str(thread_id), str(turn_id) if turn_id is not None else None
+            str(thread_id),
+            str(turn_id) if turn_id is not None else None,
+            deadline=deadline,
         )
 
     def collect_outcome(self, runtime_handle: Mapping[str, object]) -> ExecutionOutcome:
+        deadline = time.monotonic() + self.request_timeout
         session = self._live_session(runtime_handle)
         if not session:
             thread_id = runtime_handle.get("thread_id")
             turn_id = runtime_handle.get("turn_id")
             recovered = (
                 self._read_stored_outcome(
-                    str(thread_id), str(turn_id) if turn_id is not None else None
+                    str(thread_id),
+                    str(turn_id) if turn_id is not None else None,
+                    deadline=deadline,
                 )
                 if thread_id
                 else None
             )
             if recovered is not None:
                 return recovered
-            observation = self.observe_execution(runtime_handle)
+            observation = self._observe_until(runtime_handle, deadline)
             return ExecutionOutcome(
                 observation.state,
                 failure_class=FailureClass.EXECUTION_LOST,
@@ -356,7 +414,10 @@ class CodexAppServerAdapter:
             )
         status = self._turn_status(terminal)
         text = self._collect_agent_text(session.notifications())
-        self._close_live_session(runtime_handle)
+        self._close_live_session(
+            runtime_handle,
+            timeout=self._remaining(deadline, "collect_outcome/close"),
+        )
         if status == "completed":
             payload: Mapping[str, Any]
             try:
@@ -384,6 +445,7 @@ class CodexAppServerAdapter:
     def reconcile_start(
         self, request_id: str, runtime_handle: Mapping[str, object]
     ) -> StartObservation:
+        deadline = time.monotonic() + self.request_timeout
         if runtime_handle.get("request_id") not in (None, request_id):
             return StartObservation(
                 ExecutionState.UNKNOWN,
@@ -392,7 +454,7 @@ class CodexAppServerAdapter:
                 failure_class=FailureClass.ADAPTER_PROTOCOL_FAILURE,
                 failure_code="REQUEST_ID_MISMATCH",
             )
-        observation = self.observe_execution(runtime_handle)
+        observation = self._observe_until(runtime_handle, deadline)
         if observation.state in (ExecutionState.RUNNING, ExecutionState.SUCCEEDED):
             return StartObservation(observation.state, runtime_handle)
         return StartObservation(
@@ -408,6 +470,13 @@ class CodexAppServerAdapter:
         )
 
     def interrupt_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
+        return self._interrupt_until(
+            runtime_handle, time.monotonic() + self.request_timeout
+        )
+
+    def _interrupt_until(
+        self, runtime_handle: Mapping[str, object], deadline: float
+    ) -> ExecutionObservation:
         session = self._live_session(runtime_handle)
         if not session:
             return ExecutionObservation(
@@ -424,13 +493,15 @@ class CodexAppServerAdapter:
             session.request(
                 "turn/interrupt",
                 {"threadId": str(thread_id), "turnId": str(turn_id)},
-                timeout=10,
+                timeout=self._remaining(deadline, "interrupt_execution/request"),
             )
-            deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 terminal = self._terminal_notification(session, runtime_handle)
                 if terminal:
-                    process_stopped = self._close_live_session(runtime_handle)
+                    process_stopped = self._close_live_session(
+                        runtime_handle,
+                        timeout=self._remaining(deadline, "interrupt_execution/close"),
+                    )
                     return ExecutionObservation(
                         ExecutionState.TERMINATED,
                         terminal_confirmed=True,
@@ -447,11 +518,20 @@ class CodexAppServerAdapter:
             return ExecutionObservation(ExecutionState.UNKNOWN, detail=str(exc))
 
     def terminate_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
-        interrupted = self.interrupt_execution(runtime_handle)
+        deadline = time.monotonic() + self.request_timeout
+        interrupted = self._interrupt_until(runtime_handle, deadline)
         if interrupted.terminal_confirmed and interrupted.quiescent_confirmed:
             return interrupted
         session = self._live_session(runtime_handle)
-        process_stopped = self._close_live_session(runtime_handle) if session else False
+        try:
+            close_timeout = self._remaining(deadline, "terminate_execution/close")
+        except TimeoutError:
+            close_timeout = 0.0
+        process_stopped = (
+            self._close_live_session(runtime_handle, timeout=close_timeout)
+            if session
+            else False
+        )
         if process_stopped:
             return ExecutionObservation(
                 ExecutionState.TERMINATED,
@@ -469,12 +549,19 @@ class CodexAppServerAdapter:
         session_id = runtime_handle.get("adapter_session_id")
         return self._sessions.get(str(session_id)) if session_id else None
 
-    def _close_live_session(self, runtime_handle: Mapping[str, object]) -> bool:
+    def _close_live_session(
+        self,
+        runtime_handle: Mapping[str, object],
+        *,
+        timeout: float | None = None,
+    ) -> bool:
         session_id = runtime_handle.get("adapter_session_id")
         if not session_id:
             return False
         session = self._sessions.pop(str(session_id), None)
-        return session.close() if session is not None else False
+        if session is None:
+            return False
+        return session.close() if timeout is None else session.close(timeout=timeout)
 
     @staticmethod
     def _turn_status(notification: Mapping[str, Any]) -> str:
@@ -519,9 +606,9 @@ class CodexAppServerAdapter:
         return completed_text if completed_text is not None else "".join(deltas)
 
     def _read_stored_thread(
-        self, thread_id: str, turn_id: str | None
+        self, thread_id: str, turn_id: str | None, *, deadline: float
     ) -> ExecutionObservation:
-        document = self._read_stored_document(thread_id)
+        document = self._read_stored_document(thread_id, deadline=deadline)
         if document is None:
             return ExecutionObservation(
                 ExecutionState.UNKNOWN,
@@ -555,21 +642,31 @@ class CodexAppServerAdapter:
             detail=f"stored turn has unknown status: {status}",
         )
 
-    def _read_stored_document(self, thread_id: str) -> Mapping[str, Any] | None:
+    def _read_stored_document(
+        self, thread_id: str, *, deadline: float
+    ) -> Mapping[str, Any] | None:
         session: AppServerSession | None = None
         try:
-            session = self.session_factory(self.command, self.process_cwd, self.request_timeout)
-            return session.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+            session = self.session_factory(
+                self.command,
+                self.process_cwd,
+                self._remaining(deadline, "stored_thread/session"),
+            )
+            return session.request(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": True},
+                timeout=self._remaining(deadline, "stored_thread/read"),
+            )
         except Exception:
             return None
         finally:
             if session is not None:
-                session.close()
+                session.close(timeout=max(0.0, deadline - time.monotonic()))
 
     def _read_stored_outcome(
-        self, thread_id: str, turn_id: str | None
+        self, thread_id: str, turn_id: str | None, *, deadline: float
     ) -> ExecutionOutcome | None:
-        document = self._read_stored_document(thread_id)
+        document = self._read_stored_document(thread_id, deadline=deadline)
         if document is None:
             return None
         turn = self._stored_turn(document, turn_id)

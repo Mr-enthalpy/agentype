@@ -162,7 +162,7 @@ class Dispatcher:
             start = adapter.start_execution(request)
             if start.state == ExecutionState.RUNNING:
                 try:
-                    self.scheduler.confirm_execution_running(
+                    self.scheduler.confirm_running_and_renew_authority(
                         claim.attempt_id,
                         claim.lease_epoch,
                         execution_id,
@@ -236,14 +236,11 @@ class Dispatcher:
                 if start.state == ExecutionState.RUNNING:
                     try:
                         attempt = self.scheduler.get("attempts", execution["attempt_id"])
-                        self.scheduler.confirm_execution_running(
+                        self.scheduler.confirm_running_and_renew_authority(
                             execution["attempt_id"],
                             int(attempt["lease_epoch"]),
                             execution["id"],
                             runtime_handle=start.runtime_handle,
-                        )
-                        self.scheduler.heartbeat(
-                            execution["attempt_id"], int(attempt["lease_epoch"])
                         )
                         self._admit_supervision(
                             execution["id"], execution["attempt_id"]

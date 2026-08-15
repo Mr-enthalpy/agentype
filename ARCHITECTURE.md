@@ -1120,6 +1120,13 @@ obligation must commit the canonical destination and its retention policy before
 the LogicalAgent becomes schedulable again; every authority-ending path uses
 the same cutover invariant.
 
+Lease expiry may intentionally leave the old physical Execution in
+STARTING/RUNNING/UNKNOWN for stale-history reconciliation. Once authority has
+ended, that row does not prevent logical topology detachment when the work was
+read-only, the Execution's frozen snapshot proves attempt isolation, or
+quiescence is confirmed. It continues to block a non-isolated writer whose
+quiescence is unknown.
+
 The same idle cross-target cutover rule applies during MERGE: inactive reusable
 presence is fenced, while only an actually ASSIGNED identity uses a pending
 drain transition. MERGE rebases pending inbound references to the canonical
@@ -1458,6 +1465,10 @@ daemon-owned admission after a bounded start/reconciliation positively confirms
 the exact Execution as RUNNING. UNKNOWN/ambiguous reconciliation never rolls
 that admission deadline forward; when the existing Lease expires, ordinary
 fencing and writer-quiescence rules apply.
+
+A positive RUNNING observation establishes state and renews its Lease in one
+fenced transaction. Daemon-owned supervision admission occurs only after that
+commit; a separate first heartbeat is not an authority bridge.
 
 The Core should understand standardized ambiguity, not frontend-specific exception text.
 
