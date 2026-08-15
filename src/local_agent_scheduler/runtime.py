@@ -524,9 +524,9 @@ class SchedulerDaemon:
         signal.signal(signal.SIGINT, self.stop)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self.stop)
-        self.dispatcher.recover(after_expiry=self._start_supervision)
-        self._start_notifier()
         try:
+            self.dispatcher.recover(after_expiry=self._start_supervision)
+            self._start_notifier()
             while not self._stopping:
                 self.dispatcher.tick()
                 time.sleep(self.poll_seconds)
@@ -541,9 +541,9 @@ class SchedulerDaemon:
             raise ValueError("max_wait_seconds must be positive")
         self._begin_single_run()
 
-        self.dispatcher.recover(after_expiry=self._start_supervision)
-        self._start_notifier()
         try:
+            self.dispatcher.recover(after_expiry=self._start_supervision)
+            self._start_notifier()
             totals: dict[str, int] = {}
             deadline = time.monotonic() + max_wait_seconds
             while True:

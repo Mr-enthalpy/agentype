@@ -1114,6 +1114,12 @@ A merge therefore affects scheduling classification, not agent minds.
 
 For V0.1, MERGE also moves every nonterminal source Task's future scheduling classification to the target. An already-active Attempt keeps its frozen LogicalAgent, ExecutionTarget/Profile, and lease epoch; only later retry/dispatch observes the target partition. Desired target capacity is the sum of the two declared capacities at the topology revision boundary, never a function of instantaneous runtime population.
 
+If an assignment ends in writer-safety suspension, desired membership remains
+pending until quiescence or frozen attempt isolation is proven. Resolving that
+obligation must commit the canonical destination and its retention policy before
+the LogicalAgent becomes schedulable again; every authority-ending path uses
+the same cutover invariant.
+
 The same idle cross-target cutover rule applies during MERGE: inactive reusable
 presence is fenced, while only an actually ASSIGNED identity uses a pending
 drain transition. MERGE rebases pending inbound references to the canonical

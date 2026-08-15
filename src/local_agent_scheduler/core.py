@@ -1981,7 +1981,8 @@ class Scheduler:
                 raise InvalidTransition("escalation is not open")
             task = self._required(conn, "tasks", escalation["task_id"])
             latest = conn.execute(
-                "SELECT a.incarnation_id,e.attempt_isolation FROM attempts a "
+                "SELECT a.incarnation_id,e.id AS execution_id,e.attempt_isolation "
+                "FROM attempts a "
                 "LEFT JOIN executions e ON e.attempt_id=a.id WHERE a.task_id=? "
                 "ORDER BY a.attempt_number DESC LIMIT 1",
                 (task["id"],),
@@ -1997,18 +1998,16 @@ class Scheduler:
                     raise InvalidTransition(
                         "cancelled writer release requires confirmed quiescence or attempt isolation"
                     )
-                if latest:
-                    next_state = "TERMINATED" if quiescence_confirmed else "LOST"
-                    conn.execute(
-                        "UPDATE incarnations SET state=?,ended_at=? WHERE id=? "
-                        "AND state IN ('STARTING','WARM','COLD','LOST')",
-                        (next_state, now, latest["incarnation_id"]),
-                    )
+                self._finalize_escalated_writer_presence(
+                    conn,
+                    latest,
+                    quiescence_confirmed=quiescence_confirmed,
+                    frozen_isolation=frozen_isolation,
+                    now=now,
+                )
                 if escalation["logical_agent_id"]:
-                    conn.execute(
-                        "UPDATE logical_agents SET state='REVIVING',available_since=NULL,updated_at=? "
-                        "WHERE id=? AND state='SUSPENDED'",
-                        (now, escalation["logical_agent_id"]),
+                    self._prepare_agent_revival_after_safety(
+                        conn, escalation["logical_agent_id"], now
                     )
             elif operation == "retry":
                 if task["state"] != TaskState.SUSPENDED.value:
@@ -2035,22 +2034,15 @@ class Scheduler:
                     == FailureClass.WRITER_QUIESCENCE_UNKNOWN.value
                     and escalation["logical_agent_id"]
                 ):
-                    if latest and quiescence_confirmed:
-                        conn.execute(
-                            "UPDATE incarnations SET state='TERMINATED',ended_at=? WHERE id=? "
-                            "AND state IN ('STARTING','WARM','COLD','LOST')",
-                            (now, latest["incarnation_id"]),
-                        )
-                    elif latest and frozen_isolation:
-                        conn.execute(
-                            "UPDATE incarnations SET state='LOST',ended_at=? WHERE id=? "
-                            "AND state IN ('STARTING','WARM','COLD')",
-                            (now, latest["incarnation_id"]),
-                        )
-                    conn.execute(
-                        "UPDATE logical_agents SET state='REVIVING',current_task_id=NULL,"
-                        "available_since=NULL,updated_at=? WHERE id=? AND state='SUSPENDED'",
-                        (now, escalation["logical_agent_id"]),
+                    self._finalize_escalated_writer_presence(
+                        conn,
+                        latest,
+                        quiescence_confirmed=quiescence_confirmed,
+                        frozen_isolation=frozen_isolation,
+                        now=now,
+                    )
+                    self._prepare_agent_revival_after_safety(
+                        conn, escalation["logical_agent_id"], now
                     )
             else:
                 conn.execute(
@@ -2230,6 +2222,58 @@ class Scheduler:
             "pending_partition_name=NULL,available_since=?,updated_at=? WHERE id=?",
             (state, available_since, now, agent_id),
         )
+
+    def _prepare_agent_revival_after_safety(
+        self, conn: sqlite3.Connection, agent_id: str, now: float
+    ) -> None:
+        """Finalize desired topology before a safety-suspended agent can revive."""
+
+        agent = self._required(conn, "logical_agents", agent_id)
+        if agent["state"] == AgentState.RETIRED.value:
+            return
+        self._release_agent(conn, agent_id, now)
+        released = self._required(conn, "logical_agents", agent_id)
+        if released["state"] == AgentState.READY.value:
+            conn.execute(
+                "UPDATE logical_agents SET state='REVIVING',available_since=NULL,updated_at=? "
+                "WHERE id=? AND state='READY'",
+                (now, agent_id),
+            )
+
+    @staticmethod
+    def _finalize_escalated_writer_presence(
+        conn: sqlite3.Connection,
+        latest: sqlite3.Row | None,
+        *,
+        quiescence_confirmed: bool,
+        frozen_isolation: bool,
+        now: float,
+    ) -> None:
+        if not latest:
+            return
+        if latest["execution_id"]:
+            if quiescence_confirmed:
+                conn.execute(
+                    "UPDATE executions SET state=CASE "
+                    "WHEN state IN ('STARTING','RUNNING','UNKNOWN') THEN 'TERMINATED' "
+                    "ELSE state END,terminal_confirmed=1,quiescent_confirmed=1,"
+                    "updated_at=?,ended_at=COALESCE(ended_at,?) WHERE id=?",
+                    (now, now, latest["execution_id"]),
+                )
+            elif frozen_isolation:
+                conn.execute(
+                    "UPDATE executions SET state=CASE "
+                    "WHEN state IN ('STARTING','RUNNING','UNKNOWN') THEN 'LOST' "
+                    "ELSE state END,updated_at=?,ended_at=COALESCE(ended_at,?) WHERE id=?",
+                    (now, now, latest["execution_id"]),
+                )
+        if latest["incarnation_id"]:
+            next_state = "TERMINATED" if quiescence_confirmed else "LOST"
+            conn.execute(
+                "UPDATE incarnations SET state=?,ended_at=COALESCE(ended_at,?) WHERE id=? "
+                "AND state IN ('STARTING','WARM','COLD','LOST')",
+                (next_state, now, latest["incarnation_id"]),
+            )
 
     @staticmethod
     def _release_dependencies(conn: sqlite3.Connection, batch_id: str, now: float) -> None:

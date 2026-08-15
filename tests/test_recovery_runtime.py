@@ -117,6 +117,13 @@ class AlwaysAmbiguousAdapter(FakeAdapter):
         return StartObservation(ExecutionState.UNKNOWN, runtime_handle, ambiguous=True)
 
 
+class RecoveryFailsAfterAdmissionAdapter(FakeAdapter):
+    def observe_execution(self, runtime_handle):
+        if runtime_handle.get("recovery_order") == 2:
+            raise RuntimeError("injected recovery observation failure")
+        return ExecutionObservation(ExecutionState.RUNNING)
+
+
 class FakeProcess:
     def poll(self):
         return None
@@ -548,6 +555,53 @@ completion_timeout = 1
         self.assertEqual(lease["expires_at"], original_expiry)
         failure = restarted.list("failures")[-1]
         self.assertEqual(failure["failure_code"], "CLAIM_ORPHANED")
+
+    def test_recovery_failure_stops_heartbeat_and_clears_admissions(self) -> None:
+        self.scheduler.resize_partition("general", 2)
+        self.scheduler.reconcile_pool()
+        _batch, _ids = self.scheduler.submit_batch(
+            [TaskSpec("recover-one", {}, priority=2), TaskSpec("recover-two", {})]
+        )
+        claims = []
+        for order in (1, 2):
+            claim = self.scheduler.claim_next_available()
+            execution_id, _request = self.scheduler.create_execution(claim)
+            self.scheduler.confirm_execution_running(
+                claim.attempt_id,
+                claim.lease_epoch,
+                execution_id,
+                runtime_handle={"recovery_order": order},
+            )
+            with self.scheduler.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET started_at=? WHERE id=?",
+                    (float(order), execution_id),
+                )
+            claims.append(claim)
+
+        restarted = Scheduler(Database(self.db_path), lease_seconds=5)
+        restarted.initialize()
+        dispatcher = Dispatcher(
+            restarted,
+            adapters={"codex": RecoveryFailsAfterAdmissionAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        daemon = SchedulerDaemon(
+            dispatcher, poll_seconds=0.001, heartbeat_seconds=0.005
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected recovery"):
+            daemon.run_until_idle(max_wait_seconds=1)
+
+        self.assertIsNone(daemon._heartbeat_thread)
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+        lease_after_cleanup = restarted.get("leases", claims[0].lease_id)["expires_at"]
+        time.sleep(0.03)
+        self.assertEqual(
+            restarted.get("leases", claims[0].lease_id)["expires_at"],
+            lease_after_cleanup,
+        )
 
     def test_restart_ambiguous_execution_is_not_admitted_for_renewal(self) -> None:
         policy = RetryPolicy(

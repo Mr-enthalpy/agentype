@@ -40,6 +40,7 @@ class AppServerSession:
         self._notifications: list[Mapping[str, Any]] = []
         self._stderr: list[str] = []
         self._condition = threading.Condition()
+        self._write_lock = threading.Lock()
         self._next_id = 1
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
@@ -85,44 +86,111 @@ class AppServerSession:
         self.process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
         self.process.stdin.flush()
 
+    def _abort(self) -> None:
+        """Break blocked stdio without waiting beyond the operation deadline."""
+
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+        with self._condition:
+            self._condition.notify_all()
+
+    def _write_until(
+        self, message: Mapping[str, Any], *, deadline: float, operation: str
+    ) -> None:
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def write() -> None:
+            try:
+                with self._write_lock:
+                    self._write(message)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        threading.Thread(
+            target=write,
+            name=f"codex-app-server-write-{operation}",
+            daemon=True,
+        ).start()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not completed.wait(remaining):
+            self._abort()
+            raise TimeoutError(
+                f"Codex app-server request timed out while writing: {operation}"
+            )
+        if errors:
+            self._abort()
+            raise errors[0]
+
     def request(
         self, method: str, params: Mapping[str, Any], *, timeout: float | None = None
     ) -> Mapping[str, Any]:
+        operation_timeout = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + operation_timeout
         with self._condition:
             request_id = self._next_id
             self._next_id += 1
-        self._write({"method": method, "id": request_id, "params": params})
-        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
-        with self._condition:
-            while request_id not in self._responses:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"Codex app-server request timed out: {method}")
-                self._condition.wait(min(remaining, 0.25))
-                if self.process.poll() is not None and request_id not in self._responses:
-                    raise AdapterError(
-                        f"Codex app-server exited during {method}: {' | '.join(self._stderr[-5:])}"
-                    )
-            response = self._responses.pop(request_id)
+        self._write_until(
+            {"method": method, "id": request_id, "params": params},
+            deadline=deadline,
+            operation=method,
+        )
+        try:
+            with self._condition:
+                while request_id not in self._responses:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Codex app-server request timed out: {method}"
+                        )
+                    self._condition.wait(min(remaining, 0.25))
+                    if self.process.poll() is not None and request_id not in self._responses:
+                        raise AdapterError(
+                            f"Codex app-server exited during {method}: "
+                            f"{' | '.join(self._stderr[-5:])}"
+                        )
+                response = self._responses.pop(request_id)
+        except TimeoutError:
+            self._abort()
+            raise
         if response.get("error"):
             raise AdapterError(f"{method}: {response['error']}")
         return response.get("result", {})
 
-    def notify(self, method: str, params: Mapping[str, Any]) -> None:
-        self._write({"method": method, "params": params})
+    def notify(
+        self, method: str, params: Mapping[str, Any], *, timeout: float | None = None
+    ) -> None:
+        operation_timeout = self.timeout if timeout is None else timeout
+        self._write_until(
+            {"method": method, "params": params},
+            deadline=time.monotonic() + operation_timeout,
+            operation=method,
+        )
 
     def notifications(self) -> list[Mapping[str, Any]]:
         with self._condition:
             return list(self._notifications)
 
-    def close(self, *, terminate: bool = True) -> bool:
+    def close(self, *, terminate: bool = True, timeout: float | None = None) -> bool:
+        close_timeout = min(self.timeout, 1.0) if timeout is None else timeout
+        deadline = time.monotonic() + max(0.0, close_timeout)
         if self.process.poll() is None and terminate:
             self.process.terminate()
             try:
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait(timeout=5)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        self.process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        pass
         return self.process.poll() is not None
 
 

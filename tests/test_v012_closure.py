@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
+from local_agent_scheduler.adapters.codex import AppServerSession, CodexAppServerAdapter
 from local_agent_scheduler.cli import _partition_spec_for_upsert, _task_specs, build_parser
 from local_agent_scheduler.config import ExecutionTargetConfig, load_config
 from local_agent_scheduler.core import Scheduler
@@ -82,6 +83,53 @@ class AdvancingFailureBridge:
     def deliver(self, *_args):
         self.clock[0] += 100
         return type("Delivery", (), {"delivered": False, "detail": "slow failure"})()
+
+
+class EmptyReadableStream:
+    def __iter__(self):
+        return iter(())
+
+
+class BlockingStdin:
+    def __init__(self, released: threading.Event, block_at: str):
+        self.released = released
+        self.block_at = block_at
+
+    def write(self, value):
+        if self.block_at == "write":
+            self.released.wait()
+        return len(value)
+
+    def flush(self):
+        if self.block_at == "flush":
+            self.released.wait()
+
+
+class BlockingStdioProcess:
+    def __init__(self, block_at: str):
+        self.released = threading.Event()
+        self.stdin = BlockingStdin(self.released, block_at)
+        self.stdout = EmptyReadableStream()
+        self.stderr = EmptyReadableStream()
+        self.returncode = None
+        self.kill_calls = 0
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+        self.released.set()
+
+    def kill(self):
+        self.kill_calls += 1
+        self.returncode = -9
+        self.released.set()
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("codex app-server", timeout)
+        return self.returncode
 
 
 class SuccessfulTerminalAdapter:
@@ -581,6 +629,135 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(resident["retention"], Retention.RESIDENT.value)
         self.assertEqual(resident["state"], "READY")
 
+    def _suspend_writer_with_desired_partition(
+        self,
+        target_name: str,
+        *,
+        retention: Retention = Retention.RESIDENT,
+        merge: bool = False,
+    ):
+        self.scheduler.upsert_partition(
+            PartitionSpec(target_name, 0, retention, "other", "default")
+        )
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    f"writer-{target_name}",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        if merge:
+            self.scheduler.merge_partitions("general", target_name)
+        else:
+            self.scheduler.move_capacity("general", target_name, 1)
+        self.scheduler.expire_leases(now=claim.lease_expires_at + 1)
+        escalation = self.scheduler.list("escalations", state="OPEN")[-1]
+        return ids[f"writer-{target_name}"], claim, execution_id, escalation
+
+    def test_writer_retry_commits_pending_move_capacity_before_revival(self):
+        _task_id, claim, execution_id, escalation = (
+            self._suspend_writer_with_desired_partition("writer-target")
+        )
+
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "writer-target")
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(agent["state"], "REVIVING")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "TERMINATED")
+        self.assertEqual(self.scheduler.revive_eligible_agents(), 1)
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "READY",
+        )
+
+    def test_writer_retry_commits_canonical_merged_target_before_revival(self):
+        _task_id, claim, _execution_id, escalation = (
+            self._suspend_writer_with_desired_partition(
+                "merged-writer-target", merge=True
+            )
+        )
+
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+        self.assertEqual(self.scheduler.revive_eligible_agents(), 1)
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "merged-writer-target")
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(agent["state"], "READY")
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+
+    def test_writer_retry_applies_ephemeral_destination_retirement(self):
+        _task_id, claim, _execution_id, escalation = (
+            self._suspend_writer_with_desired_partition(
+                "ephemeral-writer-target", retention=Retention.EPHEMERAL
+            )
+        )
+
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "ephemeral-writer-target")
+        self.assertEqual(agent["retention"], Retention.EPHEMERAL.value)
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(agent["state"], "RETIRED")
+
+    def test_cancelled_writer_release_commits_pending_membership(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("cancel-target", 0, Retention.RESIDENT, "other", "default")
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("cancel-moving-writer", {}, workspace_mode=WorkspaceMode.WRITE)]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        self.scheduler.move_capacity("general", "cancel-target", 1)
+        self.scheduler.cancel_task(ids["cancel-moving-writer"])
+        escalation = self.scheduler.list("escalations", state="OPEN")[-1]
+
+        self.scheduler.resolve_escalation(
+            escalation["id"],
+            operation="release_cancelled_writer",
+            quiescence_confirmed=True,
+        )
+        self.assertEqual(self.scheduler.revive_eligible_agents(), 1)
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "cancel-target")
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(agent["state"], "READY")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "TERMINATED")
+
     def test_busy_cross_target_cutover_fences_reusable_presence(self):
         self.scheduler.upsert_partition(
             PartitionSpec("other", 0, Retention.RESIDENT, "other", "default")
@@ -750,6 +927,21 @@ class ClosureCase(unittest.TestCase):
             "thread_id": "thread",
         }
         self.assertEqual(adapter.observe_execution(incomplete).state, ExecutionState.UNKNOWN)
+
+    def test_app_server_stdio_write_and_flush_share_request_deadline(self):
+        for block_at in ("write", "flush"):
+            with self.subTest(block_at=block_at):
+                process = BlockingStdioProcess(block_at)
+                started = time.monotonic()
+                with patch(
+                    "local_agent_scheduler.adapters.codex.subprocess.Popen",
+                    return_value=process,
+                ), self.assertRaisesRegex(TimeoutError, "timed out while writing"):
+                    AppServerSession(("codex", "app-server"), None, 0.05)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 0.5)
+                self.assertEqual(process.kill_calls, 1)
+                self.assertIsNotNone(process.poll())
 
     def test_topology_bootstrap_does_not_resurrect_retired_partition(self):
         with tempfile.TemporaryDirectory() as temporary:
