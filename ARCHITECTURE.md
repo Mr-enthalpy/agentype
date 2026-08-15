@@ -1127,6 +1127,11 @@ read-only, the Execution's frozen snapshot proves attempt isolation, or
 quiescence is confirmed. It continues to block a non-isolated writer whose
 quiescence is unknown.
 
+This safety predicate belongs to the cutover primitive, not to its caller.
+Consequently topology composition is order independent: expiry followed by
+MOVE/MERGE and MOVE/MERGE followed by expiry produce the same safe detachment or
+the same suspended desired membership.
+
 The same idle cross-target cutover rule applies during MERGE: inactive reusable
 presence is fenced, while only an actually ASSIGNED identity uses a pending
 drain transition. MERGE rebases pending inbound references to the canonical
@@ -1469,6 +1474,11 @@ fencing and writer-quiescence rules apply.
 A positive RUNNING observation establishes state and renews its Lease in one
 fenced transaction. Daemon-owned supervision admission occurs only after that
 commit; a separate first heartbeat is not an authority bridge.
+Core heartbeat APIs accept only a persisted RUNNING Execution. A late bounded
+start that lost authority records its physical state and complete runtime handle
+on the exact Execution/Incarnation without admitting supervision or modifying
+Task authority; ambiguous and terminal late starts use the same physical-only
+path.
 
 The Core should understand standardized ambiguity, not frontend-specific exception text.
 

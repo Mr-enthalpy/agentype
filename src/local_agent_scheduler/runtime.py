@@ -107,6 +107,34 @@ class Dispatcher:
     def renew_supervised_leases(self) -> int:
         return self.scheduler.renew_active_leases(self.supervised_attempt_ids())
 
+    def _record_start_physical_history(
+        self,
+        execution_id: str,
+        start,
+        *,
+        state: ExecutionState,
+        runtime_handle: Mapping[str, object] | None = None,
+        terminal_confirmed: bool = False,
+        quiescent_confirmed: bool = False,
+    ) -> None:
+        """Persist a start observation without restoring Task/Lease authority."""
+
+        self.scheduler.record_physical_outcome(
+            execution_id,
+            state=state,
+            runtime_handle=(
+                start.runtime_handle if runtime_handle is None else runtime_handle
+            ),
+            payload={"detail": start.detail} if start.detail is not None else None,
+            failure_class=(
+                start.failure_class
+                or (FailureClass.START_FAILURE if state is ExecutionState.FAILED else None)
+            ),
+            failure_code=start.failure_code,
+            terminal_confirmed=terminal_confirmed,
+            quiescent_confirmed=quiescent_confirmed,
+        )
+
     def dispatch_ready(self) -> int:
         dispatched = 0
         while True:
@@ -170,31 +198,57 @@ class Dispatcher:
                     )
                 except StaleAuthority:
                     self._revoke_supervision(execution_id)
-                    self.scheduler.record_physical_outcome(
-                        execution_id, state=ExecutionState.RUNNING
+                    self._record_start_physical_history(
+                        execution_id, start, state=ExecutionState.RUNNING
                     )
                 else:
                     self._admit_supervision(execution_id, claim.attempt_id)
                     dispatched += 1
             elif start.ambiguous or start.state == ExecutionState.UNKNOWN:
-                self.scheduler.record_start_ambiguity(
-                    claim.attempt_id,
-                    claim.lease_epoch,
-                    execution_id,
-                    runtime_handle=start.runtime_handle,
-                    detail=start.detail,
-                )
+                try:
+                    self.scheduler.record_start_ambiguity(
+                        claim.attempt_id,
+                        claim.lease_epoch,
+                        execution_id,
+                        runtime_handle=start.runtime_handle,
+                        detail=start.detail,
+                    )
+                except StaleAuthority:
+                    self._revoke_supervision(execution_id)
+                    self._record_start_physical_history(
+                        execution_id, start, state=ExecutionState.UNKNOWN
+                    )
             else:
-                self.scheduler.nack(
-                    claim.attempt_id,
-                    claim.lease_epoch,
-                    failure_class=start.failure_class or FailureClass.START_FAILURE,
-                    execution_id=execution_id,
-                    failure_code=start.failure_code,
-                    detail=start.detail,
-                    terminal_confirmed=True,
-                    quiescent_confirmed=True,
-                )
+                try:
+                    self.scheduler.nack(
+                        claim.attempt_id,
+                        claim.lease_epoch,
+                        failure_class=start.failure_class or FailureClass.START_FAILURE,
+                        execution_id=execution_id,
+                        failure_code=start.failure_code,
+                        detail=start.detail,
+                        terminal_confirmed=True,
+                        quiescent_confirmed=True,
+                    )
+                except StaleAuthority:
+                    self._revoke_supervision(execution_id)
+                    physical_state = (
+                        start.state
+                        if start.state
+                        in {
+                            ExecutionState.FAILED,
+                            ExecutionState.LOST,
+                            ExecutionState.TERMINATED,
+                        }
+                        else ExecutionState.FAILED
+                    )
+                    self._record_start_physical_history(
+                        execution_id,
+                        start,
+                        state=physical_state,
+                        terminal_confirmed=True,
+                        quiescent_confirmed=True,
+                    )
         return dispatched
 
     def poll_executions(self, *, recovery: bool = False) -> int:
@@ -233,6 +287,8 @@ class Dispatcher:
             handle = json_loads(execution["runtime_handle_json"], {})
             if execution["state"] in (ExecutionState.STARTING.value, ExecutionState.UNKNOWN.value):
                 start = adapter.reconcile_start(execution["request_id"], handle)
+                if start.runtime_handle:
+                    handle = dict(start.runtime_handle)
                 if start.state == ExecutionState.RUNNING:
                     try:
                         attempt = self.scheduler.get("attempts", execution["attempt_id"])
@@ -247,13 +303,22 @@ class Dispatcher:
                         )
                     except StaleAuthority:
                         self._revoke_supervision(execution["id"])
-                        self.scheduler.record_physical_outcome(
-                            execution["id"], state=ExecutionState.RUNNING
+                        self._record_start_physical_history(
+                            execution["id"],
+                            start,
+                            state=ExecutionState.RUNNING,
+                            runtime_handle=handle,
                         )
                     count += 1
                     continue
                 if start.ambiguous:
                     self._revoke_supervision(execution["id"])
+                    self._record_start_physical_history(
+                        execution["id"],
+                        start,
+                        state=ExecutionState.UNKNOWN,
+                        runtime_handle=handle,
+                    )
                     continue
                 if start.state in {
                     ExecutionState.SUCCEEDED,
@@ -325,6 +390,7 @@ class Dispatcher:
                 self.scheduler.record_physical_outcome(
                     execution["id"],
                     state=outcome.state,
+                    runtime_handle=handle,
                     payload=outcome.payload,
                     failure_class=outcome.failure_class,
                     failure_code=outcome.failure_code,

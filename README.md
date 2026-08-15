@@ -67,6 +67,10 @@ Positive RUNNING confirmation atomically renews the Lease before daemon-owned
 supervision admission. Read-only or frozen-isolated expired work can detach
 logically across a target cutover while its old Execution remains available for
 stale physical reconciliation; unsafe writers remain suspended.
+The cutover safety proof is caller-independent and therefore does not depend on
+whether expiry or topology mutation happened first. Late start observations
+retain their runtime locator through physical-only history, while Core heartbeat
+accepts RUNNING Executions only.
 Persisted unavailable partitions do not abort daemon startup: unhealthy work is
 normalized while healthy work and notification delivery continue. Every
 ExecutionAdapter call is contractually bounded by the adapter's configured

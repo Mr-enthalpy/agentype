@@ -326,6 +326,16 @@ class ClosureCase(unittest.TestCase):
             self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
 
         execution_id, _request = self.scheduler.create_execution(claim)
+        self.assertEqual(self.scheduler.renew_active_leases({claim.attempt_id}), 0)
+        with self.assertRaises(StaleAuthority):
+            self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET state='UNKNOWN' WHERE id=?", (execution_id,)
+            )
+        self.assertEqual(self.scheduler.renew_active_leases({claim.attempt_id}), 0)
+        with self.assertRaises(StaleAuthority):
+            self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
         self.scheduler.confirm_execution_running(
             claim.attempt_id,
             claim.lease_epoch,
@@ -841,6 +851,96 @@ class ClosureCase(unittest.TestCase):
             "expiry-target",
         )
         self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+
+    def _expire_before_topology_change(self, *, workspace_mode, isolated):
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "expiry-first",
+                    {},
+                    workspace_mode=workspace_mode,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next_available()
+        execution_id, _request = self.scheduler.create_execution(
+            claim, attempt_isolation=isolated
+        )
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"thread_id": "stale-thread", "turn_id": "stale-turn"},
+        )
+        self.scheduler.expire_leases(now=claim.lease_expires_at + 10)
+        return ids["expiry-first"], claim, execution_id
+
+    def test_read_only_expiry_then_cross_target_move_preserves_identity(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("move-after-expiry", 0, Retention.RESIDENT, "other", "default")
+        )
+        task_id, claim, execution_id = self._expire_before_topology_change(
+            workspace_mode=WorkspaceMode.READ_ONLY, isolated=False
+        )
+
+        self.scheduler.move_capacity("general", "move-after-expiry", 1)
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "move-after-expiry")
+        self.assertEqual(agent["state"], "READY")
+        self.assertIsNone(agent["pending_partition_name"])
+        self.assertEqual(self.scheduler.get("tasks", task_id)["state"], "RETRY_WAIT")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+
+    def test_isolated_writer_expiry_then_cross_target_merge_preserves_identity(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("merge-after-expiry", 0, Retention.RESIDENT, "other", "default")
+        )
+        _task_id, claim, execution_id = self._expire_before_topology_change(
+            workspace_mode=WorkspaceMode.WRITE, isolated=True
+        )
+
+        self.scheduler.merge_partitions("general", "merge-after-expiry")
+
+        agent = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(agent["partition_name"], "merge-after-expiry")
+        self.assertEqual(agent["state"], "READY")
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+        self.assertEqual(self.scheduler.reconcile_pool()["born"], 0)
+
+    def test_unsafe_writer_expiry_then_move_stages_desired_membership(self):
+        self.scheduler.upsert_partition(
+            PartitionSpec("unsafe-move-after-expiry", 0, Retention.RESIDENT, "other", "default")
+        )
+        _task_id, claim, execution_id = self._expire_before_topology_change(
+            workspace_mode=WorkspaceMode.WRITE, isolated=False
+        )
+        escalation = self.scheduler.list("escalations", state="OPEN")[-1]
+
+        self.scheduler.move_capacity("general", "unsafe-move-after-expiry", 1)
+
+        suspended = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(suspended["state"], "SUSPENDED")
+        self.assertEqual(suspended["partition_name"], "general")
+        self.assertEqual(
+            suspended["pending_partition_name"], "unsafe-move-after-expiry"
+        )
+        self.assertEqual(self.scheduler.get("executions", execution_id)["state"], "RUNNING")
+
+        self.scheduler.resolve_escalation(
+            escalation["id"], operation="retry", quiescence_confirmed=True
+        )
+        committed = self.scheduler.get("logical_agents", claim.logical_agent_id)
+        self.assertEqual(committed["partition_name"], "unsafe-move-after-expiry")
+        self.assertEqual(committed["state"], "REVIVING")
+        self.assertIsNone(committed["pending_partition_name"])
 
     def test_suspended_nonisolated_writer_merge_defers_cutover_until_quiescent(self):
         self.scheduler.upsert_partition(

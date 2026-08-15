@@ -117,6 +117,29 @@ class AlwaysAmbiguousAdapter(FakeAdapter):
         return StartObservation(ExecutionState.UNKNOWN, runtime_handle, ambiguous=True)
 
 
+class FailedStartAdapter(FakeAdapter):
+    def start_execution(self, request):
+        return StartObservation(
+            ExecutionState.FAILED,
+            {"request_id": request.request_id, "thread_id": "late-failed-thread"},
+            failure_class=FailureClass.START_FAILURE,
+            failure_code="LATE_START_FAILED",
+            detail="bounded start returned after authority ended",
+        )
+
+
+class ReconcileRunningWithNewHandleAdapter(FakeAdapter):
+    def reconcile_start(self, request_id, runtime_handle):
+        return StartObservation(
+            ExecutionState.RUNNING,
+            {
+                "request_id": request_id,
+                "thread_id": "recovered-thread",
+                "turn_id": "recovered-turn",
+            },
+        )
+
+
 class RecoveryFailsAfterAdmissionAdapter(FakeAdapter):
     def observe_execution(self, runtime_handle):
         if runtime_handle.get("recovery_order") == 2:
@@ -717,8 +740,88 @@ completion_timeout = 1
 
         execution = self.scheduler.list("executions")[0]
         self.assertEqual(execution["state"], "RUNNING")
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(handle["execution_id"], execution["id"])
+        incarnation = self.scheduler.get("incarnations", execution["incarnation_id"])
+        self.assertEqual(json.loads(incarnation["runtime_handle_json"]), handle)
         self.assertEqual(dispatcher.supervised_attempt_ids(), set())
         self.assertEqual(dispatcher.renew_supervised_leases(), 0)
+
+    def test_late_ambiguous_start_is_physical_history_not_dispatcher_failure(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("late-ambiguous", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": AlwaysAmbiguousAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "record_start_ambiguity",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "UNKNOWN")
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(handle["execution_id"], execution["id"])
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+
+    def test_late_failed_start_is_physical_history_not_dispatcher_failure(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("late-failed", {})])
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": FailedStartAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "nack",
+            side_effect=StaleAuthority("lease expired during bounded start"),
+        ):
+            self.assertEqual(dispatcher.dispatch_ready(), 0)
+
+        execution = self.scheduler.list("executions")[0]
+        self.assertEqual(execution["state"], "FAILED")
+        self.assertEqual(execution["failure_code"], "LATE_START_FAILED")
+        self.assertEqual(
+            json.loads(execution["runtime_handle_json"])["thread_id"],
+            "late-failed-thread",
+        )
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
+
+    def test_stale_reconcile_running_persists_the_new_physical_locator(self) -> None:
+        _batch, _ids = self.scheduler.submit_batch([TaskSpec("stale-reconcile", {})])
+        agent = self.scheduler.list("logical_agents", state="READY")[0]
+        claim = self.scheduler.claim_next(agent["id"])
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id},
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": ReconcileRunningWithNewHandleAdapter()},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        with patch.object(
+            self.scheduler,
+            "confirm_running_and_renew_authority",
+            side_effect=StaleAuthority("recovery authority ended"),
+        ):
+            self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+
+        execution = self.scheduler.get("executions", execution_id)
+        handle = json.loads(execution["runtime_handle_json"])
+        self.assertEqual(execution["state"], "RUNNING")
+        self.assertEqual(handle["thread_id"], "recovered-thread")
+        self.assertEqual(handle["turn_id"], "recovered-turn")
+        self.assertEqual(dispatcher.supervised_attempt_ids(), set())
 
     def test_restart_reconciles_completed_execution_before_notification(self) -> None:
         batch_id, ids = self.scheduler.submit_batch([TaskSpec("recovered", {})])
