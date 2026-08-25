@@ -40,7 +40,7 @@ class AppServerSession:
         try:
             self._initialize(initialization_deadline)
         except BaseException:
-            self._cleanup_failed_initialization()
+            self._cleanup_failed_initialization(initialization_deadline)
             raise
 
     def _initialize(self, initialization_deadline: float) -> None:
@@ -73,21 +73,33 @@ class AppServerSession:
             timeout=self._remaining(initialization_deadline, "initialized"),
         )
 
-    def _cleanup_failed_initialization(self) -> None:
+    def _cleanup_failed_initialization(self, deadline: float) -> None:
+        self._abandon_process(deadline)
+
+    def _abandon_process(self, deadline: float, *, terminate: bool = True) -> bool:
+        """Consume only the remaining absolute deadline for process cleanup."""
+
         if self.process.poll() is not None:
-            return
+            return True
+        remaining = deadline - time.monotonic()
         try:
-            self.process.terminate()
-            self.process.wait(timeout=min(self.timeout, 1.0))
-        except (OSError, subprocess.TimeoutExpired):
-            try:
+            if terminate and remaining > 0:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    remaining = deadline - time.monotonic()
+            if self.process.poll() is None:
                 self.process.kill()
-            except OSError:
-                return
-            try:
-                self.process.wait(timeout=min(self.timeout, 1.0))
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        self.process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except OSError:
+            return self.process.poll() is not None
+        return self.process.poll() is not None
 
     @staticmethod
     def _remaining(deadline: float, operation: str) -> float:
@@ -217,21 +229,10 @@ class AppServerSession:
             return list(self._notifications)
 
     def close(self, *, terminate: bool = True, timeout: float | None = None) -> bool:
-        close_timeout = min(self.timeout, 1.0) if timeout is None else timeout
-        deadline = time.monotonic() + max(0.0, close_timeout)
-        if self.process.poll() is None and terminate:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    try:
-                        self.process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        pass
-        return self.process.poll() is not None
+        close_timeout = 0.0 if timeout is None else max(0.0, timeout)
+        return self._abandon_process(
+            time.monotonic() + close_timeout, terminate=terminate
+        )
 
 
 class CodexAppServerAdapter:
@@ -341,7 +342,7 @@ class CodexAppServerAdapter:
             )
         except Exception as exc:
             if session is not None:
-                session.close()
+                session.close(timeout=max(0.0, method_deadline - time.monotonic()))
             failure_class = self._classify_failure(str(exc))
             return StartObservation(
                 ExecutionState.FAILED,
@@ -356,16 +357,20 @@ class CodexAppServerAdapter:
             runtime_handle, time.monotonic() + self.request_timeout
         )
 
+    def _close_budget(self, deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
+
     def _observe_until(
         self, runtime_handle: Mapping[str, object], deadline: float
     ) -> ExecutionObservation:
         session = self._live_session(runtime_handle)
+        process_detached = False
         if session:
             if not runtime_handle.get("thread_id") or not runtime_handle.get("turn_id"):
                 if session.process.poll() is not None:
                     self._close_live_session(
                         runtime_handle,
-                        timeout=self._remaining(deadline, "observe_execution/close"),
+                        timeout=self._close_budget(deadline),
                     )
                     return ExecutionObservation(
                         ExecutionState.LOST,
@@ -382,27 +387,37 @@ class CodexAppServerAdapter:
                 status = self._turn_status(terminal)
                 state = ExecutionState.SUCCEEDED if status == "completed" else ExecutionState.FAILED
                 return ExecutionObservation(state, terminal_confirmed=True, quiescent_confirmed=True)
-            if session.process.poll() is not None:
-                self._close_live_session(
-                    runtime_handle,
-                    timeout=self._remaining(deadline, "observe_execution/close"),
-                )
-                return ExecutionObservation(
-                    ExecutionState.LOST,
-                    terminal_confirmed=True,
-                    quiescent_confirmed=True,
-                    detail="app-server process exited without a turn completion event",
-                )
-            return ExecutionObservation(ExecutionState.RUNNING)
+            if session.process.poll() is None:
+                return ExecutionObservation(ExecutionState.RUNNING)
+            self._close_live_session(
+                runtime_handle,
+                timeout=self._close_budget(deadline),
+            )
+            process_detached = True
         thread_id = runtime_handle.get("thread_id")
         if not thread_id:
             return ExecutionObservation(ExecutionState.UNKNOWN, detail="no thread handle")
         turn_id = runtime_handle.get("turn_id")
-        return self._read_stored_thread(
+        stored = self._read_stored_thread(
             str(thread_id),
             str(turn_id) if turn_id is not None else None,
             deadline=deadline,
         )
+        if stored.state in {
+            ExecutionState.RUNNING,
+            ExecutionState.SUCCEEDED,
+            ExecutionState.FAILED,
+        }:
+            return stored
+        if process_detached:
+            return ExecutionObservation(
+                ExecutionState.LOST,
+                terminal_confirmed=False,
+                quiescent_confirmed=False,
+                detail=stored.detail
+                or "app-server process exited without a confirmed terminal turn",
+            )
+        return stored
 
     def collect_outcome(self, runtime_handle: Mapping[str, object]) -> ExecutionOutcome:
         deadline = time.monotonic() + self.request_timeout
@@ -441,7 +456,7 @@ class CodexAppServerAdapter:
         text = self._collect_agent_text(session.notifications())
         self._close_live_session(
             runtime_handle,
-            timeout=self._remaining(deadline, "collect_outcome/close"),
+            timeout=self._close_budget(deadline),
         )
         if status == "completed":
             payload: Mapping[str, Any]
@@ -481,7 +496,12 @@ class CodexAppServerAdapter:
             )
         observation = self._observe_until(runtime_handle, deadline)
         if observation.state in (ExecutionState.RUNNING, ExecutionState.SUCCEEDED):
-            return StartObservation(observation.state, runtime_handle)
+            return StartObservation(
+                observation.state,
+                runtime_handle,
+                terminal_confirmed=observation.terminal_confirmed,
+                quiescent_confirmed=observation.quiescent_confirmed,
+            )
         return StartObservation(
             observation.state,
             runtime_handle,
@@ -492,6 +512,8 @@ class CodexAppServerAdapter:
                 else None
             ),
             detail=observation.detail,
+            terminal_confirmed=observation.terminal_confirmed,
+            quiescent_confirmed=observation.quiescent_confirmed,
         )
 
     def interrupt_execution(self, runtime_handle: Mapping[str, object]) -> ExecutionObservation:
@@ -525,7 +547,7 @@ class CodexAppServerAdapter:
                 if terminal:
                     process_stopped = self._close_live_session(
                         runtime_handle,
-                        timeout=self._remaining(deadline, "interrupt_execution/close"),
+                        timeout=self._close_budget(deadline),
                     )
                     return ExecutionObservation(
                         ExecutionState.TERMINATED,
@@ -548,12 +570,10 @@ class CodexAppServerAdapter:
         if interrupted.terminal_confirmed and interrupted.quiescent_confirmed:
             return interrupted
         session = self._live_session(runtime_handle)
-        try:
-            close_timeout = self._remaining(deadline, "terminate_execution/close")
-        except TimeoutError:
-            close_timeout = 0.0
         process_stopped = (
-            self._close_live_session(runtime_handle, timeout=close_timeout)
+            self._close_live_session(
+                runtime_handle, timeout=self._close_budget(deadline)
+            )
             if session
             else False
         )

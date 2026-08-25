@@ -7,7 +7,8 @@ notifications. Physical execution belongs to replaceable adapters.
 
 V0.1.2 uses SQLite WAL and ships a Codex `app-server` adapter. Codex, CCR,
 TokenRhythm, DeepSeek, credentials, and provider routing are not Scheduler Core
-semantics.
+semantics. A nonterminal `collect_outcome` cannot inherit quiescence proof
+from `reconcile_start`.
 
 The long-term architecture is in [ARCHITECTURE.md](ARCHITECTURE.md). The frozen
 V0.1 contracts and V0.1.2 correctness closure are in

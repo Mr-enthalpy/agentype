@@ -1338,9 +1338,10 @@ reconcile_start(...)
 
 These are synchronous Scheduler-facing operations. Every Adapter implementation
 must bound each call with its own configured operation deadline, including all
-underlying process, transport, and stream I/O, and translate timeout into the
-standard outcome vocabulary. The Scheduler does not provide a generic watchdog
-for a non-conforming Adapter.
+underlying process, transport, stream I/O, and exception cleanup, and translate
+timeout into the standard outcome vocabulary. Cleanup may not open a fresh wait
+budget after the method deadline. The Scheduler does not provide a generic
+watchdog for a non-conforming Adapter.
 
 The exact API is not yet frozen beyond this bounded-call correctness contract.
 

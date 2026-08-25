@@ -32,10 +32,12 @@ from local_agent_scheduler.errors import (
     StaleAuthority,
 )
 from local_agent_scheduler.models import (
+    ExecutionObservation,
     ExecutionOutcome,
     ExecutionRequest,
     PartitionSpec,
     RetryPolicy,
+    StartObservation,
     TaskSpec,
 )
 from local_agent_scheduler.runtime import Dispatcher, SchedulerDaemon
@@ -216,6 +218,34 @@ class SuccessfulTerminalAdapter:
 
     def collect_outcome(self, _handle):
         return ExecutionOutcome(ExecutionState.SUCCEEDED, payload={"ok": True})
+
+
+class LostThenRunningAdapter:
+    """Reconcile claims a terminal LOST writer; collect then reports RUNNING."""
+
+    def reconcile_start(self, _request_id, runtime_handle):
+        return StartObservation(
+            ExecutionState.LOST,
+            runtime_handle,
+            failure_class=FailureClass.EXECUTION_LOST,
+            failure_code="SYNTHETIC_LOST",
+            terminal_confirmed=True,
+            quiescent_confirmed=True,
+        )
+
+    def collect_outcome(self, _handle):
+        return ExecutionOutcome(
+            ExecutionState.RUNNING,
+            failure_class=FailureClass.EXECUTION_LOST,
+            failure_code="STILL_RUNNING",
+            terminal_confirmed=False,
+            quiescent_confirmed=False,
+        )
+
+    def observe_execution(self, _handle):
+        return ExecutionObservation(
+            ExecutionState.LOST, terminal_confirmed=True, quiescent_confirmed=True
+        )
 
 
 class ForbiddenStartAdapter:
@@ -1920,6 +1950,147 @@ class ClosureCase(unittest.TestCase):
 
         bridge.release.set()
         daemon._notifier_thread.join(timeout=1)
+
+    def test_nonterminal_collect_does_not_inherit_reconcile_quiescence(self):
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-still-running",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"request_id": request_id, "turn_id": "live"},
+        )
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": LostThenRunningAdapter()},
+            targets={
+                "codex": ExecutionTargetConfig(
+                    "codex", "codex_app_server", False, True
+                )
+            },
+            execution_profiles={"default"},
+            workspace_root=self.temp.name,
+        )
+
+        self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+        execution = self.scheduler.get("executions", execution_id)
+        task = self.scheduler.get("tasks", ids["writer-still-running"])
+        attempts = self.scheduler.list("attempts")
+        self.assertEqual(task["state"], "LEASED")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["state"], "ACTIVE")
+        self.assertEqual(execution["state"], "UNKNOWN")
+        self.assertEqual(execution["terminal_confirmed"], 0)
+        self.assertEqual(execution["quiescent_confirmed"], 0)
+        self.assertEqual(self.scheduler.list("results"), [])
+
+        expired = self.scheduler.expire_leases(now=time.time() + 120)
+        self.assertEqual(expired["retried"], 0)
+        self.assertEqual(expired["suspended"], 1)
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["writer-still-running"])["state"],
+            "SUSPENDED",
+        )
+        self.assertEqual(
+            self.scheduler.list("escalations", state="OPEN")[0]["failure_class"],
+            FailureClass.WRITER_QUIESCENCE_UNKNOWN.value,
+        )
+        self.assertEqual(len(self.scheduler.list("attempts")), 1)
+
+    def test_start_exception_cleanup_uses_remaining_method_deadline(self):
+        class RequestFailingSession:
+            close_timeouts: list[float | None] = []
+            clock = [0.0]
+
+            def __init__(self, _command, _cwd, _timeout):
+                self.session_id = "failing-start"
+                self.process = type("Process", (), {"poll": lambda self: None})()
+                self.__class__.clock[0] += 0.4
+
+            def request(self, method, _params, **_kwargs):
+                self.__class__.clock[0] += 0.5
+                raise RuntimeError("thread/start failed")
+
+            def close(self, *, timeout=None, **_kwargs):
+                self.__class__.close_timeouts.append(timeout)
+                return True
+
+        RequestFailingSession.close_timeouts = []
+        RequestFailingSession.clock = [0.0]
+        adapter = CodexAppServerAdapter(
+            request_timeout=1.0, session_factory=RequestFailingSession
+        )
+        request = ExecutionRequest(
+            "request",
+            "execution",
+            "task",
+            "attempt",
+            1,
+            "agent",
+            "inc",
+            "codex",
+            "default",
+            self.temp.name,
+            "inspect",
+            WorkspaceMode.READ_ONLY,
+            {},
+            {},
+        )
+        with patch(
+            "local_agent_scheduler.adapters.codex.time.monotonic",
+            side_effect=lambda: RequestFailingSession.clock[0],
+        ):
+            started = adapter.start_execution(request)
+        self.assertEqual(started.state, ExecutionState.FAILED)
+        self.assertEqual(len(RequestFailingSession.close_timeouts), 1)
+        self.assertIsNotNone(RequestFailingSession.close_timeouts[0])
+        self.assertLessEqual(RequestFailingSession.close_timeouts[0], 0.1)
+        self.assertGreaterEqual(RequestFailingSession.close_timeouts[0], 0.0)
+
+    def test_exhausted_cleanup_deadline_kills_without_new_wait_budget(self):
+        process = BlockingStdioProcess("none")
+        process.stdin = None
+        waits: list[float | None] = []
+        original_wait = process.wait
+
+        def tracking_wait(timeout=None):
+            waits.append(timeout)
+            return original_wait(timeout=timeout)
+
+        process.wait = tracking_wait  # type: ignore[method-assign]
+        clock = {"n": 0}
+
+        def fake_monotonic():
+            clock["n"] += 1
+            return 0.0 if clock["n"] == 1 else 1.0
+
+        with patch(
+            "local_agent_scheduler.adapters.codex.subprocess.Popen",
+            return_value=process,
+        ), patch(
+            "local_agent_scheduler.adapters.codex.time.monotonic",
+            side_effect=fake_monotonic,
+        ), self.assertRaisesRegex(AdapterError, "failed to open"):
+            AppServerSession(("codex", "app-server"), None, 0.05)
+        self.assertEqual(waits, [])
+        self.assertEqual(process.kill_calls, 1)
+        self.assertIsNotNone(process.poll())
 
 
 if __name__ == "__main__":

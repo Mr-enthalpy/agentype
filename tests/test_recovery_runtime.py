@@ -205,6 +205,19 @@ class FakeStoredSession(FakeRootSession):
         return super().request(method, params)
 
 
+class FakeInProgressStoredSession(FakeRootSession):
+    def request(self, method, params, **_kwargs):
+        self.requests.append((method, params))
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "turns": [{"id": "live-turn", "status": "inProgress"}],
+                }
+            }
+        return super().request(method, params)
+
+
 class FakeInterruptedSession(FakeRootSession):
     def request(self, method, params, **_kwargs):
         self.requests.append((method, params))
@@ -1067,8 +1080,83 @@ termination_confirmation = true
             }
         )
         self.assertEqual(observation.state, ExecutionState.LOST)
+        self.assertFalse(observation.terminal_confirmed)
+        self.assertFalse(observation.quiescent_confirmed)
         self.assertTrue(session.closed)
         self.assertNotIn("exited-session", adapter._sessions)
+
+    def test_exited_session_with_in_progress_turn_is_not_quiescent(self) -> None:
+        adapter = CodexAppServerAdapter(session_factory=FakeInProgressStoredSession)
+        session = FakeInProgressStoredSession((), None, 1)
+        session.process = FakeExitedProcess()
+        adapter._sessions["exited-session"] = session
+        handle = {
+            "adapter_session_id": "exited-session",
+            "thread_id": "thread",
+            "turn_id": "live-turn",
+        }
+        observation = adapter.observe_execution(handle)
+        self.assertEqual(observation.state, ExecutionState.RUNNING)
+        self.assertFalse(observation.quiescent_confirmed)
+        self.assertFalse(observation.terminal_confirmed)
+        self.assertTrue(session.closed)
+        self.assertNotIn("exited-session", adapter._sessions)
+
+        outcome = adapter.collect_outcome(handle)
+        self.assertEqual(outcome.state, ExecutionState.RUNNING)
+        self.assertFalse(outcome.quiescent_confirmed)
+        self.assertFalse(outcome.terminal_confirmed)
+
+    def test_codex_in_progress_after_process_exit_does_not_replace_writer(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-in-progress",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next(
+            self.scheduler.list("logical_agents", state="READY")[0]["id"]
+        )
+        execution_id, request_id = self.scheduler.create_execution(claim)
+        self.scheduler.record_start_ambiguity(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={
+                "request_id": request_id,
+                "adapter_session_id": "exited-session",
+                "thread_id": "thread",
+                "turn_id": "live-turn",
+            },
+        )
+        adapter = CodexAppServerAdapter(session_factory=FakeInProgressStoredSession)
+        session = FakeInProgressStoredSession((), None, 1)
+        session.process = FakeExitedProcess()
+        adapter._sessions["exited-session"] = session
+        dispatcher = Dispatcher(
+            self.scheduler,
+            adapters={"codex": adapter},
+            targets={"codex": self.target},
+            workspace_root=self.root,
+        )
+        self.assertEqual(dispatcher.poll_executions(recovery=True), 1)
+        execution = self.scheduler.get("executions", execution_id)
+        task = self.scheduler.get("tasks", ids["writer-in-progress"])
+        self.assertEqual(execution["state"], "RUNNING")
+        self.assertEqual(execution["quiescent_confirmed"], 0)
+        self.assertNotEqual(task["state"], "RETRY_WAIT")
+        self.assertEqual(len(self.scheduler.list("attempts")), 1)
+        self.assertEqual(self.scheduler.list("results"), [])
 
 
 if __name__ == "__main__":

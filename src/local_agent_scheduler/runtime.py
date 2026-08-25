@@ -331,8 +331,12 @@ class Dispatcher:
                 }:
                     observation = ExecutionObservation(
                         start.state,
-                        terminal_confirmed=True,
-                        quiescent_confirmed=True,
+                        terminal_confirmed=bool(
+                            getattr(start, "terminal_confirmed", False)
+                        ),
+                        quiescent_confirmed=bool(
+                            getattr(start, "quiescent_confirmed", False)
+                        ),
                         detail=start.detail,
                     )
                 else:
@@ -357,6 +361,35 @@ class Dispatcher:
                 continue
             self._revoke_supervision(execution["id"])
             outcome = adapter.collect_outcome(handle)
+            if outcome.state in {
+                ExecutionState.STARTING,
+                ExecutionState.RUNNING,
+                ExecutionState.UNKNOWN,
+            }:
+                # A nonterminal collect_outcome may never inherit terminal or
+                # quiescence proof from an earlier reconcile_start state.
+                unresolved = (
+                    ExecutionState.UNKNOWN
+                    if execution["state"]
+                    in {
+                        ExecutionState.STARTING.value,
+                        ExecutionState.UNKNOWN.value,
+                    }
+                    else ExecutionState.LOST
+                )
+                self.scheduler.record_physical_outcome(
+                    execution["id"],
+                    state=unresolved,
+                    runtime_handle=handle,
+                    payload=outcome.payload,
+                    failure_class=outcome.failure_class,
+                    failure_code=outcome.failure_code,
+                    failure_signature=outcome.failure_signature,
+                    terminal_confirmed=False,
+                    quiescent_confirmed=False,
+                )
+                count += 1
+                continue
             terminal_confirmed = (
                 observation.terminal_confirmed or outcome.terminal_confirmed
             )

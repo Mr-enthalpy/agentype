@@ -91,6 +91,8 @@ class StartObservation:
     failure_class: FailureClass | None = None
     failure_code: str | None = None
     detail: str | None = None
+    terminal_confirmed: bool = False
+    quiescent_confirmed: bool = False
 
 
 @dataclass(frozen=True)
