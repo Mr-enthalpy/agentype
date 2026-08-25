@@ -1439,11 +1439,8 @@ class Scheduler:
         result_id = new_id("result")
         with self.db.transaction() as conn:
             attempt, lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
-            execution = None
-            if execution_id is not None:
-                execution = self._required(conn, "executions", execution_id)
-                if execution["attempt_id"] != attempt_id:
-                    raise StaleAuthority("execution does not belong to current attempt")
+            execution = self._execution_for_attempt(conn, attempt_id, execution_id)
+            resolved_execution_id = execution["id"] if execution is not None else None
             if (
                 task["workspace_mode"] == WorkspaceMode.WRITE.value
                 and execution is not None
@@ -1452,7 +1449,7 @@ class Scheduler:
                 conn.execute(
                     "UPDATE executions SET state='SUCCEEDED',outcome_json=?,terminal_confirmed=1,"
                     "quiescent_confirmed=0,updated_at=?,ended_at=? WHERE id=?",
-                    (json_dumps(payload), now, now, execution_id),
+                    (json_dumps(payload), now, now, resolved_execution_id),
                 )
                 self._record_incarnation_presence(
                     conn,
@@ -1466,7 +1463,7 @@ class Scheduler:
                     conn,
                     task["id"],
                     attempt_id,
-                    execution_id,
+                    resolved_execution_id,
                     FailureClass.WRITER_QUIESCENCE_UNKNOWN,
                     "WRITER_SUCCESS_NOT_QUIESCENT",
                     "WRITER_SUCCESS_NOT_QUIESCENT",
@@ -1502,12 +1499,18 @@ class Scheduler:
                     ExecutionState.UNKNOWN.value,
                 }:
                     raise InvalidTransition(
-                        f"execution {execution_id} cannot succeed from {execution['state']}"
+                        f"execution {resolved_execution_id} cannot succeed from {execution['state']}"
                     )
                 conn.execute(
                     "UPDATE executions SET state='SUCCEEDED',outcome_json=?,terminal_confirmed=1,"
                     "quiescent_confirmed=?,updated_at=?,ended_at=? WHERE id=?",
-                    (json_dumps(payload), int(quiescent_confirmed), now, now, execution_id),
+                    (
+                        json_dumps(payload),
+                        int(quiescent_confirmed),
+                        now,
+                        now,
+                        resolved_execution_id,
+                    ),
                 )
             self._record_incarnation_presence(
                 conn,
@@ -1541,7 +1544,7 @@ class Scheduler:
                     task["batch_id"],
                     attempt_id,
                     attempt["logical_agent_id"],
-                    execution_id,
+                    resolved_execution_id,
                     json_dumps(payload),
                     summary,
                     checkpoint_id,
@@ -1573,16 +1576,13 @@ class Scheduler:
         now = utc_now() if now is None else now
         with self.db.transaction() as conn:
             attempt, lease, task = self._validate_authority(conn, attempt_id, lease_epoch)
-            execution = None
-            if execution_id is not None:
-                execution = self._required(conn, "executions", execution_id)
-                if execution["attempt_id"] != attempt_id:
-                    raise StaleAuthority("execution does not belong to current attempt")
+            execution = self._execution_for_attempt(conn, attempt_id, execution_id)
+            resolved_execution_id = execution["id"] if execution is not None else None
             self._record_failure(
                 conn,
                 task["id"],
                 attempt_id,
-                execution_id,
+                resolved_execution_id,
                 failure_class,
                 failure_code,
                 failure_signature,
@@ -1596,7 +1596,7 @@ class Scheduler:
                     ExecutionState.UNKNOWN.value,
                 }:
                     raise InvalidTransition(
-                        f"execution {execution_id} cannot fail from {execution['state']}"
+                        f"execution {resolved_execution_id} cannot fail from {execution['state']}"
                     )
                 conn.execute(
                     "UPDATE executions SET state=?,failure_class=?,failure_code=?,"
@@ -1616,7 +1616,7 @@ class Scheduler:
                         now,
                         int(terminal_confirmed),
                         now,
-                        execution_id,
+                        resolved_execution_id,
                     ),
                 )
             self._record_incarnation_presence(
@@ -1961,10 +1961,7 @@ class Scheduler:
                 return
             if task["current_attempt_id"]:
                 attempt = self._required(conn, "attempts", task["current_attempt_id"])
-                execution = conn.execute(
-                    "SELECT * FROM executions WHERE attempt_id=? ORDER BY started_at DESC LIMIT 1",
-                    (attempt["id"],),
-                ).fetchone()
+                execution = self._execution_for_attempt(conn, attempt["id"])
                 writer_unknown = (
                     task["workspace_mode"] == WorkspaceMode.WRITE.value
                     and execution is not None
@@ -2041,10 +2038,7 @@ class Scheduler:
                 (now, batch_id, FailureClass.WRITER_QUIESCENCE_UNKNOWN.value),
             )
             for attempt in active:
-                execution = conn.execute(
-                    "SELECT * FROM executions WHERE attempt_id=? ORDER BY started_at DESC LIMIT 1",
-                    (attempt["id"],),
-                ).fetchone()
+                execution = self._execution_for_attempt(conn, attempt["id"])
                 writer_unknown = (
                     attempt["workspace_mode"] == WorkspaceMode.WRITE.value
                     and execution is not None
@@ -2292,6 +2286,29 @@ class Scheduler:
 
         for node in graph:
             visit(node)
+
+    def _execution_for_attempt(
+        self,
+        conn: sqlite3.Connection,
+        attempt_id: str,
+        execution_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Resolve the unique Execution for an Attempt.
+
+        Writer safety always uses the persisted row. Omitting execution_id
+        cannot make an existing physical writer look executionless.
+        """
+
+        actual = conn.execute(
+            "SELECT * FROM executions WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if execution_id is None:
+            return actual
+        supplied = self._required(conn, "executions", execution_id)
+        if supplied["attempt_id"] != attempt_id:
+            raise StaleAuthority("execution does not belong to current attempt")
+        return supplied
 
     @staticmethod
     def _required(

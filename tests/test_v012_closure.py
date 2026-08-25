@@ -22,6 +22,7 @@ from local_agent_scheduler.enums import (
     ExecutionState,
     FailureClass,
     Retention,
+    TaskState,
     WorkspaceMode,
 )
 from local_agent_scheduler.errors import (
@@ -306,6 +307,87 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(
             self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
             "SUSPENDED",
+        )
+
+    def test_ack_success_without_execution_id_cannot_complete_running_writer(self):
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("writer-omit-ack", {}, workspace_mode=WorkspaceMode.WRITE)]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, _ = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        result = self.scheduler.ack_success(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=None,
+            payload={"reported": "success"},
+            quiescent_confirmed=False,
+        )
+        self.assertIsNone(result)
+        self.assertNotEqual(
+            self.scheduler.get("tasks", ids["writer-omit-ack"])["state"], "COMPLETED"
+        )
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["writer-omit-ack"])["state"], "SUSPENDED"
+        )
+        self.assertEqual(self.scheduler.list("results"), [])
+        self.assertEqual(
+            self.scheduler.list("escalations", state="OPEN")[0]["failure_class"],
+            FailureClass.WRITER_QUIESCENCE_UNKNOWN.value,
+        )
+
+    def test_nack_without_execution_id_cannot_retry_running_writer(self):
+        policy = RetryPolicy(
+            max_attempts=2,
+            retry_classes=(FailureClass.EXECUTION_LOST,),
+            base_backoff_seconds=0,
+            max_backoff_seconds=0,
+        )
+        _batch, ids = self.scheduler.submit_batch(
+            [
+                TaskSpec(
+                    "writer-omit-nack",
+                    {},
+                    workspace_mode=WorkspaceMode.WRITE,
+                    retry_policy=policy,
+                )
+            ]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        execution_id, _ = self.scheduler.create_execution(claim)
+        self.scheduler.confirm_execution_running(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id,
+            runtime_handle={"live": True},
+        )
+        state = self.scheduler.nack(
+            claim.attempt_id,
+            claim.lease_epoch,
+            execution_id=None,
+            failure_class=FailureClass.EXECUTION_LOST,
+            terminal_confirmed=False,
+            quiescent_confirmed=False,
+        )
+        self.assertEqual(state, TaskState.SUSPENDED)
+        self.assertNotEqual(
+            self.scheduler.get("tasks", ids["writer-omit-nack"])["state"], "RETRY_WAIT"
+        )
+        self.assertEqual(
+            self.scheduler.get("tasks", ids["writer-omit-nack"])["state"], "SUSPENDED"
+        )
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "SUSPENDED",
+        )
+        self.assertEqual(
+            self.scheduler.list("escalations", state="OPEN")[0]["failure_class"],
+            FailureClass.WRITER_QUIESCENCE_UNKNOWN.value,
         )
 
     def test_writer_success_uses_frozen_execution_isolation(self):
