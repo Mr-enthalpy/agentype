@@ -267,6 +267,21 @@ class CodexAppServerAdapter:
             raise TimeoutError(f"Codex adapter method timed out: {operation}")
         return remaining
 
+    def _thread_sandbox(self, workspace_mode: WorkspaceMode) -> str:
+        """Map Scheduler workspace mode to Codex ThreadStartParams.sandbox.
+
+        Current app-server `SandboxMode` is kebab-case. This is not
+        `SandboxPolicy.type` (`readOnly` / `workspaceWrite`).
+        """
+
+        if workspace_mode is WorkspaceMode.READ_ONLY:
+            return "read-only"
+        if self.sandbox in {"workspace-write", "danger-full-access"}:
+            return "workspace-write"
+        raise RuntimeError(
+            "write Task exceeds the configured Codex adapter sandbox ceiling"
+        )
+
     def start_execution(self, request: ExecutionRequest) -> StartObservation:
         method_deadline = time.monotonic() + self.request_timeout
         session: AppServerSession | None = None
@@ -275,14 +290,7 @@ class CodexAppServerAdapter:
             "execution_id": request.execution_id,
         }
         try:
-            if request.workspace_mode is WorkspaceMode.READ_ONLY:
-                task_sandbox = "read-only"
-            elif self.sandbox in {"workspace-write", "danger-full-access"}:
-                task_sandbox = "workspace-write"
-            else:
-                raise RuntimeError(
-                    "write Task exceeds the configured Codex adapter sandbox ceiling"
-                )
+            task_sandbox = self._thread_sandbox(request.workspace_mode)
             session = self.session_factory(
                 self.command,
                 self.process_cwd,

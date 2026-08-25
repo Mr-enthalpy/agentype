@@ -456,6 +456,53 @@ class ClosureCase(unittest.TestCase):
         with self.assertRaises(InvalidTransition):
             self.scheduler.revive_agent(claim.logical_agent_id, "codex")
 
+    def test_retire_rejects_open_cancelled_writer_safety_obligation(self):
+        _batch, ids = self.scheduler.submit_batch(
+            [TaskSpec("cancel-writer", {}, workspace_mode=WorkspaceMode.WRITE)]
+        )
+        claim = self.scheduler.claim_next(self.agent())
+        self.scheduler.create_execution(claim)
+        self.scheduler.cancel_task(ids["cancel-writer"])
+        self.assertEqual(self.scheduler.get("tasks", ids["cancel-writer"])["state"], "CANCELLED")
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "SUSPENDED",
+        )
+        revisions_before = self.scheduler.db.fetch_one(
+            "SELECT COUNT(*) count FROM pool_topology_revisions"
+        )["count"]
+        with self.assertRaisesRegex(InvalidTransition, "writer-safety obligation"):
+            self.scheduler.retire_partition("general")
+        partition = next(
+            row for row in self.scheduler.list("pool_partitions") if row["name"] == "general"
+        )
+        self.assertEqual(partition["active"], 1)
+        self.assertEqual(
+            self.scheduler.db.fetch_one(
+                "SELECT COUNT(*) count FROM pool_topology_revisions"
+            )["count"],
+            revisions_before,
+        )
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "SUSPENDED",
+        )
+        escalation = self.scheduler.list("escalations", state="OPEN")[0]
+        self.scheduler.resolve_escalation(
+            escalation["id"],
+            operation="release_cancelled_writer",
+            quiescence_confirmed=True,
+        )
+        self.scheduler.retire_partition("general")
+        self.assertEqual(
+            self.scheduler.get("logical_agents", claim.logical_agent_id)["state"],
+            "RETIRED",
+        )
+        retired = next(
+            row for row in self.scheduler.list("pool_partitions") if row["name"] == "general"
+        )
+        self.assertEqual(retired["active"], 0)
+
     def test_suspended_member_does_not_block_capacity_birth(self):
         old = self.agent()
         with self.db.transaction() as conn:
@@ -1291,6 +1338,16 @@ class ClosureCase(unittest.TestCase):
         started = adapter.start_execution(request)
         self.assertEqual(started.state, ExecutionState.RUNNING)
         self.assertEqual(CapturingSession.instances[0].calls[0][1]["sandbox"], "read-only")
+        write_request = ExecutionRequest(
+            "request-w", "execution-w", "task", "attempt", 1, "agent", "inc", "codex",
+            "default", self.temp.name, "mutate", WorkspaceMode.WRITE, {}, {}
+        )
+        CapturingSession.instances.clear()
+        written = adapter.start_execution(write_request)
+        self.assertEqual(written.state, ExecutionState.RUNNING)
+        self.assertEqual(
+            CapturingSession.instances[0].calls[0][1]["sandbox"], "workspace-write"
+        )
         incomplete = {
             "adapter_session_id": CapturingSession.instances[0].session_id,
             "thread_id": "thread",

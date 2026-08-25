@@ -733,6 +733,19 @@ class Scheduler:
                 raise InvalidTransition(
                     f"cannot retire partition with desired LogicalAgent {inbound['id']}"
                 )
+            unsafe = conn.execute(
+                "SELECT a.id FROM logical_agents a "
+                "JOIN escalations e ON e.logical_agent_id=a.id "
+                "WHERE a.partition_name=? AND a.state<>'RETIRED' "
+                "AND e.state='OPEN' AND e.failure_class=? "
+                "ORDER BY a.id LIMIT 1",
+                (name, FailureClass.WRITER_QUIESCENCE_UNKNOWN.value),
+            ).fetchone()
+            if unsafe:
+                raise InvalidTransition(
+                    f"cannot retire partition with open writer-safety obligation "
+                    f"on LogicalAgent {unsafe['id']}"
+                )
             departing = conn.execute(
                 "SELECT * FROM logical_agents WHERE partition_name=? "
                 "AND pending_partition_name IS NOT NULL AND current_task_id IS NULL "
