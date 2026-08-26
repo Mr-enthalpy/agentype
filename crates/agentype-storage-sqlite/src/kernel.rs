@@ -835,6 +835,16 @@ impl Kernel {
         terminal_confirmed: bool,
         quiescent_confirmed: bool,
     ) -> Result<(), Error> {
+        // Spec 16 §A / 14: a nonterminal authoritative observation MUST NOT
+        // carry (or inherit) terminal/quiescence proof. Durable proof may only
+        // be persisted together with a terminal physical state; entering an
+        // unresolved state supersedes and clears any earlier stored proof.
+        let unresolved = matches!(state, ExecutionState::Unknown | ExecutionState::Lost);
+        if unresolved && (terminal_confirmed || quiescent_confirmed) {
+            return Err(Error::invalid_transition(
+                "an unresolved physical outcome cannot carry terminal or quiescence proof",
+            ));
+        }
         self.tx(|tx, now| {
             let execution = required_execution(tx, execution_id.as_str())?;
             let from = ExecutionState::parse_sql(&execution.state)?;
@@ -845,9 +855,10 @@ impl Kernel {
                 "UPDATE executions SET state=?1,runtime_handle_json=COALESCE(?2,runtime_handle_json),
                  outcome_json=COALESCE(?3,outcome_json),
                  failure_class=COALESCE(?4,failure_class),
-                 terminal_confirmed=MAX(terminal_confirmed,?5),
-                 quiescent_confirmed=MAX(quiescent_confirmed,?6),updated_at=?7,
-                 ended_at=CASE WHEN ?5 THEN ?7 ELSE ended_at END WHERE id=?8",
+                 terminal_confirmed=CASE WHEN ?7 THEN 0 ELSE MAX(terminal_confirmed,?5) END,
+                 quiescent_confirmed=CASE WHEN ?7 THEN 0 ELSE MAX(quiescent_confirmed,?6) END,
+                 updated_at=?8,
+                 ended_at=CASE WHEN ?5 THEN ?8 ELSE ended_at END WHERE id=?9",
                 params![
                     state.as_sql(),
                     handle_json,
@@ -855,6 +866,7 @@ impl Kernel {
                     failure_class.map(|c| c.as_sql().to_string()),
                     terminal_confirmed as i64,
                     quiescent_confirmed as i64,
+                    unresolved as i64,
                     now,
                     execution.id
                 ],
@@ -1051,7 +1063,8 @@ impl Kernel {
                 }
                 let next = if terminal_confirmed { "FAILED" } else { "UNKNOWN" };
                 tx.execute(
-                    "UPDATE executions SET state=?1,failure_class=?2,terminal_confirmed=?3,quiescent_confirmed=?4,
+                    "UPDATE executions SET state=?1,failure_class=?2,terminal_confirmed=?3,
+                     quiescent_confirmed=CASE WHEN ?3 THEN ?4 ELSE 0 END,
                      updated_at=?5,ended_at=CASE WHEN ?3 THEN ?5 ELSE ended_at END WHERE id=?6",
                     params![
                         next,
@@ -1198,6 +1211,134 @@ impl Kernel {
             )
             .map_err(map_sqlite)?;
             recompute_batch(tx, &task.batch_id, now)?;
+            Ok(())
+        })
+    }
+
+    /// Spec 03 §Batch: OPEN/ACTIVE/SUSPENDED -> cancel -> CANCELLED. Cancelling
+    /// a batch closes every nonterminal Task and every active Attempt/Lease
+    /// under writer-quiescence rules; an open WRITER_QUIESCENCE_UNKNOWN
+    /// obligation survives (spec 03: cancellation is not quiescence proof).
+    pub fn cancel_batch(&self, batch_id: &BatchId) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            let state: String = tx
+                .query_row(
+                    "SELECT state FROM batches WHERE id=?1",
+                    params![batch_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Error::not_found(format!("batches {:?}", batch_id.as_str()))
+                    }
+                    other => map_sqlite(other),
+                })?;
+            if state == "CANCELLED" {
+                return Ok(());
+            }
+            if !matches!(state.as_str(), "OPEN" | "ACTIVE" | "SUSPENDED") {
+                return Err(Error::invalid_transition(format!(
+                    "batch in state {state} cannot be cancelled"
+                )));
+            }
+            tx.execute(
+                "UPDATE escalations SET state='CANCELLED',resolved_at=?1
+                 WHERE batch_id=?2 AND state='OPEN' AND failure_class<>'WRITER_QUIESCENCE_UNKNOWN'",
+                params![now, batch_id.as_str()],
+            )
+            .map_err(map_sqlite)?;
+            let active: Vec<(String, String, Option<String>, String, String, Option<String>)> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT a.id,a.logical_agent_id,a.incarnation_id,t.id,t.workspace_mode,t.workstream_id
+                         FROM attempts a JOIN tasks t ON t.id=a.task_id
+                         WHERE t.batch_id=?1 AND a.state='ACTIVE' ORDER BY a.id",
+                    )
+                    .map_err(map_sqlite)?;
+                let rows = stmt.query_map(params![batch_id.as_str()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .map_err(map_sqlite)?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(map_sqlite)?);
+                }
+                out
+            };
+            for (attempt_id, agent_id, incarnation_id, task_id, workspace_mode, workstream_id) in
+                active
+            {
+                let execution = execution_for_attempt(tx, &attempt_id, None)?;
+                let (row_quiescent, row_isolation) = execution
+                    .as_ref()
+                    .map(|e| (e.quiescent_confirmed, e.attempt_isolation))
+                    .unwrap_or((false, false));
+                let writer_unknown =
+                    workspace_mode == "write" && execution.is_some() && !(row_quiescent || row_isolation);
+                let physical_quiescent = execution.is_none() || row_quiescent;
+                record_incarnation_presence(
+                    tx,
+                    incarnation_id.as_deref(),
+                    if physical_quiescent {
+                        ExecutionState::Terminated
+                    } else {
+                        ExecutionState::Lost
+                    },
+                    physical_quiescent,
+                    physical_quiescent,
+                    false,
+                    now,
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET state='CANCELLED',ended_at=?1 WHERE id=?2 AND state='ACTIVE'",
+                    params![now, attempt_id],
+                )
+                .map_err(map_sqlite)?;
+                tx.execute(
+                    "UPDATE leases SET state='REVOKED',ended_at=?1 WHERE attempt_id=?2 AND state='ACTIVE'",
+                    params![now, attempt_id],
+                )
+                .map_err(map_sqlite)?;
+                if writer_unknown {
+                    tx.execute(
+                        "UPDATE logical_agents SET state='SUSPENDED',current_task_id=NULL,
+                         available_since=NULL,updated_at=?1 WHERE id=?2 AND state<>'RETIRED'",
+                        params![now, agent_id],
+                    )
+                    .map_err(map_sqlite)?;
+                    create_escalation(
+                        tx,
+                        &task_id,
+                        batch_id.as_str(),
+                        Some(&agent_id),
+                        workstream_id.as_deref(),
+                        FailureClass::WriterQuiescenceUnknown,
+                        Some("CANCELLED_WRITER_NOT_QUIESCENT"),
+                        Some("batch cancelled but physical writer quiescence is unknown"),
+                        now,
+                    )?;
+                } else {
+                    release_agent(tx, &agent_id, now)?;
+                }
+            }
+            tx.execute(
+                "UPDATE tasks SET state='CANCELLED',current_attempt_id=NULL,updated_at=?1
+                 WHERE batch_id=?2 AND state NOT IN ('COMPLETED','CANCELLED')",
+                params![now, batch_id.as_str()],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE batches SET state='CANCELLED',updated_at=?1 WHERE id=?2",
+                params![now, batch_id.as_str()],
+            )
+            .map_err(map_sqlite)?;
             Ok(())
         })
     }
@@ -1619,13 +1760,16 @@ impl Kernel {
         detail: &str,
     ) -> Result<TaskState, Error> {
         let _ = detail;
+        // Configuration unavailability says nothing about the physical state
+        // of an existing writer. It MUST NOT fabricate terminal/quiescence
+        // proof (spec 02: cancellation/config events are not quiescence).
         self.nack(
             attempt_id,
             lease_epoch,
             unavailable_configuration_failure(),
             None,
-            true,
-            true,
+            false,
+            false,
             false,
         )
     }
@@ -1700,33 +1844,6 @@ impl Kernel {
             n += 1;
         }
         Ok(n)
-    }
-
-    pub fn ensure_incarnation(
-        &self,
-        logical_agent_id: &LogicalAgentId,
-        target: &str,
-    ) -> Result<IncarnationId, Error> {
-        self.tx(|tx, now| {
-            let id = ensure_incarnation(tx, logical_agent_id.as_str(), target, now)?;
-            Ok(IncarnationId::from_string(id))
-        })
-    }
-
-    pub fn set_logical_agent_state(
-        &self,
-        id: &LogicalAgentId,
-        state: LogicalAgentState,
-    ) -> Result<(), Error> {
-        self.tx(|tx, now| {
-            required_agent(tx, id.as_str())?;
-            tx.execute(
-                "UPDATE logical_agents SET state=?1,updated_at=?2 WHERE id=?3",
-                params![state.as_sql(), now, id.as_str()],
-            )
-            .map_err(map_sqlite)?;
-            Ok(())
-        })
     }
 
     pub fn recover_authority(&self) -> Result<ExpireReport, Error> {
@@ -2034,18 +2151,6 @@ impl Kernel {
                     topology_revision: row.topology_revision,
                 })
             })
-        })
-    }
-
-    pub fn warm_incarnation(&self, execution_id: &ExecutionId) -> Result<(), Error> {
-        self.tx(|tx, _now| {
-            let execution = required_execution(tx, execution_id.as_str())?;
-            tx.execute(
-                "UPDATE incarnations SET state='WARM' WHERE id=?1 AND state IN ('STARTING','WARM','COLD')",
-                params![execution.incarnation_id],
-            )
-            .map_err(map_sqlite)?;
-            Ok(())
         })
     }
 }

@@ -607,6 +607,12 @@ pub fn ensure_incarnation(
     target: &str,
     now: UnixTime,
 ) -> Result<String, Error> {
+    let agent = required_agent(tx, logical_agent_id)?;
+    if agent.state == "RETIRED" {
+        return Err(Error::invalid_transition(
+            "a semantically retired LogicalAgent cannot obtain a live Incarnation",
+        ));
+    }
     if let Some((id, exec_target)) = query_opt(
         tx,
         "SELECT id,execution_target FROM incarnations WHERE logical_agent_id=?1
