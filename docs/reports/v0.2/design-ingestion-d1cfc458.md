@@ -1,15 +1,21 @@
 # V0.2 design ingestion report
 
 Status: Historical Report
-Applies to: V0.2 design bundle landing
-Canonical path: docs/design/v0.2/comprehension.md
-Not a specification. Does not freeze Rust APIs or storage schema.
+Applies to: V0.2 design bundle ingestion at `d1cfc458`
+Canonical path: docs/reports/v0.2/design-ingestion-d1cfc458.md
+Not a specification. Not part of the canonical design bundle.
 
-This report is the required architecture comprehension output from
-`AGENT_INGESTION_GUIDE.md` and the ingestion `plan.txt`. It restates frozen
-direction in the ingesting agent's words, records conflicts with the V0.1
-tree, and lists questions the bundle marks unresolved. It does not answer
-those questions.
+This is one agent's derived comprehension of `docs/design/v0.2/` at
+`d1cfc458`. Later agents must re-read the canonical bundle and produce their
+own report. This file is not a canonical input and must not be listed in
+`docs/design/v0.2/MANIFEST.json`.
+
+Subsequent bundle amendments after `d1cfc458` (Root operating doctrine,
+information-function orthogonality, memory-promotion open questions,
+Generation vs mechanical recovery) live in `docs/design/v0.2/` and are not
+fully reflected here.
+
+Not a specification. Does not freeze Rust APIs or storage schema.
 
 The design remains coherent if every available model is equally capable,
 cheap, fast, long-context, and general. Model names, price tiers, Python

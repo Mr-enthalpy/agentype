@@ -128,3 +128,23 @@ Negative-semantic pollution often comes from duplicate failures, overgeneralized
 Negative Transform tends to deduplicate, generalize correctly, narrow applicability, split domains, and retire obsolete exclusions.
 
 Semantic specialization is a topology choice, not an inheritance hierarchy.
+
+## 9. Information function is orthogonal to type class and lifecycle
+
+EXPAND, COMPRESS-POSITIVE, and COMPRESS-NEGATIVE are information operations.
+
+They are not a required mutually exclusive AgentType taxonomy and they are
+not a retention mode.
+
+Do not encode them as:
+
+```text
+enum AgentKind { Positive, Negative, Explorer }
+```
+
+A single small-domain LogicalAgent may carry more than one information
+function (for example positive and negative maintenance of one bounded
+area). Lifecycle (short-lived explore-and-retire vs long-lived continuity)
+is a separate policy. Semantic function belongs on AgentType as a
+policy/trait/set, not as the AgentType's exclusive class.
+

@@ -15,7 +15,7 @@ V0.2 design covers:
 
 - AgentType and typed logical specialization;
 - SpawnSource as a provisioning abstraction orthogonal to AgentType;
-- Root semantic operating policy;
+- Root semantic operating policy and the runtime Root operating doctrine;
 - positive / negative / exploratory information functions;
 - flat agent topology;
 - task generations and bounded frontier expansion;

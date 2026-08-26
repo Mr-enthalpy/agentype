@@ -16,18 +16,24 @@ Read every document in this order:
 2. 00-design-charter.md
 3. 01-system-thesis-and-information-functions.md
 4. 02-root-operating-model.md
-5. 03-flat-organization-and-generations.md
-6. 04-work-intent-compilation.md
-7. 05-agent-type-and-spawn-source.md
-8. 06-transform-lineage-and-memory.md
-9. 07-revival-continuity-and-terminal-boundary.md
-10. 08-sandbox-and-capability-enforcement.md
-11. 09-v01-correctness-kernel-boundary.md
-12. 10-rust-rewrite-boundary.md
-13. 11-open-questions.md
-14. 12-normative-invariants.md
+5. ROOT_OPERATING_DOCTRINE.md
+6. 03-flat-organization-and-generations.md
+7. 04-work-intent-compilation.md
+8. 05-agent-type-and-spawn-source.md
+9. 06-transform-lineage-and-memory.md
+10. 07-revival-continuity-and-terminal-boundary.md
+11. 08-sandbox-and-capability-enforcement.md
+12. 09-v01-correctness-kernel-boundary.md
+13. 10-rust-rewrite-boundary.md
+14. 11-open-questions.md
+15. 12-normative-invariants.md
 
 Do not stop after the overview.
+
+Do not treat a previous agent's comprehension report as canonical input.
+Those reports live under `docs/reports/` as historical evidence. Absorb this
+bundle, then write a new report under `docs/reports/v0.2/`. Never add that
+report to `MANIFEST.json`.
 
 ## 2. Required interpretation
 
@@ -44,7 +50,9 @@ Build your architecture model around these distinctions:
 - revival vs Transform;
 - Scheduler memory floor vs native terminal continuity;
 - correctness capabilities vs continuity capabilities vs experience capabilities;
-- flat information topology vs forbidden command hierarchy.
+- flat information topology vs forbidden command hierarchy;
+- information function vs mutually exclusive AgentType class;
+- Generation transition vs mechanical retry/recovery/revival.
 
 If you collapse any pair above into one concept, your interpretation is probably wrong.
 
@@ -80,7 +88,11 @@ The architecture structures cognition even if all models are equally capable.
 
 ## 5. Before proposing implementation
 
-Produce a short architecture comprehension report containing:
+Produce a short architecture comprehension report under `docs/reports/v0.2/`,
+not inside this bundle. A previous report is evidence of one reading, not
+source design.
+
+The report must contain:
 
 ### A. Ten frozen invariants in your own words
 

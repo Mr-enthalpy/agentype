@@ -17,8 +17,8 @@
     "11-open-questions.md",
     "12-normative-invariants.md",
     "AGENT_INGESTION_GUIDE.md",
-    "README.md",
-    "comprehension.md"
+    "ROOT_OPERATING_DOCTRINE.md",
+    "README.md"
   ],
   "purpose": "V0.2 architecture consolidation and agent ingestion guidance"
 }

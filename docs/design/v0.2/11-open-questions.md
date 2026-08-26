@@ -60,6 +60,42 @@ Need to decide:
 - positive/negative specialization;
 - update/merge rules.
 
+## Semantic memory promotion protocol
+
+A Result may carry a candidate positive or negative semantic delta.
+Workers cannot promote that delta into long-lived MemoryCapsule / canonical
+semantic memory merely by labeling it `validated_delta`.
+
+Need to decide who accepts and writes the promotion:
+
+- Root acceptance during Generation review;
+- an explicit semantic-integration Task;
+- another mechanism that still uses the ordinary correctness kernel.
+
+Until this is specified, implementations must not add a hidden write path.
+
+## Negative semantic entry lifecycle
+
+Need to decide, for a durable negative/exclusion record:
+
+- scope;
+- assumptions;
+- applicability conditions;
+- supersession;
+- hot vs cold retention and garbage collection.
+
+Without scope, “Y failed under condition C” degenerates into “Y must never
+be used.”
+
+## Information-function representation
+
+Frozen: information function and lifecycle are orthogonal; positive,
+negative, and exploratory functions are not required to be mutually
+exclusive AgentType categories.
+
+Still need the concrete representation (policy/trait/set, cardinality
+limits, how matching uses a set rather than an exclusive kind).
+
 ## ContinuityBinding persistence
 
 Need to decide:

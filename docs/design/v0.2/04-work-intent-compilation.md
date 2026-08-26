@@ -90,7 +90,11 @@ Conceptually:
 
 The implementation may use a specialized long-lived AgentType, deterministic validation, or both.
 
-It has no worker-management authority, no frontier-admission authority, no special Task lifecycle, and no hierarchical status.
+It has no worker-management authority, no frontier-admission authority, and no hierarchical status.
+
+It has no privileged lifecycle. If compilation requires agent/model
+execution, that execution is ordinary scheduled work governed by the normal
+Task / Attempt / Lease / Result correctness kernel.
 
 ## 6. Compiler input view
 

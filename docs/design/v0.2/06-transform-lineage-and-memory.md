@@ -111,6 +111,13 @@ Updates may come from normal checkpoint promotion, explicit maintenance Tasks, o
 
 Any LLM-based compression is ordinary scheduled work with provenance.
 
+A Result may carry a candidate positive or negative semantic delta. That
+does not write long-lived MemoryCapsule contents. Workers cannot promote
+their own `validated_delta` into canonical semantic memory. The promotion /
+acceptance protocol (Root acceptance vs an explicit semantic-integration
+Task vs another mechanism) is an open question; until it is specified, do
+not add a hidden write path.
+
 ## 8. Positive and negative memory specialization
 
 Positive-semantic maintainer capsules emphasize current valid structure, accepted decisions, and implementation state.

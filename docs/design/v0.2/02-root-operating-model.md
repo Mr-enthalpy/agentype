@@ -11,6 +11,10 @@ Root is not a lease manager, incarnation manager, retry controller, worker proce
 
 Root owns the semantic frontier.
 
+The runtime prompt contract for a running Root is
+`ROOT_OPERATING_DOCTRINE.md`. That file is how Root *uses* Agentype. It is
+not the architecture/RIIR ingestion guide.
+
 ## 2. Root retains
 
 - problem definition;

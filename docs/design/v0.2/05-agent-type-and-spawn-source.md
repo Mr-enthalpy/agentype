@@ -20,7 +20,8 @@ Suggested descriptor:
 - continuity_policy;
 - anchor_constraint;
 - spawn_requirements;
-- semantic function / memory policy;
+- semantic function / memory policy (a set of information functions plus
+  memory policy; not a mutually exclusive Positive/Negative/Explorer class);
 - transform policy;
 - optional based_on_type_id for provenance/config reuse.
 

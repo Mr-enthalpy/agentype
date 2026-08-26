@@ -93,3 +93,12 @@ Canonical path: docs/design/v0.2/12-normative-invariants.md
 59. Unsafe duplicate writers remain prohibited.
 60. Scheduler remains sole claim/state authority.
 61. Generation/AgentType/Compiler layers may not bypass the Task/Attempt/Lease/Result correctness kernel.
+62. If WorkIntent compilation requires agent/model execution, that execution is ordinary scheduled work with no privileged Task lifecycle.
+
+## Information-function orthogonality
+
+63. Information function and lifecycle are orthogonal. Positive, negative, and exploratory functions are not required to be mutually exclusive AgentType categories.
+
+## Generation vs mechanical recovery
+
+64. Mechanical retry, recovery, reconciliation, and revival remain inside the originating semantic Task/Generation and do not create a new Generation.

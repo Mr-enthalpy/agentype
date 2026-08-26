@@ -53,6 +53,12 @@ Every Task belongs to a Generation.
 
 A Generation may represent a coherent wave such as EXPLORE, IMPLEMENT, VERIFY, AUDIT, or REFINE. These are policy modes, not AgentType names.
 
+Generation describes the semantic search frontier only.
+
+Mechanical retry, recovery, adapter reconciliation, and revival remain
+inside the originating semantic Task/Generation. They are not a Generation
+transition and they are not new semantic work.
+
 ## 4. GenerationPolicy
 
 A Generation applies a small global constraint set to all work in that frontier.

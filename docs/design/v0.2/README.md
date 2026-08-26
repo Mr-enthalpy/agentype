@@ -18,16 +18,25 @@ The V0.1 correctness kernel remains the execution foundation: Task / Attempt /
 Lease / Result / LogicalAgent / Incarnation / Execution / Batch / Escalation /
 Pool correctness must not be weakened by V0.2 semantic features.
 
-Ingestion report (required before implementation):
-[comprehension.md](comprehension.md).
-
 Unresolved questions — do not invent answers during ingestion or kernel work:
 [11-open-questions.md](11-open-questions.md).
 
 If repository code or V0.1 documentation conflicts with this bundle: state the
 conflict, classify it as historical V0.1 vs current V0.2, and do not silently
-preserve the old design or rewrite the frozen direction. Conflicts identified
-during ingestion are listed in [comprehension.md](comprehension.md).
+preserve the old design or rewrite the frozen direction.
+
+Two operational contracts live beside the numbered documents and are not
+substitutes for each other:
+
+- [AGENT_INGESTION_GUIDE.md](AGENT_INGESTION_GUIDE.md) teaches an
+  architecture/RIIR agent how to absorb Agentype.
+- [ROOT_OPERATING_DOCTRINE.md](ROOT_OPERATING_DOCTRINE.md) teaches a runtime
+  Root how to use Agentype to solve a user problem.
+
+Latest ingestion *evidence* (historical report, not canonical input):
+[docs/reports/v0.2/design-ingestion-d1cfc458.md](../../reports/v0.2/design-ingestion-d1cfc458.md).
+Every new architecture/RIIR agent must produce its own comprehension from this
+bundle. A previous agent's report must not be treated as source design.
 
 ## Reading order
 
@@ -48,6 +57,10 @@ during ingestion are listed in [comprehension.md](comprehension.md).
 `AGENT_INGESTION_GUIDE.md` is the operational instruction for a future
 architecture/implementation agent to absorb the bundle without flattening it
 into a simplistic hierarchy or model-routing design.
+
+`ROOT_OPERATING_DOCTRINE.md` is the runtime Root prompt contract. Read it
+after `02-root-operating-model.md`. It does not replace the architecture
+model and does not grant Root Scheduler mechanics.
 
 ## Normative intent
 
