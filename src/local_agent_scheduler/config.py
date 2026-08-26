@@ -27,10 +27,19 @@ class CodexAdapterConfig:
 
 
 @dataclass(frozen=True)
+class GrokAdapterConfig:
+    command: tuple[str, ...]
+    cwd: str
+    sandbox: str
+    request_timeout: float
+
+
+@dataclass(frozen=True)
 class RootBridgeConfig:
     kind: str
     inbox: str
     root_thread_id: str | None
+    root_session_id: str | None
     request_timeout: float
     completion_timeout: float
 
@@ -46,6 +55,7 @@ class SchedulerConfig:
     partitions: tuple[PartitionSpec, ...]
     execution_targets: tuple[ExecutionTargetConfig, ...]
     codex_adapter: CodexAdapterConfig
+    grok_adapter: GrokAdapterConfig | None
     execution_profiles: Mapping[str, Mapping[str, Any]]
     retry_defaults: RetryPolicy
     root_bridge: RootBridgeConfig
@@ -176,7 +186,7 @@ def load_config(path: str | Path) -> SchedulerConfig:
             raise ConfigurationError(f"missing execution target key: {exc}") from exc
 
     adapters = raw.get("adapters", {})
-    _reject_unknown(adapters, {"codex_app_server"}, "adapters")
+    _reject_unknown(adapters, {"codex_app_server", "grok_acp"}, "adapters")
     codex = adapters.get("codex_app_server", {})
     _reject_unknown(codex, {"command", "cwd", "approval_policy", "sandbox"}, "adapters.codex_app_server")
     command_value = _typed(codex.get("command", ["codex", "app-server"]), list, "adapters.codex_app_server.command")
@@ -199,6 +209,43 @@ def load_config(path: str | Path) -> SchedulerConfig:
         ),
         sandbox=sandbox,
     )
+    grok_raw = adapters.get("grok_acp")
+    grok_config: GrokAdapterConfig | None = None
+    if grok_raw is not None:
+        _typed(grok_raw, dict, "adapters.grok_acp")
+        _reject_unknown(
+            grok_raw, {"command", "cwd", "sandbox", "request_timeout"}, "adapters.grok_acp"
+        )
+        grok_command_value = _typed(
+            grok_raw.get("command", ["grok", "agent", "--always-approve", "stdio"]),
+            list,
+            "adapters.grok_acp.command",
+        )
+        grok_command = tuple(
+            _nonempty(part, "adapters.grok_acp.command") for part in grok_command_value
+        )
+        if not grok_command:
+            raise ConfigurationError("Grok adapter command cannot be empty")
+        grok_sandbox = _nonempty(
+            grok_raw.get("sandbox", "workspace"), "adapters.grok_acp.sandbox"
+        )
+        if grok_sandbox not in {"off", "workspace", "read-only", "strict"}:
+            raise ConfigurationError(
+                "adapters.grok_acp.sandbox must be off, workspace, read-only, or strict"
+            )
+        grok_timeout = grok_raw.get("request_timeout", 30)
+        if (
+            not isinstance(grok_timeout, (int, float))
+            or isinstance(grok_timeout, bool)
+            or grok_timeout <= 0
+        ):
+            raise ConfigurationError("adapters.grok_acp.request_timeout must be a positive number")
+        grok_config = GrokAdapterConfig(
+            command=grok_command,
+            cwd=_nonempty(grok_raw.get("cwd", "."), "adapters.grok_acp.cwd"),
+            sandbox=grok_sandbox,
+            request_timeout=float(grok_timeout),
+        )
 
     raw_profiles = raw.get("execution_profiles", {})
     _typed(raw_profiles, dict, "execution_profiles")
@@ -252,7 +299,14 @@ def load_config(path: str | Path) -> SchedulerConfig:
     root_bridge = raw.get("root_bridge", {})
     _reject_unknown(
         root_bridge,
-        {"kind", "inbox", "root_thread_id", "request_timeout", "completion_timeout"},
+        {
+            "kind",
+            "inbox",
+            "root_thread_id",
+            "root_session_id",
+            "request_timeout",
+            "completion_timeout",
+        },
         "root_bridge",
     )
     bridge_kind = _nonempty(root_bridge.get("kind", "filesystem"), "root_bridge.kind")
@@ -265,6 +319,7 @@ def load_config(path: str | Path) -> SchedulerConfig:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             raise ConfigurationError(f"{name} must be a positive number")
     raw_thread_id = root_bridge.get("root_thread_id")
+    raw_session_id = root_bridge.get("root_session_id")
     bridge_config = RootBridgeConfig(
         kind=bridge_kind,
         inbox=_nonempty(root_bridge.get("inbox", ".scheduler-root-events"), "root_bridge.inbox"),
@@ -273,13 +328,22 @@ def load_config(path: str | Path) -> SchedulerConfig:
             if raw_thread_id is not None
             else None
         ),
+        root_session_id=(
+            _nonempty(raw_session_id, "root_bridge.root_session_id")
+            if raw_session_id is not None
+            else None
+        ),
         request_timeout=float(request_timeout),
         completion_timeout=float(completion_timeout),
     )
-    if bridge_config.kind not in {"filesystem", "codex_app_server"}:
-        raise ConfigurationError("root_bridge.kind must be filesystem or codex_app_server")
+    if bridge_config.kind not in {"filesystem", "codex_app_server", "grok_acp"}:
+        raise ConfigurationError(
+            "root_bridge.kind must be filesystem, codex_app_server, or grok_acp"
+        )
     if bridge_config.kind == "codex_app_server" and bridge_config.root_thread_id is None:
         raise ConfigurationError("Codex RootBridge requires root_thread_id")
+    if bridge_config.kind == "grok_acp" and bridge_config.root_session_id is None:
+        raise ConfigurationError("Grok RootBridge requires root_session_id")
 
     target_names = {target.name for target in targets}
     if len(target_names) != len(targets):
@@ -296,8 +360,15 @@ def load_config(path: str | Path) -> SchedulerConfig:
                 f"partition {partition.name!r} references unknown profile {partition.execution_profile!r}"
             )
     for target in targets:
-        if target.adapter != "codex_app_server":
+        if target.adapter not in {"codex_app_server", "grok_acp"}:
             raise ConfigurationError(f"unsupported adapter {target.adapter!r}")
+        if target.adapter == "grok_acp" and grok_config is None:
+            grok_config = GrokAdapterConfig(
+                command=("grok", "agent", "--always-approve", "stdio"),
+                cwd=".",
+                sandbox="workspace",
+                request_timeout=30.0,
+            )
 
     lease_seconds = raw.get("lease_seconds", 120)
     heartbeat_seconds = raw.get("heartbeat_seconds", 30)
@@ -331,6 +402,7 @@ def load_config(path: str | Path) -> SchedulerConfig:
         partitions=tuple(partitions),
         execution_targets=tuple(targets),
         codex_adapter=codex_config,
+        grok_adapter=grok_config,
         execution_profiles=profiles,
         retry_defaults=retry_defaults,
         root_bridge=bridge_config,
