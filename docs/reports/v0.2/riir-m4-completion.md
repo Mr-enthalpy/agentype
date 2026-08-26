@@ -31,7 +31,7 @@ and CLI crates are not present (M5/M7).
 
 | Spec | Implemented |
 |---|---|
-| [03] Task/Attempt/Lease/Result/Batch/Escalation/Outbox machines | yes; Task has **no** Generation membership |
+| [03] Task/Attempt/Lease/Result/Batch/Escalation/Outbox machines | yes; Task has **no** Generation membership; Batch `OPEN/ACTIVE/SUSPENDED -> cancel -> CANCELLED` via `cancel_batch` (COMPLETED is terminal and rejects cancellation) |
 | [03] Claim is the authority boundary | yes: epoch++, Attempt ACTIVE, Lease ACTIVE, Task LEASED, agent ASSIGNED, one tx |
 | [03] Writer safety from persisted Execution | yes; omitted `execution_id` cannot hide a writer; isolation is frozen on the Execution |
 | [03] Physical Execution graph including UNKNOWN→RUNNING and LOST→TERMINATED | yes; stale refine cannot mutate Task/Result |
@@ -44,7 +44,32 @@ and CLI crates are not present (M5/M7).
 | [13] Unique indexes for active lease/attempt/agent, one Execution per Attempt, one Result per Task, one OPEN Escalation, one live Incarnation, one active Execution per Incarnation | yes |
 | [14] Authority recovery barrier (expire overdue + unstarted claims, promote retry, reconcile pool, revive non-RETIRED) | `Kernel::recover_authority` / `agentype_runtime::recover_authority` |
 | [15] Newtypes, closed enums, typed errors, no vendor types in Core | yes |
-| [16] §A M4 tests | `crates/agentype-storage-sqlite/tests/m4_kernel.rs` |
+| [16] §A M4 tests | `crates/agentype-storage-sqlite/tests/{m4_kernel,recovery,topology}.rs` |
+
+## Kernel rules frozen for M4 (writer-safety proof semantics)
+
+Spec [16] §A requires `collect_outcome` MUST NOT inherit `reconcile_start`
+quiescence. M4 has no dispatcher, so this landing freezes the kernel
+representation of that rule (oracle parity verified against
+`runtime.py` / `core.py`):
+
+- Durable terminal/quiescence proof may only be persisted together with a
+  terminal physical state. `record_physical_outcome` rejects proof bits on
+  UNKNOWN / LOST targets (`invalid_transition`).
+- Entering an unresolved physical state supersedes and **clears** earlier
+  stored proof bits (no MAX inheritance across an authoritative nonterminal
+  observation).
+- `nack` with `terminal_confirmed=false` persists both proof bits as 0
+  regardless of caller claims; `UNKNOWN` rows can never carry durable proof.
+- `report_configuration_unavailable` passes `terminal=false, quiescent=false`:
+  configuration unavailability is not physical proof. With no persisted
+  Execution the RESOURCE_UNAVAILABLE retry policy applies unchanged; with a
+  RUNNING writer the task suspends behind `WRITER_QUIESCENCE_UNKNOWN`.
+- A semantically retired LogicalAgent cannot revive and cannot obtain a new
+  Incarnation (`ensure_incarnation` rejects RETIRED inside the transaction;
+  `create_execution` reaches it through the claim path).
+
+Regressions: `m4_kernel.rs` (proof bits), `recovery.rs` (RETIRED defences).
 
 M6 objects are absent: no Generation table, no WorkIntent, no AgentType matching,
 no SpawnSource semantic integration, no Transform saga, no MemoryCapsule promotion,
@@ -72,7 +97,7 @@ Oracle → Rust test (not a function-by-function port):
 | `test_v012_closure.test_writer_success_uses_frozen_execution_isolation` | `isolated_writer_may_safely_recover` |
 | `test_v012_closure.test_cancelled_writer_keeps_safety_escalation_open` | `cancelled_writer_still_requires_quiescence` |
 | `test_v012_closure.test_retire_rejects_open_cancelled_writer_safety_obligation` | `open_writer_safety_escalation_blocks_retire` |
-| `test_v012_closure.test_unassigned_initializing_and_reviving_excess_retire_without_drain` | `excess_initializing_retires_directly`, `excess_reviving_retires_directly` |
+| `test_v012_closure.test_unassigned_initializing_and_reviving_excess_retire_without_drain` | `excess_initializing_retires_directly_and_fences_presence`, `excess_reviving_retires_directly` |
 | `test_v012_closure.test_semantic_retirement_fences_idle_reusable_incarnation` | `semantic_retirement_fences_live_incarnation_lost` |
 | `test_v012_closure.test_running_confirmation_atomically_renews_near_deadline_lease` | `running_confirmation_and_first_lease_renewal_are_atomic` |
 | `test_v012_closure.test_merge_adds_declared_capacities_and_preserves_population` | `merge_sums_desired_capacity` |
@@ -80,15 +105,20 @@ Oracle → Rust test (not a function-by-function port):
 | `test_recovery_runtime.test_claim_survives_process_exit…` / `test_process_restart` | `restart_recovery_prevents_blind_duplicate_execution` |
 | `test_recovery_runtime.test_root_failure_does_not_change_result_or_batch` | Result/Batch complete before any delivery; Root ACK is consumption only |
 | filesystem outbox ACK | `notifier_ack_allows_pending_to_acked`, `notifier_ack_from_delivered` |
-| `test_v012_closure.test_unavailable_execution_target_is_normalized_not_raised` (mechanical class only) | `unavailable_runtime_configuration_is_standardized_failure` |
+| `test_v012_closure.test_unavailable_execution_target_is_normalized_not_raised` (mechanical class only) | `unavailable_runtime_configuration_is_standardized_failure`, `configuration_unavailable_with_running_writer_must_not_retry` |
+| `test_core.test_batch_cancellation_revokes_authority_and_preserves_completed_result` | `cancel_queued_batch_cancels_tasks_and_batch`, `cancel_active_read_only_batch_closes_attempts_and_releases_agents`, `cancel_batch_is_idempotent`, `cancel_rejects_completed_batch` |
+| `test_core.test_writer_cancellation_does_not_release_unknown_physical_writer` | `cancel_active_writer_with_unknown_quiescence_keeps_obligation_open`, `cancel_suspended_batch_preserves_open_writer_obligation`, `cancelled_writer_still_requires_quiescence` |
 
 ### PYTHON/ADAPTER-SPECIFIC — defer to M5
 
 Daemon/heartbeat/notifier threads, adapter absolute deadlines, Codex/Grok
 process handles, RootBridge transports, CLI, profile registry,
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`,
-`collect_outcome` vs `reconcile_start` quiescence inheritance, empty
-ExecutionProfile registry, notifier isolation. These are [16] §A2.
+empty ExecutionProfile registry, notifier isolation. These are [16] §A2.
+`collect_outcome` vs `reconcile_start` quiescence inheritance is **not**
+deferred: its kernel representation and regressions are frozen in M4 (see
+"Kernel rules frozen for M4" above); the M5 dispatcher only wires the oracle
+callsite that already exists in `runtime.py`.
 
 ### OBSOLETE / not ported
 
@@ -124,15 +154,30 @@ reports `journal_mode=MEMORY`. File databases used by `Kernel::open` are WAL
   drive the kernel directly, as the Python unit oracle did.
 - Runtime crate only sequences authority recovery. No dispatcher loop.
 
+## Test fixture discipline
+
+Test-only state construction lives below the persistence boundary:
+`tests/common/mod.rs` opens the schema via `Kernel::open(file)` and mutates
+rows directly (short-lived connections, `PRAGMA foreign_keys=ON`, semantic
+helpers such as `fixture_agent_state` / `fixture_incarnation` /
+`fixture_execution`). The operation under test always runs through the Kernel
+public API afterwards. The production API surface contains no unrestricted
+state setter: `set_logical_agent_state`, the public `ensure_incarnation`
+wrapper, and `warm_incarnation` were removed in this landing. States that the
+schema itself forbids are asserted to be rejected by the database.
+
 ## Known limitations (still M4-complete)
 
-- Pool matching, MOVE/MERGE, and RETIRE cover the required M4 cases; not
-  every Python topology composition test is ported (pending membership across
-  consecutive moves, retention adoption, temporary replacement convergence).
-  Those are V0.1 kernel rules and remain required if a gap is found; they are
-  not deferred as M6.
-- `Kernel::set_logical_agent_state` exists so tests can place INITIALIZING /
-  REVIVING members. Production path births READY (V0.1 oracle).
+- Pool matching and MOVE/MERGE/RETIRE cover the required M4 cases and the
+  V0.1 topology composition regressions ported in this landing (consecutive
+  MOVE / MERGE pending rebasing, target retention adoption, SUSPENDED
+  identity through temporary replacement, MOVE/MERGE x lease-expiry ordering,
+  assignment-boundary retirement fencing, multi-task partial Batch). Any
+  further V0.1 kernel rule found by the M5 oracle port remains required and
+  is not deferred as M6.
+- `Kernel::set_logical_agent_state` does not exist; tests place
+  INITIALIZING / REVIVING members through storage fixtures, and production
+  births READY (V0.1 oracle).
 - Heartbeat bulk renewal of a daemon-admitted set is M5. Single-attempt
   `heartbeat` requires a persisted RUNNING Execution.
 - Outbox delivery/backoff clock is M5. M4 persists states and ACK.
@@ -160,8 +205,11 @@ Result on this landing (Windows, rustc via cargo 1.x):
 - `agentype-core`: 4 tests
 - `agentype-adapter-api`: 1 test
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration `m4_kernel`: 40 tests
-- total: 46 passed, 0 failed
+- `agentype-storage-sqlite` integration: 60 tests
+  - `m4_kernel`: 40
+  - `recovery`: 8
+  - `topology`: 12
+- total: 66 passed, 0 failed
 
 Python tests were not modified and are not required to pass as part of M4
 Rust CI. The existing Python job remains for the V0.1 oracle package.
