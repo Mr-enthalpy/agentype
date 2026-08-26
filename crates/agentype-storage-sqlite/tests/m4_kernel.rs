@@ -5,7 +5,6 @@
 mod common;
 
 use agentype_core::*;
-use agentype_storage_sqlite::Kernel;
 use common::*;
 use serde_json::json;
 
