@@ -22,3 +22,15 @@ jobs:
         run: |
           python -m compileall -q src tests
           python -m unittest discover -s tests -t . -v
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test workspace
+        run: cargo test --workspace

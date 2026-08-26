@@ -1,0 +1,11 @@
+[package]
+name = "agentype-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agentype domain types, states, and authority predicates (no I/O)"
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
