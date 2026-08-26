@@ -31,15 +31,17 @@ DEFERRED (D-GEN-POLICY).
 | OPEN/ACTIVE | Root or policy cancel | CANCELLED | Root |
 | OPEN/ACTIVE | mechanical safety stop (writer-safety; scope unchanged) | SUSPENDED | Scheduler |
 | OPEN/ACTIVE | semantic / decision-required Escalation | SUSPENDED | Scheduler |
-| SUSPENDED | mechanical: previously declared deterministic recovery holds, semantic scope unchanged | ACTIVE or OPEN | Scheduler MAY |
-| SUSPENDED | semantic / decision-required | ACTIVE or OPEN | Root MUST decide; Scheduler MUST NOT |
+| SUSPENDED | resume (mechanical or semantic) | ACTIVE or OPEN | **DEFERRED** D-GEN-RESUME |
 
 `CLOSED` and `CANCELLED` are terminal for that id.
 
-Mechanical suspension: Scheduler MAY resume only inside the already-admitted
-scope when the declared recovery condition is satisfied. Semantic /
-decision-required suspension MUST NOT become schedulable again without a
-Root decision. These two MUST NOT be collapsed into “Root/scheduler resume”.
+Intent (not a frozen resume API): mechanical vs semantic suspension MUST
+eventually be distinguished — Scheduler MUST NOT regain frontier authority
+on a decision-required Escalation. **Do not implement** Scheduler-owned
+`SUSPENDED → ACTIVE/OPEN` yet: Task has no SUSPENDED recovery edge, and
+Batch `SUSPENDED → ACTIVE` is a Root recovery operation
+([03](03-task-attempt-lease-result.md)). Alignment of Generation / Task /
+Batch / Escalation resume is D-GEN-RESUME.
 
 How a model-backed compilation Task participates in drain/REVIEWABLE is
 DEFERRED (D-COMPILATION-CLOSURE). Compilation MUST NOT recursively expand

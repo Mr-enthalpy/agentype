@@ -71,11 +71,18 @@ supervision cleanup, profile registry, poll/heartbeat/lease timing, notifier
 backoff-from-completion, daemon single-run, adapter deadlines. M5 is not
 both V0.1.3 transports.
 
-**M6** still waits on BLOCKS_SEMANTIC_LAYER including D-COMPILATION-CLOSURE.
-Transform **failure** is not frozen. Cutover **option A** is an **explicit
-freeze** after audit (not a literal translation of the design saga's
-durable CUTTING_OVER). Split-brain (source and successor both schedulable)
-remains forbidden.
+**M6** still waits on BLOCKS_SEMANTIC_LAYER including D-COMPILATION-CLOSURE
+and **D-GEN-RESUME** (Generation mechanical resume is not closed against
+Task/Batch recovery edges; do not implement Scheduler-owned Generation
+resume yet).
+
+Transform **failure** is not frozen. Cutover **option A** is an **owner-
+visible design decision**, not a translation of Architecture Direction:
+
+- Design suggested durable CUTTING_OVER.
+- Spec intentionally uses atomic TARGET_READY → COMPLETED.
+- Reason: no crash-visible half-cutover; source and successor MUST NOT both
+  be schedulable.
 
 This review MUST NOT be read as an unconditional “M4 MAY begin” that
 includes Generation.

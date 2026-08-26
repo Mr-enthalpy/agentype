@@ -25,7 +25,7 @@ That claim is where execution authority is established.
 | Claim / Attempt / Lease | MUST NOT | MUST | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT |
 | Task/Result state | MUST NOT mutate | MUST | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT |
 | Retry / suspend / recover | MUST NOT | MUST (mechanical) | MUST NOT | MUST NOT | observe only | MUST NOT | MUST NOT |
-| Resume semantic Generation | MUST (decision-required) | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT |
+| Resume decision-required Generation | MUST | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT | MUST NOT |
 | Revival mechanics | MUST NOT | MUST | MUST NOT | MUST NOT | continuity only | MAY host | MUST NOT |
 | Physical start/observe/stop | MUST NOT | requests | runs | MUST NOT | MUST | MUST NOT | MUST NOT |
 | Sandbox enforcement | intent | eligibility | MUST NOT bypass | MUST NOT | MUST | capability ceiling | MUST NOT |

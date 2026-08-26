@@ -6,14 +6,25 @@ Canonical path: docs/specs/v0.2/05-work-intent-compilation.md
 ## Boundary
 
 ```text
-RawWorkIntent → compilation → CompiledWorkProposal → Root admission → Task
+RawWorkIntent → compilation → CompiledWorkProposal → Root admission
+  → admitted semantic operation
+       TASK              → Task
+       TRANSFORM         → AgentTransform (refinement work still uses the
+                           ordinary Task/Attempt/Lease/Result kernel)
+       TYPE_REFINEMENT   → type-refinement intent
+       TOPOLOGY_CHANGE   → topology intent
+       NEEDS_ROOT_DECISION → stays with Root
 ```
+
+Not every admitted proposal becomes a Task.
 
 Compilation answers: if admitted, how would the architecture represent the
 work?
 Admission answers: should it enter the frontier now?
 
 Compilation MUST NOT imply admission.
+Any step that needs model/agent execution MUST still enter the ordinary
+Task/Attempt/Lease/Result kernel.
 
 ## RawWorkIntent
 

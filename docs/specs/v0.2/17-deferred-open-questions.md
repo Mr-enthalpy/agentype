@@ -33,6 +33,7 @@ Classification:
 | D-DB-MIGRATE | In-place V0.1 SQLite migrate vs import vs new DB | decide before upgrade claims | DOES_NOT_BLOCK_RIIR_KERNEL | before storage upgrade; M3 MAY use new DB |
 | D-OBJECTIVE | Objective/problem-scope schema | optional Root model | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-COMPILATION-CLOSURE | How model-backed compilation Tasks participate in Generation drain/REVIEWABLE (same-generation closure phase vs dedicated non-frontier system work vs other bounded form) | ordinary Task vs drain vs “every semantic Task has a Generation” | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-GEN-RESUME | Align Generation resume with Task/Batch/Escalation: mechanical vs semantic discriminator, recovery edges, atomicity. Scheduler-owned Generation SUSPENDED→ACTIVE is **not** frozen | Task has no SUSPENDED recovery edge; Batch resume is Root recovery | BLOCKS_SEMANTIC_LAYER | M6 |
 
 The first landing of this spec omitted V0.1.2 physical Execution transitions,
 LogicalAgent excess-retire, Outbox ACKED, and the Batch-COMPLETED/outbox

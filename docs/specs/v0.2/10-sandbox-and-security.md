@@ -33,12 +33,15 @@ ineligible to provision that type.
 
 ## Intersection
 
-Effective execution permission MUST equal:
+**M6** semantic enforcement: effective execution permission MUST equal
 
 `AgentType policy ∩ Generation policy ∩ Task policy ∩ SpawnSource capability ceiling`
 
 No layer MAY silently widen a stricter upstream policy.
 Root-created refinements MUST only narrow ([06](06-agent-type-and-matching.md)).
+
+**M4** continues the V0.1 WorkspaceMode / adapter enforcement contract only.
+M4 MUST NOT require AgentType or Generation objects to exist.
 
 ## V0.1 mapping (kernel)
 

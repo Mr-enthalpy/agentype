@@ -97,7 +97,8 @@ thread/session semantics. Storage/security details DEFERRED (D-CONTINUITY-BIND).
 
 ## Provenance (MUST be representable)
 
-- Task belongs to one Generation and one Batch.
+- **M4:** Task belongs to one Batch and MUST NOT require Generation membership (no GenerationId / NOT NULL FK).
+- **M6:** every semantic Task belongs to exactly one Generation and one Batch.
 - Attempt belongs to one Task; Lease belongs to one Attempt.
 - Execution belongs to one Attempt; Incarnation hosts Executions.
 - RawWorkIntent originates from a Result when policy allows.

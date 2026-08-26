@@ -92,9 +92,12 @@ same AgentLineage. A becomes RETIRED after successful cutover.
 
 `COMPLETED` and `CANCELLED` are terminal.
 
-`CUTTING_OVER` is an **operation / internal phase**, not a durable semantic
-state in which topology has already switched while the source LogicalAgent
-remains schedulable.
+Architecture direction **suggested** a durable CUTTING_OVER saga state.
+Normative V0.2 **intentionally** chooses atomic cutover **Option A** (not a
+translation of that saga): `CUTTING_OVER` is an operation / internal phase,
+not a crash-visible state in which topology has switched while the source
+LogicalAgent remains schedulable. Reason: eliminate half-cutover and dual
+schedulability.
 
 Crash-visible states around cutover MUST be only `TARGET_READY` or
 `COMPLETED`. `COMPLETED` means successor created, lineage linked, topology
