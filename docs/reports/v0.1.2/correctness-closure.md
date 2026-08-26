@@ -1,9 +1,10 @@
 # Local Agent Scheduler V0.1.2 Correctness Closure Report
 
-Status: provider-free correctness closure complete; post-closure real worker,
-dormant-Root notification, Result consumption, and full live smoke passed
-
-Package: `local-agent-scheduler 0.1.2`
+Status: Historical Report
+Applies to: V0.1.2
+Package recorded: local-agent-scheduler 0.1.2
+Canonical path: docs/reports/v0.1.2/correctness-closure.md
+Not a live specification. 0.1.3 Grok ACP transport is not in the scope of this report.
 
 V0.1.2 closes the V0.1 correctness audit without adding features. `Incarnation`
 is one physical embodiment rather than an Execution wrapper: READY agents may
@@ -29,7 +30,7 @@ and diagnostic/control CLI.
 
 ## State machines and transaction boundaries
 
-The frozen transition matrices are in [V0.1_SPEC.md](V0.1_SPEC.md). The critical
+The frozen transition matrices are in [V0.1_SPEC.md](../../specs/v0.1.md). The critical
 single-transaction boundaries are:
 
 1. Batch, Task graph, dependencies, and initial eligibility.
@@ -325,11 +326,11 @@ requires a configured existing Root thread ID; RootBridge does not create or
 own that thread.
 
 The sanitized acceptance record is
-[V0.1.1_LIVE_ACCEPTANCE.md](V0.1.1_LIVE_ACCEPTANCE.md). It intentionally omits
+[V0.1.1_LIVE_ACCEPTANCE.md](../../acceptance/v0.1.1/live-acceptance.md). It intentionally omits
 thread/event identifiers, prompts, credentials, and request bodies.
 
 A new V0.1.2 live smoke is recorded in
-[V0.1.2_LIVE_ACCEPTANCE.md](V0.1.2_LIVE_ACCEPTANCE.md). Its real read-only worker,
+[V0.1.2_LIVE_ACCEPTANCE.md](../../acceptance/v0.1.2/live-acceptance.md). Its real read-only worker,
 Task/Result/Batch flow, Batch-level-only outbox, Codex RootBridge delivery, and
 Root Result consumption all passed. After the restarted Codex process loaded an
 explicit local HTTP/HTTPS proxy, the final worker completed in 6.835 seconds and
