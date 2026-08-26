@@ -1,7 +1,7 @@
 # V0.2 specification freezing review
 
 Status: Historical Report
-Applies to: `docs/specs/v0.2/` as landed on this branch
+Applies to: `docs/specs/v0.2/` after kernel-machine audit repair
 Canonical path: docs/reports/v0.2/spec-freezing-review.md
 Not a specification.
 
@@ -9,48 +9,78 @@ Not a specification.
 
 Root retains frontier admission; Generation is a bounded admitted slice, not
 a sub-Root. Claim, not Task creation, establishes execution authority.
-Compilation is not admission. Transform creates a successor. Revival
-preserves LogicalAgent and is not a new Generation. Prompt is not a sandbox.
-Worker deltas do not auto-write MemoryCapsule. Compiler has no privileged
-lifecycle. Information functions are not exclusive AgentKind classes. V0.1
-kernel machines, fencing, Result atomicity, writer safety, and recovery
-barrier are unchanged.
+Compilation is not admission and MUST NOT negatively admit by dropping
+intents as generic redundant. Transform successor is created in one atomic
+cutover (TARGET_READY → COMPLETED); `CUTTING_OVER` is not a durable
+split-brain state. Revival preserves LogicalAgent and is not a new
+Generation. Prompt is not a sandbox. Worker deltas do not auto-write
+MemoryCapsule. Compiler has no privileged lifecycle. Information functions
+are not exclusive AgentKind classes. V0.1 kernel machines (including
+physical Execution UNKNOWN→RUNNING, LogicalAgent excess unassigned retire,
+Outbox ACKED, Batch COMPLETED + BATCH_RESULTS_READY same tx), fencing,
+Result atomicity, writer safety, recovery barrier, and SQLite WAL +
+`synchronous=FULL` are unchanged.
 
 ## Implementation-defined
 
-Rust crate/struct/SQL names, async runtime, serialization, vendor wire
+Rust crate/struct/SQL *names*, async runtime, serialization, vendor wire
 formats (as opaque handles), exact GenerationPolicy bytes, exact
-information-function encoding.
+information-function encoding. M4 store itself is **not**
+implementation-defined: SQLite WAL + `synchronous=FULL` MUST.
 
 ## Unresolved (see specs/v0.2/17)
 
-None classified BLOCKS_KERNEL.
+Open *questions* in 17 are not BLOCKS_KERNEL after this repair.
+
+The first spec landing *was* blocked for M4 until Execution/LogicalAgent/
+Outbox/transaction tables matched the V0.1.2 oracle. Those are now
+normative, not DEFERRED.
 
 BLOCKS_SEMANTIC_LAYER: GenerationPolicy encoding, intra-generation Task
 adds, Generation DAG vs chain, intent schema/fanout, type relation and
 revision encodings, memory schema/promotion, negative GC, ContinuityBinding
-storage, Root review API, Transform rollback, remaining topology-vs-type
-split, Objective schema.
+storage, Root review API, Transform **failure/rollback** (not cutover
+atomicity), remaining topology-vs-type split, Objective schema.
 
 DOES_NOT_BLOCK_RIIR_KERNEL: second-adapter extras (M7), V0.1 DB migrate
 (M3 MAY use a new DB).
 
 ## Did any V0.1 correctness behavior have to change?
 
-No. Preservation table: all kernel rows **unchanged**. V0.2 **adds**
-semantic objects above the kernel.
+No. Preservation table: kernel rows **unchanged**, including Outbox ACKED
+and SQLite WAL. V0.2 **adds** semantic objects above the kernel.
 
 Python still binds PoolPartition to ExecutionTarget/Profile. That is a
 recorded V0.1 vs V0.2-intent conflict. Python was not modified.
 
 ## Can Rust kernel RIIR begin?
 
-Yes for M4: authority, Task/Attempt/Lease/Result/Batch, fencing, recovery,
-topology MOVE/MERGE, adapter contract, and V0.1 tests are specified.
-Implementers MAY choose representation. They MUST NOT decide the questions
-listed in `docs/specs/v0.2/README.md` “What an implementer may choose”.
+After this repair, yes for M4: the physical Execution graph, LogicalAgent
+excess-retire, Incarnation/Escalation/Outbox tables, and durable-outbox
+atomicity are specified. Implementers MAY choose Rust representation. They
+MUST NOT decide the questions listed in `docs/specs/v0.2/README.md`.
+
+This PR MUST NOT claim the Transform **failure** contract or compiler
+exact-duplicate auto-drop are frozen. Cutover option A **is** frozen.
 
 M6 MUST wait on the BLOCKS_SEMANTIC_LAYER registry.
+
+## Numbered design invariants → spec
+
+| ID | Spec |
+|---|---|
+| 1–4 topology/teams | 02, 04, 01 provenance |
+| 5–9 Root | 12, 02 |
+| 10–15 information | 06, 09, 12 |
+| 16–22 Generation/Batch | 04, 03 |
+| 23–28 WorkIntent | 05, 02 |
+| 29–34 type/provision | 06, 07 |
+| 35–38 sandbox | 10 |
+| 39–44 Transform/memory | 08, 09, 13 |
+| 45–52 revival/terminal | 09, 07 |
+| 53–62 V0.1 kernel + compiler lifecycle | 02, 03, 13, 14, 05 |
+| 63 information-function orthogonality | 06 |
+| 64 retry ≠ new Generation | 04, 14 |
 
 ## Architecture regression checklist
 
@@ -62,7 +92,7 @@ M6 MUST wait on the BLOCKS_SEMANTIC_LAYER registry.
 | 4. Manager/team-lead hierarchy | No. Forbidden Core relations. |
 | 5. Generation as delegated sub-Root | No. Admission stays with Root. |
 | 6. Worker recursively creates executable work | No. |
-| 7. Compiler admits its proposal | No. |
+| 7. Compiler admits its proposal | No. Negative admit via generic redundant-drop also forbidden. |
 | 8. retry/revival creates a Generation | No. |
 | 9. Transform mutates type in place | No. |
 | 10. Native session required for correctness | No. Level 3 is the floor. |

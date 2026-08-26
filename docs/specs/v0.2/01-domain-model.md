@@ -16,7 +16,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 | Batch | id | Scheduler | execution barrier | state machine | Y | Y | N | Y | N |
 | Task | id | Scheduler | until terminal | state machine | Y | Y | N | Y | N |
 | TaskRequirement | part of Task/Proposal | Root intent / compiler | with Task or proposal | immutable after materialize | Y | Y | N | Y | N |
-| RawWorkIntent | id | Scheduler record; worker proposes | until compiled/rejected | immutable evidence | Y | Y | N | Y | N |
+| RawWorkIntent | id | Scheduler record; worker proposes | until Root disposition | immutable evidence | Y | Y | N | Y | N |
 | CompiledWorkProposal | id | Scheduler record; compiler produces | until Root decision | immutable | Y | Y | N | Y | N |
 | AgentType | type_id + revision | Scheduler registry; Root intent | until GC | revisions immutable | Y | Y | N | Y | Y |
 | LogicalAgent | id | Scheduler | until RETIRED | identity immutable | Y | Y | N | Y | N |
@@ -34,7 +34,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 | Escalation | id | Scheduler | until resolved | open/resolved | Y | Y | N | Y | N |
 | Checkpoint | id | Scheduler | fenced promotion | versioned | limited | Y | N | Y | Y |
 | ContinuityBinding | opaque handle | Scheduler stores; Adapter interprets | until invalid | opaque | N | Y | Y | Y | N |
-| Outbox event | event_id | Scheduler | until delivered+policy | at-least-once | indexes | Y | via bridge | Y | N |
+| Outbox event | event_id | Scheduler | until ACKED | at-least-once | indexes | Y | via bridge | Y | N |
 
 ## Meaning (MUST)
 
@@ -54,7 +54,9 @@ execution authority.
 MUST NOT encode a model name as identity.
 
 **RawWorkIntent** is domain-semantic and architecture-light. Workers MUST NOT
-be required to understand Scheduler internals to emit one.
+be required to understand Scheduler internals to emit one. Lifetime lasts
+until **Root** disposition (admit / reject / defer / accept a redundancy
+candidate). Compiler rejection MUST NOT end the intent's Root-visible life.
 
 **CompiledWorkProposal** is architecture-aware and execution-unbound. It MUST
 NOT normally bind logical_agent_id, incarnation_id, attempt_id, lease_id, or a

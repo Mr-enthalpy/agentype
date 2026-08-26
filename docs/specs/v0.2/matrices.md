@@ -20,22 +20,22 @@ Canonical path: docs/specs/v0.2/matrices.md
 | 09-v01-correctness-kernel-boundary.md | 02, 03, 14 |
 | 10-rust-rewrite-boundary.md | 00, 15, 16 |
 | 11-open-questions.md | 17 |
-| 12-normative-invariants.md | throughout; numbered invariants mapped in the review report |
+| 12-normative-invariants.md | numbered 1–64 mapped in [spec-freezing-review.md](../../reports/v0.2/spec-freezing-review.md) |
 | AGENT_INGESTION_GUIDE.md | process only; not a runtime contract |
 
 ## B. V0.1 kernel → V0.2
 
 | V0.1 rule | V0.2 | Status |
 |---|---|---|
-| SQLite authoritative; at-least-once | 02, 13 | unchanged |
+| SQLite WAL + `synchronous=FULL` authoritative; at-least-once | 02, 13 | unchanged (M4 MUST SQLite; not an abstract store) |
 | Claim = Attempt+Lease+epoch | 02, 03, 13 | unchanged |
-| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged |
+| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged (Execution physical graph includes UNKNOWN→RUNNING; LogicalAgent excess unassigned retire) |
 | Fencing + stale physical-only history | 02, 03 | unchanged |
 | One Result per completed Task; ACK is consumption | 03 | unchanged |
 | Writer quiescence / isolation snapshot / RETIRE block | 03, 11 | unchanged |
 | Retry classes; no semantic recovery by Scheduler | 02 | unchanged |
 | Adapter deadline + nonterminal collect MUST NOT inherit reconcile quiescence | 07, 14 | unchanged |
-| Outbox wakeup ≠ Result transport; notifier isolation | 03, 14 | unchanged |
+| Outbox PENDING/DELIVERED/ACKED; first Batch COMPLETED + BATCH_RESULTS_READY same tx; notifier isolation | 03, 13, 14 | unchanged |
 | Startup RECOVERY barrier | 14 | unchanged |
 | MOVE/MERGE preserve identity; RETIRE guards | 11 | unchanged |
 | Revival preserves LogicalAgent; READY ≠ physical | 08, 09 | unchanged |

@@ -40,8 +40,9 @@ mechanical recovery as a new Generation.
 Worker MUST NOT: create an executable Task, expand the frontier, promote its
 own semantic delta into canonical MemoryCapsule, or bypass Attempt/Lease.
 
-Compiler MUST NOT: admit work, recursively expand work by default, or possess a
-privileged lifecycle.
+Compiler MUST NOT: admit work, **negatively admit** work by dropping an
+intent as generic “redundant”, recursively expand work by default, or
+possess a privileged lifecycle.
 
 Adapter MUST NOT: define Core scheduling semantics or grant Task authority from
 physical observations alone.

@@ -17,6 +17,17 @@ dispatcher/heartbeat; `collect_outcome` MUST NOT inherit
 `reconcile_start` quiescence; RETIRE blocked by open writer-safety
 obligation.
 
+Physical Execution transitions (oracle `record_physical_outcome`):
+UNKNOWN → RUNNING; LOST → TERMINATED; STARTING → UNKNOWN; identity-preserving
+refine after Task authority ended MUST NOT mutate Task/Result.
+
+LogicalAgent: excess unassigned INITIALIZING/READY/REVIVING retire without
+DRAINING; only ASSIGNED drains; safety-resolved SUSPENDED → REVIVING or
+RETIRED.
+
+Outbox: first `Batch → COMPLETED` inserts exactly one `BATCH_RESULTS_READY`
+in the same transaction; PENDING/DELIVERED → ACKED.
+
 Python V0.1.2/0.1.3 suite is the behavior oracle.
 
 ## B. V0.2 semantic tests (M6)
@@ -27,6 +38,8 @@ MUST cover:
 - worker cannot directly create next-generation executable Task
 - RawWorkIntent compilation is non-authoritative
 - compiler cannot admit work
+- compiler cannot negatively admit (generic REJECTED_AS_REDUNDANT drop)
+- Transform cutover is atomic TARGET_READY → COMPLETED (no durable split-brain CUTTING_OVER)
 - audit Generation is non-expansive
 - AgentType refinement cannot widen sandbox
 - SpawnSource ineligible if enforcement insufficient

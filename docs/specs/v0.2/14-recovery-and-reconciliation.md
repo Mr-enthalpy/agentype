@@ -15,6 +15,8 @@ Before dispatch after restart:
    quiescence is unknown.
 3. Ask the owning adapter to reconcile still-authoritative or stale-unresolved
    STARTING/UNKNOWN/RUNNING handles by persisted execution identity.
+   Physical-history MUST allow UNKNOWN → RUNNING
+   ([03](03-task-attempt-lease-result.md)).
    Unavailable adapter: lose Task authority per failure policy; physical
    state remains UNKNOWN while termination/quiescence unconfirmed.
    Adapter presence alone MUST NOT admit Lease renewal. The current daemon

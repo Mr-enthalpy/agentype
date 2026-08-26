@@ -55,15 +55,36 @@ expiry sweep has not yet updated the row.
 
 ## Execution
 
-| From | Operation | To |
-|---|---|---|
-| STARTING | adapter confirms start | RUNNING |
-| STARTING | adapter rejects start | FAILED |
-| STARTING | start outcome ambiguous | UNKNOWN |
-| RUNNING | standardized success | SUCCEEDED |
-| RUNNING | standardized failure | FAILED |
-| RUNNING | lost during observation | LOST |
-| STARTING/RUNNING/UNKNOWN | confirmed termination | TERMINATED |
+There are two machines. They MUST NOT be collapsed.
+
+**Authority-bearing completion** (ACK/NACK/checkpoint) still requires a
+current Attempt, ACTIVE unexpired Lease, and matching fencing epoch.
+
+**Physical-history** (`record_physical_outcome`) MAY refine an Execution
+after Task authority has ended. It MUST NOT restore Task/Lease/Result
+authority. The V0.1.2 oracle graph (UNCHANGED) is:
+
+| From | Allowed physical To |
+|---|---|
+| STARTING | STARTING, RUNNING, SUCCEEDED, FAILED, LOST, UNKNOWN, TERMINATED |
+| UNKNOWN | UNKNOWN, RUNNING, SUCCEEDED, FAILED, LOST, TERMINATED |
+| RUNNING | RUNNING, SUCCEEDED, FAILED, LOST, TERMINATED |
+| LOST | LOST, SUCCEEDED, FAILED, TERMINATED |
+| SUCCEEDED | SUCCEEDED, TERMINATED |
+| FAILED | FAILED, TERMINATED |
+| TERMINATED | TERMINATED |
+
+UNKNOWN → RUNNING is required for ambiguous-start reconciliation
+([14](14-recovery-and-reconciliation.md)). A Rust M4 that omits it is
+non-conformant.
+
+Typical authority-path *operations* (not a second, smaller graph):
+
+- STARTING + adapter confirms start → RUNNING (and may establish supervision)
+- STARTING + reject → FAILED
+- STARTING + ambiguous → UNKNOWN
+- RUNNING + lost observation → LOST
+- confirmed termination → TERMINATED
 
 Execution MUST NOT mutate Task authority without a current Attempt/Lease check.
 At most one Execution history row per Attempt (kernel).
@@ -111,16 +132,38 @@ current partition member MUST block RETIRE.
 
 ## Escalation
 
-Open while a decision or writer-safety obligation exists. Terminal when
-resolved. One open Escalation per suspended Task (kernel).
+| From | Operation | To |
+|---|---|---|
+| (none) | suspend / writer-safety / decision required | OPEN |
+| OPEN | obligation resolved | RESOLVED |
+| OPEN | cancel without resolution (policy) | CANCELLED |
+
+`RESOLVED` and `CANCELLED` are terminal. At most one OPEN Escalation per
+suspended Task (kernel). Open `WRITER_QUIESCENCE_UNKNOWN` on a current
+partition member MUST block RETIRE.
 
 ## Notification outbox
 
+ACKED is retained (V0.1 UNCHANGED, not EVOLVED). Events remain until
+delivered **and acknowledged**.
+
 | From | Operation | To |
 |---|---|---|
-| pending | bounded deliver success | DELIVERED |
-| pending | bounded deliver failure | backoff then retry |
-| DELIVERED | (terminal for delivery) | — |
+| (none) | enqueue | PENDING |
+| PENDING | bounded deliver success | DELIVERED |
+| PENDING | bounded deliver failure | PENDING (backoff, then retry) |
+| PENDING | acknowledge | ACKED |
+| DELIVERED | acknowledge | ACKED |
+
+`ACKED` is terminal for the event.
+
+The **first** `Batch → COMPLETED` and the **exactly-one**
+`BATCH_RESULTS_READY` insert MUST occur in the **same** atomic transaction
+([13](13-storage-and-transactions.md)). A crash gap of
+`COMPLETED` without a durable wakeup MUST NOT exist.
+
+Other control wakeups (suspension / decision) MUST likewise be inserted in
+the same transaction as the state change that requires Root attention.
 
 RootBridge failure MUST NOT change Task, Result, or Batch state.
 Notifier thread MUST NOT supervise Tasks, renew Leases, recompute Batches, or

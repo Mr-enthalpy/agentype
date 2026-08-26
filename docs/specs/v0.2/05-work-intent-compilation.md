@@ -65,12 +65,24 @@ Normative names:
 | Outcome | Meaning |
 |---|---|
 | COMPILED | one proposal produced |
-| REJECTED_AS_REDUNDANT | no new work |
+| REDUNDANCY_CANDIDATE | possible duplicate; intent remains Root-visible |
 | NEEDS_ROOT_DECISION | architectural/semantic ambiguity |
 | NEEDS_DECOMPOSITION | cannot compile without split; MUST NOT recurse |
-| INVALID | malformed or disallowed |
+| INVALID | malformed or disallowed by schema/policy |
 
-Architectural ambiguity MUST return to Root. The compiler MUST NOT guess.
+`REJECTED_AS_REDUNDANT` is **not** a V0.2 disposition that may drop an
+intent from Root's frontier view. Compiler MAY detect redundancy;
+disposition remains Root's. A `REDUNDANCY_CANDIDATE` MUST stay auditable
+(intent id + compiler evidence + optional pointer to an existing
+proposal/intent/evidence_ref).
+
+Automatic drop of an intent is forbidden unless a later spec defines a
+**deterministic exact-duplicate** predicate (same originating Result and
+normalized objective at minimum) **and** Root override/audit. Until then,
+implementations MUST NOT auto-drop.
+
+Architectural ambiguity MUST return to Root. The compiler MUST NOT guess
+and MUST NOT negatively admit (silently close) the frontier.
 
 ## Cardinality
 

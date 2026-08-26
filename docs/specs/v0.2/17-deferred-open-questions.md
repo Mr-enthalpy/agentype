@@ -33,6 +33,16 @@ Classification:
 | D-DB-MIGRATE | In-place V0.1 SQLite migrate vs import vs new DB | decide before upgrade claims | DOES_NOT_BLOCK_RIIR_KERNEL | before storage upgrade; M3 MAY use new DB |
 | D-OBJECTIVE | Objective/problem-scope schema | optional Root model | BLOCKS_SEMANTIC_LAYER | M6 |
 
-No current item is `BLOCKS_KERNEL`. M4 MAY begin from [03](03-task-attempt-lease-result.md),
-[11](11-pool-topology.md), [13](13-storage-and-transactions.md),
-[14](14-recovery-and-reconciliation.md), and V0.1 rows of [16](16-conformance-tests.md).
+The first landing of this spec omitted V0.1.2 physical Execution transitions,
+LogicalAgent excess-retire, Outbox ACKED, and the Batch-COMPLETED/outbox
+atomicity rule. Those omissions **were** kernel blockers. They are specified
+in [03](03-task-attempt-lease-result.md), [08](08-logical-agent-lineage-transform.md),
+and [13](13-storage-and-transactions.md); they are **not** DEFERRED items.
+
+After that repair, no **open question** in this table is `BLOCKS_KERNEL`.
+M4 MAY begin from those files plus [11](11-pool-topology.md),
+[14](14-recovery-and-reconciliation.md), and V0.1 rows of
+[16](16-conformance-tests.md).
+
+M6 MUST NOT treat Transform failure rollback or compiler exact-duplicate
+auto-drop as frozen. Cutover atomicity (option A) **is** frozen.
