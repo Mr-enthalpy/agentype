@@ -1,5 +1,17 @@
 # V0.1.3 Grok Worker Live Round
 
+Status: Historical Evidence
+Applies to: 0.1.3
+Canonical path: docs/acceptance/v0.1.3/grok-live-acceptance.md
+Not normative.
+
+Evidence note: the original Scope paragraph records the first worker-round
+observation (filesystem RootBridge; Grok RootBridge then not in scope),
+committed in f760fbd. A later section in this same file records the
+subsequent dormant-Root wakeup after d8ffa69 added GrokAcpRootBridge.
+Both observations are retained. Later evidence does not rewrite earlier
+observations.
+
 Date: 2026-08-26
 
 Environment: Windows, Grok CLI 1.0.5, existing authenticated user deployment.

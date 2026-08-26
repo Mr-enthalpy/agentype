@@ -1,5 +1,10 @@
 # V0.1.1 Live Acceptance Record
 
+Status: Historical Evidence
+Applies to: V0.1.1
+Canonical path: docs/acceptance/v0.1.1/live-acceptance.md
+Not normative. Observations are not a substitute for docs/specs/v0.1.md.
+
 Date: 2026-08-12
 
 Environment: Windows, installed Codex CLI 0.147.0, existing authenticated user
