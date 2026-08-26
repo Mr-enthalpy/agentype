@@ -40,7 +40,8 @@ Restated from `12-normative-invariants.md`; not a substitute for that file.
 6. **Generation is a semantic-frontier barrier; Batch is an
    execution-completion barrier.** They do not replace each other. Every
    semantic Task belongs to a Generation, and every Generation has a bounded
-   expansion policy.
+   expansion policy. A Generation is an admitted slice whose ceiling Root
+   already fixed; it does not hold independent frontier-admission authority.
 7. **AgentType and SpawnSource are orthogonal.** AgentType is the
    semantic / capability / security / lifecycle contract. SpawnSource is how a
    compatible logical agent is physically provisioned. Cost, latency, and
@@ -78,11 +79,14 @@ Task. Those four names are not synonyms.
 
 ### 3. Generation vs Batch
 
-Generation answers which work belongs to one semantic frontier (explore,
-implement, audit, …) and whether expansion is allowed. Batch answers which
-Tasks form one execution/synchronization completion unit. A Generation may
-contain several Batches. Using Batch completion to auto-admit the next wave
-hands the semantic frontier to the execution layer.
+Generation answers which work belongs to one already-admitted semantic
+frontier slice (explore, implement, audit, …) and which expansion ceiling
+Root fixed for that slice. Batch answers which Tasks form one
+execution/synchronization completion unit. A Generation may contain several
+Batches. GenerationPolicy constrains admitted work; it does not receive
+independent frontier-admission authority. Using Batch completion to
+auto-admit the next wave would hand Root’s frontier decision to the
+execution layer.
 
 ### 4. RawWorkIntent vs CompiledWorkProposal
 
@@ -138,22 +142,30 @@ and break fencing.
 
 1. **User → Root.** Root writes the current positive model: the fencing
    invariant must hold; this race is the highest-value unknown. Semantic
-   authority is with Root. Scheduler has no Task authority yet.
+   frontier authority stays with Root. No schedulable Task exists yet, and no
+   execution authority exists yet.
 
 2. **Root → exploratory Generation.** Root admits a bounded EXPLORE
    Generation (limited RawWorkIntent allowed; workers cannot create Tasks).
-   This is the only transfer of **semantic frontier** authority: from Root’s
-   admit/deny into that Generation’s policy ceiling. Still no claim.
+   Root retains semantic frontier authority. Admission materializes a bounded
+   Generation whose scope and expansion ceiling are fixed by Root.
+   GenerationPolicy constrains admitted work; it does not receive independent
+   frontier-admission authority. Still no claim.
 
 3. **Generation → Task.** Root expresses a task requirement (type, anchor,
-   read-only sandbox, acceptance). Scheduler creates Task/Batch. **Execution
-   authority is born here.** Root does not assign Leases.
+   read-only sandbox, acceptance). Scheduler durably materializes
+   schedulable work (Task, and a Batch if that is the completion unit).
+   **No execution authority exists yet.** A Task is not a grant of Attempt,
+   Lease, or fencing. Root does not assign Leases.
 
-4. **Task → exploratory LogicalAgent → Execution.** Scheduler matches a
-   short-lived explorer (or provisions one). Claim transactionally creates
-   Attempt, Lease, and fencing epoch. Execution authority stays in Scheduler.
-   If a physical host is needed, a SpawnSource provisions an Incarnation.
-   That is provisioning, not type identity and not semantic final review.
+4. **Task → claim.** Scheduler atomically creates Attempt + Lease + fencing
+   epoch. **Execution authority is established here.** All
+   authority-bearing completion, failure, and checkpoint actions are fenced
+   by that Attempt/Lease. Scheduler may then match a short-lived explorer
+   (or provision one) and start an Execution. If a physical host is needed,
+   a SpawnSource provisions an Incarnation. That is provisioning, not type
+   identity and not semantic final review. Existence of a Task must not be
+   confused with some actor already holding execution authority.
 
 5. **Execution → Result.** The explorer returns a conclusion, evidence
    references, and — if policy allows — a RawWorkIntent: “verify whether
@@ -171,7 +183,8 @@ and break fencing.
 7. **Generation REVIEWABLE → Root admission.** The wave is drained; Results
    and intents are durable; compilation has finished. Root reviews once:
    integrates compact negative findings, then reject / defer / admit the next
-   wave. Semantic frontier authority is again only with Root.
+   wave. Frontier-admission authority never left Root; this is another Root
+   decision, not a Generation handing authority back.
 
 8. **Next Generation → typed long-lived agent.** If the admitted work is
    ongoing audit or positive maintenance, Root may express type refinement or
@@ -179,8 +192,10 @@ and break fencing.
    LogicalAgent or a new identity. Refinements may only narrow authority.
 
 9. **SpawnSource → Execution → Result → Root integration.** Provisioning
-   picks a source that can enforce the sandbox. The adapter runs Execution.
-   Another authoritative Result is created atomically. Root integrates
+   picks a source that can enforce the sandbox. A later Execution still
+   requires a claim (Attempt + Lease + fencing) before execution authority
+   exists. The adapter then runs Execution. Another authoritative Result is
+   created atomically. Root integrates
    reference-first into the single current positive model; the obsolete model
    becomes a negative record. Root ACK consumes the Result Queue and does not
    complete the worker.
@@ -198,9 +213,12 @@ outside a Task.
    Generations forbid intents; mechanical expansion budgets.
 
 2. **Hierarchy creep.** Team / reports_to / compiler-as-manager objects are
-   added “for manageability.” Information flow is mistaken for command.
-   Mitigation: persist caused_by / depends_on / audits / supersedes; let
-   temporary teams emerge from affinity and Generation.
+   added “for manageability.” Information flow is mistaken for command. A
+   related failure is treating Generation admission as a transfer of frontier
+   authority, which invites “Root grants a Generation, the Generation grants
+   workers bounded spawning.” Mitigation: persist caused_by / depends_on /
+   audits / supersedes; let temporary teams emerge from affinity and
+   Generation; keep frontier admission exclusively with Root.
 
 3. **Model-routing semantics leaking into Core.** AgentType is named by
    expensive vs cheap models, or vendor SpawnSource fields enter the claim
