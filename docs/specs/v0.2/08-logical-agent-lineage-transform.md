@@ -28,8 +28,16 @@ Excess unassigned INITIALIZING / READY / REVIVING members MUST retire
 directly. Only ASSIGNED members enter DRAINING and apply a pending
 transition at their assignment boundary.
 
+Any committed transition of a LogicalAgent to RETIRED MUST fence every
+STARTING/WARM/COLD Incarnation of that LogicalAgent to LOST in the **same**
+semantic-retirement transaction, before RETIRED is observable. This applies
+to excess unassigned retirement (which is **not** a topology cutover),
+assignment-boundary retirement, and Transform source retirement. A reusable
+physical presence MUST NOT remain scheduler-authoritative after semantic
+death.
+
 V0.2 Transform retirement is the same terminal RETIRED after successful
-cutover of a successor.
+cutover of a successor, and MUST apply the same Incarnation fencing.
 
 ## Incarnation (kernel UNCHANGED)
 
@@ -43,7 +51,8 @@ active Execution.
 | STARTING | adapter confirms live presence | WARM |
 | STARTING/WARM | safely detached presence (reserved) | COLD |
 | STARTING/WARM/COLD | confirmed closed | TERMINATED |
-| STARTING/WARM/COLD | lost / unconfirmed / fenced at cutover | LOST |
+| STARTING/WARM/COLD | lost / unconfirmed / topology cutover fence | LOST |
+| STARTING/WARM/COLD | owning LogicalAgent committed RETIRED | LOST |
 | LOST | late confirmed closed | TERMINATED |
 | LOST | still lost | LOST |
 | TERMINATED | (terminal; no reopen as live) | TERMINATED |

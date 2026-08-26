@@ -94,3 +94,8 @@ Whether limited one-to-many normalization is ever justified is DEFERRED
 End-of-generation flow:
 
 `Generation drains → Results durable → intents collected → compilation pass → proposals → REVIEWABLE → Root reject/defer/admit`.
+
+If compilation requires agent/model execution, that work is ordinary
+Task/Attempt/Lease/Result. **Which Generation (if any) that compiler Task
+belongs to** is DEFERRED (D-COMPILATION-CLOSURE). It MUST NOT be used to
+recursively expand the frontier. RIIR MUST NOT pick a default.

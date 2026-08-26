@@ -24,7 +24,10 @@ refine after Task authority ended MUST NOT mutate Task/Result.
 
 LogicalAgent: excess unassigned INITIALIZING/READY/REVIVING retire without
 DRAINING; only ASSIGNED drains; safety-resolved SUSPENDED → REVIVING or
-RETIRED.
+RETIRED. Semantic retirement MUST fence every STARTING/WARM/COLD Incarnation
+to LOST in the same transaction (oracle
+`test_semantic_retirement_fences_idle_reusable_incarnation` and
+assignment-boundary retirement fencing).
 
 Outbox: first `Batch → COMPLETED` inserts exactly one `BATCH_RESULTS_READY`
 in the same transaction; PENDING or DELIVERED → ACKED.
@@ -41,7 +44,9 @@ threads and in-memory admissions; empty ExecutionProfile registry is
 authoritative (`RESOURCE_UNAVAILABLE`, no adapter default); configuration
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`; daemon
 single-run; adapter absolute deadlines including cleanup; first-adapter
-runtime/live parity as in V0.1.3 transports (opaque handles only).
+runtime/live parity for **one named** reference adapter (opaque handles
+only; which adapter is IMPLEMENTATION-DEFINED). M5 MUST NOT require both
+V0.1.3 transports.
 
 ## B. V0.2 semantic tests (M6)
 
@@ -64,7 +69,8 @@ MUST cover:
 
 ## C. Provider/frontend neutrality (M7)
 
-A second adapter MUST be addable without Core state-machine changes.
+A **second independent** adapter MUST be addable without Core state-machine
+changes. Completing M5 with one reference adapter does not satisfy M7.
 
 ## D. Crash/restart
 

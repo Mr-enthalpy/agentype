@@ -47,9 +47,10 @@ IDs MUST be unique durable strings (UUID recommended, IMPLEMENTATION-DEFINED).
 | Result ACK | Result state only |
 | Checkpoint promote | matching Attempt + epoch |
 | Topology mutation | revision + desired membership (V0.1 rules) |
+| LogicalAgent RETIRED | RETIRED observable only with every STARTING/WARM/COLD Incarnation of that agent fenced LOST in the **same** transaction (excess retire, assignment-boundary retire, Transform source retire) |
 | Generation REVIEWABLE | drain predicates + durable intents/proposals flags |
 | Proposal persist | intent → proposal outcome; MUST NOT admit |
-| Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER |
+| Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 
 Stale writes MUST fail closed (no canonical mutation). Physical-only history

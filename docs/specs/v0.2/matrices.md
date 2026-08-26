@@ -29,7 +29,7 @@ Canonical path: docs/specs/v0.2/matrices.md
 |---|---|---|
 | SQLite WAL + `synchronous=FULL` authoritative; at-least-once | 02, 13 | unchanged (M4 MUST SQLite; not an abstract store) |
 | Claim = Attempt+Lease+epoch | 02, 03, 13 | unchanged |
-| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged (Execution physical graph includes UNKNOWN→RUNNING; LogicalAgent excess unassigned retire). Generation membership is **M6 added**, not M4. |
+| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged (Execution physical graph includes UNKNOWN→RUNNING; LogicalAgent excess unassigned retire; RETIRED fences live Incarnations LOST). Generation membership is **M6 added**, not M4. 08 **kernel** is M4; Transform saga is M6. |
 | Fencing + stale physical-only history | 02, 03 | unchanged |
 | RUNNING confirm + first Lease renewal one fenced tx before admission | 13, 14 | unchanged (M4) |
 | One Result per completed Task; ACK is consumption | 03 | unchanged |

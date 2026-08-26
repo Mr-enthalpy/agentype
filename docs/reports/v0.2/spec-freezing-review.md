@@ -42,7 +42,8 @@ Outbox/transaction tables matched the V0.1.2 oracle. Those are now
 normative, not DEFERRED.
 
 BLOCKS_SEMANTIC_LAYER: GenerationPolicy encoding, intra-generation Task
-adds, Generation DAG vs chain, intent schema/fanout, type relation and
+adds, Generation DAG vs chain, intent schema/fanout, **D-COMPILATION-CLOSURE**
+(which Generation a model-backed compiler Task belongs to), type relation and
 revision encodings, memory schema/promotion, negative GC, ContinuityBinding
 storage, Root review API, Transform **failure/rollback** (not cutover
 atomicity), remaining topology-vs-type split, Objective schema.
@@ -60,16 +61,21 @@ recorded V0.1 vs V0.2-intent conflict. Python was not modified.
 
 ## Can Rust kernel RIIR begin?
 
-**M4 Core** MAY begin only after this staging split: Task MUST NOT require
-Generation; RUNNING-confirm + first Lease renewal is a listed M4
-transaction. M4 MUST NOT implement `04` Generation.
+**M4 Core** MAY begin only with: Task MUST NOT require Generation;
+RUNNING-confirm + first Lease renewal is an M4 transaction; **08 kernel**
+LogicalAgent/Incarnation including RETIRED fencing live Incarnations to LOST
+in the same transaction. M4 MUST NOT implement `04` Generation or Transform.
 
-**M5 Runtime** is a separate gate (supervision cleanup, profile registry,
-poll/heartbeat/lease timing, notifier completion-based backoff, daemon
-single-run, adapter deadlines).
+**M5 Runtime** is a separate gate: **one named** reference adapter, plus
+supervision cleanup, profile registry, poll/heartbeat/lease timing, notifier
+backoff-from-completion, daemon single-run, adapter deadlines. M5 is not
+both V0.1.3 transports.
 
-**M6** still waits on BLOCKS_SEMANTIC_LAYER. Transform **failure** and
-compiler exact-duplicate auto-drop are not frozen. Cutover option A is.
+**M6** still waits on BLOCKS_SEMANTIC_LAYER including D-COMPILATION-CLOSURE.
+Transform **failure** is not frozen. Cutover **option A** is an **explicit
+freeze** after audit (not a literal translation of the design saga's
+durable CUTTING_OVER). Split-brain (source and successor both schedulable)
+remains forbidden.
 
 This review MUST NOT be read as an unconditional “M4 MAY begin” that
 includes Generation.

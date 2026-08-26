@@ -27,28 +27,35 @@ manager/worker organizations.
 
 **M4 — Core correctness parity.** MUST satisfy Task/Attempt/Lease/Result/Batch
 machines in [03](03-task-attempt-lease-result.md) **except Generation
-membership**, writer safety, fencing, RUNNING-confirm + first Lease renewal
-atomicity, SQLite transactions in [13](13-storage-and-transactions.md),
-topology kernel in [11](11-pool-topology.md), restart **authority**
-reconciliation in [14](14-recovery-and-reconciliation.md), and M4 rows of
+membership**, the **kernel** LogicalAgent and Incarnation machines in
+[08](08-logical-agent-lineage-transform.md) (semantic retirement fencing
+included; **not** the Transform saga), writer safety, fencing, RUNNING-confirm
++ first Lease renewal atomicity, SQLite transactions in
+[13](13-storage-and-transactions.md), topology kernel in
+[11](11-pool-topology.md), restart **authority** reconciliation in
+[14](14-recovery-and-reconciliation.md), and M4 rows of
 [16](16-conformance-tests.md).
 
 M4 MUST NOT require Generation, WorkIntent, AgentType, SpawnSource semantic
 integration, Transform, or MemoryCapsule promotion. M4 MUST NOT invent a
 default Generation to satisfy later sections.
 
-**M5 — Runtime / first-adapter parity.** MUST satisfy supervision lifecycle
-cleanup, adapter absolute deadlines, authoritative ExecutionProfile registry,
-`dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`, notifier
-completion-based backoff, daemon single-run, and M5 rows of [16](16-conformance-tests.md).
+**M5 — Runtime / one reference-adapter parity.** MUST satisfy supervision
+lifecycle cleanup, adapter absolute deadlines, authoritative ExecutionProfile
+registry, `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`,
+notifier completion-based backoff, daemon single-run, **one named** reference
+adapter acceptance (which adapter is IMPLEMENTATION-DEFINED; M5 MUST NOT be
+read as requiring both V0.1.3 transports), and M5 rows of
+[16](16-conformance-tests.md).
 
 **M6 — V0.2 semantic conformance.** MUST also satisfy Generation (every
 semantic Task belongs to exactly one Generation; retry stays in that
 Generation), WorkIntent, AgentType, SpawnSource semantic integration,
 Transform, memory, Root contract, and M6 rows of [16](16-conformance-tests.md).
 
-**M7 — Frontend neutrality.** MUST add a second adapter without changing Core
-state machines.
+**M7 — Frontend neutrality.** MUST add a **second independent** adapter
+without changing Core state machines. M5's single reference adapter does not
+satisfy M7.
 
 ## Staged implementation
 
