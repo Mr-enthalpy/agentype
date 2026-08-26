@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "purpose": "v0.1.3 grok worker live round"
+  },
+  "tasks": [
+    {
+      "name": "ping",
+      "payload": {
+        "objective": "Do not use tools. Reply with only this JSON object and no other text: {\"status\":\"ok\",\"evidence\":\"v0.1.3-grok-live\"}"
+      },
+      "acceptance": {
+        "requires": ["status", "evidence"]
+      },
+      "partition": "general",
+      "workspace_mode": "read_only",
+      "retry_policy": {
+        "max_attempts": 1,
+        "retry_classes": []
+      }
+    }
+  ]
+}

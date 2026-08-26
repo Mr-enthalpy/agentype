@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters.codex import CodexAppServerAdapter
+from .adapters.grok import GrokAcpAdapter
 from .config import SchedulerConfig, load_config
 from .core import Scheduler
 from .enums import ContinuityPreference, FailureClass, Retention, WorkspaceMode
@@ -62,19 +63,51 @@ def _partition_spec_for_upsert(
     )
 
 
+def _adapter_for_kind(kind: str, config: SchedulerConfig, process_cwd: str):
+    if kind == "codex_app_server":
+        return CodexAppServerAdapter(
+            command=config.codex_adapter.command,
+            process_cwd=process_cwd,
+            approval_policy=config.codex_adapter.approval_policy,
+            sandbox=config.codex_adapter.sandbox,
+            profile_options=config.execution_profiles,
+        )
+    if kind == "grok_acp":
+        grok = config.grok_adapter
+        if grok is None:
+            raise ConfigurationError("adapters.grok_acp is required for grok_acp targets")
+        return GrokAcpAdapter(
+            command=grok.command,
+            process_cwd=config.resolve(grok.cwd),
+            sandbox=grok.sandbox,
+            request_timeout=grok.request_timeout,
+            profile_options=config.execution_profiles,
+        )
+    raise ConfigurationError(f"unsupported adapter {kind!r}")
+
+
+def _workspace_cwd(config: SchedulerConfig) -> str:
+    for target in config.execution_targets:
+        if target.adapter == "grok_acp" and config.grok_adapter is not None:
+            if all(item.adapter != "codex_app_server" for item in config.execution_targets):
+                return config.resolve(config.grok_adapter.cwd)
+            break
+    return config.resolve(config.codex_adapter.cwd)
+
+
 def _build_dispatcher(
     scheduler: Scheduler, config: SchedulerConfig
 ) -> tuple[Dispatcher, SchedulerDaemon]:
     profile_names = set(config.execution_profiles)
-    process_cwd = config.resolve(config.codex_adapter.cwd)
-    adapter = CodexAppServerAdapter(
-        command=config.codex_adapter.command,
-        process_cwd=process_cwd,
-        approval_policy=config.codex_adapter.approval_policy,
-        sandbox=config.codex_adapter.sandbox,
-        profile_options=config.execution_profiles,
-    )
-    adapters = {target.name: adapter for target in config.execution_targets}
+    process_cwd = _workspace_cwd(config)
+    adapter_by_kind: dict[str, object] = {}
+    adapters = {}
+    for target in config.execution_targets:
+        if target.adapter not in adapter_by_kind:
+            adapter_by_kind[target.adapter] = _adapter_for_kind(
+                target.adapter, config, process_cwd
+            )
+        adapters[target.name] = adapter_by_kind[target.adapter]
     targets = {target.name: target for target in config.execution_targets}
     if config.root_bridge.kind == "codex_app_server":
         bridge = CodexAppServerRootBridge(

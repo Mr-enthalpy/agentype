@@ -62,7 +62,7 @@ class AppServerSession:
                 "clientInfo": {
                     "name": "local_agent_scheduler",
                     "title": "Local Agent Scheduler",
-                    "version": "0.1.2",
+                    "version": "0.1.3",
                 }
             },
             timeout=self._remaining(initialization_deadline, "initialize"),

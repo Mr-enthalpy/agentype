@@ -5,10 +5,12 @@ plane for durable agent work. It owns Tasks, Attempts, Leases, Results,
 LogicalAgents, Batches, pool topology, recovery, escalation, and durable Root
 notifications. Physical execution belongs to replaceable adapters.
 
-V0.1.2 uses SQLite WAL and ships a Codex `app-server` adapter. Codex, CCR,
-TokenRhythm, DeepSeek, credentials, and provider routing are not Scheduler Core
-semantics. A nonterminal `collect_outcome` cannot inherit quiescence proof
-from `reconcile_start`.
+V0.1.3 uses SQLite WAL and ships Codex `app-server` and Grok ACP stdio
+adapters. A partition still selects exactly one execution target. Codex, Grok,
+CCR, TokenRhythm, DeepSeek, credentials, and provider routing are not Scheduler
+Core semantics. A nonterminal `collect_outcome` cannot inherit quiescence proof
+from `reconcile_start`. `config/scheduler.grok.toml` selects the Grok worker.
+Set `AGENTYPE_GROK_LIVE=1` to run one real worker round.
 
 The long-term architecture is in [ARCHITECTURE.md](ARCHITECTURE.md). The frozen
 V0.1 contracts and V0.1.2 correctness closure are in
