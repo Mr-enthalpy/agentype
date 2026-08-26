@@ -36,6 +36,9 @@ request_timeout = 90
 
 [root_bridge]
 # Provider-free/local testing. Root remains notification-driven.
+# For a real dormant Grok Root wakeup:
+# kind = "grok_acp"
+# root_session_id = "<existing-idle-grok-session-id>"
 kind = "filesystem"
 inbox = ".scheduler-root-events"
 request_timeout = 30

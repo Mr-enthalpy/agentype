@@ -39,6 +39,7 @@ class RootBridgeConfig:
     kind: str
     inbox: str
     root_thread_id: str | None
+    root_session_id: str | None
     request_timeout: float
     completion_timeout: float
 
@@ -298,7 +299,14 @@ def load_config(path: str | Path) -> SchedulerConfig:
     root_bridge = raw.get("root_bridge", {})
     _reject_unknown(
         root_bridge,
-        {"kind", "inbox", "root_thread_id", "request_timeout", "completion_timeout"},
+        {
+            "kind",
+            "inbox",
+            "root_thread_id",
+            "root_session_id",
+            "request_timeout",
+            "completion_timeout",
+        },
         "root_bridge",
     )
     bridge_kind = _nonempty(root_bridge.get("kind", "filesystem"), "root_bridge.kind")
@@ -311,6 +319,7 @@ def load_config(path: str | Path) -> SchedulerConfig:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             raise ConfigurationError(f"{name} must be a positive number")
     raw_thread_id = root_bridge.get("root_thread_id")
+    raw_session_id = root_bridge.get("root_session_id")
     bridge_config = RootBridgeConfig(
         kind=bridge_kind,
         inbox=_nonempty(root_bridge.get("inbox", ".scheduler-root-events"), "root_bridge.inbox"),
@@ -319,13 +328,22 @@ def load_config(path: str | Path) -> SchedulerConfig:
             if raw_thread_id is not None
             else None
         ),
+        root_session_id=(
+            _nonempty(raw_session_id, "root_bridge.root_session_id")
+            if raw_session_id is not None
+            else None
+        ),
         request_timeout=float(request_timeout),
         completion_timeout=float(completion_timeout),
     )
-    if bridge_config.kind not in {"filesystem", "codex_app_server"}:
-        raise ConfigurationError("root_bridge.kind must be filesystem or codex_app_server")
+    if bridge_config.kind not in {"filesystem", "codex_app_server", "grok_acp"}:
+        raise ConfigurationError(
+            "root_bridge.kind must be filesystem, codex_app_server, or grok_acp"
+        )
     if bridge_config.kind == "codex_app_server" and bridge_config.root_thread_id is None:
         raise ConfigurationError("Codex RootBridge requires root_thread_id")
+    if bridge_config.kind == "grok_acp" and bridge_config.root_session_id is None:
+        raise ConfigurationError("Grok RootBridge requires root_session_id")
 
     target_names = {target.name for target in targets}
     if len(target_names) != len(targets):

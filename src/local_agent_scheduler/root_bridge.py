@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .adapters.codex import AppServerSession
+from .adapters.grok import AcpSession
 from .enums import OutboxState
 from .models import DeliveryObservation
 from .storage import Database, json_loads, utc_now
@@ -191,6 +192,87 @@ class CodexAppServerRootBridge:
             "Read authoritative Scheduler state and Result Queue by event id; "
             "deduplicate repeated delivery using EVENT_ID."
         )
+
+
+class GrokAcpRootBridge:
+    """Wake an existing Grok ACP Root session without transporting Result content.
+
+    The Bridge never creates Root identity. It loads a configured session and
+    treats the notification `session/prompt` RPC as the exact wakeup turn.
+    """
+
+    def __init__(
+        self,
+        *,
+        root_session_id: str,
+        command: tuple[str, ...] = ("grok", "agent", "--always-approve", "stdio"),
+        process_cwd: str | None = None,
+        request_timeout: float = 30.0,
+        completion_timeout: float = 120.0,
+        session_factory: Callable[..., AcpSession] = AcpSession,
+    ) -> None:
+        if not root_session_id.strip():
+            raise ValueError("root_session_id cannot be empty")
+        if request_timeout <= 0 or completion_timeout <= 0:
+            raise ValueError("RootBridge timeouts must be positive")
+        self.root_session_id = root_session_id
+        self.command = self._root_command(command)
+        self.process_cwd = process_cwd
+        self.request_timeout = request_timeout
+        self.completion_timeout = completion_timeout
+        self.session_factory = session_factory
+
+    @staticmethod
+    def _root_command(command: tuple[str, ...]) -> tuple[str, ...]:
+        parts = list(command)
+        if "--sandbox" not in parts:
+            agent_index = parts.index("agent") if "agent" in parts else 1
+            parts[agent_index:agent_index] = ["--sandbox", "read-only"]
+        return tuple(parts)
+
+    def deliver(
+        self, event_id: str, event_type: str, payload: Mapping[str, Any]
+    ) -> DeliveryObservation:
+        session = self.session_factory(
+            self.command, self.process_cwd, self.request_timeout
+        )
+        try:
+            load_params: dict[str, Any] = {
+                "sessionId": self.root_session_id,
+                "mcpServers": [],
+            }
+            if self.process_cwd:
+                load_params["cwd"] = self.process_cwd
+            session.request(
+                "session/load",
+                load_params,
+                timeout=self.request_timeout,
+            )
+            notice = CodexAppServerRootBridge._notification_text(
+                event_id, event_type, payload
+            )
+            result = session.request(
+                "session/prompt",
+                {
+                    "sessionId": self.root_session_id,
+                    "prompt": [{"type": "text", "text": notice}],
+                },
+                timeout=self.completion_timeout,
+            )
+            stop = ""
+            if isinstance(result, Mapping):
+                stop = str(result.get("stopReason") or result.get("stop_reason") or "")
+            if stop.lower() in {"cancelled", "interrupted", "max_turn_requests"}:
+                return DeliveryObservation(
+                    False, f"Grok Root prompt ended as {stop or 'failed'}"
+                )
+            return DeliveryObservation(True, "confirmed by session/prompt")
+        except TimeoutError as exc:
+            return DeliveryObservation(False, str(exc))
+        except Exception as exc:
+            return DeliveryObservation(False, str(exc))
+        finally:
+            session.close(timeout=min(self.request_timeout, 2.0))
 
 
 class OutboxDispatcher:

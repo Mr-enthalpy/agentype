@@ -13,7 +13,12 @@ from .core import Scheduler
 from .enums import ContinuityPreference, FailureClass, Retention, WorkspaceMode
 from .errors import ConfigurationError
 from .models import PartitionSpec, RetryPolicy, TaskSpec
-from .root_bridge import CodexAppServerRootBridge, FilesystemRootBridge, OutboxDispatcher
+from .root_bridge import (
+    CodexAppServerRootBridge,
+    FilesystemRootBridge,
+    GrokAcpRootBridge,
+    OutboxDispatcher,
+)
 from .runtime import Dispatcher, SchedulerDaemon
 from .storage import Database
 
@@ -114,6 +119,21 @@ def _build_dispatcher(
             root_thread_id=config.root_bridge.root_thread_id or "",
             command=config.codex_adapter.command,
             process_cwd=process_cwd,
+            request_timeout=config.root_bridge.request_timeout,
+            completion_timeout=config.root_bridge.completion_timeout,
+        )
+    elif config.root_bridge.kind == "grok_acp":
+        grok = config.grok_adapter
+        bridge = GrokAcpRootBridge(
+            root_session_id=config.root_bridge.root_session_id or "",
+            command=(
+                grok.command
+                if grok is not None
+                else ("grok", "agent", "--always-approve", "stdio")
+            ),
+            process_cwd=(
+                config.resolve(grok.cwd) if grok is not None else process_cwd
+            ),
             request_timeout=config.root_bridge.request_timeout,
             completion_timeout=config.root_bridge.completion_timeout,
         )

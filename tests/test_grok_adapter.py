@@ -13,6 +13,7 @@ from local_agent_scheduler.adapters.codex import CodexAppServerAdapter
 from local_agent_scheduler.adapters.grok import GrokAcpAdapter
 from local_agent_scheduler.cli import _build_dispatcher
 from local_agent_scheduler.config import ExecutionTargetConfig, load_config
+from local_agent_scheduler.root_bridge import GrokAcpRootBridge
 from local_agent_scheduler.core import Scheduler
 from local_agent_scheduler.enums import ExecutionState, FailureClass, Retention, WorkspaceMode
 from local_agent_scheduler.errors import ConfigurationError
@@ -382,6 +383,89 @@ inbox = ".events"
         self.assertIsInstance(dispatcher.adapters["local_codex"], CodexAppServerAdapter)
         self.assertIsInstance(dispatcher.adapters["local_grok"], GrokAcpAdapter)
         self.assertIsNot(dispatcher.adapters["local_codex"], dispatcher.adapters["local_grok"])
+
+    def test_grok_root_bridge_loads_existing_session_without_result_transport(self):
+        class RootSession(CapturingGrokSession):
+            def request(self, method, params, *, timeout=None, **_kwargs):
+                self.calls.append((method, dict(params), timeout))
+                if method == "session/load":
+                    return {"sessionId": params["sessionId"]}
+                if method == "session/prompt":
+                    return {"stopReason": "end_turn"}
+                if method == "session/new":
+                    raise AssertionError("RootBridge must not create Root identity")
+                return {}
+
+        RootSession.instances = []
+        bridge = GrokAcpRootBridge(
+            root_session_id="root-session",
+            session_factory=RootSession,
+        )
+        outcome = bridge.deliver(
+            "event-1",
+            "BATCH_RESULTS_READY",
+            {"batch_id": "batch-1", "result_body": "must-not-be-transported"},
+        )
+        self.assertTrue(outcome.delivered)
+        session = RootSession.instances[-1]
+        methods = [name for name, _params, _timeout in session.calls]
+        self.assertEqual(methods[0], "session/load")
+        self.assertEqual(session.calls[0][1]["sessionId"], "root-session")
+        self.assertIn("session/prompt", methods)
+        self.assertNotIn("session/new", methods)
+        notice = session.calls[1][1]["prompt"][0]["text"]
+        self.assertIn("event-1", notice)
+        self.assertIn("batch-1", notice)
+        self.assertNotIn("must-not-be-transported", notice)
+        self.assertTrue(session.closed)
+        self.assertIn("--sandbox", session.command)
+        self.assertEqual(session.command[session.command.index("agent") - 1], "read-only")
+
+    def test_grok_root_bridge_failed_prompt_is_not_delivered(self):
+        class FailingRootSession(CapturingGrokSession):
+            def request(self, method, params, *, timeout=None, **_kwargs):
+                self.calls.append((method, dict(params), timeout))
+                if method == "session/load":
+                    return {"sessionId": params["sessionId"]}
+                raise TimeoutError("Grok ACP request timed out: session/prompt")
+
+        FailingRootSession.instances = []
+        bridge = GrokAcpRootBridge(
+            root_session_id="root-session",
+            session_factory=FailingRootSession,
+            completion_timeout=0.05,
+        )
+        outcome = bridge.deliver("event-1", "BATCH_RESULTS_READY", {"batch_id": "batch-1"})
+        self.assertFalse(outcome.delivered)
+        self.assertTrue(FailingRootSession.instances[-1].closed)
+
+    def test_grok_root_bridge_config_requires_session_id(self):
+        path = Path(self.temp.name) / "grok-root-missing.toml"
+        path.write_text(
+            """
+schema_version = 1
+[execution_profiles.default]
+[[partitions]]
+name = "general"
+desired_capacity = 1
+retention = "resident"
+execution_target = "local_grok"
+execution_profile = "default"
+[[execution_targets]]
+name = "local_grok"
+adapter = "grok_acp"
+attempt_isolation = false
+termination_confirmation = true
+[adapters.grok_acp]
+command = ["grok", "agent", "--always-approve", "stdio"]
+[root_bridge]
+kind = "grok_acp"
+inbox = ".events"
+""",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ConfigurationError, "root_session_id"):
+            load_config(path)
 
 
 if __name__ == "__main__":
