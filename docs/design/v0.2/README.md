@@ -34,6 +34,8 @@ substitutes for each other:
   Root how to use Agentype to solve a user problem.
 
 Latest ingestion *evidence* (historical report, not canonical input):
+[docs/reports/v0.2/design-ingestion-e71f8ec.md](../../reports/v0.2/design-ingestion-e71f8ec.md).
+An earlier incomplete absorption remains at
 [docs/reports/v0.2/design-ingestion-d1cfc458.md](../../reports/v0.2/design-ingestion-d1cfc458.md).
 Every new architecture/RIIR agent must produce its own comprehension from this
 bundle. A previous agent's report must not be treated as source design.
