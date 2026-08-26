@@ -105,7 +105,8 @@ Labelled here only; not fixed in this change.
 - Grok acceptance Scope vs later dormant-Root section (labeled in-file, not
   rewritten).
 - ADR candidates ADR-0001–0006 not extracted (`docs/decisions/README.md` TODO).
-- V0.2 design not written (`docs/design/v0.2/` empty except README).
+- V0.2 design was empty at the time of this report. The bundle later
+  landed in `docs/design/v0.2/`; open questions remain unresolved.
 - `v0.1.3` git tag is a separate release action at `729143f`, not this commit.
 
 ## Confirmation
