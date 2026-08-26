@@ -25,27 +25,40 @@ manager/worker organizations.
 
 ## Conformance classes
 
-A implementation claiming **V0.2 kernel conformance** (RIIR M4) MUST satisfy
-[03](03-task-attempt-lease-result.md), [11](11-pool-topology.md) MOVE/MERGE/RETIRE
-rules that already exist in V0.1, [13](13-storage-and-transactions.md) kernel
-transactions, [14](14-recovery-and-reconciliation.md), and the V0.1 rows of
+**M4 — Core correctness parity.** MUST satisfy Task/Attempt/Lease/Result/Batch
+machines in [03](03-task-attempt-lease-result.md) **except Generation
+membership**, writer safety, fencing, RUNNING-confirm + first Lease renewal
+atomicity, SQLite transactions in [13](13-storage-and-transactions.md),
+topology kernel in [11](11-pool-topology.md), restart **authority**
+reconciliation in [14](14-recovery-and-reconciliation.md), and M4 rows of
 [16](16-conformance-tests.md).
 
-A implementation claiming **V0.2 semantic conformance** (RIIR M6) MUST also
-satisfy Generation, WorkIntent, AgentType, SpawnSource, Transform, memory, Root
-contract, and the V0.2 rows of [16](16-conformance-tests.md).
+M4 MUST NOT require Generation, WorkIntent, AgentType, SpawnSource semantic
+integration, Transform, or MemoryCapsule promotion. M4 MUST NOT invent a
+default Generation to satisfy later sections.
 
-A implementation claiming **frontend neutrality** (RIIR M7) MUST add a second
-adapter without changing Core state machines.
+**M5 — Runtime / first-adapter parity.** MUST satisfy supervision lifecycle
+cleanup, adapter absolute deadlines, authoritative ExecutionProfile registry,
+`dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`, notifier
+completion-based backoff, daemon single-run, and M5 rows of [16](16-conformance-tests.md).
+
+**M6 — V0.2 semantic conformance.** MUST also satisfy Generation (every
+semantic Task belongs to exactly one Generation; retry stays in that
+Generation), WorkIntent, AgentType, SpawnSource semantic integration,
+Transform, memory, Root contract, and M6 rows of [16](16-conformance-tests.md).
+
+**M7 — Frontend neutrality.** MUST add a second adapter without changing Core
+state machines.
 
 ## Staged implementation
 
-RIIR MUST follow design milestone order: freeze spec (this directory) →
-workspace/bootstrap → kernel parity → first-adapter runtime parity → semantic
-layer → second adapter.
+RIIR MUST follow: freeze spec (this directory) → workspace/bootstrap (M3) →
+kernel parity (M4) → first-adapter runtime parity (M5) → semantic layer (M6) →
+second adapter (M7).
 
 An implementer MUST NOT simultaneously change language, weaken the kernel, and
-add semantic architecture.
+add semantic architecture. An implementer MUST NOT implement M6 objects in
+order to pass M4.
 
 ## Conflict policy
 

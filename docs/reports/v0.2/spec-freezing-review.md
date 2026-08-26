@@ -21,12 +21,17 @@ Outbox ACKED, Batch COMPLETED + BATCH_RESULTS_READY same tx), fencing,
 Result atomicity, writer safety, recovery barrier, and SQLite WAL +
 `synchronous=FULL` are unchanged.
 
-## Implementation-defined
+## Implementation-defined vs deferred
 
-Rust crate/struct/SQL *names*, async runtime, serialization, vendor wire
-formats (as opaque handles), exact GenerationPolicy bytes, exact
-information-function encoding. M4 store itself is **not**
-implementation-defined: SQLite WAL + `synchronous=FULL` MUST.
+IMPLEMENTATION-DEFINED: Rust crate/struct/SQL *names*, async runtime,
+serialization, vendor wire formats (opaque handles).
+
+DEFERRED / BLOCKS_SEMANTIC_LAYER (not a free implementation choice):
+GenerationPolicy encoding, information-function set/trait encoding, and the
+other rows in `docs/specs/v0.2/17-deferred-open-questions.md`.
+
+M4 store itself is **not** implementation-defined: SQLite WAL +
+`synchronous=FULL` MUST.
 
 ## Unresolved (see specs/v0.2/17)
 
@@ -55,15 +60,19 @@ recorded V0.1 vs V0.2-intent conflict. Python was not modified.
 
 ## Can Rust kernel RIIR begin?
 
-After this repair, yes for M4: the physical Execution graph, LogicalAgent
-excess-retire, Incarnation/Escalation/Outbox tables, and durable-outbox
-atomicity are specified. Implementers MAY choose Rust representation. They
-MUST NOT decide the questions listed in `docs/specs/v0.2/README.md`.
+**M4 Core** MAY begin only after this staging split: Task MUST NOT require
+Generation; RUNNING-confirm + first Lease renewal is a listed M4
+transaction. M4 MUST NOT implement `04` Generation.
 
-This PR MUST NOT claim the Transform **failure** contract or compiler
-exact-duplicate auto-drop are frozen. Cutover option A **is** frozen.
+**M5 Runtime** is a separate gate (supervision cleanup, profile registry,
+poll/heartbeat/lease timing, notifier completion-based backoff, daemon
+single-run, adapter deadlines).
 
-M6 MUST wait on the BLOCKS_SEMANTIC_LAYER registry.
+**M6** still waits on BLOCKS_SEMANTIC_LAYER. Transform **failure** and
+compiler exact-duplicate auto-drop are not frozen. Cutover option A is.
+
+This review MUST NOT be read as an unconditional “M4 MAY begin” that
+includes Generation.
 
 ## Numbered design invariants → spec
 

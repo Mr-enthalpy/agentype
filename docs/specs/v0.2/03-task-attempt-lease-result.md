@@ -27,8 +27,12 @@ Completed work is superseded by a new Task.
 V0.1 has no optional Task path. Every submitted Task participates in the Batch
 barrier. V0.2 MUST NOT add an optional-task bypass of Result creation.
 
-A V0.2 Task MUST belong to a Generation ([04](04-generation-and-frontier.md)).
-Retry of that Task MUST remain in the same Generation.
+**M4:** a Task MUST NOT require Generation membership. Retry remains on the
+same Task. M4 MUST NOT create a default Generation.
+
+**M6:** every semantic Task MUST belong to exactly one Generation
+([04](04-generation-and-frontier.md)). Retry of that Task MUST remain in the
+originating Generation.
 
 ## Attempt
 
@@ -144,8 +148,10 @@ partition member MUST block RETIRE.
 
 ## Notification outbox
 
-ACKED is retained (V0.1 UNCHANGED, not EVOLVED). Events remain until
-delivered **and acknowledged**.
+ACKED is retained (V0.1 UNCHANGED, not EVOLVED). An event remains durable
+until ACKED. Delivery and acknowledgement are distinct. Acknowledgement MAY
+transition PENDING or DELIVERED to ACKED. PENDING → DELIVERED → ACKED is
+**not** the only legal path.
 
 | From | Operation | To |
 |---|---|---|
@@ -156,6 +162,10 @@ delivered **and acknowledged**.
 | DELIVERED | acknowledge | ACKED |
 
 `ACKED` is terminal for the event.
+
+Delivery success timestamps and retry eligibility MUST be computed from the
+**completion** of the bounded bridge call, not its start (**M5**). A slow
+failure MUST still receive its declared backoff.
 
 The **first** `Batch → COMPLETED` and the **exactly-one**
 `BATCH_RESULTS_READY` insert MUST occur in the **same** atomic transaction

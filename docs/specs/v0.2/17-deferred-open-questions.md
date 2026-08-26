@@ -39,10 +39,18 @@ atomicity rule. Those omissions **were** kernel blockers. They are specified
 in [03](03-task-attempt-lease-result.md), [08](08-logical-agent-lineage-transform.md),
 and [13](13-storage-and-transactions.md); they are **not** DEFERRED items.
 
-After that repair, no **open question** in this table is `BLOCKS_KERNEL`.
-M4 MAY begin from those files plus [11](11-pool-topology.md),
-[14](14-recovery-and-reconciliation.md), and V0.1 rows of
-[16](16-conformance-tests.md).
+No **open question** in this table is `BLOCKS_KERNEL`.
+
+M4 Core MAY begin only from the **M4** slices of [03](03-task-attempt-lease-result.md)
+(no Generation membership), [11](11-pool-topology.md),
+[13](13-storage-and-transactions.md) including RUNNING-confirm + first
+renewal, [14](14-recovery-and-reconciliation.md) authority reconciliation,
+and [16](16-conformance-tests.md) section A.
+
+M4 MUST NOT implement [04](04-generation-and-frontier.md). GenerationPolicy
+and related items remain BLOCKS_SEMANTIC_LAYER.
+
+M5 is a separate gate ([16](16-conformance-tests.md) section A2).
 
 M6 MUST NOT treat Transform failure rollback or compiler exact-duplicate
 auto-drop as frozen. Cutover atomicity (option A) **is** frozen.

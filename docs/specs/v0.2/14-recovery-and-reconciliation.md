@@ -38,18 +38,34 @@ those objects; it MUST NOT invent a new Generation or a new LogicalAgent.
 quiescence. Nonterminal `collect_outcome` MUST NOT inherit
 `reconcile_start` quiescence.
 
-## Heartbeat
+## Heartbeat (**M4** admission + **M5** timing)
 
 Heartbeat renewal is restricted to Executions this daemon positively
 admitted as RUNNING. UNKNOWN database state or mere adapter presence is
-insufficient.
+insufficient. Core heartbeat and bulk renewal MUST require the persisted
+Execution itself to be RUNNING.
 
-## Notifier isolation
+The positive RUNNING transition and first Lease renewal MUST commit in one
+fenced Core transaction before daemon admission ([13](13-storage-and-transactions.md)).
+
+**M5:** configuration MUST satisfy
+`dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`.
+
+## Recovery startup cleanup (**M5**)
+
+Heartbeat/notifier startup and the remaining recovery steps MUST share one
+cleanup scope. If any later reconciliation fails after supervision started,
+the daemon MUST stop those threads and clear all in-memory supervision
+admissions before propagating the error. A failed startup MUST NOT leave
+renewable authority behind.
+
+## Notifier isolation (**M5** includes backoff clock)
 
 Outbox delivery MUST run independently of dispatcher and heartbeat.
 Slow delivery MUST NOT block lease supervision.
+Backoff clock: [03](03-task-attempt-lease-result.md) (completion, not start).
 
-## Daemon lifecycle
+## Daemon lifecycle (**M5**)
 
 A SchedulerDaemon object MUST be single-run. A second `run` while notifier
 shutdown is in progress MUST be rejected.

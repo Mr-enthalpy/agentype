@@ -29,13 +29,15 @@ Canonical path: docs/specs/v0.2/matrices.md
 |---|---|---|
 | SQLite WAL + `synchronous=FULL` authoritative; at-least-once | 02, 13 | unchanged (M4 MUST SQLite; not an abstract store) |
 | Claim = Attempt+Lease+epoch | 02, 03, 13 | unchanged |
-| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged (Execution physical graph includes UNKNOWN→RUNNING; LogicalAgent excess unassigned retire) |
+| Task/Attempt/Lease/Execution/Batch/LogicalAgent machines | 03, 08 | unchanged (Execution physical graph includes UNKNOWN→RUNNING; LogicalAgent excess unassigned retire). Generation membership is **M6 added**, not M4. |
 | Fencing + stale physical-only history | 02, 03 | unchanged |
+| RUNNING confirm + first Lease renewal one fenced tx before admission | 13, 14 | unchanged (M4) |
 | One Result per completed Task; ACK is consumption | 03 | unchanged |
 | Writer quiescence / isolation snapshot / RETIRE block | 03, 11 | unchanged |
 | Retry classes; no semantic recovery by Scheduler | 02 | unchanged |
 | Adapter deadline + nonterminal collect MUST NOT inherit reconcile quiescence | 07, 14 | unchanged |
-| Outbox PENDING/DELIVERED/ACKED; first Batch COMPLETED + BATCH_RESULTS_READY same tx; notifier isolation | 03, 13, 14 | unchanged |
+| Outbox PENDING/DELIVERED/ACKED; ACK MAY skip DELIVERED; first Batch COMPLETED + BATCH_RESULTS_READY same tx | 03, 13 | unchanged (M4) |
+| Notifier isolation; backoff from call **completion**; poll ≤ heartbeat < lease; recovery startup cleanup; empty profile registry authoritative | 03, 07, 14 | unchanged (M5) |
 | Startup RECOVERY barrier | 14 | unchanged |
 | MOVE/MERGE preserve identity; RETIRE guards | 11 | unchanged |
 | Revival preserves LogicalAgent; READY ≠ physical | 08, 09 | unchanged |
@@ -44,7 +46,8 @@ Canonical path: docs/specs/v0.2/matrices.md
 | Generation / WorkIntent / AgentType / SpawnSource / Transform | 04–09 | **added** (M6); MUST NOT bypass kernel |
 | PoolPartition absorbs target+profile+capacity | 11 | V0.1 kernel unchanged; V0.2 split DEFERRED |
 
-No V0.1 correctness property is removed.
+No V0.1 **kernel or runtime** correctness property listed above is removed.
+Generation membership is an M6 addition, not a V0.1 removal.
 
 ## C. Spec → Rust boundary
 

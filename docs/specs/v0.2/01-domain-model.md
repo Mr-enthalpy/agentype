@@ -39,7 +39,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 ## Meaning (MUST)
 
 **Objective** MAY be represented as Root-owned problem scope. Exact schema
-DEFERRED ([17](17-deferred-open-questions.md) D-ROOT-API).
+DEFERRED ([17](17-deferred-open-questions.md) D-OBJECTIVE).
 
 **Generation** is a semantic-frontier barrier, not an organizational layer. See
 [04](04-generation-and-frontier.md).

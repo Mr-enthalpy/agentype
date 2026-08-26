@@ -8,14 +8,15 @@ the corresponding milestone. They are not an afterthought.
 
 This document does not ship the tests.
 
-## A. V0.1 correctness parity (M4)
+## A. V0.1 Core correctness (M4)
 
 MUST cover: fencing; stale ACK; duplicate writer prevention; restart
-recovery; Result durability; Batch partial completion; topology recovery;
-writer quiescence / omitted execution_id; notifier isolation from
-dispatcher/heartbeat; `collect_outcome` MUST NOT inherit
-`reconcile_start` quiescence; RETIRE blocked by open writer-safety
-obligation.
+**authority** recovery; Result durability; Batch partial completion;
+topology recovery; writer quiescence / omitted execution_id;
+`collect_outcome` MUST NOT inherit `reconcile_start` quiescence; RETIRE
+blocked by open writer-safety obligation; **RUNNING confirmation + first
+Lease renewal in one fenced transaction before supervision admission**
+(oracle `test_running_confirmation_atomically_renews_near_deadline_lease`).
 
 Physical Execution transitions (oracle `record_physical_outcome`):
 UNKNOWN → RUNNING; LOST → TERMINATED; STARTING → UNKNOWN; identity-preserving
@@ -26,9 +27,21 @@ DRAINING; only ASSIGNED drains; safety-resolved SUSPENDED → REVIVING or
 RETIRED.
 
 Outbox: first `Batch → COMPLETED` inserts exactly one `BATCH_RESULTS_READY`
-in the same transaction; PENDING/DELIVERED → ACKED.
+in the same transaction; PENDING or DELIVERED → ACKED.
+
+M4 MUST NOT require Generation membership on Task.
 
 Python V0.1.2/0.1.3 suite is the behavior oracle.
+
+## A2. Runtime / adapter parity (M5)
+
+MUST cover: notifier isolation from dispatcher/heartbeat; notifier backoff
+measured from delivery **completion**; recovery startup failure clears
+threads and in-memory admissions; empty ExecutionProfile registry is
+authoritative (`RESOURCE_UNAVAILABLE`, no adapter default); configuration
+`dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`; daemon
+single-run; adapter absolute deadlines including cleanup; first-adapter
+runtime/live parity as in V0.1.3 transports (opaque handles only).
 
 ## B. V0.2 semantic tests (M6)
 
@@ -55,8 +68,9 @@ A second adapter MUST be addable without Core state-machine changes.
 
 ## D. Crash/restart
 
-MUST cover restart during: Generation, Transform, Result AVAILABLE,
-compilation, revival. Resume MUST NOT mint a new Generation or identity.
+MUST cover restart during Result AVAILABLE (M4). Generation, Transform,
+compilation, and revival restarts are **M6**. Resume MUST NOT mint a new
+Generation or identity.
 
 ## E. Persistence invariants
 

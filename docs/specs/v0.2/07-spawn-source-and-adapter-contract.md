@@ -54,6 +54,17 @@ Incarnation/Execution. Core MUST NOT interpret vendor enums.
 
 Process death is not quiescence proof.
 
+Adapter absolute deadlines are **M5** runtime conformance (the interface
+itself is required for M4 observation vocabulary).
+
+## ExecutionProfile registry (**M5**)
+
+An Execution profile registry supplied by the composition root is
+authoritative, including when it is empty. A persisted profile absent from
+that registry MUST be `RESOURCE_UNAVAILABLE`. It MUST NEVER silently fall
+back to adapter defaults. `None` is reserved for direct callers that
+intentionally provide no registry.
+
 ## TerminalExperienceAdapter (optional)
 
 MAY display child agents, conversations, status, workstreams.

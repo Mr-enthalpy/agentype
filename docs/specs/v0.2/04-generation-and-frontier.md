@@ -2,6 +2,7 @@
 
 Status: Normative
 Canonical path: docs/specs/v0.2/04-generation-and-frontier.md
+Conformance: **M6 only**. M4 MUST NOT implement Generation.
 
 Generation is a **semantic frontier barrier**, not an organizational level
 and not a Batch.
