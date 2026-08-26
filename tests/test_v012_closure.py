@@ -2031,11 +2031,6 @@ class ClosureCase(unittest.TestCase):
         )
         self.assertEqual(dispatcher.poll_executions(), 1)
         self.assertEqual(dispatcher.supervised_attempt_ids(), {claim.attempt_id})
-        with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE leases SET expires_at=? WHERE id=?",
-                (time.time() + 0.1, claim.lease_id),
-            )
         daemon = SchedulerDaemon(
             dispatcher, poll_seconds=0.01, heartbeat_seconds=0.03
         )
@@ -2043,6 +2038,29 @@ class ClosureCase(unittest.TestCase):
         daemon._start_notifier()
         try:
             self.assertTrue(bridge.started.wait(1))
+            # Shorten the remaining TTL only after heartbeat and notifier
+            # threads exist. A pre-start 100ms window loses to Windows thread
+            # startup; renew_active_leases then refuses already-expired rows.
+            shortened = time.time() + 0.25
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE leases SET expires_at=? WHERE id=?",
+                    (shortened, claim.lease_id),
+                )
+            renewed = False
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                row = self.scheduler.get("leases", claim.lease_id)
+                if row["state"] != "ACTIVE":
+                    break
+                if float(row["expires_at"]) > shortened + 0.5:
+                    renewed = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(
+                renewed,
+                "heartbeat did not renew the shortened lease while the notifier was blocked",
+            )
             with ThreadPoolExecutor(max_workers=1) as pool:
                 snapshot = pool.submit(dispatcher.tick).result(timeout=1)
             self.assertGreaterEqual(snapshot["observed"], 1)
