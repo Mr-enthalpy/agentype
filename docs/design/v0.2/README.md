@@ -81,7 +81,8 @@ should be explicit and reviewed rather than silently introduced.
 
 ## Current executable contract
 
-Until open questions are resolved and a V0.2 spec is written:
+Until Rust kernel parity:
 
 - Language-independent V0.1 invariants: [docs/architecture/overview.md](../../architecture/overview.md)
-- Testable V0.1 contract: [docs/specs/v0.1.md](../../specs/v0.1.md)
+- Testable V0.1 Python-line contract: [docs/specs/v0.1.md](../../specs/v0.1.md)
+- V0.2 normative spec: [docs/specs/v0.2/](../../specs/v0.2/) (what MUST be true; this directory remains why)
