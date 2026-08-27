@@ -68,8 +68,23 @@ representation of that rule (oracle parity verified against
 - A semantically retired LogicalAgent cannot revive and cannot obtain a new
   Incarnation (`ensure_incarnation` rejects RETIRED inside the transaction;
   `create_execution` reaches it through the claim path).
+- Claim matching preserves the frozen V0.1 order: continuity rank, oldest
+  `available_since` (created_at fallback), then lowest LogicalAgent ID. The
+  comparator re-applies the SQL ordering so the availability tiebreak cannot
+  be lost in selection.
+- Durable persisted JSON decodes fail-closed: corrupted documents surface as
+  `InvariantViolation`, never as a silent alternative schedule
+  (`store::json_load` returns `Result`).
+- The continuity capsule byte bound is constructor-configured
+  (`Kernel::open`/`open_memory`); composition supplies the bound at startup.
+- `ExecutionAdapter::reconcile_start` is keyed by stable request identity
+  (spec 07 narrow interface UNCHANGED from V0.1): `reconcile_start(request_id,
+  Option<&RuntimeHandle>)` so an ambiguous start can be re-located even when
+  the scheduler never obtained a complete runtime handle.
 
-Regressions: `m4_kernel.rs` (proof bits), `recovery.rs` (RETIRED defences).
+Regressions: `m4_kernel.rs` (proof bits), `recovery.rs` (RETIRED defences,
+orphaned-claim restart, corrupted-state fail-closed), `topology.rs` (frozen
+claim ordering).
 
 M6 objects are absent: no Generation table, no WorkIntent, no AgentType matching,
 no SpawnSource semantic integration, no Transform saga, no MemoryCapsule promotion,
@@ -203,13 +218,13 @@ cargo test --workspace
 Result on this landing (Windows, rustc via cargo 1.x):
 
 - `agentype-core`: 4 tests
-- `agentype-adapter-api`: 1 test
+- `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 60 tests
+- `agentype-storage-sqlite` integration: 64 tests
   - `m4_kernel`: 40
-  - `recovery`: 8
-  - `topology`: 12
-- total: 66 passed, 0 failed
+  - `recovery`: 10
+  - `topology`: 14
+- total: 72 passed, 0 failed
 
 Python tests were not modified and are not required to pass as part of M4
 Rust CI. The existing Python job remains for the V0.1 oracle package.

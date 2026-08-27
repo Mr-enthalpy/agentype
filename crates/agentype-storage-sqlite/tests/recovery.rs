@@ -15,6 +15,7 @@ fn restart_recovery_prevents_blind_duplicate_execution() {
     let env = file_env(&db);
     let task_id;
     let attempt_id;
+    let original_expiry;
     {
         let k = &env.k;
         let (_b, ids) = k.submit_batch(&[retryable_write("restart")]).unwrap();
@@ -22,8 +23,10 @@ fn restart_recovery_prevents_blind_duplicate_execution() {
         let claim = k.claim_next_available().unwrap().unwrap();
         attempt_id = claim.attempt_id.clone();
         let _ = k.create_execution(&claim, false).unwrap();
+        original_expiry = k.lease_for_attempt(&attempt_id).unwrap().expires_at;
     }
     env.clock.advance(20.0);
+    assert!(env.clock.now() > original_expiry);
     {
         let k = reopen(&env, &db);
         k.recover_authority().unwrap();
@@ -220,4 +223,66 @@ fn excess_reviving_retires_directly() {
     let report = env.k.reconcile_pool().unwrap();
     assert_eq!(report.retired, 1);
     assert_eq!(report.draining, 0);
+}
+
+/// Crash boundary: the claim committed but the process died before
+/// create_execution. Recovery must close the ACTIVE claim as an orphaned
+/// attempt and mechanically recover the Task WITHOUT waiting for the original
+/// lease deadline (spec 14: unstarted claims are authority-recoverable).
+#[test]
+fn restart_orphaned_claim_recovered_before_lease_deadline() {
+    let db = FixtureDb::new("orphan-claim");
+    let env = file_env(&db);
+    let task_id;
+    let attempt_id;
+    let original_expiry;
+    {
+        let k = &env.k;
+        let (_b, ids) = k.submit_batch(&[retryable_read("orphan")]).unwrap();
+        task_id = ids["orphan"].clone();
+        let claim = k.claim_next_available().unwrap().unwrap();
+        attempt_id = claim.attempt_id.clone();
+        original_expiry = k.lease_for_attempt(&attempt_id).unwrap().expires_at;
+        // Crash before create_execution: no Execution row exists.
+    }
+    // Advance but stay inside the original lease window.
+    env.clock.advance(2.0);
+    assert!(env.clock.now() < original_expiry);
+
+    let k = reopen(&env, &db);
+    let report = k.recover_authority().unwrap();
+    assert_eq!(report.retried, 1, "orphaned read claim recovers mechanically");
+    let attempt = k.attempt(&attempt_id).unwrap();
+    assert_eq!(attempt.state, AttemptState::Expired);
+    let task = k.task(&task_id).unwrap();
+    assert!(task.current_attempt_id.is_none());
+    assert_eq!(
+        task.state,
+        TaskState::RetryWait,
+        "recovered under backoff, not waiting for the lease deadline"
+    );
+    // Backoff (1s) elapses inside the original lease window; promote and
+    // re-claim with an advanced fencing epoch.
+    env.clock.advance(2.0);
+    assert!(env.clock.now() < original_expiry);
+    k.promote_retry_wait().unwrap();
+    assert_eq!(k.task(&task_id).unwrap().state, TaskState::Queued);
+    let claim2 = k.claim_next_available().unwrap().expect("re-claim");
+    assert!(claim2.lease_epoch > attempt.lease_epoch, "fencing epoch advances");
+}
+
+/// Authoritative durable state decodes fail-closed: a corrupted
+/// retry_classes_json must surface as an invariant error, not silently become
+/// an empty retry-class list that changes scheduling semantics.
+#[test]
+fn corrupted_durable_json_fails_closed() {
+    let db = FixtureDb::new("corrupt-json");
+    let env = file_env(&db);
+    let (_b, task_id, _claim, _exec) = run_claim(&env.k, retryable_write("corrupt"), false);
+    fixture_corrupt_json(&db, "tasks", "retry_classes_json", task_id.as_str());
+
+    env.clock.advance(20.0);
+    let err = env.k.expire_leases(false).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+    assert!(err.to_string().contains("corrupted durable JSON"));
 }

@@ -40,6 +40,8 @@ impl Drop for FixtureDb {
     }
 }
 
+pub const CONTINUITY_MAX_BYTES: usize = 16_384;
+
 pub struct Env {
     pub k: Kernel,
     pub clock: Arc<ManualClock>,
@@ -64,19 +66,19 @@ impl Env {
 
 /// In-memory environment (kernel-level conformance tests).
 pub fn memory_env() -> Env {
-    Env::build(|clock| Kernel::open_memory(clock, 10.0))
+    Env::build(|clock| Kernel::open_memory(clock, 10.0, CONTINUITY_MAX_BYTES))
 }
 
 /// File-backed environment; required for storage-level fixtures.
 pub fn file_env(db: &FixtureDb) -> Env {
     let path = db.path.clone();
-    Env::build(move |clock| Kernel::open(&path, clock, 10.0))
+    Env::build(move |clock| Kernel::open(&path, clock, 10.0, CONTINUITY_MAX_BYTES))
 }
 
 /// Re-open an existing file-backed database (restart simulation).
 pub fn reopen(env: &Env, db: &FixtureDb) -> Kernel {
     let clock = env.clock.clone() as Arc<dyn Clock>;
-    Kernel::open(&db.path, clock, 10.0).unwrap()
+    Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES).unwrap()
 }
 
 pub fn read_task(name: &str) -> TaskSpec {
@@ -147,6 +149,30 @@ pub fn fixture_agent_state(db: &FixtureDb, agent: &LogicalAgentId, state: &str, 
         )
         .unwrap();
     assert_eq!(n, 1, "fixture agent row missing");
+}
+
+/// Rewrite an agent's availability timestamp (matching-order fixture).
+pub fn fixture_agent_available(db: &FixtureDb, agent: &LogicalAgentId, available_since: f64) {
+    let conn = connect(&db.path);
+    let n = conn
+        .execute(
+            "UPDATE logical_agents SET available_since=?1,updated_at=?2 WHERE id=?3",
+            rusqlite::params![available_since, available_since, agent.as_str()],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "fixture agent row missing");
+}
+
+/// Corrupt an authoritative durable document (fail-closed fixture).
+pub fn fixture_corrupt_json(db: &FixtureDb, table: &str, column: &str, id: &str) {
+    let conn = connect(&db.path);
+    let n = conn
+        .execute(
+            &format!("UPDATE {table} SET {column}='not-json{{' WHERE id=?1"),
+            rusqlite::params![id],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "fixture row missing");
 }
 
 /// Insert a physical Incarnation in an arbitrary persisted state.

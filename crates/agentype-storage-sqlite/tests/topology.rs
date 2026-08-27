@@ -21,6 +21,66 @@ fn partition(
     k.reconcile_pool().unwrap();
 }
 
+/// Both members of the general partition, ordered by id (fixture read).
+fn ready_members(db: &FixtureDb) -> Vec<agentype_core::LogicalAgentId> {
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id FROM logical_agents WHERE partition_name='general' AND state='READY' ORDER BY id")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    rows.into_iter().map(LogicalAgentId::from_string).collect()
+}
+
+#[test]
+fn claim_prefers_oldest_available_since() {
+    let db = FixtureDb::new("match-age");
+    let env = file_env(&db);
+    env.k.resize_partition("general", 2).unwrap();
+    env.k.reconcile_pool().unwrap();
+
+    let members = ready_members(&db);
+    assert_eq!(members.len(), 2, "fixture needs two READY members");
+    let older = members[1].clone();
+    let newer = members[0].clone();
+
+    // Force the ordering against the id tiebreak: the id-larger member is
+    // older, so the frozen (available_since, id) order must still pick it.
+    fixture_agent_available(&db, &older, 900_000.0);
+    fixture_agent_available(&db, &newer, 1_100_000.0);
+
+    let (_batch, _ids) = env.k.submit_batch(&[read_task("oldest-first")]).unwrap();
+    let claim = env.k.claim_next_available().unwrap().unwrap();
+    assert_eq!(
+        claim.logical_agent_id, older,
+        "oldest available_since must win the claim even when its id is larger"
+    );
+}
+
+#[test]
+fn claim_prefers_lowest_id_on_tied_availability() {
+    let db = FixtureDb::new("match-tie");
+    let env = file_env(&db);
+    env.k.resize_partition("general", 2).unwrap();
+    env.k.reconcile_pool().unwrap();
+
+    let members = ready_members(&db);
+    assert_eq!(members.len(), 2);
+    // Tie the availability: the frozen tiebreak is lowest LogicalAgent ID.
+    for m in &members {
+        fixture_agent_available(&db, m, 1_000_000.0);
+    }
+    let expected = members[0].clone();
+
+    let (_batch, _ids) = env.k.submit_batch(&[read_task("tie-break")]).unwrap();
+    let claim = env.k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim.logical_agent_id, expected);
+}
+
 #[test]
 fn assigned_topology_move_drains() {
     let Env { k, .. } = memory_env();
