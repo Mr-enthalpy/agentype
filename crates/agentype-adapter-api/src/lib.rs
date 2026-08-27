@@ -79,10 +79,7 @@ pub struct ExecutionOutcome {
 
 pub trait ExecutionAdapter: Send + Sync {
     fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation>;
-    fn observe_execution(
-        &self,
-        handle: &RuntimeHandle,
-    ) -> AdapterResult<ExecutionObservation>;
+    fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
     fn interrupt_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
     fn terminate_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
     fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome>;
@@ -156,10 +153,7 @@ impl ExecutionAdapter for FakeAdapter {
         }))
     }
 
-    fn observe_execution(
-        &self,
-        handle: &RuntimeHandle,
-    ) -> AdapterResult<ExecutionObservation> {
+    fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
         if g.unavailable {
             return Err(AdapterError::Unavailable("adapter unavailable".into()));
@@ -206,7 +200,9 @@ impl ExecutionAdapter for FakeAdapter {
     ) -> AdapterResult<StartObservation> {
         let g = self.inner.lock().expect("fake adapter");
         let non_empty = |h: &RuntimeHandle| {
-            h.0.as_object().map(|o| !o.is_empty()).unwrap_or(!h.0.is_null())
+            h.0.as_object()
+                .map(|o| !o.is_empty())
+                .unwrap_or(!h.0.is_null())
         };
         let handle = match persisted_handle {
             Some(h) if non_empty(h) => h.clone(),

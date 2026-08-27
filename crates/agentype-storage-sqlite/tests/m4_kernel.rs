@@ -60,7 +60,10 @@ fn foreign_lineage_with_colliding_version_is_rejected() {
     drop(conn);
 
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
-    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) { Err(e) => e, Ok(_) => panic!("foreign database must be rejected") };
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("foreign database must be rejected"),
+    };
     assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
     assert!(err.to_string().contains("not importable"), "got: {err:?}");
 }
@@ -71,14 +74,15 @@ fn foreign_lineage_with_colliding_version_is_rejected() {
 fn tables_without_identity_are_rejected() {
     let db = FixtureDb::new("no-identity");
     let conn = rusqlite::Connection::open(&db.path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE batches (id TEXT PRIMARY KEY);",
-    )
-    .unwrap();
+    conn.execute_batch("CREATE TABLE batches (id TEXT PRIMARY KEY);")
+        .unwrap();
     drop(conn);
 
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
-    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) { Err(e) => e, Ok(_) => panic!("foreign database must be rejected") };
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("foreign database must be rejected"),
+    };
     assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
 }
 
@@ -300,7 +304,10 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
     assert!(expires > clock.now());
     let lease = k.lease_for_attempt(&claim.attempt_id).unwrap();
     assert_eq!(lease.state, LeaseState::Active);
-    assert_eq!(k.execution(&execution_id).unwrap().state, ExecutionState::Running);
+    assert_eq!(
+        k.execution(&execution_id).unwrap().state,
+        ExecutionState::Running
+    );
     assert_eq!(k.task(&claim.task_id).unwrap().state, TaskState::Running);
 }
 
@@ -589,8 +596,7 @@ fn nonterminal_nack_persists_no_quiescence() {
 #[test]
 fn nonterminal_nack_cannot_retry_writer_on_unproven_quiescence() {
     let Env { k, clock } = memory_env();
-    let (batch, task_id, claim, execution_id) =
-        run_claim(&k, retryable_write("unproven"), false);
+    let (batch, task_id, claim, execution_id) = run_claim(&k, retryable_write("unproven"), false);
 
     // Retryable class + raw quiescent=true + terminal=false: the historical
     // hole dispatched a replacement writer here.
@@ -605,7 +611,11 @@ fn nonterminal_nack_cannot_retry_writer_on_unproven_quiescence() {
             false,
         )
         .unwrap();
-    assert_eq!(state, TaskState::Suspended, "no retry on unproven quiescence");
+    assert_eq!(
+        state,
+        TaskState::Suspended,
+        "no retry on unproven quiescence"
+    );
 
     // Durable truth and scheduling outcome agree.
     let row = k.execution(&execution_id).unwrap();
@@ -678,7 +688,7 @@ fn unresolved_record_clears_stored_proof() {
     let claim = env.k.claim_next_available().unwrap().unwrap();
     let (execution_id, _) = env.k.create_execution(&claim, false).unwrap();
     // Simulate corrupted pre-fix history below the API boundary...
-    fixture_execution(&db, &execution_id, "UNKNOWN", true, true);
+    fixture_execution(&db, &execution_id, "STARTING", true, false);
     // ...then an authoritative nonterminal observation must clear it.
     env.k
         .record_physical_outcome(
@@ -706,7 +716,8 @@ fn multi_task_batch_partial_completion_and_suspension() {
     let env = memory_env();
     env.k.resize_partition("general", 2).unwrap();
     env.k.reconcile_pool().unwrap();
-    let (batch, ids) = env.k
+    let (batch, ids) = env
+        .k
         .submit_batch(&[read_task("p-done"), write_task("p-stuck")])
         .unwrap();
     assert_eq!(env.k.batch(&batch).unwrap().state, BatchState::Active);
@@ -840,7 +851,8 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     let env = memory_env();
     env.k.resize_partition("general", 2).unwrap();
     env.k.reconcile_pool().unwrap();
-    let (batch, ids) = env.k
+    let (batch, ids) = env
+        .k
         .submit_batch(&[write_task("stuck"), read_task("sibling")])
         .unwrap();
     let stuck_id = ids["stuck"].clone();
@@ -1055,7 +1067,10 @@ fn nack_without_named_retry_class_suspends() {
         .unwrap();
     assert_eq!(state, TaskState::Suspended);
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Suspended);
-    assert_eq!(k.batch(&claim.batch_id).unwrap().state, BatchState::Suspended);
+    assert_eq!(
+        k.batch(&claim.batch_id).unwrap().state,
+        BatchState::Suspended
+    );
 }
 
 #[test]
@@ -1148,15 +1163,16 @@ fn partial_batch_cancellation_preserves_completed_task_and_result() {
         ResultState::Available
     );
     assert_eq!(k.task(other_task_id).unwrap().state, TaskState::Cancelled);
-    assert_eq!(k.batch(&claim_a.batch_id).unwrap().state, BatchState::Cancelled);
+    assert_eq!(
+        k.batch(&claim_a.batch_id).unwrap().state,
+        BatchState::Cancelled
+    );
 }
 
 #[test]
 fn create_execution_rejects_tampered_claim_identities() {
     let Env { k, .. } = memory_env();
-    let (_b, _ids) = k
-        .submit_batch(&[read_task("t1"), read_task("t2")])
-        .unwrap();
+    let (_b, _ids) = k.submit_batch(&[read_task("t1"), read_task("t2")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
 
     // Mutate task_id to a different ID
@@ -1210,8 +1226,7 @@ fn durable_json_shape_fail_closed_regressions() {
     assert!(matches!(err_null, Error::InvalidTransition(_)));
 
     // Malformed JSON shape in retry_classes_json or partition tags fails closed with InvariantViolation
-    let err_obj_classes =
-        agentype_storage_sqlite::txutil::parse_failure_classes("{}").unwrap_err();
+    let err_obj_classes = agentype_storage_sqlite::txutil::parse_failure_classes("{}").unwrap_err();
     assert!(matches!(err_obj_classes, Error::InvariantViolation(_)));
 
     let err_mixed_classes =
@@ -1241,5 +1256,122 @@ fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
         res.is_err(),
         "CHECK constraint must reject quiescent_confirmed=1 with terminal_confirmed=0"
     );
+
+    // Raw UPDATE setting quiescent_confirmed=1, terminal_confirmed=1 but state=RUNNING must also violate CHECK constraint
+    let res_running = conn.execute(
+        "UPDATE executions SET quiescent_confirmed=1, terminal_confirmed=1, state='RUNNING' WHERE id=?1",
+        rusqlite::params![exec_id.as_str()],
+    );
+    assert!(
+        res_running.is_err(),
+        "CHECK constraint must reject quiescent_confirmed=1 with non-terminal state"
+    );
 }
 
+#[test]
+fn arbitrary_existing_table_without_marker_is_rejected() {
+    let db = FixtureDb::new("arbitrary-table");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch("CREATE TABLE custom_app_data (id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("arbitrary existing table database must be rejected"),
+    };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+}
+
+#[test]
+fn tasks_only_database_without_marker_is_rejected() {
+    let db = FixtureDb::new("tasks-only");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch("CREATE TABLE tasks (id TEXT PRIMARY KEY);")
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("tasks-only database must be rejected"),
+    };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+}
+
+#[test]
+fn scheduler_meta_with_wrong_identity_is_rejected() {
+    let db = FixtureDb::new("wrong-identity");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE scheduler_meta (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at REAL NOT NULL);
+         INSERT INTO scheduler_meta(key, value_json, updated_at) VALUES ('implementation_line', 'some-other-runtime', 0.0);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("wrong identity database must be rejected"),
+    };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+}
+
+#[test]
+fn rust_marker_without_schema_version_is_rejected() {
+    let db = FixtureDb::new("missing-migrations");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE scheduler_meta (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at REAL NOT NULL);
+         INSERT INTO scheduler_meta(key, value_json, updated_at) VALUES ('implementation_line', 'rust-v0.2', 0.0);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("database with scheduler_meta but no migrations must be rejected"),
+    };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+}
+
+#[test]
+fn escalation_resolution_of_lost_writer_transitions_to_terminated_with_durable_quiescence() {
+    let Env { k, clock } = memory_env();
+    let (_batch, _task_id, claim, exec_id) = run_claim(&k, write_task("lost-writer"), false);
+
+    // Physical observation transitions execution to LOST
+    k.record_physical_outcome(
+        &exec_id,
+        ExecutionState::Lost,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    // Lease expires -> sweeper runs -> Task becomes SUSPENDED and Escalation is created
+    clock.advance(20.0);
+    k.expire_leases(false).unwrap();
+    assert_eq!(k.task(&claim.task_id).unwrap().state, TaskState::Suspended);
+
+    let esc = k.open_escalation_for_task(&claim.task_id).unwrap();
+    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+
+    // Root confirms quiescence and resolves escalation to retry
+    k.resolve_escalation(&esc.id, "retry", true).unwrap();
+
+    // Execution must transition to TERMINATED (not stay LOST) and carry durable terminal/quiescence proof
+    let exec = k.execution(&exec_id).unwrap();
+    assert_eq!(exec.state, ExecutionState::Terminated);
+    assert!(exec.terminal_confirmed);
+    assert!(exec.quiescent_confirmed);
+
+    // Task is back in QUEUED and ready for retry
+    assert_eq!(k.task(&claim.task_id).unwrap().state, TaskState::Queued);
+}

@@ -23,7 +23,12 @@ impl Kernel {
         lease_seconds: f64,
         continuity_max_bytes: usize,
     ) -> Result<Self, Error> {
-        Self::from_store(Store::open(path)?, clock, lease_seconds, continuity_max_bytes)
+        Self::from_store(
+            Store::open(path)?,
+            clock,
+            lease_seconds,
+            continuity_max_bytes,
+        )
     }
 
     pub fn open_memory(
@@ -61,7 +66,10 @@ impl Kernel {
         })
     }
 
-    fn tx<T>(&self, f: impl FnOnce(&rusqlite::Transaction<'_>, UnixTime) -> Result<T, Error>) -> Result<T, Error> {
+    fn tx<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>, UnixTime) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let now = self.clock.now();
         self.store.with_immediate_at(now, f)
     }
@@ -87,8 +95,10 @@ impl Kernel {
 
     pub fn schema_version(&self) -> Result<i64, Error> {
         self.store.query(|conn| {
-            conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
-                .map_err(map_sqlite)
+            conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .map_err(map_sqlite)
         })
     }
 
@@ -605,9 +615,14 @@ impl Kernel {
 
     // ------------------------------------------------------------------ work
 
-    pub fn submit_batch(&self, tasks: &[TaskSpec]) -> Result<(BatchId, HashMap<String, TaskId>), Error> {
+    pub fn submit_batch(
+        &self,
+        tasks: &[TaskSpec],
+    ) -> Result<(BatchId, HashMap<String, TaskId>), Error> {
         if tasks.is_empty() {
-            return Err(Error::invalid_transition("a batch requires at least one task"));
+            return Err(Error::invalid_transition(
+                "a batch requires at least one task",
+            ));
         }
         let mut names = HashSet::new();
         for t in tasks {
@@ -1740,7 +1755,11 @@ impl Kernel {
         })
     }
 
-    pub fn heartbeat(&self, attempt_id: &AttemptId, lease_epoch: LeaseEpoch) -> Result<UnixTime, Error> {
+    pub fn heartbeat(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+    ) -> Result<UnixTime, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
             let (_attempt, lease, _) =
@@ -1778,7 +1797,16 @@ impl Kernel {
         self.tx(|tx, now| {
             let (attempt, _, task) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
-            let id = promote_checkpoint(tx, &attempt, &task, lease_epoch.get(), capsule, None, max_bytes, now)?;
+            let id = promote_checkpoint(
+                tx,
+                &attempt,
+                &task,
+                lease_epoch.get(),
+                capsule,
+                None,
+                max_bytes,
+                now,
+            )?;
             Ok(CheckpointId::from_string(id))
         })
     }
@@ -1789,14 +1817,7 @@ impl Kernel {
         operation: &str,
         quiescence_confirmed: bool,
     ) -> Result<(), Error> {
-        if !matches!(
-            operation,
-            "retry" | "cancel_task" | "release_cancelled_writer"
-        ) {
-            return Err(Error::invalid_transition(
-                "supported operations are retry, cancel_task, and release_cancelled_writer",
-            ));
-        }
+        let op = EscalationOperation::parse(operation)?;
         self.tx(|tx, now| {
             let (task_id, batch_id, logical_agent_id, failure_class, state): (
                 String,
@@ -1811,9 +1832,6 @@ impl Kernel {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .map_err(map_sqlite)?;
-            if state != "OPEN" {
-                return Err(Error::invalid_transition("escalation is not open"));
-            }
             let task = required_task(tx, &task_id)?;
             let latest = query_opt(
                 tx,
@@ -1831,78 +1849,112 @@ impl Kernel {
             )?;
             let (incarnation_id, execution_id, frozen_isolation) =
                 latest.unwrap_or((None, None, false));
-            if operation == "release_cancelled_writer" {
-                if task.state != "CANCELLED"
-                    || failure_class != "WRITER_QUIESCENCE_UNKNOWN"
-                    || !(quiescence_confirmed || frozen_isolation)
-                {
-                    return Err(Error::invalid_transition(
-                        "cancelled writer release requires confirmed quiescence or attempt isolation",
-                    ));
+
+            let snap = EscalationResolutionSnapshot {
+                escalation_is_open: state == "OPEN",
+                failure_class: FailureClass::parse_sql(&failure_class)?,
+                task_state: TaskState::parse_sql(&task.state)?,
+                workspace_mode: WorkspaceMode::parse_sql(&task.workspace_mode)?,
+                frozen_isolation,
+                has_agent: logical_agent_id.is_some(),
+            };
+
+            let plan = plan_escalation_resolution(&snap, op, quiescence_confirmed)?;
+            match plan {
+                EscalationResolutionPlan::ReleaseCancelledWriter {
+                    writer_presence,
+                    revive_agent,
+                    resolve_escalation,
+                } => {
+                    if writer_presence == EscalatedWriterPresenceAction::FinalizePresence {
+                        finalize_escalated_writer_presence(
+                            tx,
+                            execution_id.as_deref(),
+                            incarnation_id.as_deref(),
+                            frozen_isolation,
+                            quiescence_confirmed,
+                            now,
+                        )?;
+                    }
+                    if revive_agent {
+                        if let Some(agent_id) = &logical_agent_id {
+                            prepare_agent_revival_after_safety(tx, agent_id, now)?;
+                        }
+                    }
+                    if resolve_escalation {
+                        tx.execute(
+                            "UPDATE escalations SET state='RESOLVED',resolved_at=?1 WHERE id=?2",
+                            params![now, escalation_id.as_str()],
+                        )
+                        .map_err(map_sqlite)?;
+                    }
+                    recompute_batch(tx, &batch_id, now)?;
                 }
-                finalize_escalated_writer_presence(
-                    tx,
-                    execution_id.as_deref(),
-                    incarnation_id.as_deref(),
-                    frozen_isolation,
-                    quiescence_confirmed,
-                    now,
-                )?;
-                if let Some(agent_id) = &logical_agent_id {
-                    prepare_agent_revival_after_safety(tx, agent_id, now)?;
+                EscalationResolutionPlan::Retry {
+                    next_task_state,
+                    reactivate_batch,
+                    writer_presence,
+                    revive_agent,
+                    resolve_escalation,
+                } => {
+                    tx.execute(
+                        "UPDATE tasks SET state=?1,next_eligible_at=NULL,updated_at=?2 WHERE id=?3",
+                        params![next_task_state.as_sql(), now, task.id],
+                    )
+                    .map_err(map_sqlite)?;
+                    if reactivate_batch {
+                        tx.execute(
+                            "UPDATE batches SET state='ACTIVE',updated_at=?1 WHERE id=?2 AND state='SUSPENDED'",
+                            params![now, batch_id],
+                        )
+                        .map_err(map_sqlite)?;
+                    }
+                    if writer_presence == EscalatedWriterPresenceAction::FinalizePresence {
+                        finalize_escalated_writer_presence(
+                            tx,
+                            execution_id.as_deref(),
+                            incarnation_id.as_deref(),
+                            frozen_isolation,
+                            quiescence_confirmed,
+                            now,
+                        )?;
+                    }
+                    if revive_agent {
+                        if let Some(agent_id) = &logical_agent_id {
+                            prepare_agent_revival_after_safety(tx, agent_id, now)?;
+                        }
+                    }
+                    if resolve_escalation {
+                        tx.execute(
+                            "UPDATE escalations SET state='RESOLVED',resolved_at=?1 WHERE id=?2",
+                            params![now, escalation_id.as_str()],
+                        )
+                        .map_err(map_sqlite)?;
+                    }
+                    recompute_batch(tx, &batch_id, now)?;
                 }
-            } else if operation == "retry" {
-                if task.state != "SUSPENDED" {
-                    return Err(Error::invalid_transition("only a suspended task can be retried"));
-                }
-                if task.workspace_mode == "write"
-                    && failure_class == "WRITER_QUIESCENCE_UNKNOWN"
-                    && !(quiescence_confirmed || frozen_isolation)
-                {
-                    return Err(Error::invalid_transition(
-                        "writer retry requires confirmed quiescence or attempt isolation",
-                    ));
-                }
-                tx.execute(
-                    "UPDATE tasks SET state='QUEUED',next_eligible_at=NULL,updated_at=?1 WHERE id=?2",
-                    params![now, task.id],
-                )
-                .map_err(map_sqlite)?;
-                tx.execute(
-                    "UPDATE batches SET state='ACTIVE',updated_at=?1 WHERE id=?2 AND state='SUSPENDED'",
-                    params![now, batch_id],
-                )
-                .map_err(map_sqlite)?;
-                if failure_class == "WRITER_QUIESCENCE_UNKNOWN" {
-                    finalize_escalated_writer_presence(
-                        tx,
-                        execution_id.as_deref(),
-                        incarnation_id.as_deref(),
-                        frozen_isolation,
-                        quiescence_confirmed,
-                        now,
-                    )?;
-                    if let Some(agent_id) = &logical_agent_id {
-                        prepare_agent_revival_after_safety(tx, agent_id, now)?;
+                EscalationResolutionPlan::CancelTask {
+                    next_task_state,
+                    resolve_escalation,
+                    recompute_batch_only,
+                } => {
+                    tx.execute(
+                        "UPDATE tasks SET state=?1,updated_at=?2 WHERE id=?3",
+                        params![next_task_state.as_sql(), now, task.id],
+                    )
+                    .map_err(map_sqlite)?;
+                    if resolve_escalation {
+                        tx.execute(
+                            "UPDATE escalations SET state='RESOLVED',resolved_at=?1 WHERE id=?2",
+                            params![now, escalation_id.as_str()],
+                        )
+                        .map_err(map_sqlite)?;
+                    }
+                    if recompute_batch_only || resolve_escalation {
+                        recompute_batch(tx, &batch_id, now)?;
                     }
                 }
-            } else {
-                tx.execute(
-                    "UPDATE tasks SET state='CANCELLED',updated_at=?1 WHERE id=?2",
-                    params![now, task.id],
-                )
-                .map_err(map_sqlite)?;
-                if failure_class == "WRITER_QUIESCENCE_UNKNOWN" {
-                    recompute_batch(tx, &batch_id, now)?;
-                    return Ok(());
-                }
             }
-            tx.execute(
-                "UPDATE escalations SET state='RESOLVED',resolved_at=?1 WHERE id=?2",
-                params![now, escalation_id.as_str()],
-            )
-            .map_err(map_sqlite)?;
-            recompute_batch(tx, &batch_id, now)?;
             Ok(())
         })
     }
@@ -1928,7 +1980,11 @@ impl Kernel {
         )
     }
 
-    pub fn revive_agent(&self, logical_agent_id: &LogicalAgentId, execution_target: &str) -> Result<(), Error> {
+    pub fn revive_agent(
+        &self,
+        logical_agent_id: &LogicalAgentId,
+        execution_target: &str,
+    ) -> Result<(), Error> {
         self.tx(|tx, now| {
             let agent = required_agent(tx, logical_agent_id.as_str())?;
             if agent.state == "RETIRED" {
@@ -1990,7 +2046,8 @@ impl Kernel {
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(map_sqlite)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)
         })?;
         let mut n = 0u32;
         for (id, target) in candidates {
@@ -2031,9 +2088,11 @@ impl Kernel {
     pub fn batch(&self, id: &BatchId) -> Result<BatchRecord, Error> {
         self.store.query(|conn| {
             let state: String = conn
-                .query_row("SELECT state FROM batches WHERE id=?1", params![id.as_str()], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT state FROM batches WHERE id=?1",
+                    params![id.as_str()],
+                    |r| r.get(0),
+                )
                 .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => {
                         Error::not_found(format!("batches {:?}", id.as_str()))
@@ -2248,7 +2307,11 @@ impl Kernel {
         })
     }
 
-    pub fn outbox_for_batch(&self, batch_id: &BatchId, event_type: &str) -> Result<Vec<OutboxEvent>, Error> {
+    pub fn outbox_for_batch(
+        &self,
+        batch_id: &BatchId,
+        event_type: &str,
+    ) -> Result<Vec<OutboxEvent>, Error> {
         self.store.query(|conn| {
             let mut stmt = conn
                 .prepare(

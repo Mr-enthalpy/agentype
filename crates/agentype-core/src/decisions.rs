@@ -6,6 +6,7 @@
 //! authoritative rows, invokes these functions inside its transaction, and
 //! persists the results atomically.
 
+use crate::errors::Error;
 use crate::records::RetryPolicy;
 use crate::states::{
     AttemptState, BatchState, ContinuityPreference, ExecutionState, FailureClass, LeaseState,
@@ -64,12 +65,18 @@ pub fn claim_task_eligible(s: &ClaimTaskSnapshot, now: f64) -> bool {
 /// Frozen task order for claiming: highest priority, oldest submission, then
 /// lowest Task ID. Returns ids in deterministic visiting order.
 pub fn order_claim_tasks(tasks: &[ClaimTaskSnapshot], now: f64) -> Vec<String> {
-    let mut eligible: Vec<&ClaimTaskSnapshot> =
-        tasks.iter().filter(|t| claim_task_eligible(t, now)).collect();
+    let mut eligible: Vec<&ClaimTaskSnapshot> = tasks
+        .iter()
+        .filter(|t| claim_task_eligible(t, now))
+        .collect();
     eligible.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
-            .then(a.created_at.partial_cmp(&b.created_at).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                a.created_at
+                    .partial_cmp(&b.created_at)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(a.id.cmp(&b.id))
     });
     eligible.into_iter().map(|t| t.id.clone()).collect()
@@ -215,9 +222,7 @@ pub fn incarnation_presence(
 ) -> PresenceAction {
     match execution_state {
         ExecutionState::Running => return PresenceAction::PromoteWarm,
-        ExecutionState::Starting | ExecutionState::Unknown => {
-            return PresenceAction::Ignore
-        }
+        ExecutionState::Starting | ExecutionState::Unknown => return PresenceAction::Ignore,
         _ => {}
     }
     if execution_state == ExecutionState::Terminated
@@ -258,7 +263,11 @@ pub struct PoolMemberSnapshot {
 /// Excess-shrink ordering (V0.1 parity): prefer to retire unassigned members,
 /// READY before the other live states, then lowest ID as the final tiebreak.
 pub fn excess_rank_key(s: &PoolMemberSnapshot) -> (bool, bool, &str) {
-    (s.assigned_to_task, s.state != LogicalAgentState::Ready, s.id.as_str())
+    (
+        s.assigned_to_task,
+        s.state != LogicalAgentState::Ready,
+        s.id.as_str(),
+    )
 }
 
 /// Sort excess candidates in place into visit order for capacity shrink.
@@ -275,8 +284,7 @@ pub fn move_candidate_eligible(s: &PoolMemberSnapshot) -> bool {
 /// MOVE ordering (V0.1 parity): idle READY members move first (zero-cost
 /// cutover), then oldest availability, then lowest ID.
 pub fn move_rank_key(s: &PoolMemberSnapshot) -> (i32, f64, &str) {
-    let idle_ready =
-        s.state == LogicalAgentState::Ready && !s.assigned_to_task;
+    let idle_ready = s.state == LogicalAgentState::Ready && !s.assigned_to_task;
     (
         if idle_ready { 0 } else { 1 },
         s.available_since.unwrap_or(s.created_at),
@@ -357,7 +365,9 @@ pub fn is_cross_target_execution_safe(exec: &CrossTargetExecutionSnapshot, now: 
 /// Evaluates whether a set of cross-target executions are ALL safe to abandon.
 /// Returns `true` if safe, `false` if any execution is unsafe.
 pub fn cross_target_cutover_safety(executions: &[CrossTargetExecutionSnapshot], now: f64) -> bool {
-    executions.iter().all(|e| is_cross_target_execution_safe(e, now))
+    executions
+        .iter()
+        .all(|e| is_cross_target_execution_safe(e, now))
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +469,9 @@ pub struct BlockedTaskSnapshot {
 
 /// Evaluates whether a BLOCKED task's dependencies are all satisfied (all parents are COMPLETED).
 pub fn dependency_release_decision(parent_states: &[TaskState]) -> bool {
-    parent_states.iter().all(|&state| state == TaskState::Completed)
+    parent_states
+        .iter()
+        .all(|&state| state == TaskState::Completed)
 }
 
 /// Given candidate blocked tasks and their dependency parent states, returns the task IDs
@@ -472,3 +484,126 @@ pub fn plan_dependency_releases(blocked_tasks: &[BlockedTaskSnapshot]) -> Vec<St
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Escalation resolution scheduling (spec 15: pure escalation recovery plan).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalationOperation {
+    Retry,
+    CancelTask,
+    ReleaseCancelledWriter,
+}
+
+impl EscalationOperation {
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        match s {
+            "retry" => Ok(Self::Retry),
+            "cancel_task" => Ok(Self::CancelTask),
+            "release_cancelled_writer" => Ok(Self::ReleaseCancelledWriter),
+            other => Err(Error::invalid_transition(format!(
+                "unsupported escalation operation '{other}'; supported operations are retry, cancel_task, and release_cancelled_writer"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EscalationResolutionSnapshot {
+    pub escalation_is_open: bool,
+    pub failure_class: FailureClass,
+    pub task_state: TaskState,
+    pub workspace_mode: WorkspaceMode,
+    pub frozen_isolation: bool,
+    pub has_agent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalatedWriterPresenceAction {
+    None,
+    FinalizePresence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscalationResolutionPlan {
+    ReleaseCancelledWriter {
+        writer_presence: EscalatedWriterPresenceAction,
+        revive_agent: bool,
+        resolve_escalation: bool,
+    },
+    Retry {
+        next_task_state: TaskState,
+        reactivate_batch: bool,
+        writer_presence: EscalatedWriterPresenceAction,
+        revive_agent: bool,
+        resolve_escalation: bool,
+    },
+    CancelTask {
+        next_task_state: TaskState,
+        resolve_escalation: bool,
+        recompute_batch_only: bool,
+    },
+}
+
+pub fn plan_escalation_resolution(
+    snap: &EscalationResolutionSnapshot,
+    op: EscalationOperation,
+    quiescence_confirmed: bool,
+) -> Result<EscalationResolutionPlan, Error> {
+    if !snap.escalation_is_open {
+        return Err(Error::invalid_transition("escalation is not open"));
+    }
+    let is_writer_safe = quiescence_confirmed || snap.frozen_isolation;
+    match op {
+        EscalationOperation::ReleaseCancelledWriter => {
+            if snap.task_state != TaskState::Cancelled
+                || snap.failure_class != FailureClass::WriterQuiescenceUnknown
+                || !is_writer_safe
+            {
+                return Err(Error::invalid_transition(
+                    "cancelled writer release requires confirmed quiescence or attempt isolation",
+                ));
+            }
+            Ok(EscalationResolutionPlan::ReleaseCancelledWriter {
+                writer_presence: EscalatedWriterPresenceAction::FinalizePresence,
+                revive_agent: snap.has_agent,
+                resolve_escalation: true,
+            })
+        }
+        EscalationOperation::Retry => {
+            if snap.task_state != TaskState::Suspended {
+                return Err(Error::invalid_transition(
+                    "only a suspended task can be retried",
+                ));
+            }
+            if snap.workspace_mode == WorkspaceMode::Write
+                && snap.failure_class == FailureClass::WriterQuiescenceUnknown
+                && !is_writer_safe
+            {
+                return Err(Error::invalid_transition(
+                    "writer retry requires confirmed quiescence or attempt isolation",
+                ));
+            }
+            let is_writer_unknown = snap.failure_class == FailureClass::WriterQuiescenceUnknown;
+            Ok(EscalationResolutionPlan::Retry {
+                next_task_state: TaskState::Queued,
+                reactivate_batch: true,
+                writer_presence: if is_writer_unknown {
+                    EscalatedWriterPresenceAction::FinalizePresence
+                } else {
+                    EscalatedWriterPresenceAction::None
+                },
+                revive_agent: is_writer_unknown && snap.has_agent,
+                resolve_escalation: true,
+            })
+        }
+        EscalationOperation::CancelTask => {
+            let is_writer_unknown = snap.failure_class == FailureClass::WriterQuiescenceUnknown;
+            Ok(EscalationResolutionPlan::CancelTask {
+                next_task_state: TaskState::Cancelled,
+                resolve_escalation: !is_writer_unknown,
+                recompute_batch_only: is_writer_unknown,
+            })
+        }
+    }
+}

@@ -29,7 +29,11 @@ pub fn required_agent(tx: &Transaction<'_>, id: &str) -> Result<AgentRow, Error>
     .ok_or_else(|| Error::not_found(format!("logical_agents {id:?} not found")))
 }
 
-pub fn required_partition(tx: &Transaction<'_>, name: &str, active: bool) -> Result<PartitionRow, Error> {
+pub fn required_partition(
+    tx: &Transaction<'_>,
+    name: &str,
+    active: bool,
+) -> Result<PartitionRow, Error> {
     let sql = if active {
         "SELECT name,desired_capacity,retention,execution_target,execution_profile,tags_json,active,merged_into,topology_revision
          FROM pool_partitions WHERE name=?1 AND active=1"
@@ -84,15 +88,14 @@ pub fn validate_authority_tx(
         lease_state: LeaseState::parse_sql(&lease.state)?,
         lease_epoch: LeaseEpoch(attempt.lease_epoch),
         lease_expires_at: lease.expires_at,
-        task_current_attempt_id: task
-            .current_attempt_id
-            .as_ref()
-            .map(AttemptId::from_string),
+        task_current_attempt_id: task.current_attempt_id.as_ref().map(AttemptId::from_string),
         task_fencing_epoch: LeaseEpoch(task.fencing_epoch),
     };
     validate_authority(&snap, LeaseEpoch(lease_epoch), now)?;
     if lease.epoch != lease_epoch {
-        return Err(Error::stale("attempt no longer owns authoritative task state"));
+        return Err(Error::stale(
+            "attempt no longer owns authoritative task state",
+        ));
     }
     Ok((attempt, lease, task))
 }
@@ -121,7 +124,11 @@ pub fn execution_for_attempt(
     }
 }
 
-pub fn retire_logical_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime) -> Result<(), Error> {
+pub fn retire_logical_agent(
+    tx: &Transaction<'_>,
+    agent_id: &str,
+    now: UnixTime,
+) -> Result<(), Error> {
     tx.execute(
         "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?1)
          WHERE logical_agent_id=?2 AND state IN ('STARTING','WARM','COLD')",
@@ -138,7 +145,10 @@ pub fn retire_logical_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime)
     Ok(())
 }
 
-pub fn canonical_partition(tx: &Transaction<'_>, partition_name: &str) -> Result<PartitionRow, Error> {
+pub fn canonical_partition(
+    tx: &Transaction<'_>,
+    partition_name: &str,
+) -> Result<PartitionRow, Error> {
     let mut visited = std::collections::HashSet::new();
     let mut current = partition_name.to_string();
     loop {
@@ -201,7 +211,10 @@ pub fn unsafe_cross_target_execution(
         let durable_quiescent = durable_quiescence(terminal, quiescent);
         snapshots.push(CrossTargetExecutionSnapshot {
             attempt_state: AttemptState::parse_sql(&attempt_state)?,
-            lease_state: lease_state.as_deref().map(LeaseState::parse_sql).transpose()?,
+            lease_state: lease_state
+                .as_deref()
+                .map(LeaseState::parse_sql)
+                .transpose()?,
             lease_expires_at: expires_at,
             workspace_mode: WorkspaceMode::parse_sql(&workspace)?,
             attempt_isolation: isolation,
@@ -227,8 +240,7 @@ pub fn commit_partition_cutover(
         )
         .optional()
         .map_err(map_sqlite)?;
-    let unsafe_exec =
-        unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
+    let unsafe_exec = unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
     let agent_state = LogicalAgentState::parse_sql(&agent.state)?;
     let plan = partition_cutover_plan(
         agent_state,
@@ -281,8 +293,7 @@ pub fn request_partition_cutover(
         )
         .optional()
         .map_err(map_sqlite)?;
-    let unsafe_exec =
-        unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
+    let unsafe_exec = unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
     let agent_state = LogicalAgentState::parse_sql(&agent.state)?;
     let plan = partition_cutover_plan(
         agent_state,
@@ -350,11 +361,8 @@ pub fn prepare_agent_revival_after_safety(
         .unwrap_or(&agent.partition);
     let target = canonical_partition(tx, target_name)?;
     let target_retention = Retention::parse_sql(&target.retention)?;
-    let disposition = post_safety_agent_disposition(
-        agent_state,
-        agent.retirement_requested,
-        target_retention,
-    );
+    let disposition =
+        post_safety_agent_disposition(agent_state, agent.retirement_requested, target_retention);
     match disposition {
         PostSafetyAgentDisposition::NoAction => Ok(()),
         PostSafetyAgentDisposition::Retire => release_agent(tx, agent_id, now),
@@ -374,7 +382,11 @@ pub fn prepare_agent_revival_after_safety(
     }
 }
 
-pub fn release_dependencies(tx: &Transaction<'_>, batch_id: &str, now: UnixTime) -> Result<(), Error> {
+pub fn release_dependencies(
+    tx: &Transaction<'_>,
+    batch_id: &str,
+    now: UnixTime,
+) -> Result<(), Error> {
     let mut stmt = tx
         .prepare(
             "SELECT t.id, p.state
@@ -443,9 +455,11 @@ pub fn enqueue_event(
 
 pub fn recompute_batch(tx: &Transaction<'_>, batch_id: &str, now: UnixTime) -> Result<(), Error> {
     let state: String = tx
-        .query_row("SELECT state FROM batches WHERE id=?1", params![batch_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT state FROM batches WHERE id=?1",
+            params![batch_id],
+            |r| r.get(0),
+        )
         .map_err(map_sqlite)?;
     if state == "CANCELLED" {
         return Ok(());
@@ -826,7 +840,7 @@ pub fn finalize_escalated_writer_presence(
         if quiescence_confirmed {
             tx.execute(
                 "UPDATE executions SET state=CASE
-                 WHEN state IN ('STARTING','RUNNING','UNKNOWN') THEN 'TERMINATED'
+                 WHEN state IN ('STARTING','RUNNING','UNKNOWN','LOST') THEN 'TERMINATED'
                  ELSE state END,terminal_confirmed=1,quiescent_confirmed=1,
                  updated_at=?1,ended_at=COALESCE(ended_at,?1) WHERE id=?2",
                 params![now, eid],

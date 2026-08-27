@@ -193,10 +193,7 @@ impl ExecutionState {
     }
 }
 
-closed_enum!(ResultState {
-    Available,
-    Acked,
-});
+closed_enum!(ResultState { Available, Acked });
 
 impl ResultState {
     pub fn as_sql(self) -> &'static str {

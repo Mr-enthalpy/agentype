@@ -26,7 +26,13 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
         let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
         kernel
-            .upsert_partition(&PartitionSpec::new("general", 1, Retention::Resident, "local", "default"))
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
             .unwrap();
         let report = recover_authority(&kernel).unwrap();
         assert_eq!(report.retried, 0);

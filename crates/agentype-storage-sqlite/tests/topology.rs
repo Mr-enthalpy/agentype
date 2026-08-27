@@ -16,8 +16,10 @@ fn partition(
     target: &str,
     retention: Retention,
 ) {
-    k.upsert_partition(&PartitionSpec::new(name, capacity, retention, target, "default"))
-        .unwrap();
+    k.upsert_partition(&PartitionSpec::new(
+        name, capacity, retention, target, "default",
+    ))
+    .unwrap();
     k.reconcile_pool().unwrap();
 }
 
@@ -183,13 +185,12 @@ fn semantic_retirement_fences_live_incarnation_lost() {
         IncarnationState::Lost
     );
     // No scheduler-authoritative live presence remains.
-    assert!(
-        !env.k
-            .incarnation(&IncarnationId::from_string(&inc))
-            .unwrap()
-            .state
-            .is_live_presence()
-    );
+    assert!(!env
+        .k
+        .incarnation(&IncarnationId::from_string(&inc))
+        .unwrap()
+        .state
+        .is_live_presence());
 }
 
 /// Assignment-boundary retirement: a DRAINING assigned member retires only at
@@ -225,14 +226,18 @@ fn assignment_boundary_retirement_fences_incarnation_at_release() {
     // The release boundary never leaves a scheduler-authoritative live
     // Incarnation behind: a quiescent ack already terminated it, and any
     // still-live presence would be fenced LOST by the retirement transaction.
-    let incarnation = env.k
+    let incarnation = env
+        .k
         .attempt(&claim.attempt_id)
         .unwrap()
         .incarnation_id
         .unwrap();
-    assert!(
-        !env.k.incarnation(&incarnation).unwrap().state.is_live_presence()
-    );
+    assert!(!env
+        .k
+        .incarnation(&incarnation)
+        .unwrap()
+        .state
+        .is_live_presence());
 }
 
 /// Consecutive MOVE_CAPACITY rebases an assigned member's pending destination:
@@ -369,7 +374,11 @@ fn suspended_identity_survives_temporary_replacement_convergence() {
     // Make room so the replacement can coexist once the holder revives.
     k.resize_partition("general", 2).unwrap();
     k.reconcile_pool().unwrap(); // births the temporary replacement
-    assert!(k.logical_agent(&original).unwrap().current_task_id.is_some());
+    assert!(k
+        .logical_agent(&original)
+        .unwrap()
+        .current_task_id
+        .is_some());
 
     clock.advance(20.0);
     k.expire_leases(false).unwrap(); // writer quiescence unknown

@@ -160,10 +160,7 @@ fn retired_agent_cannot_revive_via_public_api() {
     let agent = env.k.ready_agent("general").unwrap();
     fixture_agent_state(&db, &agent, "RETIRED", 1_000_001.0);
 
-    let err = env
-        .k
-        .revive_agent(&agent, "local")
-        .unwrap_err();
+    let err = env.k.revive_agent(&agent, "local").unwrap_err();
     assert!(matches!(err, Error::InvalidTransition(_)));
     assert_eq!(
         env.k.logical_agent(&agent).unwrap().state,
@@ -209,7 +206,10 @@ fn excess_initializing_retires_directly_and_fences_presence() {
         LogicalAgentState::Retired
     );
     assert_eq!(
-        env.k.incarnation(&IncarnationId::from_string(inc)).unwrap().state,
+        env.k
+            .incarnation(&IncarnationId::from_string(inc))
+            .unwrap()
+            .state,
         IncarnationState::Lost
     );
 }
@@ -253,7 +253,10 @@ fn restart_orphaned_claim_recovered_before_lease_deadline() {
 
     let k = reopen(&env, &db);
     let report = k.recover_authority().unwrap();
-    assert_eq!(report.retried, 1, "orphaned read claim recovers mechanically");
+    assert_eq!(
+        report.retried, 1,
+        "orphaned read claim recovers mechanically"
+    );
     let attempt = k.attempt(&attempt_id).unwrap();
     assert_eq!(attempt.state, AttemptState::Expired);
     let task = k.task(&task_id).unwrap();
@@ -270,7 +273,10 @@ fn restart_orphaned_claim_recovered_before_lease_deadline() {
     k.promote_retry_wait().unwrap();
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Queued);
     let claim2 = k.claim_next_available().unwrap().expect("re-claim");
-    assert!(claim2.lease_epoch > attempt.lease_epoch, "fencing epoch advances");
+    assert!(
+        claim2.lease_epoch > attempt.lease_epoch,
+        "fencing epoch advances"
+    );
 }
 
 /// Authoritative durable state decodes fail-closed: a corrupted

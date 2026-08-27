@@ -50,7 +50,10 @@ pub fn physical_transition_allowed(from: ExecutionState, to: ExecutionState) -> 
             to,
             Starting | Running | Succeeded | Failed | Lost | Unknown | Terminated
         ),
-        Unknown => matches!(to, Unknown | Running | Succeeded | Failed | Lost | Terminated),
+        Unknown => matches!(
+            to,
+            Unknown | Running | Succeeded | Failed | Lost | Terminated
+        ),
         Running => matches!(to, Running | Succeeded | Failed | Lost | Terminated),
         Lost => matches!(to, Lost | Succeeded | Failed | Terminated),
         Succeeded => matches!(to, Succeeded | Terminated),

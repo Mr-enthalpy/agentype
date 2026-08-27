@@ -21,10 +21,12 @@ pub use decisions::{
     claim_tiebreak, cross_target_cutover_safety, dependency_release_decision, durable_quiescence,
     excess_disposition, excess_rank_key, incarnation_presence, is_cross_target_execution_safe,
     move_candidate_eligible, move_rank_key, order_claim_tasks, partition_cutover_plan,
-    plan_dependency_releases, plan_move_cutover, post_safety_agent_disposition, retry_allowed,
-    retry_backoff_seconds, select_claim_agent, sort_excess_candidates, sort_move_candidates,
-    suspension_failure_class, AgentReleaseDisposition, BlockedTaskSnapshot, ClaimAgentSnapshot,
-    ClaimIntent, ClaimTaskSnapshot, CrossTargetExecutionSnapshot, ExcessDisposition,
+    plan_dependency_releases, plan_escalation_resolution, plan_move_cutover,
+    post_safety_agent_disposition, retry_allowed, retry_backoff_seconds, select_claim_agent,
+    sort_excess_candidates, sort_move_candidates, suspension_failure_class,
+    AgentReleaseDisposition, BlockedTaskSnapshot, ClaimAgentSnapshot, ClaimIntent,
+    ClaimTaskSnapshot, CrossTargetExecutionSnapshot, EscalatedWriterPresenceAction,
+    EscalationOperation, EscalationResolutionPlan, EscalationResolutionSnapshot, ExcessDisposition,
     MoveCutoverPlan, PartitionCutoverDisposition, PoolMemberSnapshot, PostSafetyAgentDisposition,
     PresenceAction,
 };
@@ -116,10 +118,7 @@ mod tests {
         use decisions::*;
         let older = claim_tiebreak(Some(900.0), 1000.0, "zzz");
         let newer = claim_tiebreak(Some(1100.0), 900.0, "aaa");
-        assert!(
-            older < newer,
-            "availability must dominate the id tiebreak"
-        );
+        assert!(older < newer, "availability must dominate the id tiebreak");
         let tied_low = claim_tiebreak(Some(5.0), 5.0, "a");
         let tied_high = claim_tiebreak(Some(5.0), 5.0, "b");
         assert!(tied_low < tied_high);
@@ -165,7 +164,10 @@ mod tests {
             LogicalAgentState::Initializing,
             LogicalAgentState::Reviving,
         ] {
-            assert_eq!(excess_disposition(state, false), ExcessDisposition::RetireDirectly);
+            assert_eq!(
+                excess_disposition(state, false),
+                ExcessDisposition::RetireDirectly
+            );
             assert_eq!(
                 excess_disposition(state, true),
                 ExcessDisposition::DrainForRetirement
@@ -244,10 +246,7 @@ mod tests {
 
         // Highest priority first regardless of id/created_at; ineligible rows
         // never surface even with extreme priority.
-        let order = order_claim_tasks(
-            &[high.clone(), low.clone(), task_snap("d", 7, 0.0)],
-            now,
-        );
+        let order = order_claim_tasks(&[high.clone(), low.clone(), task_snap("d", 7, 0.0)], now);
         assert_eq!(order, vec!["d".to_string(), "a".to_string()]);
 
         // A queued task whose next_eligible_at is still in the future is not
@@ -297,25 +296,37 @@ mod tests {
         assert_eq!(picked.id, "zzz-older");
         // Tied availability falls back to lowest id.
         let tied = vec![agent("b", 5.0), agent("a", 5.0)];
-        assert_eq!(select_claim_agent(&tied, &intent_defaults("general")).unwrap().id, "a");
+        assert_eq!(
+            select_claim_agent(&tied, &intent_defaults("general"))
+                .unwrap()
+                .id,
+            "a"
+        );
 
         // Wrong partition is invisible to the selector.
         let mut other = agent("x", 0.0);
         other.partition = "elsewhere".to_string();
-        assert!(select_claim_agent(std::slice::from_ref(&other), &intent_defaults("general")).is_none());
+        assert!(
+            select_claim_agent(std::slice::from_ref(&other), &intent_defaults("general")).is_none()
+        );
 
         // Assigned members and non-READY states are not consumers.
         let mut busy = agent("busy", 0.0);
         busy.assigned_to_task = true;
-        assert!(select_claim_agent(std::slice::from_ref(&busy), &intent_defaults("general")).is_none());
+        assert!(
+            select_claim_agent(std::slice::from_ref(&busy), &intent_defaults("general")).is_none()
+        );
         let mut reviving = agent("rev", 0.0);
         reviving.state = LogicalAgentState::Reviving;
-        assert!(select_claim_agent(std::slice::from_ref(&reviving), &intent_defaults("general")).is_none());
+        assert!(
+            select_claim_agent(std::slice::from_ref(&reviving), &intent_defaults("general"))
+                .is_none()
+        );
 
         // Required tag missing rejects; subset accepts.
         let tagged_intent = ClaimIntent {
             partition: "general",
-            required_tags: &[ "gpu".to_string() ],
+            required_tags: &["gpu".to_string()],
             workstream_id: None,
             continuity: ContinuityPreference::None,
         };
@@ -344,14 +355,15 @@ mod tests {
     #[test]
     fn pool_rankings_match_v01_parity() {
         use decisions::*;
-        let member = |id: &str, state: LogicalAgentState, assigned: bool, avail: f64| PoolMemberSnapshot {
-            id: id.to_string(),
-            state,
-            assigned_to_task: assigned,
-            retirement_requested: false,
-            available_since: Some(avail),
-            created_at: 0.0,
-        };
+        let member =
+            |id: &str, state: LogicalAgentState, assigned: bool, avail: f64| PoolMemberSnapshot {
+                id: id.to_string(),
+                state,
+                assigned_to_task: assigned,
+                retirement_requested: false,
+                available_since: Some(avail),
+                created_at: 0.0,
+            };
         // Excess: unassigned before assigned, READY before others, then id.
         let mut excess = vec![
             member("m3", LogicalAgentState::Reviving, false, 5.0),
@@ -371,7 +383,11 @@ mod tests {
         ];
         sort_move_candidates(&mut move_pool);
         let ids: Vec<&str> = move_pool.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["x7", "x8", "x9"], "idle READY outranks; rest by availability");
+        assert_eq!(
+            ids,
+            vec!["x7", "x8", "x9"],
+            "idle READY outranks; rest by availability"
+        );
         assert!(move_candidate_eligible(&move_pool[0]));
     }
 
@@ -390,16 +406,22 @@ mod tests {
         // Idle DRAINING reconnects and restores availability.
         assert_eq!(
             plan_move_cutover(LogicalAgentState::Draining, false),
-            MoveCutoverPlan::ReconnectCutover { restore_ready: true }
+            MoveCutoverPlan::ReconnectCutover {
+                restore_ready: true
+            }
         );
         // Plain idle members just cut over.
         assert_eq!(
             plan_move_cutover(LogicalAgentState::Ready, false),
-            MoveCutoverPlan::ReconnectCutover { restore_ready: false }
+            MoveCutoverPlan::ReconnectCutover {
+                restore_ready: false
+            }
         );
         assert_eq!(
             plan_move_cutover(LogicalAgentState::Suspended, false),
-            MoveCutoverPlan::ReconnectCutover { restore_ready: false }
+            MoveCutoverPlan::ReconnectCutover {
+                restore_ready: false
+            }
         );
     }
 
@@ -415,7 +437,10 @@ mod tests {
             quiescent_confirmed: false,
         };
         assert!(is_cross_target_execution_safe(&safe_exec, 10.0));
-        assert!(cross_target_cutover_safety(std::slice::from_ref(&safe_exec), 10.0));
+        assert!(cross_target_cutover_safety(
+            std::slice::from_ref(&safe_exec),
+            10.0
+        ));
 
         // Active attempt is unsafe.
         let mut active_attempt = safe_exec.clone();
@@ -512,7 +537,11 @@ mod tests {
             PostSafetyAgentDisposition::Retire
         );
         assert_eq!(
-            post_safety_agent_disposition(LogicalAgentState::Suspended, false, Retention::Ephemeral),
+            post_safety_agent_disposition(
+                LogicalAgentState::Suspended,
+                false,
+                Retention::Ephemeral
+            ),
             PostSafetyAgentDisposition::Retire
         );
     }
@@ -549,5 +578,80 @@ mod tests {
         ];
         let ready = plan_dependency_releases(&blocked);
         assert_eq!(ready, vec!["t1", "t3"]);
+    }
+
+    #[test]
+    fn escalation_resolution_decisions() {
+        use decisions::*;
+
+        let base_snap = EscalationResolutionSnapshot {
+            escalation_is_open: true,
+            failure_class: FailureClass::WriterQuiescenceUnknown,
+            task_state: TaskState::Suspended,
+            workspace_mode: WorkspaceMode::Write,
+            frozen_isolation: false,
+            has_agent: true,
+        };
+
+        // Closed escalation fails
+        let mut closed_snap = base_snap.clone();
+        closed_snap.escalation_is_open = false;
+        assert!(
+            plan_escalation_resolution(&closed_snap, EscalationOperation::Retry, true).is_err()
+        );
+
+        // Retry writer without quiescence or isolation fails
+        assert!(plan_escalation_resolution(&base_snap, EscalationOperation::Retry, false).is_err());
+
+        // Retry writer with confirmed quiescence succeeds
+        let plan =
+            plan_escalation_resolution(&base_snap, EscalationOperation::Retry, true).unwrap();
+        assert_eq!(
+            plan,
+            EscalationResolutionPlan::Retry {
+                next_task_state: TaskState::Queued,
+                reactivate_batch: true,
+                writer_presence: EscalatedWriterPresenceAction::FinalizePresence,
+                revive_agent: true,
+                resolve_escalation: true,
+            }
+        );
+
+        // Cancel task for writer unknown
+        let cancel_plan =
+            plan_escalation_resolution(&base_snap, EscalationOperation::CancelTask, false).unwrap();
+        assert_eq!(
+            cancel_plan,
+            EscalationResolutionPlan::CancelTask {
+                next_task_state: TaskState::Cancelled,
+                resolve_escalation: false,
+                recompute_batch_only: true,
+            }
+        );
+
+        // Release cancelled writer requires cancelled task state
+        assert!(plan_escalation_resolution(
+            &base_snap,
+            EscalationOperation::ReleaseCancelledWriter,
+            true
+        )
+        .is_err());
+
+        let mut cancelled_snap = base_snap.clone();
+        cancelled_snap.task_state = TaskState::Cancelled;
+        let release_plan = plan_escalation_resolution(
+            &cancelled_snap,
+            EscalationOperation::ReleaseCancelledWriter,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            release_plan,
+            EscalationResolutionPlan::ReleaseCancelledWriter {
+                writer_presence: EscalatedWriterPresenceAction::FinalizePresence,
+                revive_agent: true,
+                resolve_escalation: true,
+            }
+        );
     }
 }

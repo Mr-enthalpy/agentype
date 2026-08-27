@@ -232,14 +232,14 @@ cargo test --workspace
 
 Result on this landing (Windows, rustc via cargo 1.x):
 
-- `agentype-core`: 19 tests (authority + `decisions` unit coverage)
+- `agentype-core`: 20 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 73 tests
-  - `m4_kernel`: 48
+- `agentype-storage-sqlite` integration: 78 tests
+  - `m4_kernel`: 53
   - `recovery`: 11
   - `topology`: 14
-- total: 96 passed, 0 failed
+- total: 102 passed, 0 failed
 
 Python production implementation was not modified. Two Python oracle
 tests received timing-only stabilization so that the existing V0.1 CI
@@ -258,10 +258,10 @@ import graph:
   SQLite-free function with unit tests: claim matching rank and tiebreak,
   claim task eligibility, claim agent selection, cross-target cutover safety,
   partition cutover planning, agent release & post-safety revival dispositions,
-  dependency release planning, durable quiescence, suspension failure
-  classification, batch aggregate state, excess-member disposition,
-  incarnation presence outcome, retry gating and backoff (over the frozen
-  `RetryPolicy`).
+  dependency release planning, escalation recovery planning (`plan_escalation_resolution`),
+  durable quiescence, suspension failure classification, batch aggregate state,
+  excess-member disposition, incarnation presence outcome, retry gating and backoff
+  (over the frozen `RetryPolicy`).
 - `agentype-storage-sqlite` loads authoritative rows, invokes core
   decisions inside `BEGIN IMMEDIATE`, persists results atomically, and
   enforces DB constraints; presence SQL translates the returned

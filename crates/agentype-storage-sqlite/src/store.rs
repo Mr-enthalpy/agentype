@@ -57,12 +57,20 @@ impl Store {
                 )
                 .optional()
                 .map_err(map_sqlite)?;
-            if identity.is_none() {
-                tx.execute(
-                    "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?1,?2,?3)",
-                    rusqlite::params![IDENTITY_KEY, IMPLEMENTATION_LINE, now],
-                )
-                .map_err(map_sqlite)?;
+            match identity.as_deref() {
+                Some(line) if line == IMPLEMENTATION_LINE => {}
+                Some(_) => {
+                    return Err(Error::invariant(format!(
+                        "database belongs to an unsupported implementation lineage ({identity:?})"
+                    )));
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?1,?2,?3)",
+                        rusqlite::params![IDENTITY_KEY, IMPLEMENTATION_LINE, now],
+                    )
+                    .map_err(map_sqlite)?;
+                }
             }
             let current: i64 = tx
                 .query_row(
@@ -113,9 +121,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         match f(&tx, now) {
-            Ok(value) => {
+            Ok(val) => {
                 tx.commit().map_err(map_sqlite)?;
-                Ok(value)
+                Ok(val)
             }
             Err(err) => {
                 let _ = tx.rollback();
@@ -124,10 +132,7 @@ impl Store {
         }
     }
 
-    pub fn query<T>(
-        &self,
-        f: impl FnOnce(&Connection) -> Result<T, Error>,
-    ) -> Result<T, Error> {
+    pub fn query<T>(&self, f: impl FnOnce(&Connection) -> Result<T, Error>) -> Result<T, Error> {
         let conn = self
             .conn
             .lock()
@@ -136,20 +141,19 @@ impl Store {
     }
 }
 
-/// Probe BEFORE configure: whether this database already contains agentype
+/// Probe BEFORE configure: whether this database already contains user
 /// tables decides "brand new" vs "existing lineage". Refusing foreign lineages
 /// before setting PRAGMA journal_mode=WAL ensures fail-closed behavior without
 /// mutating database headers or creating sidecars.
 fn verify_lineage_before_configure(conn: &Connection) -> Result<(), Error> {
-    let has_agentype_tables: bool = conn
+    let user_table_count: i64 = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
-               AND name IN ('schema_migrations','batches','pool_partitions','logical_agents'))",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
             [],
-            |r| r.get::<_, i64>(0).map(|v| v != 0),
+            |r| r.get(0),
         )
         .map_err(map_sqlite)?;
-    if !has_agentype_tables {
+    if user_table_count == 0 {
         return Ok(());
     }
     let has_scheduler_meta: bool = conn
@@ -161,8 +165,8 @@ fn verify_lineage_before_configure(conn: &Connection) -> Result<(), Error> {
         .map_err(map_sqlite)?;
     if !has_scheduler_meta {
         return Err(Error::invariant(
-            "database contains agentype tables but no Rust-era identity; \
-             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
+            "database contains existing tables but no Rust-era identity; \
+             foreign or un-migrated databases are not importable (D-DB-MIGRATE unresolved); \
              refusing to open",
         ));
     }
@@ -175,14 +179,45 @@ fn verify_lineage_before_configure(conn: &Connection) -> Result<(), Error> {
         .optional()
         .map_err(map_sqlite)?;
     match identity.as_deref() {
-        Some(line) if line == IMPLEMENTATION_LINE => Ok(()),
-        Some(_other) => Err(Error::invariant(format!(
-            "database belongs to an unsupported implementation lineage (implementation_line={identity:?}); refusing to open"
+        Some(line) if line == IMPLEMENTATION_LINE => {}
+        Some(_) => {
+            return Err(Error::invariant(format!(
+                "database belongs to an unsupported implementation lineage (implementation_line={identity:?}); refusing to open"
+            )));
+        }
+        None => {
+            return Err(Error::invariant(
+                "database contains scheduler_meta but no implementation_line identity marker; \
+                 foreign databases are not importable (D-DB-MIGRATE unresolved); \
+                 refusing to open",
+            ));
+        }
+    }
+    let has_migrations: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .map_err(map_sqlite)?;
+    if !has_migrations {
+        return Err(Error::invariant(
+            "database has scheduler_meta but no schema_migrations table; refusing to open",
+        ));
+    }
+    let current_version: Option<i64> = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(map_sqlite)?;
+    match current_version {
+        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) => Err(Error::invariant(format!(
+            "database schema version {v} does not match expected {SCHEMA_VERSION}; refusing to open"
         ))),
         None => Err(Error::invariant(
-            "database contains agentype tables but no Rust-era identity; \
-             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
-             refusing to open",
+            "database schema_migrations is empty; refusing to open",
         )),
     }
 }
@@ -223,11 +258,8 @@ pub fn json_dump(value: &serde_json::Value) -> String {
 /// Authoritative persisted state must decode strictly: a corrupted durable
 /// document is an invariant violation, never a silent alternative schedule.
 pub fn json_load(s: &str) -> Result<serde_json::Value, Error> {
-    serde_json::from_str(s)
-        .map_err(|e| Error::invariant(format!("corrupted durable JSON: {e}")))
+    serde_json::from_str(s).map_err(|e| Error::invariant(format!("corrupted durable JSON: {e}")))
 }
-
-
 
 pub fn query_opt<T>(
     tx: &Transaction<'_>,
