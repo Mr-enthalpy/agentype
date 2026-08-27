@@ -5,8 +5,10 @@
 mod common;
 
 use agentype_core::*;
+use agentype_storage_sqlite::Kernel;
 use common::*;
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn wal_full_and_foreign_keys() {
@@ -17,6 +19,67 @@ fn wal_full_and_foreign_keys() {
     assert_eq!(sync, 2, "synchronous=FULL");
     assert_eq!(fk, 1);
     assert_eq!(env.k.schema_version().unwrap(), 1);
+}
+
+/// A database carrying the Rust-era identity survives reopen; a foreign
+/// lineage is rejected even when its schema_migrations version collides with
+/// the Rust schema version (Python V0.1 databases start at version 1 too).
+#[test]
+fn fresh_database_carries_rust_identity_and_reopens() {
+    let db = FixtureDb::new("identity");
+    {
+        let env = file_env(&db);
+        let conn = rusqlite::Connection::open(&db.path).unwrap();
+        let line: String = conn
+            .query_row(
+                "SELECT value_json FROM scheduler_meta WHERE key='implementation_line'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(line, agentype_storage_sqlite::IMPLEMENTATION_LINE);
+        drop(env);
+    }
+    // Reopen must succeed: same family, version 1.
+    let env = file_env(&db);
+    assert_eq!(env.k.schema_version().unwrap(), 1);
+}
+
+/// A simulated Python-lineage database (schema_migrations present at version
+/// 1, no Rust identity) must fail closed instead of being adopted.
+#[test]
+fn foreign_lineage_with_colliding_version_is_rejected() {
+    let db = FixtureDb::new("foreign-v1");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+         INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0.0);
+         CREATE TABLE scheduler_meta (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at REAL NOT NULL);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) { Err(e) => e, Ok(_) => panic!("foreign database must be rejected") };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
+    assert!(err.to_string().contains("not importable"), "got: {err:?}");
+}
+
+/// A database that has tables but no identity marker at all is rejected too
+/// (partial adoption by IF NOT EXISTS must never be observable).
+#[test]
+fn tables_without_identity_are_rejected() {
+    let db = FixtureDb::new("no-identity");
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE batches (id TEXT PRIMARY KEY);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) { Err(e) => e, Ok(_) => panic!("foreign database must be rejected") };
+    assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
 }
 
 #[test]

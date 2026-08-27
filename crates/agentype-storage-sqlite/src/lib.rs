@@ -11,3 +11,4 @@ mod txutil;
 
 pub use kernel::Kernel;
 pub use schema::SCHEMA_VERSION;
+pub use store::IMPLEMENTATION_LINE;

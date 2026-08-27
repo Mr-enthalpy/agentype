@@ -1,4 +1,5 @@
-//! SQLite connection, WAL / synchronous=FULL, and IMMEDIATE transactions.
+//! SQLite connection, WAL / synchronous=FULL, IMMEDIATE transactions, and
+//! Rust-era schema-family identity (fail-closed on foreign lineages).
 
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 use agentype_core::{Error, UnixTime};
@@ -6,6 +7,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Durable lineage marker. Written into `scheduler_meta` on first creation.
+/// This value is part of the persisted identity contract: once published it
+/// MUST NOT change, or every existing Rust-era database becomes unrecognizable.
+pub const IMPLEMENTATION_LINE: &str = "rust-v0.2";
+const IDENTITY_KEY: &str = "implementation_line";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -36,8 +43,56 @@ impl Store {
 
     pub fn initialize(&self) -> Result<(), Error> {
         self.with_immediate(|tx, now| {
+            // Probe BEFORE any DDL: whether this database already contains
+            // agentype tables decides "brand new" vs "existing lineage".
+            let has_agentype_tables: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+                       AND name IN ('schema_migrations','batches','pool_partitions','logical_agents'))",
+                    [],
+                    |r| r.get::<_, i64>(0).map(|v| v != 0),
+                )
+                .map_err(map_sqlite)?;
+            // Idempotent DDL (CREATE TABLE IF NOT EXISTS) so the identity
+            // table exists for the lookup below; a foreign database's tables
+            // are never re-shaped into adoptability because the identity
+            // check runs against the pre-existing lineage state.
             tx.execute_batch(SCHEMA_SQL)
                 .map_err(|e| Error::invariant(format!("schema: {e}")))?;
+            // Fail closed on any database that does not carry the Rust-era
+            // family marker. Python V0.1 databases also record
+            // schema_migrations with version=1, so the version number alone
+            // cannot distinguish lineages.
+            let identity: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM scheduler_meta WHERE key=?1",
+                    rusqlite::params![IDENTITY_KEY],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_sqlite)?;
+            match identity.as_deref() {
+                Some(line) if line == IMPLEMENTATION_LINE => {}
+                Some(_other) => {
+                    return Err(Error::invariant(format!(
+                        "database belongs to an unsupported implementation lineage (implementation_line={identity:?}); refusing to open"
+                    )));
+                }
+                None => {
+                    if has_agentype_tables {
+                        return Err(Error::invariant(
+                            "database contains agentype tables but no Rust-era identity; \
+                             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
+                             refusing to open",
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?1,?2,?3)",
+                        rusqlite::params![IDENTITY_KEY, IMPLEMENTATION_LINE, now],
+                    )
+                    .map_err(map_sqlite)?;
+                }
+            }
             let current: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
