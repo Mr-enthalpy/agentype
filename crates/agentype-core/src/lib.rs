@@ -17,12 +17,16 @@ pub use authority::{
 };
 pub use clock::{Clock, ManualClock, SystemClock, UnixTime};
 pub use decisions::{
-    batch_next_state, claim_selection_rank, claim_tiebreak, claim_task_eligible,
-    durable_quiescence, excess_disposition, excess_rank_key, incarnation_presence,
-    move_candidate_eligible, move_rank_key, order_claim_tasks, plan_move_cutover, retry_allowed,
+    agent_release_disposition, batch_next_state, claim_selection_rank, claim_task_eligible,
+    claim_tiebreak, cross_target_cutover_safety, dependency_release_decision, durable_quiescence,
+    excess_disposition, excess_rank_key, incarnation_presence, is_cross_target_execution_safe,
+    move_candidate_eligible, move_rank_key, order_claim_tasks, partition_cutover_plan,
+    plan_dependency_releases, plan_move_cutover, post_safety_agent_disposition, retry_allowed,
     retry_backoff_seconds, select_claim_agent, sort_excess_candidates, sort_move_candidates,
-    suspension_failure_class, ClaimAgentSnapshot, ClaimIntent, ClaimTaskSnapshot,
-    ExcessDisposition, MoveCutoverPlan, PoolMemberSnapshot, PresenceAction,
+    suspension_failure_class, AgentReleaseDisposition, BlockedTaskSnapshot, ClaimAgentSnapshot,
+    ClaimIntent, ClaimTaskSnapshot, CrossTargetExecutionSnapshot, ExcessDisposition,
+    MoveCutoverPlan, PartitionCutoverDisposition, PoolMemberSnapshot, PostSafetyAgentDisposition,
+    PresenceAction,
 };
 pub use errors::Error;
 pub use ids::*;
@@ -397,5 +401,153 @@ mod tests {
             plan_move_cutover(LogicalAgentState::Suspended, false),
             MoveCutoverPlan::ReconnectCutover { restore_ready: false }
         );
+    }
+
+    #[test]
+    fn cross_target_cutover_safety_rules() {
+        use decisions::*;
+        let safe_exec = CrossTargetExecutionSnapshot {
+            attempt_state: AttemptState::Failed,
+            lease_state: Some(LeaseState::Expired),
+            lease_expires_at: Some(5.0),
+            workspace_mode: WorkspaceMode::ReadOnly,
+            attempt_isolation: false,
+            quiescent_confirmed: false,
+        };
+        assert!(is_cross_target_execution_safe(&safe_exec, 10.0));
+        assert!(cross_target_cutover_safety(std::slice::from_ref(&safe_exec), 10.0));
+
+        // Active attempt is unsafe.
+        let mut active_attempt = safe_exec.clone();
+        active_attempt.attempt_state = AttemptState::Active;
+        active_attempt.lease_state = Some(LeaseState::Active);
+        active_attempt.lease_expires_at = Some(20.0);
+        assert!(!is_cross_target_execution_safe(&active_attempt, 10.0));
+
+        // Active lease unexpired is unsafe even if attempt is non-active.
+        let mut active_lease = safe_exec.clone();
+        active_lease.lease_state = Some(LeaseState::Active);
+        active_lease.lease_expires_at = Some(20.0);
+        assert!(!is_cross_target_execution_safe(&active_lease, 10.0));
+
+        // Write workspace without isolation or confirmed quiescence is unsafe.
+        let mut write_unsafe = safe_exec.clone();
+        write_unsafe.workspace_mode = WorkspaceMode::Write;
+        assert!(!is_cross_target_execution_safe(&write_unsafe, 10.0));
+
+        // Write workspace with isolation is safe.
+        let mut write_isolated = write_unsafe.clone();
+        write_isolated.attempt_isolation = true;
+        assert!(is_cross_target_execution_safe(&write_isolated, 10.0));
+
+        // Write workspace with confirmed quiescence is safe.
+        let mut write_quiescent = write_unsafe;
+        write_quiescent.quiescent_confirmed = true;
+        assert!(is_cross_target_execution_safe(&write_quiescent, 10.0));
+    }
+
+    #[test]
+    fn partition_cutover_plan_dispositions() {
+        use decisions::*;
+        // Active attempt rejects immediately with drain required.
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Assigned, true, true, true),
+            PartitionCutoverDisposition::RejectAssignedDrainRequired
+        );
+        // Unsafe cross-target execution on idle suspended stages pending destination.
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Suspended, false, false, false),
+            PartitionCutoverDisposition::StagePendingDestination
+        );
+        // Unsafe cross-target execution on non-suspended rejects.
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Ready, false, false, false),
+            PartitionCutoverDisposition::RejectUnsafeExecution
+        );
+        // Unsafe cross-target execution on suspended with current task rejects.
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Suspended, false, true, false),
+            PartitionCutoverDisposition::RejectUnsafeExecution
+        );
+        // Safe cross-target execution commits.
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Ready, false, false, true),
+            PartitionCutoverDisposition::Commit
+        );
+        assert_eq!(
+            partition_cutover_plan(LogicalAgentState::Suspended, false, false, true),
+            PartitionCutoverDisposition::Commit
+        );
+    }
+
+    #[test]
+    fn agent_release_and_post_safety_dispositions() {
+        use decisions::*;
+        // Release: retirement requested or ephemeral -> Retire; otherwise -> BecomeReady.
+        assert_eq!(
+            agent_release_disposition(true, Retention::Resident),
+            AgentReleaseDisposition::Retire
+        );
+        assert_eq!(
+            agent_release_disposition(false, Retention::Ephemeral),
+            AgentReleaseDisposition::Retire
+        );
+        assert_eq!(
+            agent_release_disposition(false, Retention::Resident),
+            AgentReleaseDisposition::BecomeReady
+        );
+
+        // Post-safety: RETIRED is no-op.
+        assert_eq!(
+            post_safety_agent_disposition(LogicalAgentState::Retired, false, Retention::Resident),
+            PostSafetyAgentDisposition::NoAction
+        );
+        // Post-safety: otherwise maps BecomeReady -> Revive, Retire -> Retire.
+        assert_eq!(
+            post_safety_agent_disposition(LogicalAgentState::Suspended, false, Retention::Resident),
+            PostSafetyAgentDisposition::Revive
+        );
+        assert_eq!(
+            post_safety_agent_disposition(LogicalAgentState::Suspended, true, Retention::Resident),
+            PostSafetyAgentDisposition::Retire
+        );
+        assert_eq!(
+            post_safety_agent_disposition(LogicalAgentState::Suspended, false, Retention::Ephemeral),
+            PostSafetyAgentDisposition::Retire
+        );
+    }
+
+    #[test]
+    fn dependency_release_unblocking() {
+        use decisions::*;
+        assert!(dependency_release_decision(&[
+            TaskState::Completed,
+            TaskState::Completed
+        ]));
+        assert!(!dependency_release_decision(&[
+            TaskState::Completed,
+            TaskState::Running
+        ]));
+        assert!(!dependency_release_decision(&[
+            TaskState::Completed,
+            TaskState::Cancelled
+        ]));
+
+        let blocked = vec![
+            BlockedTaskSnapshot {
+                task_id: "t1".to_string(),
+                parent_states: vec![TaskState::Completed, TaskState::Completed],
+            },
+            BlockedTaskSnapshot {
+                task_id: "t2".to_string(),
+                parent_states: vec![TaskState::Completed, TaskState::Queued],
+            },
+            BlockedTaskSnapshot {
+                task_id: "t3".to_string(),
+                parent_states: vec![TaskState::Completed],
+            },
+        ];
+        let ready = plan_dependency_releases(&blocked);
+        assert_eq!(ready, vec!["t1", "t3"]);
     }
 }

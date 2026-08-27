@@ -8,7 +8,8 @@
 
 use crate::records::RetryPolicy;
 use crate::states::{
-    BatchState, ContinuityPreference, ExecutionState, FailureClass, LogicalAgentState, TaskState,
+    AttemptState, BatchState, ContinuityPreference, ExecutionState, FailureClass, LeaseState,
+    LogicalAgentState, Retention, TaskState, WorkspaceMode,
 };
 
 /// Frozen claim-matching rank (V0.1 parity): workstream-aware placement beats
@@ -322,3 +323,152 @@ pub fn retry_allowed(policy: &RetryPolicy, class: FailureClass, attempt_number: 
 pub fn retry_backoff_seconds(policy: &RetryPolicy, attempt_number: u32) -> f64 {
     policy.delay_for_attempt(attempt_number)
 }
+
+// ---------------------------------------------------------------------------
+// Cross-target execution safety (spec 15: pure safety predicate).
+// ---------------------------------------------------------------------------
+
+/// Execution snapshot used to evaluate cross-target cutover / abandonment safety.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrossTargetExecutionSnapshot {
+    pub attempt_state: AttemptState,
+    pub lease_state: Option<LeaseState>,
+    pub lease_expires_at: Option<f64>,
+    pub workspace_mode: WorkspaceMode,
+    pub attempt_isolation: bool,
+    pub quiescent_confirmed: bool,
+}
+
+/// Cross-target safety gate: whether an execution on a foreign target is safe
+/// to abandon. An execution is safe if its authority is definitively closed
+/// (non-ACTIVE attempt, or absent/non-ACTIVE/expired lease) AND it is safe for
+/// writers (read-only workspace, isolated attempt, or confirmed quiescent).
+pub fn is_cross_target_execution_safe(exec: &CrossTargetExecutionSnapshot, now: f64) -> bool {
+    let authority_closed = exec.attempt_state != AttemptState::Active
+        && (exec.lease_state.is_none()
+            || exec.lease_state != Some(LeaseState::Active)
+            || exec.lease_expires_at.unwrap_or(0.0) <= now);
+    let writer_ok = exec.workspace_mode == WorkspaceMode::ReadOnly
+        || exec.attempt_isolation
+        || exec.quiescent_confirmed;
+    authority_closed && writer_ok
+}
+
+/// Evaluates whether a set of cross-target executions are ALL safe to abandon.
+/// Returns `true` if safe, `false` if any execution is unsafe.
+pub fn cross_target_cutover_safety(executions: &[CrossTargetExecutionSnapshot], now: f64) -> bool {
+    executions.iter().all(|e| is_cross_target_execution_safe(e, now))
+}
+
+// ---------------------------------------------------------------------------
+// Partition cutover disposition / planning.
+// ---------------------------------------------------------------------------
+
+/// The topology disposition for a partition cutover request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionCutoverDisposition {
+    /// Cutover can commit immediately: update partition, retention, clear pending, lose foreign incarnations.
+    Commit,
+    /// Unsafe execution on suspended idle agent: stage pending destination until safety resolution.
+    StagePendingDestination,
+    /// Agent currently has active attempt: must drain via task completion boundary.
+    RejectAssignedDrainRequired,
+    /// Unsafe physical execution cannot be abandoned immediately.
+    RejectUnsafeExecution,
+}
+
+/// Decides how a partition cutover request should proceed based on agent state,
+/// active assignment, and physical cross-target execution safety.
+pub fn partition_cutover_plan(
+    agent_state: LogicalAgentState,
+    has_active_attempt: bool,
+    has_current_task: bool,
+    cross_target_safe: bool,
+) -> PartitionCutoverDisposition {
+    if has_active_attempt {
+        return PartitionCutoverDisposition::RejectAssignedDrainRequired;
+    }
+    if !cross_target_safe {
+        if agent_state == LogicalAgentState::Suspended && !has_current_task {
+            return PartitionCutoverDisposition::StagePendingDestination;
+        }
+        return PartitionCutoverDisposition::RejectUnsafeExecution;
+    }
+    PartitionCutoverDisposition::Commit
+}
+
+// ---------------------------------------------------------------------------
+// Agent lifecycle release & post-safety revival policy.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle disposition when releasing a LogicalAgent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentReleaseDisposition {
+    Retire,
+    BecomeReady,
+}
+
+/// Determines the lifecycle transition when releasing a LogicalAgent.
+pub fn agent_release_disposition(
+    retirement_requested: bool,
+    target_retention: Retention,
+) -> AgentReleaseDisposition {
+    if retirement_requested || target_retention == Retention::Ephemeral {
+        AgentReleaseDisposition::Retire
+    } else {
+        AgentReleaseDisposition::BecomeReady
+    }
+}
+
+/// Disposition of an agent following safety resolution (e.g. escalation resolve).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostSafetyAgentDisposition {
+    /// Agent is already RETIRED; no further transition.
+    NoAction,
+    /// Agent becomes READY per release policy and should be promoted to REVIVING.
+    Revive,
+    /// Agent is retired per release policy (e.g. ephemeral or retirement_requested).
+    Retire,
+}
+
+/// Determines the disposition of an agent following safety resolution.
+pub fn post_safety_agent_disposition(
+    current_state: LogicalAgentState,
+    retirement_requested: bool,
+    target_retention: Retention,
+) -> PostSafetyAgentDisposition {
+    if current_state == LogicalAgentState::Retired {
+        return PostSafetyAgentDisposition::NoAction;
+    }
+    match agent_release_disposition(retirement_requested, target_retention) {
+        AgentReleaseDisposition::Retire => PostSafetyAgentDisposition::Retire,
+        AgentReleaseDisposition::BecomeReady => PostSafetyAgentDisposition::Revive,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dependency scheduling (spec 15: pure dependency evaluation).
+// ---------------------------------------------------------------------------
+
+/// Snapshot of a BLOCKED task and the states of its prerequisite parent tasks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockedTaskSnapshot {
+    pub task_id: String,
+    pub parent_states: Vec<TaskState>,
+}
+
+/// Evaluates whether a BLOCKED task's dependencies are all satisfied (all parents are COMPLETED).
+pub fn dependency_release_decision(parent_states: &[TaskState]) -> bool {
+    parent_states.iter().all(|&state| state == TaskState::Completed)
+}
+
+/// Given candidate blocked tasks and their dependency parent states, returns the task IDs
+/// that are unblocked and eligible to transition from BLOCKED to QUEUED.
+pub fn plan_dependency_releases(blocked_tasks: &[BlockedTaskSnapshot]) -> Vec<String> {
+    blocked_tasks
+        .iter()
+        .filter(|t| dependency_release_decision(&t.parent_states))
+        .map(|t| t.task_id.clone())
+        .collect()
+}
+

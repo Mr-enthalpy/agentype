@@ -21,7 +21,8 @@ pub struct Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let conn = Connection::open(path.as_ref())
-            .map_err(|e| Error::invariant(format!("open sqlite: {e}")))?;
+            .map_err(|e| Error::storage_failure(format!("open sqlite: {e}")))?;
+        verify_lineage_before_configure(&conn)?;
         configure(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
@@ -32,7 +33,8 @@ impl Store {
 
     pub fn open_memory() -> Result<Self, Error> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| Error::invariant(format!("open memory sqlite: {e}")))?;
+            .map_err(|e| Error::storage_failure(format!("open memory sqlite: {e}")))?;
+        verify_lineage_before_configure(&conn)?;
         configure(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
@@ -43,26 +45,10 @@ impl Store {
 
     pub fn initialize(&self) -> Result<(), Error> {
         self.with_immediate(|tx, now| {
-            // Probe BEFORE any DDL: whether this database already contains
-            // agentype tables decides "brand new" vs "existing lineage".
-            let has_agentype_tables: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
-                       AND name IN ('schema_migrations','batches','pool_partitions','logical_agents'))",
-                    [],
-                    |r| r.get::<_, i64>(0).map(|v| v != 0),
-                )
-                .map_err(map_sqlite)?;
-            // Idempotent DDL (CREATE TABLE IF NOT EXISTS) so the identity
-            // table exists for the lookup below; a foreign database's tables
-            // are never re-shaped into adoptability because the identity
-            // check runs against the pre-existing lineage state.
+            // Idempotent DDL (CREATE TABLE IF NOT EXISTS)
             tx.execute_batch(SCHEMA_SQL)
-                .map_err(|e| Error::invariant(format!("schema: {e}")))?;
-            // Fail closed on any database that does not carry the Rust-era
-            // family marker. Python V0.1 databases also record
-            // schema_migrations with version=1, so the version number alone
-            // cannot distinguish lineages.
+                .map_err(|e| Error::storage_failure(format!("schema: {e}")))?;
+            // Ensure identity marker exists for fresh databases
             let identity: Option<String> = tx
                 .query_row(
                     "SELECT value_json FROM scheduler_meta WHERE key=?1",
@@ -71,27 +57,12 @@ impl Store {
                 )
                 .optional()
                 .map_err(map_sqlite)?;
-            match identity.as_deref() {
-                Some(line) if line == IMPLEMENTATION_LINE => {}
-                Some(_other) => {
-                    return Err(Error::invariant(format!(
-                        "database belongs to an unsupported implementation lineage (implementation_line={identity:?}); refusing to open"
-                    )));
-                }
-                None => {
-                    if has_agentype_tables {
-                        return Err(Error::invariant(
-                            "database contains agentype tables but no Rust-era identity; \
-                             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
-                             refusing to open",
-                        ));
-                    }
-                    tx.execute(
-                        "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?1,?2,?3)",
-                        rusqlite::params![IDENTITY_KEY, IMPLEMENTATION_LINE, now],
-                    )
-                    .map_err(map_sqlite)?;
-                }
+            if identity.is_none() {
+                tx.execute(
+                    "INSERT INTO scheduler_meta(key,value_json,updated_at) VALUES(?1,?2,?3)",
+                    rusqlite::params![IDENTITY_KEY, IMPLEMENTATION_LINE, now],
+                )
+                .map_err(map_sqlite)?;
             }
             let current: i64 = tx
                 .query_row(
@@ -165,6 +136,57 @@ impl Store {
     }
 }
 
+/// Probe BEFORE configure: whether this database already contains agentype
+/// tables decides "brand new" vs "existing lineage". Refusing foreign lineages
+/// before setting PRAGMA journal_mode=WAL ensures fail-closed behavior without
+/// mutating database headers or creating sidecars.
+fn verify_lineage_before_configure(conn: &Connection) -> Result<(), Error> {
+    let has_agentype_tables: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+               AND name IN ('schema_migrations','batches','pool_partitions','logical_agents'))",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .map_err(map_sqlite)?;
+    if !has_agentype_tables {
+        return Ok(());
+    }
+    let has_scheduler_meta: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_meta')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .map_err(map_sqlite)?;
+    if !has_scheduler_meta {
+        return Err(Error::invariant(
+            "database contains agentype tables but no Rust-era identity; \
+             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
+             refusing to open",
+        ));
+    }
+    let identity: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM scheduler_meta WHERE key=?1",
+            rusqlite::params![IDENTITY_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?;
+    match identity.as_deref() {
+        Some(line) if line == IMPLEMENTATION_LINE => Ok(()),
+        Some(_other) => Err(Error::invariant(format!(
+            "database belongs to an unsupported implementation lineage (implementation_line={identity:?}); refusing to open"
+        ))),
+        None => Err(Error::invariant(
+            "database contains agentype tables but no Rust-era identity; \
+             Python-lineage databases are not importable (D-DB-MIGRATE unresolved); \
+             refusing to open",
+        )),
+    }
+}
+
 fn configure(conn: &Connection) -> Result<(), Error> {
     conn.busy_timeout(Duration::from_secs(30))
         .map_err(map_sqlite)?;
@@ -190,7 +212,7 @@ pub fn map_sqlite(err: rusqlite::Error) -> Error {
             Error::conflict(err.to_string())
         }
         rusqlite::Error::QueryReturnedNoRows => Error::not_found("row"),
-        _ => Error::invariant(format!("sqlite: {err}")),
+        _ => Error::storage_failure(format!("sqlite: {err}")),
     }
 }
 

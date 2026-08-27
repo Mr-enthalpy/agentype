@@ -1,9 +1,8 @@
-//! Transaction-local helpers. Semantics live in agentype-core predicates.
-
 use crate::store::{json_dump, json_load, map_sqlite, query_opt};
 use agentype_core::*;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn required_task(tx: &Transaction<'_>, id: &str) -> Result<TaskRow, Error> {
     query_opt(
@@ -194,19 +193,21 @@ pub fn unsafe_cross_target_execution(
             ))
         })
         .map_err(map_sqlite)?;
+    let mut snapshots = Vec::new();
     for row in rows {
         let (isolation, quiescent, attempt_state, lease_state, expires_at, workspace) =
             row.map_err(map_sqlite)?;
-        let authority_closed = attempt_state != "ACTIVE"
-            && (lease_state.is_none()
-                || lease_state.as_deref() != Some("ACTIVE")
-                || expires_at.unwrap_or(0.0) <= now);
-        let writer_ok = workspace == "read_only" || isolation || quiescent;
-        if !(authority_closed && writer_ok) {
-            return Ok(true);
-        }
+        snapshots.push(CrossTargetExecutionSnapshot {
+            attempt_state: AttemptState::parse_sql(&attempt_state)?,
+            lease_state: lease_state.as_deref().map(LeaseState::parse_sql).transpose()?,
+            lease_expires_at: expires_at,
+            workspace_mode: WorkspaceMode::parse_sql(&workspace)?,
+            attempt_isolation: isolation,
+            quiescent_confirmed: quiescent,
+        });
     }
-    Ok(false)
+    let is_safe = cross_target_cutover_safety(&snapshots, now);
+    Ok(!is_safe)
 }
 
 pub fn commit_partition_cutover(
@@ -224,15 +225,28 @@ pub fn commit_partition_cutover(
         )
         .optional()
         .map_err(map_sqlite)?;
-    if active.is_some() {
-        return Err(Error::invalid_transition(
-            "an assigned LogicalAgent must use a drain boundary",
-        ));
-    }
-    if unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)? {
-        return Err(Error::invalid_transition(
-            "a topology cutover cannot abandon an unsafe physical Execution",
-        ));
+    let unsafe_exec =
+        unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
+    let agent_state = LogicalAgentState::parse_sql(&agent.state)?;
+    let plan = partition_cutover_plan(
+        agent_state,
+        active.is_some(),
+        agent.current_task_id.is_some(),
+        !unsafe_exec,
+    );
+    match plan {
+        PartitionCutoverDisposition::RejectAssignedDrainRequired => {
+            return Err(Error::invalid_transition(
+                "an assigned LogicalAgent must use a drain boundary",
+            ));
+        }
+        PartitionCutoverDisposition::RejectUnsafeExecution
+        | PartitionCutoverDisposition::StagePendingDestination => {
+            return Err(Error::invalid_transition(
+                "a topology cutover cannot abandon an unsafe physical Execution",
+            ));
+        }
+        PartitionCutoverDisposition::Commit => {}
     }
     tx.execute(
         "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?1)
@@ -257,17 +271,42 @@ pub fn request_partition_cutover(
     now: UnixTime,
 ) -> Result<PartitionRow, Error> {
     let target = canonical_partition(tx, target_partition)?;
+    let active: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM attempts WHERE logical_agent_id=?1 AND state='ACTIVE' LIMIT 1",
+            params![agent.id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?;
     let unsafe_exec =
         unsafe_cross_target_execution(tx, &agent.id, &target.execution_target, now)?;
-    if unsafe_exec && agent.state == "SUSPENDED" && agent.current_task_id.is_none() {
-        tx.execute(
-            "UPDATE logical_agents SET pending_partition_name=?1,updated_at=?2 WHERE id=?3",
-            params![target.name, now, agent.id],
-        )
-        .map_err(map_sqlite)?;
-        return Ok(target);
+    let agent_state = LogicalAgentState::parse_sql(&agent.state)?;
+    let plan = partition_cutover_plan(
+        agent_state,
+        active.is_some(),
+        agent.current_task_id.is_some(),
+        !unsafe_exec,
+    );
+    match plan {
+        PartitionCutoverDisposition::StagePendingDestination => {
+            tx.execute(
+                "UPDATE logical_agents SET pending_partition_name=?1,updated_at=?2 WHERE id=?3",
+                params![target.name, now, agent.id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(target)
+        }
+        PartitionCutoverDisposition::RejectAssignedDrainRequired => Err(Error::invalid_transition(
+            "an assigned LogicalAgent must use a drain boundary",
+        )),
+        PartitionCutoverDisposition::RejectUnsafeExecution => Err(Error::invalid_transition(
+            "a topology cutover cannot abandon an unsafe physical Execution",
+        )),
+        PartitionCutoverDisposition::Commit => {
+            commit_partition_cutover(tx, agent, &target.name, now)
+        }
     }
-    commit_partition_cutover(tx, agent, &target.name, now)
 }
 
 pub fn release_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime) -> Result<(), Error> {
@@ -280,16 +319,20 @@ pub fn release_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime) -> Res
         .clone()
         .unwrap_or_else(|| agent.partition.clone());
     let target = commit_partition_cutover(tx, &agent, &target_name, now)?;
-    if target.retention == "ephemeral" {
-        return retire_logical_agent(tx, agent_id, now);
+    let target_retention = Retention::parse_sql(&target.retention)?;
+    let disposition = agent_release_disposition(false, target_retention);
+    match disposition {
+        AgentReleaseDisposition::Retire => retire_logical_agent(tx, agent_id, now),
+        AgentReleaseDisposition::BecomeReady => {
+            tx.execute(
+                "UPDATE logical_agents SET state='READY',current_task_id=NULL,
+                 pending_partition_name=NULL,available_since=?1,updated_at=?1 WHERE id=?2",
+                params![now, agent_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        }
     }
-    tx.execute(
-        "UPDATE logical_agents SET state='READY',current_task_id=NULL,
-         pending_partition_name=NULL,available_since=?1,updated_at=?1 WHERE id=?2",
-        params![now, agent_id],
-    )
-    .map_err(map_sqlite)?;
-    Ok(())
 }
 
 pub fn prepare_agent_revival_after_safety(
@@ -298,32 +341,76 @@ pub fn prepare_agent_revival_after_safety(
     now: UnixTime,
 ) -> Result<(), Error> {
     let agent = required_agent(tx, agent_id)?;
-    if agent.state == "RETIRED" {
-        return Ok(());
+    let agent_state = LogicalAgentState::parse_sql(&agent.state)?;
+    let target_name = agent
+        .pending_partition
+        .as_deref()
+        .unwrap_or(&agent.partition);
+    let target = canonical_partition(tx, target_name)?;
+    let target_retention = Retention::parse_sql(&target.retention)?;
+    let disposition = post_safety_agent_disposition(
+        agent_state,
+        agent.retirement_requested,
+        target_retention,
+    );
+    match disposition {
+        PostSafetyAgentDisposition::NoAction => Ok(()),
+        PostSafetyAgentDisposition::Retire => release_agent(tx, agent_id, now),
+        PostSafetyAgentDisposition::Revive => {
+            release_agent(tx, agent_id, now)?;
+            let released = required_agent(tx, agent_id)?;
+            if released.state == "READY" {
+                tx.execute(
+                    "UPDATE logical_agents SET state='REVIVING',available_since=NULL,updated_at=?1
+                     WHERE id=?2 AND state='READY'",
+                    params![now, agent_id],
+                )
+                .map_err(map_sqlite)?;
+            }
+            Ok(())
+        }
     }
-    release_agent(tx, agent_id, now)?;
-    let released = required_agent(tx, agent_id)?;
-    if released.state == "READY" {
-        tx.execute(
-            "UPDATE logical_agents SET state='REVIVING',available_since=NULL,updated_at=?1
-             WHERE id=?2 AND state='READY'",
-            params![now, agent_id],
-        )
-        .map_err(map_sqlite)?;
-    }
-    Ok(())
 }
 
 pub fn release_dependencies(tx: &Transaction<'_>, batch_id: &str, now: UnixTime) -> Result<(), Error> {
-    tx.execute(
-        "UPDATE tasks SET state='QUEUED',updated_at=?1 WHERE batch_id=?2 AND state='BLOCKED'
-         AND NOT EXISTS (
-            SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.depends_on_task_id
-            WHERE d.task_id=tasks.id AND p.state<>'COMPLETED'
-         )",
-        params![now, batch_id],
-    )
-    .map_err(map_sqlite)?;
+    let mut stmt = tx
+        .prepare(
+            "SELECT t.id, p.state
+             FROM tasks t
+             LEFT JOIN task_dependencies d ON d.task_id = t.id
+             LEFT JOIN tasks p ON p.id = d.depends_on_task_id
+             WHERE t.batch_id = ?1 AND t.state = 'BLOCKED'
+             ORDER BY t.id",
+        )
+        .map_err(map_sqlite)?;
+    let rows = stmt
+        .query_map(params![batch_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(map_sqlite)?;
+    let mut task_deps: HashMap<String, Vec<TaskState>> = HashMap::new();
+    for row in rows {
+        let (task_id, parent_state_sql) = row.map_err(map_sqlite)?;
+        let entry = task_deps.entry(task_id).or_default();
+        if let Some(p_state) = parent_state_sql {
+            entry.push(TaskState::parse_sql(&p_state)?);
+        }
+    }
+    let snapshots: Vec<BlockedTaskSnapshot> = task_deps
+        .into_iter()
+        .map(|(task_id, parent_states)| BlockedTaskSnapshot {
+            task_id,
+            parent_states,
+        })
+        .collect();
+    let to_release = plan_dependency_releases(&snapshots);
+    for task_id in to_release {
+        tx.execute(
+            "UPDATE tasks SET state='QUEUED',updated_at=?1 WHERE id=?2 AND state='BLOCKED'",
+            params![now, task_id],
+        )
+        .map_err(map_sqlite)?;
+    }
     Ok(())
 }
 

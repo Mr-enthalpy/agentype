@@ -232,14 +232,14 @@ cargo test --workspace
 
 Result on this landing (Windows, rustc via cargo 1.x):
 
-- `agentype-core`: 15 tests (authority + `decisions` unit coverage)
+- `agentype-core`: 19 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
 - `agentype-storage-sqlite` integration: 69 tests
   - `m4_kernel`: 44
   - `recovery`: 11
   - `topology`: 14
-- total: 88 passed, 0 failed
+- total: 92 passed, 0 failed
 
 Python production implementation was not modified. Two Python oracle
 tests received timing-only stabilization so that the existing V0.1 CI
@@ -256,9 +256,12 @@ import graph:
 
 - `agentype-core::decisions` owns every scheduling decision as a pure,
   SQLite-free function with unit tests: claim matching rank and tiebreak,
-  durable quiescence, suspension failure classification, batch aggregate
-  state, excess-member disposition, incarnation presence outcome, retry
-  gating and backoff (over the frozen `RetryPolicy`).
+  claim task eligibility, claim agent selection, cross-target cutover safety,
+  partition cutover planning, agent release & post-safety revival dispositions,
+  dependency release planning, durable quiescence, suspension failure
+  classification, batch aggregate state, excess-member disposition,
+  incarnation presence outcome, retry gating and backoff (over the frozen
+  `RetryPolicy`).
 - `agentype-storage-sqlite` loads authoritative rows, invokes core
   decisions inside `BEGIN IMMEDIATE`, persists results atomically, and
   enforces DB constraints; presence SQL translates the returned

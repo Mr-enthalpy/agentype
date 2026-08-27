@@ -13,6 +13,7 @@ pub enum Error {
     Conflict(String),
     ConfigurationUnavailable(String),
     RecoveryRequired(String),
+    StorageFailure(String),
 }
 
 impl Error {
@@ -39,6 +40,10 @@ impl Error {
     pub fn configuration_unavailable(msg: impl Into<String>) -> Self {
         Self::ConfigurationUnavailable(msg.into())
     }
+
+    pub fn storage_failure(msg: impl Into<String>) -> Self {
+        Self::StorageFailure(msg.into())
+    }
 }
 
 impl fmt::Display for Error {
@@ -52,6 +57,7 @@ impl fmt::Display for Error {
             Self::Conflict(m) => write!(f, "conflict: {m}"),
             Self::ConfigurationUnavailable(m) => write!(f, "configuration unavailable: {m}"),
             Self::RecoveryRequired(m) => write!(f, "recovery required: {m}"),
+            Self::StorageFailure(m) => write!(f, "storage failure: {m}"),
         }
     }
 }
