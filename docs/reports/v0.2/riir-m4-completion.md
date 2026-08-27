@@ -145,6 +145,11 @@ in-place upgrade.
 
 - New database. No import of Python V0.1 files.
 - `schema_migrations.version = 1` is the Rust-era kernel.
+- Databases carry a permanent lineage marker
+  `scheduler_meta.implementation_line = "rust-v0.2"`; any pre-existing
+  database without it is rejected at open (Python V0.1 databases also
+  start at schema version 1, so the version number alone cannot identify a
+  lineage — D-DB-MIGRATE remains unresolved and import is never guessed).
 - Table/column names follow the semantic unique constraints, not a copy of
   Python `SCHEMA` as an architecture document. Uniqueness that the oracle
   enforced (partial unique indexes, `required = 1` trigger) is preserved.
@@ -168,6 +173,16 @@ reports `journal_mode=MEMORY`. File databases used by `Kernel::open` are WAL
 - Adapter trait + `FakeAdapter` live in `agentype-adapter-api`. M4 tests
   drive the kernel directly, as the Python unit oracle did.
 - Runtime crate only sequences authority recovery. No dispatcher loop.
+  **Recovery scope (authority half)**: the M4 restart barrier covers spec 14
+  steps 1/2/5/6 and the kernel/decision side of steps 3/4 — identify and
+  expire overdue authority and never-created claims, apply the deterministic
+  read-only retry policy with writer-quiescence suspension, promote eligible
+  retry waits, reconcile the pool and revive non-RETIRED agents. Steps 3/4
+  require the owning adapter (reconcile/collect_outcome over persisted
+  handles, confirming terminal outcomes back into physical history) and
+  belong to M5 §A2 runtime/adapter parity; their kernel representation is
+  frozen here (proof-bit rules, UNKNOWN→RUNNING, LOST→TERMINATED). This
+  landing therefore claims the authority half of recovery only.
 
 ## Test fixture discipline
 
@@ -217,14 +232,14 @@ cargo test --workspace
 
 Result on this landing (Windows, rustc via cargo 1.x):
 
-- `agentype-core`: 11 tests (authority + `decisions` unit coverage)
+- `agentype-core`: 15 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 66 tests
-  - `m4_kernel`: 41
+- `agentype-storage-sqlite` integration: 69 tests
+  - `m4_kernel`: 44
   - `recovery`: 11
   - `topology`: 14
-- total: 81 passed, 0 failed
+- total: 88 passed, 0 failed
 
 Python production implementation was not modified. Two Python oracle
 tests received timing-only stabilization so that the existing V0.1 CI
