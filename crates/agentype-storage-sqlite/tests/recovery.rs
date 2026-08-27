@@ -5,9 +5,11 @@
 mod common;
 
 use agentype_core::*;
+use agentype_storage_sqlite::Kernel;
 use common::*;
 use rusqlite::Connection;
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn restart_recovery_prevents_blind_duplicate_execution() {
@@ -285,4 +287,101 @@ fn corrupted_durable_json_fails_closed() {
     let err = env.k.expire_leases(false).unwrap_err();
     assert!(matches!(err, Error::InvariantViolation(_)), "got: {err:?}");
     assert!(err.to_string().contains("corrupted durable JSON"));
+}
+
+/// Spec 16 §B/13 conformance gate: crash/restart during Result AVAILABLE.
+/// Task COMPLETED + Result AVAILABLE + Batch COMPLETED + exactly one
+/// BATCH_RESULTS_READY must survive a full close/reopen cycle untouched, and
+/// authority recovery must be a no-op over terminal history (no duplicate
+/// Result, no re-enqueued wakeup).
+#[test]
+fn restart_during_result_available_preserves_durable_outcome() {
+    let db = FixtureDb::new("result-available");
+    let clock = Arc::new(ManualClock::new(2_000_000.0));
+    let batch;
+    let task_id;
+    let result_id;
+    {
+        // Separate scope = full connection lifecycle before the crash point.
+        let k = Kernel::open(
+            &db.path,
+            clock.clone() as Arc<dyn Clock>,
+            10.0,
+            CONTINUITY_MAX_BYTES,
+        )
+        .unwrap();
+        k.upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+        k.reconcile_pool().unwrap();
+        let (b, ids) = k.submit_batch(&[read_task("durable")]).unwrap();
+        batch = b;
+        task_id = ids["durable"].clone();
+        let claim = k.claim_next_available().unwrap().unwrap();
+        let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+        k.confirm_running_and_renew(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            &execution_id,
+            &json!({"live": true}),
+        )
+        .unwrap();
+        result_id = k
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(&execution_id),
+                &json!({"answer": 7}),
+                None,
+                true,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            k.result_for_task(&task_id).unwrap().state,
+            ResultState::Available
+        );
+        assert_eq!(k.batch(&batch).unwrap().state, BatchState::Completed);
+        assert_eq!(
+            k.outbox_for_batch(&batch, BATCH_RESULTS_READY)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    clock.advance(30.0);
+
+    {
+        let k = Kernel::open(
+            &db.path,
+            clock.clone() as Arc<dyn Clock>,
+            10.0,
+            CONTINUITY_MAX_BYTES,
+        )
+        .unwrap();
+        let report = k.recover_authority().unwrap();
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.suspended, 0);
+
+        // The durable outcome is exactly what it was before the restart.
+        let stored = k.result_for_task(&task_id).unwrap();
+        assert_eq!(stored.id, result_id);
+        assert_eq!(stored.state, ResultState::Available);
+        assert_eq!(stored.payload["answer"], 7);
+        assert_eq!(k.task(&task_id).unwrap().state, TaskState::Completed);
+        assert_eq!(k.batch(&batch).unwrap().state, BatchState::Completed);
+
+        // No duplicate wakeup, no resurrected work.
+        let events = k.outbox_for_batch(&batch, BATCH_RESULTS_READY).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, OutboxState::Pending);
+        assert!(k.claim_next_available().unwrap().is_none());
+    }
 }
