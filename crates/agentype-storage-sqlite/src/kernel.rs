@@ -277,18 +277,22 @@ impl Kernel {
                             .then(a.id.cmp(&b.id))
                     });
                     for member in candidates.into_iter().take(excess) {
-                        if matches!(member.state.as_str(), "READY" | "INITIALIZING" | "REVIVING")
-                            && member.current_task_id.is_none()
-                        {
-                            retire_logical_agent(tx, &member.id, now)?;
-                            report.retired += 1;
-                        } else {
-                            tx.execute(
-                                "UPDATE logical_agents SET state='DRAINING',retirement_requested=1,updated_at=?1 WHERE id=?2",
-                                params![now, member.id],
-                            )
-                            .map_err(map_sqlite)?;
-                            report.draining += 1;
+                        match excess_disposition(
+                            LogicalAgentState::parse_sql(&member.state)?,
+                            member.current_task_id.is_some(),
+                        ) {
+                            ExcessDisposition::RetireDirectly => {
+                                retire_logical_agent(tx, &member.id, now)?;
+                                report.retired += 1;
+                            }
+                            ExcessDisposition::DrainForRetirement => {
+                                tx.execute(
+                                    "UPDATE logical_agents SET state='DRAINING',retirement_requested=1,updated_at=?1 WHERE id=?2",
+                                    params![now, member.id],
+                                )
+                                .map_err(map_sqlite)?;
+                                report.draining += 1;
+                            }
                         }
                     }
                 }
@@ -720,22 +724,23 @@ impl Kernel {
                     if continuity == ContinuityPreference::Required && !same_ws {
                         continue;
                     }
-                    let rank = if continuity != ContinuityPreference::None && same_ws {
-                        0
-                    } else {
-                        1
-                    };
-                    eligible.push((rank, agent, available_since, created_at));
+                    eligible.push((
+                        claim_selection_rank(continuity, same_ws),
+                        agent,
+                        available_since,
+                        created_at,
+                    ));
                 }
                 if let Some((_, agent, _, _)) = eligible.into_iter().min_by(|a, b| {
-                    let avail = |c: &(i32, AgentRow, Option<f64>, f64)| c.2.unwrap_or(c.3);
                     a.0.cmp(&b.0)
-                        .then(
-                            avail(a)
-                                .partial_cmp(&avail(b))
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                        .then(a.1.id.cmp(&b.1.id))
+                        .then_with(|| {
+                            // Frozen order: oldest availability dominates the id.
+                            let (ka, ia) = claim_tiebreak(a.2, a.3, &a.1.id);
+                            let (kb, ib) = claim_tiebreak(b.2, b.3, &b.1.id);
+                            ka.partial_cmp(&kb)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(ia.cmp(ib))
+                        })
                 }) {
                     let partition = required_partition(tx, &task.partition, true)?;
                     return Ok(Some(claim_selected(
@@ -1122,14 +1127,14 @@ impl Kernel {
             } else {
                 ExecutionState::Failed
             };
-            // One normalized truth for persistence AND policy: only a
-            // terminal observation constitutes durable quiescence proof. A
-            // caller claiming quiescence without terminality is a nonterminal
-            // observation (UNKNOWN, zero proof bits below) and must not
-            // unlock writer replacement — otherwise a crash after the fact
-            // would dispatch a duplicate writer the durable state itself
-            // records as unproven.
-            let durable_quiescent = terminal_confirmed && quiescent_confirmed;
+            // One normalized truth for persistence AND policy (core::
+            // durable_quiescence): only a terminal observation constitutes
+            // durable quiescence proof. A caller claiming quiescence without
+            // terminality is a nonterminal observation (UNKNOWN, zero proof
+            // bits below) and must not unlock writer replacement — otherwise
+            // a crash after the fact would dispatch a duplicate writer the
+            // durable state itself records as unproven.
+            let durable_quiescent = durable_quiescence(terminal_confirmed, quiescent_confirmed);
             record_incarnation_presence(
                 tx,
                 attempt.incarnation_id.as_deref(),
@@ -1139,9 +1144,8 @@ impl Kernel {
                 incarnation_reusable,
                 now,
             )?;
-            let retry_classes = parse_failure_classes(&task.retry_classes_json)?;
-            let attempts_remaining = (attempt.attempt_number as u32) < (task.max_attempts as u32);
-            let retry_allowed = retry_classes.contains(&failure_class) && attempts_remaining;
+            let policy = task_retry_policy(&task)?;
+            let retry_allowed = retry_allowed(&policy, failure_class, attempt.attempt_number as u32);
             let writer_safe = writer_is_safe_to_replace(
                 task.workspace_mode == "write",
                 execution.is_some(),
@@ -1149,10 +1153,8 @@ impl Kernel {
                 execution.as_ref().map(|e| e.attempt_isolation).unwrap_or(false),
             );
             if retry_allowed && writer_safe {
-                let delay = task.max_backoff_seconds.min(
-                    task.base_backoff_seconds
-                        * 2f64.powi((attempt.attempt_number as i32 - 1).max(0)),
-                );
+                let delay =
+                    retry_backoff_seconds(&policy, attempt.attempt_number as u32);
                 tx.execute(
                     "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
                     params![now, attempt.id],
@@ -1171,11 +1173,7 @@ impl Kernel {
                 release_agent(tx, &attempt.logical_agent_id, now)?;
                 return Ok(TaskState::RetryWait);
             }
-            let suspension = if writer_safe {
-                failure_class
-            } else {
-                FailureClass::WriterQuiescenceUnknown
-            };
+            let suspension = suspension_failure_class(writer_safe, failure_class);
             suspend_current(tx, &attempt, &lease, &task, suspension, None, None, now)?;
             Ok(TaskState::Suspended)
         })
@@ -1482,15 +1480,20 @@ impl Kernel {
                     row.quiescent_confirmed,
                     row.attempt_isolation,
                 );
-                let retry_classes = parse_failure_classes(&row.retry_classes_json)?;
-                let retry_allowed = retry_classes.contains(&FailureClass::ExecutionLost)
-                    && (row.attempt_number as u32) < (row.max_attempts as u32);
+                // Frozen retry semantics come from core's RetryPolicy; storage
+                // only decodes the durable columns into it.
+                let policy = RetryPolicy {
+                    max_attempts: row.max_attempts as u32,
+                    retry_classes: parse_failure_classes(&row.retry_classes_json)?,
+                    base_backoff_seconds: row.base_backoff_seconds,
+                    max_backoff_seconds: row.max_backoff_seconds,
+                };
+                let retry_allowed =
+                    retry_allowed(&policy, FailureClass::ExecutionLost, row.attempt_number as u32);
                 if retry_allowed && writer_safe {
                     release_agent(tx, &row.logical_agent_id, now)?;
-                    let delay = row.max_backoff_seconds.min(
-                        row.base_backoff_seconds
-                            * 2f64.powi((row.attempt_number as i32 - 1).max(0)),
-                    );
+                    let delay =
+                        retry_backoff_seconds(&policy, row.attempt_number as u32);
                     tx.execute(
                         "UPDATE tasks SET state='RETRY_WAIT',current_attempt_id=NULL,next_eligible_at=?1,updated_at=?2 WHERE id=?3",
                         params![now + delay, now, row.task_id],
@@ -1498,11 +1501,8 @@ impl Kernel {
                     .map_err(map_sqlite)?;
                     report.retried += 1;
                 } else {
-                    let failure_class = if writer_safe {
-                        FailureClass::ExecutionLost
-                    } else {
-                        FailureClass::WriterQuiescenceUnknown
-                    };
+                    let failure_class =
+                        suspension_failure_class(writer_safe, FailureClass::ExecutionLost);
                     tx.execute(
                         "UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL,updated_at=?1 WHERE id=?2",
                         params![now, row.task_id],

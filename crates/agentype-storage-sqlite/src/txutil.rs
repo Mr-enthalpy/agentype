@@ -372,13 +372,9 @@ pub fn recompute_batch(tx: &Transaction<'_>, batch_id: &str, now: UnixTime) -> R
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(map_sqlite)?;
-    let next = if suspended > 0 || cancelled > 0 {
-        "SUSPENDED"
-    } else if incomplete == 0 {
-        "COMPLETED"
-    } else {
-        "ACTIVE"
-    };
+    // Decision lives in core (spec 15); storage only persists the outcome.
+    let next = batch_next_state(suspended > 0, cancelled > 0, incomplete == 0);
+    let next = next.as_sql();
     if state != next {
         tx.execute(
             "UPDATE batches SET state=?1,updated_at=?2 WHERE id=?3",
@@ -553,52 +549,44 @@ pub fn record_incarnation_presence(
     let Some(incarnation_id) = incarnation_id else {
         return Ok(());
     };
-    if execution_state == ExecutionState::Running {
-        tx.execute(
-            "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=?1
-             AND state IN ('STARTING','WARM','COLD')",
-            params![incarnation_id],
-        )
-        .map_err(map_sqlite)?;
-        return Ok(());
-    }
-    if !matches!(
+    // The decision lives in core (spec 15); this function only translates the
+    // chosen action into the corresponding persistence statement.
+    let action = incarnation_presence(
         execution_state,
-        ExecutionState::Succeeded
-            | ExecutionState::Failed
-            | ExecutionState::Lost
-            | ExecutionState::Terminated
-    ) {
-        return Ok(());
+        terminal_confirmed,
+        quiescent_confirmed,
+        incarnation_reusable,
+    );
+    match action {
+        PresenceAction::Ignore => Ok(()),
+        PresenceAction::PromoteWarm => {
+            tx.execute(
+                "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=?1
+                 AND state IN ('STARTING','WARM','COLD')",
+                params![incarnation_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        }
+        PresenceAction::FenceTerminated => {
+            tx.execute(
+                "UPDATE incarnations SET state='TERMINATED',ended_at=COALESCE(ended_at,?2)
+                 WHERE id=?3 AND state IN ('STARTING','WARM','COLD','LOST')",
+                params!["TERMINATED", now, incarnation_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        }
+        PresenceAction::FenceLost => {
+            tx.execute(
+                "UPDATE incarnations SET state='LOST',ended_at=COALESCE(ended_at,?2)
+                 WHERE id=?3 AND state IN ('STARTING','WARM','COLD')",
+                params!["LOST", now, incarnation_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        }
     }
-    if incarnation_reusable && terminal_confirmed && quiescent_confirmed {
-        tx.execute(
-            "UPDATE incarnations SET state='WARM',ended_at=NULL WHERE id=?1
-             AND state IN ('STARTING','WARM','COLD')",
-            params![incarnation_id],
-        )
-        .map_err(map_sqlite)?;
-        return Ok(());
-    }
-    let confirmed_end =
-        execution_state != ExecutionState::Lost && terminal_confirmed && quiescent_confirmed;
-    let next = if confirmed_end { "TERMINATED" } else { "LOST" };
-    if confirmed_end {
-        tx.execute(
-            "UPDATE incarnations SET state=?1,ended_at=COALESCE(ended_at,?2) WHERE id=?3
-             AND state IN ('STARTING','WARM','COLD','LOST')",
-            params![next, now, incarnation_id],
-        )
-        .map_err(map_sqlite)?;
-    } else {
-        tx.execute(
-            "UPDATE incarnations SET state=?1,ended_at=COALESCE(ended_at,?2) WHERE id=?3
-             AND state IN ('STARTING','WARM','COLD')",
-            params![next, now, incarnation_id],
-        )
-        .map_err(map_sqlite)?;
-    }
-    Ok(())
 }
 
 pub fn ensure_incarnation(
@@ -817,6 +805,18 @@ pub fn parse_failure_classes(json: &str) -> Result<Vec<FailureClass>, Error> {
         .into_iter()
         .map(|s| FailureClass::parse_sql(&s))
         .collect()
+}
+
+/// Materialize the Task's frozen retry policy (spec 15: the policy semantics —
+/// class gating and exponential backoff bounds — live in core; storage only
+/// decodes the durable columns into it).
+pub fn task_retry_policy(task: &TaskRow) -> Result<RetryPolicy, Error> {
+    Ok(RetryPolicy {
+        max_attempts: task.max_attempts as u32,
+        retry_classes: parse_failure_classes(&task.retry_classes_json)?,
+        base_backoff_seconds: task.base_backoff_seconds,
+        max_backoff_seconds: task.max_backoff_seconds,
+    })
 }
 
 #[derive(Clone, Debug)]
