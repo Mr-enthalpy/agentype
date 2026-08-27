@@ -170,7 +170,7 @@ pub fn unsafe_cross_target_execution(
 ) -> Result<bool, Error> {
     let mut stmt = tx
         .prepare(
-            "SELECT e.attempt_isolation,e.quiescent_confirmed,a.state AS attempt_state,
+            "SELECT e.attempt_isolation,e.terminal_confirmed,e.quiescent_confirmed,a.state AS attempt_state,
                     l.state AS lease_state,l.expires_at,t.workspace_mode
              FROM executions e
              JOIN incarnations i ON i.id=e.incarnation_id
@@ -186,24 +186,26 @@ pub fn unsafe_cross_target_execution(
             Ok((
                 r.get::<_, i64>(0)? != 0,
                 r.get::<_, i64>(1)? != 0,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-                r.get::<_, String>(5)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, String>(6)?,
             ))
         })
         .map_err(map_sqlite)?;
     let mut snapshots = Vec::new();
     for row in rows {
-        let (isolation, quiescent, attempt_state, lease_state, expires_at, workspace) =
+        let (isolation, terminal, quiescent, attempt_state, lease_state, expires_at, workspace) =
             row.map_err(map_sqlite)?;
+        let durable_quiescent = durable_quiescence(terminal, quiescent);
         snapshots.push(CrossTargetExecutionSnapshot {
             attempt_state: AttemptState::parse_sql(&attempt_state)?,
             lease_state: lease_state.as_deref().map(LeaseState::parse_sql).transpose()?,
             lease_expires_at: expires_at,
             workspace_mode: WorkspaceMode::parse_sql(&workspace)?,
             attempt_isolation: isolation,
-            quiescent_confirmed: quiescent,
+            quiescent_confirmed: durable_quiescent,
         });
     }
     let is_safe = cross_target_cutover_safety(&snapshots, now);
@@ -730,14 +732,7 @@ pub fn birth_agent(
     let agent_id = LogicalAgentId::new().to_string();
     let effective_tags = match tags {
         Some(t) => t.to_vec(),
-        None => json_load(&partition.tags_json)?
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        None => parse_str_list(&partition.tags_json)?,
     };
     tx.execute(
         "INSERT INTO logical_agents(id,partition_name,retention,state,workstream_id,tags_json,
@@ -768,13 +763,14 @@ pub fn promote_checkpoint(
     max_bytes: usize,
     now: UnixTime,
 ) -> Result<String, Error> {
-    if let Some(obj) = capsule.as_object() {
-        for key in obj.keys() {
-            if !CONTINUITY_KEYS.contains(&key.as_str()) {
-                return Err(Error::invalid_transition(format!(
-                    "unknown continuity keys: {key}"
-                )));
-            }
+    let obj = capsule
+        .as_object()
+        .ok_or_else(|| Error::invalid_transition("continuity capsule must be a JSON object"))?;
+    for key in obj.keys() {
+        if !CONTINUITY_KEYS.contains(&key.as_str()) {
+            return Err(Error::invalid_transition(format!(
+                "unknown continuity keys: {key}"
+            )));
         }
     }
     let encoded = json_dump(capsule);
@@ -877,14 +873,18 @@ pub fn insert_revision(
 }
 
 pub fn parse_str_list(json: &str) -> Result<Vec<String>, Error> {
-    Ok(json_load(json)?
+    let value = json_load(json)?;
+    let arr = value
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default())
+        .ok_or_else(|| Error::invariant("expected JSON array of strings"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| Error::invariant("expected string elements in JSON array"))?;
+        out.push(s.to_string());
+    }
+    Ok(out)
 }
 
 pub fn parse_failure_classes(json: &str) -> Result<Vec<FailureClass>, Error> {

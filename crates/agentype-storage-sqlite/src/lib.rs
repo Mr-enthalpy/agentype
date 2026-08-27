@@ -7,7 +7,7 @@
 mod kernel;
 mod schema;
 mod store;
-mod txutil;
+pub mod txutil;
 
 pub use kernel::Kernel;
 pub use schema::SCHEMA_VERSION;

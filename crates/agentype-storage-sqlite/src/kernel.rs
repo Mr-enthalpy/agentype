@@ -815,7 +815,7 @@ impl Kernel {
                         tx,
                         agent,
                         &partition,
-                        &task,
+                        task,
                         now,
                         lease_seconds,
                     )?));
@@ -831,14 +831,35 @@ impl Kernel {
         attempt_isolation: bool,
     ) -> Result<(ExecutionId, RequestId), Error> {
         self.tx(|tx, now| {
-            let (attempt, _, _) =
+            let (attempt, _, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
+            if claim.task_id.as_str() != attempt.task_id {
+                return Err(Error::invalid_authority(
+                    "claim task_id does not match authoritative attempt",
+                ));
+            }
+            if claim.logical_agent_id.as_str() != attempt.logical_agent_id {
+                return Err(Error::invalid_authority(
+                    "claim logical_agent_id does not match authoritative attempt",
+                ));
+            }
+            let partition = required_partition(tx, &task.partition, false)?;
+            if claim.execution_target != partition.execution_target {
+                return Err(Error::invalid_authority(
+                    "claim execution_target does not match authoritative partition",
+                ));
+            }
+            if claim.execution_profile != partition.execution_profile {
+                return Err(Error::invalid_authority(
+                    "claim execution_profile does not match authoritative partition",
+                ));
+            }
             let incarnation_id = match attempt.incarnation_id {
                 Some(id) => id,
                 None => ensure_incarnation(
                     tx,
-                    claim.logical_agent_id.as_str(),
-                    &claim.execution_target,
+                    &attempt.logical_agent_id,
+                    &partition.execution_target,
                     now,
                 )?,
             };
@@ -858,7 +879,7 @@ impl Kernel {
             }
             tx.execute(
                 "UPDATE attempts SET incarnation_id=?1 WHERE id=?2 AND incarnation_id IS NULL",
-                params![incarnation_id, claim.attempt_id.as_str()],
+                params![incarnation_id, attempt.id],
             )
             .map_err(map_sqlite)?;
             let execution_id = ExecutionId::new();
@@ -870,11 +891,11 @@ impl Kernel {
                 params![
                     execution_id.as_str(),
                     request_id.as_str(),
-                    claim.task_id.as_str(),
-                    claim.attempt_id.as_str(),
+                    attempt.task_id,
+                    attempt.id,
                     incarnation_id,
-                    claim.execution_target,
-                    claim.execution_profile,
+                    partition.execution_target,
+                    partition.execution_profile,
                     attempt_isolation as i64,
                     now
                 ],
@@ -1256,24 +1277,20 @@ impl Kernel {
             if let Some(attempt_id) = &task.current_attempt_id {
                 let attempt = required_attempt(tx, attempt_id)?;
                 let execution = execution_for_attempt(tx, &attempt.id, None)?;
+                let row_durable_quiescent = execution
+                    .as_ref()
+                    .map(|e| durable_quiescence(e.terminal_confirmed, e.quiescent_confirmed))
+                    .unwrap_or(false);
                 let writer_unknown = task.workspace_mode == "write"
                     && execution.is_some()
                     && !writer_is_safe_to_replace(
                         true,
                         true,
-                        quiescence_confirmed
-                            || execution
-                                .as_ref()
-                                .map(|e| e.quiescent_confirmed)
-                                .unwrap_or(false),
+                        quiescence_confirmed || row_durable_quiescent,
                         execution.as_ref().map(|e| e.attempt_isolation).unwrap_or(false),
                     );
-                let physical_quiescent = execution.is_none()
-                    || quiescence_confirmed
-                    || execution
-                        .as_ref()
-                        .map(|e| e.quiescent_confirmed)
-                        .unwrap_or(false);
+                let physical_quiescent =
+                    execution.is_none() || quiescence_confirmed || row_durable_quiescent;
                 record_incarnation_presence(
                     tx,
                     attempt.incarnation_id.as_deref(),
@@ -1297,6 +1314,19 @@ impl Kernel {
                     params![now, attempt.id],
                 )
                 .map_err(map_sqlite)?;
+                if let Some(eid) = execution.as_ref().map(|e| e.id.as_str()) {
+                    let next = if physical_quiescent {
+                        "TERMINATED"
+                    } else {
+                        "LOST"
+                    };
+                    tx.execute(
+                        "UPDATE executions SET state=?1,ended_at=COALESCE(ended_at,?2),updated_at=?2
+                         WHERE id=?3 AND state IN ('STARTING','RUNNING','UNKNOWN')",
+                        params![next, now, eid],
+                    )
+                    .map_err(map_sqlite)?;
+                }
                 if writer_unknown {
                     tx.execute(
                         "UPDATE logical_agents SET state='SUSPENDED',current_task_id=NULL,
@@ -1347,13 +1377,13 @@ impl Kernel {
                     }
                     other => map_sqlite(other),
                 })?;
+            if state == "COMPLETED" {
+                return Err(Error::invalid_transition(
+                    "a terminal COMPLETED batch cannot be cancelled",
+                ));
+            }
             if state == "CANCELLED" {
                 return Ok(());
-            }
-            if !matches!(state.as_str(), "OPEN" | "ACTIVE" | "SUSPENDED") {
-                return Err(Error::invalid_transition(format!(
-                    "batch in state {state} cannot be cancelled"
-                )));
             }
             tx.execute(
                 "UPDATE escalations SET state='CANCELLED',resolved_at=?1
@@ -1392,7 +1422,12 @@ impl Kernel {
                 let execution = execution_for_attempt(tx, &attempt_id, None)?;
                 let (row_quiescent, row_isolation) = execution
                     .as_ref()
-                    .map(|e| (e.quiescent_confirmed, e.attempt_isolation))
+                    .map(|e| {
+                        (
+                            durable_quiescence(e.terminal_confirmed, e.quiescent_confirmed),
+                            e.attempt_isolation,
+                        )
+                    })
                     .unwrap_or((false, false));
                 let writer_unknown =
                     workspace_mode == "write" && execution.is_some() && !(row_quiescent || row_isolation);
@@ -1465,7 +1500,7 @@ impl Kernel {
                     "SELECT l.id,l.attempt_id,l.task_id,a.logical_agent_id,a.attempt_number,a.incarnation_id,
                             t.batch_id,t.workspace_mode,t.max_attempts,t.retry_classes_json,
                             t.base_backoff_seconds,t.max_backoff_seconds,t.workstream_id,
-                            e.id,e.attempt_isolation,e.quiescent_confirmed
+                            e.id,e.attempt_isolation,e.terminal_confirmed,e.quiescent_confirmed
                      FROM leases l JOIN attempts a ON a.id=l.attempt_id JOIN tasks t ON t.id=l.task_id
                      LEFT JOIN executions e ON e.attempt_id=a.id
                      WHERE l.state='ACTIVE' AND (l.expires_at<=?1 OR (?2=1 AND e.id IS NULL))
@@ -1490,7 +1525,8 @@ impl Kernel {
                         workstream_id: r.get(12)?,
                         execution_id: r.get(13)?,
                         attempt_isolation: r.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
-                        quiescent_confirmed: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
+                        terminal_confirmed: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
+                        quiescent_confirmed: r.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
                     })
                 })
                 .map_err(map_sqlite)?;
@@ -1542,10 +1578,12 @@ impl Kernel {
                     }),
                     now,
                 )?;
+                let durable_quiescent =
+                    durable_quiescence(row.terminal_confirmed, row.quiescent_confirmed);
                 let writer_safe = writer_is_safe_to_replace(
                     row.workspace_mode == "write",
                     row.execution_id.is_some(),
-                    row.quiescent_confirmed,
+                    durable_quiescent,
                     row.attempt_isolation,
                 );
                 // Frozen retry semantics come from core's RetryPolicy; storage
@@ -2402,6 +2440,7 @@ struct ExpireRow {
     workstream_id: Option<String>,
     execution_id: Option<String>,
     attempt_isolation: bool,
+    terminal_confirmed: bool,
     quiescent_confirmed: bool,
 }
 

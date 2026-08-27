@@ -177,7 +177,8 @@ CREATE TABLE IF NOT EXISTS executions (
     quiescent_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (quiescent_confirmed IN (0,1)),
     started_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    ended_at REAL
+    ended_at REAL,
+    CHECK (quiescent_confirmed = 0 OR terminal_confirmed = 1)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_attempt

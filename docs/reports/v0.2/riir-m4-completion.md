@@ -235,11 +235,11 @@ Result on this landing (Windows, rustc via cargo 1.x):
 - `agentype-core`: 19 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 69 tests
-  - `m4_kernel`: 44
+- `agentype-storage-sqlite` integration: 73 tests
+  - `m4_kernel`: 48
   - `recovery`: 11
   - `topology`: 14
-- total: 92 passed, 0 failed
+- total: 96 passed, 0 failed
 
 Python production implementation was not modified. Two Python oracle
 tests received timing-only stabilization so that the existing V0.1 CI

@@ -1087,3 +1087,159 @@ fn no_generation_membership_on_task() {
     let (_b, ids) = k.submit_batch(&[read_task("no-gen")]).unwrap();
     let _ = k.task(&ids["no-gen"]).unwrap();
 }
+
+#[test]
+fn partial_batch_cancellation_preserves_completed_task_and_result() {
+    let Env { k, .. } = memory_env();
+    let (_b, ids) = k
+        .submit_batch(&[read_task("task-a"), read_task("task-b")])
+        .unwrap();
+    let task_a_id = &ids["task-a"];
+    let task_b_id = &ids["task-b"];
+
+    // Claim and complete one task
+    let claim_a = k.claim_next_available().unwrap().unwrap();
+    let (exec_a, _) = k.create_execution(&claim_a, false).unwrap();
+    k.confirm_running_and_renew(
+        &claim_a.attempt_id,
+        claim_a.lease_epoch,
+        &exec_a,
+        &json!({}),
+    )
+    .unwrap();
+    k.ack_success(
+        &claim_a.attempt_id,
+        claim_a.lease_epoch,
+        Some(&exec_a),
+        &json!({"out": "done"}),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let completed_task_id = claim_a.task_id.clone();
+    let other_task_id = if &completed_task_id == task_a_id {
+        task_b_id
+    } else {
+        task_a_id
+    };
+
+    assert_eq!(
+        k.task(&completed_task_id).unwrap().state,
+        TaskState::Completed
+    );
+    assert_eq!(
+        k.result_for_task(&completed_task_id).unwrap().state,
+        ResultState::Available
+    );
+    assert_eq!(k.task(other_task_id).unwrap().state, TaskState::Queued);
+
+    // Cancel the entire batch
+    k.cancel_batch(&claim_a.batch_id).unwrap();
+
+    // Verify completed_task and its result remain intact, other_task is cancelled, and batch is cancelled
+    assert_eq!(
+        k.task(&completed_task_id).unwrap().state,
+        TaskState::Completed
+    );
+    assert_eq!(
+        k.result_for_task(&completed_task_id).unwrap().state,
+        ResultState::Available
+    );
+    assert_eq!(k.task(other_task_id).unwrap().state, TaskState::Cancelled);
+    assert_eq!(k.batch(&claim_a.batch_id).unwrap().state, BatchState::Cancelled);
+}
+
+#[test]
+fn create_execution_rejects_tampered_claim_identities() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k
+        .submit_batch(&[read_task("t1"), read_task("t2")])
+        .unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+
+    // Mutate task_id to a different ID
+    let mut bad_task_claim = claim.clone();
+    bad_task_claim.task_id = TaskId::new();
+    let err = k.create_execution(&bad_task_claim, false).unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+
+    // Mutate logical_agent_id
+    let mut bad_agent_claim = claim.clone();
+    bad_agent_claim.logical_agent_id = LogicalAgentId::new();
+    let err = k.create_execution(&bad_agent_claim, false).unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+
+    // Mutate execution_target
+    let mut bad_target_claim = claim.clone();
+    bad_target_claim.execution_target = "foreign-target".to_string();
+    let err = k.create_execution(&bad_target_claim, false).unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+
+    // Mutate execution_profile
+    let mut bad_profile_claim = claim.clone();
+    bad_profile_claim.execution_profile = "foreign-profile".to_string();
+    let err = k.create_execution(&bad_profile_claim, false).unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+
+    // Original valid claim succeeds
+    let (exec_id, _) = k.create_execution(&claim, false).unwrap();
+    assert!(!exec_id.as_str().is_empty());
+}
+
+#[test]
+fn durable_json_shape_fail_closed_regressions() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[read_task("json-shape")]).unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+
+    // Continuity capsule must be JSON object (array and null must fail with InvalidTransition)
+    let err_arr = k
+        .promote_checkpoint(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            &json!(["not", "an", "object"]),
+        )
+        .unwrap_err();
+    assert!(matches!(err_arr, Error::InvalidTransition(_)));
+
+    let err_null = k
+        .promote_checkpoint(&claim.attempt_id, claim.lease_epoch, &json!(null))
+        .unwrap_err();
+    assert!(matches!(err_null, Error::InvalidTransition(_)));
+
+    // Malformed JSON shape in retry_classes_json or partition tags fails closed with InvariantViolation
+    let err_obj_classes =
+        agentype_storage_sqlite::txutil::parse_failure_classes("{}").unwrap_err();
+    assert!(matches!(err_obj_classes, Error::InvariantViolation(_)));
+
+    let err_mixed_classes =
+        agentype_storage_sqlite::txutil::parse_failure_classes("[\"TIMEOUT\", 42]").unwrap_err();
+    assert!(matches!(err_mixed_classes, Error::InvariantViolation(_)));
+
+    let err_obj_tags =
+        agentype_storage_sqlite::txutil::parse_str_list("{\"foo\":\"bar\"}").unwrap_err();
+    assert!(matches!(err_obj_tags, Error::InvariantViolation(_)));
+}
+
+#[test]
+fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
+    let db = FixtureDb::new("db-check");
+    let env = file_env(&db);
+    let (_b, _ids) = env.k.submit_batch(&[read_task("db-check")]).unwrap();
+    let claim = env.k.claim_next_available().unwrap().unwrap();
+    let (exec_id, _) = env.k.create_execution(&claim, false).unwrap();
+
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    // Raw UPDATE setting quiescent_confirmed=1 and terminal_confirmed=0 must violate CHECK constraint
+    let res = conn.execute(
+        "UPDATE executions SET quiescent_confirmed=1, terminal_confirmed=0 WHERE id=?1",
+        rusqlite::params![exec_id.as_str()],
+    );
+    assert!(
+        res.is_err(),
+        "CHECK constraint must reject quiescent_confirmed=1 with terminal_confirmed=0"
+    );
+}
+

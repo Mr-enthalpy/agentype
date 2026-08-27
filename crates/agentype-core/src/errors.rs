@@ -33,12 +33,20 @@ impl Error {
         Self::InvariantViolation(msg.into())
     }
 
+    pub fn invalid_authority(msg: impl Into<String>) -> Self {
+        Self::InvalidAuthority(msg.into())
+    }
+
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::Conflict(msg.into())
     }
 
     pub fn configuration_unavailable(msg: impl Into<String>) -> Self {
         Self::ConfigurationUnavailable(msg.into())
+    }
+
+    pub fn recovery_required(msg: impl Into<String>) -> Self {
+        Self::RecoveryRequired(msg.into())
     }
 
     pub fn storage_failure(msg: impl Into<String>) -> Self {
