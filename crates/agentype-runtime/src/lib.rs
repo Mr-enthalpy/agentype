@@ -24,7 +24,7 @@ mod tests {
     #[test]
     fn recovery_does_not_dispatch() {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
-        let kernel = Kernel::open_memory(clock, 10.0).unwrap();
+        let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
         kernel
             .upsert_partition(&PartitionSpec::new("general", 1, Retention::Resident, "local", "default"))
             .unwrap();

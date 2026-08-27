@@ -655,7 +655,7 @@ pub fn birth_agent(
     let agent_id = LogicalAgentId::new().to_string();
     let effective_tags = match tags {
         Some(t) => t.to_vec(),
-        None => json_load(&partition.tags_json)
+        None => json_load(&partition.tags_json)?
             .as_array()
             .map(|a| {
                 a.iter()
@@ -801,19 +801,19 @@ pub fn insert_revision(
     Ok(tx.last_insert_rowid())
 }
 
-pub fn parse_str_list(json: &str) -> Vec<String> {
-    json_load(json)
+pub fn parse_str_list(json: &str) -> Result<Vec<String>, Error> {
+    Ok(json_load(json)?
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 pub fn parse_failure_classes(json: &str) -> Result<Vec<FailureClass>, Error> {
-    parse_str_list(json)
+    parse_str_list(json)?
         .into_iter()
         .map(|s| FailureClass::parse_sql(&s))
         .collect()

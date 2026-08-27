@@ -86,7 +86,15 @@ pub trait ExecutionAdapter: Send + Sync {
     fn interrupt_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
     fn terminate_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
     fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome>;
-    fn reconcile_start(&self, handle: &RuntimeHandle) -> AdapterResult<StartObservation>;
+    /// Spec 07: narrow interface UNCHANGED from V0.1. Reconciliation is keyed
+    /// by the stable start request identity because an ambiguous start may
+    /// leave the scheduler without a complete runtime handle; the persisted
+    /// handle, when present, is only a hint for the adapter.
+    fn reconcile_start(
+        &self,
+        request_id: &RequestId,
+        persisted_handle: Option<&RuntimeHandle>,
+    ) -> AdapterResult<StartObservation>;
 }
 
 /// In-memory fake used by M4 tests. No process, no vendor protocol.
@@ -191,13 +199,29 @@ impl ExecutionAdapter for FakeAdapter {
         }))
     }
 
-    fn reconcile_start(&self, handle: &RuntimeHandle) -> AdapterResult<StartObservation> {
+    fn reconcile_start(
+        &self,
+        request_id: &RequestId,
+        persisted_handle: Option<&RuntimeHandle>,
+    ) -> AdapterResult<StartObservation> {
+        let g = self.inner.lock().expect("fake adapter");
+        let non_empty = |h: &RuntimeHandle| {
+            h.0.as_object().map(|o| !o.is_empty()).unwrap_or(!h.0.is_null())
+        };
+        let handle = match persisted_handle {
+            Some(h) if non_empty(h) => h.clone(),
+            _ => g
+                .by_request
+                .get(request_id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        };
         Ok(StartObservation {
             state: ExecutionState::Unknown,
-            runtime_handle: handle.clone(),
+            runtime_handle: handle,
             ambiguous: true,
             failure_class: None,
-            detail: Some("fake reconcile is identity-preserving".into()),
+            detail: Some("fake reconcile is identity-preserving by request".into()),
             terminal_confirmed: false,
             quiescent_confirmed: false,
         })
@@ -224,8 +248,45 @@ mod tests {
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
-        let rec = fake.reconcile_start(&start.runtime_handle).unwrap();
+        let rec = fake
+            .reconcile_start(&req.request_id, Some(&start.runtime_handle))
+            .unwrap();
         assert!(rec.ambiguous);
+        assert!(!rec.quiescent_confirmed);
+    }
+
+    #[test]
+    fn reconcile_can_restore_handle_by_request_id_alone() {
+        let fake = FakeAdapter::new();
+        let req = ExecutionRequest {
+            request_id: RequestId::new(),
+            execution_id: ExecutionId::new(),
+            execution_target: "local".into(),
+            execution_profile: "default".into(),
+            workspace_mode: WorkspaceMode::ReadOnly,
+            prompt: "hi".into(),
+            payload: Value::Null,
+            incarnation_runtime_handle: RuntimeHandle::default(),
+        };
+        let start = fake.start_execution(&req).unwrap();
+
+        // Ambiguous start: scheduler lost the handle, but the start request
+        // identity was persisted. Reconciliation must locate the runtime by
+        // request identity alone (spec 07: reconcile_start is UNCHANGED from
+        // V0.1 and takes request_id + optional persisted handle).
+        let rec = fake.reconcile_start(&req.request_id, None).unwrap();
+        assert_eq!(rec.runtime_handle, start.runtime_handle);
+        assert!(rec.ambiguous);
+        assert!(!rec.terminal_confirmed);
+        assert!(!rec.quiescent_confirmed);
+    }
+
+    #[test]
+    fn unknown_request_reconciles_ambiguous_without_proof() {
+        let fake = FakeAdapter::new();
+        let rec = fake.reconcile_start(&RequestId::new(), None).unwrap();
+        assert!(rec.ambiguous);
+        assert!(!rec.terminal_confirmed);
         assert!(!rec.quiescent_confirmed);
     }
 }

@@ -143,8 +143,11 @@ pub fn json_dump(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
 }
 
-pub fn json_load(s: &str) -> serde_json::Value {
-    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+/// Authoritative persisted state must decode strictly: a corrupted durable
+/// document is an invariant violation, never a silent alternative schedule.
+pub fn json_load(s: &str) -> Result<serde_json::Value, Error> {
+    serde_json::from_str(s)
+        .map_err(|e| Error::invariant(format!("corrupted durable JSON: {e}")))
 }
 
 
