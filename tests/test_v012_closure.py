@@ -16,6 +16,7 @@ from local_agent_scheduler.adapters.codex import AppServerSession, CodexAppServe
 from local_agent_scheduler.cli import _partition_spec_for_upsert, _task_specs, build_parser
 from local_agent_scheduler.config import ExecutionTargetConfig, load_config
 from local_agent_scheduler.core import Scheduler
+from dataclasses import replace as dc_replace
 from local_agent_scheduler.enums import (
     AgentState,
     ContinuityPreference,
@@ -43,6 +44,7 @@ from local_agent_scheduler.models import (
 )
 from local_agent_scheduler.runtime import Dispatcher, SchedulerDaemon
 from local_agent_scheduler.root_bridge import OutboxDispatcher
+from local_agent_scheduler.storage import utc_now
 from local_agent_scheduler.storage import Database
 
 
@@ -472,7 +474,8 @@ class ClosureCase(unittest.TestCase):
 
     def test_core_lease_renewal_requires_an_active_execution(self):
         _batch, _ids = self.scheduler.submit_batch([TaskSpec("supervised-only", {})])
-        claim = self.scheduler.claim_next(self.agent())
+        started_at = utc_now()
+        claim = self.scheduler.claim_next(self.agent(), now=started_at)
 
         self.assertEqual(
             self.scheduler.renew_active_leases({claim.attempt_id}),
@@ -492,23 +495,33 @@ class ClosureCase(unittest.TestCase):
         self.assertEqual(self.scheduler.renew_active_leases({claim.attempt_id}), 0)
         with self.assertRaises(StaleAuthority):
             self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
-        self.scheduler.confirm_execution_running(
+        # Pin the supervision timeline: confirm at +1 re-bases the lease onto
+        # [start+1, start+1+lease_seconds), so runner speed cannot change
+        # which branch each renewal observation lands in.
+        self.scheduler.confirm_running_and_renew_authority(
             claim.attempt_id,
             claim.lease_epoch,
             execution_id,
             runtime_handle={"live": True},
+            now=started_at + 1,
         )
+        # At a now beyond the confirmed expiry the renewal must be refused.
         self.assertEqual(
             self.scheduler.renew_active_leases(
-                {claim.attempt_id}, now=claim.lease_expires_at + 1
+                {claim.attempt_id}, now=started_at + 3.5
             ),
             0,
         )
+        # While the confirmed lease is still fresh it must renew.
         self.assertEqual(
-            self.scheduler.renew_active_leases({claim.attempt_id}),
+            self.scheduler.renew_active_leases(
+                {claim.attempt_id}, now=started_at + 2
+            ),
             1,
         )
-        self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+        self.scheduler.heartbeat(
+            claim.attempt_id, claim.lease_epoch, now=started_at + 2
+        )
 
         self.scheduler.record_physical_outcome(
             execution_id,
@@ -517,11 +530,15 @@ class ClosureCase(unittest.TestCase):
             quiescent_confirmed=True,
         )
         self.assertEqual(
-            self.scheduler.renew_active_leases({claim.attempt_id}),
+            self.scheduler.renew_active_leases(
+                {claim.attempt_id}, now=started_at + 2
+            ),
             0,
         )
         with self.assertRaises(StaleAuthority):
-            self.scheduler.heartbeat(claim.attempt_id, claim.lease_epoch)
+            self.scheduler.heartbeat(
+                claim.attempt_id, claim.lease_epoch, now=started_at + 2
+            )
 
     def test_cancelled_writer_keeps_safety_escalation_open(self):
         _batch, ids = self.scheduler.submit_batch(
@@ -943,13 +960,21 @@ class ClosureCase(unittest.TestCase):
                 )
             ]
         )
-        claim = self.scheduler.claim_next_available()
+        started_at = utc_now()
+        claim = self.scheduler.claim_next_available(now=started_at)
         execution_id, _request = self.scheduler.create_execution(claim)
-        self.scheduler.confirm_execution_running(
+        # Pin confirm so the lease expiry the expire below depends on cannot
+        # drift with runner speed (lease_seconds=2 makes a >1s stall flip
+        # whether the sweep sees an expired authority).
+        self.scheduler.confirm_running_and_renew_authority(
             claim.attempt_id,
             claim.lease_epoch,
             execution_id,
             runtime_handle={"live": True},
+            now=started_at + 1,
+        )
+        claim = dc_replace(
+            claim, lease_expires_at=started_at + 1 + self.scheduler.lease_seconds
         )
         if merge:
             self.scheduler.merge_partitions("general", target_name)
