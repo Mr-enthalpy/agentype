@@ -17,9 +17,12 @@ pub use authority::{
 };
 pub use clock::{Clock, ManualClock, SystemClock, UnixTime};
 pub use decisions::{
-    batch_next_state, claim_selection_rank, claim_tiebreak, durable_quiescence,
-    excess_disposition, incarnation_presence, retry_allowed, retry_backoff_seconds,
-    suspension_failure_class, ExcessDisposition, PresenceAction,
+    batch_next_state, claim_selection_rank, claim_tiebreak, claim_task_eligible,
+    durable_quiescence, excess_disposition, excess_rank_key, incarnation_presence,
+    move_candidate_eligible, move_rank_key, order_claim_tasks, plan_move_cutover, retry_allowed,
+    retry_backoff_seconds, select_claim_agent, sort_excess_candidates, sort_move_candidates,
+    suspension_failure_class, ClaimAgentSnapshot, ClaimIntent, ClaimTaskSnapshot,
+    ExcessDisposition, MoveCutoverPlan, PoolMemberSnapshot, PresenceAction,
 };
 pub use errors::Error;
 pub use ids::*;
@@ -211,6 +214,188 @@ mod tests {
         assert_eq!(
             incarnation_presence(ExecutionState::Terminated, true, true, false),
             PresenceAction::FenceTerminated
+        );
+    }
+
+    fn task_snap(id: &str, priority: i64, created_at: f64) -> decisions::ClaimTaskSnapshot {
+        decisions::ClaimTaskSnapshot {
+            id: id.to_string(),
+            state: TaskState::Queued,
+            batch_state: BatchState::Active,
+            partition_active: true,
+            next_eligible_at: None,
+            priority,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn claim_task_ordering_and_eligibility_are_semantic() {
+        use decisions::*;
+        let now = 100.0;
+        let mut high = task_snap("b", 5, 1.0);
+        let low = task_snap("a", 1, 0.0);
+        let suspended = task_snap("c", 9, 0.0);
+        suspended_state(&mut high);
+
+        // Highest priority first regardless of id/created_at; ineligible rows
+        // never surface even with extreme priority.
+        let order = order_claim_tasks(
+            &[high.clone(), low.clone(), task_snap("d", 7, 0.0)],
+            now,
+        );
+        assert_eq!(order, vec!["d".to_string(), "a".to_string()]);
+
+        // A queued task whose next_eligible_at is still in the future is not
+        // claimable yet (backoff), independent of SQL text.
+        let mut delayed = task_snap("e", 99, 0.0);
+        delayed.next_eligible_at = Some(now + 1.0);
+        assert!(!claim_task_eligible(&delayed, now));
+        // Suspended batch / inactive partition / LEASED state all reject.
+        let mut s = task_snap("f", 99, 0.0);
+        s.batch_state = BatchState::Suspended;
+        assert!(!claim_task_eligible(&s, now));
+        let mut g = task_snap("g", 99, 0.0);
+        g.partition_active = false;
+        assert!(!claim_task_eligible(&g, now));
+        let mut h = task_snap("h", 99, 0.0);
+        h.state = TaskState::Leased;
+        assert!(!claim_task_eligible(&h, now));
+        let _ = suspended;
+    }
+
+    fn suspended_state(t: &mut decisions::ClaimTaskSnapshot) {
+        t.state = TaskState::Leased;
+    }
+
+    #[test]
+    fn claim_agent_selection_is_frozen_order_over_snapshot() {
+        use decisions::*;
+        let intent_defaults = |partition: &'static str| ClaimIntent {
+            partition,
+            required_tags: &[],
+            workstream_id: None,
+            continuity: ContinuityPreference::None,
+        };
+        let agent = |id: &str, avail: f64| ClaimAgentSnapshot {
+            id: id.to_string(),
+            state: LogicalAgentState::Ready,
+            assigned_to_task: false,
+            partition: "general".to_string(),
+            workstream_id: None,
+            tags: vec![],
+            available_since: Some(avail),
+            created_at: 0.0,
+        };
+        // Oldest availability wins even when its id sorts larger.
+        let agents = vec![agent("zzz-older", 10.0), agent("aaa-newer", 20.0)];
+        let picked = select_claim_agent(&agents, &intent_defaults("general")).unwrap();
+        assert_eq!(picked.id, "zzz-older");
+        // Tied availability falls back to lowest id.
+        let tied = vec![agent("b", 5.0), agent("a", 5.0)];
+        assert_eq!(select_claim_agent(&tied, &intent_defaults("general")).unwrap().id, "a");
+
+        // Wrong partition is invisible to the selector.
+        let mut other = agent("x", 0.0);
+        other.partition = "elsewhere".to_string();
+        assert!(select_claim_agent(std::slice::from_ref(&other), &intent_defaults("general")).is_none());
+
+        // Assigned members and non-READY states are not consumers.
+        let mut busy = agent("busy", 0.0);
+        busy.assigned_to_task = true;
+        assert!(select_claim_agent(std::slice::from_ref(&busy), &intent_defaults("general")).is_none());
+        let mut reviving = agent("rev", 0.0);
+        reviving.state = LogicalAgentState::Reviving;
+        assert!(select_claim_agent(std::slice::from_ref(&reviving), &intent_defaults("general")).is_none());
+
+        // Required tag missing rejects; subset accepts.
+        let tagged_intent = ClaimIntent {
+            partition: "general",
+            required_tags: &[ "gpu".to_string() ],
+            workstream_id: None,
+            continuity: ContinuityPreference::None,
+        };
+        let mut plain = agent("plain", 0.0);
+        plain.tags = vec!["cpu".to_string()];
+        let mut capable = agent("gpu-one", 0.0);
+        capable.tags = vec!["cpu".to_string(), "gpu".to_string()];
+        let pool2 = vec![plain, capable];
+        assert_eq!(
+            select_claim_agent(&pool2, &tagged_intent).unwrap().id,
+            "gpu-one"
+        );
+
+        // Required continuity across a different workstream rejects outright.
+        let mut ws_agent = agent("ws", 0.0);
+        ws_agent.workstream_id = Some("w2".to_string());
+        let strict = ClaimIntent {
+            partition: "general",
+            required_tags: &[],
+            workstream_id: Some("w1"),
+            continuity: ContinuityPreference::Required,
+        };
+        assert!(select_claim_agent(std::slice::from_ref(&ws_agent), &strict).is_none());
+    }
+
+    #[test]
+    fn pool_rankings_match_v01_parity() {
+        use decisions::*;
+        let member = |id: &str, state: LogicalAgentState, assigned: bool, avail: f64| PoolMemberSnapshot {
+            id: id.to_string(),
+            state,
+            assigned_to_task: assigned,
+            retirement_requested: false,
+            available_since: Some(avail),
+            created_at: 0.0,
+        };
+        // Excess: unassigned before assigned, READY before others, then id.
+        let mut excess = vec![
+            member("m3", LogicalAgentState::Reviving, false, 5.0),
+            member("m4", LogicalAgentState::Assigned, true, 0.0),
+            member("m2", LogicalAgentState::Ready, false, 9.0),
+            member("m1", LogicalAgentState::Ready, false, 1.0),
+        ];
+        sort_excess_candidates(&mut excess);
+        let ids: Vec<&str> = excess.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4"]);
+
+        // Move: idle READY first, then oldest availability, then id.
+        let mut move_pool = vec![
+            member("x9", LogicalAgentState::Suspended, false, 1.0),
+            member("x8", LogicalAgentState::Ready, true, 0.0),
+            member("x7", LogicalAgentState::Ready, false, 50.0),
+        ];
+        sort_move_candidates(&mut move_pool);
+        let ids: Vec<&str> = move_pool.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["x7", "x8", "x9"], "idle READY outranks; rest by availability");
+        assert!(move_candidate_eligible(&move_pool[0]));
+    }
+
+    #[test]
+    fn move_cutover_plan_stages_only_busy_members() {
+        use decisions::*;
+        // Anything holding (or handing off) a Task stages under DRAINING.
+        assert_eq!(
+            plan_move_cutover(LogicalAgentState::Assigned, true),
+            MoveCutoverPlan::StageDrain
+        );
+        assert_eq!(
+            plan_move_cutover(LogicalAgentState::Reviving, true),
+            MoveCutoverPlan::StageDrain
+        );
+        // Idle DRAINING reconnects and restores availability.
+        assert_eq!(
+            plan_move_cutover(LogicalAgentState::Draining, false),
+            MoveCutoverPlan::ReconnectCutover { restore_ready: true }
+        );
+        // Plain idle members just cut over.
+        assert_eq!(
+            plan_move_cutover(LogicalAgentState::Ready, false),
+            MoveCutoverPlan::ReconnectCutover { restore_ready: false }
+        );
+        assert_eq!(
+            plan_move_cutover(LogicalAgentState::Suspended, false),
+            MoveCutoverPlan::ReconnectCutover { restore_ready: false }
         );
     }
 }

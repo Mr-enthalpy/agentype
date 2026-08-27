@@ -243,22 +243,34 @@ impl Kernel {
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
             };
             for partition in partitions {
-                let members: Vec<AgentRow> = {
+                // Coarse pre-filter; shrink ordering is a core decision
+                // (unassigned first, READY first, lowest id) revalidated over
+                // the snapshot so SQL text cannot change the outcome.
+                let members: Vec<(AgentRow, Option<f64>, f64)> = {
                     let mut stmt = tx
                         .prepare(
                             "SELECT id,partition_name,retention,state,workstream_id,tags_json,current_task_id,
-                                    pending_partition_name,retirement_requested,continuity_json,continuity_version
+                                    pending_partition_name,retirement_requested,continuity_json,continuity_version,
+                                    available_since,created_at
                              FROM logical_agents
                              WHERE COALESCE(pending_partition_name,partition_name)=?1
                              AND state IN ('INITIALIZING','READY','ASSIGNED','DRAINING','REVIVING')
-                             AND NOT (state='DRAINING' AND retirement_requested=1)
-                             ORDER BY created_at,id",
+                             AND NOT (state='DRAINING' AND retirement_requested=1)",
                         )
                         .map_err(map_sqlite)?;
                     let rows = stmt
-                        .query_map(params![partition.name], AgentRow::from_query)
+                        .query_map(params![partition.name], |r| {
+                            let agent = AgentRow::from_query(r)?;
+                            let available_since = r.get::<_, Option<f64>>(11)?;
+                            let created_at = r.get::<_, f64>(12)?;
+                            Ok((agent, available_since, created_at))
+                        })
                         .map_err(map_sqlite)?;
-                    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.map_err(map_sqlite)?);
+                    }
+                    out
                 };
                 let deficit = partition.desired_capacity - members.len() as i64;
                 for _ in 0..deficit.max(0) {
@@ -267,28 +279,28 @@ impl Kernel {
                 }
                 let excess = (-deficit).max(0) as usize;
                 if excess > 0 {
-                    let mut candidates = members;
-                    candidates.sort_by(|a, b| {
-                        let a_assigned = a.state == "ASSIGNED";
-                        let b_assigned = b.state == "ASSIGNED";
-                        a_assigned
-                            .cmp(&b_assigned)
-                            .then((a.state != "READY").cmp(&(b.state != "READY")))
-                            .then(a.id.cmp(&b.id))
-                    });
-                    for member in candidates.into_iter().take(excess) {
-                        match excess_disposition(
-                            LogicalAgentState::parse_sql(&member.state)?,
-                            member.current_task_id.is_some(),
-                        ) {
+                    let mut candidates: Vec<PoolMemberSnapshot> = Vec::with_capacity(members.len());
+                    for (a, available_since, created_at) in &members {
+                        candidates.push(PoolMemberSnapshot {
+                            id: a.id.clone(),
+                            state: LogicalAgentState::parse_sql(&a.state)?,
+                            assigned_to_task: a.current_task_id.is_some(),
+                            retirement_requested: false,
+                            available_since: *available_since,
+                            created_at: *created_at,
+                        });
+                    }
+                    sort_excess_candidates(&mut candidates);
+                    for candidate in candidates.into_iter().take(excess) {
+                        match excess_disposition(candidate.state, candidate.assigned_to_task) {
                             ExcessDisposition::RetireDirectly => {
-                                retire_logical_agent(tx, &member.id, now)?;
+                                retire_logical_agent(tx, &candidate.id, now)?;
                                 report.retired += 1;
                             }
                             ExcessDisposition::DrainForRetirement => {
                                 tx.execute(
                                     "UPDATE logical_agents SET state='DRAINING',retirement_requested=1,updated_at=?1 WHERE id=?2",
-                                    params![now, member.id],
+                                    params![now, candidate.id],
                                 )
                                 .map_err(map_sqlite)?;
                                 report.draining += 1;
@@ -334,40 +346,74 @@ impl Kernel {
                 params![target_p.desired_capacity + count, revision, now, target],
             )
             .map_err(map_sqlite)?;
-            let members: Vec<AgentRow> = {
+            // Coarse pre-filter; candidate ordering and per-member cutover
+            // planning are core decisions (spec 15).
+            let members: Vec<(AgentRow, Option<f64>, f64)> = {
                 let mut stmt = tx
                     .prepare(
                         "SELECT id,partition_name,retention,state,workstream_id,tags_json,current_task_id,
-                                pending_partition_name,retirement_requested,continuity_json,continuity_version
+                                pending_partition_name,retirement_requested,continuity_json,continuity_version,
+                                available_since,created_at
                          FROM logical_agents
                          WHERE COALESCE(pending_partition_name,partition_name)=?1
                          AND state IN ('INITIALIZING','READY','ASSIGNED','DRAINING','REVIVING','SUSPENDED')
-                         AND retirement_requested=0
-                         ORDER BY CASE WHEN state='READY' AND current_task_id IS NULL THEN 0 ELSE 1 END,
-                                  COALESCE(available_since,created_at),id",
+                         AND retirement_requested=0",
                     )
                     .map_err(map_sqlite)?;
                 let rows = stmt
-                    .query_map(params![source], AgentRow::from_query)
+                    .query_map(params![source], |r| {
+                        let agent = AgentRow::from_query(r)?;
+                        let available_since = r.get::<_, Option<f64>>(11)?;
+                        let created_at = r.get::<_, f64>(12)?;
+                        Ok((agent, available_since, created_at))
+                    })
                     .map_err(map_sqlite)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(map_sqlite)?);
+                }
+                out
             };
-            for agent in members.into_iter().take(count as usize) {
-                if agent.current_task_id.is_some() || agent.state == "ASSIGNED" {
-                    tx.execute(
-                        "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?1,
-                         available_since=NULL,updated_at=?2 WHERE id=?3",
-                        params![target, now, agent.id],
-                    )
-                    .map_err(map_sqlite)?;
-                } else {
-                    request_partition_cutover(tx, &agent, target, now)?;
-                    if agent.state == "DRAINING" {
+            let mut candidates: Vec<(PoolMemberSnapshot, usize)> = Vec::with_capacity(members.len());
+            for (i, (a, available_since, created_at)) in members.iter().enumerate() {
+                candidates.push((
+                    PoolMemberSnapshot {
+                        id: a.id.clone(),
+                        state: LogicalAgentState::parse_sql(&a.state)?,
+                        assigned_to_task: a.current_task_id.is_some(),
+                        retirement_requested: a.retirement_requested,
+                        available_since: *available_since,
+                        created_at: *created_at,
+                    },
+                    i,
+                ));
+            }
+            candidates.retain(|(s, _)| move_candidate_eligible(s));
+            candidates.sort_by(|a, b| {
+                move_rank_key(&a.0)
+                    .partial_cmp(&move_rank_key(&b.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (candidate, idx) in candidates.into_iter().take(count as usize) {
+                let agent = &members[idx].0;
+                match plan_move_cutover(candidate.state, candidate.assigned_to_task) {
+                    MoveCutoverPlan::StageDrain => {
                         tx.execute(
-                            "UPDATE logical_agents SET state='READY',available_since=?1,updated_at=?1 WHERE id=?2",
-                            params![now, agent.id],
+                            "UPDATE logical_agents SET state='DRAINING',pending_partition_name=?1,
+                             available_since=NULL,updated_at=?2 WHERE id=?3",
+                            params![target, now, agent.id],
                         )
                         .map_err(map_sqlite)?;
+                    }
+                    MoveCutoverPlan::ReconnectCutover { restore_ready } => {
+                        request_partition_cutover(tx, agent, target, now)?;
+                        if restore_ready {
+                            tx.execute(
+                                "UPDATE logical_agents SET state='READY',available_since=?1,updated_at=?1 WHERE id=?2",
+                                params![now, agent.id],
+                            )
+                            .map_err(map_sqlite)?;
+                        }
                     }
                 }
             }
@@ -663,30 +709,59 @@ impl Kernel {
     pub fn claim_next_available(&self) -> Result<Option<Claim>, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
-            let tasks: Vec<TaskRow> = {
+            // Coarse pre-filter only (performance); semantic eligibility and
+            // ordering are re-decided by core::decisions below so that query
+            // text alone can never change scheduler behavior (spec 15).
+            let tasks: Vec<(TaskRow, i64, f64, bool, String)> = {
                 let mut stmt = tx
                     .prepare(
                         "SELECT t.id,t.batch_id,t.name,t.payload_json,t.acceptance_json,t.partition_name,t.workstream_id,
                                 t.continuity,t.affinity_tags_json,t.workspace_mode,t.state,t.max_attempts,t.retry_classes_json,
-                                t.base_backoff_seconds,t.max_backoff_seconds,t.next_eligible_at,t.current_attempt_id,t.fencing_epoch
+                                t.base_backoff_seconds,t.max_backoff_seconds,t.next_eligible_at,t.current_attempt_id,t.fencing_epoch,
+                                t.priority,t.created_at,p.active,b.state
                          FROM tasks t JOIN batches b ON b.id=t.batch_id
                          JOIN pool_partitions p ON p.name=t.partition_name
-                         WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1
-                         AND (t.next_eligible_at IS NULL OR t.next_eligible_at<=?1)
-                         ORDER BY t.priority DESC,t.created_at,t.id",
+                         WHERE t.state='QUEUED'",
                     )
                     .map_err(map_sqlite)?;
                 let rows = stmt
-                    .query_map(params![now], TaskRow::from_query)
+                    .query_map(params![], |r| {
+                        Ok((
+                            TaskRow::from_query(r)?,
+                            r.get::<_, i64>(18)?,
+                            r.get::<_, f64>(19)?,
+                            r.get::<_, i64>(20)? != 0,
+                            r.get::<_, String>(21)?,
+                        ))
+                    })
                     .map_err(map_sqlite)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(map_sqlite)?);
+                }
+                out
             };
-            for task in tasks {
-                // Frozen matching order (V0.1 parity, spec 11): continuity
-                // rank, then oldest available_since (created_at as defensive
-                // fallback), then lowest LogicalAgent ID. The query is ordered
-                // the same way; the comparator below re-applies it so the
-                // selection never silently loses the availability tiebreak.
+            // Core decides which queued tasks are claimable and in what order.
+            let mut snapshots: Vec<ClaimTaskSnapshot> = Vec::with_capacity(tasks.len());
+            for (t, priority, created_at, active, batch_state) in &tasks {
+                snapshots.push(ClaimTaskSnapshot {
+                    id: t.id.clone(),
+                    state: TaskState::parse_sql(&t.state)?,
+                    batch_state: BatchState::parse_sql(batch_state)?,
+                    partition_active: *active,
+                    next_eligible_at: t.next_eligible_at,
+                    priority: *priority,
+                    created_at: *created_at,
+                });
+            }
+            for task_id in order_claim_tasks(&snapshots, now) {
+                let (task, _, _, _, _) =
+                    match tasks.iter().find(|(t, _, _, _, _)| t.id == task_id) {
+                        Some(found) => found,
+                        None => continue,
+                    };
+                // Coarse pre-filter (partition + cheap readiness predicate);
+                // selection semantics live in core::select_claim_agent.
                 let agents: Vec<(AgentRow, Option<f64>, f64)> = {
                     let mut stmt = tx
                         .prepare(
@@ -694,7 +769,7 @@ impl Kernel {
                                     pending_partition_name,retirement_requested,continuity_json,continuity_version,
                                     available_since,created_at
                              FROM logical_agents WHERE partition_name=?1 AND state='READY'
-                             AND current_task_id IS NULL ORDER BY available_since,id",
+                             AND current_task_id IS NULL",
                         )
                         .map_err(map_sqlite)?;
                     let rows = stmt
@@ -713,39 +788,32 @@ impl Kernel {
                 };
                 let task_tags = parse_str_list(&task.affinity_tags_json)?;
                 let continuity = ContinuityPreference::parse_sql(&task.continuity)?;
-                let mut eligible: Vec<(i32, AgentRow, Option<f64>, f64)> = Vec::new();
-                for (agent, available_since, created_at) in agents {
-                    let agent_tags = parse_str_list(&agent.tags_json)?;
-                    if !tags_match(&task_tags, &agent_tags) {
-                        continue;
-                    }
-                    let same_ws = task.workstream_id.is_some()
-                        && task.workstream_id == agent.workstream_id;
-                    if continuity == ContinuityPreference::Required && !same_ws {
-                        continue;
-                    }
-                    eligible.push((
-                        claim_selection_rank(continuity, same_ws),
-                        agent,
-                        available_since,
-                        created_at,
-                    ));
+                let intent = ClaimIntent {
+                    partition: &task.partition,
+                    required_tags: &task_tags,
+                    workstream_id: task.workstream_id.as_deref(),
+                    continuity,
+                };
+                let mut agent_snaps: Vec<ClaimAgentSnapshot> = Vec::with_capacity(agents.len());
+                for (a, available_since, created_at) in &agents {
+                    agent_snaps.push(ClaimAgentSnapshot {
+                        id: a.id.clone(),
+                        state: LogicalAgentState::parse_sql(&a.state)?,
+                        assigned_to_task: a.current_task_id.is_some(),
+                        partition: a.partition.clone(),
+                        workstream_id: a.workstream_id.clone(),
+                        tags: parse_str_list(&a.tags_json)?,
+                        available_since: *available_since,
+                        created_at: *created_at,
+                    });
                 }
-                if let Some((_, agent, _, _)) = eligible.into_iter().min_by(|a, b| {
-                    a.0.cmp(&b.0)
-                        .then_with(|| {
-                            // Frozen order: oldest availability dominates the id.
-                            let (ka, ia) = claim_tiebreak(a.2, a.3, &a.1.id);
-                            let (kb, ib) = claim_tiebreak(b.2, b.3, &b.1.id);
-                            ka.partial_cmp(&kb)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(ia.cmp(ib))
-                        })
-                }) {
+                if let Some(picked) = select_claim_agent(&agent_snaps, &intent) {
+                    let (agent, _, _) =
+                        agents.iter().find(|(a, _, _)| a.id == picked.id).expect("picked from loaded set");
                     let partition = required_partition(tx, &task.partition, true)?;
                     return Ok(Some(claim_selected(
                         tx,
-                        &agent,
+                        agent,
                         &partition,
                         &task,
                         now,
