@@ -217,14 +217,39 @@ cargo test --workspace
 
 Result on this landing (Windows, rustc via cargo 1.x):
 
-- `agentype-core`: 4 tests
+- `agentype-core`: 11 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 64 tests
-  - `m4_kernel`: 40
-  - `recovery`: 10
+- `agentype-storage-sqlite` integration: 66 tests
+  - `m4_kernel`: 41
+  - `recovery`: 11
   - `topology`: 14
-- total: 72 passed, 0 failed
+- total: 81 passed, 0 failed
 
-Python tests were not modified and are not required to pass as part of M4
-Rust CI. The existing Python job remains for the V0.1 oracle package.
+Python production implementation was not modified. Two Python oracle
+tests received timing-only stabilization so that the existing V0.1 CI
+remains deterministic while Rust CI was added. No Python scheduler
+semantics were changed, and the Python suite is not required to pass as
+part of M4 Rust CI; the existing Python job remains for the V0.1 oracle
+package.
+
+## Scheduling-semantics placement (spec 15 direction)
+
+Spec 15: storage persists core state; it MUST NOT define scheduling
+semantics. This landing enforces the substance of the rule, not just the
+import graph:
+
+- `agentype-core::decisions` owns every scheduling decision as a pure,
+  SQLite-free function with unit tests: claim matching rank and tiebreak,
+  durable quiescence, suspension failure classification, batch aggregate
+  state, excess-member disposition, incarnation presence outcome, retry
+  gating and backoff (over the frozen `RetryPolicy`).
+- `agentype-storage-sqlite` loads authoritative rows, invokes core
+  decisions inside `BEGIN IMMEDIATE`, persists results atomically, and
+  enforces DB constraints; presence SQL translates the returned
+  `PresenceAction` rather than deciding it.
+- `agentype-runtime` may keep depending on the storage-backed `Kernel`
+  in M4: the normative constraint forbids semantics defined in storage,
+  not the runtime-to-persistence composition direction. Whether M5's
+  dispatcher wants a storage-free command trait boundary is an M5 design
+  decision to be driven by its actual needs, not anticipated here.
