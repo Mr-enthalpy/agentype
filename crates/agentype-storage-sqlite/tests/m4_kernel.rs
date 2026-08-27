@@ -517,6 +517,50 @@ fn nonterminal_nack_persists_no_quiescence() {
     assert!(!row.quiescent_confirmed);
 }
 
+/// The retry policy must consult the SAME normalized truth the durable state
+/// records. A caller can claim `quiescent_confirmed=true` without terminality;
+/// that claim must not send an unproven writer's Task to RETRY_WAIT — after a
+/// crash there would be no live lease to re-run the writer-safety gate, and a
+/// duplicate writer could be dispatched over an execution the database itself
+/// records as quiescence-unknown.
+#[test]
+fn nonterminal_nack_cannot_retry_writer_on_unproven_quiescence() {
+    let Env { k, clock } = memory_env();
+    let (batch, task_id, claim, execution_id) =
+        run_claim(&k, retryable_write("unproven"), false);
+
+    // Retryable class + raw quiescent=true + terminal=false: the historical
+    // hole dispatched a replacement writer here.
+    let state = k
+        .nack(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            FailureClass::Timeout,
+            Some(&execution_id),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+    assert_eq!(state, TaskState::Suspended, "no retry on unproven quiescence");
+
+    // Durable truth and scheduling outcome agree.
+    let row = k.execution(&execution_id).unwrap();
+    assert_eq!(row.state, ExecutionState::Unknown);
+    assert!(!row.quiescent_confirmed);
+    assert_eq!(k.task(&task_id).unwrap().state, TaskState::Suspended);
+    assert_eq!(k.batch(&batch).unwrap().state, BatchState::Suspended);
+    let esc = k.open_escalation_for_task(&task_id).unwrap();
+    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert!(k.claim_next_available().unwrap().is_none());
+
+    // Crash-restart convergence: recovery must not resurrect a replacement.
+    clock.advance(20.0);
+    k.recover_authority().unwrap();
+    assert_eq!(k.task(&task_id).unwrap().state, TaskState::Suspended);
+    assert!(k.claim_next_available().unwrap().is_none());
+}
+
 /// Entering an unresolved state supersedes earlier stored proof; once proof
 /// became durable together with a terminal state, a late authoritative
 /// nonterminal observation can neither rewrite history nor resume the writer.

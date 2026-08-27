@@ -1122,12 +1122,20 @@ impl Kernel {
             } else {
                 ExecutionState::Failed
             };
+            // One normalized truth for persistence AND policy: only a
+            // terminal observation constitutes durable quiescence proof. A
+            // caller claiming quiescence without terminality is a nonterminal
+            // observation (UNKNOWN, zero proof bits below) and must not
+            // unlock writer replacement — otherwise a crash after the fact
+            // would dispatch a duplicate writer the durable state itself
+            // records as unproven.
+            let durable_quiescent = terminal_confirmed && quiescent_confirmed;
             record_incarnation_presence(
                 tx,
                 attempt.incarnation_id.as_deref(),
                 presence,
                 terminal_confirmed,
-                quiescent_confirmed,
+                durable_quiescent,
                 incarnation_reusable,
                 now,
             )?;
@@ -1137,7 +1145,7 @@ impl Kernel {
             let writer_safe = writer_is_safe_to_replace(
                 task.workspace_mode == "write",
                 execution.is_some(),
-                quiescent_confirmed,
+                durable_quiescent,
                 execution.as_ref().map(|e| e.attempt_isolation).unwrap_or(false),
             );
             if retry_allowed && writer_safe {
