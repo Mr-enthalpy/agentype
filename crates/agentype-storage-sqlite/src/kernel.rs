@@ -21,27 +21,43 @@ impl Kernel {
         path: impl AsRef<Path>,
         clock: Arc<dyn Clock>,
         lease_seconds: f64,
+        continuity_max_bytes: usize,
     ) -> Result<Self, Error> {
-        Self::from_store(Store::open(path)?, clock, lease_seconds)
+        Self::from_store(Store::open(path)?, clock, lease_seconds, continuity_max_bytes)
     }
 
-    pub fn open_memory(clock: Arc<dyn Clock>, lease_seconds: f64) -> Result<Self, Error> {
-        Self::from_store(Store::open_memory()?, clock, lease_seconds)
+    pub fn open_memory(
+        clock: Arc<dyn Clock>,
+        lease_seconds: f64,
+        continuity_max_bytes: usize,
+    ) -> Result<Self, Error> {
+        Self::from_store(
+            Store::open_memory()?,
+            clock,
+            lease_seconds,
+            continuity_max_bytes,
+        )
     }
 
     fn from_store(
         store: Store,
         clock: Arc<dyn Clock>,
         lease_seconds: f64,
+        continuity_max_bytes: usize,
     ) -> Result<Self, Error> {
         if lease_seconds <= 0.0 {
             return Err(Error::invalid_transition("lease_seconds must be positive"));
+        }
+        if continuity_max_bytes == 0 {
+            return Err(Error::invalid_transition(
+                "continuity_max_bytes must be positive",
+            ));
         }
         Ok(Self {
             store,
             clock,
             lease_seconds,
-            continuity_max_bytes: 16_384,
+            continuity_max_bytes,
         })
     }
 
@@ -118,7 +134,7 @@ impl Kernel {
                     if profile != spec.execution_profile {
                         mismatches.push("execution_profile");
                     }
-                    let mut existing_tags = parse_str_list(&tags_json);
+                    let mut existing_tags = parse_str_list(&tags_json)?;
                     existing_tags.sort();
                     let mut new_tags = spec.tags.clone();
                     new_tags.sort();
@@ -662,7 +678,12 @@ impl Kernel {
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
             };
             for task in tasks {
-                let agents: Vec<AgentRow> = {
+                // Frozen matching order (V0.1 parity, spec 11): continuity
+                // rank, then oldest available_since (created_at as defensive
+                // fallback), then lowest LogicalAgent ID. The query is ordered
+                // the same way; the comparator below re-applies it so the
+                // selection never silently loses the availability tiebreak.
+                let agents: Vec<(AgentRow, Option<f64>, f64)> = {
                     let mut stmt = tx
                         .prepare(
                             "SELECT id,partition_name,retention,state,workstream_id,tags_json,current_task_id,
@@ -673,15 +694,25 @@ impl Kernel {
                         )
                         .map_err(map_sqlite)?;
                     let rows = stmt
-                        .query_map(params![task.partition], AgentRow::from_query_ext)
+                        .query_map(params![task.partition], |r| {
+                            let agent = AgentRow::from_query(r)?;
+                            let available_since = r.get::<_, Option<f64>>(11)?;
+                            let created_at = r.get::<_, f64>(12)?;
+                            Ok((agent, available_since, created_at))
+                        })
                         .map_err(map_sqlite)?;
-                    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.map_err(map_sqlite)?);
+                    }
+                    out
                 };
-                let task_tags = parse_str_list(&task.affinity_tags_json);
+                let task_tags = parse_str_list(&task.affinity_tags_json)?;
                 let continuity = ContinuityPreference::parse_sql(&task.continuity)?;
-                let mut eligible: Vec<(i32, AgentRow)> = Vec::new();
-                for agent in agents {
-                    if !tags_match(&task_tags, &parse_str_list(&agent.tags_json)) {
+                let mut eligible: Vec<(i32, AgentRow, Option<f64>, f64)> = Vec::new();
+                for (agent, available_since, created_at) in agents {
+                    let agent_tags = parse_str_list(&agent.tags_json)?;
+                    if !tags_match(&task_tags, &agent_tags) {
                         continue;
                     }
                     let same_ws = task.workstream_id.is_some()
@@ -694,9 +725,18 @@ impl Kernel {
                     } else {
                         1
                     };
-                    eligible.push((rank, agent));
+                    eligible.push((rank, agent, available_since, created_at));
                 }
-                if let Some((_, agent)) = eligible.into_iter().min_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id))) {
+                if let Some((_, agent, _, _)) = eligible.into_iter().min_by(|a, b| {
+                    let avail = |c: &(i32, AgentRow, Option<f64>, f64)| c.2.unwrap_or(c.3);
+                    a.0.cmp(&b.0)
+                        .then(
+                            avail(a)
+                                .partial_cmp(&avail(b))
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                        .then(a.1.id.cmp(&b.1.id))
+                }) {
                     let partition = required_partition(tx, &task.partition, true)?;
                     return Ok(Some(claim_selected(
                         tx,
@@ -1920,7 +1960,7 @@ impl Kernel {
                     task_id: TaskId::from_string(tid),
                     batch_id: BatchId::from_string(bid),
                     state: ResultState::parse_sql(&state)?,
-                    payload: json_load(&payload),
+                    payload: json_load(&payload)?,
                 })
             })
         })
@@ -2123,7 +2163,7 @@ impl Kernel {
                     aggregate_type: at,
                     aggregate_id: aid,
                     state: OutboxState::parse_sql(&state)?,
-                    payload: json_load(&payload),
+                    payload: json_load(&payload)?,
                 });
             }
             Ok(out)
@@ -2231,8 +2271,8 @@ fn claim_selected(
         execution_target: partition.execution_target.clone(),
         execution_profile: partition.execution_profile.clone(),
         workspace_mode: WorkspaceMode::parse_sql(&task.workspace_mode)?,
-        payload: json_load(&task.payload_json),
-        acceptance: json_load(&task.acceptance_json),
+        payload: json_load(&task.payload_json)?,
+        acceptance: json_load(&task.acceptance_json)?,
         workstream_id: task.workstream_id.as_ref().map(WorkstreamId::from_string),
     })
 }
@@ -2344,10 +2384,6 @@ impl AgentRow {
             continuity_json: r.get(9)?,
             continuity_version: r.get(10)?,
         })
-    }
-
-    pub(crate) fn from_query_ext(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Self::from_query(r)
     }
 }
 
