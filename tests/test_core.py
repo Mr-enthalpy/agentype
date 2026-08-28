@@ -23,7 +23,7 @@ from local_agent_scheduler.enums import (
 )
 from local_agent_scheduler.errors import InvalidTransition, StaleAuthority
 from local_agent_scheduler.models import PartitionSpec, RetryPolicy, TaskSpec
-from local_agent_scheduler.storage import Database
+from local_agent_scheduler.storage import Database, utc_now
 
 
 class SchedulerCase(unittest.TestCase):
@@ -51,16 +51,25 @@ class SchedulerCase(unittest.TestCase):
 
     def running_claim(self, task: TaskSpec):
         batch_id, ids = self.scheduler.submit_batch([task])
-        claim = self.scheduler.claim_next(self.ready_agent())
+        started_at = utc_now()
+        claim = self.scheduler.claim_next(self.ready_agent(), now=started_at)
         self.assertIsNotNone(claim)
         execution_id, _ = self.scheduler.create_execution(claim)
         execution = self.scheduler.get("executions", execution_id)
-        claim = replace(claim, incarnation_id=execution["incarnation_id"])
-        self.scheduler.confirm_execution_running(
+        # Pin confirm and report the CONFIRMED expiry through the claim so
+        # consumers sweeping at lease_expires_at + N observe deterministic
+        # authority closure instead of a runner-speed-dependent branch.
+        claim = replace(
+            claim,
+            incarnation_id=execution["incarnation_id"],
+            lease_expires_at=started_at + 1 + self.scheduler.lease_seconds,
+        )
+        self.scheduler.confirm_running_and_renew_authority(
             claim.attempt_id,
             claim.lease_epoch,
             execution_id,
             runtime_handle={"thread_id": "thread", "turn_id": "turn"},
+            now=started_at + 1,
         )
         return batch_id, ids[task.name], claim, execution_id
 

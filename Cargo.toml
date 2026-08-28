@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentype-core",
+    "crates/agentype-storage-sqlite",
+    "crates/agentype-adapter-api",
+    "crates/agentype-runtime",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.2.0"
+
+[workspace.dependencies]
+agentype-core = { path = "crates/agentype-core" }
+agentype-adapter-api = { path = "crates/agentype-adapter-api" }
+agentype-storage-sqlite = { path = "crates/agentype-storage-sqlite" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
