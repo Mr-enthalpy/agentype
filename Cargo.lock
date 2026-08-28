@@ -25,6 +25,7 @@ version = "0.2.0"
 dependencies = [
  "agentype-core",
  "agentype-storage-sqlite",
+ "serde_json",
 ]
 
 [[package]]

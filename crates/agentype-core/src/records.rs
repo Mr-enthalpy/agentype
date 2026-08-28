@@ -247,6 +247,35 @@ pub struct ExecutionRecord {
     pub quiescent_confirmed: bool,
 }
 
+/// Authoritative launch snapshot reconstructed from durable Scheduler state.
+///
+/// This object is produced by the Execution creation transaction and MUST NOT
+/// trust caller-held Claim copies of task semantics (payload, workspace mode,
+/// acceptance, or workstream). Physical execution requests are built strictly
+/// from this snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionLaunchSnapshot {
+    pub execution_id: ExecutionId,
+    pub request_id: RequestId,
+    pub task_id: TaskId,
+    pub batch_id: BatchId,
+    pub attempt_id: AttemptId,
+    pub attempt_number: u32,
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub lease_expires_at: UnixTime,
+    pub logical_agent_id: LogicalAgentId,
+    pub incarnation_id: IncarnationId,
+    pub execution_target: String,
+    pub execution_profile: String,
+    pub workspace_mode: WorkspaceMode,
+    pub prompt: String,
+    pub payload: Value,
+    pub acceptance: Value,
+    pub workstream_id: Option<WorkstreamId>,
+    pub attempt_isolation: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct EscalationRecord {
     pub id: EscalationId,

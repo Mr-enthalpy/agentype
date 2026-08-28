@@ -46,7 +46,8 @@ fn unknown_execution_can_reconcile_to_running() {
     let Env { k, .. } = memory_env();
     let (_b, _ids) = k.submit_batch(&[read_task("amb2")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
-    let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k.create_execution(&claim, false).unwrap();
+    let execution_id = launch.execution_id;
     k.record_physical_outcome(
         &execution_id,
         ExecutionState::Unknown,
@@ -329,7 +330,8 @@ fn restart_during_result_available_preserves_durable_outcome() {
         batch = b;
         task_id = ids["durable"].clone();
         let claim = k.claim_next_available().unwrap().unwrap();
-        let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+        let launch = k.create_execution(&claim, false).unwrap();
+        let execution_id = launch.execution_id;
         k.confirm_running_and_renew(
             &claim.attempt_id,
             claim.lease_epoch,

@@ -118,7 +118,8 @@ pub fn run_claim(
 ) -> (BatchId, TaskId, Claim, ExecutionId) {
     let (batch, ids) = k.submit_batch(std::slice::from_ref(&spec)).unwrap();
     let claim = k.claim_next_available().unwrap().expect("claim");
-    let (execution_id, _) = k.create_execution(&claim, isolation).unwrap();
+    let launch = k.create_execution(&claim, isolation).unwrap();
+    let execution_id = launch.execution_id;
     k.confirm_running_and_renew(
         &claim.attempt_id,
         claim.lease_epoch,

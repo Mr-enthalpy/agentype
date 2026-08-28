@@ -291,7 +291,8 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
     let Env { k, clock } = memory_env();
     let (_b, _ids) = k.submit_batch(&[read_task("near-deadline")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
-    let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k.create_execution(&claim, false).unwrap();
+    let execution_id = launch.execution_id;
     clock.advance(9.5);
     let expires = k
         .confirm_running_and_renew(
@@ -535,7 +536,8 @@ fn unresolved_physical_outcome_rejects_proof_bits() {
     let Env { k, .. } = memory_env();
     let (_b, _ids) = k.submit_batch(&[read_task("amb")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
-    let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k.create_execution(&claim, false).unwrap();
+    let execution_id = launch.execution_id;
 
     let err = k
         .record_physical_outcome(
@@ -686,7 +688,8 @@ fn unresolved_record_clears_stored_proof() {
     let env = file_env(&db);
     let (_b, _ids) = env.k.submit_batch(&[read_task("stale-proof")]).unwrap();
     let claim = env.k.claim_next_available().unwrap().unwrap();
-    let (execution_id, _) = env.k.create_execution(&claim, false).unwrap();
+    let launch = env.k.create_execution(&claim, false).unwrap();
+    let execution_id = launch.execution_id;
     // Simulate corrupted pre-fix history below the API boundary...
     fixture_execution(&db, &execution_id, "STARTING", true, false);
     // ...then an authoritative nonterminal observation must clear it.
@@ -729,7 +732,8 @@ fn multi_task_batch_partial_completion_and_suspension() {
     // by task identity so the writer ends SUSPENDED (success without
     // quiescence proof) and the read task completes when claimable.
     let first = env.k.claim_next_available().unwrap().unwrap();
-    let (exec1, _) = env.k.create_execution(&first, false).unwrap();
+    let launch1 = env.k.create_execution(&first, false).unwrap();
+    let exec1 = launch1.execution_id;
     env.k
         .confirm_running_and_renew(&first.attempt_id, first.lease_epoch, &exec1, &json!({}))
         .unwrap();
@@ -759,7 +763,8 @@ fn multi_task_batch_partial_completion_and_suspension() {
             .unwrap();
         assert_eq!(env.k.batch(&batch).unwrap().state, BatchState::Active);
         let second = env.k.claim_next_available().unwrap().unwrap();
-        let (exec2, _) = env.k.create_execution(&second, false).unwrap();
+        let launch2 = env.k.create_execution(&second, false).unwrap();
+        let exec2 = launch2.execution_id;
         env.k
             .confirm_running_and_renew(&second.attempt_id, second.lease_epoch, &exec2, &json!({}))
             .unwrap();
@@ -862,7 +867,8 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     // complete the read sibling cleanly, then cancel the writer with unknown
     // quiescence to open the obligation and suspend the batch.
     let first = env.k.claim_next_available().unwrap().unwrap();
-    let (exec1, _) = env.k.create_execution(&first, false).unwrap();
+    let launch1 = env.k.create_execution(&first, false).unwrap();
+    let exec1 = launch1.execution_id;
     env.k
         .confirm_running_and_renew(&first.attempt_id, first.lease_epoch, &exec1, &json!({}))
         .unwrap();
@@ -882,7 +888,8 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
             .unwrap();
         assert_eq!(env.k.batch(&batch).unwrap().state, BatchState::Active);
         let second = env.k.claim_next_available().unwrap().unwrap();
-        let (exec2, _) = env.k.create_execution(&second, false).unwrap();
+        let launch2 = env.k.create_execution(&second, false).unwrap();
+        let exec2 = launch2.execution_id;
         env.k
             .confirm_running_and_renew(&second.attempt_id, second.lease_epoch, &exec2, &json!({}))
             .unwrap();
@@ -997,7 +1004,8 @@ fn heartbeat_requires_running_execution() {
         .heartbeat(&claim.attempt_id, claim.lease_epoch)
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
-    let (execution_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k.create_execution(&claim, false).unwrap();
+    let execution_id = launch.execution_id;
     let err = k
         .heartbeat(&claim.attempt_id, claim.lease_epoch)
         .unwrap_err();
@@ -1114,7 +1122,8 @@ fn partial_batch_cancellation_preserves_completed_task_and_result() {
 
     // Claim and complete one task
     let claim_a = k.claim_next_available().unwrap().unwrap();
-    let (exec_a, _) = k.create_execution(&claim_a, false).unwrap();
+    let launch_a = k.create_execution(&claim_a, false).unwrap();
+    let exec_a = launch_a.execution_id;
     k.confirm_running_and_renew(
         &claim_a.attempt_id,
         claim_a.lease_epoch,
@@ -1200,7 +1209,8 @@ fn create_execution_rejects_tampered_claim_identities() {
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Original valid claim succeeds
-    let (exec_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k.create_execution(&claim, false).unwrap();
+    let exec_id = launch.execution_id;
     assert!(!exec_id.as_str().is_empty());
 }
 
@@ -1244,7 +1254,8 @@ fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
     let env = file_env(&db);
     let (_b, _ids) = env.k.submit_batch(&[read_task("db-check")]).unwrap();
     let claim = env.k.claim_next_available().unwrap().unwrap();
-    let (exec_id, _) = env.k.create_execution(&claim, false).unwrap();
+    let launch = env.k.create_execution(&claim, false).unwrap();
+    let exec_id = launch.execution_id;
 
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     // Raw UPDATE setting quiescent_confirmed=1 and terminal_confirmed=0 must violate CHECK constraint
@@ -1374,4 +1385,111 @@ fn escalation_resolution_of_lost_writer_transitions_to_terminated_with_durable_q
 
     // Task is back in QUEUED and ready for retry
     assert_eq!(k.task(&claim.task_id).unwrap().state, TaskState::Queued);
+}
+
+// ------------------------------------------------------------ M5.1 launch & tamper regressions
+
+#[test]
+fn mutated_claim_payload_does_not_alter_launch_snapshot() {
+    let Env { k, .. } = memory_env();
+    let spec = TaskSpec::new(
+        "tamper-payload",
+        json!({"original_key": "authoritative_value"}),
+    );
+    let (_b, _ids) = k.submit_batch(&[spec]).unwrap();
+    let mut claim = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim.payload["original_key"], "authoritative_value");
+
+    // Tamper with caller-held Claim DTO
+    claim.payload = json!({"injected_key": "malicious_tampered_value"});
+
+    // Authoritative launch snapshot MUST contain the durable payload
+    let launch = k.create_execution(&claim, false).unwrap();
+    assert_eq!(
+        launch.payload,
+        json!({"original_key": "authoritative_value"})
+    );
+}
+
+#[test]
+fn mutated_claim_acceptance_does_not_alter_launch_snapshot() {
+    let Env { k, .. } = memory_env();
+    let mut spec = TaskSpec::new("tamper-acceptance", json!({}));
+    spec.acceptance = json!({"criteria": "strict_validation"});
+    let (_b, _ids) = k.submit_batch(&[spec]).unwrap();
+    let mut claim = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim.acceptance["criteria"], "strict_validation");
+
+    // Tamper with caller-held Claim DTO
+    claim.acceptance = json!({"criteria": "bypassed"});
+
+    // Authoritative launch snapshot MUST contain durable acceptance
+    let launch = k.create_execution(&claim, false).unwrap();
+    assert_eq!(launch.acceptance, json!({"criteria": "strict_validation"}));
+}
+
+#[test]
+fn mutated_claim_workspace_mode_cannot_widen_launch_authority() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[read_task("read-only-task")]).unwrap();
+    let mut claim = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim.workspace_mode, WorkspaceMode::ReadOnly);
+
+    // Tamper with caller-held Claim DTO to claim WRITE authority
+    claim.workspace_mode = WorkspaceMode::Write;
+
+    // Authoritative launch snapshot MUST remain ReadOnly
+    let launch = k.create_execution(&claim, false).unwrap();
+    assert_eq!(launch.workspace_mode, WorkspaceMode::ReadOnly);
+}
+
+#[test]
+fn mutated_claim_workstream_does_not_alter_launch_snapshot() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[read_task("no-ws-task")]).unwrap();
+    let mut claim = k.claim_next_available().unwrap().unwrap();
+    assert!(claim.workstream_id.is_none());
+
+    // Tamper with caller-held Claim DTO to inject a workstream
+    claim.workstream_id = Some(WorkstreamId::from_string("forged-workstream"));
+
+    // Authoritative launch snapshot MUST remain None
+    let launch = k.create_execution(&claim, false).unwrap();
+    assert!(launch.workstream_id.is_none());
+}
+
+#[test]
+fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[write_task("isolated-task")]).unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+
+    let launch = k.create_execution(&claim, true).unwrap();
+    assert_eq!(launch.task_id, claim.task_id);
+    assert_eq!(launch.attempt_id, claim.attempt_id);
+    assert_eq!(launch.logical_agent_id, claim.logical_agent_id);
+    assert!(launch.attempt_isolation);
+
+    let exec = k.execution(&launch.execution_id).unwrap();
+    assert_eq!(exec.id, launch.execution_id);
+    assert_eq!(exec.attempt_id, launch.attempt_id);
+    assert_eq!(exec.incarnation_id, launch.incarnation_id);
+    assert_eq!(exec.execution_target, launch.execution_target);
+    assert_eq!(exec.execution_profile, launch.execution_profile);
+    assert!(exec.attempt_isolation);
+}
+
+#[test]
+fn expired_lease_cannot_create_execution_before_expiry_sweep() {
+    let Env { k, clock } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[read_task("expire-pre-exec")]).unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+
+    // Advance clock past lease deadline without calling expire_leases
+    clock.advance(20.0);
+    assert!(clock.now() > claim.lease_expires_at);
+
+    // create_execution must fail closed on expired authority
+    let err = k.create_execution(&claim, false).unwrap_err();
+    assert!(matches!(err, Error::StaleAuthority(_)));
 }

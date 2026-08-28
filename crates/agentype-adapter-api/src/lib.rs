@@ -3,7 +3,9 @@
 //! Core MUST NOT import vendor names. Adapters own process/session mapping.
 //! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
 
-use agentype_core::{ExecutionId, ExecutionState, FailureClass, RequestId, WorkspaceMode};
+use agentype_core::{
+    ExecutionId, ExecutionLaunchSnapshot, ExecutionState, FailureClass, RequestId, WorkspaceMode,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,6 +47,24 @@ pub struct ExecutionRequest {
     pub prompt: String,
     pub payload: Value,
     pub incarnation_runtime_handle: RuntimeHandle,
+}
+
+impl ExecutionRequest {
+    pub fn from_launch(
+        launch: &ExecutionLaunchSnapshot,
+        incarnation_runtime_handle: RuntimeHandle,
+    ) -> Self {
+        Self {
+            request_id: launch.request_id.clone(),
+            execution_id: launch.execution_id.clone(),
+            execution_target: launch.execution_target.clone(),
+            execution_profile: launch.execution_profile.clone(),
+            workspace_mode: launch.workspace_mode,
+            prompt: launch.prompt.clone(),
+            payload: launch.payload.clone(),
+            incarnation_runtime_handle,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -284,5 +304,40 @@ mod tests {
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
         assert!(!rec.quiescent_confirmed);
+    }
+
+    #[test]
+    fn execution_request_constructed_from_launch_snapshot() {
+        let launch = ExecutionLaunchSnapshot {
+            execution_id: ExecutionId::new(),
+            request_id: RequestId::new(),
+            task_id: agentype_core::TaskId::new(),
+            batch_id: agentype_core::BatchId::new(),
+            attempt_id: agentype_core::AttemptId::new(),
+            attempt_number: 1,
+            lease_id: agentype_core::LeaseId::new(),
+            lease_epoch: agentype_core::LeaseEpoch(1),
+            lease_expires_at: 100.0,
+            logical_agent_id: agentype_core::LogicalAgentId::new(),
+            incarnation_id: agentype_core::IncarnationId::new(),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+            workspace_mode: WorkspaceMode::ReadOnly,
+            prompt: "task-prompt".to_string(),
+            payload: serde_json::json!({"key": "val"}),
+            acceptance: serde_json::json!({}),
+            workstream_id: None,
+            attempt_isolation: false,
+        };
+        let handle = RuntimeHandle(serde_json::json!({"proc": 42}));
+        let req = ExecutionRequest::from_launch(&launch, handle.clone());
+        assert_eq!(req.request_id, launch.request_id);
+        assert_eq!(req.execution_id, launch.execution_id);
+        assert_eq!(req.execution_target, "local");
+        assert_eq!(req.execution_profile, "default");
+        assert_eq!(req.workspace_mode, WorkspaceMode::ReadOnly);
+        assert_eq!(req.prompt, "task-prompt");
+        assert_eq!(req.payload, serde_json::json!({"key": "val"}));
+        assert_eq!(req.incarnation_runtime_handle, handle);
     }
 }

@@ -844,9 +844,9 @@ impl Kernel {
         &self,
         claim: &Claim,
         attempt_isolation: bool,
-    ) -> Result<(ExecutionId, RequestId), Error> {
+    ) -> Result<ExecutionLaunchSnapshot, Error> {
         self.tx(|tx, now| {
-            let (attempt, _, _task) =
+            let (attempt, lease, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
             if claim.task_id.as_str() != attempt.task_id {
                 return Err(Error::invalid_authority(
@@ -915,7 +915,32 @@ impl Kernel {
                 ],
             )
             .map_err(map_sqlite)?;
-            Ok((execution_id, request_id))
+
+            let payload = json_load(&task.payload_json)?;
+            let acceptance = json_load(&task.acceptance_json)?;
+            let workspace_mode = WorkspaceMode::parse_sql(&task.workspace_mode)?;
+
+            Ok(ExecutionLaunchSnapshot {
+                execution_id,
+                request_id,
+                task_id: TaskId::from_string(&attempt.task_id),
+                batch_id: BatchId::from_string(&task.batch_id),
+                attempt_id: AttemptId::from_string(&attempt.id),
+                attempt_number: attempt.attempt_number as u32,
+                lease_id: LeaseId::from_string(&lease.id),
+                lease_epoch: LeaseEpoch(lease.epoch),
+                lease_expires_at: lease.expires_at,
+                logical_agent_id: LogicalAgentId::from_string(&attempt.logical_agent_id),
+                incarnation_id: IncarnationId::from_string(&incarnation_id),
+                execution_target: attempt.execution_target,
+                execution_profile: attempt.execution_profile,
+                workspace_mode,
+                prompt: task.name,
+                payload,
+                acceptance,
+                workstream_id: task.workstream_id.map(WorkstreamId::from_string),
+                attempt_isolation,
+            })
         })
     }
 
