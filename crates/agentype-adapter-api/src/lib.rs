@@ -4,7 +4,8 @@
 //! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
 
 use agentype_core::{
-    ExecutionId, ExecutionLaunchSnapshot, ExecutionState, FailureClass, RequestId, WorkspaceMode,
+    CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot, ExecutionState,
+    FailureClass, RequestId, WorkspaceMode,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -39,14 +40,15 @@ pub struct RuntimeHandle(pub Value);
 
 #[derive(Clone, Debug)]
 pub struct ExecutionRequest {
-    pub request_id: RequestId,
-    pub execution_id: ExecutionId,
-    pub execution_target: String,
-    pub execution_profile: String,
-    pub workspace_mode: WorkspaceMode,
-    pub prompt: String,
-    pub payload: Value,
-    pub incarnation_runtime_handle: RuntimeHandle,
+    request_id: RequestId,
+    execution_id: ExecutionId,
+    execution_target: String,
+    execution_profile: String,
+    workspace_mode: WorkspaceMode,
+    prompt: String,
+    payload: Value,
+    continuity: CommittedContinuitySnapshot,
+    incarnation_runtime_handle: RuntimeHandle,
 }
 
 impl ExecutionRequest {
@@ -55,15 +57,78 @@ impl ExecutionRequest {
         incarnation_runtime_handle: RuntimeHandle,
     ) -> Self {
         Self {
-            request_id: launch.request_id.clone(),
-            execution_id: launch.execution_id.clone(),
-            execution_target: launch.execution_target.clone(),
-            execution_profile: launch.execution_profile.clone(),
-            workspace_mode: launch.workspace_mode,
-            prompt: launch.prompt.clone(),
-            payload: launch.payload.clone(),
+            request_id: launch.request_id().clone(),
+            execution_id: launch.execution_id().clone(),
+            execution_target: launch.execution_target().to_string(),
+            execution_profile: launch.execution_profile().to_string(),
+            workspace_mode: launch.workspace_mode(),
+            prompt: launch.prompt().to_string(),
+            payload: launch.payload().clone(),
+            continuity: launch.continuity().clone(),
             incarnation_runtime_handle,
         }
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_testing(
+        request_id: RequestId,
+        execution_id: ExecutionId,
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+        workspace_mode: WorkspaceMode,
+        prompt: impl Into<String>,
+        payload: Value,
+        continuity: CommittedContinuitySnapshot,
+        incarnation_runtime_handle: RuntimeHandle,
+    ) -> Self {
+        Self {
+            request_id,
+            execution_id,
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            workspace_mode,
+            prompt: prompt.into(),
+            payload,
+            continuity,
+            incarnation_runtime_handle,
+        }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn execution_target(&self) -> &str {
+        &self.execution_target
+    }
+
+    pub fn execution_profile(&self) -> &str {
+        &self.execution_profile
+    }
+
+    pub fn workspace_mode(&self) -> WorkspaceMode {
+        self.workspace_mode
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn continuity(&self) -> &CommittedContinuitySnapshot {
+        &self.continuity
+    }
+
+    pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
+        &self.incarnation_runtime_handle
     }
 }
 
@@ -153,15 +218,15 @@ impl ExecutionAdapter for FakeAdapter {
         if g.unavailable {
             return Err(AdapterError::Unavailable(format!(
                 "target {} unavailable",
-                request.execution_target
+                request.execution_target()
             )));
         }
         let handle = RuntimeHandle(serde_json::json!({
             "fake": true,
-            "request_id": request.request_id.as_str(),
+            "request_id": request.request_id().as_str(),
         }));
         g.by_request
-            .insert(request.request_id.as_str().to_string(), handle.clone());
+            .insert(request.request_id().as_str().to_string(), handle.clone());
         Ok(g.next_start.take().unwrap_or(StartObservation {
             state: ExecutionState::Running,
             runtime_handle: handle,
@@ -247,25 +312,27 @@ impl ExecutionAdapter for FakeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentype_core::FrozenExecutionSafety;
 
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest {
-            request_id: RequestId::new(),
-            execution_id: ExecutionId::new(),
-            execution_target: "local".into(),
-            execution_profile: "default".into(),
-            workspace_mode: WorkspaceMode::ReadOnly,
-            prompt: "hi".into(),
-            payload: Value::Null,
-            incarnation_runtime_handle: RuntimeHandle::default(),
-        };
+        let req = ExecutionRequest::for_testing(
+            RequestId::new(),
+            ExecutionId::new(),
+            "local",
+            "default",
+            WorkspaceMode::ReadOnly,
+            "hi",
+            Value::Null,
+            CommittedContinuitySnapshot::stateless(),
+            RuntimeHandle::default(),
+        );
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
         let rec = fake
-            .reconcile_start(&req.request_id, Some(&start.runtime_handle))
+            .reconcile_start(req.request_id(), Some(&start.runtime_handle))
             .unwrap();
         assert!(rec.ambiguous);
         assert!(!rec.quiescent_confirmed);
@@ -274,23 +341,24 @@ mod tests {
     #[test]
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest {
-            request_id: RequestId::new(),
-            execution_id: ExecutionId::new(),
-            execution_target: "local".into(),
-            execution_profile: "default".into(),
-            workspace_mode: WorkspaceMode::ReadOnly,
-            prompt: "hi".into(),
-            payload: Value::Null,
-            incarnation_runtime_handle: RuntimeHandle::default(),
-        };
+        let req = ExecutionRequest::for_testing(
+            RequestId::new(),
+            ExecutionId::new(),
+            "local",
+            "default",
+            WorkspaceMode::ReadOnly,
+            "hi",
+            Value::Null,
+            CommittedContinuitySnapshot::stateless(),
+            RuntimeHandle::default(),
+        );
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
         // identity was persisted. Reconciliation must locate the runtime by
         // request identity alone (spec 07: reconcile_start is UNCHANGED from
         // V0.1 and takes request_id + optional persisted handle).
-        let rec = fake.reconcile_start(&req.request_id, None).unwrap();
+        let rec = fake.reconcile_start(req.request_id(), None).unwrap();
         assert_eq!(rec.runtime_handle, start.runtime_handle);
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
@@ -308,36 +376,50 @@ mod tests {
 
     #[test]
     fn execution_request_constructed_from_launch_snapshot() {
-        let launch = ExecutionLaunchSnapshot {
-            execution_id: ExecutionId::new(),
-            request_id: RequestId::new(),
-            task_id: agentype_core::TaskId::new(),
-            batch_id: agentype_core::BatchId::new(),
-            attempt_id: agentype_core::AttemptId::new(),
-            attempt_number: 1,
-            lease_id: agentype_core::LeaseId::new(),
-            lease_epoch: agentype_core::LeaseEpoch(1),
-            lease_expires_at: 100.0,
-            logical_agent_id: agentype_core::LogicalAgentId::new(),
-            incarnation_id: agentype_core::IncarnationId::new(),
-            execution_target: "local".to_string(),
-            execution_profile: "default".to_string(),
-            workspace_mode: WorkspaceMode::ReadOnly,
-            prompt: "task-prompt".to_string(),
-            payload: serde_json::json!({"key": "val"}),
-            acceptance: serde_json::json!({}),
-            workstream_id: None,
-            attempt_isolation: false,
-        };
+        let launch = ExecutionLaunchSnapshot::from_kernel_authority(
+            ExecutionId::new(),
+            RequestId::new(),
+            agentype_core::TaskId::new(),
+            agentype_core::BatchId::new(),
+            agentype_core::AttemptId::new(),
+            1,
+            agentype_core::LeaseId::new(),
+            agentype_core::LeaseEpoch(1),
+            100.0,
+            agentype_core::LogicalAgentId::new(),
+            agentype_core::IncarnationId::new(),
+            "local".to_string(),
+            "default".to_string(),
+            WorkspaceMode::ReadOnly,
+            "task-prompt".to_string(),
+            serde_json::json!({"key": "val"}),
+            serde_json::json!({}),
+            None,
+            CommittedContinuitySnapshot::new(
+                agentype_core::ContinuityPreference::Required,
+                3,
+                serde_json::json!({"state": "saved"}),
+            ),
+            FrozenExecutionSafety::UNISOLATED,
+        );
         let handle = RuntimeHandle(serde_json::json!({"proc": 42}));
         let req = ExecutionRequest::from_launch(&launch, handle.clone());
-        assert_eq!(req.request_id, launch.request_id);
-        assert_eq!(req.execution_id, launch.execution_id);
-        assert_eq!(req.execution_target, "local");
-        assert_eq!(req.execution_profile, "default");
-        assert_eq!(req.workspace_mode, WorkspaceMode::ReadOnly);
-        assert_eq!(req.prompt, "task-prompt");
-        assert_eq!(req.payload, serde_json::json!({"key": "val"}));
-        assert_eq!(req.incarnation_runtime_handle, handle);
+        assert_eq!(req.request_id(), launch.request_id());
+        assert_eq!(req.execution_id(), launch.execution_id());
+        assert_eq!(req.execution_target(), "local");
+        assert_eq!(req.execution_profile(), "default");
+        assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
+        assert_eq!(req.prompt(), "task-prompt");
+        assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
+        assert_eq!(req.continuity().version(), 3);
+        assert_eq!(
+            req.continuity().capsule(),
+            &serde_json::json!({"state": "saved"})
+        );
+        assert_eq!(
+            req.continuity().preference(),
+            agentype_core::ContinuityPreference::Required
+        );
+        assert_eq!(req.incarnation_runtime_handle(), &handle);
     }
 }

@@ -247,33 +247,227 @@ pub struct ExecutionRecord {
     pub quiescent_confirmed: bool,
 }
 
+/// Monotonic committed continuity snapshot for an authoritative launch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommittedContinuitySnapshot {
+    preference: ContinuityPreference,
+    version: i64,
+    capsule: Value,
+}
+
+impl CommittedContinuitySnapshot {
+    pub fn new(preference: ContinuityPreference, version: i64, capsule: Value) -> Self {
+        Self {
+            preference,
+            version,
+            capsule,
+        }
+    }
+
+    pub fn stateless() -> Self {
+        Self {
+            preference: ContinuityPreference::None,
+            version: 0,
+            capsule: Value::Null,
+        }
+    }
+
+    pub fn preference(&self) -> ContinuityPreference {
+        self.preference
+    }
+
+    pub fn version(&self) -> i64 {
+        self.version
+    }
+
+    pub fn capsule(&self) -> &Value {
+        &self.capsule
+    }
+}
+
+/// Strongly-typed safety guarantee frozen at execution creation.
+///
+/// Indicates whether the physical execution environment guarantees attempt-scoped
+/// isolation against writer concurrency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FrozenExecutionSafety {
+    attempt_isolation: bool,
+}
+
+impl FrozenExecutionSafety {
+    pub const UNISOLATED: Self = Self {
+        attempt_isolation: false,
+    };
+
+    pub const fn from_isolated_fact(attempt_isolation: bool) -> Self {
+        Self { attempt_isolation }
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+}
+
 /// Authoritative launch snapshot reconstructed from durable Scheduler state.
 ///
-/// This object is produced by the Execution creation transaction and MUST NOT
-/// trust caller-held Claim copies of task semantics (payload, workspace mode,
-/// acceptance, or workstream). Physical execution requests are built strictly
-/// from this snapshot.
+/// This object is produced exclusively by the Execution creation transaction and
+/// encapsulates all execution parameters as private, readonly fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionLaunchSnapshot {
-    pub execution_id: ExecutionId,
-    pub request_id: RequestId,
-    pub task_id: TaskId,
-    pub batch_id: BatchId,
-    pub attempt_id: AttemptId,
-    pub attempt_number: u32,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
-    pub lease_expires_at: UnixTime,
-    pub logical_agent_id: LogicalAgentId,
-    pub incarnation_id: IncarnationId,
-    pub execution_target: String,
-    pub execution_profile: String,
-    pub workspace_mode: WorkspaceMode,
-    pub prompt: String,
-    pub payload: Value,
-    pub acceptance: Value,
-    pub workstream_id: Option<WorkstreamId>,
-    pub attempt_isolation: bool,
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    task_id: TaskId,
+    batch_id: BatchId,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    lease_id: LeaseId,
+    lease_epoch: LeaseEpoch,
+    lease_expires_at: UnixTime,
+    logical_agent_id: LogicalAgentId,
+    incarnation_id: IncarnationId,
+    execution_target: String,
+    execution_profile: String,
+    workspace_mode: WorkspaceMode,
+    prompt: String,
+    payload: Value,
+    acceptance: Value,
+    workstream_id: Option<WorkstreamId>,
+    continuity: CommittedContinuitySnapshot,
+    safety: FrozenExecutionSafety,
+}
+
+impl ExecutionLaunchSnapshot {
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_kernel_authority(
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        task_id: TaskId,
+        batch_id: BatchId,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        lease_expires_at: UnixTime,
+        logical_agent_id: LogicalAgentId,
+        incarnation_id: IncarnationId,
+        execution_target: String,
+        execution_profile: String,
+        workspace_mode: WorkspaceMode,
+        prompt: String,
+        payload: Value,
+        acceptance: Value,
+        workstream_id: Option<WorkstreamId>,
+        continuity: CommittedContinuitySnapshot,
+        safety: FrozenExecutionSafety,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_id,
+            task_id,
+            batch_id,
+            attempt_id,
+            attempt_number,
+            lease_id,
+            lease_epoch,
+            lease_expires_at,
+            logical_agent_id,
+            incarnation_id,
+            execution_target,
+            execution_profile,
+            workspace_mode,
+            prompt,
+            payload,
+            acceptance,
+            workstream_id,
+            continuity,
+            safety,
+        }
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn batch_id(&self) -> &BatchId {
+        &self.batch_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+
+    pub fn lease_id(&self) -> &LeaseId {
+        &self.lease_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    pub fn lease_expires_at(&self) -> UnixTime {
+        self.lease_expires_at
+    }
+
+    pub fn logical_agent_id(&self) -> &LogicalAgentId {
+        &self.logical_agent_id
+    }
+
+    pub fn incarnation_id(&self) -> &IncarnationId {
+        &self.incarnation_id
+    }
+
+    pub fn execution_target(&self) -> &str {
+        &self.execution_target
+    }
+
+    pub fn execution_profile(&self) -> &str {
+        &self.execution_profile
+    }
+
+    pub fn workspace_mode(&self) -> WorkspaceMode {
+        self.workspace_mode
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn acceptance(&self) -> &Value {
+        &self.acceptance
+    }
+
+    pub fn workstream_id(&self) -> Option<&WorkstreamId> {
+        self.workstream_id.as_ref()
+    }
+
+    pub fn continuity(&self) -> &CommittedContinuitySnapshot {
+        &self.continuity
+    }
+
+    pub fn safety(&self) -> FrozenExecutionSafety {
+        self.safety
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.safety.attempt_isolation()
+    }
 }
 
 #[derive(Clone, Debug)]

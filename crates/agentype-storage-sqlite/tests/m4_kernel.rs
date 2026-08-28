@@ -291,8 +291,10 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
     let Env { k, clock } = memory_env();
     let (_b, _ids) = k.submit_batch(&[read_task("near-deadline")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
-    let launch = k.create_execution(&claim, false).unwrap();
-    let execution_id = launch.execution_id;
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let execution_id = launch.execution_id().clone();
     clock.advance(9.5);
     let expires = k
         .confirm_running_and_renew(
@@ -536,8 +538,10 @@ fn unresolved_physical_outcome_rejects_proof_bits() {
     let Env { k, .. } = memory_env();
     let (_b, _ids) = k.submit_batch(&[read_task("amb")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
-    let launch = k.create_execution(&claim, false).unwrap();
-    let execution_id = launch.execution_id;
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let execution_id = launch.execution_id().clone();
 
     let err = k
         .record_physical_outcome(
@@ -688,8 +692,11 @@ fn unresolved_record_clears_stored_proof() {
     let env = file_env(&db);
     let (_b, _ids) = env.k.submit_batch(&[read_task("stale-proof")]).unwrap();
     let claim = env.k.claim_next_available().unwrap().unwrap();
-    let launch = env.k.create_execution(&claim, false).unwrap();
-    let execution_id = launch.execution_id;
+    let launch = env
+        .k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let execution_id = launch.execution_id().clone();
     // Simulate corrupted pre-fix history below the API boundary...
     fixture_execution(&db, &execution_id, "STARTING", true, false);
     // ...then an authoritative nonterminal observation must clear it.
@@ -732,8 +739,11 @@ fn multi_task_batch_partial_completion_and_suspension() {
     // by task identity so the writer ends SUSPENDED (success without
     // quiescence proof) and the read task completes when claimable.
     let first = env.k.claim_next_available().unwrap().unwrap();
-    let launch1 = env.k.create_execution(&first, false).unwrap();
-    let exec1 = launch1.execution_id;
+    let launch1 = env
+        .k
+        .create_execution(&first, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let exec1 = launch1.execution_id().clone();
     env.k
         .confirm_running_and_renew(&first.attempt_id, first.lease_epoch, &exec1, &json!({}))
         .unwrap();
@@ -763,8 +773,11 @@ fn multi_task_batch_partial_completion_and_suspension() {
             .unwrap();
         assert_eq!(env.k.batch(&batch).unwrap().state, BatchState::Active);
         let second = env.k.claim_next_available().unwrap().unwrap();
-        let launch2 = env.k.create_execution(&second, false).unwrap();
-        let exec2 = launch2.execution_id;
+        let launch2 = env
+            .k
+            .create_execution(&second, FrozenExecutionSafety::UNISOLATED)
+            .unwrap();
+        let exec2 = launch2.execution_id().clone();
         env.k
             .confirm_running_and_renew(&second.attempt_id, second.lease_epoch, &exec2, &json!({}))
             .unwrap();
@@ -867,8 +880,11 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     // complete the read sibling cleanly, then cancel the writer with unknown
     // quiescence to open the obligation and suspend the batch.
     let first = env.k.claim_next_available().unwrap().unwrap();
-    let launch1 = env.k.create_execution(&first, false).unwrap();
-    let exec1 = launch1.execution_id;
+    let launch1 = env
+        .k
+        .create_execution(&first, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let exec1 = launch1.execution_id().clone();
     env.k
         .confirm_running_and_renew(&first.attempt_id, first.lease_epoch, &exec1, &json!({}))
         .unwrap();
@@ -888,8 +904,11 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
             .unwrap();
         assert_eq!(env.k.batch(&batch).unwrap().state, BatchState::Active);
         let second = env.k.claim_next_available().unwrap().unwrap();
-        let launch2 = env.k.create_execution(&second, false).unwrap();
-        let exec2 = launch2.execution_id;
+        let launch2 = env
+            .k
+            .create_execution(&second, FrozenExecutionSafety::UNISOLATED)
+            .unwrap();
+        let exec2 = launch2.execution_id().clone();
         env.k
             .confirm_running_and_renew(&second.attempt_id, second.lease_epoch, &exec2, &json!({}))
             .unwrap();
@@ -1004,8 +1023,10 @@ fn heartbeat_requires_running_execution() {
         .heartbeat(&claim.attempt_id, claim.lease_epoch)
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
-    let launch = k.create_execution(&claim, false).unwrap();
-    let execution_id = launch.execution_id;
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let execution_id = launch.execution_id().clone();
     let err = k
         .heartbeat(&claim.attempt_id, claim.lease_epoch)
         .unwrap_err();
@@ -1122,8 +1143,10 @@ fn partial_batch_cancellation_preserves_completed_task_and_result() {
 
     // Claim and complete one task
     let claim_a = k.claim_next_available().unwrap().unwrap();
-    let launch_a = k.create_execution(&claim_a, false).unwrap();
-    let exec_a = launch_a.execution_id;
+    let launch_a = k
+        .create_execution(&claim_a, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let exec_a = launch_a.execution_id().clone();
     k.confirm_running_and_renew(
         &claim_a.attempt_id,
         claim_a.lease_epoch,
@@ -1187,30 +1210,40 @@ fn create_execution_rejects_tampered_claim_identities() {
     // Mutate task_id to a different ID
     let mut bad_task_claim = claim.clone();
     bad_task_claim.task_id = TaskId::new();
-    let err = k.create_execution(&bad_task_claim, false).unwrap_err();
+    let err = k
+        .create_execution(&bad_task_claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Mutate logical_agent_id
     let mut bad_agent_claim = claim.clone();
     bad_agent_claim.logical_agent_id = LogicalAgentId::new();
-    let err = k.create_execution(&bad_agent_claim, false).unwrap_err();
+    let err = k
+        .create_execution(&bad_agent_claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Mutate execution_target
     let mut bad_target_claim = claim.clone();
     bad_target_claim.execution_target = "foreign-target".to_string();
-    let err = k.create_execution(&bad_target_claim, false).unwrap_err();
+    let err = k
+        .create_execution(&bad_target_claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Mutate execution_profile
     let mut bad_profile_claim = claim.clone();
     bad_profile_claim.execution_profile = "foreign-profile".to_string();
-    let err = k.create_execution(&bad_profile_claim, false).unwrap_err();
+    let err = k
+        .create_execution(&bad_profile_claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Original valid claim succeeds
-    let launch = k.create_execution(&claim, false).unwrap();
-    let exec_id = launch.execution_id;
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let exec_id = launch.execution_id().clone();
     assert!(!exec_id.as_str().is_empty());
 }
 
@@ -1254,8 +1287,11 @@ fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
     let env = file_env(&db);
     let (_b, _ids) = env.k.submit_batch(&[read_task("db-check")]).unwrap();
     let claim = env.k.claim_next_available().unwrap().unwrap();
-    let launch = env.k.create_execution(&claim, false).unwrap();
-    let exec_id = launch.execution_id;
+    let launch = env
+        .k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    let exec_id = launch.execution_id().clone();
 
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     // Raw UPDATE setting quiescent_confirmed=1 and terminal_confirmed=0 must violate CHECK constraint
@@ -1404,10 +1440,12 @@ fn mutated_claim_payload_does_not_alter_launch_snapshot() {
     claim.payload = json!({"injected_key": "malicious_tampered_value"});
 
     // Authoritative launch snapshot MUST contain the durable payload
-    let launch = k.create_execution(&claim, false).unwrap();
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
     assert_eq!(
-        launch.payload,
-        json!({"original_key": "authoritative_value"})
+        launch.payload(),
+        &json!({"original_key": "authoritative_value"})
     );
 }
 
@@ -1424,8 +1462,13 @@ fn mutated_claim_acceptance_does_not_alter_launch_snapshot() {
     claim.acceptance = json!({"criteria": "bypassed"});
 
     // Authoritative launch snapshot MUST contain durable acceptance
-    let launch = k.create_execution(&claim, false).unwrap();
-    assert_eq!(launch.acceptance, json!({"criteria": "strict_validation"}));
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    assert_eq!(
+        launch.acceptance(),
+        &json!({"criteria": "strict_validation"})
+    );
 }
 
 #[test]
@@ -1439,8 +1482,10 @@ fn mutated_claim_workspace_mode_cannot_widen_launch_authority() {
     claim.workspace_mode = WorkspaceMode::Write;
 
     // Authoritative launch snapshot MUST remain ReadOnly
-    let launch = k.create_execution(&claim, false).unwrap();
-    assert_eq!(launch.workspace_mode, WorkspaceMode::ReadOnly);
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    assert_eq!(launch.workspace_mode(), WorkspaceMode::ReadOnly);
 }
 
 #[test]
@@ -1454,8 +1499,10 @@ fn mutated_claim_workstream_does_not_alter_launch_snapshot() {
     claim.workstream_id = Some(WorkstreamId::from_string("forged-workstream"));
 
     // Authoritative launch snapshot MUST remain None
-    let launch = k.create_execution(&claim, false).unwrap();
-    assert!(launch.workstream_id.is_none());
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    assert!(launch.workstream_id().is_none());
 }
 
 #[test]
@@ -1464,18 +1511,24 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     let (_b, _ids) = k.submit_batch(&[write_task("isolated-task")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
 
-    let launch = k.create_execution(&claim, true).unwrap();
-    assert_eq!(launch.task_id, claim.task_id);
-    assert_eq!(launch.attempt_id, claim.attempt_id);
-    assert_eq!(launch.logical_agent_id, claim.logical_agent_id);
-    assert!(launch.attempt_isolation);
+    let launch = k
+        .create_execution(&claim, FrozenExecutionSafety::from_isolated_fact(true))
+        .unwrap();
+    assert_eq!(launch.task_id(), &claim.task_id);
+    assert_eq!(launch.attempt_id(), &claim.attempt_id);
+    assert_eq!(launch.logical_agent_id(), &claim.logical_agent_id);
+    assert!(launch.attempt_isolation());
+    assert_eq!(
+        launch.safety(),
+        FrozenExecutionSafety::from_isolated_fact(true)
+    );
 
-    let exec = k.execution(&launch.execution_id).unwrap();
-    assert_eq!(exec.id, launch.execution_id);
-    assert_eq!(exec.attempt_id, launch.attempt_id);
-    assert_eq!(exec.incarnation_id, launch.incarnation_id);
-    assert_eq!(exec.execution_target, launch.execution_target);
-    assert_eq!(exec.execution_profile, launch.execution_profile);
+    let exec = k.execution(launch.execution_id()).unwrap();
+    assert_eq!(&exec.id, launch.execution_id());
+    assert_eq!(&exec.attempt_id, launch.attempt_id());
+    assert_eq!(&exec.incarnation_id, launch.incarnation_id());
+    assert_eq!(exec.execution_target.as_str(), launch.execution_target());
+    assert_eq!(exec.execution_profile.as_str(), launch.execution_profile());
     assert!(exec.attempt_isolation);
 }
 
@@ -1490,6 +1543,56 @@ fn expired_lease_cannot_create_execution_before_expiry_sweep() {
     assert!(clock.now() > claim.lease_expires_at);
 
     // create_execution must fail closed on expired authority
-    let err = k.create_execution(&claim, false).unwrap_err();
+    let err = k
+        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
+}
+
+#[test]
+fn launch_snapshot_carries_committed_continuity_and_preference() {
+    let Env { k, .. } = memory_env();
+    let ws = k.create_workstream("ws-test", None, None).unwrap();
+
+    // 1. Submit first task to establish a logical agent and promote a checkpoint
+    let spec1 = retryable_read("task-1").workstream(ws.clone());
+    let (_b1, _task1, claim1, exec1) = run_claim(&k, spec1, false);
+    k.promote_checkpoint(
+        &claim1.attempt_id,
+        claim1.lease_epoch,
+        &json!({"CURRENT CHECKPOINT": "step_1_finished"}),
+    )
+    .unwrap();
+    k.ack_success(
+        &claim1.attempt_id,
+        claim1.lease_epoch,
+        Some(&exec1),
+        &json!({"ok": true}),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+
+    // 2. Submit second task demanding REQUIRED continuity in the same workstream
+    let spec2 = TaskSpec::new("task-2", json!({"step": 2}))
+        .workstream(ws)
+        .continuity(ContinuityPreference::Required);
+    let (_b2, _ids2) = k.submit_batch(&[spec2]).unwrap();
+    let claim2 = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim2.logical_agent_id, claim1.logical_agent_id);
+
+    // 3. create_execution must bundle the agent's committed continuity capsule & monotonic version
+    let launch2 = k
+        .create_execution(&claim2, FrozenExecutionSafety::UNISOLATED)
+        .unwrap();
+    assert_eq!(
+        launch2.continuity().preference(),
+        ContinuityPreference::Required
+    );
+    assert_eq!(launch2.continuity().version(), 1);
+    assert_eq!(
+        launch2.continuity().capsule(),
+        &json!({"CURRENT CHECKPOINT": "step_1_finished"})
+    );
 }

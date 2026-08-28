@@ -198,6 +198,23 @@ impl Kernel {
         })
     }
 
+    pub fn create_workstream(
+        &self,
+        name: &str,
+        project_state_ref: Option<&str>,
+        workstream_id: Option<WorkstreamId>,
+    ) -> Result<WorkstreamId, Error> {
+        let id = workstream_id.unwrap_or_default();
+        self.tx(|tx, now| {
+            tx.execute(
+                "INSERT INTO workstreams(id,name,project_state_ref,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+                params![id.as_str(), name, project_state_ref, now],
+            )
+            .map_err(map_sqlite)?;
+            Ok(id)
+        })
+    }
+
     pub fn resize_partition(&self, name: &str, desired_capacity: i64) -> Result<i64, Error> {
         if desired_capacity < 0 {
             return Err(Error::invalid_transition(
@@ -843,7 +860,7 @@ impl Kernel {
     pub fn create_execution(
         &self,
         claim: &Claim,
-        attempt_isolation: bool,
+        safety: FrozenExecutionSafety,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
         self.tx(|tx, now| {
             let (attempt, lease, task) =
@@ -898,6 +915,7 @@ impl Kernel {
             .map_err(map_sqlite)?;
             let execution_id = ExecutionId::new();
             let request_id = RequestId::new();
+            let attempt_isolation = safety.attempt_isolation();
             tx.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,
                  execution_profile,attempt_isolation,state,started_at,updated_at)
@@ -920,27 +938,37 @@ impl Kernel {
             let acceptance = json_load(&task.acceptance_json)?;
             let workspace_mode = WorkspaceMode::parse_sql(&task.workspace_mode)?;
 
-            Ok(ExecutionLaunchSnapshot {
+            let agent = required_agent(tx, &attempt.logical_agent_id)?;
+            let continuity_capsule = json_load(&agent.continuity_json)?;
+            let continuity_pref = ContinuityPreference::parse_sql(&task.continuity)?;
+            let continuity = CommittedContinuitySnapshot::new(
+                continuity_pref,
+                agent.continuity_version,
+                continuity_capsule,
+            );
+
+            Ok(ExecutionLaunchSnapshot::from_kernel_authority(
                 execution_id,
                 request_id,
-                task_id: TaskId::from_string(&attempt.task_id),
-                batch_id: BatchId::from_string(&task.batch_id),
-                attempt_id: AttemptId::from_string(&attempt.id),
-                attempt_number: attempt.attempt_number as u32,
-                lease_id: LeaseId::from_string(&lease.id),
-                lease_epoch: LeaseEpoch(lease.epoch),
-                lease_expires_at: lease.expires_at,
-                logical_agent_id: LogicalAgentId::from_string(&attempt.logical_agent_id),
-                incarnation_id: IncarnationId::from_string(&incarnation_id),
-                execution_target: attempt.execution_target,
-                execution_profile: attempt.execution_profile,
+                TaskId::from_string(&attempt.task_id),
+                BatchId::from_string(&task.batch_id),
+                AttemptId::from_string(&attempt.id),
+                attempt.attempt_number as u32,
+                LeaseId::from_string(&lease.id),
+                LeaseEpoch(lease.epoch),
+                lease.expires_at,
+                LogicalAgentId::from_string(&attempt.logical_agent_id),
+                IncarnationId::from_string(&incarnation_id),
+                attempt.execution_target,
+                attempt.execution_profile,
                 workspace_mode,
-                prompt: task.name,
+                task.name,
                 payload,
                 acceptance,
-                workstream_id: task.workstream_id.map(WorkstreamId::from_string),
-                attempt_isolation,
-            })
+                task.workstream_id.map(WorkstreamId::from_string),
+                continuity,
+                safety,
+            ))
         })
     }
 

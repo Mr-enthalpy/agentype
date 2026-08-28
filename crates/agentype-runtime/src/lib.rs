@@ -1,7 +1,7 @@
 //! M5 runtime configuration boundary and M4 recovery orchestration.
 //! Dispatcher/heartbeat/notifier loops belong to subsequent M5 tasks.
 
-use agentype_core::{Error, ExpireReport};
+use agentype_core::{Error, ExpireReport, FrozenExecutionSafety};
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,14 +11,20 @@ use std::collections::HashMap;
 pub struct ExecutionTargetConfig {
     pub name: String,
     pub adapter_kind: String,
+    pub supports_isolation: bool,
     pub options: Value,
 }
 
 impl ExecutionTargetConfig {
-    pub fn new(name: impl Into<String>, adapter_kind: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        adapter_kind: impl Into<String>,
+        supports_isolation: bool,
+    ) -> Self {
         Self {
             name: name.into(),
             adapter_kind: adapter_kind.into(),
+            supports_isolation,
             options: Value::Null,
         }
     }
@@ -29,20 +35,20 @@ impl ExecutionTargetConfig {
     }
 }
 
-/// Configuration for an execution profile (model settings, attempt isolation, timeouts).
+/// Configuration for an execution profile (model settings, required isolation, timeouts).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionProfileConfig {
     pub name: String,
-    pub attempt_isolation: bool,
+    pub requires_isolation: bool,
     pub timeout_seconds: Option<f64>,
     pub options: Value,
 }
 
 impl ExecutionProfileConfig {
-    pub fn new(name: impl Into<String>, attempt_isolation: bool) -> Self {
+    pub fn new(name: impl Into<String>, requires_isolation: bool) -> Self {
         Self {
             name: name.into(),
-            attempt_isolation,
+            requires_isolation,
             timeout_seconds: None,
             options: Value::Null,
         }
@@ -96,6 +102,12 @@ pub struct ResolvedExecutionEnvironment {
     pub attempt_isolation: bool,
 }
 
+impl ResolvedExecutionEnvironment {
+    pub fn safety(&self) -> FrozenExecutionSafety {
+        FrozenExecutionSafety::from_isolated_fact(self.attempt_isolation)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionError {
     TargetNotFound(String),
@@ -125,8 +137,9 @@ impl std::error::Error for ResolutionError {}
 /// 1. If `registry` is `Some`, the registry is strictly authoritative:
 ///    - Missing target -> `ResolutionError::TargetNotFound` (RESOURCE_UNAVAILABLE).
 ///    - Missing profile -> `ResolutionError::ProfileNotFound` (RESOURCE_UNAVAILABLE).
+///    - Incompatible (profile requires isolation but target does not support it) -> `ResolutionError::Incompatible`.
 ///    - No silent fallback to adapter defaults.
-/// 2. If `registry` is `None`, explicit direct-caller mode is used with default values.
+/// 2. If `registry` is `None`, explicit direct-caller mode is used with unisolated defaults.
 pub fn resolve_execution_environment(
     registry: Option<&ExecutionRegistry>,
     target_name: &str,
@@ -140,14 +153,22 @@ pub fn resolve_execution_environment(
             let profile = reg
                 .get_profile(profile_name)
                 .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?;
+
+            if profile.requires_isolation && !target.supports_isolation {
+                return Err(ResolutionError::Incompatible(format!(
+                    "profile '{profile_name}' requires attempt isolation, but target '{target_name}' does not support isolation"
+                )));
+            }
+
+            let attempt_isolation = target.supports_isolation && profile.requires_isolation;
             Ok(ResolvedExecutionEnvironment {
                 target: target.clone(),
                 profile: profile.clone(),
-                attempt_isolation: profile.attempt_isolation,
+                attempt_isolation,
             })
         }
         None => Ok(ResolvedExecutionEnvironment {
-            target: ExecutionTargetConfig::new(target_name, "default"),
+            target: ExecutionTargetConfig::new(target_name, "default", false),
             profile: ExecutionProfileConfig::new(profile_name, false),
             attempt_isolation: false,
         }),
@@ -200,7 +221,7 @@ mod tests {
     #[test]
     fn missing_profile_fails_closed() {
         let mut registry = ExecutionRegistry::new();
-        registry.register_target(ExecutionTargetConfig::new("local", "process"));
+        registry.register_target(ExecutionTargetConfig::new("local", "process", false));
         let err = resolve_execution_environment(Some(&registry), "local", "isolated").unwrap_err();
         assert_eq!(
             err,
@@ -209,9 +230,28 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_target_profile_pair_fails_closed() {
+        let mut registry = ExecutionRegistry::new();
+        // Target does NOT support isolation
+        registry.register_target(ExecutionTargetConfig::new(
+            "local-unisolated",
+            "process",
+            false,
+        ));
+        // Profile REQUIRES isolation
+        registry.register_profile(ExecutionProfileConfig::new("isolated-writer", true));
+
+        let err =
+            resolve_execution_environment(Some(&registry), "local-unisolated", "isolated-writer")
+                .unwrap_err();
+        assert!(matches!(err, ResolutionError::Incompatible(_)));
+        assert!(err.to_string().contains("requires attempt isolation"));
+    }
+
+    #[test]
     fn valid_target_and_profile_resolve_isolation() {
         let mut registry = ExecutionRegistry::new();
-        registry.register_target(ExecutionTargetConfig::new("local-b", "codex"));
+        registry.register_target(ExecutionTargetConfig::new("local-b", "codex", true));
         registry.register_profile(ExecutionProfileConfig::new("isolated-writer", true));
 
         let env =
@@ -220,6 +260,10 @@ mod tests {
         assert_eq!(env.target.adapter_kind, "codex");
         assert_eq!(env.profile.name, "isolated-writer");
         assert!(env.attempt_isolation);
+        assert_eq!(
+            env.safety(),
+            FrozenExecutionSafety::from_isolated_fact(true)
+        );
     }
 
     #[test]
@@ -228,5 +272,6 @@ mod tests {
         assert_eq!(env.target.name, "local");
         assert_eq!(env.profile.name, "default");
         assert!(!env.attempt_isolation);
+        assert_eq!(env.safety(), FrozenExecutionSafety::UNISOLATED);
     }
 }
