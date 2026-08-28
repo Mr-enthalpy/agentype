@@ -285,22 +285,43 @@ impl CommittedContinuitySnapshot {
     }
 }
 
-/// Strongly-typed safety guarantee frozen at execution creation.
+/// Strongly-typed safety guarantee bound to a specific execution target and profile.
 ///
-/// Indicates whether the physical execution environment guarantees attempt-scoped
-/// isolation against writer concurrency.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Ensures that the isolation guarantee cannot be decoupled from the target and profile
+/// for which configuration resolution was performed.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenExecutionSafety {
+    execution_target: String,
+    execution_profile: String,
     attempt_isolation: bool,
 }
 
 impl FrozenExecutionSafety {
-    pub const UNISOLATED: Self = Self {
-        attempt_isolation: false,
-    };
+    pub fn new(
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+        attempt_isolation: bool,
+    ) -> Self {
+        Self {
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            attempt_isolation,
+        }
+    }
 
-    pub const fn from_isolated_fact(attempt_isolation: bool) -> Self {
-        Self { attempt_isolation }
+    pub fn unisolated(
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+    ) -> Self {
+        Self::new(execution_target, execution_profile, false)
+    }
+
+    pub fn execution_target(&self) -> &str {
+        &self.execution_target
+    }
+
+    pub fn execution_profile(&self) -> &str {
+        &self.execution_profile
     }
 
     pub fn attempt_isolation(&self) -> bool {
@@ -461,8 +482,8 @@ impl ExecutionLaunchSnapshot {
         &self.continuity
     }
 
-    pub fn safety(&self) -> FrozenExecutionSafety {
-        self.safety
+    pub fn safety(&self) -> &FrozenExecutionSafety {
+        &self.safety
     }
 
     pub fn attempt_isolation(&self) -> bool {

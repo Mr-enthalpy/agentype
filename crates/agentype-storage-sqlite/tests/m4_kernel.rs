@@ -292,7 +292,10 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
     let (_b, _ids) = k.submit_batch(&[read_task("near-deadline")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let execution_id = launch.execution_id().clone();
     clock.advance(9.5);
@@ -539,7 +542,10 @@ fn unresolved_physical_outcome_rejects_proof_bits() {
     let (_b, _ids) = k.submit_batch(&[read_task("amb")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let execution_id = launch.execution_id().clone();
 
@@ -694,7 +700,10 @@ fn unresolved_record_clears_stored_proof() {
     let claim = env.k.claim_next_available().unwrap().unwrap();
     let launch = env
         .k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let execution_id = launch.execution_id().clone();
     // Simulate corrupted pre-fix history below the API boundary...
@@ -741,7 +750,10 @@ fn multi_task_batch_partial_completion_and_suspension() {
     let first = env.k.claim_next_available().unwrap().unwrap();
     let launch1 = env
         .k
-        .create_execution(&first, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &first,
+            FrozenExecutionSafety::unisolated(&first.execution_target, &first.execution_profile),
+        )
         .unwrap();
     let exec1 = launch1.execution_id().clone();
     env.k
@@ -775,7 +787,13 @@ fn multi_task_batch_partial_completion_and_suspension() {
         let second = env.k.claim_next_available().unwrap().unwrap();
         let launch2 = env
             .k
-            .create_execution(&second, FrozenExecutionSafety::UNISOLATED)
+            .create_execution(
+                &second,
+                FrozenExecutionSafety::unisolated(
+                    &second.execution_target,
+                    &second.execution_profile,
+                ),
+            )
             .unwrap();
         let exec2 = launch2.execution_id().clone();
         env.k
@@ -882,7 +900,10 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     let first = env.k.claim_next_available().unwrap().unwrap();
     let launch1 = env
         .k
-        .create_execution(&first, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &first,
+            FrozenExecutionSafety::unisolated(&first.execution_target, &first.execution_profile),
+        )
         .unwrap();
     let exec1 = launch1.execution_id().clone();
     env.k
@@ -906,7 +927,13 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
         let second = env.k.claim_next_available().unwrap().unwrap();
         let launch2 = env
             .k
-            .create_execution(&second, FrozenExecutionSafety::UNISOLATED)
+            .create_execution(
+                &second,
+                FrozenExecutionSafety::unisolated(
+                    &second.execution_target,
+                    &second.execution_profile,
+                ),
+            )
             .unwrap();
         let exec2 = launch2.execution_id().clone();
         env.k
@@ -1024,7 +1051,10 @@ fn heartbeat_requires_running_execution() {
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let execution_id = launch.execution_id().clone();
     let err = k
@@ -1144,7 +1174,13 @@ fn partial_batch_cancellation_preserves_completed_task_and_result() {
     // Claim and complete one task
     let claim_a = k.claim_next_available().unwrap().unwrap();
     let launch_a = k
-        .create_execution(&claim_a, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim_a,
+            FrozenExecutionSafety::unisolated(
+                &claim_a.execution_target,
+                &claim_a.execution_profile,
+            ),
+        )
         .unwrap();
     let exec_a = launch_a.execution_id().clone();
     k.confirm_running_and_renew(
@@ -1211,7 +1247,13 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_task_claim = claim.clone();
     bad_task_claim.task_id = TaskId::new();
     let err = k
-        .create_execution(&bad_task_claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &bad_task_claim,
+            FrozenExecutionSafety::unisolated(
+                &bad_task_claim.execution_target,
+                &bad_task_claim.execution_profile,
+            ),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1219,7 +1261,13 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_agent_claim = claim.clone();
     bad_agent_claim.logical_agent_id = LogicalAgentId::new();
     let err = k
-        .create_execution(&bad_agent_claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &bad_agent_claim,
+            FrozenExecutionSafety::unisolated(
+                &bad_agent_claim.execution_target,
+                &bad_agent_claim.execution_profile,
+            ),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1227,7 +1275,13 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_target_claim = claim.clone();
     bad_target_claim.execution_target = "foreign-target".to_string();
     let err = k
-        .create_execution(&bad_target_claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &bad_target_claim,
+            FrozenExecutionSafety::unisolated(
+                &bad_target_claim.execution_target,
+                &bad_target_claim.execution_profile,
+            ),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1235,13 +1289,22 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_profile_claim = claim.clone();
     bad_profile_claim.execution_profile = "foreign-profile".to_string();
     let err = k
-        .create_execution(&bad_profile_claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &bad_profile_claim,
+            FrozenExecutionSafety::unisolated(
+                &bad_profile_claim.execution_target,
+                &bad_profile_claim.execution_profile,
+            ),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Original valid claim succeeds
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let exec_id = launch.execution_id().clone();
     assert!(!exec_id.as_str().is_empty());
@@ -1289,7 +1352,10 @@ fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
     let claim = env.k.claim_next_available().unwrap().unwrap();
     let launch = env
         .k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let exec_id = launch.execution_id().clone();
 
@@ -1441,7 +1507,10 @@ fn mutated_claim_payload_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST contain the durable payload
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     assert_eq!(
         launch.payload(),
@@ -1463,7 +1532,10 @@ fn mutated_claim_acceptance_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST contain durable acceptance
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     assert_eq!(
         launch.acceptance(),
@@ -1483,7 +1555,10 @@ fn mutated_claim_workspace_mode_cannot_widen_launch_authority() {
 
     // Authoritative launch snapshot MUST remain ReadOnly
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     assert_eq!(launch.workspace_mode(), WorkspaceMode::ReadOnly);
 }
@@ -1500,7 +1575,10 @@ fn mutated_claim_workstream_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST remain None
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     assert!(launch.workstream_id().is_none());
 }
@@ -1511,17 +1589,14 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     let (_b, _ids) = k.submit_batch(&[write_task("isolated-task")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
 
-    let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::from_isolated_fact(true))
-        .unwrap();
+    let safety =
+        FrozenExecutionSafety::new(&claim.execution_target, &claim.execution_profile, true);
+    let launch = k.create_execution(&claim, safety.clone()).unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
     assert_eq!(launch.logical_agent_id(), &claim.logical_agent_id);
     assert!(launch.attempt_isolation());
-    assert_eq!(
-        launch.safety(),
-        FrozenExecutionSafety::from_isolated_fact(true)
-    );
+    assert_eq!(launch.safety(), &safety);
 
     let exec = k.execution(launch.execution_id()).unwrap();
     assert_eq!(&exec.id, launch.execution_id());
@@ -1530,6 +1605,41 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     assert_eq!(exec.execution_target.as_str(), launch.execution_target());
     assert_eq!(exec.execution_profile.as_str(), launch.execution_profile());
     assert!(exec.attempt_isolation);
+}
+
+#[test]
+fn mismatched_target_or_profile_safety_proof_rejected() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k
+        .submit_batch(&[read_task("proof-target-mismatch")])
+        .unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim.execution_target, "local");
+    assert_eq!(claim.execution_profile, "default");
+
+    // 1. Safety proof for forged target "remote" is rejected
+    let forged_target_safety = FrozenExecutionSafety::new("remote", "default", true);
+    let err = k
+        .create_execution(&claim, forged_target_safety)
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("safety proof target 'remote' does not match"));
+
+    // 2. Safety proof for forged profile "isolated" is rejected
+    let forged_profile_safety = FrozenExecutionSafety::new("local", "isolated", true);
+    let err = k
+        .create_execution(&claim, forged_profile_safety)
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("safety proof profile 'isolated' does not match"));
+
+    // 3. Matching target & profile succeeds
+    let valid_safety = FrozenExecutionSafety::new("local", "default", false);
+    let launch = k.create_execution(&claim, valid_safety).unwrap();
+    assert_eq!(launch.execution_target(), "local");
+    assert_eq!(launch.execution_profile(), "default");
 }
 
 #[test]
@@ -1544,7 +1654,10 @@ fn expired_lease_cannot_create_execution_before_expiry_sweep() {
 
     // create_execution must fail closed on expired authority
     let err = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
 }
@@ -1584,7 +1697,10 @@ fn launch_snapshot_carries_committed_continuity_and_preference() {
 
     // 3. create_execution must bundle the agent's committed continuity capsule & monotonic version
     let launch2 = k
-        .create_execution(&claim2, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim2,
+            FrozenExecutionSafety::unisolated(&claim2.execution_target, &claim2.execution_profile),
+        )
         .unwrap();
     assert_eq!(
         launch2.continuity().preference(),

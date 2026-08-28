@@ -11,7 +11,7 @@ use std::collections::HashMap;
 pub struct ExecutionTargetConfig {
     pub name: String,
     pub adapter_kind: String,
-    pub supports_isolation: bool,
+    pub attempt_isolation: bool,
     pub options: Value,
 }
 
@@ -19,12 +19,12 @@ impl ExecutionTargetConfig {
     pub fn new(
         name: impl Into<String>,
         adapter_kind: impl Into<String>,
-        supports_isolation: bool,
+        attempt_isolation: bool,
     ) -> Self {
         Self {
             name: name.into(),
             adapter_kind: adapter_kind.into(),
-            supports_isolation,
+            attempt_isolation,
             options: Value::Null,
         }
     }
@@ -35,20 +35,18 @@ impl ExecutionTargetConfig {
     }
 }
 
-/// Configuration for an execution profile (model settings, required isolation, timeouts).
+/// Configuration for an execution profile (model settings, timeouts, options).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionProfileConfig {
     pub name: String,
-    pub requires_isolation: bool,
     pub timeout_seconds: Option<f64>,
     pub options: Value,
 }
 
 impl ExecutionProfileConfig {
-    pub fn new(name: impl Into<String>, requires_isolation: bool) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            requires_isolation,
             timeout_seconds: None,
             options: Value::Null,
         }
@@ -65,6 +63,31 @@ impl ExecutionProfileConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationError {
+    DuplicateTarget(String),
+    DuplicateProfile(String),
+    InvalidName(String),
+    InvalidTimeout(String),
+}
+
+impl std::fmt::Display for ConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateTarget(t) => {
+                write!(f, "duplicate execution target registration: '{t}'")
+            }
+            Self::DuplicateProfile(p) => {
+                write!(f, "duplicate execution profile registration: '{p}'")
+            }
+            Self::InvalidName(m) => write!(f, "invalid configuration name: {m}"),
+            Self::InvalidTimeout(m) => write!(f, "invalid timeout: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigurationError {}
+
 /// Authoritative registry of execution targets and profiles.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExecutionRegistry {
@@ -77,12 +100,43 @@ impl ExecutionRegistry {
         Self::default()
     }
 
-    pub fn register_target(&mut self, target: ExecutionTargetConfig) {
+    pub fn register_target(
+        &mut self,
+        target: ExecutionTargetConfig,
+    ) -> Result<(), ConfigurationError> {
+        if target.name.trim().is_empty() {
+            return Err(ConfigurationError::InvalidName(
+                "target name cannot be empty".into(),
+            ));
+        }
+        if self.targets.contains_key(&target.name) {
+            return Err(ConfigurationError::DuplicateTarget(target.name));
+        }
         self.targets.insert(target.name.clone(), target);
+        Ok(())
     }
 
-    pub fn register_profile(&mut self, profile: ExecutionProfileConfig) {
+    pub fn register_profile(
+        &mut self,
+        profile: ExecutionProfileConfig,
+    ) -> Result<(), ConfigurationError> {
+        if profile.name.trim().is_empty() {
+            return Err(ConfigurationError::InvalidName(
+                "profile name cannot be empty".into(),
+            ));
+        }
+        if let Some(t) = profile.timeout_seconds {
+            if !t.is_finite() || t <= 0.0 {
+                return Err(ConfigurationError::InvalidTimeout(format!(
+                    "timeout must be positive finite seconds, got {t}"
+                )));
+            }
+        }
+        if self.profiles.contains_key(&profile.name) {
+            return Err(ConfigurationError::DuplicateProfile(profile.name));
+        }
         self.profiles.insert(profile.name.clone(), profile);
+        Ok(())
     }
 
     pub fn get_target(&self, name: &str) -> Option<&ExecutionTargetConfig> {
@@ -104,7 +158,11 @@ pub struct ResolvedExecutionEnvironment {
 
 impl ResolvedExecutionEnvironment {
     pub fn safety(&self) -> FrozenExecutionSafety {
-        FrozenExecutionSafety::from_isolated_fact(self.attempt_isolation)
+        FrozenExecutionSafety::new(
+            &self.target.name,
+            &self.profile.name,
+            self.attempt_isolation,
+        )
     }
 }
 
@@ -112,7 +170,6 @@ impl ResolvedExecutionEnvironment {
 pub enum ResolutionError {
     TargetNotFound(String),
     ProfileNotFound(String),
-    Incompatible(String),
 }
 
 impl std::fmt::Display for ResolutionError {
@@ -121,9 +178,6 @@ impl std::fmt::Display for ResolutionError {
             Self::TargetNotFound(t) => write!(f, "execution target not found in registry: '{t}'"),
             Self::ProfileNotFound(p) => {
                 write!(f, "execution profile not found in registry: '{p}'")
-            }
-            Self::Incompatible(msg) => {
-                write!(f, "incompatible target/profile configuration: {msg}")
             }
         }
     }
@@ -137,7 +191,6 @@ impl std::error::Error for ResolutionError {}
 /// 1. If `registry` is `Some`, the registry is strictly authoritative:
 ///    - Missing target -> `ResolutionError::TargetNotFound` (RESOURCE_UNAVAILABLE).
 ///    - Missing profile -> `ResolutionError::ProfileNotFound` (RESOURCE_UNAVAILABLE).
-///    - Incompatible (profile requires isolation but target does not support it) -> `ResolutionError::Incompatible`.
 ///    - No silent fallback to adapter defaults.
 /// 2. If `registry` is `None`, explicit direct-caller mode is used with unisolated defaults.
 pub fn resolve_execution_environment(
@@ -153,14 +206,7 @@ pub fn resolve_execution_environment(
             let profile = reg
                 .get_profile(profile_name)
                 .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?;
-
-            if profile.requires_isolation && !target.supports_isolation {
-                return Err(ResolutionError::Incompatible(format!(
-                    "profile '{profile_name}' requires attempt isolation, but target '{target_name}' does not support isolation"
-                )));
-            }
-
-            let attempt_isolation = target.supports_isolation && profile.requires_isolation;
+            let attempt_isolation = target.attempt_isolation;
             Ok(ResolvedExecutionEnvironment {
                 target: target.clone(),
                 profile: profile.clone(),
@@ -169,7 +215,7 @@ pub fn resolve_execution_environment(
         }
         None => Ok(ResolvedExecutionEnvironment {
             target: ExecutionTargetConfig::new(target_name, "default", false),
-            profile: ExecutionProfileConfig::new(profile_name, false),
+            profile: ExecutionProfileConfig::new(profile_name),
             attempt_isolation: false,
         }),
     }
@@ -221,7 +267,9 @@ mod tests {
     #[test]
     fn missing_profile_fails_closed() {
         let mut registry = ExecutionRegistry::new();
-        registry.register_target(ExecutionTargetConfig::new("local", "process", false));
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
         let err = resolve_execution_environment(Some(&registry), "local", "isolated").unwrap_err();
         assert_eq!(
             err,
@@ -230,29 +278,59 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_target_profile_pair_fails_closed() {
+    fn duplicate_target_or_profile_registration_fails_closed() {
         let mut registry = ExecutionRegistry::new();
-        // Target does NOT support isolation
-        registry.register_target(ExecutionTargetConfig::new(
-            "local-unisolated",
-            "process",
-            false,
-        ));
-        // Profile REQUIRES isolation
-        registry.register_profile(ExecutionProfileConfig::new("isolated-writer", true));
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        let dup_target = registry
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap_err();
+        assert_eq!(
+            dup_target,
+            ConfigurationError::DuplicateTarget("local".into())
+        );
 
-        let err =
-            resolve_execution_environment(Some(&registry), "local-unisolated", "isolated-writer")
-                .unwrap_err();
-        assert!(matches!(err, ResolutionError::Incompatible(_)));
-        assert!(err.to_string().contains("requires attempt isolation"));
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let dup_profile = registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap_err();
+        assert_eq!(
+            dup_profile,
+            ConfigurationError::DuplicateProfile("default".into())
+        );
+    }
+
+    #[test]
+    fn invalid_configuration_parameters_fail_closed() {
+        let mut registry = ExecutionRegistry::new();
+        assert_eq!(
+            registry
+                .register_target(ExecutionTargetConfig::new("   ", "process", false))
+                .unwrap_err(),
+            ConfigurationError::InvalidName("target name cannot be empty".into())
+        );
+        assert_eq!(
+            registry
+                .register_profile(ExecutionProfileConfig::new("p").with_timeout(-5.0))
+                .unwrap_err(),
+            ConfigurationError::InvalidTimeout(
+                "timeout must be positive finite seconds, got -5".into()
+            )
+        );
     }
 
     #[test]
     fn valid_target_and_profile_resolve_isolation() {
         let mut registry = ExecutionRegistry::new();
-        registry.register_target(ExecutionTargetConfig::new("local-b", "codex", true));
-        registry.register_profile(ExecutionProfileConfig::new("isolated-writer", true));
+        registry
+            .register_target(ExecutionTargetConfig::new("local-b", "codex", true))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("isolated-writer"))
+            .unwrap();
 
         let env =
             resolve_execution_environment(Some(&registry), "local-b", "isolated-writer").unwrap();
@@ -262,7 +340,7 @@ mod tests {
         assert!(env.attempt_isolation);
         assert_eq!(
             env.safety(),
-            FrozenExecutionSafety::from_isolated_fact(true)
+            FrozenExecutionSafety::new("local-b", "isolated-writer", true)
         );
     }
 
@@ -272,6 +350,9 @@ mod tests {
         assert_eq!(env.target.name, "local");
         assert_eq!(env.profile.name, "default");
         assert!(!env.attempt_isolation);
-        assert_eq!(env.safety(), FrozenExecutionSafety::UNISOLATED);
+        assert_eq!(
+            env.safety(),
+            FrozenExecutionSafety::unisolated("local", "default")
+        );
     }
 }

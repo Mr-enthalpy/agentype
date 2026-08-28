@@ -119,7 +119,14 @@ pub fn run_claim(
     let (batch, ids) = k.submit_batch(std::slice::from_ref(&spec)).unwrap();
     let claim = k.claim_next_available().unwrap().expect("claim");
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::from_isolated_fact(isolation))
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::new(
+                &claim.execution_target,
+                &claim.execution_profile,
+                isolation,
+            ),
+        )
         .unwrap();
     let execution_id = launch.execution_id().clone();
     k.confirm_running_and_renew(

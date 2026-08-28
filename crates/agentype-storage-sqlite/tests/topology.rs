@@ -153,7 +153,10 @@ fn claim_on_source_then_merge_before_execution_preserves_frozen_target() {
 
     // create_execution MUST succeed even though task.partition is now "general"
     let launch = k
-        .create_execution(&claim, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim,
+            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
+        )
         .unwrap();
     let exec_id = launch.execution_id().clone();
     let exec = k.execution(&exec_id).unwrap();
@@ -186,13 +189,25 @@ fn tampered_claim_target_or_profile_rejected() {
     let mut tampered_target = claim.clone();
     tampered_target.execution_target = "forged-target".to_string();
     assert!(k
-        .create_execution(&tampered_target, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &tampered_target,
+            FrozenExecutionSafety::unisolated(
+                &tampered_target.execution_target,
+                &tampered_target.execution_profile
+            )
+        )
         .is_err());
 
     let mut tampered_profile = claim.clone();
     tampered_profile.execution_profile = "forged-profile".to_string();
     assert!(k
-        .create_execution(&tampered_profile, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &tampered_profile,
+            FrozenExecutionSafety::unisolated(
+                &tampered_profile.execution_target,
+                &tampered_profile.execution_profile
+            )
+        )
         .is_err());
 }
 
@@ -224,7 +239,10 @@ fn retry_after_merged_attempt_uses_new_partition_target() {
 
     // Attempt 1 execution succeeds under frozen local-b/profile-b
     let launch1 = k
-        .create_execution(&claim1, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim1,
+            FrozenExecutionSafety::unisolated(&claim1.execution_target, &claim1.execution_profile),
+        )
         .unwrap();
     let exec_id1 = launch1.execution_id().clone();
     let exec1 = k.execution(&exec_id1).unwrap();
@@ -267,7 +285,10 @@ fn retry_after_merged_attempt_uses_new_partition_target() {
     assert_eq!(claim2.execution_profile, "default");
 
     let launch2 = k
-        .create_execution(&claim2, FrozenExecutionSafety::UNISOLATED)
+        .create_execution(
+            &claim2,
+            FrozenExecutionSafety::unisolated(&claim2.execution_target, &claim2.execution_profile),
+        )
         .unwrap();
     let exec_id2 = launch2.execution_id().clone();
     let exec2 = k.execution(&exec_id2).unwrap();

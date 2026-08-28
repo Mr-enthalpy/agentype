@@ -4,8 +4,9 @@
 //! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
 
 use agentype_core::{
-    CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot, ExecutionState,
-    FailureClass, RequestId, WorkspaceMode,
+    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot,
+    ExecutionState, FailureClass, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId,
+    WorkspaceMode, WorkstreamId,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -38,15 +39,29 @@ pub type AdapterResult<T> = Result<T, AdapterError>;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeHandle(pub Value);
 
+/// Complete structured physical execution request.
+///
+/// Constructed strictly from an authoritative `ExecutionLaunchSnapshot` + runtime handle.
+/// Contains all task context, acceptance criteria, and continuity needed by the adapter
+/// to encode physical execution instructions without out-of-band DB reads.
 #[derive(Clone, Debug)]
 pub struct ExecutionRequest {
     request_id: RequestId,
     execution_id: ExecutionId,
+    task_id: TaskId,
+    batch_id: BatchId,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    lease_id: LeaseId,
+    lease_epoch: LeaseEpoch,
+    logical_agent_id: LogicalAgentId,
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
     prompt: String,
     payload: Value,
+    acceptance: Value,
+    workstream_id: Option<WorkstreamId>,
     continuity: CommittedContinuitySnapshot,
     incarnation_runtime_handle: RuntimeHandle,
 }
@@ -59,37 +74,64 @@ impl ExecutionRequest {
         Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
+            task_id: launch.task_id().clone(),
+            batch_id: launch.batch_id().clone(),
+            attempt_id: launch.attempt_id().clone(),
+            attempt_number: launch.attempt_number(),
+            lease_id: launch.lease_id().clone(),
+            lease_epoch: launch.lease_epoch(),
+            logical_agent_id: launch.logical_agent_id().clone(),
             execution_target: launch.execution_target().to_string(),
             execution_profile: launch.execution_profile().to_string(),
             workspace_mode: launch.workspace_mode(),
             prompt: launch.prompt().to_string(),
             payload: launch.payload().clone(),
+            acceptance: launch.acceptance().clone(),
+            workstream_id: launch.workstream_id().cloned(),
             continuity: launch.continuity().clone(),
             incarnation_runtime_handle,
         }
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn for_testing(
         request_id: RequestId,
         execution_id: ExecutionId,
+        task_id: TaskId,
+        batch_id: BatchId,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        logical_agent_id: LogicalAgentId,
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
         workspace_mode: WorkspaceMode,
         prompt: impl Into<String>,
         payload: Value,
+        acceptance: Value,
+        workstream_id: Option<WorkstreamId>,
         continuity: CommittedContinuitySnapshot,
         incarnation_runtime_handle: RuntimeHandle,
     ) -> Self {
         Self {
             request_id,
             execution_id,
+            task_id,
+            batch_id,
+            attempt_id,
+            attempt_number,
+            lease_id,
+            lease_epoch,
+            logical_agent_id,
             execution_target: execution_target.into(),
             execution_profile: execution_profile.into(),
             workspace_mode,
             prompt: prompt.into(),
             payload,
+            acceptance,
+            workstream_id,
             continuity,
             incarnation_runtime_handle,
         }
@@ -101,6 +143,34 @@ impl ExecutionRequest {
 
     pub fn execution_id(&self) -> &ExecutionId {
         &self.execution_id
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn batch_id(&self) -> &BatchId {
+        &self.batch_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+
+    pub fn lease_id(&self) -> &LeaseId {
+        &self.lease_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    pub fn logical_agent_id(&self) -> &LogicalAgentId {
+        &self.logical_agent_id
     }
 
     pub fn execution_target(&self) -> &str {
@@ -121,6 +191,14 @@ impl ExecutionRequest {
 
     pub fn payload(&self) -> &Value {
         &self.payload
+    }
+
+    pub fn acceptance(&self) -> &Value {
+        &self.acceptance
+    }
+
+    pub fn workstream_id(&self) -> Option<&WorkstreamId> {
+        self.workstream_id.as_ref()
     }
 
     pub fn continuity(&self) -> &CommittedContinuitySnapshot {
@@ -320,11 +398,20 @@ mod tests {
         let req = ExecutionRequest::for_testing(
             RequestId::new(),
             ExecutionId::new(),
+            TaskId::new(),
+            BatchId::new(),
+            AttemptId::new(),
+            1,
+            LeaseId::new(),
+            LeaseEpoch(1),
+            LogicalAgentId::new(),
             "local",
             "default",
             WorkspaceMode::ReadOnly,
             "hi",
             Value::Null,
+            Value::Null,
+            None,
             CommittedContinuitySnapshot::stateless(),
             RuntimeHandle::default(),
         );
@@ -344,11 +431,20 @@ mod tests {
         let req = ExecutionRequest::for_testing(
             RequestId::new(),
             ExecutionId::new(),
+            TaskId::new(),
+            BatchId::new(),
+            AttemptId::new(),
+            1,
+            LeaseId::new(),
+            LeaseEpoch(1),
+            LogicalAgentId::new(),
             "local",
             "default",
             WorkspaceMode::ReadOnly,
             "hi",
             Value::Null,
+            Value::Null,
+            None,
             CommittedContinuitySnapshot::stateless(),
             RuntimeHandle::default(),
         );
@@ -376,6 +472,7 @@ mod tests {
 
     #[test]
     fn execution_request_constructed_from_launch_snapshot() {
+        let ws = WorkstreamId::new();
         let launch = ExecutionLaunchSnapshot::from_kernel_authority(
             ExecutionId::new(),
             RequestId::new(),
@@ -393,24 +490,33 @@ mod tests {
             WorkspaceMode::ReadOnly,
             "task-prompt".to_string(),
             serde_json::json!({"key": "val"}),
-            serde_json::json!({}),
-            None,
+            serde_json::json!({"criterion": "pass"}),
+            Some(ws.clone()),
             CommittedContinuitySnapshot::new(
                 agentype_core::ContinuityPreference::Required,
                 3,
                 serde_json::json!({"state": "saved"}),
             ),
-            FrozenExecutionSafety::UNISOLATED,
+            FrozenExecutionSafety::unisolated("local", "default"),
         );
         let handle = RuntimeHandle(serde_json::json!({"proc": 42}));
         let req = ExecutionRequest::from_launch(&launch, handle.clone());
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
+        assert_eq!(req.task_id(), launch.task_id());
+        assert_eq!(req.batch_id(), launch.batch_id());
+        assert_eq!(req.attempt_id(), launch.attempt_id());
+        assert_eq!(req.attempt_number(), 1);
+        assert_eq!(req.lease_id(), launch.lease_id());
+        assert_eq!(req.lease_epoch(), LeaseEpoch(1));
+        assert_eq!(req.logical_agent_id(), launch.logical_agent_id());
         assert_eq!(req.execution_target(), "local");
         assert_eq!(req.execution_profile(), "default");
         assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
         assert_eq!(req.prompt(), "task-prompt");
         assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
+        assert_eq!(req.acceptance(), &serde_json::json!({"criterion": "pass"}));
+        assert_eq!(req.workstream_id(), Some(&ws));
         assert_eq!(req.continuity().version(), 3);
         assert_eq!(
             req.continuity().capsule(),

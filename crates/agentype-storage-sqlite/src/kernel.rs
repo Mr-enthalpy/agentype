@@ -885,6 +885,20 @@ impl Kernel {
                     "claim execution_profile does not match authoritative attempt",
                 ));
             }
+            if safety.execution_target() != attempt.execution_target {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof target '{}' does not match authoritative attempt target '{}'",
+                    safety.execution_target(),
+                    attempt.execution_target
+                )));
+            }
+            if safety.execution_profile() != attempt.execution_profile {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof profile '{}' does not match authoritative attempt profile '{}'",
+                    safety.execution_profile(),
+                    attempt.execution_profile
+                )));
+            }
             let incarnation_id = match attempt.incarnation_id {
                 Some(id) => id,
                 None => ensure_incarnation(
