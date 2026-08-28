@@ -230,23 +230,26 @@ D-DB-MIGRATE remains DOES_NOT_BLOCK_RIIR_KERNEL. D-ADAPTER2 is M7.
 cargo test --workspace
 ```
 
-Result on this landing (Windows, rustc via cargo 1.x):
+Result on this landing (Windows & Ubuntu Rust CI, rustc via cargo 1.x):
 
 - `agentype-core`: 20 tests (authority + `decisions` unit coverage)
 - `agentype-adapter-api`: 3 tests
 - `agentype-runtime`: 1 test
-- `agentype-storage-sqlite` integration: 78 tests
+- `agentype-storage-sqlite` integration: 80 tests
   - `m4_kernel`: 53
   - `recovery`: 11
-  - `topology`: 14
-- total: 102 passed, 0 failed
+  - `topology`: 16 (including frozen attempt authority across MERGE and tamper defenses)
+- total: 104 passed, 0 failed
+
+CI matrix status: Windows Rust, Ubuntu Rust, and all four Python matrix jobs are green.
+
+### Oracle Test Stabilization Rationale
 
 Python production implementation was not modified. Two Python oracle
-tests received timing-only stabilization so that the existing V0.1 CI
-remains deterministic while Rust CI was added. No Python scheduler
-semantics were changed, and the Python suite is not required to pass as
-part of M4 Rust CI; the existing Python job remains for the V0.1 oracle
-package.
+tests received timing-only stabilization (explicitly pinning lease timelines
+to `started_at` and passing `now` explicitly) so that cross-platform CI
+remains deterministic regardless of runner scheduling speed. No Python scheduler
+semantics were modified, and no assertion invariants were weakened.
 
 ## Scheduling-semantics placement (spec 15 direction)
 
@@ -271,3 +274,14 @@ import graph:
   not the runtime-to-persistence composition direction. Whether M5's
   dispatcher wants a storage-free command trait boundary is an M5 design
   decision to be driven by its actual needs, not anticipated here.
+
+## M5 Prerequisites: Launch Context Authority
+
+M4 establishes the correctness kernel and storage transaction boundaries without dispatching real physical child processes. To prevent security and correctness boundary gaps when physical dispatching is introduced in M5, the following hard rule is established:
+
+> **Execution launch semantics must be derived from persisted authoritative state, not replayed from a mutable Claim DTO.**
+
+- `Claim` serves as an authority token for state transition, not as the source of truth for physical process arguments.
+- In M5 runtime, `create_execution` / `prepare_execution` re-reads authoritative `Task` and `Attempt` state to produce an `AuthoritativeExecutionLaunchSnapshot` (`task_id`, `attempt_id`, `epoch`, `logical_agent_id`, `execution_target`, `execution_profile`, `workspace_mode`, `payload`, `acceptance`, etc.). The runtime builds physical `ExecutionRequest`s strictly from this authoritative snapshot.
+- `attempt_isolation` MUST derive from the authoritative ExecutionProfile/target registry, never from adapter self-assertion.
+
