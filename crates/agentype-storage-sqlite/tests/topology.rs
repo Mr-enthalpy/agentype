@@ -121,7 +121,7 @@ fn merge_migrates_future_task_classification() {
 }
 
 #[test]
-fn active_attempt_keeps_frozen_authority_through_merge() {
+fn claim_on_source_then_merge_before_execution_preserves_frozen_target() {
     let Env { k, .. } = memory_env();
     k.upsert_partition(&PartitionSpec::new(
         "src",
@@ -137,22 +137,125 @@ fn active_attempt_keeps_frozen_authority_through_merge() {
         .unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     assert_eq!(claim.execution_target, "local-b");
+    assert_eq!(claim.execution_profile, "profile-b");
+
+    // MERGE partition src -> general
     k.merge_partitions("src", "general").unwrap();
+
     let attempt = k.attempt(&claim.attempt_id).unwrap();
     assert_eq!(attempt.state, AttemptState::Active);
+    assert_eq!(attempt.execution_target, "local-b");
+    assert_eq!(attempt.execution_profile, "profile-b");
+
     let lease = k.lease_for_attempt(&claim.attempt_id).unwrap();
     assert_eq!(lease.state, LeaseState::Active);
     assert_eq!(lease.epoch, claim.lease_epoch);
+
+    // create_execution MUST succeed even though task.partition is now "general"
+    let (exec_id, _) = k.create_execution(&claim, false).unwrap();
+    let exec = k.execution(&exec_id).unwrap();
+    assert_eq!(exec.execution_target, "local-b");
+    assert_eq!(exec.execution_profile, "profile-b");
+
+    k.confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
+        .unwrap();
+
     k.ack_success(
         &claim.attempt_id,
         claim.lease_epoch,
-        None,
+        Some(&exec_id),
         &json!({"ok": true}),
         None,
         true,
         false,
     )
     .unwrap();
+}
+
+#[test]
+fn tampered_claim_target_or_profile_rejected() {
+    let Env { k, .. } = memory_env();
+    let (_b, _ids) = k.submit_batch(&[read_task("t1")]).unwrap();
+    let claim = k.claim_next_available().unwrap().unwrap();
+
+    let mut tampered_target = claim.clone();
+    tampered_target.execution_target = "forged-target".to_string();
+    assert!(k.create_execution(&tampered_target, false).is_err());
+
+    let mut tampered_profile = claim.clone();
+    tampered_profile.execution_profile = "forged-profile".to_string();
+    assert!(k.create_execution(&tampered_profile, false).is_err());
+}
+
+#[test]
+fn retry_after_merged_attempt_uses_new_partition_target() {
+    let Env { k, clock } = memory_env();
+    k.upsert_partition(&PartitionSpec::new(
+        "src",
+        1,
+        Retention::Resident,
+        "local-b",
+        "profile-b",
+    ))
+    .unwrap();
+    k.reconcile_pool().unwrap();
+
+    let (_b, ids) = k
+        .submit_batch(&[retryable_read("live").partition("src")])
+        .unwrap();
+    let task_id = &ids["live"];
+
+    // Claim Attempt 1 under partition src
+    let claim1 = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim1.execution_target, "local-b");
+    assert_eq!(claim1.execution_profile, "profile-b");
+
+    // Merge src -> general (general has target="local", profile="default")
+    k.merge_partitions("src", "general").unwrap();
+
+    // Attempt 1 execution succeeds under frozen local-b/profile-b
+    let (exec_id1, _) = k.create_execution(&claim1, false).unwrap();
+    let exec1 = k.execution(&exec_id1).unwrap();
+    assert_eq!(exec1.execution_target, "local-b");
+    assert_eq!(exec1.execution_profile, "profile-b");
+
+    // Attempt 1 fails with retryable TIMEOUT failure
+    k.confirm_running_and_renew(
+        &claim1.attempt_id,
+        claim1.lease_epoch,
+        &exec_id1,
+        &json!({}),
+    )
+    .unwrap();
+    k.nack(
+        &claim1.attempt_id,
+        claim1.lease_epoch,
+        FailureClass::Timeout,
+        Some(&exec_id1),
+        true,
+        true,
+        false,
+    )
+    .unwrap();
+
+    // Task transitions to RETRY_WAIT and its scheduling partition is general
+    let task = k.task(task_id).unwrap();
+    assert_eq!(task.state, TaskState::RetryWait);
+    assert_eq!(task.partition.as_str(), "general");
+
+    clock.advance(10.0);
+    k.promote_retry_wait().unwrap();
+    assert_eq!(k.task(task_id).unwrap().state, TaskState::Queued);
+
+    // Claim Attempt 2: must pick up migrated partition target and profile ("local", "default")
+    let claim2 = k.claim_next_available().unwrap().unwrap();
+    assert_eq!(claim2.execution_target, "local");
+    assert_eq!(claim2.execution_profile, "default");
+
+    let (exec_id2, _) = k.create_execution(&claim2, false).unwrap();
+    let exec2 = k.execution(&exec_id2).unwrap();
+    assert_eq!(exec2.execution_target, "local");
+    assert_eq!(exec2.execution_profile, "default");
 }
 
 #[test]

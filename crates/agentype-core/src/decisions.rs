@@ -27,11 +27,7 @@ pub fn claim_selection_rank(preference: ContinuityPreference, same_workstream: b
 /// Deterministic claim tiebreak after [`claim_selection_rank`] ties: oldest
 /// availability first (`created_at` is the defensive fallback for a NULL
 /// `available_since`), then lowest LogicalAgent ID.
-pub fn claim_tiebreak<'a>(
-    available_since: Option<f64>,
-    created_at: f64,
-    id: &'a str,
-) -> (f64, &'a str) {
+pub fn claim_tiebreak(available_since: Option<f64>, created_at: f64, id: &str) -> (f64, &str) {
     (available_since.unwrap_or(created_at), id)
 }
 
@@ -59,7 +55,7 @@ pub fn claim_task_eligible(s: &ClaimTaskSnapshot, now: f64) -> bool {
     s.state == TaskState::Queued
         && s.batch_state == BatchState::Active
         && s.partition_active
-        && s.next_eligible_at.map_or(true, |t| t <= now)
+        && s.next_eligible_at.is_none_or(|t| t <= now)
 }
 
 /// Frozen task order for claiming: highest priority, oldest submission, then
@@ -122,7 +118,7 @@ pub fn select_claim_agent<'a>(
         .filter(|a| {
             let same_ws = intent.workstream_id.is_some()
                 && Some(intent.workstream_id.unwrap()) == a.workstream_id.as_deref();
-            !(intent.continuity == ContinuityPreference::Required && !same_ws)
+            intent.continuity != ContinuityPreference::Required || same_ws
         })
         .min_by(|a, b| {
             let same_a = intent.workstream_id.is_some()

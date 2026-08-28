@@ -48,7 +48,8 @@ pub fn required_partition(
 pub fn required_attempt(tx: &Transaction<'_>, id: &str) -> Result<AttemptRow, Error> {
     query_opt(
         tx,
-        "SELECT id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state
+        "SELECT id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state,
+                execution_target,execution_profile,partition_name
          FROM attempts WHERE id=?1",
         params![id],
         AttemptRow::from_row,
@@ -59,7 +60,8 @@ pub fn required_attempt(tx: &Transaction<'_>, id: &str) -> Result<AttemptRow, Er
 pub fn required_execution(tx: &Transaction<'_>, id: &str) -> Result<ExecutionRow, Error> {
     query_opt(
         tx,
-        "SELECT id,task_id,attempt_id,incarnation_id,state,attempt_isolation,terminal_confirmed,quiescent_confirmed
+        "SELECT id,task_id,attempt_id,incarnation_id,execution_target,execution_profile,
+                state,attempt_isolation,terminal_confirmed,quiescent_confirmed
          FROM executions WHERE id=?1",
         params![id],
         ExecutionRow::from_row,
@@ -107,7 +109,8 @@ pub fn execution_for_attempt(
 ) -> Result<Option<ExecutionRow>, Error> {
     let actual = query_opt(
         tx,
-        "SELECT id,task_id,attempt_id,incarnation_id,state,attempt_isolation,terminal_confirmed,quiescent_confirmed
+        "SELECT id,task_id,attempt_id,incarnation_id,execution_target,execution_profile,
+                state,attempt_isolation,terminal_confirmed,quiescent_confirmed
          FROM executions WHERE attempt_id=?1",
         params![attempt_id],
         ExecutionRow::from_row,
@@ -1039,10 +1042,13 @@ pub struct AttemptRow {
     pub attempt_number: i64,
     pub lease_epoch: u64,
     pub state: String,
+    pub execution_target: String,
+    pub execution_profile: String,
+    pub partition_name: String,
 }
 
 impl AttemptRow {
-    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: r.get(0)?,
             task_id: r.get(1)?,
@@ -1051,6 +1057,9 @@ impl AttemptRow {
             attempt_number: r.get(4)?,
             lease_epoch: r.get::<_, i64>(5)? as u64,
             state: r.get(6)?,
+            execution_target: r.get(7)?,
+            execution_profile: r.get(8)?,
+            partition_name: r.get(9)?,
         })
     }
 }
@@ -1066,7 +1075,7 @@ pub struct LeaseRow {
 }
 
 impl LeaseRow {
-    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: r.get(0)?,
             task_id: r.get(1)?,
@@ -1084,6 +1093,8 @@ pub struct ExecutionRow {
     pub task_id: String,
     pub attempt_id: String,
     pub incarnation_id: String,
+    pub execution_target: String,
+    pub execution_profile: String,
     pub state: String,
     pub attempt_isolation: bool,
     pub terminal_confirmed: bool,
@@ -1091,16 +1102,18 @@ pub struct ExecutionRow {
 }
 
 impl ExecutionRow {
-    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: r.get(0)?,
             task_id: r.get(1)?,
             attempt_id: r.get(2)?,
             incarnation_id: r.get(3)?,
-            state: r.get(4)?,
-            attempt_isolation: r.get::<_, i64>(5)? != 0,
-            terminal_confirmed: r.get::<_, i64>(6)? != 0,
-            quiescent_confirmed: r.get::<_, i64>(7)? != 0,
+            execution_target: r.get(4)?,
+            execution_profile: r.get(5)?,
+            state: r.get(6)?,
+            attempt_isolation: r.get::<_, i64>(7)? != 0,
+            terminal_confirmed: r.get::<_, i64>(8)? != 0,
+            quiescent_confirmed: r.get::<_, i64>(9)? != 0,
         })
     }
 }

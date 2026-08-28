@@ -131,6 +131,9 @@ CREATE TABLE IF NOT EXISTS attempts (
     attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
     lease_epoch INTEGER NOT NULL CHECK (lease_epoch >= 1),
     state TEXT NOT NULL CHECK (state IN ('ACTIVE','SUCCEEDED','FAILED','EXPIRED','CANCELLED')),
+    execution_target TEXT NOT NULL,
+    execution_profile TEXT NOT NULL,
+    partition_name TEXT NOT NULL,
     created_at REAL NOT NULL,
     ended_at REAL,
     UNIQUE (task_id, attempt_number)

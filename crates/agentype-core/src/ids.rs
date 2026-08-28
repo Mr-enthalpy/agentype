@@ -8,6 +8,12 @@ macro_rules! typed_id {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name(String);
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl $name {
             pub fn new() -> Self {
                 Self(format!("{}_{}", $prefix, Uuid::new_v4().simple()))

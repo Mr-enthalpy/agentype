@@ -846,7 +846,7 @@ impl Kernel {
         attempt_isolation: bool,
     ) -> Result<(ExecutionId, RequestId), Error> {
         self.tx(|tx, now| {
-            let (attempt, _, task) =
+            let (attempt, _, _task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
             if claim.task_id.as_str() != attempt.task_id {
                 return Err(Error::invalid_authority(
@@ -858,15 +858,14 @@ impl Kernel {
                     "claim logical_agent_id does not match authoritative attempt",
                 ));
             }
-            let partition = required_partition(tx, &task.partition, false)?;
-            if claim.execution_target != partition.execution_target {
+            if claim.execution_target != attempt.execution_target {
                 return Err(Error::invalid_authority(
-                    "claim execution_target does not match authoritative partition",
+                    "claim execution_target does not match authoritative attempt",
                 ));
             }
-            if claim.execution_profile != partition.execution_profile {
+            if claim.execution_profile != attempt.execution_profile {
                 return Err(Error::invalid_authority(
-                    "claim execution_profile does not match authoritative partition",
+                    "claim execution_profile does not match authoritative attempt",
                 ));
             }
             let incarnation_id = match attempt.incarnation_id {
@@ -874,7 +873,7 @@ impl Kernel {
                 None => ensure_incarnation(
                     tx,
                     &attempt.logical_agent_id,
-                    &partition.execution_target,
+                    &attempt.execution_target,
                     now,
                 )?,
             };
@@ -909,8 +908,8 @@ impl Kernel {
                     attempt.task_id,
                     attempt.id,
                     incarnation_id,
-                    partition.execution_target,
-                    partition.execution_profile,
+                    attempt.execution_target,
+                    attempt.execution_profile,
                     attempt_isolation as i64,
                     now
                 ],
@@ -2142,9 +2141,11 @@ impl Kernel {
     pub fn attempt(&self, id: &AttemptId) -> Result<AttemptRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(
-                "SELECT id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state FROM attempts WHERE id=?1",
+                "SELECT id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state,
+                        execution_target,execution_profile,partition_name
+                 FROM attempts WHERE id=?1",
                 params![id.as_str()],
-                AttemptRow::from_query,
+                AttemptRow::from_row,
             )
             .map_err(map_sqlite)
             .and_then(|row| {
@@ -2156,6 +2157,9 @@ impl Kernel {
                     attempt_number: row.attempt_number as u32,
                     lease_epoch: LeaseEpoch(row.lease_epoch),
                     state: AttemptState::parse_sql(&row.state)?,
+                    execution_target: row.execution_target,
+                    execution_profile: row.execution_profile,
+                    partition_name: PartitionId::new(row.partition_name),
                 })
             })
         })
@@ -2166,7 +2170,7 @@ impl Kernel {
             conn.query_row(
                 "SELECT id,task_id,attempt_id,epoch,state,expires_at FROM leases WHERE attempt_id=?1",
                 params![attempt_id.as_str()],
-                LeaseRow::from_query,
+                LeaseRow::from_row,
             )
             .map_err(map_sqlite)
             .and_then(|row| {
@@ -2252,10 +2256,11 @@ impl Kernel {
     pub fn execution(&self, id: &ExecutionId) -> Result<ExecutionRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(
-                "SELECT id,task_id,attempt_id,incarnation_id,state,attempt_isolation,terminal_confirmed,quiescent_confirmed
+                "SELECT id,task_id,attempt_id,incarnation_id,execution_target,execution_profile,
+                        state,attempt_isolation,terminal_confirmed,quiescent_confirmed
                  FROM executions WHERE id=?1",
                 params![id.as_str()],
-                ExecutionRow::from_query,
+                ExecutionRow::from_row,
             )
             .map_err(map_sqlite)
             .and_then(|row| {
@@ -2264,6 +2269,8 @@ impl Kernel {
                     task_id: TaskId::from_string(&row.task_id),
                     attempt_id: AttemptId::from_string(&row.attempt_id),
                     incarnation_id: IncarnationId::from_string(&row.incarnation_id),
+                    execution_target: row.execution_target,
+                    execution_profile: row.execution_profile,
                     state: ExecutionState::parse_sql(&row.state)?,
                     attempt_isolation: row.attempt_isolation,
                     terminal_confirmed: row.terminal_confirmed,
@@ -2393,14 +2400,18 @@ fn claim_selected(
     let lease_id = LeaseId::new();
     let expires_at = now + lease_seconds;
     tx.execute(
-        "INSERT INTO attempts(id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state,created_at)
-         VALUES(?1,?2,?3,NULL,?4,?5,'ACTIVE',?6)",
+        "INSERT INTO attempts(id,task_id,logical_agent_id,incarnation_id,attempt_number,lease_epoch,state,
+                              execution_target,execution_profile,partition_name,created_at)
+         VALUES(?1,?2,?3,NULL,?4,?5,'ACTIVE',?6,?7,?8,?9)",
         params![
             attempt_id.as_str(),
             task.id,
             agent.id,
             attempt_number,
             epoch as i64,
+            partition.execution_target,
+            partition.execution_profile,
+            partition.name,
             now
         ],
     )
@@ -2577,48 +2588,6 @@ impl PartitionRow {
             active: r.get::<_, i64>(6)? != 0,
             merged_into: r.get(7)?,
             topology_revision: r.get(8)?,
-        })
-    }
-}
-
-impl AttemptRow {
-    pub(crate) fn from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: r.get(0)?,
-            task_id: r.get(1)?,
-            logical_agent_id: r.get(2)?,
-            incarnation_id: r.get(3)?,
-            attempt_number: r.get(4)?,
-            lease_epoch: r.get::<_, i64>(5)? as u64,
-            state: r.get(6)?,
-        })
-    }
-}
-
-impl LeaseRow {
-    pub(crate) fn from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: r.get(0)?,
-            task_id: r.get(1)?,
-            attempt_id: r.get(2)?,
-            epoch: r.get::<_, i64>(3)? as u64,
-            state: r.get(4)?,
-            expires_at: r.get(5)?,
-        })
-    }
-}
-
-impl ExecutionRow {
-    pub(crate) fn from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: r.get(0)?,
-            task_id: r.get(1)?,
-            attempt_id: r.get(2)?,
-            incarnation_id: r.get(3)?,
-            state: r.get(4)?,
-            attempt_isolation: r.get::<_, i64>(5)? != 0,
-            terminal_confirmed: r.get::<_, i64>(6)? != 0,
-            quiescent_confirmed: r.get::<_, i64>(7)? != 0,
         })
     }
 }

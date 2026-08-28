@@ -189,6 +189,9 @@ pub struct AttemptRecord {
     pub attempt_number: u32,
     pub lease_epoch: LeaseEpoch,
     pub state: AttemptState,
+    pub execution_target: String,
+    pub execution_profile: String,
+    pub partition_name: PartitionId,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +239,8 @@ pub struct ExecutionRecord {
     pub task_id: TaskId,
     pub attempt_id: AttemptId,
     pub incarnation_id: IncarnationId,
+    pub execution_target: String,
+    pub execution_profile: String,
     pub state: ExecutionState,
     pub attempt_isolation: bool,
     pub terminal_confirmed: bool,
