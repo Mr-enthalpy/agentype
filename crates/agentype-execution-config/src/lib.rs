@@ -347,6 +347,11 @@ pub fn resolve_execution_environment(
 ///
 /// This object is produced exclusively by the Execution creation transaction and
 /// encapsulates all execution parameters as private, readonly fields.
+///
+/// `task_name` is the durable human-readable Task label (a scheduling/display
+/// fact). It is NOT the worker prompt: the worker-facing prompt is a derived
+/// representation rendered by the runtime from the full launch protocol
+/// (IDs, epoch, payload, acceptance, continuity, workspace mode).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionLaunchSnapshot {
     execution_id: ExecutionId,
@@ -364,7 +369,7 @@ pub struct ExecutionLaunchSnapshot {
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
-    prompt: String,
+    task_name: String,
     payload: Value,
     acceptance: Value,
     workstream_id: Option<WorkstreamId>,
@@ -396,7 +401,7 @@ impl ExecutionLaunchSnapshot {
         execution_target: String,
         execution_profile: String,
         workspace_mode: WorkspaceMode,
-        prompt: String,
+        task_name: String,
         payload: Value,
         acceptance: Value,
         workstream_id: Option<WorkstreamId>,
@@ -419,7 +424,7 @@ impl ExecutionLaunchSnapshot {
             execution_target,
             execution_profile,
             workspace_mode,
-            prompt,
+            task_name,
             payload,
             acceptance,
             workstream_id,
@@ -488,8 +493,10 @@ impl ExecutionLaunchSnapshot {
         self.workspace_mode
     }
 
-    pub fn prompt(&self) -> &str {
-        &self.prompt
+    /// Durable human-readable Task label. Never send this to a worker as the
+    /// prompt; use the runtime-rendered worker protocol instead.
+    pub fn task_name(&self) -> &str {
+        &self.task_name
     }
 
     pub fn payload(&self) -> &Value {

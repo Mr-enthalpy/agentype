@@ -46,6 +46,10 @@ pub struct RuntimeHandle(pub Value);
 ///
 /// Encapsulates all execution metadata as private fields with readonly getters.
 /// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
+///
+/// `prompt` is the derived worker-protocol representation (task protocol
+/// sections: IDs, epoch, workstream, objective, acceptance, committed
+/// continuity, and writer rules for WRITE tasks). It is NOT the Task name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     request_id: RequestId,
@@ -70,7 +74,13 @@ pub struct ExecutionRequest {
 }
 
 impl ExecutionRequest {
-    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
+    /// Assemble the worker request from an authoritative launch snapshot.
+    ///
+    /// `prompt` MUST be the runtime-rendered worker protocol produced by
+    /// `agentype_runtime::render_worker_prompt(&launch)`. Adapters and other
+    /// consumers MUST NOT compose scheduler semantics into the prompt
+    /// themselves; the runtime is the single composition point.
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot, prompt: String) -> Self {
         Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
@@ -85,7 +95,7 @@ impl ExecutionRequest {
             execution_target: launch.execution_target().to_string(),
             execution_profile: launch.execution_profile().to_string(),
             workspace_mode: launch.workspace_mode(),
-            prompt: launch.prompt().to_string(),
+            prompt,
             payload: launch.payload().clone(),
             acceptance: launch.acceptance().clone(),
             workstream_id: launch.workstream_id().cloned(),
@@ -146,6 +156,8 @@ impl ExecutionRequest {
         self.workspace_mode
     }
 
+    /// Derived worker-protocol representation, as supplied to `from_launch`.
+    /// Produced by `agentype_runtime::render_worker_prompt`; never the Task name.
     pub fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -386,7 +398,7 @@ mod tests {
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
         let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let req = ExecutionRequest::from_launch(&launch, "rendered".to_string());
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -401,7 +413,7 @@ mod tests {
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
         let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let req = ExecutionRequest::from_launch(&launch, "rendered".to_string());
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -445,7 +457,7 @@ mod tests {
                 "local".to_string(),
                 "default".to_string(),
                 WorkspaceMode::ReadOnly,
-                "task-prompt".to_string(),
+                "my-task".to_string(),
                 serde_json::json!({"key": "val"}),
                 serde_json::json!({"criterion": "pass"}),
                 Some(ws.clone()),
@@ -457,7 +469,7 @@ mod tests {
                 FrozenExecutionSafety::unisolated("local", "default"),
             )
         };
-        let req = ExecutionRequest::from_launch(&launch);
+        let req = ExecutionRequest::from_launch(&launch, "RENDERED WORKER PROTOCOL".to_string());
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -471,7 +483,10 @@ mod tests {
         assert_eq!(req.execution_target(), "local");
         assert_eq!(req.execution_profile(), "default");
         assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
-        assert_eq!(req.prompt(), "task-prompt");
+        // The snapshot carries the durable Task label; the request prompt is
+        // whatever the runtime rendered — never conflated with the label.
+        assert_eq!(launch.task_name(), "my-task");
+        assert_eq!(req.prompt(), "RENDERED WORKER PROTOCOL");
         assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
         assert_eq!(req.acceptance(), &serde_json::json!({"criterion": "pass"}));
         assert_eq!(req.workstream_id(), Some(&ws));

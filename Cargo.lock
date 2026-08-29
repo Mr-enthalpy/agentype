@@ -32,6 +32,7 @@ dependencies = [
 name = "agentype-runtime"
 version = "0.2.0"
 dependencies = [
+ "agentype-adapter-api",
  "agentype-core",
  "agentype-execution-config",
  "agentype-storage-sqlite",

@@ -8,5 +8,6 @@ description = "M4 recovery orchestration and M5 runtime configuration boundary; 
 [dependencies]
 agentype-core.workspace = true
 agentype-execution-config.workspace = true
+agentype-adapter-api.workspace = true
 agentype-storage-sqlite.workspace = true
 serde_json.workspace = true
