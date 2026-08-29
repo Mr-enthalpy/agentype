@@ -6,18 +6,58 @@
 pub use agentype_execution_config::*;
 
 use agentype_adapter_api::ExecutionRequest;
-use agentype_core::{Claim, Error, ExpireReport};
+use agentype_core::{Claim, Error, ExpireReport, FailureClass};
 use agentype_storage_sqlite::Kernel;
 
-/// Authoritative launch snapshot plus the runtime-assembled worker request.
+/// Preparation failure of the canonical launch façade.
 ///
-/// The runtime façade is the single composition point between durable
-/// Scheduler facts and the physical worker contract: adapters never receive
-/// raw launch pieces, and the worker prompt is never conflated with the
-/// durable Task label.
+/// Configuration-resolution failures are frozen at this boundary to the
+/// standardized Scheduler failure class `RESOURCE_UNAVAILABLE` (spec 16 §A2:
+/// the supplied registry is authoritative; there is no adapter-default
+/// fallback). Kernel authority rejections remain domain errors and are
+/// deliberately NOT mapped to a Task failure class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPreparationError {
+    /// The authoritative registry lacks the claimed target/profile or the
+    /// pair is incompatible. Standardized as `FailureClass::ResourceUnavailable`.
+    Configuration(ResolutionError),
+    /// The fenced Kernel execution-creation transaction rejected the launch
+    /// (domain/authority error, e.g. stale or invalid authority).
+    Kernel(Error),
+}
+
+impl ExecutionPreparationError {
+    /// Standardized Task failure class for this preparation failure, if one
+    /// is defined. Configuration failures are always
+    /// `FailureClass::ResourceUnavailable`; kernel authority errors are not
+    /// Task execution failures and yield `None`.
+    pub fn standard_failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::Configuration(_) => Some(FailureClass::ResourceUnavailable),
+            Self::Kernel(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(e) => write!(f, "execution configuration unavailable: {e}"),
+            Self::Kernel(e) => write!(f, "execution launch rejected: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutionPreparationError {}
+
+/// Authoritative launch snapshot, the runtime-assembled worker request, and
+/// the resolved environment that minted the persisted safety proof — one
+/// atomically bound unit.
+#[derive(Debug)]
 pub struct PreparedExecutionLaunch {
     snapshot: ExecutionLaunchSnapshot,
     request: ExecutionRequest,
+    resolved_environment: ResolvedExecutionEnvironment,
 }
 
 impl PreparedExecutionLaunch {
@@ -28,21 +68,49 @@ impl PreparedExecutionLaunch {
     pub fn request(&self) -> &ExecutionRequest {
         &self.request
     }
+
+    /// The environment that minted this launch's persisted `attempt_isolation`
+    /// proof.
+    ///
+    /// This is atomically the same environment the safety fact was frozen
+    /// from: resolution happens inside `prepare_execution_launch`, immediately
+    /// before the fenced execution-creation transaction, so a stale
+    /// pre-resolved environment can never be replayed as launch authority.
+    /// The M5.2 dispatcher MUST select the adapter binding, options, and
+    /// timeouts from this instance and MUST NOT re-resolve.
+    pub fn resolved_environment(&self) -> &ResolvedExecutionEnvironment {
+        &self.resolved_environment
+    }
 }
 
-/// Authoritatively prepare and record an execution launch from a Scheduler claim and resolved environment.
+/// Authoritatively prepare and record an execution launch from a Scheduler claim.
 ///
-/// Ensures the execution environment safety proof is passed directly from configuration resolution
-/// to the Kernel without caller tampering, then assembles the worker request whose prompt is
-/// deterministically derived from the snapshot (never the Task label, never caller text).
+/// Configuration resolution happens here, immediately before the fenced
+/// Kernel execution-creation transaction, so the persisted `attempt_isolation`
+/// fact and the returned `resolved_environment` are bound to the same
+/// authoritative registry state at the same instant. Callers pass the
+/// currently-authoritative registry (or the explicit standalone resolution
+/// mode); they cannot supply a pre-resolved environment, so an environment
+/// resolved under an older configuration can never authorize a later attempt.
+/// The Kernel still cross-validates the safety proof against the frozen
+/// Attempt target/profile, so a tampered claim cannot steer resolution.
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,
-    environment: &ResolvedExecutionEnvironment,
-) -> Result<PreparedExecutionLaunch, Error> {
-    let snapshot = kernel.create_execution(claim, environment.safety())?;
+    mode: ExecutionResolutionMode<'_>,
+) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
+    let environment =
+        resolve_execution_environment(mode, &claim.execution_target, &claim.execution_profile)
+            .map_err(ExecutionPreparationError::Configuration)?;
+    let snapshot = kernel
+        .create_execution(claim, environment.safety())
+        .map_err(ExecutionPreparationError::Kernel)?;
     let request = ExecutionRequest::from_launch(&snapshot);
-    Ok(PreparedExecutionLaunch { snapshot, request })
+    Ok(PreparedExecutionLaunch {
+        snapshot,
+        request,
+        resolved_environment: environment,
+    })
 }
 
 /// Restart authority barrier. Dispatch MUST NOT run until this returns.
@@ -137,16 +205,13 @@ mod tests {
             )
             .unwrap();
         let claim_unisolated = kernel.claim_next_available().unwrap().unwrap();
-        let env_unisolated = resolve_execution_environment(
+        let launch_unisolated = prepare_execution_launch(
+            &kernel,
+            &claim_unisolated,
             ExecutionResolutionMode::Authoritative(&registry),
-            &claim_unisolated.execution_target,
-            &claim_unisolated.execution_profile,
         )
         .unwrap();
-        assert!(!env_unisolated.attempt_isolation());
-
-        let launch_unisolated =
-            prepare_execution_launch(&kernel, &claim_unisolated, &env_unisolated).unwrap();
+        assert!(!launch_unisolated.resolved_environment().attempt_isolation());
         assert!(!launch_unisolated.snapshot().attempt_isolation());
         let exec_unisolated = kernel
             .execution(launch_unisolated.snapshot().execution_id())
@@ -158,16 +223,13 @@ mod tests {
             .submit_batch(&[TaskSpec::new("isolated-task", Value::Null).partition("p-isolated")])
             .unwrap();
         let claim_isolated = kernel.claim_next_available().unwrap().unwrap();
-        let env_isolated = resolve_execution_environment(
+        let launch_isolated = prepare_execution_launch(
+            &kernel,
+            &claim_isolated,
             ExecutionResolutionMode::Authoritative(&registry),
-            &claim_isolated.execution_target,
-            &claim_isolated.execution_profile,
         )
         .unwrap();
-        assert!(env_isolated.attempt_isolation());
-
-        let launch_isolated =
-            prepare_execution_launch(&kernel, &claim_isolated, &env_isolated).unwrap();
+        assert!(launch_isolated.resolved_environment().attempt_isolation());
         assert!(launch_isolated.snapshot().attempt_isolation());
         let exec_isolated = kernel
             .execution(launch_isolated.snapshot().execution_id())
@@ -226,14 +288,13 @@ mod tests {
         kernel.submit_batch(&[spec]).unwrap();
 
         let claim = kernel.claim_next_available().unwrap().unwrap();
-        let env = resolve_execution_environment(
+        let launch = prepare_execution_launch(
+            &kernel,
+            &claim,
             ExecutionResolutionMode::Authoritative(&creation_registry),
-            &claim.execution_target,
-            &claim.execution_profile,
         )
         .unwrap();
-        assert!(env.attempt_isolation());
-        let launch = prepare_execution_launch(&kernel, &claim, &env).unwrap();
+        assert!(launch.resolved_environment().attempt_isolation());
         let execution_id = launch.snapshot().execution_id().clone();
         kernel
             .confirm_running_and_renew(
@@ -328,14 +389,13 @@ mod tests {
         kernel.submit_batch(&[spec]).unwrap();
 
         let claim = kernel.claim_next_available().unwrap().unwrap();
-        let env = resolve_execution_environment(
+        let launch = prepare_execution_launch(
+            &kernel,
+            &claim,
             ExecutionResolutionMode::Authoritative(&registry),
-            &claim.execution_target,
-            &claim.execution_profile,
         )
         .unwrap();
-        assert!(!env.attempt_isolation());
-        let launch = prepare_execution_launch(&kernel, &claim, &env).unwrap();
+        assert!(!launch.resolved_environment().attempt_isolation());
         let execution_id = launch.snapshot().execution_id().clone();
         kernel
             .confirm_running_and_renew(
@@ -395,13 +455,12 @@ mod tests {
     ) -> PreparedExecutionLaunch {
         kernel.submit_batch(&[spec]).unwrap();
         let claim = kernel.claim_next_available().unwrap().unwrap();
-        let env = resolve_execution_environment(
+        prepare_execution_launch(
+            kernel,
+            &claim,
             ExecutionResolutionMode::Authoritative(registry),
-            &claim.execution_target,
-            &claim.execution_profile,
         )
-        .unwrap();
-        prepare_execution_launch(kernel, &claim, &env).unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -494,5 +553,167 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             !prompt.contains("implement-foo"),
             "the worker prompt must never be the bare task name"
         );
+    }
+
+    /// Review P1 (round 2): the persisted attempt_isolation fact and the
+    /// environment used for the physical start must be one atomically bound
+    /// resolved environment. The façade resolves inside, so each launch binds
+    /// the registry generation passed at launch time; a stale resolved
+    /// environment cannot be replayed as launch authority (the API no longer
+    /// accepts one).
+    #[test]
+    fn launch_binds_current_registry_state_not_a_stale_resolved_environment() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "remote-env",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+
+        // Registry generation A: the target is isolated.
+        let mut registry_a = ExecutionRegistry::new();
+        registry_a
+            .register_target(ExecutionTargetConfig::new("remote-env", "container", true))
+            .unwrap();
+        registry_a
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+
+        let launch_a = launch_spec(
+            &kernel,
+            &registry_a,
+            TaskSpec::new("task-a", serde_json::json!({"objective": "a"})),
+        );
+        assert!(launch_a.resolved_environment().attempt_isolation());
+        assert!(launch_a.snapshot().attempt_isolation());
+        let exec_a = launch_a.snapshot().execution_id().clone();
+        kernel
+            .ack_success(
+                launch_a.snapshot().attempt_id(),
+                launch_a.snapshot().lease_epoch(),
+                Some(&exec_a),
+                &serde_json::json!({"ok": true}),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+
+        // Registry generation B: same target name, now unisolated. The next
+        // launch must bind generation B, not a hoarded generation-A environment.
+        let mut registry_b = ExecutionRegistry::new();
+        registry_b
+            .register_target(ExecutionTargetConfig::new("remote-env", "container", false))
+            .unwrap();
+        registry_b
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+
+        let launch_b = launch_spec(
+            &kernel,
+            &registry_b,
+            TaskSpec::new("task-b", serde_json::json!({"objective": "b"})),
+        );
+        assert!(
+            !launch_b.resolved_environment().attempt_isolation(),
+            "the second launch must resolve from the current registry generation"
+        );
+        assert!(!launch_b.snapshot().attempt_isolation());
+        assert!(
+            !kernel
+                .execution(launch_b.snapshot().execution_id())
+                .unwrap()
+                .attempt_isolation
+        );
+        // Generation A's persisted fact is untouched by generation B's launch.
+        assert!(kernel.execution(&exec_a).unwrap().attempt_isolation);
+    }
+
+    /// Review P2 (round 2): configuration-resolution failures are frozen at
+    /// the façade boundary to the standardized Task failure class
+    /// RESOURCE_UNAVAILABLE (spec 16 §A2: the supplied registry is
+    /// authoritative, no adapter default). Kernel authority errors are not
+    /// Task failure classes.
+    #[test]
+    fn preparation_errors_standardize_configuration_failures_as_resource_unavailable() {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+
+        kernel
+            .submit_batch(&[TaskSpec::new("prep-failure-task", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+
+        // Authoritative registry missing the claimed target.
+        let empty = ExecutionRegistry::new();
+        let err = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&empty),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ExecutionPreparationError::Configuration(ResolutionError::TargetNotFound(_))
+        ));
+        assert_eq!(
+            err.standard_failure_class(),
+            Some(FailureClass::ResourceUnavailable)
+        );
+
+        // Missing profile is the same standardized class.
+        let mut partial = ExecutionRegistry::new();
+        partial
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        let err = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&partial),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ExecutionPreparationError::Configuration(ResolutionError::ProfileNotFound(_))
+        ));
+        assert_eq!(
+            err.standard_failure_class(),
+            Some(FailureClass::ResourceUnavailable)
+        );
+
+        // Kernel authority errors are domain errors, not Task failure classes.
+        let kernel_err = ExecutionPreparationError::Kernel(Error::not_found("unreachable"));
+        assert_eq!(kernel_err.standard_failure_class(), None);
+
+        // Failed preparations left the claim untouched: the same claim still
+        // launches under a complete registry.
+        let mut full = ExecutionRegistry::new();
+        full.register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        full.register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let prepared = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&full),
+        )
+        .unwrap();
+        assert_eq!(prepared.snapshot().attempt_id(), &claim.attempt_id);
     }
 }
