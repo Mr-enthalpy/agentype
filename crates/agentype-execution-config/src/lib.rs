@@ -10,8 +10,9 @@
 //! memory-safety-enforced.)
 
 use agentype_core::{
-    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, IncarnationId, LeaseEpoch,
-    LeaseId, LogicalAgentId, RequestId, TaskId, UnixTime, WorkspaceMode, WorkstreamId,
+    AttemptId, AuthoritativeExecutionBinding, BatchId, CommittedContinuitySnapshot, ExecutionId,
+    IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, UnixTime, WorkspaceMode,
+    WorkstreamId,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -181,41 +182,55 @@ pub enum ExecutionResolutionMode<'a> {
     DirectUnconfigured,
 }
 
-/// Strongly-typed safety fact produced exclusively through authoritative configuration resolution.
+/// Strongly-typed safety fact produced exclusively through authoritative
+/// configuration resolution, and bound to the Attempt identity it was
+/// resolved for.
 ///
-/// Ensures that the isolation guarantee cannot be decoupled from the target and profile
-/// for which configuration resolution was performed.
+/// Ensures that the isolation guarantee cannot be decoupled from the target
+/// and profile for which configuration resolution was performed, nor from the
+/// Attempt/lease epoch whose durable binding keyed the resolution: the Kernel
+/// rejects a proof whose `attempt_id` / `lease_epoch` do not match the
+/// attempt being launched, so a proof can never be replayed across attempts
+/// even when the target and profile names coincide.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenExecutionSafety {
+    attempt_id: AttemptId,
+    lease_epoch: LeaseEpoch,
     execution_target: String,
     execution_profile: String,
     attempt_isolation: bool,
 }
 
 impl FrozenExecutionSafety {
-    /// Safe constructor for unisolated execution environments (no-isolation-assumption fail-safe).
-    pub fn unisolated(
-        execution_target: impl Into<String>,
-        execution_profile: impl Into<String>,
-    ) -> Self {
+    /// Safe constructor for unisolated execution environments
+    /// (no-isolation-assumption fail-safe). The proof is still Attempt-bound.
+    pub fn unisolated(binding: AuthoritativeExecutionBinding) -> Self {
         Self {
-            execution_target: execution_target.into(),
-            execution_profile: execution_profile.into(),
+            attempt_id: binding.attempt_id,
+            lease_epoch: binding.lease_epoch,
+            execution_target: binding.execution_target,
+            execution_profile: binding.execution_profile,
             attempt_isolation: false,
         }
     }
 
     /// Internal constructor used exclusively by `ResolvedExecutionEnvironment`.
-    pub(crate) fn new(
-        execution_target: String,
-        execution_profile: String,
-        attempt_isolation: bool,
-    ) -> Self {
+    pub(crate) fn new(binding: AuthoritativeExecutionBinding, attempt_isolation: bool) -> Self {
         Self {
-            execution_target,
-            execution_profile,
+            attempt_id: binding.attempt_id,
+            lease_epoch: binding.lease_epoch,
+            execution_target: binding.execution_target,
+            execution_profile: binding.execution_profile,
             attempt_isolation,
         }
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
     }
 
     pub fn execution_target(&self) -> &str {
@@ -234,12 +249,15 @@ impl FrozenExecutionSafety {
 /// Resolved physical execution environment for an authoritative launch.
 ///
 /// Fields are encapsulated as private and readonly to prevent post-resolution
-/// tampering with the isolated safety fact.
+/// tampering with the isolated safety fact. The environment carries the
+/// durable `AuthoritativeExecutionBinding` it was resolved for, so the minted
+/// safety proof is Attempt-bound.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedExecutionEnvironment {
     target: ExecutionTargetConfig,
     profile: ExecutionProfileConfig,
     attempt_isolation: bool,
+    binding: AuthoritativeExecutionBinding,
 }
 
 impl ResolvedExecutionEnvironment {
@@ -247,11 +265,13 @@ impl ResolvedExecutionEnvironment {
         target: ExecutionTargetConfig,
         profile: ExecutionProfileConfig,
         attempt_isolation: bool,
+        binding: AuthoritativeExecutionBinding,
     ) -> Self {
         Self {
             target,
             profile,
             attempt_isolation,
+            binding,
         }
     }
 
@@ -267,16 +287,18 @@ impl ResolvedExecutionEnvironment {
         self.attempt_isolation
     }
 
-    /// Produce the strongly-typed safety proof bound to this resolved environment.
+    /// The durable authority binding this environment was resolved for.
+    pub fn binding(&self) -> &AuthoritativeExecutionBinding {
+        &self.binding
+    }
+
+    /// Produce the strongly-typed safety proof bound to this resolved
+    /// environment AND to the Attempt identity of its binding.
     ///
-    /// This is the sole mechanism across all crates to obtain a `FrozenExecutionSafety`
-    /// carrying `attempt_isolation = true`.
+    /// This is the sole mechanism across all crates to obtain a
+    /// `FrozenExecutionSafety` carrying `attempt_isolation = true`.
     pub fn safety(&self) -> FrozenExecutionSafety {
-        FrozenExecutionSafety::new(
-            self.target.name.clone(),
-            self.profile.name.clone(),
-            self.attempt_isolation,
-        )
+        FrozenExecutionSafety::new(self.binding.clone(), self.attempt_isolation)
     }
 }
 
@@ -303,18 +325,25 @@ impl std::error::Error for ResolutionError {}
 
 /// Standardized runtime resolution of execution environment.
 ///
-/// Rules:
+/// The resolution key comes from the durable `AuthoritativeExecutionBinding`
+/// (Attempt-frozen target/profile), never from a Claim DTO. Rules:
 /// 1. If `mode` is `ExecutionResolutionMode::Authoritative(reg)`, the registry is strictly authoritative:
 ///    - Missing target -> `ResolutionError::TargetNotFound` (RESOURCE_UNAVAILABLE).
 ///    - Missing profile -> `ResolutionError::ProfileNotFound` (RESOURCE_UNAVAILABLE).
 ///    - Incompatible target/profile -> `ResolutionError::Incompatible` (RESOURCE_UNAVAILABLE).
 ///    - No silent fallback to adapter defaults.
 /// 2. If `mode` is `ExecutionResolutionMode::DirectUnconfigured`, direct-caller mode is used with unisolated defaults.
+///
+/// The resolved environment carries the binding, so the minted
+/// `FrozenExecutionSafety` is Attempt-bound: `Kernel::create_execution`
+/// rejects a proof whose attempt/lease epoch do not match the attempt being
+/// launched, closing cross-attempt proof replay.
 pub fn resolve_execution_environment(
     mode: ExecutionResolutionMode<'_>,
-    target_name: &str,
-    profile_name: &str,
+    binding: &AuthoritativeExecutionBinding,
 ) -> Result<ResolvedExecutionEnvironment, ResolutionError> {
+    let target_name = binding.execution_target.as_str();
+    let profile_name = binding.execution_profile.as_str();
     match mode {
         ExecutionResolutionMode::Authoritative(reg) => {
             let target = reg
@@ -337,12 +366,14 @@ pub fn resolve_execution_environment(
                 target.clone(),
                 profile.clone(),
                 attempt_isolation,
+                binding.clone(),
             ))
         }
         ExecutionResolutionMode::DirectUnconfigured => Ok(ResolvedExecutionEnvironment::new(
             ExecutionTargetConfig::new(target_name, "default", false),
             ExecutionProfileConfig::new(profile_name),
             false,
+            binding.clone(),
         )),
     }
 }
@@ -544,13 +575,21 @@ impl ExecutionLaunchSnapshot {
 mod tests {
     use super::*;
 
+    fn binding(target: &str, profile: &str) -> AuthoritativeExecutionBinding {
+        AuthoritativeExecutionBinding {
+            attempt_id: AttemptId::new(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: target.to_string(),
+            execution_profile: profile.to_string(),
+        }
+    }
+
     #[test]
     fn explicitly_empty_registry_fails_closed() {
         let registry = ExecutionRegistry::new();
         let err = resolve_execution_environment(
             ExecutionResolutionMode::Authoritative(&registry),
-            "local",
-            "default",
+            &binding("local", "default"),
         )
         .unwrap_err();
         assert_eq!(err, ResolutionError::TargetNotFound("local".to_string()));
@@ -564,8 +603,7 @@ mod tests {
             .unwrap();
         let err = resolve_execution_environment(
             ExecutionResolutionMode::Authoritative(&registry),
-            "local",
-            "isolated",
+            &binding("local", "isolated"),
         )
         .unwrap_err();
         assert_eq!(
@@ -592,8 +630,7 @@ mod tests {
         // local + remote-only must fail with Incompatible
         let err = resolve_execution_environment(
             ExecutionResolutionMode::Authoritative(&registry),
-            "local",
-            "remote-only",
+            &binding("local", "remote-only"),
         )
         .unwrap_err();
         assert_eq!(
@@ -606,8 +643,7 @@ mod tests {
         // remote + remote-only must succeed
         let env = resolve_execution_environment(
             ExecutionResolutionMode::Authoritative(&registry),
-            "remote",
-            "remote-only",
+            &binding("remote", "remote-only"),
         )
         .unwrap();
         assert_eq!(env.target().name, "remote");
@@ -670,36 +706,26 @@ mod tests {
             .register_profile(ExecutionProfileConfig::new("isolated-writer"))
             .unwrap();
 
-        let env = resolve_execution_environment(
-            ExecutionResolutionMode::Authoritative(&registry),
-            "local-b",
-            "isolated-writer",
-        )
-        .unwrap();
+        let b = binding("local-b", "isolated-writer");
+        let env =
+            resolve_execution_environment(ExecutionResolutionMode::Authoritative(&registry), &b)
+                .unwrap();
         assert_eq!(env.target().name, "local-b");
         assert_eq!(env.target().adapter_kind, "process");
         assert_eq!(env.profile().name, "isolated-writer");
         assert!(env.attempt_isolation());
-        assert_eq!(
-            env.safety(),
-            FrozenExecutionSafety::new("local-b".into(), "isolated-writer".into(), true)
-        );
+        assert_eq!(env.binding(), &b);
+        assert_eq!(env.safety(), FrozenExecutionSafety::new(b.clone(), true));
     }
 
     #[test]
     fn direct_unconfigured_mode_returns_unisolated_defaults() {
-        let env = resolve_execution_environment(
-            ExecutionResolutionMode::DirectUnconfigured,
-            "local",
-            "default",
-        )
-        .unwrap();
+        let b = binding("local", "default");
+        let env =
+            resolve_execution_environment(ExecutionResolutionMode::DirectUnconfigured, &b).unwrap();
         assert_eq!(env.target().name, "local");
         assert_eq!(env.profile().name, "default");
         assert!(!env.attempt_isolation());
-        assert_eq!(
-            env.safety(),
-            FrozenExecutionSafety::unisolated("local", "default")
-        );
+        assert_eq!(env.safety(), FrozenExecutionSafety::unisolated(b));
     }
 }

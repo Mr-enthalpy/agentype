@@ -115,6 +115,22 @@ pub fn retryable_read(name: &str) -> TaskSpec {
     })
 }
 
+/// Durable-authority binding derived from a claim's validated identity,
+/// used to key configuration resolution and mint test safety proofs.
+pub fn binding_for(claim: &Claim) -> AuthoritativeExecutionBinding {
+    AuthoritativeExecutionBinding {
+        attempt_id: claim.attempt_id.clone(),
+        lease_epoch: claim.lease_epoch,
+        execution_target: claim.execution_target.clone(),
+        execution_profile: claim.execution_profile.clone(),
+    }
+}
+
+/// Attempt-bound unisolated proof for the claim's attempt (test harness).
+pub fn unisolated_safety(claim: &Claim) -> FrozenExecutionSafety {
+    FrozenExecutionSafety::unisolated(binding_for(claim))
+}
+
 pub fn run_claim(
     k: &Kernel,
     spec: TaskSpec,
@@ -136,13 +152,12 @@ pub fn run_claim(
             .unwrap();
         let env = resolve_execution_environment(
             ExecutionResolutionMode::Authoritative(&registry),
-            &claim.execution_target,
-            &claim.execution_profile,
+            &binding_for(&claim),
         )
         .unwrap();
         env.safety()
     } else {
-        FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile)
+        unisolated_safety(&claim)
     };
     let launch = k.create_execution(&claim, safety).unwrap();
     let execution_id = launch.execution_id().clone();

@@ -505,9 +505,19 @@ mod tests {
                 Value::Null,
                 None,
                 CommittedContinuitySnapshot::stateless(),
-                FrozenExecutionSafety::unisolated("local", "default"),
+                unisolated_local_safety(),
             )
         }
+    }
+
+    /// Attempt-bound unisolated proof for the mock snapshot's synthetic attempt.
+    fn unisolated_local_safety() -> FrozenExecutionSafety {
+        FrozenExecutionSafety::unisolated(agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: agentype_core::AttemptId::new(),
+            lease_epoch: agentype_core::LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        })
     }
 
     #[test]
@@ -582,7 +592,7 @@ mod tests {
                     3,
                     serde_json::json!({"state": "saved"}),
                 ),
-                FrozenExecutionSafety::unisolated("local", "default"),
+                unisolated_local_safety(),
             )
         };
         let req = ExecutionRequest::from_launch(&launch);

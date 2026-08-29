@@ -932,6 +932,22 @@ impl Kernel {
                     "claim execution_profile does not match authoritative attempt",
                 ));
             }
+            // Attempt-bound proof: a safety fact minted for a different
+            // attempt (or a different lease epoch) is rejected even when the
+            // target and profile names coincide, closing cross-attempt
+            // replay of a stale isolated proof.
+            if safety.attempt_id().as_str() != attempt.id {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof is bound to attempt {} but the authoritative attempt is {}",
+                    safety.attempt_id().as_str(),
+                    attempt.id
+                )));
+            }
+            if safety.lease_epoch() != claim.lease_epoch {
+                return Err(Error::invalid_authority(
+                    "safety proof is bound to a different lease epoch",
+                ));
+            }
             if safety.execution_target() != attempt.execution_target {
                 return Err(Error::invalid_authority(format!(
                     "safety proof target '{}' does not match authoritative attempt target '{}'",

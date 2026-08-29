@@ -5,7 +5,6 @@
 mod common;
 
 use agentype_core::*;
-use agentype_execution_config::*;
 use agentype_storage_sqlite::Kernel;
 use common::*;
 use rusqlite::Connection;
@@ -26,13 +25,7 @@ fn restart_recovery_prevents_blind_duplicate_execution() {
         let claim = k.claim_next_available().unwrap().unwrap();
         attempt_id = claim.attempt_id.clone();
         let _ = k
-            .create_execution(
-                &claim,
-                FrozenExecutionSafety::unisolated(
-                    &claim.execution_target,
-                    &claim.execution_profile,
-                ),
-            )
+            .create_execution(&claim, unisolated_safety(&claim))
             .unwrap();
         original_expiry = k.lease_for_attempt(&attempt_id).unwrap().expires_at;
     }
@@ -56,10 +49,7 @@ fn unknown_execution_can_reconcile_to_running() {
     let (_b, _ids) = k.submit_batch(&[read_task("amb2")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     let launch = k
-        .create_execution(
-            &claim,
-            FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile),
-        )
+        .create_execution(&claim, unisolated_safety(&claim))
         .unwrap();
     let execution_id = launch.execution_id().clone();
     k.record_physical_outcome(
@@ -163,13 +153,7 @@ fn retired_agent_claim_leftover_cannot_create_execution() {
     };
     let err = env
         .k
-        .create_execution(
-            &stale_claim,
-            FrozenExecutionSafety::unisolated(
-                &stale_claim.execution_target,
-                &stale_claim.execution_profile,
-            ),
-        )
+        .create_execution(&stale_claim, unisolated_safety(&stale_claim))
         .unwrap_err();
     assert!(matches!(err, Error::InvalidTransition(_)));
     assert!(err.to_string().contains("retired"));
@@ -354,13 +338,7 @@ fn restart_during_result_available_preserves_durable_outcome() {
         task_id = ids["durable"].clone();
         let claim = k.claim_next_available().unwrap().unwrap();
         let launch = k
-            .create_execution(
-                &claim,
-                FrozenExecutionSafety::unisolated(
-                    &claim.execution_target,
-                    &claim.execution_profile,
-                ),
-            )
+            .create_execution(&claim, unisolated_safety(&claim))
             .unwrap();
         let execution_id = launch.execution_id().clone();
         k.confirm_running_and_renew(

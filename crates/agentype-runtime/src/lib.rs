@@ -112,9 +112,8 @@ pub fn prepare_execution_launch(
     let binding = kernel
         .resolve_execution_binding(claim)
         .map_err(ExecutionPreparationError::Kernel)?;
-    let environment =
-        resolve_execution_environment(mode, &binding.execution_target, &binding.execution_profile)
-            .map_err(ExecutionPreparationError::Configuration)?;
+    let environment = resolve_execution_environment(mode, &binding)
+        .map_err(ExecutionPreparationError::Configuration)?;
     let snapshot = kernel
         .create_execution(claim, environment.safety())
         .map_err(ExecutionPreparationError::Kernel)?;
@@ -142,11 +141,22 @@ pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
 mod tests {
     use super::*;
     use agentype_core::{
-        Clock, FailureClass, LeaseEpoch, ManualClock, PartitionSpec, Retention, RetryPolicy,
-        TaskSpec, TaskState,
+        AttemptId, AuthoritativeExecutionBinding, Clock, FailureClass, LeaseEpoch, ManualClock,
+        PartitionSpec, Retention, RetryPolicy, TaskSpec, TaskState,
     };
     use serde_json::Value;
     use std::sync::Arc;
+
+    /// Synthetic durable binding for registry-only assertions (the attempt
+    /// identity is irrelevant when only target/profile resolution is probed).
+    fn synthetic_binding(target: &str, profile: &str) -> AuthoritativeExecutionBinding {
+        AuthoritativeExecutionBinding {
+            attempt_id: AttemptId::new(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: target.to_string(),
+            execution_profile: profile.to_string(),
+        }
+    }
 
     #[test]
     fn recovery_does_not_dispatch() {
@@ -330,8 +340,7 @@ mod tests {
         assert!(
             !resolve_execution_environment(
                 ExecutionResolutionMode::Authoritative(&reconfigured_registry),
-                "remote-env",
-                "default",
+                &synthetic_binding("remote-env", "default"),
             )
             .unwrap()
             .attempt_isolation(),
@@ -820,5 +829,103 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             ExecutionPreparationError::Kernel(Error::StaleAuthority(_))
         ));
         assert_eq!(err.standard_failure_class(), None);
+    }
+
+    /// Review P1 (round 4): the safety proof is Attempt-bound. A proof minted
+    /// for attempt A (under a registry generation where the target was
+    /// isolated) cannot authorize attempt B even when B freezes the identical
+    /// target/profile — the Kernel rejects it on attempt/epoch identity —
+    /// while the canonical façade for B under the current registry succeeds
+    /// and persists the current isolation fact.
+    #[test]
+    fn stale_safety_proof_cannot_authorize_later_attempt_after_registry_reconfiguration() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "remote-env",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+
+        // Registry generation A: the target is isolated. Launch attempt A.
+        let mut registry_a = ExecutionRegistry::new();
+        registry_a
+            .register_target(ExecutionTargetConfig::new("remote-env", "container", true))
+            .unwrap();
+        registry_a
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+
+        let launch_a = launch_spec(
+            &kernel,
+            &registry_a,
+            TaskSpec::new("task-a", serde_json::json!({"objective": "a"})),
+        );
+        assert!(launch_a.snapshot().attempt_isolation());
+        // Retain the resolved environment (and its Attempt-bound proof).
+        let env_a = launch_a.resolved_environment().clone();
+        let exec_a = launch_a.snapshot().execution_id().clone();
+        kernel
+            .ack_success(
+                launch_a.snapshot().attempt_id(),
+                launch_a.snapshot().lease_epoch(),
+                Some(&exec_a),
+                &serde_json::json!({"ok": true}),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+
+        // Registry generation B: same target name, now unisolated. Attempt B
+        // freezes the same target/profile pair.
+        let mut registry_b = ExecutionRegistry::new();
+        registry_b
+            .register_target(ExecutionTargetConfig::new("remote-env", "container", false))
+            .unwrap();
+        registry_b
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+
+        kernel
+            .submit_batch(&[TaskSpec::new(
+                "task-b",
+                serde_json::json!({"objective": "b"}),
+            )])
+            .unwrap();
+        let claim_b = kernel.claim_next_available().unwrap().unwrap();
+
+        // Replay attempt A's proof onto attempt B: rejected on identity, even
+        // though target and profile coincide.
+        let err = kernel
+            .create_execution(&claim_b, env_a.safety())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidAuthority(_)),
+            "stale proof must be an authority rejection, got: {err:?}"
+        );
+
+        // The canonical façade with the current registry authorizes attempt B
+        // and persists the current (unisolated) fact.
+        let launch_b = prepare_execution_launch(
+            &kernel,
+            &claim_b,
+            ExecutionResolutionMode::Authoritative(&registry_b),
+        )
+        .unwrap();
+        assert!(!launch_b.snapshot().attempt_isolation());
+        assert!(
+            !kernel
+                .execution(launch_b.snapshot().execution_id())
+                .unwrap()
+                .attempt_isolation
+        );
+        // Attempt A's persisted fact is untouched.
+        assert!(kernel.execution(&exec_a).unwrap().attempt_isolation);
     }
 }
