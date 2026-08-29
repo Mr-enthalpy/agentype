@@ -297,46 +297,25 @@ pub struct FrozenExecutionSafety {
 }
 
 impl FrozenExecutionSafety {
+    /// Internal constructor for authoritative configuration resolution within agentype-core.
+    pub(crate) fn new(
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+        attempt_isolation: bool,
+    ) -> Self {
+        Self {
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            attempt_isolation,
+        }
+    }
+
     /// Safe constructor for unisolated execution environments (fail-safe default).
     pub fn unisolated(
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
     ) -> Self {
-        Self {
-            execution_target: execution_target.into(),
-            execution_profile: execution_profile.into(),
-            attempt_isolation: false,
-        }
-    }
-
-    /// Internal constructor for authoritative configuration resolution.
-    ///
-    /// # Safety
-    /// Caller MUST ensure that `attempt_isolation` was resolved directly from an authoritative
-    /// `ExecutionRegistry` configuration for the specified `execution_target`.
-    pub unsafe fn from_resolved_authority(
-        execution_target: impl Into<String>,
-        execution_profile: impl Into<String>,
-        attempt_isolation: bool,
-    ) -> Self {
-        Self {
-            execution_target: execution_target.into(),
-            execution_profile: execution_profile.into(),
-            attempt_isolation,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn for_testing(
-        execution_target: impl Into<String>,
-        execution_profile: impl Into<String>,
-        attempt_isolation: bool,
-    ) -> Self {
-        Self {
-            execution_target: execution_target.into(),
-            execution_profile: execution_profile.into(),
-            attempt_isolation,
-        }
+        Self::new(execution_target, execution_profile, false)
     }
 
     pub fn execution_target(&self) -> &str {
@@ -369,6 +348,7 @@ pub struct ExecutionLaunchSnapshot {
     lease_expires_at: UnixTime,
     logical_agent_id: LogicalAgentId,
     incarnation_id: IncarnationId,
+    incarnation_runtime_handle: Value,
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
@@ -385,7 +365,7 @@ impl ExecutionLaunchSnapshot {
     ///
     /// # Safety
     /// Caller MUST be a fenced Kernel database transaction that has atomically validated
-    /// the Attempt, Lease, Task, and Agent records from durable storage.
+    /// the Attempt, Lease, Task, Agent, and Incarnation records from durable storage.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_persisted_kernel_authority(
         execution_id: ExecutionId,
@@ -399,6 +379,7 @@ impl ExecutionLaunchSnapshot {
         lease_expires_at: UnixTime,
         logical_agent_id: LogicalAgentId,
         incarnation_id: IncarnationId,
+        incarnation_runtime_handle: Value,
         execution_target: String,
         execution_profile: String,
         workspace_mode: WorkspaceMode,
@@ -421,6 +402,7 @@ impl ExecutionLaunchSnapshot {
             lease_expires_at,
             logical_agent_id,
             incarnation_id,
+            incarnation_runtime_handle,
             execution_target,
             execution_profile,
             workspace_mode,
@@ -447,6 +429,7 @@ impl ExecutionLaunchSnapshot {
         lease_expires_at: UnixTime,
         logical_agent_id: LogicalAgentId,
         incarnation_id: IncarnationId,
+        incarnation_runtime_handle: Value,
         execution_target: String,
         execution_profile: String,
         workspace_mode: WorkspaceMode,
@@ -469,6 +452,7 @@ impl ExecutionLaunchSnapshot {
             lease_expires_at,
             logical_agent_id,
             incarnation_id,
+            incarnation_runtime_handle,
             execution_target,
             execution_profile,
             workspace_mode,
@@ -523,6 +507,10 @@ impl ExecutionLaunchSnapshot {
 
     pub fn incarnation_id(&self) -> &IncarnationId {
         &self.incarnation_id
+    }
+
+    pub fn incarnation_runtime_handle(&self) -> &Value {
+        &self.incarnation_runtime_handle
     }
 
     pub fn execution_target(&self) -> &str {

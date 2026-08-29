@@ -899,14 +899,33 @@ impl Kernel {
                     attempt.execution_profile
                 )));
             }
-            let incarnation_id = match attempt.incarnation_id {
-                Some(id) => id,
-                None => ensure_incarnation(
-                    tx,
-                    &attempt.logical_agent_id,
-                    &attempt.execution_target,
-                    now,
-                )?,
+            let (incarnation_id, incarnation_handle_json) = match attempt.incarnation_id {
+                Some(id) => {
+                    let handle: String = tx
+                        .query_row(
+                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_sqlite)?;
+                    (id, handle)
+                }
+                None => {
+                    let id = ensure_incarnation(
+                        tx,
+                        &attempt.logical_agent_id,
+                        &attempt.execution_target,
+                        now,
+                    )?;
+                    let handle: String = tx
+                        .query_row(
+                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_sqlite)?;
+                    (id, handle)
+                }
             };
             let busy: Option<i64> = tx
                 .query_row(
@@ -960,6 +979,7 @@ impl Kernel {
                 agent.continuity_version,
                 continuity_capsule,
             );
+            let incarnation_runtime_handle = json_load(&incarnation_handle_json)?;
 
             // SAFETY: Atomically validated and reconstructed from durable storage within the
             // Kernel execution creation transaction.
@@ -976,6 +996,7 @@ impl Kernel {
                     lease.expires_at,
                     LogicalAgentId::from_string(&attempt.logical_agent_id),
                     IncarnationId::from_string(&incarnation_id),
+                    incarnation_runtime_handle,
                     attempt.execution_target,
                     attempt.execution_profile,
                     workspace_mode,

@@ -5,8 +5,8 @@
 
 use agentype_core::{
     AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot,
-    ExecutionState, FailureClass, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId,
-    WorkspaceMode, WorkstreamId,
+    ExecutionState, FailureClass, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId,
+    TaskId, WorkspaceMode, WorkstreamId,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,6 +55,7 @@ pub struct ExecutionRequest {
     lease_id: LeaseId,
     lease_epoch: LeaseEpoch,
     logical_agent_id: LogicalAgentId,
+    incarnation_id: IncarnationId,
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
@@ -67,10 +68,7 @@ pub struct ExecutionRequest {
 }
 
 impl ExecutionRequest {
-    pub fn from_launch(
-        launch: &ExecutionLaunchSnapshot,
-        incarnation_runtime_handle: RuntimeHandle,
-    ) -> Self {
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
         Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
@@ -81,6 +79,7 @@ impl ExecutionRequest {
             lease_id: launch.lease_id().clone(),
             lease_epoch: launch.lease_epoch(),
             logical_agent_id: launch.logical_agent_id().clone(),
+            incarnation_id: launch.incarnation_id().clone(),
             execution_target: launch.execution_target().to_string(),
             execution_profile: launch.execution_profile().to_string(),
             workspace_mode: launch.workspace_mode(),
@@ -89,7 +88,7 @@ impl ExecutionRequest {
             acceptance: launch.acceptance().clone(),
             workstream_id: launch.workstream_id().cloned(),
             continuity: launch.continuity().clone(),
-            incarnation_runtime_handle,
+            incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
         }
     }
 
@@ -105,6 +104,7 @@ impl ExecutionRequest {
         lease_id: LeaseId,
         lease_epoch: LeaseEpoch,
         logical_agent_id: LogicalAgentId,
+        incarnation_id: IncarnationId,
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
         workspace_mode: WorkspaceMode,
@@ -125,6 +125,7 @@ impl ExecutionRequest {
             lease_id,
             lease_epoch,
             logical_agent_id,
+            incarnation_id,
             execution_target: execution_target.into(),
             execution_profile: execution_profile.into(),
             workspace_mode,
@@ -171,6 +172,10 @@ impl ExecutionRequest {
 
     pub fn logical_agent_id(&self) -> &LogicalAgentId {
         &self.logical_agent_id
+    }
+
+    pub fn incarnation_id(&self) -> &IncarnationId {
+        &self.incarnation_id
     }
 
     pub fn execution_target(&self) -> &str {
@@ -405,6 +410,7 @@ mod tests {
             LeaseId::new(),
             LeaseEpoch(1),
             LogicalAgentId::new(),
+            IncarnationId::new(),
             "local",
             "default",
             WorkspaceMode::ReadOnly,
@@ -438,6 +444,7 @@ mod tests {
             LeaseId::new(),
             LeaseEpoch(1),
             LogicalAgentId::new(),
+            IncarnationId::new(),
             "local",
             "default",
             WorkspaceMode::ReadOnly,
@@ -473,6 +480,7 @@ mod tests {
     #[test]
     fn execution_request_constructed_from_launch_snapshot() {
         let ws = WorkstreamId::new();
+        let inc_id = agentype_core::IncarnationId::new();
         let launch = ExecutionLaunchSnapshot::for_testing(
             ExecutionId::new(),
             RequestId::new(),
@@ -484,7 +492,8 @@ mod tests {
             agentype_core::LeaseEpoch(1),
             100.0,
             agentype_core::LogicalAgentId::new(),
-            agentype_core::IncarnationId::new(),
+            inc_id.clone(),
+            serde_json::json!({"proc": 42}),
             "local".to_string(),
             "default".to_string(),
             WorkspaceMode::ReadOnly,
@@ -499,8 +508,7 @@ mod tests {
             ),
             FrozenExecutionSafety::unisolated("local", "default"),
         );
-        let handle = RuntimeHandle(serde_json::json!({"proc": 42}));
-        let req = ExecutionRequest::from_launch(&launch, handle.clone());
+        let req = ExecutionRequest::from_launch(&launch);
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -510,6 +518,7 @@ mod tests {
         assert_eq!(req.lease_id(), launch.lease_id());
         assert_eq!(req.lease_epoch(), LeaseEpoch(1));
         assert_eq!(req.logical_agent_id(), launch.logical_agent_id());
+        assert_eq!(req.incarnation_id(), &inc_id);
         assert_eq!(req.execution_target(), "local");
         assert_eq!(req.execution_profile(), "default");
         assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
@@ -526,6 +535,9 @@ mod tests {
             req.continuity().preference(),
             agentype_core::ContinuityPreference::Required
         );
-        assert_eq!(req.incarnation_runtime_handle(), &handle);
+        assert_eq!(
+            req.incarnation_runtime_handle(),
+            &RuntimeHandle(serde_json::json!({"proc": 42}))
+        );
     }
 }
