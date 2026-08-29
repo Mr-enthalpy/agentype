@@ -6,7 +6,7 @@
 pub use agentype_execution_config::*;
 
 use agentype_adapter_api::ExecutionRequest;
-use agentype_core::{Claim, Error, ExpireReport, WorkspaceMode};
+use agentype_core::{Claim, Error, ExpireReport};
 use agentype_storage_sqlite::Kernel;
 
 /// Authoritative launch snapshot plus the runtime-assembled worker request.
@@ -33,112 +33,16 @@ impl PreparedExecutionLaunch {
 /// Authoritatively prepare and record an execution launch from a Scheduler claim and resolved environment.
 ///
 /// Ensures the execution environment safety proof is passed directly from configuration resolution
-/// to the Kernel without caller tampering, then assembles the worker request with the
-/// runtime-rendered worker prompt (never the Task label).
+/// to the Kernel without caller tampering, then assembles the worker request whose prompt is
+/// deterministically derived from the snapshot (never the Task label, never caller text).
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,
     environment: &ResolvedExecutionEnvironment,
 ) -> Result<PreparedExecutionLaunch, Error> {
     let snapshot = kernel.create_execution(claim, environment.safety())?;
-    let prompt = render_worker_prompt(&snapshot);
-    let request = ExecutionRequest::from_launch(&snapshot, prompt);
+    let request = ExecutionRequest::from_launch(&snapshot);
     Ok(PreparedExecutionLaunch { snapshot, request })
-}
-
-/// Render the provider-neutral worker prompt from an authoritative launch snapshot.
-///
-/// Replicates the V0.1 worker protocol exactly (Python oracle
-/// `Dispatcher._render_prompt`): one section per fact, joined by blank lines,
-/// with writer recovery rules appended only for WRITE tasks. The durable Task
-/// label (`task_name`) is deliberately not part of the protocol; the objective
-/// is the task payload. Adapters MUST NOT compose scheduler semantics themselves.
-pub fn render_worker_prompt(launch: &ExecutionLaunchSnapshot) -> String {
-    let mut sections = vec![
-        "LOCAL AGENT SCHEDULER TASK".to_string(),
-        format!("TASK_ID\n{}", launch.task_id().as_str()),
-        format!("ATTEMPT_ID\n{}", launch.attempt_id().as_str()),
-        format!("LEASE_EPOCH\n{}", launch.lease_epoch()),
-        format!(
-            "WORKSTREAM\n{}",
-            match launch.workstream_id() {
-                Some(w) => w.as_str().to_string(),
-                None => "none".to_string(),
-            }
-        ),
-        format!("OBJECTIVE\n{}", python_canonical_json(launch.payload())),
-        format!("ACCEPTANCE\n{}", python_canonical_json(launch.acceptance())),
-        format!(
-            "COMMITTED CONTINUITY\n{}",
-            python_canonical_json(launch.continuity().capsule())
-        ),
-    ];
-    if matches!(launch.workspace_mode(), WorkspaceMode::Write) {
-        sections.push(
-            "WRITER RECOVERY RULES\n\
-             The current workspace is authoritative. Inspect assignment-scoped state and diff \
-             before writing; continue idempotently; do not revert unrelated work."
-                .to_string(),
-        );
-    }
-    sections.push(
-        "RETURN\nReturn the authoritative result only when acceptance is satisfied. \
-         Do not claim Scheduler ACK; the Scheduler validates the current lease separately."
-            .to_string(),
-    );
-    sections.join("\n\n")
-}
-
-/// Canonical JSON rendering matching the V0.1 oracle's
-/// `json.dumps(value, ensure_ascii=False, sort_keys=True)` (sorted object
-/// keys, `", "` / `": "` separators, non-ASCII kept literal).
-fn python_canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(true) => "true".to_string(),
-        serde_json::Value::Bool(false) => "false".to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => python_json_string(s),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<String> = items.iter().map(python_canonical_json).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let parts: Vec<String> = keys
-                .into_iter()
-                .map(|k| {
-                    format!(
-                        "{}: {}",
-                        python_json_string(k),
-                        python_canonical_json(&map[k])
-                    )
-                })
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
-    }
-}
-
-fn python_json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Restart authority barrier. Dispatch MUST NOT run until this returns.

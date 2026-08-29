@@ -42,14 +42,129 @@ pub type AdapterResult<T> = Result<T, AdapterError>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeHandle(pub Value);
 
+/// Deterministic, provider-neutral worker protocol derived from an
+/// authoritative launch snapshot.
+///
+/// Given the same `ExecutionLaunchSnapshot`, the scheduler worker instruction
+/// is uniquely determined: the V0.1 task protocol (`LOCAL AGENT SCHEDULER
+/// TASK` / `TASK_ID` / `ATTEMPT_ID` / `LEASE_EPOCH` / `WORKSTREAM` /
+/// `OBJECTIVE` = payload / `ACCEPTANCE` / `COMMITTED CONTINUITY`, plus
+/// `WRITER RECOVERY RULES` for WRITE tasks and a closing `RETURN` section).
+/// There is no constructor accepting arbitrary text, so the instruction
+/// traveling to a worker can never be substituted away from the Task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedWorkerPrompt {
+    protocol: String,
+}
+
+impl RenderedWorkerPrompt {
+    /// The only construction path: derive the protocol from the launch snapshot.
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
+        Self {
+            protocol: render_worker_protocol(launch),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.protocol
+    }
+}
+
+fn render_worker_protocol(launch: &ExecutionLaunchSnapshot) -> String {
+    let mut sections = vec![
+        "LOCAL AGENT SCHEDULER TASK".to_string(),
+        format!("TASK_ID\n{}", launch.task_id().as_str()),
+        format!("ATTEMPT_ID\n{}", launch.attempt_id().as_str()),
+        format!("LEASE_EPOCH\n{}", launch.lease_epoch()),
+        format!(
+            "WORKSTREAM\n{}",
+            match launch.workstream_id() {
+                Some(w) => w.as_str().to_string(),
+                None => "none".to_string(),
+            }
+        ),
+        format!("OBJECTIVE\n{}", python_canonical_json(launch.payload())),
+        format!("ACCEPTANCE\n{}", python_canonical_json(launch.acceptance())),
+        format!(
+            "COMMITTED CONTINUITY\n{}",
+            python_canonical_json(launch.continuity().capsule())
+        ),
+    ];
+    if matches!(launch.workspace_mode(), WorkspaceMode::Write) {
+        sections.push(
+            "WRITER RECOVERY RULES\n\
+             The current workspace is authoritative. Inspect assignment-scoped state and diff \
+             before writing; continue idempotently; do not revert unrelated work."
+                .to_string(),
+        );
+    }
+    sections.push(
+        "RETURN\nReturn the authoritative result only when acceptance is satisfied. \
+         Do not claim Scheduler ACK; the Scheduler validates the current lease separately."
+            .to_string(),
+    );
+    sections.join("\n\n")
+}
+
+/// Canonical JSON rendering matching the V0.1 oracle's
+/// `json.dumps(value, ensure_ascii=False, sort_keys=True)` (sorted object
+/// keys, `", "` / `": "` separators, non-ASCII kept literal).
+fn python_canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => python_json_string(s),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(python_canonical_json).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    format!(
+                        "{}: {}",
+                        python_json_string(k),
+                        python_canonical_json(&map[k])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+fn python_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Complete structured execution request passed to an ExecutionAdapter.
 ///
 /// Encapsulates all execution metadata as private fields with readonly getters.
 /// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
 ///
-/// `prompt` is the derived worker-protocol representation (task protocol
-/// sections: IDs, epoch, workstream, objective, acceptance, committed
-/// continuity, and writer rules for WRITE tasks). It is NOT the Task name.
+/// `prompt` is deterministically derived from the snapshot (see
+/// `RenderedWorkerPrompt`); it is not a parameter and cannot be injected.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     request_id: RequestId,
@@ -76,11 +191,12 @@ pub struct ExecutionRequest {
 impl ExecutionRequest {
     /// Assemble the worker request from an authoritative launch snapshot.
     ///
-    /// `prompt` MUST be the runtime-rendered worker protocol produced by
-    /// `agentype_runtime::render_worker_prompt(&launch)`. Adapters and other
-    /// consumers MUST NOT compose scheduler semantics into the prompt
-    /// themselves; the runtime is the single composition point.
-    pub fn from_launch(launch: &ExecutionLaunchSnapshot, prompt: String) -> Self {
+    /// The worker prompt is not a parameter: it is deterministically derived
+    /// from the snapshot as the provider-neutral V0.1 worker protocol (see
+    /// `RenderedWorkerPrompt`). Every caller receives the same instruction
+    /// for the same durable launch facts; there is no path to inject
+    /// arbitrary text between the scheduler and the worker.
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
         Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
@@ -95,7 +211,7 @@ impl ExecutionRequest {
             execution_target: launch.execution_target().to_string(),
             execution_profile: launch.execution_profile().to_string(),
             workspace_mode: launch.workspace_mode(),
-            prompt,
+            prompt: RenderedWorkerPrompt::from_launch(launch).protocol,
             payload: launch.payload().clone(),
             acceptance: launch.acceptance().clone(),
             workstream_id: launch.workstream_id().cloned(),
@@ -156,8 +272,8 @@ impl ExecutionRequest {
         self.workspace_mode
     }
 
-    /// Derived worker-protocol representation, as supplied to `from_launch`.
-    /// Produced by `agentype_runtime::render_worker_prompt`; never the Task name.
+    /// Deterministically derived worker protocol (V0.1 task protocol), never
+    /// the Task name and never caller-supplied text.
     pub fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -398,7 +514,7 @@ mod tests {
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
         let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch, "rendered".to_string());
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -413,7 +529,7 @@ mod tests {
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
         let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch, "rendered".to_string());
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -469,7 +585,7 @@ mod tests {
                 FrozenExecutionSafety::unisolated("local", "default"),
             )
         };
-        let req = ExecutionRequest::from_launch(&launch, "RENDERED WORKER PROTOCOL".to_string());
+        let req = ExecutionRequest::from_launch(&launch);
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -484,9 +600,13 @@ mod tests {
         assert_eq!(req.execution_profile(), "default");
         assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
         // The snapshot carries the durable Task label; the request prompt is
-        // whatever the runtime rendered — never conflated with the label.
+        // deterministically derived from the protocol — never the label.
         assert_eq!(launch.task_name(), "my-task");
-        assert_eq!(req.prompt(), "RENDERED WORKER PROTOCOL");
+        assert_eq!(
+            req.prompt(),
+            RenderedWorkerPrompt::from_launch(&launch).as_str()
+        );
+        assert!(req.prompt().contains("OBJECTIVE\n{\"key\": \"val\"}"));
         assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
         assert_eq!(req.acceptance(), &serde_json::json!({"criterion": "pass"}));
         assert_eq!(req.workstream_id(), Some(&ws));
@@ -503,5 +623,25 @@ mod tests {
             req.incarnation_runtime_handle(),
             &RuntimeHandle(serde_json::json!({"proc": 42}))
         );
+    }
+
+    /// Review P1: the worker instruction is a pure function of the launch
+    /// snapshot. There is no API path to inject arbitrary text, so the same
+    /// durable facts always produce the same protocol.
+    #[test]
+    fn worker_prompt_is_deterministic_and_cannot_be_injected() {
+        let launch = mock_launch_snapshot();
+        let first = ExecutionRequest::from_launch(&launch);
+        let second = ExecutionRequest::from_launch(&launch);
+        assert_eq!(first, second);
+        assert_eq!(
+            first.prompt(),
+            RenderedWorkerPrompt::from_launch(&launch).as_str()
+        );
+        assert!(first
+            .prompt()
+            .starts_with("LOCAL AGENT SCHEDULER TASK\n\nTASK_ID\n"));
+        // The mock snapshot is read-only: no writer instructions may appear.
+        assert!(!first.prompt().contains("WRITER RECOVERY RULES"));
     }
 }
