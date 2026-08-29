@@ -346,7 +346,9 @@ pub trait ExecutionAdapter: Send + Sync {
     ) -> AdapterResult<StartObservation>;
 }
 
-/// In-memory fake used by M4 tests. No process, no vendor protocol.
+/// In-memory fake used by M4 tests and M5.2 dispatch tests. No process, no
+/// vendor protocol. Deterministic controls let tests assert invocation
+/// counts, inspect the exact request received, and inject outcomes/errors.
 #[derive(Clone, Default)]
 pub struct FakeAdapter {
     inner: Arc<Mutex<FakeState>>,
@@ -356,9 +358,12 @@ pub struct FakeAdapter {
 struct FakeState {
     by_request: HashMap<String, RuntimeHandle>,
     next_start: Option<StartObservation>,
+    next_start_error: Option<AdapterError>,
     next_observe: Option<ExecutionObservation>,
     next_outcome: Option<ExecutionOutcome>,
     unavailable: bool,
+    start_call_count: usize,
+    last_request: Option<ExecutionRequest>,
 }
 
 impl FakeAdapter {
@@ -374,19 +379,44 @@ impl FakeAdapter {
         self.inner.lock().expect("fake adapter").next_start = Some(obs);
     }
 
+    /// Inject an error for the next `start_execution` call (after this one
+    /// call the injection is consumed).
+    pub fn set_next_start_error(&self, err: AdapterError) {
+        self.inner.lock().expect("fake adapter").next_start_error = Some(err);
+    }
+
     pub fn set_next_outcome(&self, outcome: ExecutionOutcome) {
         self.inner.lock().expect("fake adapter").next_outcome = Some(outcome);
+    }
+
+    /// How many times `start_execution` was invoked in total.
+    pub fn start_call_count(&self) -> usize {
+        self.inner.lock().expect("fake adapter").start_call_count
+    }
+
+    /// The request received by the most recent `start_execution` call.
+    pub fn last_request(&self) -> Option<ExecutionRequest> {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .last_request
+            .clone()
     }
 }
 
 impl ExecutionAdapter for FakeAdapter {
     fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
+        g.start_call_count += 1;
+        g.last_request = Some(request.clone());
         if g.unavailable {
             return Err(AdapterError::Unavailable(format!(
                 "target {} unavailable",
                 request.execution_target()
             )));
+        }
+        if let Some(err) = g.next_start_error.take() {
+            return Err(err);
         }
         let handle = RuntimeHandle(serde_json::json!({
             "fake": true,
@@ -482,14 +512,28 @@ mod tests {
     use super::*;
     use agentype_execution_config::FrozenExecutionSafety;
 
-    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
-        unsafe {
+    /// Coherent synthetic launch fixture: the snapshot's attempt identity and
+    /// its Attempt-bound safety proof share one `AuthoritativeExecutionBinding`
+    /// (review §21 fixture hygiene — never hand a snapshot a safety proof
+    /// minted for a different synthetic attempt).
+    fn mock_launch_fixture() -> (
+        ExecutionLaunchSnapshot,
+        agentype_core::AuthoritativeExecutionBinding,
+    ) {
+        let attempt_id = agentype_core::AttemptId::new();
+        let binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let snapshot = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
                 RequestId::new(),
                 TaskId::new(),
                 BatchId::new(),
-                AttemptId::new(),
+                attempt_id,
                 1,
                 LeaseId::new(),
                 LeaseEpoch(1),
@@ -497,27 +541,22 @@ mod tests {
                 LogicalAgentId::new(),
                 IncarnationId::new(),
                 Value::Null,
-                "local".to_string(),
-                "default".to_string(),
+                binding.execution_target.clone(),
+                binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
                 "hi".to_string(),
                 Value::Null,
                 Value::Null,
                 None,
                 CommittedContinuitySnapshot::stateless(),
-                unisolated_local_safety(),
+                FrozenExecutionSafety::unisolated(binding.clone()),
             )
-        }
+        };
+        (snapshot, binding)
     }
 
-    /// Attempt-bound unisolated proof for the mock snapshot's synthetic attempt.
-    fn unisolated_local_safety() -> FrozenExecutionSafety {
-        FrozenExecutionSafety::unisolated(agentype_core::AuthoritativeExecutionBinding {
-            attempt_id: agentype_core::AttemptId::new(),
-            lease_epoch: agentype_core::LeaseEpoch(1),
-            execution_target: "local".to_string(),
-            execution_profile: "default".to_string(),
-        })
+    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
+        mock_launch_fixture().0
     }
 
     #[test]
@@ -566,22 +605,31 @@ mod tests {
     fn execution_request_constructed_from_launch_snapshot() {
         let ws = WorkstreamId::new();
         let inc_id = agentype_core::IncarnationId::new();
+        // §21 fixture hygiene: one attempt identity shared by the snapshot
+        // and its Attempt-bound safety proof.
+        let attempt_id = agentype_core::AttemptId::new();
+        let binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
         let launch = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
                 RequestId::new(),
                 agentype_core::TaskId::new(),
                 agentype_core::BatchId::new(),
-                agentype_core::AttemptId::new(),
+                attempt_id,
                 1,
                 agentype_core::LeaseId::new(),
-                agentype_core::LeaseEpoch(1),
+                LeaseEpoch(1),
                 100.0,
                 agentype_core::LogicalAgentId::new(),
                 inc_id.clone(),
                 serde_json::json!({"proc": 42}),
-                "local".to_string(),
-                "default".to_string(),
+                binding.execution_target.clone(),
+                binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
                 "my-task".to_string(),
                 serde_json::json!({"key": "val"}),
@@ -592,9 +640,12 @@ mod tests {
                     3,
                     serde_json::json!({"state": "saved"}),
                 ),
-                unisolated_local_safety(),
+                FrozenExecutionSafety::unisolated(binding),
             )
         };
+        // The safety proof is bound to the snapshot's own attempt identity.
+        assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
+        assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
         let req = ExecutionRequest::from_launch(&launch);
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
@@ -653,5 +704,39 @@ mod tests {
             .starts_with("LOCAL AGENT SCHEDULER TASK\n\nTASK_ID\n"));
         // The mock snapshot is read-only: no writer instructions may appear.
         assert!(!first.prompt().contains("WRITER RECOVERY RULES"));
+    }
+
+    /// §21 fixture hygiene regression: the synthetic snapshot and its
+    /// Attempt-bound safety proof share one attempt identity.
+    #[test]
+    fn fixture_safety_is_bound_to_the_snapshot_attempt_identity() {
+        let (launch, binding) = mock_launch_fixture();
+        assert_eq!(launch.attempt_id(), &binding.attempt_id);
+        assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
+        assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
+        assert_eq!(launch.execution_target(), binding.execution_target.as_str());
+        assert_eq!(
+            launch.execution_profile(),
+            binding.execution_profile.as_str()
+        );
+    }
+
+    /// §30: deterministic FakeAdapter controls for dispatch tests.
+    #[test]
+    fn fake_adapter_records_invocation_count_and_last_request() {
+        let fake = FakeAdapter::new();
+        assert_eq!(fake.start_call_count(), 0);
+        let launch = mock_launch_snapshot();
+        let req = ExecutionRequest::from_launch(&launch);
+        let _ = fake.start_execution(&req).unwrap();
+        let _ = fake.start_execution(&req).unwrap();
+        assert_eq!(fake.start_call_count(), 2);
+        assert_eq!(fake.last_request().as_ref(), Some(&req));
+
+        // An injected start error is consumed exactly once.
+        fake.set_next_start_error(AdapterError::DeadlineExceeded("cleanup".into()));
+        assert!(fake.start_execution(&req).is_err());
+        assert_eq!(fake.start_call_count(), 3);
+        assert!(fake.start_execution(&req).is_ok());
     }
 }
