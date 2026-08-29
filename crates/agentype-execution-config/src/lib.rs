@@ -89,6 +89,7 @@ pub enum ConfigurationError {
     DuplicateTarget(String),
     DuplicateProfile(String),
     InvalidName(String),
+    InvalidAdapterKind(String),
     InvalidTimeout(String),
 }
 
@@ -102,6 +103,7 @@ impl std::fmt::Display for ConfigurationError {
                 write!(f, "duplicate execution profile registration: '{p}'")
             }
             Self::InvalidName(m) => write!(f, "invalid configuration name: {m}"),
+            Self::InvalidAdapterKind(m) => write!(f, "invalid adapter kind: {m}"),
             Self::InvalidTimeout(m) => write!(f, "invalid timeout: {m}"),
         }
     }
@@ -128,6 +130,11 @@ impl ExecutionRegistry {
         if target.name.trim().is_empty() {
             return Err(ConfigurationError::InvalidName(
                 "target name cannot be empty".into(),
+            ));
+        }
+        if target.adapter_kind.trim().is_empty() {
+            return Err(ConfigurationError::InvalidAdapterKind(
+                "adapter kind cannot be empty: a target must name its adapter binding".into(),
             ));
         }
         if self.targets.contains_key(&target.name) {
@@ -685,6 +692,23 @@ mod tests {
                 .register_target(ExecutionTargetConfig::new("   ", "process", false))
                 .unwrap_err(),
             ConfigurationError::InvalidName("target name cannot be empty".into())
+        );
+        // An empty or whitespace adapter_kind is an empty binding: rejected.
+        assert_eq!(
+            registry
+                .register_target(ExecutionTargetConfig::new("local", "", false))
+                .unwrap_err(),
+            ConfigurationError::InvalidAdapterKind(
+                "adapter kind cannot be empty: a target must name its adapter binding".into()
+            )
+        );
+        assert_eq!(
+            registry
+                .register_target(ExecutionTargetConfig::new("local", "   ", false))
+                .unwrap_err(),
+            ConfigurationError::InvalidAdapterKind(
+                "adapter kind cannot be empty: a target must name its adapter binding".into()
+            )
         );
         assert_eq!(
             registry
