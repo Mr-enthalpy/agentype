@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn execution_request_constructed_from_launch_snapshot() {
         let ws = WorkstreamId::new();
-        let launch = ExecutionLaunchSnapshot::from_kernel_authority(
+        let launch = ExecutionLaunchSnapshot::for_testing(
             ExecutionId::new(),
             RequestId::new(),
             agentype_core::TaskId::new(),

@@ -5,7 +5,7 @@ Applies to: branch `rust/m5-runtime`
 Canonical path: `docs/reports/v0.2/riir-m5.1-launch-foundation.md`  
 Not a specification.
 
-This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, target/profile-bound `FrozenExecutionSafety`, fail-closed runtime configuration layer, complete structured worker request contract, and bundled committed continuity for M5.
+This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, unforgeable `FrozenExecutionSafety` provenance, explicit `ExecutionResolutionMode`, target/profile compatibility checks, canonical `prepare_execution_launch` runtime façade, fail-closed runtime configuration layer, complete structured worker request contract, and bundled committed continuity for M5.
 
 ---
 
@@ -17,15 +17,20 @@ In M4, `Claim` was returned to callers as a composite DTO carrying both authorit
 - `Claim` is strictly treated as an **authority receipt**, not the physical execution source of truth.
 - `Kernel::create_execution` reconstructs `ExecutionLaunchSnapshot` inside the SQLite transaction directly from durable `TaskRow`, `AttemptRow`, `LeaseRow`, `AgentRow` (committed continuity), and the newly created `Execution` row.
 - `ExecutionLaunchSnapshot` and `ExecutionRequest` have all **private fields and readonly getter methods**, preventing downstream mutation or structural forgery.
+- `ExecutionLaunchSnapshot::from_persisted_kernel_authority` is an `unsafe` storage-level constructor requiring callers to be within a fenced Kernel transaction.
+- `FrozenExecutionSafety` cannot be forged in safe production code; it is produced exclusively through `ResolvedExecutionEnvironment::safety()` from authoritative registry resolution (or `FrozenExecutionSafety::unisolated` fail-safe default).
+- `ResolvedExecutionEnvironment` has private fields to prevent post-resolution tampering with `attempt_isolation`.
 - `ExecutionRequest::from_launch` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot` + runtime handles, retaining the complete structured worker contract (`payload`, `acceptance`, `workstream_id`, `task_id`, `attempt_id`, `lease_epoch`, `continuity`, `workspace_mode`).
-- `ExecutionRequest::for_testing` is gated by `#[cfg(any(test, feature = "test-support"))]`, preventing test bypasses from appearing in production builds.
+- `ExecutionRequest::for_testing` and `FrozenExecutionSafety::for_testing` are gated by `#[cfg(any(test, feature = "test-support"))]`, preventing test bypasses from appearing in production builds.
 
 ```text
 Claim (receipt)
       ↓
-resolve_execution_environment(reg, target, profile)
-      ↓ [fails closed on missing target/profile]
-ResolvedExecutionEnvironment (env.safety())
+resolve_execution_environment(ExecutionResolutionMode::Authoritative(reg), target, profile)
+      ↓ [fails closed on missing target/profile or incompatible pair]
+ResolvedExecutionEnvironment (opaque, private fields)
+      ↓
+prepare_execution_launch(&kernel, &claim, &env)
       ↓
 Kernel::create_execution(&claim, env.safety())
       ↓ [inside SQLite transaction]
@@ -41,11 +46,9 @@ Kernel::create_execution(&claim, env.safety())
       ↓
 ExecutionLaunchSnapshot (private fields, readonly getters)
       ↓
-Future Dispatcher / Runtime
-      ↓
 ExecutionRequest::from_launch(&launch, handle)
       ↓ [complete worker contract: payload, acceptance, continuity, IDs]
-ExecutionAdapter
+ExecutionAdapter.start_execution(&request)
 ```
 
 ---
@@ -54,8 +57,13 @@ ExecutionAdapter
 
 ### `agentype-core`
 - Added `CommittedContinuitySnapshot` in `records.rs` carrying `preference: ContinuityPreference`, `version: i64`, and `capsule: Value`.
-- Added `FrozenExecutionSafety` in `records.rs` carrying `(execution_target, execution_profile, attempt_isolation)`.
-- Added `ExecutionLaunchSnapshot` with all private fields and readonly getter methods, constructible only by Kernel authority (`from_kernel_authority`).
+- Sealed `FrozenExecutionSafety` in `records.rs` carrying `(execution_target, execution_profile, attempt_isolation)`:
+  - `pub fn unisolated(target, profile) -> Self` (safe fail-safe default).
+  - `pub unsafe fn from_resolved_authority(...) -> Self` (internal boundary with formal `# Safety` contract).
+  - `#[cfg(any(test, feature = "test-support"))] pub fn for_testing(...) -> Self`.
+- Sealed `ExecutionLaunchSnapshot` with all private fields and readonly getter methods:
+  - `pub unsafe fn from_persisted_kernel_authority(...) -> Self` (internal storage boundary with formal `# Safety` contract).
+  - `#[cfg(any(test, feature = "test-support"))] pub fn for_testing(...) -> Self`.
 
 ### `agentype-storage-sqlite`
 - Updated signature:
@@ -78,9 +86,25 @@ ExecutionAdapter
 
 ### `agentype-runtime`
 - Defined `attempt_isolation: bool` on `ExecutionTargetConfig` (target mechanical isolation property).
-- Defined `ExecutionProfileConfig` for model settings, timeouts, and options.
+- Defined `ExecutionProfileConfig` for model settings, timeouts, options, and optional `allowed_targets: Option<HashSet<String>>`.
+- Explicit `ExecutionResolutionMode`:
+  ```rust
+  pub enum ExecutionResolutionMode<'a> {
+      Authoritative(&'a ExecutionRegistry),
+      DirectUnconfigured,
+  }
+  ```
+- Opaque `ResolvedExecutionEnvironment` with private fields and `.safety() -> FrozenExecutionSafety`.
+- Canonical launch preparation façade:
+  ```rust
+  pub fn prepare_execution_launch(
+      kernel: &Kernel,
+      claim: &Claim,
+      environment: &ResolvedExecutionEnvironment,
+  ) -> Result<ExecutionLaunchSnapshot, Error>
+  ```
 - Fail-closed registry registration: `register_target` and `register_profile` return `Result<(), ConfigurationError>`, rejecting duplicates, empty names, and non-positive timeouts.
-- `resolve_execution_environment` fails closed on missing target/profile, producing `ResolvedExecutionEnvironment` with `.safety() -> FrozenExecutionSafety` bound to the resolved target and profile.
+- `resolve_execution_environment` fails closed on missing target/profile or incompatible target/profile pairs (`ResolutionError::Incompatible`).
 
 ---
 
@@ -119,13 +143,15 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
    - Belongs strictly to runtime/composition (`agentype-runtime`), not Core semantics.
    - Core contains zero vendor, provider, endpoint, or model brand identifiers.
    - Registration is fail-closed against duplicate names, invalid names, and negative timeouts.
-2. **Fail-Closed Resolution**:
-   - When an explicit `ExecutionRegistry` is provided (even if empty), missing targets or profiles return `ResolutionError::TargetNotFound` / `ResolutionError::ProfileNotFound` (RESOURCE_UNAVAILABLE). No silent fallback to adapter defaults occurs.
-   - When `registry` is `None` (permissive direct-caller mode), explicit unisolated defaults are populated without ambiguity.
-3. **Attempt Isolation**:
+2. **Fail-Closed Resolution & Compatibility**:
+   - In `ExecutionResolutionMode::Authoritative(reg)` (even if empty), missing targets or profiles return `ResolutionError::TargetNotFound` / `ResolutionError::ProfileNotFound` (RESOURCE_UNAVAILABLE). No silent fallback to adapter defaults occurs.
+   - If a profile defines `allowed_targets` and the target is not in the set, resolution returns `ResolutionError::Incompatible`.
+   - In `ExecutionResolutionMode::DirectUnconfigured` (permissive standalone mode), explicit unisolated defaults are populated.
+3. **Attempt Isolation & Unforgeable Provenance**:
    - `attempt_isolation` represents whether the target execution environment mechanically guarantees attempt-scoped writer isolation.
    - Passed to `create_execution` bound to target and profile inside `FrozenExecutionSafety`.
    - Kernel verifies that the safety proof's target and profile match the Attempt's frozen target and profile.
+   - Normal production code cannot instantiate a `FrozenExecutionSafety` with `attempt_isolation = true` outside of `resolve_execution_environment`.
    - Adapters cannot observe, declare, or alter `attempt_isolation` after start.
    - Writer safety and crash recovery strictly inspect the persisted Execution fact.
 
@@ -151,10 +177,10 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 ## 6. Test Suite & Validation Results
 
 ### Rust Workspace (`cargo test --workspace`)
-**119 passed, 0 failed:**
+**121 passed, 0 failed:**
 - `agentype-adapter-api`: 4 passed (including `execution_request_constructed_from_launch_snapshot`)
 - `agentype-core`: 20 passed
-- `agentype-runtime`: 7 passed (including `duplicate_target_or_profile_registration_fails_closed`, `invalid_configuration_parameters_fail_closed`, `explicitly_empty_registry_fails_closed`, `missing_profile_fails_closed`, `valid_target_and_profile_resolve_isolation`, `unsupplied_registry_returns_direct_caller_mode`)
+- `agentype-runtime`: 9 passed (including `incompatible_target_and_profile_fails_closed`, `end_to_end_launch_preserves_registry_isolation_fact`, `duplicate_target_or_profile_registration_fails_closed`, `invalid_configuration_parameters_fail_closed`, `explicitly_empty_registry_fails_closed`, `missing_profile_fails_closed`, `valid_target_and_profile_resolve_isolation`, `direct_unconfigured_mode_returns_unisolated_defaults`)
 - `agentype-storage-sqlite`: 88 passed
   - `m4_kernel.rs`: 61 passed (including launch, continuity, mismatch & tamper regressions)
   - `recovery.rs`: 11 passed
@@ -175,6 +201,6 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 ## 7. Next Steps: M5.2 Dispatcher
 
 With M5.1 complete, the foundation is set for **M5.2**:
-1. Implement the asynchronous Dispatcher worker loop in `agentype-runtime` using `resolve_execution_environment` and `create_execution`.
+1. Implement the asynchronous Dispatcher worker loop in `agentype-runtime` using `resolve_execution_environment` (`ExecutionResolutionMode::Authoritative`) and `prepare_execution_launch`.
 2. Connect `ExecutionAdapter` lifecycle (start -> observe -> interrupt -> terminate -> collect).
 3. Implement heartbeat supervision thread and status notification loop.

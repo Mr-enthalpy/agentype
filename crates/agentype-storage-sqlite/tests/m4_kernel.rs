@@ -1590,7 +1590,7 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     let claim = k.claim_next_available().unwrap().unwrap();
 
     let safety =
-        FrozenExecutionSafety::new(&claim.execution_target, &claim.execution_profile, true);
+        FrozenExecutionSafety::for_testing(&claim.execution_target, &claim.execution_profile, true);
     let launch = k.create_execution(&claim, safety.clone()).unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
@@ -1618,7 +1618,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
     assert_eq!(claim.execution_profile, "default");
 
     // 1. Safety proof for forged target "remote" is rejected
-    let forged_target_safety = FrozenExecutionSafety::new("remote", "default", true);
+    let forged_target_safety = FrozenExecutionSafety::for_testing("remote", "default", true);
     let err = k
         .create_execution(&claim, forged_target_safety)
         .unwrap_err();
@@ -1627,7 +1627,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
         .contains("safety proof target 'remote' does not match"));
 
     // 2. Safety proof for forged profile "isolated" is rejected
-    let forged_profile_safety = FrozenExecutionSafety::new("local", "isolated", true);
+    let forged_profile_safety = FrozenExecutionSafety::for_testing("local", "isolated", true);
     let err = k
         .create_execution(&claim, forged_profile_safety)
         .unwrap_err();
@@ -1636,7 +1636,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
         .contains("safety proof profile 'isolated' does not match"));
 
     // 3. Matching target & profile succeeds
-    let valid_safety = FrozenExecutionSafety::new("local", "default", false);
+    let valid_safety = FrozenExecutionSafety::for_testing("local", "default", false);
     let launch = k.create_execution(&claim, valid_safety).unwrap();
     assert_eq!(launch.execution_target(), "local");
     assert_eq!(launch.execution_profile(), "default");

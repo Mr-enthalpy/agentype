@@ -297,7 +297,24 @@ pub struct FrozenExecutionSafety {
 }
 
 impl FrozenExecutionSafety {
-    pub fn new(
+    /// Safe constructor for unisolated execution environments (fail-safe default).
+    pub fn unisolated(
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+    ) -> Self {
+        Self {
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            attempt_isolation: false,
+        }
+    }
+
+    /// Internal constructor for authoritative configuration resolution.
+    ///
+    /// # Safety
+    /// Caller MUST ensure that `attempt_isolation` was resolved directly from an authoritative
+    /// `ExecutionRegistry` configuration for the specified `execution_target`.
+    pub unsafe fn from_resolved_authority(
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
         attempt_isolation: bool,
@@ -309,11 +326,17 @@ impl FrozenExecutionSafety {
         }
     }
 
-    pub fn unisolated(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_testing(
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
+        attempt_isolation: bool,
     ) -> Self {
-        Self::new(execution_target, execution_profile, false)
+        Self {
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            attempt_isolation,
+        }
     }
 
     pub fn execution_target(&self) -> &str {
@@ -358,9 +381,61 @@ pub struct ExecutionLaunchSnapshot {
 }
 
 impl ExecutionLaunchSnapshot {
-    #[doc(hidden)]
+    /// Internal storage-level constructor for Kernel execution creation transactions.
+    ///
+    /// # Safety
+    /// Caller MUST be a fenced Kernel database transaction that has atomically validated
+    /// the Attempt, Lease, Task, and Agent records from durable storage.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_kernel_authority(
+    pub unsafe fn from_persisted_kernel_authority(
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        task_id: TaskId,
+        batch_id: BatchId,
+        attempt_id: AttemptId,
+        attempt_number: u32,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        lease_expires_at: UnixTime,
+        logical_agent_id: LogicalAgentId,
+        incarnation_id: IncarnationId,
+        execution_target: String,
+        execution_profile: String,
+        workspace_mode: WorkspaceMode,
+        prompt: String,
+        payload: Value,
+        acceptance: Value,
+        workstream_id: Option<WorkstreamId>,
+        continuity: CommittedContinuitySnapshot,
+        safety: FrozenExecutionSafety,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_id,
+            task_id,
+            batch_id,
+            attempt_id,
+            attempt_number,
+            lease_id,
+            lease_epoch,
+            lease_expires_at,
+            logical_agent_id,
+            incarnation_id,
+            execution_target,
+            execution_profile,
+            workspace_mode,
+            prompt,
+            payload,
+            acceptance,
+            workstream_id,
+            continuity,
+            safety,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_testing(
         execution_id: ExecutionId,
         request_id: RequestId,
         task_id: TaskId,

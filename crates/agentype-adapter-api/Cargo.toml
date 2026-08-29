@@ -11,3 +11,6 @@ serde_json.workspace = true
 
 [features]
 test-support = []
+
+[dev-dependencies]
+agentype-core = { path = "../agentype-core", features = ["test-support"] }

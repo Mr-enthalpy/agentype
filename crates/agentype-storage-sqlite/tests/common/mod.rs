@@ -121,7 +121,7 @@ pub fn run_claim(
     let launch = k
         .create_execution(
             &claim,
-            FrozenExecutionSafety::new(
+            FrozenExecutionSafety::for_testing(
                 &claim.execution_target,
                 &claim.execution_profile,
                 isolation,

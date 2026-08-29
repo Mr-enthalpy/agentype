@@ -961,28 +961,32 @@ impl Kernel {
                 continuity_capsule,
             );
 
-            Ok(ExecutionLaunchSnapshot::from_kernel_authority(
-                execution_id,
-                request_id,
-                TaskId::from_string(&attempt.task_id),
-                BatchId::from_string(&task.batch_id),
-                AttemptId::from_string(&attempt.id),
-                attempt.attempt_number as u32,
-                LeaseId::from_string(&lease.id),
-                LeaseEpoch(lease.epoch),
-                lease.expires_at,
-                LogicalAgentId::from_string(&attempt.logical_agent_id),
-                IncarnationId::from_string(&incarnation_id),
-                attempt.execution_target,
-                attempt.execution_profile,
-                workspace_mode,
-                task.name,
-                payload,
-                acceptance,
-                task.workstream_id.map(WorkstreamId::from_string),
-                continuity,
-                safety,
-            ))
+            // SAFETY: Atomically validated and reconstructed from durable storage within the
+            // Kernel execution creation transaction.
+            Ok(unsafe {
+                ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                    execution_id,
+                    request_id,
+                    TaskId::from_string(&attempt.task_id),
+                    BatchId::from_string(&task.batch_id),
+                    AttemptId::from_string(&attempt.id),
+                    attempt.attempt_number as u32,
+                    LeaseId::from_string(&lease.id),
+                    LeaseEpoch(lease.epoch),
+                    lease.expires_at,
+                    LogicalAgentId::from_string(&attempt.logical_agent_id),
+                    IncarnationId::from_string(&incarnation_id),
+                    attempt.execution_target,
+                    attempt.execution_profile,
+                    workspace_mode,
+                    task.name,
+                    payload,
+                    acceptance,
+                    task.workstream_id.map(WorkstreamId::from_string),
+                    continuity,
+                    safety,
+                )
+            })
         })
     }
 

@@ -9,3 +9,7 @@ description = "M4 recovery orchestration; daemon loops are M5"
 agentype-core.workspace = true
 agentype-storage-sqlite.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+agentype-core = { path = "../agentype-core", features = ["test-support"] }
+
