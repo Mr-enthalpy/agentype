@@ -3,6 +3,7 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_core::*;
+use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenExecutionSafety};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};

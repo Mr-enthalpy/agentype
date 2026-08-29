@@ -5,6 +5,7 @@
 mod common;
 
 use agentype_core::*;
+use agentype_execution_config::*;
 use agentype_storage_sqlite::Kernel;
 use common::*;
 use rusqlite::Connection;

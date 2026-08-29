@@ -5,7 +5,7 @@ Applies to: branch `rust/m5-runtime`
 Canonical path: `docs/reports/v0.2/riir-m5.1-launch-foundation.md`  
 Not a specification.
 
-This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation, authoritative physical `Incarnation` and `RuntimeHandle` binding, canonical `prepare_execution_launch` runtime façade, complete structured worker request contract, and bundled committed continuity for M5.
+This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation via `agentype-execution-config`, unforgeable compile-time isolated safety proofs, authoritative physical `Incarnation` and `RuntimeHandle` binding, canonical `prepare_execution_launch` runtime façade, complete structured worker request contract, and bundled committed continuity for M5.
 
 ---
 
@@ -17,8 +17,8 @@ In M4, `Claim` was returned to callers as a composite DTO carrying both authorit
 - `Claim` is strictly treated as an **authority receipt**, not the physical execution source of truth.
 - `Kernel::create_execution` reconstructs `ExecutionLaunchSnapshot` inside the SQLite transaction directly from durable `TaskRow`, `AttemptRow`, `LeaseRow`, `AgentRow` (committed continuity), `IncarnationsRow` (`runtime_handle_json`), and the newly created `Execution` row.
 - `ExecutionLaunchSnapshot` and `ExecutionRequest` have all **private fields and readonly getter methods**, preventing downstream mutation.
-- `ExecutionLaunchSnapshot::from_persisted_kernel_authority` defines the explicit **storage trust boundary** between `agentype-storage-sqlite` and `agentype-core`.
-- Publicly-enableable test bypasses (`test-support` Cargo features and public `for_testing` constructors) have been eliminated.
+- `ExecutionLaunchSnapshot::from_persisted_kernel_authority` defines the explicit **storage trust boundary** between `agentype-storage-sqlite` and `agentype-core` / `agentype-execution-config`. Its contract requires: *"The only safe production construction path is the fenced Kernel execution-creation transaction."*
+- Publicly-enableable test bypasses (`test-support` Cargo features and public `for_testing` constructors) have been eliminated across all workspace crates.
 - `#![forbid(unsafe_code)]` is enforced on `agentype-runtime`, and `#![deny(unsafe_code)]` is enforced on `agentype-adapter-api`.
 - `ExecutionRequest::from_launch(&launch)` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot`, binding both `incarnation_id` and `incarnation_runtime_handle` directly from durable storage without caller handle injection.
 
@@ -55,19 +55,36 @@ ExecutionAdapter.start_execution(&request)
 
 ## 2. Layering & API Architecture
 
+```text
+[agentype-core] (100% Pure Domain, IDs, States, Clock, Authority Predicates)
+      ▲
+      │ (depends on core)
+[agentype-execution-config] (Configuration Authority, Zero I/O)
+      ├── FrozenExecutionSafety (pub(crate) new, pub unisolated)
+      ├── ExecutionTargetConfig { name, adapter_kind, attempt_isolation, options }
+      ├── ExecutionProfileConfig { name, timeout_seconds, allowed_targets, options }
+      ├── ExecutionRegistry (fail-closed registration)
+      ├── ExecutionResolutionMode (Authoritative / DirectUnconfigured)
+      ├── ResolvedExecutionEnvironment (opaque, .safety() -> FrozenExecutionSafety)
+      ├── resolve_execution_environment
+      └── ExecutionLaunchSnapshot (storage trust boundary)
+      ▲                     ▲
+      │ (depends on config) │ (depends on config + storage)
+[agentype-storage-sqlite]   [agentype-runtime] (#![forbid(unsafe_code)])
+      │                     ├── prepare_execution_launch(kernel, claim, env)
+      │                     └── recover_authority(kernel)
+      ▲
+      │ (depends on core + config)
+[agentype-adapter-api] (#![deny(unsafe_code)])
+      ├── ExecutionRequest::from_launch(&launch)
+      └── ExecutionAdapter trait
+```
+
 ### `agentype-core` (Pure Domain Layer)
 - Strictly independent of adapters, timeouts, model options, and runtime resolution.
-- `FrozenExecutionSafety`:
-  - `pub fn unisolated(target, profile) -> Self` (no-isolation-assumption fail-safe).
-  - `pub fn from_resolved_authority(target, profile, attempt_isolation: bool) -> Self` (called by authoritative configuration resolvers).
-  - Readonly getters for `execution_target`, `execution_profile`, and `attempt_isolation`.
-- `ExecutionLaunchSnapshot`:
-  - Cross-crate storage constructor `pub unsafe fn from_persisted_kernel_authority(...)` with formal `# Safety` documentation.
-  - Carries `incarnation_id: IncarnationId` and `incarnation_runtime_handle: Value`.
-  - Readonly getters for all fields.
+- Pure domain models, IDs, states, clock abstractions, and writer safety predicates.
 
-### `agentype-runtime` (Mechanical Runtime & Configuration Boundary)
-- Enforces `#![forbid(unsafe_code)]`.
+### `agentype-execution-config` (Configuration Authority Layer)
 - Owns execution configuration models and registry:
   - `ExecutionTargetConfig`: `name`, `adapter_kind`, `attempt_isolation`, `options`.
   - `ExecutionProfileConfig`: `name`, `timeout_seconds`, `allowed_targets: Option<HashSet<String>>`, `options`.
@@ -75,17 +92,15 @@ ExecutionAdapter.start_execution(&request)
   - `ExecutionResolutionMode`:
     - `Authoritative(&'a ExecutionRegistry)`: Required for production daemon/dispatcher loops; fails closed on missing target/profile or incompatible pair (`ResolutionError::Incompatible`).
     - `DirectUnconfigured`: Standalone / single-shot test mode with unisolated defaults.
+  - `FrozenExecutionSafety`:
+    - Constructor accepting `attempt_isolation: bool` is sealed as **`pub(crate)`**.
+    - Safe public constructor: `pub fn unisolated(target, profile) -> Self` (`attempt_isolation = false`, no-isolation-assumption fail-safe).
+    - Unforgeable: Ordinary safe code cannot forge `attempt_isolation = true` without authoritative registry resolution.
   - `ResolvedExecutionEnvironment`: Encapsulated private fields, readonly getters, and `.safety() -> FrozenExecutionSafety`.
   - `resolve_execution_environment(mode, target, profile) -> Result<ResolvedExecutionEnvironment, ResolutionError>`.
-- Canonical launch preparation façade:
-  ```rust
-  pub fn prepare_execution_launch(
-      kernel: &Kernel,
-      claim: &Claim,
-      environment: &ResolvedExecutionEnvironment,
-  ) -> Result<ExecutionLaunchSnapshot, Error>
-  ```
-- Recovery orchestration: `recover_authority(&kernel) -> Result<ExpireReport, Error>`.
+  - `ExecutionLaunchSnapshot`:
+    - Private fields for all execution launch parameters.
+    - `pub unsafe fn from_persisted_kernel_authority(...) -> Self` (storage trust boundary with formal `# Safety` invariant).
 
 ### `agentype-storage-sqlite` (Scheduler Storage Engine)
 - Updated signature:
@@ -100,6 +115,19 @@ ExecutionAdapter.start_execution(&request)
 - Re-reads all task semantics (`payload`, `acceptance`, `workspace_mode`, `workstream_id`) directly from SQLite `tasks` table.
 - Re-reads agent continuity state (`continuity_json`, `continuity_version`) directly from SQLite `logical_agents` table and bundles it into `CommittedContinuitySnapshot`.
 - Re-reads `incarnations.runtime_handle_json` from durable storage and bundles it into `ExecutionLaunchSnapshot`.
+
+### `agentype-runtime` (Mechanical Runtime Façade)
+- Enforces `#![forbid(unsafe_code)]`.
+- Canonical launch preparation façade:
+  ```rust
+  pub fn prepare_execution_launch(
+      kernel: &Kernel,
+      claim: &Claim,
+      environment: &ResolvedExecutionEnvironment,
+  ) -> Result<ExecutionLaunchSnapshot, Error>
+  ```
+- Recovery orchestration: `recover_authority(&kernel) -> Result<ExpireReport, Error>`.
+- Verified regression: `reconfigured_registry_does_not_alter_persisted_execution_safety_or_writer_recovery` ensures that once an Execution is created with `attempt_isolation = true`, subsequent changes or destruction of the runtime registry do not alter the durable execution isolation fact or writer recovery behavior.
 
 ### `agentype-adapter-api` (Execution Adapter Contracts)
 - Enforces `#![deny(unsafe_code)]`.
@@ -149,7 +177,8 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 **121 passed, 0 failed:**
 - `agentype-adapter-api`: 4 passed (including `execution_request_constructed_from_launch_snapshot`)
 - `agentype-core`: 20 passed (domain authority, decision matrix, state machines)
-- `agentype-runtime`: 9 passed (configuration, compatibility, fail-closed resolution, isolation persistence)
+- `agentype-execution-config`: 7 passed (registry validation, configuration error checking, resolution modes, fail-closed handling)
+- `agentype-runtime`: 3 passed (end-to-end isolation persistence, immutable safety across registry reconfiguration regression, recovery isolation)
 - `agentype-storage-sqlite`: 88 passed
   - `m4_kernel.rs`: 61 passed (including launch, continuity, mismatch & tamper regressions)
   - `recovery.rs`: 11 passed

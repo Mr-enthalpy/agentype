@@ -6,6 +6,10 @@
 #![allow(dead_code)]
 
 use agentype_core::*;
+use agentype_execution_config::{
+    resolve_execution_environment, ExecutionProfileConfig, ExecutionRegistry,
+    ExecutionResolutionMode, ExecutionTargetConfig, FrozenExecutionSafety,
+};
 use agentype_storage_sqlite::Kernel;
 use rusqlite::Connection;
 use serde_json::json;
@@ -119,11 +123,24 @@ pub fn run_claim(
     let (batch, ids) = k.submit_batch(std::slice::from_ref(&spec)).unwrap();
     let claim = k.claim_next_available().unwrap().expect("claim");
     let safety = if isolation {
-        FrozenExecutionSafety::from_resolved_authority(
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new(
+                &claim.execution_target,
+                "test",
+                true,
+            ))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new(&claim.execution_profile))
+            .unwrap();
+        let env = resolve_execution_environment(
+            ExecutionResolutionMode::Authoritative(&registry),
             &claim.execution_target,
             &claim.execution_profile,
-            true,
         )
+        .unwrap();
+        env.safety()
     } else {
         FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile)
     };

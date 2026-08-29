@@ -6,6 +6,7 @@
 mod common;
 
 use agentype_core::*;
+use agentype_execution_config::*;
 use common::*;
 use serde_json::json;
 

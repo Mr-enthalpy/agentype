@@ -6,10 +6,11 @@
 #![deny(unsafe_code)]
 
 use agentype_core::{
-    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot,
-    ExecutionState, FailureClass, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId,
-    TaskId, WorkspaceMode, WorkstreamId,
+    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, FailureClass,
+    IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
+    WorkstreamId,
 };
+use agentype_execution_config::ExecutionLaunchSnapshot;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -351,7 +352,7 @@ impl ExecutionAdapter for FakeAdapter {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use agentype_core::FrozenExecutionSafety;
+    use agentype_execution_config::FrozenExecutionSafety;
 
     fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
         unsafe {
