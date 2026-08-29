@@ -5,9 +5,11 @@
 
 pub use agentype_execution_config::*;
 
-use agentype_adapter_api::ExecutionRequest;
-use agentype_core::{Claim, Error, ExpireReport, FailureClass};
+use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest};
+use agentype_core::{AuthoritativeExecutionBinding, Claim, Error, ExpireReport, FailureClass};
 use agentype_storage_sqlite::Kernel;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Preparation failure of the canonical launch façade.
 ///
@@ -125,6 +127,241 @@ pub fn prepare_execution_launch(
     })
 }
 
+// ---------------------------------------------------------------------------
+// M5.2 — runtime adapter composition and the dispatch commit boundary
+// ---------------------------------------------------------------------------
+
+/// Error raised while registering an adapter implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterRegistryError {
+    InvalidKind(String),
+    DuplicateKind(String),
+}
+
+impl std::fmt::Display for AdapterRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKind(m) => write!(f, "invalid adapter kind: {m}"),
+            Self::DuplicateKind(k) => write!(f, "duplicate adapter kind registration: '{k}'"),
+        }
+    }
+}
+
+impl std::error::Error for AdapterRegistryError {}
+
+/// The configured adapter kind is not installed in the runtime.
+///
+/// Authoritative empty resolution: there is no fallback to a first-available,
+/// target-named, "default", or direct-mode adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterUnavailable {
+    pub adapter_kind: String,
+}
+
+impl std::fmt::Display for AdapterUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no adapter installed for configured kind '{}'",
+            self.adapter_kind
+        )
+    }
+}
+
+impl std::error::Error for AdapterUnavailable {}
+
+/// Registry of installed physical adapter implementations, keyed by the
+/// `adapter_kind` named by `ExecutionTargetConfig`.
+///
+/// This represents physical implementation availability only. It is NOT
+/// SpawnSource and carries no semantic scheduling authority: target
+/// configuration says what execution environment is requested, and this
+/// registry says which physical implementation is currently installed. An
+/// explicitly empty registry is authoritative — resolution fails closed.
+#[derive(Default)]
+pub struct AdapterRegistry {
+    adapters: HashMap<String, Arc<dyn ExecutionAdapter>>,
+}
+
+impl AdapterRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        adapter: Arc<dyn ExecutionAdapter>,
+    ) -> Result<(), AdapterRegistryError> {
+        let kind = adapter_kind.into();
+        if kind.trim().is_empty() {
+            return Err(AdapterRegistryError::InvalidKind(
+                "adapter kind cannot be empty".into(),
+            ));
+        }
+        if self.adapters.contains_key(&kind) {
+            return Err(AdapterRegistryError::DuplicateKind(kind));
+        }
+        self.adapters.insert(kind, adapter);
+        Ok(())
+    }
+
+    /// Fail-closed lookup by the configured `adapter_kind`. No fallback.
+    pub fn resolve(
+        &self,
+        adapter_kind: &str,
+    ) -> Result<Arc<dyn ExecutionAdapter>, AdapterUnavailable> {
+        self.adapters
+            .get(adapter_kind)
+            .cloned()
+            .ok_or_else(|| AdapterUnavailable {
+                adapter_kind: adapter_kind.to_string(),
+            })
+    }
+}
+
+/// Mechanical normalization of adapter invocation errors into the existing
+/// `FailureClass` vocabulary (task §14). Vendor-specific classification
+/// belongs inside adapter implementations; no provider strings are parsed
+/// at the runtime or core layer.
+pub fn adapter_invocation_failure_class(err: &AdapterError) -> FailureClass {
+    match err {
+        AdapterError::Unavailable(_) => FailureClass::ResourceUnavailable,
+        AdapterError::DeadlineExceeded(_) => FailureClass::Timeout,
+        AdapterError::Protocol(_) => FailureClass::AdapterProtocolFailure,
+        AdapterError::Other(_) => FailureClass::StartFailure,
+    }
+}
+
+/// Failure to compose or execute the dispatch path.
+///
+/// Error-model categories (task §31): Authority, Configuration,
+/// AdapterAvailability, AdapterInvocation, Persistence. Authority and
+/// persistence errors are domain/storage errors and are deliberately NOT
+/// mapped to Task failure classes; configuration and missing-adapter
+/// availability normalize to `RESOURCE_UNAVAILABLE` before any physical
+/// start; adapter invocation errors use the normalized adapter failure
+/// classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    /// Durable authority validation rejected the claim (stale, expired, or
+    /// tampered identity). No Execution exists and no adapter is consulted.
+    Authority(Error),
+    /// Target/profile/compatibility resolution failed against the
+    /// authoritative `ExecutionRegistry`.
+    Configuration(ResolutionError),
+    /// The configured adapter_kind is not installed.
+    AdapterAvailability(AdapterUnavailable),
+    /// The adapter start invocation itself errored. The Execution was
+    /// already persisted, so the start is treated as potentially
+    /// side-effecting.
+    AdapterInvocation(AdapterError),
+    /// A post-start authoritative persistence step failed.
+    Persistence(Error),
+}
+
+impl DispatchError {
+    /// Standardized Task failure class for this dispatch failure, if one is
+    /// defined. Only pre-start composition failures and normalized adapter
+    /// invocation failures map to a class.
+    pub fn standard_failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::Authority(_) | Self::Persistence(_) => None,
+            Self::Configuration(_) | Self::AdapterAvailability(_) => {
+                Some(FailureClass::ResourceUnavailable)
+            }
+            Self::AdapterInvocation(err) => Some(adapter_invocation_failure_class(err)),
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authority(e) => write!(f, "dispatch authority rejected: {e}"),
+            Self::Configuration(e) => write!(f, "dispatch configuration unavailable: {e}"),
+            Self::AdapterAvailability(e) => write!(f, "dispatch adapter unavailable: {e}"),
+            Self::AdapterInvocation(e) => write!(f, "dispatch adapter invocation failed: {e}"),
+            Self::Persistence(e) => write!(f, "dispatch persistence failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// The complete physical environment required for a dispatch start.
+///
+/// The single source the Dispatcher uses for physical start: the durable
+/// authority binding, the resolved target/profile configuration (carrying
+/// the Attempt-bound safety facts and runtime options), and the installed
+/// adapter implementation resolved by `adapter_kind`.
+pub struct ResolvedPhysicalExecutionEnvironment {
+    binding: AuthoritativeExecutionBinding,
+    environment: ResolvedExecutionEnvironment,
+    adapter: Arc<dyn ExecutionAdapter>,
+}
+
+impl ResolvedPhysicalExecutionEnvironment {
+    pub fn binding(&self) -> &AuthoritativeExecutionBinding {
+        &self.binding
+    }
+
+    pub fn environment(&self) -> &ResolvedExecutionEnvironment {
+        &self.environment
+    }
+
+    pub fn adapter(&self) -> &Arc<dyn ExecutionAdapter> {
+        &self.adapter
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.environment.attempt_isolation()
+    }
+}
+
+impl std::fmt::Debug for ResolvedPhysicalExecutionEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPhysicalExecutionEnvironment")
+            .field("binding", &self.binding)
+            .field("environment", &self.environment)
+            .field("adapter_kind", &self.environment.target().adapter_kind)
+            .finish()
+    }
+}
+
+/// Resolve the complete physical execution environment for one claim.
+///
+/// Composition order is the M5.2 invariant (task §4): durable authority
+/// binding first, then target/profile configuration, then installed adapter
+/// binding. No Execution is created and no adapter is invoked here — a real
+/// `start_execution` call is only permitted once every composition
+/// requirement has resolved successfully. This is the production composition
+/// path: it accepts an authoritative `ExecutionRegistry` directly and cannot
+/// use `DirectUnconfigured`.
+pub fn resolve_physical_execution_environment(
+    kernel: &Kernel,
+    claim: &Claim,
+    execution_registry: &ExecutionRegistry,
+    adapters: &AdapterRegistry,
+) -> Result<ResolvedPhysicalExecutionEnvironment, DispatchError> {
+    let binding = kernel
+        .resolve_execution_binding(claim)
+        .map_err(DispatchError::Authority)?;
+    let environment = resolve_execution_environment(
+        ExecutionResolutionMode::Authoritative(execution_registry),
+        &binding,
+    )
+    .map_err(DispatchError::Configuration)?;
+    let adapter = adapters
+        .resolve(environment.target().adapter_kind.as_str())
+        .map_err(DispatchError::AdapterAvailability)?;
+    Ok(ResolvedPhysicalExecutionEnvironment {
+        binding,
+        environment,
+        adapter,
+    })
+}
+
 /// Restart authority barrier. Dispatch MUST NOT run until this returns.
 ///
 /// Order (spec 14):
@@ -140,6 +377,7 @@ pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentype_adapter_api::FakeAdapter;
     use agentype_core::{
         AttemptId, AuthoritativeExecutionBinding, Clock, FailureClass, LeaseEpoch, ManualClock,
         PartitionSpec, Retention, RetryPolicy, TaskSpec, TaskState,
@@ -927,5 +1165,176 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         // Attempt A's persisted fact is untouched.
         assert!(kernel.execution(&exec_a).unwrap().attempt_isolation);
+    }
+
+    // ------------------------------------------------------------------
+    // M5.2 composition: AdapterRegistry + physical environment resolution
+    // ------------------------------------------------------------------
+
+    fn compose_physical(
+        kernel: &Kernel,
+        registry: &ExecutionRegistry,
+        adapters: &AdapterRegistry,
+        spec: TaskSpec,
+    ) -> (
+        Claim,
+        Result<ResolvedPhysicalExecutionEnvironment, DispatchError>,
+    ) {
+        kernel.submit_batch(&[spec]).unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        let composed = resolve_physical_execution_environment(kernel, &claim, registry, adapters);
+        (claim, composed)
+    }
+
+    fn fake_adapters(kind: &str) -> AdapterRegistry {
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register(kind, Arc::new(FakeAdapter::new()))
+            .unwrap();
+        adapters
+    }
+
+    #[test]
+    fn physical_composition_resolves_binding_config_and_adapter() {
+        let (kernel, registry) = prompt_env();
+        let adapters = fake_adapters("process");
+
+        let (claim, composed) = compose_physical(
+            &kernel,
+            &registry,
+            &adapters,
+            TaskSpec::new("compose-ok", Value::Null),
+        );
+        let physical = composed.unwrap();
+        assert_eq!(physical.binding().attempt_id, claim.attempt_id);
+        assert_eq!(physical.binding().lease_epoch, claim.lease_epoch);
+        assert_eq!(physical.environment().target().name, "local");
+        assert_eq!(physical.environment().target().adapter_kind, "process");
+        assert_eq!(physical.environment().profile().name, "default");
+        assert!(!physical.attempt_isolation());
+    }
+
+    #[test]
+    fn physical_composition_fails_closed_on_missing_target() {
+        let (kernel, _registry) = prompt_env();
+        let empty_registry = ExecutionRegistry::new();
+        let adapters = fake_adapters("process");
+
+        let (_claim, composed) = compose_physical(
+            &kernel,
+            &empty_registry,
+            &adapters,
+            TaskSpec::new("compose-missing-target", Value::Null),
+        );
+        assert!(matches!(
+            composed.unwrap_err(),
+            DispatchError::Configuration(ResolutionError::TargetNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn physical_composition_fails_closed_on_missing_adapter_kind() {
+        let (kernel, registry) = prompt_env();
+        // Explicitly empty adapter registry is authoritative: no fallback.
+        let adapters = AdapterRegistry::new();
+
+        let (_claim, composed) = compose_physical(
+            &kernel,
+            &registry,
+            &adapters,
+            TaskSpec::new("compose-missing-adapter", Value::Null),
+        );
+        assert_eq!(
+            composed.unwrap_err(),
+            DispatchError::AdapterAvailability(AdapterUnavailable {
+                adapter_kind: "process".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn physical_composition_never_falls_back_to_another_installed_adapter() {
+        let (kernel, registry) = prompt_env();
+        // Only a different kind is installed; "process" must stay unavailable.
+        let adapters = fake_adapters("other-frontend");
+
+        let (_claim, composed) = compose_physical(
+            &kernel,
+            &registry,
+            &adapters,
+            TaskSpec::new("compose-no-fallback", Value::Null),
+        );
+        assert_eq!(
+            composed.unwrap_err(),
+            DispatchError::AdapterAvailability(AdapterUnavailable {
+                adapter_kind: "process".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn adapter_registry_registration_fails_closed() {
+        let mut adapters = AdapterRegistry::new();
+        assert_eq!(
+            adapters
+                .register("   ", Arc::new(FakeAdapter::new()))
+                .unwrap_err(),
+            AdapterRegistryError::InvalidKind("adapter kind cannot be empty".into())
+        );
+        adapters
+            .register("process", Arc::new(FakeAdapter::new()))
+            .unwrap();
+        assert_eq!(
+            adapters
+                .register("process", Arc::new(FakeAdapter::new()))
+                .unwrap_err(),
+            AdapterRegistryError::DuplicateKind("process".into())
+        );
+    }
+
+    #[test]
+    fn dispatch_error_standard_failure_classes() {
+        assert_eq!(
+            DispatchError::Configuration(ResolutionError::TargetNotFound("t".into()))
+                .standard_failure_class(),
+            Some(FailureClass::ResourceUnavailable)
+        );
+        assert_eq!(
+            DispatchError::AdapterAvailability(AdapterUnavailable {
+                adapter_kind: "k".into()
+            })
+            .standard_failure_class(),
+            Some(FailureClass::ResourceUnavailable)
+        );
+        assert_eq!(
+            DispatchError::AdapterInvocation(AdapterError::Unavailable("u".into()))
+                .standard_failure_class(),
+            Some(FailureClass::ResourceUnavailable)
+        );
+        assert_eq!(
+            DispatchError::AdapterInvocation(AdapterError::DeadlineExceeded("d".into()))
+                .standard_failure_class(),
+            Some(FailureClass::Timeout)
+        );
+        assert_eq!(
+            DispatchError::AdapterInvocation(AdapterError::Protocol("p".into()))
+                .standard_failure_class(),
+            Some(FailureClass::AdapterProtocolFailure)
+        );
+        assert_eq!(
+            DispatchError::AdapterInvocation(AdapterError::Other("o".into()))
+                .standard_failure_class(),
+            Some(FailureClass::StartFailure)
+        );
+        // Authority and persistence are domain/storage errors, never Task
+        // failure classes.
+        assert_eq!(
+            DispatchError::Authority(Error::not_found("x")).standard_failure_class(),
+            None
+        );
+        assert_eq!(
+            DispatchError::Persistence(Error::not_found("x")).standard_failure_class(),
+            None
+        );
     }
 }
