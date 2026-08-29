@@ -5,7 +5,7 @@ Applies to: branch `rust/m5-runtime`
 Canonical path: `docs/reports/v0.2/riir-m5.1-launch-foundation.md`  
 Not a specification.
 
-This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation via `agentype-execution-config`, unforgeable compile-time isolated safety proofs, authoritative physical `Incarnation` and `RuntimeHandle` binding, a canonical `prepare_execution_launch` runtime façade that assembles the worker request with the runtime-rendered V0.1 worker prompt protocol (the durable Task label is never sent as the prompt), and bundled committed continuity for M5.
+This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation via `agentype-execution-config`, unforgeable compile-time isolated safety proofs, authoritative physical `Incarnation` and `RuntimeHandle` binding, a canonical `prepare_execution_launch` runtime façade that atomically resolves the authoritative environment and assembles the worker request (its prompt is the deterministic V0.1 worker protocol derived inside `agentype-adapter-api`; the durable Task label is never sent as the prompt and no caller text can be injected), and bundled committed continuity for M5.
 
 ---
 
@@ -20,16 +20,15 @@ In M4, `Claim` was returned to callers as a composite DTO carrying both authorit
 - `ExecutionLaunchSnapshot::from_persisted_kernel_authority` defines the explicit **storage trust boundary** between `agentype-storage-sqlite` and `agentype-core` / `agentype-execution-config`. Its contract requires: *"The only safe production construction path is the fenced Kernel execution-creation transaction."*
 - Publicly-enableable test bypasses (`test-support` Cargo features and public `for_testing` constructors) have been eliminated across all workspace crates.
 - `#![forbid(unsafe_code)]` is enforced on `agentype-runtime`, and `#![deny(unsafe_code)]` is enforced on `agentype-adapter-api`.
-- `ExecutionRequest::from_launch(&launch, rendered_prompt)` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot` plus the runtime-rendered worker prompt, binding both `incarnation_id` and `incarnation_runtime_handle` directly from durable storage without caller handle injection. Adapters MUST NOT compose scheduler semantics into the prompt themselves.
+- `ExecutionRequest::from_launch(&launch)` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot`, with the worker prompt deterministically derived as a `RenderedWorkerPrompt` (no caller-supplied text is accepted), binding both `incarnation_id` and `incarnation_runtime_handle` directly from durable storage without caller handle injection.
 
 ```text
 Claim (receipt)
       ↓
-resolve_execution_environment(ExecutionResolutionMode::Authoritative(reg), target, profile)
-      ↓ [fails closed on missing target/profile or incompatible pair]
-ResolvedExecutionEnvironment (opaque, private fields)
-      ↓
-prepare_execution_launch(&kernel, &claim, &env)
+prepare_execution_launch(&kernel, &claim, ExecutionResolutionMode::Authoritative(reg))
+      ↓ [resolution happens inside the façade, immediately before the launch tx:
+         fails closed on missing target/profile or incompatible pair]
+ResolvedExecutionEnvironment (opaque, private fields; minted at launch time)
       ↓
 Kernel::create_execution(&claim, env.safety())
       ↓ [inside SQLite transaction]
@@ -44,15 +43,16 @@ Kernel::create_execution(&claim, env.safety())
       ├─ Freezes safety.attempt_isolation() on Execution row
       └─ Mints ExecutionId & RequestId
       ↓
-ExecutionLaunchSnapshot (private fields, readonly getters; task_name = durable Task label)
-      ↓
-runtime::render_worker_prompt(&launch)
-      ↓ [V0.1 worker protocol: IDs, epoch, workstream, objective(payload),
-         acceptance, continuity, + writer recovery rules when WRITE]
-ExecutionRequest::from_launch(&launch, rendered_prompt)
-      ↓ [complete worker contract: rendered prompt + payload, acceptance,
-         continuity, IDs, incarnation handle]
-ExecutionAdapter.start_execution(&request)
+PreparedExecutionLaunch { snapshot, request, resolved_environment }
+      ├─ snapshot: ExecutionLaunchSnapshot (private fields, readonly getters;
+      │            task_name = durable Task label)
+      ├─ request: ExecutionRequest::from_launch(&launch)
+      │           └─ prompt = RenderedWorkerPrompt::from_launch(&launch):
+      │              deterministic V0.1 protocol (IDs, epoch, workstream,
+      │              objective = payload, acceptance, continuity, + writer
+      │              recovery rules when WRITE); no caller text injectable
+      └─ resolved_environment: the same environment that minted the persisted
+         attempt_isolation proof — the single binding for physical start
 ```
 
 ---
@@ -75,13 +75,14 @@ ExecutionAdapter.start_execution(&request)
       ▲                     ▲
       │ (depends on config) │ (depends on config + storage)
 [agentype-storage-sqlite]   [agentype-runtime] (#![forbid(unsafe_code)])
-      │                     ├── prepare_execution_launch(kernel, claim, env) -> PreparedExecutionLaunch
-      │                     ├── render_worker_prompt(&launch) (V0.1 worker protocol)
+      │                     ├── prepare_execution_launch(kernel, claim, mode) -> PreparedExecutionLaunch
+      │                     │     (resolves internally; ExecutionPreparationError)
       │                     └── recover_authority(kernel)
       ▲
       │ (depends on core + config)
 [agentype-adapter-api] (#![deny(unsafe_code)])
-      ├── ExecutionRequest::from_launch(&launch, rendered_prompt)
+      ├── RenderedWorkerPrompt::from_launch(&launch) (deterministic V0.1 protocol)
+      ├── ExecutionRequest::from_launch(&launch)
       └── ExecutionAdapter trait
 ```
 
@@ -128,23 +129,24 @@ ExecutionAdapter.start_execution(&request)
   pub fn prepare_execution_launch(
       kernel: &Kernel,
       claim: &Claim,
-      environment: &ResolvedExecutionEnvironment,
-  ) -> Result<PreparedExecutionLaunch, Error>
+      mode: ExecutionResolutionMode<'_>,
+  ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError>
   ```
-  Returns `PreparedExecutionLaunch { snapshot, request }`: the runtime façade is the single composition point between durable Scheduler facts and the physical worker contract.
-- `render_worker_prompt(&ExecutionLaunchSnapshot) -> String` renders the provider-neutral worker protocol exactly as the V0.1 Python oracle (`Dispatcher._render_prompt`): `LOCAL AGENT SCHEDULER TASK` / `TASK_ID` / `ATTEMPT_ID` / `LEASE_EPOCH` / `WORKSTREAM` (or `none`) / `OBJECTIVE` (task payload) / `ACCEPTANCE` / `COMMITTED CONTINUITY`, plus `WRITER RECOVERY RULES` for WRITE tasks and a closing `RETURN` section, joined by blank lines; JSON sections use `json.dumps(sort_keys=True, ensure_ascii=False)` semantics. The durable Task label (`task_name`) is deliberately not part of the protocol.
+- Returns `PreparedExecutionLaunch { snapshot, request, resolved_environment }`. Configuration resolution happens **inside** the façade, immediately before the fenced execution-creation transaction, so the persisted `attempt_isolation` fact and the environment exposed for physical start are atomically the same. The dispatcher MUST select the adapter binding, options, and timeouts from `resolved_environment` and MUST NOT re-resolve; a stale pre-resolved environment is not an accepted parameter.
+- `ExecutionPreparationError` freezes configuration-resolution failures to the standardized Task failure class `RESOURCE_UNAVAILABLE` (`standard_failure_class()`), anchored on `core::authority::unavailable_configuration_failure` and spec 16 §A2 (the supplied registry is authoritative, no adapter default). Kernel authority errors are deliberately NOT mapped to a Task failure class.
+- The worker prompt is not a façade concern: `ExecutionRequest::from_launch(&launch)` derives it deterministically via `RenderedWorkerPrompt` (see adapter-api).
 - Recovery orchestration: `recover_authority(&kernel) -> Result<ExpireReport, Error>`.
-- Verified regressions: `recovery_follows_persisted_isolation_fact_despite_registry_reconfiguration` and its control `unisolated_writer_expiry_without_quiescence_suspends` form a discriminating pair (identical retryable WRITE policy): recovery must follow the persisted Execution `attempt_isolation` fact (RETRY_WAIT and a replacement Attempt) even after the registry is reconfigured, while the unisolated control suspends with `WRITER_QUIESCENCE_UNKNOWN`. Worker-prompt regressions prove the request prompt is the derived V0.1 protocol and never the bare Task name.
+- Verified regressions: `launch_binds_current_registry_state_not_a_stale_resolved_environment` (a registry generation swap between attempts binds the current generation), `preparation_errors_standardize_configuration_failures_as_resource_unavailable`, the discriminating pair `recovery_follows_persisted_isolation_fact_despite_registry_reconfiguration` / `unisolated_writer_expiry_without_quiescence_suspends` (identical retryable WRITE policy: recovery follows the persisted `attempt_isolation` fact to RETRY_WAIT and a replacement Attempt, while the unisolated control suspends with `WRITER_QUIESCENCE_UNKNOWN`), and the worker-prompt protocol regressions.
 
 ### `agentype-adapter-api` (Execution Adapter Contracts)
 - Enforces `#![deny(unsafe_code)]`.
+- `RenderedWorkerPrompt`: the deterministic, provider-neutral worker protocol (V0.1 task protocol sections) with private text and the sole constructor `from_launch(&ExecutionLaunchSnapshot)`. Given the same snapshot, the worker instruction is uniquely determined; no constructor accepts arbitrary text.
 - `ExecutionRequest` retains complete structured worker contract:
-  - `request_id`, `execution_id`, `task_id`, `batch_id`, `attempt_id`, `attempt_number`, `lease_id`, `lease_epoch`, `logical_agent_id`, `incarnation_id`, `execution_target`, `execution_profile`, `workspace_mode`, `prompt` (the runtime-rendered worker protocol, NOT the Task name), `payload`, `acceptance`, `workstream_id`, `continuity`, `incarnation_runtime_handle`.
+  - `request_id`, `execution_id`, `task_id`, `batch_id`, `attempt_id`, `attempt_number`, `lease_id`, `lease_epoch`, `logical_agent_id`, `incarnation_id`, `execution_target`, `execution_profile`, `workspace_mode`, `prompt` (deterministically derived V0.1 worker protocol via `RenderedWorkerPrompt`; not a parameter), `payload`, `acceptance`, `workstream_id`, `continuity`, `incarnation_runtime_handle`.
 - Closed derivation constructor:
   ```rust
-  pub fn from_launch(launch: &ExecutionLaunchSnapshot, prompt: String) -> ExecutionRequest
+  pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> ExecutionRequest
   ```
-  `prompt` MUST be produced by `agentype_runtime::render_worker_prompt(&launch)`.
 - Readonly getters for all fields including `incarnation_id` and `incarnation_runtime_handle`.
 
 ---
@@ -171,7 +173,7 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 | `execution_profile` | `AttemptRow.execution_profile` | Frozen on Attempt at claim time (asserted vs `safety.profile`) |
 | `workspace_mode` | `TaskRow.workspace_mode` | Re-read from durable `tasks` row (Claim tamper ignored) |
 | `task_name` | `TaskRow.name` | Re-read from durable `tasks` row; durable task label fact only — never the worker prompt |
-| worker prompt (`ExecutionRequest.prompt`) | Derived: `runtime::render_worker_prompt(&launch)` from the full launch protocol (IDs, epoch, workstream, payload, acceptance, continuity, workspace mode) | Rendered by the runtime façade (V0.1 worker protocol parity); adapters MUST NOT compose scheduler semantics |
+| worker prompt (`ExecutionRequest.prompt`) | Derived deterministically inside `agentype-adapter-api`: `RenderedWorkerPrompt::from_launch(&launch)` from the full launch protocol (IDs, epoch, workstream, payload, acceptance, continuity, workspace mode) | Not a constructor parameter — no caller text can be injected; the same snapshot always yields the same instruction |
 | `payload` | `TaskRow.payload_json` | Re-read from durable `tasks` row (Claim tamper ignored) |
 | `acceptance` | `TaskRow.acceptance_json` | Re-read from durable `tasks` row (Claim tamper ignored) |
 | `workstream_id` | `TaskRow.workstream_id` | Re-read from durable `tasks` row (Claim tamper ignored) |
@@ -183,11 +185,11 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 ## 4. Test Suite & Validation Results
 
 ### Rust Workspace (`cargo test --workspace`)
-**128 passed, 0 failed:**
-- `agentype-adapter-api`: 4 passed (including `execution_request_constructed_from_launch_snapshot`)
+**131 passed, 0 failed:**
+- `agentype-adapter-api`: 5 passed (including deterministic, non-injectable worker-prompt regressions)
 - `agentype-core`: 20 passed (domain authority, decision matrix, state machines)
 - `agentype-execution-config`: 7 passed (registry validation, configuration error checking, resolution modes, fail-closed handling)
-- `agentype-runtime`: 7 passed (end-to-end isolation persistence, discriminating registry-reconfiguration pair, recovery isolation, V0.1 worker-prompt protocol regressions)
+- `agentype-runtime`: 9 passed (atomic resolution binding, standardized preparation failures, end-to-end isolation persistence, discriminating registry-reconfiguration pair, V0.1 worker-prompt protocol regressions)
 - `agentype-storage-sqlite`: 90 passed
   - `m4_kernel.rs`: 63 passed (including launch, continuity, mismatch & tamper regressions, and workstream project_state_ref birth seeding)
   - `recovery.rs`: 11 passed
@@ -206,7 +208,14 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 
 PR review surfaced four findings against this milestone; all are incorporated on `rust/m5-runtime`:
 
-1. **Worker prompt was the Task name (P1, corrected).** The original source-of-truth table mapped `prompt ← TaskRow.name`, which would have sent a bare task label to real workers instead of the V0.1 task protocol. The snapshot field is now `task_name` (durable label fact only), and the worker prompt is a derived representation rendered by `agentype_runtime::render_worker_prompt` from the full launch protocol, replicating the V0.1 oracle `Dispatcher._render_prompt` (including writer recovery rules for WRITE tasks). `ExecutionRequest::from_launch` takes the rendered prompt explicitly; adapters must not compose scheduler semantics.
+1. **Worker prompt was the Task name (P1, corrected).** The original source-of-truth table mapped `prompt ← TaskRow.name`, which would have sent a bare task label to real workers instead of the V0.1 task protocol. The snapshot field is now `task_name` (durable label fact only), and the worker prompt is a derived representation rendered from the full launch protocol, replicating the V0.1 oracle `Dispatcher._render_prompt` (including writer recovery rules for WRITE tasks). (The rendering location and injection hardening were further tightened in Round 2 item 6; the intermediate `render_worker_prompt`/`from_launch(launch, prompt)` design is superseded.)
 2. **Newborn continuity ignored workstream project_state_ref (P1, corrected).** `birth_agent` hardcoded `continuity_json = '{}'`, so the authoritative project baseline never reached workstream-bound newborn agents and the launch snapshot preserved an empty capsule. Birth now seeds `{"CURRENT CHECKPOINT": {"project_state_ref": ...}}` per the V0.1 oracle (fail-closed on unknown workstreams). The affinity-birth runtime primitive (`ensure_task_consumers`) itself remains M5.2.
 3. **Registry-reconfiguration evidence was non-discriminating (P2, corrected).** The original test used a task whose default retry policy forbids mechanical retry, so SUSPENDED occurred under both correct and broken recovery. It is replaced by a discriminating pair with an identical retryable WRITE policy: recovery must follow the persisted `attempt_isolation = true` fact to RETRY_WAIT and a replacement Attempt even after the registry flips to `false`, while the unisolated control suspends with `WRITER_QUIESCENCE_UNKNOWN`.
-4. **Report test count was internally inconsistent (P2, corrected).** The earlier revision claimed 121 passed while its own breakdown summed to 122. Counts in this revision (128) are the measured workspace totals after the corrections above.
+4. **Report test count was internally inconsistent (P2, corrected).** The earlier revision claimed 121 passed while its own breakdown summed to 122. Counts in this revision (131) are the measured workspace totals after the corrections above.
+
+### Round 2
+
+5. **attempt_isolation proof was not atomically bound to the resolved environment (P1, corrected).** `prepare_execution_launch` accepted a pre-resolved environment, and neither it nor the `FrozenExecutionSafety` proof carried registry or Attempt identity (only target/profile names plus the isolation bit), so an environment resolved under an older registry generation could be replayed to freeze `attempt_isolation = true` on a later attempt. The façade now takes an `ExecutionResolutionMode` and resolves internally immediately before the launch transaction; `PreparedExecutionLaunch.resolved_environment` is the environment that minted the persisted proof (the single binding for physical start), and a pre-resolved environment is no longer an accepted parameter. Discriminating regression: a registry generation swap between attempts binds the current generation.
+6. **Worker prompt was still injectable (P1, corrected).** `from_launch(launch, prompt: String)` allowed arbitrary caller text to replace the scheduler instruction. The prompt is now derived inside `agentype-adapter-api` as `RenderedWorkerPrompt` (private text, sole snapshot-based constructor); the same snapshot always yields the same instruction and no API path accepts caller text. Residual boundary: `Kernel::create_execution` remains a public storage-level API that accepts a cloned proof; the façade is the canonical M5.2 path, and binding the proof to the Attempt identity inside the Kernel is recorded as optional follow-up hardening.
+7. **Configuration-resolution failure semantics were comment-only (P2, corrected).** `ExecutionPreparationError` freezes `ResolutionError` failures to the standardized Task failure class `RESOURCE_UNAVAILABLE` at the façade boundary (`standard_failure_class()`), anchored on `core::authority::unavailable_configuration_failure` and spec 16 §A2; kernel authority errors are deliberately not Task failure classes.
+8. **CI evidence gap (P2, corrected).** The Rust CI job now runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` before `cargo test --workspace`, so the quality gates cited here are reproducible in CI.
