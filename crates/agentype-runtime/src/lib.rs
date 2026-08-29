@@ -156,7 +156,10 @@ pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentype_core::{Clock, ManualClock, PartitionSpec, Retention, TaskSpec};
+    use agentype_core::{
+        Clock, FailureClass, LeaseEpoch, ManualClock, PartitionSpec, Retention, RetryPolicy,
+        TaskSpec, TaskState,
+    };
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -268,20 +271,37 @@ mod tests {
         assert!(exec_isolated.attempt_isolation);
     }
 
+    fn retryable_write_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            retry_classes: vec![
+                FailureClass::ExecutionLost,
+                FailureClass::Timeout,
+                FailureClass::TransientExternal,
+            ],
+            base_backoff_seconds: 1.0,
+            max_backoff_seconds: 8.0,
+        }
+    }
+
+    /// Review P2 (discriminating evidence): the persisted Execution carries
+    /// attempt_isolation = true from creation-time registry configuration.
+    /// After the registry is reconfigured to isolation = false, lease-expiry
+    /// recovery must follow the persisted fact (safe retry -> RETRY_WAIT ->
+    /// replacement Attempt), not the current registry — which, if consulted,
+    /// would yield writer-quiescence-unknown SUSPENSION instead.
     #[test]
-    fn reconfigured_registry_does_not_alter_persisted_execution_safety_or_writer_recovery() {
+    fn recovery_follows_persisted_isolation_fact_despite_registry_reconfiguration() {
         let clock = Arc::new(ManualClock::new(1_000.0));
         let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
 
-        // 1. Initial configuration: target "remote-env" has attempt_isolation = true
-        let mut initial_registry = ExecutionRegistry::new();
-        initial_registry
+        let mut creation_registry = ExecutionRegistry::new();
+        creation_registry
             .register_target(ExecutionTargetConfig::new("remote-env", "container", true))
             .unwrap();
-        initial_registry
+        creation_registry
             .register_profile(ExecutionProfileConfig::new("default"))
             .unwrap();
-
         kernel
             .upsert_partition(&PartitionSpec::new(
                 "p-isolated-writer",
@@ -293,26 +313,24 @@ mod tests {
             .unwrap();
         kernel.reconcile_pool().unwrap();
 
-        // 2. Submit an IsolatedWriter task and launch execution under the authoritative isolated environment
-        let task_spec = TaskSpec::new("isolated-writer-task", Value::Null)
+        // A retryable WRITE task: recovery is allowed to re-dispatch, so the
+        // persisted isolation fact is the ONLY thing deciding the branch.
+        let spec = TaskSpec::new("isolated-writer-task", Value::Null)
             .partition("p-isolated-writer")
-            .write();
-        kernel.submit_batch(&[task_spec]).unwrap();
+            .write()
+            .retry(retryable_write_policy());
+        kernel.submit_batch(&[spec]).unwrap();
 
         let claim = kernel.claim_next_available().unwrap().unwrap();
         let env = resolve_execution_environment(
-            ExecutionResolutionMode::Authoritative(&initial_registry),
+            ExecutionResolutionMode::Authoritative(&creation_registry),
             &claim.execution_target,
             &claim.execution_profile,
         )
         .unwrap();
         assert!(env.attempt_isolation());
-
         let launch = prepare_execution_launch(&kernel, &claim, &env).unwrap();
-        assert!(launch.snapshot().attempt_isolation());
         let execution_id = launch.snapshot().execution_id().clone();
-
-        // Confirm execution running
         kernel
             .confirm_running_and_renew(
                 &claim.attempt_id,
@@ -321,12 +339,9 @@ mod tests {
                 &Value::Null,
             )
             .unwrap();
+        assert!(kernel.execution(&execution_id).unwrap().attempt_isolation);
 
-        let exec_before = kernel.execution(&execution_id).unwrap();
-        assert!(exec_before.attempt_isolation);
-
-        // 3. Reconfigure / mutate runtime registry: "remote-env" is now marked attempt_isolation = false
-        // (or completely destroyed and replaced)
+        // The registry later flips the same target to unisolated.
         let mut reconfigured_registry = ExecutionRegistry::new();
         reconfigured_registry
             .register_target(ExecutionTargetConfig::new("remote-env", "container", false))
@@ -334,35 +349,115 @@ mod tests {
         reconfigured_registry
             .register_profile(ExecutionProfileConfig::new("default"))
             .unwrap();
+        assert!(
+            !resolve_execution_environment(
+                ExecutionResolutionMode::Authoritative(&reconfigured_registry),
+                "remote-env",
+                "default",
+            )
+            .unwrap()
+            .attempt_isolation(),
+            "precondition: the current registry really is unisolated now"
+        );
 
-        let reconfigured_env = resolve_execution_environment(
-            ExecutionResolutionMode::Authoritative(&reconfigured_registry),
-            "remote-env",
-            "default",
-        )
-        .unwrap();
-        assert!(!reconfigured_env.attempt_isolation());
-
-        // 4. Simulate lease expiry and writer crash recovery
         clock.advance(25.0);
         let report = kernel.expire_leases(false).unwrap();
-        assert_eq!(report.suspended, 1);
-
-        // 5. Verify the persisted execution record strictly preserved attempt_isolation = true
+        assert_eq!(
+            report.retried, 1,
+            "recovery must take the safe-retry branch"
+        );
+        assert_eq!(report.suspended, 0);
+        assert_eq!(
+            kernel.task(&claim.task_id).unwrap().state,
+            TaskState::RetryWait
+        );
         let exec_after = kernel.execution(&execution_id).unwrap();
         assert!(
             exec_after.attempt_isolation,
-            "Persisted Execution must retain its creation-time isolation fact regardless of later registry reconfigurations"
+            "persisted Execution retains its creation-time isolation fact"
         );
 
-        // 6. Verify writer recovery uses persisted execution isolation (fails closed vs unproven quiescence or safe replacement)
-        // A nonterminal NACK for this isolated writer must NOT retry without quiescence proof,
-        // and when replacing, writer safety predicates use the stored execution attempt_isolation fact.
-        let claim_after_expiry = kernel.claim_next_available().unwrap();
-        assert!(
-            claim_after_expiry.is_none(),
-            "Expired isolated writer without quiescent proof must not be blindly re-dispatched"
+        // Past the retry backoff, the replacement Attempt becomes dispatchable.
+        clock.advance(10.0);
+        kernel.promote_retry_wait().unwrap();
+        let retry_claim = kernel
+            .claim_next_available()
+            .unwrap()
+            .expect("isolated writer must recover through a replacement Attempt");
+        assert_eq!(retry_claim.attempt_number, 2);
+        assert_eq!(retry_claim.lease_epoch, LeaseEpoch(2));
+        assert_ne!(retry_claim.attempt_id, claim.attempt_id);
+    }
+
+    /// Control for the reconfiguration case: the identical retryable WRITE
+    /// task launched under an unisolated target suspends with
+    /// WRITER_QUIESCENCE_UNKNOWN. The only difference between the two tests
+    /// is the persisted isolation fact, so the pair proves recovery reads
+    /// frozen Execution state rather than current registry configuration.
+    #[test]
+    fn unisolated_writer_expiry_without_quiescence_suspends() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("remote-env", "container", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "p-writer",
+                1,
+                Retention::Resident,
+                "remote-env",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+
+        let spec = TaskSpec::new("unisolated-writer-task", Value::Null)
+            .partition("p-writer")
+            .write()
+            .retry(retryable_write_policy());
+        kernel.submit_batch(&[spec]).unwrap();
+
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        let env = resolve_execution_environment(
+            ExecutionResolutionMode::Authoritative(&registry),
+            &claim.execution_target,
+            &claim.execution_profile,
+        )
+        .unwrap();
+        assert!(!env.attempt_isolation());
+        let launch = prepare_execution_launch(&kernel, &claim, &env).unwrap();
+        let execution_id = launch.snapshot().execution_id().clone();
+        kernel
+            .confirm_running_and_renew(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                &execution_id,
+                &Value::Null,
+            )
+            .unwrap();
+        assert!(!kernel.execution(&execution_id).unwrap().attempt_isolation);
+
+        clock.advance(25.0);
+        let report = kernel.expire_leases(false).unwrap();
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.suspended, 1);
+        assert_eq!(
+            kernel.task(&claim.task_id).unwrap().state,
+            TaskState::Suspended
         );
+        let esc = kernel.open_escalation_for_task(&claim.task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+
+        // Backoff time passing does not resurrect a suspended writer.
+        clock.advance(60.0);
+        kernel.promote_retry_wait().unwrap();
+        assert!(kernel.claim_next_available().unwrap().is_none());
     }
 
     /// Kernel + "local"/"default" registry matching the default partition, for launch-path tests.
