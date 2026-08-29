@@ -1,13 +1,19 @@
-//! M5 runtime configuration boundary and M4 recovery orchestration.
-//! Dispatcher/heartbeat/notifier loops belong to subsequent M5 tasks.
+//! M5 runtime configuration boundary, M4 recovery orchestration, and the
+//! M5.2 dispatch commit boundary (adapter composition + one authoritative
+//! physical start per claim). Heartbeat supervision, restart reconciliation,
+//! notifier delivery, and the daemon loop belong to subsequent M5 tasks.
 
 #![forbid(unsafe_code)]
 
 pub use agentype_execution_config::*;
 
-use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest};
-use agentype_core::{AuthoritativeExecutionBinding, Claim, Error, ExpireReport, FailureClass};
+use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
+use agentype_core::{
+    AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState, ExpireReport,
+    FailureClass, RequestId, ResultId,
+};
 use agentype_storage_sqlite::Kernel;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -362,6 +368,371 @@ pub fn resolve_physical_execution_environment(
     })
 }
 
+/// Immediate outcome of one dispatch attempt (task §25 vocabulary).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DispatchOneOutcome {
+    /// Nothing was claimable; no state was touched.
+    NoWork,
+    /// Durable authority rejected the claim (stale, expired, or tampered
+    /// identity). No Execution exists, no adapter was queried, nothing was
+    /// mutated.
+    AuthorityRejected,
+    /// Target/profile configuration or installed-adapter resolution failed
+    /// before physical start. Mechanically NACKed as RESOURCE_UNAVAILABLE
+    /// through the existing scheduler primitive; no Execution is fabricated
+    /// and no writer ambiguity is created (task §15).
+    ConfigurationUnavailable { detail: String },
+    /// The physical start reported RUNNING and the fenced RUNNING
+    /// confirmation + first lease renewal succeeded. Supervision admission
+    /// itself is M5.3 (task §13).
+    StartedRunning {
+        execution_id: ExecutionId,
+        request_id: RequestId,
+    },
+    /// The start is potentially side-effecting but unresolved (ambiguous
+    /// observation, UNKNOWN/STARTING state, or stale authority after a
+    /// RUNNING report). Ambiguous physical history is persisted; Task
+    /// authority was never restored and quiescence was never claimed.
+    StartAmbiguous {
+        execution_id: ExecutionId,
+        request_id: RequestId,
+    },
+    /// The start failed (terminal observation or invocation error). The
+    /// existing NACK rules applied: failure row, physical history, retry
+    /// policy, and writer safety.
+    StartFailed {
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        failure_class: FailureClass,
+    },
+    /// The adapter completed synchronously and the authoritative ACK path
+    /// ran. `result_id` is None only when writer safety suspended the task
+    /// instead of completing it.
+    CompletedSynchronously {
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        result_id: Option<ResultId>,
+    },
+}
+
+/// Minimal dispatch service (task §9): take one eligible Scheduler claim and
+/// either fail closed before physical execution, or make exactly one
+/// authoritative physical start attempt whose request, adapter binding,
+/// execution identity, safety facts, and semantics are all derived from
+/// durable Scheduler authority plus authoritative runtime composition.
+///
+/// The Dispatcher accepts only authoritative composition objects — an
+/// `ExecutionRegistry` and an `AdapterRegistry` — and therefore cannot use
+/// `DirectUnconfigured` (task §8).
+pub struct Dispatcher<'a> {
+    kernel: &'a Kernel,
+    execution_registry: &'a ExecutionRegistry,
+    adapters: &'a AdapterRegistry,
+}
+
+impl<'a> Dispatcher<'a> {
+    pub fn new(
+        kernel: &'a Kernel,
+        execution_registry: &'a ExecutionRegistry,
+        adapters: &'a AdapterRegistry,
+    ) -> Self {
+        Self {
+            kernel,
+            execution_registry,
+            adapters,
+        }
+    }
+
+    /// Obtain one eligible claim and dispatch it.
+    pub fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
+        let claim = match self
+            .kernel
+            .claim_next_available()
+            .map_err(DispatchError::Persistence)?
+        {
+            Some(claim) => claim,
+            None => return Ok(DispatchOneOutcome::NoWork),
+        };
+        self.dispatch_claim(&claim)
+    }
+
+    /// Dispatch an explicit claim. `claim` is used ONLY as the authority
+    /// receipt entering the authoritative launch path (task §10): every
+    /// physical request field is derived from the durable launch snapshot,
+    /// never from the claim's semantic copies, and identity mismatches are
+    /// rejected by the Kernel's authority validation.
+    pub fn dispatch_claim(&self, claim: &Claim) -> Result<DispatchOneOutcome, DispatchError> {
+        // Composition (task §4): authority, then target/profile
+        // configuration, then installed adapter. Nothing exists and no
+        // adapter is consulted until all three resolve.
+        let physical = match resolve_physical_execution_environment(
+            self.kernel,
+            claim,
+            self.execution_registry,
+            self.adapters,
+        ) {
+            Ok(physical) => physical,
+            Err(DispatchError::Authority(_)) => {
+                return Ok(DispatchOneOutcome::AuthorityRejected);
+            }
+            Err(err @ DispatchError::Configuration(_))
+            | Err(err @ DispatchError::AdapterAvailability(_)) => {
+                // Pre-start composition failure (task §15):
+                // RESOURCE_UNAVAILABLE, mechanically NACKed through the
+                // existing scheduler primitive. No Execution is
+                // fabricated, so no writer ambiguity can arise.
+                let detail = err.to_string();
+                self.nack_configuration_unavailable(claim)?;
+                return Ok(DispatchOneOutcome::ConfigurationUnavailable { detail });
+            }
+            Err(other) => return Err(other),
+        };
+
+        // Create and freeze the Execution (STARTING) in its own fenced
+        // transaction. From here the start is treated as potentially
+        // side-effecting (task §11): the stable RequestId is persisted with
+        // the Execution and is never regenerated.
+        let snapshot = self
+            .kernel
+            .create_execution(claim, physical.environment().safety())
+            .map_err(|err| match err {
+                Error::StorageFailure(_) => DispatchError::Persistence(err),
+                authority => DispatchError::Authority(authority),
+            })?;
+        let execution_id = snapshot.execution_id().clone();
+        let request_id = snapshot.request_id().clone();
+        let request = ExecutionRequest::from_launch(&snapshot);
+
+        // Physical start — exactly once (task §16), outside any SQLite
+        // transaction (task §26).
+        let observation = match physical.adapter().start_execution(&request) {
+            Ok(observation) => observation,
+            Err(err) => {
+                // Invocation error ≠ absence of execution: the start may
+                // have had side effects. Nonterminal NACK (never quiescent)
+                // keeps writer ambiguity intact for WRITE tasks (task §28).
+                let failure_class = adapter_invocation_failure_class(&err);
+                self.nack_start(claim, &execution_id, failure_class, false, false)?;
+                return Ok(DispatchOneOutcome::StartFailed {
+                    execution_id,
+                    request_id,
+                    failure_class,
+                });
+            }
+        };
+
+        self.commit_start_observation(
+            claim,
+            physical.adapter(),
+            &execution_id,
+            &request_id,
+            observation,
+        )
+    }
+
+    /// Classify and durably persist the immediate start observation using
+    /// the existing fenced scheduler primitives (task §12). No heartbeat, no
+    /// supervision admission (M5.3), no reconciliation loop (M5.4).
+    fn commit_start_observation(
+        &self,
+        claim: &Claim,
+        adapter: &Arc<dyn ExecutionAdapter>,
+        execution_id: &ExecutionId,
+        request_id: &RequestId,
+        observation: StartObservation,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        // RUNNING: fenced confirmation + first lease renewal must succeed
+        // atomically before any supervision admission (M4 invariant).
+        if observation.state == ExecutionState::Running && !observation.ambiguous {
+            return match self.kernel.confirm_running_and_renew(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                execution_id,
+                &observation.runtime_handle.0,
+            ) {
+                Ok(_) => Ok(DispatchOneOutcome::StartedRunning {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                }),
+                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                    // Task §27: authority became stale between Execution
+                    // creation and the start result. Never restore Task
+                    // authority and never admit supervision; persist physical
+                    // history only where legal (the observed handle is kept
+                    // for M5.4 reconcile_start).
+                    self.kernel
+                        .record_physical_outcome(
+                            execution_id,
+                            ExecutionState::Unknown,
+                            Some(&observation.runtime_handle.0),
+                            None,
+                            None,
+                            false,
+                            false,
+                        )
+                        .map_err(DispatchError::Persistence)?;
+                    Ok(DispatchOneOutcome::StartAmbiguous {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                    })
+                }
+                Err(err) => Err(DispatchError::Persistence(err)),
+            };
+        }
+
+        // Ambiguous / unresolved start: potentially side-effecting, never
+        // quiescent, never blindly restarted. The observed physical history
+        // (with the handle) is persisted, then the mechanical nonterminal
+        // NACK lets the existing writer-safety rules decide between policy
+        // retry and WRITER_QUIESCENCE_UNKNOWN suspension (task §28).
+        if observation.ambiguous
+            || matches!(
+                observation.state,
+                ExecutionState::Unknown | ExecutionState::Starting
+            )
+        {
+            self.kernel
+                .record_physical_outcome(
+                    execution_id,
+                    ExecutionState::Unknown,
+                    Some(&observation.runtime_handle.0),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(DispatchError::Persistence)?;
+            self.nack_start(
+                claim,
+                execution_id,
+                FailureClass::ExecutionLost,
+                false,
+                false,
+            )?;
+            return Ok(DispatchOneOutcome::StartAmbiguous {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+            });
+        }
+
+        // Synchronous terminal success: retrieve the outcome through the
+        // adapter contract, then run the authoritative ACK path.
+        if observation.terminal_confirmed && observation.state == ExecutionState::Succeeded {
+            let outcome = adapter
+                .collect_outcome(&observation.runtime_handle)
+                .map_err(DispatchError::AdapterInvocation)?;
+            let payload = outcome.payload.clone().unwrap_or(Value::Null);
+            let result_id = self
+                .kernel
+                .ack_success(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    Some(execution_id),
+                    &payload,
+                    outcome.summary.as_deref(),
+                    outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
+                )
+                .map_err(|err| match err {
+                    Error::StorageFailure(_) => DispatchError::Persistence(err),
+                    authority => DispatchError::Authority(authority),
+                })?;
+            return Ok(DispatchOneOutcome::CompletedSynchronously {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                result_id,
+            });
+        }
+
+        // Terminal failure before RUNNING: the existing NACK rules apply
+        // (failure row, physical history, retry policy, writer safety).
+        if observation.terminal_confirmed {
+            let failure_class = observation
+                .failure_class
+                .unwrap_or(FailureClass::StartFailure);
+            self.nack_start(
+                claim,
+                execution_id,
+                failure_class,
+                true,
+                observation.quiescent_confirmed,
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
+
+        // Any other observation shape is unresolved by definition.
+        self.nack_start(
+            claim,
+            execution_id,
+            FailureClass::ExecutionLost,
+            false,
+            false,
+        )?;
+        Ok(DispatchOneOutcome::StartAmbiguous {
+            execution_id: execution_id.clone(),
+            request_id: request_id.clone(),
+        })
+    }
+
+    /// Mechanical NACK through the existing scheduler semantics. On stale
+    /// authority (task §27) only legal physical history is recorded — never
+    /// a Task-authority mutation.
+    fn nack_start(
+        &self,
+        claim: &Claim,
+        execution_id: &ExecutionId,
+        failure_class: FailureClass,
+        terminal_confirmed: bool,
+        quiescent_confirmed: bool,
+    ) -> Result<(), DispatchError> {
+        match self.kernel.nack(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            failure_class,
+            Some(execution_id),
+            terminal_confirmed,
+            quiescent_confirmed,
+            false,
+        ) {
+            Ok(_) => Ok(()),
+            Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => self
+                .kernel
+                .record_physical_outcome(
+                    execution_id,
+                    if terminal_confirmed {
+                        ExecutionState::Failed
+                    } else {
+                        ExecutionState::Unknown
+                    },
+                    None,
+                    None,
+                    Some(failure_class),
+                    terminal_confirmed,
+                    quiescent_confirmed && terminal_confirmed,
+                )
+                .map_err(DispatchError::Persistence),
+            Err(err) => Err(DispatchError::Persistence(err)),
+        }
+    }
+
+    fn nack_configuration_unavailable(&self, claim: &Claim) -> Result<(), DispatchError> {
+        match self.kernel.report_configuration_unavailable(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            "runtime composition unavailable (target/profile/adapter)",
+        ) {
+            Ok(_) => Ok(()),
+            // Authority already expired: nothing to NACK; recovery cleans up.
+            Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => Ok(()),
+            Err(err) => Err(DispatchError::Persistence(err)),
+        }
+    }
+}
+
 /// Restart authority barrier. Dispatch MUST NOT run until this returns.
 ///
 /// Order (spec 14):
@@ -377,7 +748,9 @@ pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentype_adapter_api::FakeAdapter;
+    use agentype_adapter_api::{
+        AdapterResult, ExecutionObservation, ExecutionOutcome, FakeAdapter, RuntimeHandle,
+    };
     use agentype_core::{
         AttemptId, AuthoritativeExecutionBinding, Clock, FailureClass, LeaseEpoch, ManualClock,
         PartitionSpec, Retention, RetryPolicy, TaskSpec, TaskState,
@@ -1336,5 +1709,598 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             DispatchError::Persistence(Error::not_found("x")).standard_failure_class(),
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M5.2 dispatcher: one authoritative physical start per claim
+    // ------------------------------------------------------------------
+
+    fn dispatch_env() -> (
+        Kernel,
+        Arc<ManualClock>,
+        ExecutionRegistry,
+        AdapterRegistry,
+        Arc<FakeAdapter>,
+    ) {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", fake.clone()).unwrap();
+        (kernel, clock, registry, adapters, fake)
+    }
+
+    /// Retry policy that also covers RESOURCE_UNAVAILABLE, so mechanical
+    /// configuration NACKs demonstrably land in RETRY_WAIT.
+    fn config_retryable_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 2,
+            retry_classes: vec![
+                FailureClass::ResourceUnavailable,
+                FailureClass::ExecutionLost,
+            ],
+            base_backoff_seconds: 1.0,
+            max_backoff_seconds: 8.0,
+        }
+    }
+
+    fn ambiguous_start() -> StartObservation {
+        StartObservation {
+            state: ExecutionState::Unknown,
+            runtime_handle: RuntimeHandle(serde_json::json!({"probe": 1})),
+            ambiguous: true,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        }
+    }
+
+    /// Test adapter that advances the shared manual clock inside
+    /// start_execution, creating the real-world window in which Scheduler
+    /// authority can expire between Execution creation and the start result
+    /// (task §27).
+    struct ClockAdvancingAdapter {
+        inner: FakeAdapter,
+        clock: Arc<ManualClock>,
+        advance_seconds: f64,
+    }
+
+    impl ClockAdvancingAdapter {
+        fn new(clock: Arc<ManualClock>, advance_seconds: f64) -> Self {
+            Self {
+                inner: FakeAdapter::new(),
+                clock,
+                advance_seconds,
+            }
+        }
+    }
+
+    impl ExecutionAdapter for ClockAdvancingAdapter {
+        fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+            self.clock.advance(self.advance_seconds);
+            self.inner.start_execution(request)
+        }
+
+        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle)
+        }
+
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.interrupt_execution(handle)
+        }
+
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.terminate_execution(handle)
+        }
+
+        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+            self.inner.collect_outcome(handle)
+        }
+
+        fn reconcile_start(
+            &self,
+            request_id: &RequestId,
+            persisted_handle: Option<&RuntimeHandle>,
+        ) -> AdapterResult<StartObservation> {
+            self.inner.reconcile_start(request_id, persisted_handle)
+        }
+    }
+
+    #[test]
+    fn dispatch_one_returns_no_work_without_claimable_tasks() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+    }
+
+    /// §1, §16-19, §21, §23: one eligible claim becomes exactly one
+    /// authoritative physical start, with stable identity propagation and
+    /// fenced RUNNING persistence.
+    #[test]
+    fn dispatch_one_starts_running_exactly_once() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let payload = serde_json::json!({"objective": "inspect"});
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("dispatch-run", payload.clone())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let (execution_id, request_id) = match &outcome {
+            DispatchOneOutcome::StartedRunning {
+                execution_id,
+                request_id,
+            } => (execution_id.clone(), request_id.clone()),
+            other => panic!("expected StartedRunning, got {other:?}"),
+        };
+
+        assert_eq!(fake.start_call_count(), 1);
+        let last = fake.last_request().unwrap();
+        assert_eq!(last.execution_id(), &execution_id);
+        assert_eq!(last.request_id(), &request_id);
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.id, execution_id);
+        assert_eq!(exec.task_id, task_id);
+        assert_eq!(last.incarnation_id(), &exec.incarnation_id);
+        assert_eq!(last.payload(), &payload);
+        assert_eq!(
+            last.workspace_mode(),
+            agentype_core::WorkspaceMode::ReadOnly
+        );
+        assert_eq!(exec.state, ExecutionState::Running);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Running);
+    }
+
+    /// §2, §32: missing authoritative target fails closed before any
+    /// physical start and mechanically NACKs as RESOURCE_UNAVAILABLE.
+    #[test]
+    fn dispatch_missing_target_fails_closed_without_physical_start() {
+        let (kernel, _clock, _registry, adapters, fake) = dispatch_env();
+        let empty_registry = ExecutionRegistry::new();
+        let d = Dispatcher::new(&kernel, &empty_registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("cfg-target", Value::Null).retry(config_retryable_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        match d.dispatch_one().unwrap() {
+            DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
+            other => panic!("expected ConfigurationUnavailable, got {other:?}"),
+        }
+        assert_eq!(fake.start_call_count(), 0);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// §3: missing profile.
+    #[test]
+    fn dispatch_missing_profile_fails_closed_without_physical_start() {
+        let (kernel, _clock, _registry, adapters, fake) = dispatch_env();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("cfg-profile", Value::Null).retry(config_retryable_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        match d.dispatch_one().unwrap() {
+            DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
+            other => panic!("expected ConfigurationUnavailable, got {other:?}"),
+        }
+        assert_eq!(fake.start_call_count(), 0);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// §4: incompatible target/profile pair.
+    #[test]
+    fn dispatch_incompatible_pair_fails_closed_without_physical_start() {
+        let (kernel, _clock, _registry, adapters, fake) = dispatch_env();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(
+                ExecutionProfileConfig::new("default").with_allowed_targets(["remote"]),
+            )
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("cfg-incompatible", Value::Null).retry(config_retryable_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        match d.dispatch_one().unwrap() {
+            DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
+            other => panic!("expected ConfigurationUnavailable, got {other:?}"),
+        }
+        assert_eq!(fake.start_call_count(), 0);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// §5, §6, §7, §31: a missing adapter_kind is authoritative, creates no
+    /// fallback, and — because no Execution exists — creates no writer
+    /// ambiguity for a WRITE task.
+    #[test]
+    fn dispatch_missing_adapter_creates_no_writer_ambiguity() {
+        let (kernel, _clock, registry, _adapters, fake) = dispatch_env();
+        let empty_adapters = AdapterRegistry::new();
+        let d = Dispatcher::new(&kernel, &registry, &empty_adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("cfg-adapter", Value::Null)
+                .write()
+                .retry(config_retryable_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        match d.dispatch_one().unwrap() {
+            DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
+            other => panic!("expected ConfigurationUnavailable, got {other:?}"),
+        }
+        assert_eq!(fake.start_call_count(), 0);
+        // No Execution existed, so writer safety cannot be ambiguous: the
+        // mechanical NACK takes the retry branch, not the WRITER_QUIESCENCE_
+        // UNKNOWN suspension.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+        assert!(kernel.open_escalation_for_task(&task_id).is_err());
+    }
+
+    /// §9: tampered target copy is an authority rejection before any adapter
+    /// lookup — never a configuration failure.
+    #[test]
+    fn dispatch_tampered_claim_target_is_authority_rejected() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("tamper-target", Value::Null)])
+            .unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+        claim.execution_target = "missing-target".to_string();
+
+        assert_eq!(
+            d.dispatch_claim(&claim).unwrap(),
+            DispatchOneOutcome::AuthorityRejected
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// §10: tampered profile copy.
+    #[test]
+    fn dispatch_tampered_claim_profile_is_authority_rejected() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("tamper-profile", Value::Null)])
+            .unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+        claim.execution_profile = "missing-profile".to_string();
+
+        assert_eq!(
+            d.dispatch_claim(&claim).unwrap(),
+            DispatchOneOutcome::AuthorityRejected
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// §11: a stale claim is rejected before any adapter lookup.
+    #[test]
+    fn dispatch_stale_claim_is_authority_rejected() {
+        let (kernel, clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("stale-claim", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        clock.advance(25.0); // lease expired
+
+        assert_eq!(
+            d.dispatch_claim(&claim).unwrap(),
+            DispatchOneOutcome::AuthorityRejected
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// §12-15: mutating the Claim's semantic copies can never alter the
+    /// physical request — every field comes from the durable launch snapshot.
+    #[test]
+    fn dispatch_claim_semantic_copies_cannot_alter_request() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let durable_payload = serde_json::json!({"objective": "durable"});
+        let durable_acceptance = serde_json::json!({"criteria": "durable"});
+        let mut spec = TaskSpec::new("tamper-semantics", durable_payload.clone());
+        spec.acceptance = durable_acceptance.clone();
+        kernel.submit_batch(&[spec]).unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+
+        claim.payload = serde_json::json!({"objective": "FORGED"});
+        claim.acceptance = serde_json::json!({"criteria": "FORGED"});
+        claim.workstream_id = Some(agentype_core::WorkstreamId::new());
+        claim.batch_id = agentype_core::BatchId::new();
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        let last = fake.last_request().unwrap();
+        assert_eq!(last.payload(), &durable_payload);
+        assert_eq!(last.acceptance(), &durable_acceptance);
+        assert_eq!(last.workstream_id(), None);
+    }
+
+    /// §29: durable READ_ONLY authority wins over a Claim mutated to WRITE.
+    #[test]
+    fn dispatch_read_only_task_stays_read_only_even_if_claim_says_write() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("ro-authority", Value::Null)])
+            .unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+        claim.workspace_mode = agentype_core::WorkspaceMode::Write;
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert_eq!(
+            fake.last_request().unwrap().workspace_mode(),
+            agentype_core::WorkspaceMode::ReadOnly
+        );
+    }
+
+    /// §30: a WRITE launch comes only from durable WRITE Task authority.
+    #[test]
+    fn dispatch_write_task_requests_write_from_durable_authority() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("write-authority", Value::Null).write()])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert_eq!(
+            fake.last_request().unwrap().workspace_mode(),
+            agentype_core::WorkspaceMode::Write
+        );
+    }
+
+    /// §22, §24: an ambiguous start is persisted as unresolved physical
+    /// history, is never restarted through another start_execution, and the
+    /// mechanical nonterminal NACK applies the retry policy.
+    #[test]
+    fn dispatch_ambiguous_start_is_persisted_and_never_restarted() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("ambig", Value::Null).retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(ambiguous_start());
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous {
+                execution_id,
+                request_id,
+            } => {
+                assert_ne!(*request_id, agentype_core::RequestId::new());
+                execution_id.clone()
+            }
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        assert_eq!(fake.start_call_count(), 1);
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+        // No blind re-dispatch: the retry wait is not claimable and nothing
+        // starts a second time.
+        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// §25: a terminal failure before RUNNING follows the existing NACK
+    /// rules (failure row, physical history, retry policy).
+    #[test]
+    fn dispatch_terminal_start_failure_follows_nack_rules() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("start-fail", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class,
+                ..
+            } => {
+                assert_eq!(*failure_class, FailureClass::Timeout);
+                execution_id.clone()
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Failed);
+        assert!(exec.terminal_confirmed);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// §12: a synchronously completing adapter runs the authoritative ACK
+    /// path and produces a durable Result.
+    #[test]
+    fn dispatch_synchronous_success_completes_authoritatively() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("sync-ok", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: Some("done".into()),
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        match &outcome {
+            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
+                assert!(result_id.is_some());
+            }
+            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        }
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
+    }
+
+    /// §27: authority expiring between Execution creation and a RUNNING
+    /// report must not restore Task authority — physical history only, with
+    /// the observed handle preserved for M5.4 reconciliation.
+    #[test]
+    fn dispatch_stale_authority_after_running_never_restores_task() {
+        let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
+        let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", advancing).unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("stale-running", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        // Task authority was NOT restored (no RUNNING task state).
+        let task_id = exec.task_id.clone();
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Leased);
+    }
+
+    /// §27: authority expiring before a terminal failure report mutates
+    /// physical history only — never Task/attempt state.
+    #[test]
+    fn dispatch_stale_authority_after_failure_records_physical_history_only() {
+        let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
+        let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
+        advancing.inner.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: Some(FailureClass::StartFailure),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", advancing).unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("stale-fail", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartFailed, got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Failed
+        );
+        let task_id = kernel.execution(&execution_id).unwrap().task_id.clone();
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Leased);
+    }
+
+    /// §28: an ambiguous WRITE start is never quiescent — the mechanical
+    /// nonterminal NACK suspends with WRITER_QUIESCENCE_UNKNOWN.
+    #[test]
+    fn dispatch_ambiguous_write_start_never_gains_quiescence() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("ambig-write", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(ambiguous_start());
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        let esc = kernel.open_escalation_for_task(&task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(fake.start_call_count(), 1);
     }
 }
