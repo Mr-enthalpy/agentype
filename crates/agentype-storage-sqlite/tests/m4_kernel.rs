@@ -6,6 +6,7 @@ mod common;
 
 use agentype_core::*;
 use agentype_execution_config::*;
+use agentype_storage_sqlite::txutil;
 use agentype_storage_sqlite::Kernel;
 use common::*;
 use serde_json::json;
@@ -1751,4 +1752,59 @@ fn launch_snapshot_carries_committed_continuity_and_preference() {
         launch2.continuity().capsule(),
         &json!({"CURRENT CHECKPOINT": "step_1_finished"})
     );
+}
+
+/// V0.1 oracle parity (test_required_affinity_births_new_identity_from_project_state,
+/// birth primitive): a newborn bound to a workstream must inherit the workstream's
+/// authoritative project_state_ref as its initial bounded continuity, so the
+/// execution-launch continuity snapshot preserves a real project baseline
+/// instead of an empty capsule.
+#[test]
+fn birth_agent_seeds_workstream_project_state_as_newborn_continuity() {
+    let db = FixtureDb::new("birth-project-state");
+    let (ws_ref, ws_bare) = {
+        let env = file_env(&db);
+        (
+            env.k
+                .create_workstream("design", Some("git:abcdef"), None)
+                .unwrap(),
+            env.k.create_workstream("scratch", None, None).unwrap(),
+        )
+    };
+
+    let mut conn = rusqlite::Connection::open(&db.path).unwrap();
+    let tx = conn.transaction().unwrap();
+    let seeded = txutil::birth_agent(&tx, "general", Some(ws_ref.as_str()), None, 5_000.0).unwrap();
+    let bare = txutil::birth_agent(&tx, "general", Some(ws_bare.as_str()), None, 5_000.0).unwrap();
+    let orphan = txutil::birth_agent(&tx, "general", None, None, 5_000.0).unwrap();
+    tx.commit().unwrap();
+
+    let continuity = |id: &str| -> String {
+        conn.query_row(
+            "SELECT continuity_json FROM logical_agents WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&continuity(&seeded)).unwrap(),
+        json!({"CURRENT CHECKPOINT": {"project_state_ref": "git:abcdef"}})
+    );
+    assert!(continuity(&seeded).contains("git:abcdef"));
+    // A workstream without a project baseline, and an unbound birth, stay empty.
+    assert_eq!(continuity(&bare), "{}");
+    assert_eq!(continuity(&orphan), "{}");
+}
+
+#[test]
+fn birth_agent_fails_closed_on_unknown_workstream() {
+    let db = FixtureDb::new("birth-unknown-ws");
+    {
+        let _env = file_env(&db);
+    }
+    let mut conn = rusqlite::Connection::open(&db.path).unwrap();
+    let tx = conn.transaction().unwrap();
+    let err = txutil::birth_agent(&tx, "general", Some("ws-missing"), None, 5_000.0).unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
 }
