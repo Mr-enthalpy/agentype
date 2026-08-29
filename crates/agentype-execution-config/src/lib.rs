@@ -1,9 +1,13 @@
-//! Pure execution configuration registry, resolution authority, and unforgeable launch proofs.
+//! Pure execution configuration registry, resolution authority, and unforgeable
+//! isolated-safety facts.
 //!
 //! This crate owns the authoritative execution configuration models and produces
 //! strongly-typed `FrozenExecutionSafety` facts. Outside of this crate, `FrozenExecutionSafety`
 //! carrying `attempt_isolation = true` cannot be forged by any safe or unsafe public constructor;
 //! it can be obtained exclusively through `ResolvedExecutionEnvironment::safety()`.
+//! (`ExecutionLaunchSnapshot`'s raw constructor is a trusted unchecked path —
+//! see its safety documentation; the snapshot boundary is procedural, not
+//! memory-safety-enforced.)
 
 use agentype_core::{
     AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, IncarnationId, LeaseEpoch,
@@ -345,8 +349,10 @@ pub fn resolve_execution_environment(
 
 /// Authoritative launch snapshot reconstructed from durable Scheduler state.
 ///
-/// This object is produced exclusively by the Execution creation transaction and
-/// encapsulates all execution parameters as private, readonly fields.
+/// Encapsulates all execution parameters as private, readonly fields. The
+/// canonical production path is the Kernel execution-creation transaction;
+/// the raw constructor below is a **trusted unchecked constructor**, not a
+/// memory-safety-enforced boundary (see its safety documentation).
 ///
 /// `task_name` is the durable human-readable Task label (a scheduling/display
 /// fact). It is NOT the worker prompt: the worker-facing prompt is a derived
@@ -378,12 +384,22 @@ pub struct ExecutionLaunchSnapshot {
 }
 
 impl ExecutionLaunchSnapshot {
-    /// Internal storage-level constructor for Kernel execution creation transactions.
+    /// Trusted internal unchecked constructor for the Kernel execution-creation
+    /// transaction.
     ///
     /// # Safety
-    /// The only safe production construction path is the fenced Kernel execution-creation transaction.
-    /// Caller MUST be a fenced Kernel database transaction that has atomically validated
-    /// the Attempt, Lease, Task, Agent, and Incarnation records from durable storage.
+    ///
+    /// The caller MUST be the fenced Kernel execution-creation transaction,
+    /// which has atomically validated the Attempt, Lease, Task, Agent, and
+    /// Incarnation records from durable storage, so that every field reflects
+    /// durable authority.
+    ///
+    /// This `unsafe` marker is a **procedural contract, not an access-control
+    /// mechanism**: Rust memory safety does not enforce the kernel-only
+    /// construction invariant, and any crate can call this function inside an
+    /// `unsafe` block. Constructing a snapshot here does not by itself confer
+    /// SQLite authority, but callers outside the Kernel transaction bypass the
+    /// validation guarantees and violate the crate's trust contract.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_persisted_kernel_authority(
         execution_id: ExecutionId,
