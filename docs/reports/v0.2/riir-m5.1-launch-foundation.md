@@ -5,7 +5,7 @@ Applies to: branch `rust/m5-runtime`
 Canonical path: `docs/reports/v0.2/riir-m5.1-launch-foundation.md`  
 Not a specification.
 
-This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation via `agentype-execution-config`, unforgeable compile-time isolated safety proofs, authoritative physical `Incarnation` and `RuntimeHandle` binding, a canonical `prepare_execution_launch` runtime façade that atomically resolves the authoritative environment and assembles the worker request (its prompt is the deterministic V0.1 worker protocol derived inside `agentype-adapter-api`; the durable Task label is never sent as the prompt and no caller text can be injected), and bundled committed continuity for M5.
+This milestone resolves the boundary ambiguity between Scheduler `Claim` authority receipts and physical execution requests, establishing an encapsulated `ExecutionLaunchSnapshot` foundation, clean domain-versus-runtime configuration separation via `agentype-execution-config`, compile-time-sealed isolated safety facts, authoritative physical `Incarnation` and `RuntimeHandle` binding, a canonical `prepare_execution_launch` runtime façade whose configuration resolution is keyed by durable Attempt authority (`Kernel::resolve_execution_binding` precedes resolution; fenced revalidation follows it) and assembles the worker request (its prompt is the deterministic V0.1 worker protocol derived inside `agentype-adapter-api`; the durable Task label is never sent as the prompt and no caller text can be injected), and bundled committed continuity for M5.
 
 ---
 
@@ -25,13 +25,19 @@ In M4, `Claim` was returned to callers as a composite DTO carrying both authorit
 ```text
 Claim (receipt)
       ↓
-prepare_execution_launch(&kernel, &claim, ExecutionResolutionMode::Authoritative(reg))
-      ↓ [resolution happens inside the façade, immediately before the launch tx:
-         fails closed on missing target/profile or incompatible pair]
-ResolvedExecutionEnvironment (opaque, private fields; minted at launch time)
+Kernel::resolve_execution_binding(&claim)
+      ↓ [short authority tx: attempt/lease/epoch/expiry; Claim copies
+         cross-validated vs the frozen Attempt — a tampered or stale
+         Claim is rejected here, BEFORE any configuration resolution]
+AuthoritativeExecutionBinding (attempt_id, lease_epoch,
+                               target/profile ← Attempt row)
+      ↓
+resolve_execution_environment(mode, binding.target, binding.profile)
+      ↓ [fails closed on missing target/profile or incompatible pair]
+ResolvedExecutionEnvironment (opaque, private fields; keyed by durable authority)
       ↓
 Kernel::create_execution(&claim, env.safety())
-      ↓ [inside SQLite transaction]
+      ↓ [fenced revalidation inside SQLite transaction — no TOCTOU hole]
       ├─ Validates Attempt/Lease/Epoch fencing
       ├─ Cross-validates claim against Attempt
       ├─ Asserts safety.target == attempt.execution_target
@@ -51,8 +57,9 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
       │              deterministic V0.1 protocol (IDs, epoch, workstream,
       │              objective = payload, acceptance, continuity, + writer
       │              recovery rules when WRITE); no caller text injectable
-      └─ resolved_environment: the same environment that minted the persisted
-         attempt_isolation proof — the single binding for physical start
+      └─ resolved_environment: the same resolved environment that minted the
+         persisted attempt_isolation proof — the single binding for physical
+         start (resolution followed by fenced revalidation)
 ```
 
 ---
@@ -76,7 +83,7 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
       │ (depends on config) │ (depends on config + storage)
 [agentype-storage-sqlite]   [agentype-runtime] (#![forbid(unsafe_code)])
       │                     ├── prepare_execution_launch(kernel, claim, mode) -> PreparedExecutionLaunch
-      │                     │     (resolves internally; ExecutionPreparationError)
+      │                     │     (binding-first: authority tx → config resolution → fenced creation)
       │                     └── recover_authority(kernel)
       ▲
       │ (depends on core + config)
@@ -106,9 +113,10 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
   - `resolve_execution_environment(mode, target, profile) -> Result<ResolvedExecutionEnvironment, ResolutionError>`.
   - `ExecutionLaunchSnapshot`:
     - Private fields for all execution launch parameters.
-    - `pub unsafe fn from_persisted_kernel_authority(...) -> Self` (storage trust boundary with formal `# Safety` invariant).
+    - `pub unsafe fn from_persisted_kernel_authority(...) -> Self` — a **trusted unchecked constructor**: the `unsafe` marker is a procedural contract whose canonical caller is the Kernel execution-creation transaction; it is NOT an access-control mechanism, and Rust memory safety does not enforce the kernel-only construction invariant.
 
 ### `agentype-storage-sqlite` (Scheduler Storage Engine)
+- `Kernel::resolve_execution_binding(&claim) -> AuthoritativeExecutionBinding`: short authority-validation transaction (attempt/lease/epoch/expiry, then cross-validation of the Claim's task/agent/target/profile copies against the durable Attempt) producing the configuration-resolution key from the frozen Attempt row.
 - Updated signature:
   ```rust
   pub fn create_execution(
@@ -132,7 +140,8 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
       mode: ExecutionResolutionMode<'_>,
   ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError>
   ```
-- Returns `PreparedExecutionLaunch { snapshot, request, resolved_environment }`. Configuration resolution happens **inside** the façade, immediately before the fenced execution-creation transaction, so the persisted `attempt_isolation` fact and the environment exposed for physical start are atomically the same. The dispatcher MUST select the adapter binding, options, and timeouts from `resolved_environment` and MUST NOT re-resolve; a stale pre-resolved environment is not an accepted parameter.
+- Returns `PreparedExecutionLaunch { snapshot, request, resolved_environment }`. Configuration resolution is keyed by the durable `AuthoritativeExecutionBinding` and runs inside the façade between the authority-validation transaction and the fenced execution-creation transaction, so the persisted `attempt_isolation` fact and the environment exposed for physical start are bound to the same resolved environment (resolution followed by fenced revalidation — not a cross registry+SQLite atomic transaction). The dispatcher MUST select the adapter binding, options, and timeouts from `resolved_environment` and MUST NOT re-resolve; a pre-resolved environment is not an accepted parameter.
+- `Kernel::resolve_execution_binding(&claim)` (storage crate): a short authority-validation transaction producing `AuthoritativeExecutionBinding` from the frozen Attempt row. A stale/expired Claim fails with `StaleAuthority` and a Claim whose task/agent/target/profile copies disagree with the Attempt fails with `InvalidAuthority` — both BEFORE any configuration resolution, so a tampered Claim cannot masquerade as a configuration failure.
 - `ExecutionPreparationError` freezes configuration-resolution failures to the standardized Task failure class `RESOURCE_UNAVAILABLE` (`standard_failure_class()`), anchored on `core::authority::unavailable_configuration_failure` and spec 16 §A2 (the supplied registry is authoritative, no adapter default). Kernel authority errors are deliberately NOT mapped to a Task failure class.
 - The worker prompt is not a façade concern: `ExecutionRequest::from_launch(&launch)` derives it deterministically via `RenderedWorkerPrompt` (see adapter-api).
 - Recovery orchestration: `recover_authority(&kernel) -> Result<ExpireReport, Error>`.
@@ -172,6 +181,7 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 | `execution_target` | `AttemptRow.execution_target` | Frozen on Attempt at claim time (asserted vs `safety.target`) |
 | `execution_profile` | `AttemptRow.execution_profile` | Frozen on Attempt at claim time (asserted vs `safety.profile`) |
 | `workspace_mode` | `TaskRow.workspace_mode` | Re-read from durable `tasks` row (Claim tamper ignored) |
+| configuration-resolution key | `AttemptRow.execution_target` / `execution_profile` (via `Kernel::resolve_execution_binding`) | Claim DTO copies cross-validated and rejected (`InvalidAuthority`) before resolution; stale authority (`StaleAuthority`) precedes configuration failure |
 | `task_name` | `TaskRow.name` | Re-read from durable `tasks` row; durable task label fact only — never the worker prompt |
 | worker prompt (`ExecutionRequest.prompt`) | Derived deterministically inside `agentype-adapter-api`: `RenderedWorkerPrompt::from_launch(&launch)` from the full launch protocol (IDs, epoch, workstream, payload, acceptance, continuity, workspace mode) | Not a constructor parameter — no caller text can be injected; the same snapshot always yields the same instruction |
 | `payload` | `TaskRow.payload_json` | Re-read from durable `tasks` row (Claim tamper ignored) |
@@ -185,11 +195,11 @@ Every physical launch field has an unambiguous, enforced authoritative owner:
 ## 4. Test Suite & Validation Results
 
 ### Rust Workspace (`cargo test --workspace`)
-**131 passed, 0 failed:**
+**134 passed, 0 failed:**
 - `agentype-adapter-api`: 5 passed (including deterministic, non-injectable worker-prompt regressions)
 - `agentype-core`: 20 passed (domain authority, decision matrix, state machines)
 - `agentype-execution-config`: 7 passed (registry validation, configuration error checking, resolution modes, fail-closed handling)
-- `agentype-runtime`: 9 passed (atomic resolution binding, standardized preparation failures, end-to-end isolation persistence, discriminating registry-reconfiguration pair, V0.1 worker-prompt protocol regressions)
+- `agentype-runtime`: 12 passed (authority-precedence discriminating set: tampered target/profile → authority rejection, stale claim precedes configuration failure; registry-generation-swap binding; standardized preparation failures; end-to-end isolation persistence; discriminating registry-reconfiguration pair; V0.1 worker-prompt protocol regressions)
 - `agentype-storage-sqlite`: 90 passed
   - `m4_kernel.rs`: 63 passed (including launch, continuity, mismatch & tamper regressions, and workstream project_state_ref birth seeding)
   - `recovery.rs`: 11 passed
@@ -219,3 +229,9 @@ PR review surfaced four findings against this milestone; all are incorporated on
 6. **Worker prompt was still injectable (P1, corrected).** `from_launch(launch, prompt: String)` allowed arbitrary caller text to replace the scheduler instruction. The prompt is now derived inside `agentype-adapter-api` as `RenderedWorkerPrompt` (private text, sole snapshot-based constructor); the same snapshot always yields the same instruction and no API path accepts caller text. Residual boundary: `Kernel::create_execution` remains a public storage-level API that accepts a cloned proof; the façade is the canonical M5.2 path, and binding the proof to the Attempt identity inside the Kernel is recorded as optional follow-up hardening.
 7. **Configuration-resolution failure semantics were comment-only (P2, corrected).** `ExecutionPreparationError` freezes `ResolutionError` failures to the standardized Task failure class `RESOURCE_UNAVAILABLE` at the façade boundary (`standard_failure_class()`), anchored on `core::authority::unavailable_configuration_failure` and spec 16 §A2; kernel authority errors are deliberately not Task failure classes.
 8. **CI evidence gap (P2, corrected).** The Rust CI job now runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` before `cargo test --workspace`, so the quality gates cited here are reproducible in CI.
+
+### Round 3
+
+9. **Configuration resolution was keyed by the Claim DTO before authority validation (P1, merge blocker, corrected).** `prepare_execution_launch` resolved configuration from the Claim's `execution_target`/`execution_profile` copies before any kernel authority check, so a tampered Claim (target renamed to a nonexistent entry) surfaced as `Configuration(TargetNotFound)` → `RESOURCE_UNAVAILABLE` instead of an authority rejection. Harmless as a bare error, but at M5.2 a dispatcher that mechanically NACKs `RESOURCE_UNAVAILABLE` would let a forged Claim DTO push a fully configured Task into retry/suspension — violating "Claim = authority receipt, not launch semantics". The façade is now three-step: `Kernel::resolve_execution_binding` (short authority tx; stale/expired Claim → `StaleAuthority`, mismatched Claim copies → `InvalidAuthority`) produces `AuthoritativeExecutionBinding` (target/profile ← the frozen Attempt row), configuration resolution is keyed by that binding, and `Kernel::create_execution` still revalidates lease/epoch transactionally (no TOCTOU hole). Discriminating regressions: tampered target / profile yield authority rejection while the authoritative target is fully available in the registry; a stale Claim with an empty registry yields `StaleAuthority` ahead of configuration failure; the untampered missing-registry case remains `RESOURCE_UNAVAILABLE`.
+10. **"Atomically bound" terminology overclaimed (P2, corrected).** Configuration resolution runs outside the SQLite transaction; the real guarantee is "bound to the same resolved environment (resolution followed by fenced revalidation)", not a cross registry+SQLite atomic transaction. Report and code wording normalized accordingly.
+11. **`pub unsafe fn` documented as an exclusive/unforgeable boundary (P2, corrected).** `unsafe` is not access control; `ExecutionLaunchSnapshot::from_persisted_kernel_authority` is now documented as a trusted internal unchecked constructor whose kernel-only invariant is procedural (canonical caller is the fenced execution-creation transaction). The genuinely type-system-sealed `FrozenExecutionSafety` claims (`pub(crate)` constructor) are unchanged.
