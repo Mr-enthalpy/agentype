@@ -119,24 +119,11 @@ pub fn run_claim(
     let (batch, ids) = k.submit_batch(std::slice::from_ref(&spec)).unwrap();
     let claim = k.claim_next_available().unwrap().expect("claim");
     let safety = if isolation {
-        let mut registry = ExecutionRegistry::new();
-        registry
-            .register_target(ExecutionTargetConfig::new(
-                &claim.execution_target,
-                "test",
-                true,
-            ))
-            .unwrap();
-        registry
-            .register_profile(ExecutionProfileConfig::new(&claim.execution_profile))
-            .unwrap();
-        let env = resolve_execution_environment(
-            ExecutionResolutionMode::Authoritative(&registry),
+        FrozenExecutionSafety::from_resolved_authority(
             &claim.execution_target,
             &claim.execution_profile,
+            true,
         )
-        .unwrap();
-        env.safety()
     } else {
         FrozenExecutionSafety::unisolated(&claim.execution_target, &claim.execution_profile)
     };

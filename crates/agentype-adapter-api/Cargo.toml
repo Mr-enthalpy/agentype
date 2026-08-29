@@ -8,9 +8,3 @@ description = "Generic ExecutionAdapter traits and opaque handles"
 [dependencies]
 agentype-core.workspace = true
 serde_json.workspace = true
-
-[features]
-test-support = []
-
-[dev-dependencies]
-agentype-core = { path = "../agentype-core", features = ["test-support"] }

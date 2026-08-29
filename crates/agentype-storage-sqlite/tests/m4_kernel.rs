@@ -1589,30 +1589,17 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     let (_b, _ids) = k.submit_batch(&[write_task("isolated-task")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
 
-    let mut registry = ExecutionRegistry::new();
-    registry
-        .register_target(ExecutionTargetConfig::new(
-            &claim.execution_target,
-            "container",
-            true,
-        ))
-        .unwrap();
-    registry
-        .register_profile(ExecutionProfileConfig::new(&claim.execution_profile))
-        .unwrap();
-    let env = resolve_execution_environment(
-        ExecutionResolutionMode::Authoritative(&registry),
+    let safety = FrozenExecutionSafety::from_resolved_authority(
         &claim.execution_target,
         &claim.execution_profile,
-    )
-    .unwrap();
-
-    let launch = k.create_execution(&claim, env.safety()).unwrap();
+        true,
+    );
+    let launch = k.create_execution(&claim, safety.clone()).unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
     assert_eq!(launch.logical_agent_id(), &claim.logical_agent_id);
     assert!(launch.attempt_isolation());
-    assert_eq!(launch.safety(), &env.safety());
+    assert_eq!(launch.safety(), &safety);
 
     let exec = k.execution(launch.execution_id()).unwrap();
     assert_eq!(&exec.id, launch.execution_id());
@@ -1634,40 +1621,20 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
     assert_eq!(claim.execution_profile, "default");
 
     // 1. Safety proof for forged target "remote" is rejected
-    let mut reg_remote = ExecutionRegistry::new();
-    reg_remote
-        .register_target(ExecutionTargetConfig::new("remote", "container", true))
-        .unwrap();
-    reg_remote
-        .register_profile(ExecutionProfileConfig::new("default"))
-        .unwrap();
-    let env_remote = resolve_execution_environment(
-        ExecutionResolutionMode::Authoritative(&reg_remote),
-        "remote",
-        "default",
-    )
-    .unwrap();
-    let err = k.create_execution(&claim, env_remote.safety()).unwrap_err();
+    let forged_target_safety =
+        FrozenExecutionSafety::from_resolved_authority("remote", "default", true);
+    let err = k
+        .create_execution(&claim, forged_target_safety)
+        .unwrap_err();
     assert!(err
         .to_string()
         .contains("safety proof target 'remote' does not match"));
 
     // 2. Safety proof for forged profile "isolated" is rejected
-    let mut reg_profile = ExecutionRegistry::new();
-    reg_profile
-        .register_target(ExecutionTargetConfig::new("local", "container", true))
-        .unwrap();
-    reg_profile
-        .register_profile(ExecutionProfileConfig::new("isolated"))
-        .unwrap();
-    let env_profile = resolve_execution_environment(
-        ExecutionResolutionMode::Authoritative(&reg_profile),
-        "local",
-        "isolated",
-    )
-    .unwrap();
+    let forged_profile_safety =
+        FrozenExecutionSafety::from_resolved_authority("local", "isolated", true);
     let err = k
-        .create_execution(&claim, env_profile.safety())
+        .create_execution(&claim, forged_profile_safety)
         .unwrap_err();
     assert!(err
         .to_string()

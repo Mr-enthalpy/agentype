@@ -3,6 +3,8 @@
 //! Core MUST NOT import vendor names. Adapters own process/session mapping.
 //! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
 
+#![deny(unsafe_code)]
+
 use agentype_core::{
     AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionLaunchSnapshot,
     ExecutionState, FailureClass, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId,
@@ -23,10 +25,10 @@ pub enum AdapterError {
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DeadlineExceeded(m) => write!(f, "adapter deadline: {m}"),
-            Self::Protocol(m) => write!(f, "adapter protocol: {m}"),
-            Self::Unavailable(m) => write!(f, "adapter unavailable: {m}"),
-            Self::Other(m) => write!(f, "adapter: {m}"),
+            Self::DeadlineExceeded(m) => write!(f, "execution deadline exceeded: {m}"),
+            Self::Protocol(m) => write!(f, "adapter protocol violation: {m}"),
+            Self::Unavailable(m) => write!(f, "adapter runtime unavailable: {m}"),
+            Self::Other(m) => write!(f, "adapter error: {m}"),
         }
     }
 }
@@ -35,16 +37,15 @@ impl std::error::Error for AdapterError {}
 
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
-/// Opaque runtime handle. Core stores JSON; it MUST NOT interpret vendor keys.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Opaque JSON-serializable runtime handle stored by the scheduler across crash/reconciliation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeHandle(pub Value);
 
-/// Complete structured physical execution request.
+/// Complete structured execution request passed to an ExecutionAdapter.
 ///
-/// Constructed strictly from an authoritative `ExecutionLaunchSnapshot` + runtime handle.
-/// Contains all task context, acceptance criteria, and continuity needed by the adapter
-/// to encode physical execution instructions without out-of-band DB reads.
-#[derive(Clone, Debug)]
+/// Encapsulates all execution metadata as private fields with readonly getters.
+/// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     request_id: RequestId,
     execution_id: ExecutionId,
@@ -89,52 +90,6 @@ impl ExecutionRequest {
             workstream_id: launch.workstream_id().cloned(),
             continuity: launch.continuity().clone(),
             incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_testing(
-        request_id: RequestId,
-        execution_id: ExecutionId,
-        task_id: TaskId,
-        batch_id: BatchId,
-        attempt_id: AttemptId,
-        attempt_number: u32,
-        lease_id: LeaseId,
-        lease_epoch: LeaseEpoch,
-        logical_agent_id: LogicalAgentId,
-        incarnation_id: IncarnationId,
-        execution_target: impl Into<String>,
-        execution_profile: impl Into<String>,
-        workspace_mode: WorkspaceMode,
-        prompt: impl Into<String>,
-        payload: Value,
-        acceptance: Value,
-        workstream_id: Option<WorkstreamId>,
-        continuity: CommittedContinuitySnapshot,
-        incarnation_runtime_handle: RuntimeHandle,
-    ) -> Self {
-        Self {
-            request_id,
-            execution_id,
-            task_id,
-            batch_id,
-            attempt_id,
-            attempt_number,
-            lease_id,
-            lease_epoch,
-            logical_agent_id,
-            incarnation_id,
-            execution_target: execution_target.into(),
-            execution_profile: execution_profile.into(),
-            workspace_mode,
-            prompt: prompt.into(),
-            payload,
-            acceptance,
-            workstream_id,
-            continuity,
-            incarnation_runtime_handle,
         }
     }
 
@@ -393,34 +348,44 @@ impl ExecutionAdapter for FakeAdapter {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use agentype_core::FrozenExecutionSafety;
 
+    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
+        unsafe {
+            ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                ExecutionId::new(),
+                RequestId::new(),
+                TaskId::new(),
+                BatchId::new(),
+                AttemptId::new(),
+                1,
+                LeaseId::new(),
+                LeaseEpoch(1),
+                100.0,
+                LogicalAgentId::new(),
+                IncarnationId::new(),
+                Value::Null,
+                "local".to_string(),
+                "default".to_string(),
+                WorkspaceMode::ReadOnly,
+                "hi".to_string(),
+                Value::Null,
+                Value::Null,
+                None,
+                CommittedContinuitySnapshot::stateless(),
+                FrozenExecutionSafety::unisolated("local", "default"),
+            )
+        }
+    }
+
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest::for_testing(
-            RequestId::new(),
-            ExecutionId::new(),
-            TaskId::new(),
-            BatchId::new(),
-            AttemptId::new(),
-            1,
-            LeaseId::new(),
-            LeaseEpoch(1),
-            LogicalAgentId::new(),
-            IncarnationId::new(),
-            "local",
-            "default",
-            WorkspaceMode::ReadOnly,
-            "hi",
-            Value::Null,
-            Value::Null,
-            None,
-            CommittedContinuitySnapshot::stateless(),
-            RuntimeHandle::default(),
-        );
+        let launch = mock_launch_snapshot();
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -434,27 +399,8 @@ mod tests {
     #[test]
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest::for_testing(
-            RequestId::new(),
-            ExecutionId::new(),
-            TaskId::new(),
-            BatchId::new(),
-            AttemptId::new(),
-            1,
-            LeaseId::new(),
-            LeaseEpoch(1),
-            LogicalAgentId::new(),
-            IncarnationId::new(),
-            "local",
-            "default",
-            WorkspaceMode::ReadOnly,
-            "hi",
-            Value::Null,
-            Value::Null,
-            None,
-            CommittedContinuitySnapshot::stateless(),
-            RuntimeHandle::default(),
-        );
+        let launch = mock_launch_snapshot();
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -481,33 +427,35 @@ mod tests {
     fn execution_request_constructed_from_launch_snapshot() {
         let ws = WorkstreamId::new();
         let inc_id = agentype_core::IncarnationId::new();
-        let launch = ExecutionLaunchSnapshot::for_testing(
-            ExecutionId::new(),
-            RequestId::new(),
-            agentype_core::TaskId::new(),
-            agentype_core::BatchId::new(),
-            agentype_core::AttemptId::new(),
-            1,
-            agentype_core::LeaseId::new(),
-            agentype_core::LeaseEpoch(1),
-            100.0,
-            agentype_core::LogicalAgentId::new(),
-            inc_id.clone(),
-            serde_json::json!({"proc": 42}),
-            "local".to_string(),
-            "default".to_string(),
-            WorkspaceMode::ReadOnly,
-            "task-prompt".to_string(),
-            serde_json::json!({"key": "val"}),
-            serde_json::json!({"criterion": "pass"}),
-            Some(ws.clone()),
-            CommittedContinuitySnapshot::new(
-                agentype_core::ContinuityPreference::Required,
-                3,
-                serde_json::json!({"state": "saved"}),
-            ),
-            FrozenExecutionSafety::unisolated("local", "default"),
-        );
+        let launch = unsafe {
+            ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                ExecutionId::new(),
+                RequestId::new(),
+                agentype_core::TaskId::new(),
+                agentype_core::BatchId::new(),
+                agentype_core::AttemptId::new(),
+                1,
+                agentype_core::LeaseId::new(),
+                agentype_core::LeaseEpoch(1),
+                100.0,
+                agentype_core::LogicalAgentId::new(),
+                inc_id.clone(),
+                serde_json::json!({"proc": 42}),
+                "local".to_string(),
+                "default".to_string(),
+                WorkspaceMode::ReadOnly,
+                "task-prompt".to_string(),
+                serde_json::json!({"key": "val"}),
+                serde_json::json!({"criterion": "pass"}),
+                Some(ws.clone()),
+                CommittedContinuitySnapshot::new(
+                    agentype_core::ContinuityPreference::Required,
+                    3,
+                    serde_json::json!({"state": "saved"}),
+                ),
+                FrozenExecutionSafety::unisolated("local", "default"),
+            )
+        };
         let req = ExecutionRequest::from_launch(&launch);
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());

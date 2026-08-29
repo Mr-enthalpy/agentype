@@ -4,7 +4,6 @@
 
 mod authority;
 mod clock;
-pub mod config;
 mod decisions;
 mod errors;
 mod ids;
@@ -17,7 +16,6 @@ pub use authority::{
     validate_authority, writer_is_safe_to_replace, AuthoritySnapshot,
 };
 pub use clock::{Clock, ManualClock, SystemClock, UnixTime};
-pub use config::*;
 pub use decisions::{
     agent_release_disposition, batch_next_state, claim_selection_rank, claim_task_eligible,
     claim_tiebreak, cross_target_cutover_safety, dependency_release_decision, durable_quiescence,

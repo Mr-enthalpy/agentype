@@ -297,8 +297,20 @@ pub struct FrozenExecutionSafety {
 }
 
 impl FrozenExecutionSafety {
-    /// Internal constructor for authoritative configuration resolution within agentype-core.
-    pub(crate) fn new(
+    /// Safe constructor for unisolated execution environments (no-isolation-assumption fail-safe).
+    pub fn unisolated(
+        execution_target: impl Into<String>,
+        execution_profile: impl Into<String>,
+    ) -> Self {
+        Self {
+            execution_target: execution_target.into(),
+            execution_profile: execution_profile.into(),
+            attempt_isolation: false,
+        }
+    }
+
+    /// Authoritative constructor for execution configuration resolvers.
+    pub fn from_resolved_authority(
         execution_target: impl Into<String>,
         execution_profile: impl Into<String>,
         attempt_isolation: bool,
@@ -308,14 +320,6 @@ impl FrozenExecutionSafety {
             execution_profile: execution_profile.into(),
             attempt_isolation,
         }
-    }
-
-    /// Safe constructor for unisolated execution environments (fail-safe default).
-    pub fn unisolated(
-        execution_target: impl Into<String>,
-        execution_profile: impl Into<String>,
-    ) -> Self {
-        Self::new(execution_target, execution_profile, false)
     }
 
     pub fn execution_target(&self) -> &str {
@@ -415,9 +419,9 @@ impl ExecutionLaunchSnapshot {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_testing(
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(crate) fn for_testing(
         execution_id: ExecutionId,
         request_id: RequestId,
         task_id: TaskId,

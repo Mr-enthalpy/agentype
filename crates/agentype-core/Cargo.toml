@@ -9,6 +9,3 @@ description = "Agentype domain types, states, and authority predicates (no I/O)"
 thiserror.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
-
-[features]
-test-support = []
