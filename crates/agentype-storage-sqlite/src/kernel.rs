@@ -858,6 +858,52 @@ impl Kernel {
         })
     }
 
+    /// Validate claim authority in a short transaction and derive the durable
+    /// execution binding used as the configuration-resolution key.
+    ///
+    /// Authority precedence: the resolution key (execution_target /
+    /// execution_profile) comes from the frozen Attempt row, never from the
+    /// Claim DTO's redundant copies. A stale or expired Claim fails authority
+    /// validation (StaleAuthority) and a Claim whose copies disagree with the
+    /// durable Attempt is rejected (InvalidAuthority) — both BEFORE any
+    /// configuration resolution, so a forged claim cannot turn a fully
+    /// configured Task into a RESOURCE_UNAVAILABLE preparation failure.
+    pub fn resolve_execution_binding(
+        &self,
+        claim: &Claim,
+    ) -> Result<AuthoritativeExecutionBinding, Error> {
+        self.tx(|tx, now| {
+            let (attempt, _lease, _task) =
+                validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
+            if claim.task_id.as_str() != attempt.task_id {
+                return Err(Error::invalid_authority(
+                    "claim task_id does not match authoritative attempt",
+                ));
+            }
+            if claim.logical_agent_id.as_str() != attempt.logical_agent_id {
+                return Err(Error::invalid_authority(
+                    "claim logical_agent_id does not match authoritative attempt",
+                ));
+            }
+            if claim.execution_target != attempt.execution_target {
+                return Err(Error::invalid_authority(
+                    "claim execution_target does not match authoritative attempt",
+                ));
+            }
+            if claim.execution_profile != attempt.execution_profile {
+                return Err(Error::invalid_authority(
+                    "claim execution_profile does not match authoritative attempt",
+                ));
+            }
+            Ok(AuthoritativeExecutionBinding {
+                attempt_id: claim.attempt_id.clone(),
+                lease_epoch: claim.lease_epoch,
+                execution_target: attempt.execution_target.clone(),
+                execution_profile: attempt.execution_profile.clone(),
+            })
+        })
+    }
+
     pub fn create_execution(
         &self,
         claim: &Claim,

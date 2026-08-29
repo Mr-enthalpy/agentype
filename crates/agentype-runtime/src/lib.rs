@@ -15,14 +15,17 @@ use agentype_storage_sqlite::Kernel;
 /// standardized Scheduler failure class `RESOURCE_UNAVAILABLE` (spec 16 §A2:
 /// the supplied registry is authoritative; there is no adapter-default
 /// fallback). Kernel authority rejections remain domain errors and are
-/// deliberately NOT mapped to a Task failure class.
+/// deliberately NOT mapped to a Task failure class — in particular, a Claim
+/// whose copies disagree with the durable Attempt is an authority rejection,
+/// never a configuration failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionPreparationError {
-    /// The authoritative registry lacks the claimed target/profile or the
-    /// pair is incompatible. Standardized as `FailureClass::ResourceUnavailable`.
+    /// The authoritative registry lacks the Attempt-frozen target/profile or
+    /// the pair is incompatible. Standardized as `FailureClass::ResourceUnavailable`.
     Configuration(ResolutionError),
-    /// The fenced Kernel execution-creation transaction rejected the launch
-    /// (domain/authority error, e.g. stale or invalid authority).
+    /// Authority validation or the fenced execution-creation transaction
+    /// rejected the launch (domain/authority error, e.g. stale or invalid
+    /// authority, tampered Claim copies).
     Kernel(Error),
 }
 
@@ -51,8 +54,8 @@ impl std::fmt::Display for ExecutionPreparationError {
 impl std::error::Error for ExecutionPreparationError {}
 
 /// Authoritative launch snapshot, the runtime-assembled worker request, and
-/// the resolved environment that minted the persisted safety proof — one
-/// atomically bound unit.
+/// the resolved environment that minted the persisted safety proof — bound to
+/// the same resolved environment (resolution followed by fenced revalidation).
 #[derive(Debug)]
 pub struct PreparedExecutionLaunch {
     snapshot: ExecutionLaunchSnapshot,
@@ -72,12 +75,12 @@ impl PreparedExecutionLaunch {
     /// The environment that minted this launch's persisted `attempt_isolation`
     /// proof.
     ///
-    /// This is atomically the same environment the safety fact was frozen
-    /// from: resolution happens inside `prepare_execution_launch`, immediately
-    /// before the fenced execution-creation transaction, so a stale
-    /// pre-resolved environment can never be replayed as launch authority.
-    /// The M5.2 dispatcher MUST select the adapter binding, options, and
-    /// timeouts from this instance and MUST NOT re-resolve.
+    /// This is the same resolved environment the safety fact was frozen from:
+    /// resolution is keyed by the durable `AuthoritativeExecutionBinding` and
+    /// is followed by the fenced execution-creation transaction, which
+    /// revalidates authority inside SQLite. The M5.2 dispatcher MUST select
+    /// the adapter binding, options, and timeouts from this instance and MUST
+    /// NOT re-resolve.
     pub fn resolved_environment(&self) -> &ResolvedExecutionEnvironment {
         &self.resolved_environment
     }
@@ -85,22 +88,32 @@ impl PreparedExecutionLaunch {
 
 /// Authoritatively prepare and record an execution launch from a Scheduler claim.
 ///
-/// Configuration resolution happens here, immediately before the fenced
-/// Kernel execution-creation transaction, so the persisted `attempt_isolation`
-/// fact and the returned `resolved_environment` are bound to the same
-/// authoritative registry state at the same instant. Callers pass the
-/// currently-authoritative registry (or the explicit standalone resolution
-/// mode); they cannot supply a pre-resolved environment, so an environment
-/// resolved under an older configuration can never authorize a later attempt.
-/// The Kernel still cross-validates the safety proof against the frozen
-/// Attempt target/profile, so a tampered claim cannot steer resolution.
+/// Authority precedence is structural, in three steps:
+///
+/// 1. `Kernel::resolve_execution_binding` validates the claim's authority in a
+///    short transaction (attempt/lease/epoch/expiry) and derives the
+///    `AuthoritativeExecutionBinding` from the frozen Attempt row — a stale
+///    Claim or a Claim whose target/profile copies disagree with the Attempt
+///    is rejected here, before any configuration resolution.
+/// 2. `resolve_execution_environment` performs pure in-memory configuration
+///    resolution keyed by the durable binding.
+/// 3. `Kernel::create_execution` revalidates the lease/epoch inside the
+///    execution-creation transaction (no TOCTOU correctness hole) and freezes
+///    the safety fact.
+///
+/// The configuration-resolution key therefore always comes from durable
+/// Attempt state, never from the Claim DTO, so a tampered claim cannot steer
+/// resolution or masquerade as a configuration failure.
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,
     mode: ExecutionResolutionMode<'_>,
 ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
+    let binding = kernel
+        .resolve_execution_binding(claim)
+        .map_err(ExecutionPreparationError::Kernel)?;
     let environment =
-        resolve_execution_environment(mode, &claim.execution_target, &claim.execution_profile)
+        resolve_execution_environment(mode, &binding.execution_target, &binding.execution_profile)
             .map_err(ExecutionPreparationError::Configuration)?;
     let snapshot = kernel
         .create_execution(claim, environment.safety())
@@ -635,11 +648,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(kernel.execution(&exec_a).unwrap().attempt_isolation);
     }
 
-    /// Review P2 (round 2): configuration-resolution failures are frozen at
-    /// the façade boundary to the standardized Task failure class
-    /// RESOURCE_UNAVAILABLE (spec 16 §A2: the supplied registry is
-    /// authoritative, no adapter default). Kernel authority errors are not
-    /// Task failure classes.
+    /// Review P2 (round 2) + case 4 of the round-3 precedence set:
+    /// configuration-resolution failures are frozen at the façade boundary to
+    /// the standardized Task failure class RESOURCE_UNAVAILABLE (spec 16 §A2:
+    /// the supplied registry is authoritative, no adapter default). The claim
+    /// here is untampered and authority-current, so this is the legitimate
+    /// configuration-failure path. Kernel authority errors are not Task
+    /// failure classes.
     #[test]
     fn preparation_errors_standardize_configuration_failures_as_resource_unavailable() {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
@@ -715,5 +730,95 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         )
         .unwrap();
         assert_eq!(prepared.snapshot().attempt_id(), &claim.attempt_id);
+    }
+
+    /// Review P1 (round 3): a Claim whose target copy disagrees with the
+    /// durable Attempt is an authority rejection, never a configuration
+    /// failure — even though the authoritative target itself is fully
+    /// available in the registry. If resolution were keyed by the Claim DTO,
+    /// this would surface as Configuration(TargetNotFound) →
+    /// RESOURCE_UNAVAILABLE and an M5.2 dispatcher would mechanically
+    /// retry/suspend a fully configured Task.
+    #[test]
+    fn tampered_claim_target_yields_authority_rejection_not_resource_unavailable() {
+        let (kernel, registry) = prompt_env();
+        kernel
+            .submit_batch(&[TaskSpec::new("tamper-target", Value::Null)])
+            .unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+        claim.execution_target = "missing-target".to_string();
+
+        let err = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&registry),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ExecutionPreparationError::Kernel(Error::InvalidAuthority(_))
+        ));
+        assert_eq!(err.standard_failure_class(), None);
+    }
+
+    /// Review P1 (round 3): same precedence for the profile copy.
+    #[test]
+    fn tampered_claim_profile_yields_authority_rejection_not_resource_unavailable() {
+        let (kernel, registry) = prompt_env();
+        kernel
+            .submit_batch(&[TaskSpec::new("tamper-profile", Value::Null)])
+            .unwrap();
+        let mut claim = kernel.claim_next_available().unwrap().unwrap();
+        claim.execution_profile = "missing-profile".to_string();
+
+        let err = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&registry),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ExecutionPreparationError::Kernel(Error::InvalidAuthority(_))
+        ));
+        assert_eq!(err.standard_failure_class(), None);
+    }
+
+    /// Review P1 (round 3): a stale/expired Claim fails authority validation
+    /// BEFORE configuration resolution — even when the (empty) registry would
+    /// also have failed, the error must be stale authority, not
+    /// RESOURCE_UNAVAILABLE.
+    #[test]
+    fn stale_claim_authority_precedes_configuration_failure() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        kernel
+            .submit_batch(&[TaskSpec::new("stale-claim", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+
+        clock.advance(25.0); // lease_seconds = 10 → authority expired
+        let empty = ExecutionRegistry::new();
+        let err = prepare_execution_launch(
+            &kernel,
+            &claim,
+            ExecutionResolutionMode::Authoritative(&empty),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ExecutionPreparationError::Kernel(Error::StaleAuthority(_))
+        ));
+        assert_eq!(err.standard_failure_class(), None);
     }
 }

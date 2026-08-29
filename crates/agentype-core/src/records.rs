@@ -160,6 +160,22 @@ pub struct Claim {
     pub workstream_id: Option<WorkstreamId>,
 }
 
+/// Durable-authority-derived execution binding: the authoritative key set for
+/// configuration resolution.
+///
+/// Produced by a Kernel authority-validation transaction from the Attempt's
+/// frozen fields — never from the Claim DTO's redundant copies. Configuration
+/// resolution for a physical launch MUST be keyed by this binding, so a
+/// tampered or stale Claim cannot steer resolution or masquerade as a
+/// configuration failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeExecutionBinding {
+    pub attempt_id: AttemptId,
+    pub lease_epoch: LeaseEpoch,
+    pub execution_target: String,
+    pub execution_profile: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskRecord {
     pub id: TaskId,
