@@ -738,6 +738,11 @@ pub fn ensure_incarnation(
     Ok(incarnation_id)
 }
 
+/// Birth a READY LogicalAgent in an active partition.
+///
+/// V0.1 oracle parity: a newborn bound to a workstream inherits the
+/// workstream's authoritative `project_state_ref` as its initial bounded
+/// continuity (`CURRENT CHECKPOINT`); the workstream row must exist.
 pub fn birth_agent(
     tx: &Transaction<'_>,
     partition_name: &str,
@@ -751,10 +756,28 @@ pub fn birth_agent(
         Some(t) => t.to_vec(),
         None => parse_str_list(&partition.tags_json)?,
     };
+    let continuity_json = match workstream_id {
+        Some(ws) => {
+            let project_state_ref: Option<String> = query_opt(
+                tx,
+                "SELECT project_state_ref FROM workstreams WHERE id=?1",
+                params![ws],
+                |r| r.get(0),
+            )?
+            .ok_or_else(|| Error::not_found(format!("workstreams {ws:?} not found")))?;
+            match project_state_ref {
+                Some(reference) if !reference.is_empty() => json_dump(&serde_json::json!({
+                    "CURRENT CHECKPOINT": {"project_state_ref": reference}
+                })),
+                _ => "{}".to_string(),
+            }
+        }
+        None => "{}".to_string(),
+    };
     tx.execute(
         "INSERT INTO logical_agents(id,partition_name,retention,state,workstream_id,tags_json,
          continuity_json,available_since,created_at,updated_at)
-         VALUES(?1,?2,?3,'READY',?4,?5,'{}',?6,?6,?6)",
+         VALUES(?1,?2,?3,'READY',?4,?5,?6,?7,?7,?7)",
         params![
             agent_id,
             partition_name,
@@ -763,6 +786,7 @@ pub fn birth_agent(
             json_dump(&Value::Array(
                 effective_tags.into_iter().map(Value::String).collect()
             )),
+            continuity_json,
             now
         ],
     )

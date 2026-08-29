@@ -3,7 +3,14 @@
 //! Core MUST NOT import vendor names. Adapters own process/session mapping.
 //! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
 
-use agentype_core::{ExecutionId, ExecutionState, FailureClass, RequestId, WorkspaceMode};
+#![deny(unsafe_code)]
+
+use agentype_core::{
+    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, FailureClass,
+    IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
+    WorkstreamId,
+};
+use agentype_execution_config::ExecutionLaunchSnapshot;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,10 +26,10 @@ pub enum AdapterError {
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DeadlineExceeded(m) => write!(f, "adapter deadline: {m}"),
-            Self::Protocol(m) => write!(f, "adapter protocol: {m}"),
-            Self::Unavailable(m) => write!(f, "adapter unavailable: {m}"),
-            Self::Other(m) => write!(f, "adapter: {m}"),
+            Self::DeadlineExceeded(m) => write!(f, "execution deadline exceeded: {m}"),
+            Self::Protocol(m) => write!(f, "adapter protocol violation: {m}"),
+            Self::Unavailable(m) => write!(f, "adapter runtime unavailable: {m}"),
+            Self::Other(m) => write!(f, "adapter error: {m}"),
         }
     }
 }
@@ -31,20 +38,265 @@ impl std::error::Error for AdapterError {}
 
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
-/// Opaque runtime handle. Core stores JSON; it MUST NOT interpret vendor keys.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Opaque JSON-serializable runtime handle stored by the scheduler across crash/reconciliation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeHandle(pub Value);
 
-#[derive(Clone, Debug)]
+/// Deterministic, provider-neutral worker protocol derived from an
+/// authoritative launch snapshot.
+///
+/// Given the same `ExecutionLaunchSnapshot`, the scheduler worker instruction
+/// is uniquely determined: the V0.1 task protocol (`LOCAL AGENT SCHEDULER
+/// TASK` / `TASK_ID` / `ATTEMPT_ID` / `LEASE_EPOCH` / `WORKSTREAM` /
+/// `OBJECTIVE` = payload / `ACCEPTANCE` / `COMMITTED CONTINUITY`, plus
+/// `WRITER RECOVERY RULES` for WRITE tasks and a closing `RETURN` section).
+/// There is no constructor accepting arbitrary text, so the instruction
+/// traveling to a worker can never be substituted away from the Task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedWorkerPrompt {
+    protocol: String,
+}
+
+impl RenderedWorkerPrompt {
+    /// The only construction path: derive the protocol from the launch snapshot.
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
+        Self {
+            protocol: render_worker_protocol(launch),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.protocol
+    }
+}
+
+fn render_worker_protocol(launch: &ExecutionLaunchSnapshot) -> String {
+    let mut sections = vec![
+        "LOCAL AGENT SCHEDULER TASK".to_string(),
+        format!("TASK_ID\n{}", launch.task_id().as_str()),
+        format!("ATTEMPT_ID\n{}", launch.attempt_id().as_str()),
+        format!("LEASE_EPOCH\n{}", launch.lease_epoch()),
+        format!(
+            "WORKSTREAM\n{}",
+            match launch.workstream_id() {
+                Some(w) => w.as_str().to_string(),
+                None => "none".to_string(),
+            }
+        ),
+        format!("OBJECTIVE\n{}", python_canonical_json(launch.payload())),
+        format!("ACCEPTANCE\n{}", python_canonical_json(launch.acceptance())),
+        format!(
+            "COMMITTED CONTINUITY\n{}",
+            python_canonical_json(launch.continuity().capsule())
+        ),
+    ];
+    if matches!(launch.workspace_mode(), WorkspaceMode::Write) {
+        sections.push(
+            "WRITER RECOVERY RULES\n\
+             The current workspace is authoritative. Inspect assignment-scoped state and diff \
+             before writing; continue idempotently; do not revert unrelated work."
+                .to_string(),
+        );
+    }
+    sections.push(
+        "RETURN\nReturn the authoritative result only when acceptance is satisfied. \
+         Do not claim Scheduler ACK; the Scheduler validates the current lease separately."
+            .to_string(),
+    );
+    sections.join("\n\n")
+}
+
+/// Canonical JSON rendering matching the V0.1 oracle's
+/// `json.dumps(value, ensure_ascii=False, sort_keys=True)` (sorted object
+/// keys, `", "` / `": "` separators, non-ASCII kept literal).
+fn python_canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => python_json_string(s),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(python_canonical_json).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    format!(
+                        "{}: {}",
+                        python_json_string(k),
+                        python_canonical_json(&map[k])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+fn python_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Complete structured execution request passed to an ExecutionAdapter.
+///
+/// Encapsulates all execution metadata as private fields with readonly getters.
+/// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
+///
+/// `prompt` is deterministically derived from the snapshot (see
+/// `RenderedWorkerPrompt`); it is not a parameter and cannot be injected.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
-    pub request_id: RequestId,
-    pub execution_id: ExecutionId,
-    pub execution_target: String,
-    pub execution_profile: String,
-    pub workspace_mode: WorkspaceMode,
-    pub prompt: String,
-    pub payload: Value,
-    pub incarnation_runtime_handle: RuntimeHandle,
+    request_id: RequestId,
+    execution_id: ExecutionId,
+    task_id: TaskId,
+    batch_id: BatchId,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    lease_id: LeaseId,
+    lease_epoch: LeaseEpoch,
+    logical_agent_id: LogicalAgentId,
+    incarnation_id: IncarnationId,
+    execution_target: String,
+    execution_profile: String,
+    workspace_mode: WorkspaceMode,
+    prompt: String,
+    payload: Value,
+    acceptance: Value,
+    workstream_id: Option<WorkstreamId>,
+    continuity: CommittedContinuitySnapshot,
+    incarnation_runtime_handle: RuntimeHandle,
+}
+
+impl ExecutionRequest {
+    /// Assemble the worker request from an authoritative launch snapshot.
+    ///
+    /// The worker prompt is not a parameter: it is deterministically derived
+    /// from the snapshot as the provider-neutral V0.1 worker protocol (see
+    /// `RenderedWorkerPrompt`). Every caller receives the same instruction
+    /// for the same durable launch facts; there is no path to inject
+    /// arbitrary text between the scheduler and the worker.
+    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
+        Self {
+            request_id: launch.request_id().clone(),
+            execution_id: launch.execution_id().clone(),
+            task_id: launch.task_id().clone(),
+            batch_id: launch.batch_id().clone(),
+            attempt_id: launch.attempt_id().clone(),
+            attempt_number: launch.attempt_number(),
+            lease_id: launch.lease_id().clone(),
+            lease_epoch: launch.lease_epoch(),
+            logical_agent_id: launch.logical_agent_id().clone(),
+            incarnation_id: launch.incarnation_id().clone(),
+            execution_target: launch.execution_target().to_string(),
+            execution_profile: launch.execution_profile().to_string(),
+            workspace_mode: launch.workspace_mode(),
+            prompt: RenderedWorkerPrompt::from_launch(launch).protocol,
+            payload: launch.payload().clone(),
+            acceptance: launch.acceptance().clone(),
+            workstream_id: launch.workstream_id().cloned(),
+            continuity: launch.continuity().clone(),
+            incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
+        }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn batch_id(&self) -> &BatchId {
+        &self.batch_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+
+    pub fn lease_id(&self) -> &LeaseId {
+        &self.lease_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    pub fn logical_agent_id(&self) -> &LogicalAgentId {
+        &self.logical_agent_id
+    }
+
+    pub fn incarnation_id(&self) -> &IncarnationId {
+        &self.incarnation_id
+    }
+
+    pub fn execution_target(&self) -> &str {
+        &self.execution_target
+    }
+
+    pub fn execution_profile(&self) -> &str {
+        &self.execution_profile
+    }
+
+    pub fn workspace_mode(&self) -> WorkspaceMode {
+        self.workspace_mode
+    }
+
+    /// Deterministically derived worker protocol (V0.1 task protocol), never
+    /// the Task name and never caller-supplied text.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn acceptance(&self) -> &Value {
+        &self.acceptance
+    }
+
+    pub fn workstream_id(&self) -> Option<&WorkstreamId> {
+        self.workstream_id.as_ref()
+    }
+
+    pub fn continuity(&self) -> &CommittedContinuitySnapshot {
+        &self.continuity
+    }
+
+    pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
+        &self.incarnation_runtime_handle
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,15 +385,15 @@ impl ExecutionAdapter for FakeAdapter {
         if g.unavailable {
             return Err(AdapterError::Unavailable(format!(
                 "target {} unavailable",
-                request.execution_target
+                request.execution_target()
             )));
         }
         let handle = RuntimeHandle(serde_json::json!({
             "fake": true,
-            "request_id": request.request_id.as_str(),
+            "request_id": request.request_id().as_str(),
         }));
         g.by_request
-            .insert(request.request_id.as_str().to_string(), handle.clone());
+            .insert(request.request_id().as_str().to_string(), handle.clone());
         Ok(g.next_start.take().unwrap_or(StartObservation {
             state: ExecutionState::Running,
             runtime_handle: handle,
@@ -225,27 +477,59 @@ impl ExecutionAdapter for FakeAdapter {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use agentype_execution_config::FrozenExecutionSafety;
+
+    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
+        unsafe {
+            ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                ExecutionId::new(),
+                RequestId::new(),
+                TaskId::new(),
+                BatchId::new(),
+                AttemptId::new(),
+                1,
+                LeaseId::new(),
+                LeaseEpoch(1),
+                100.0,
+                LogicalAgentId::new(),
+                IncarnationId::new(),
+                Value::Null,
+                "local".to_string(),
+                "default".to_string(),
+                WorkspaceMode::ReadOnly,
+                "hi".to_string(),
+                Value::Null,
+                Value::Null,
+                None,
+                CommittedContinuitySnapshot::stateless(),
+                unisolated_local_safety(),
+            )
+        }
+    }
+
+    /// Attempt-bound unisolated proof for the mock snapshot's synthetic attempt.
+    fn unisolated_local_safety() -> FrozenExecutionSafety {
+        FrozenExecutionSafety::unisolated(agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: agentype_core::AttemptId::new(),
+            lease_epoch: agentype_core::LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        })
+    }
 
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest {
-            request_id: RequestId::new(),
-            execution_id: ExecutionId::new(),
-            execution_target: "local".into(),
-            execution_profile: "default".into(),
-            workspace_mode: WorkspaceMode::ReadOnly,
-            prompt: "hi".into(),
-            payload: Value::Null,
-            incarnation_runtime_handle: RuntimeHandle::default(),
-        };
+        let launch = mock_launch_snapshot();
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
         let rec = fake
-            .reconcile_start(&req.request_id, Some(&start.runtime_handle))
+            .reconcile_start(req.request_id(), Some(&start.runtime_handle))
             .unwrap();
         assert!(rec.ambiguous);
         assert!(!rec.quiescent_confirmed);
@@ -254,23 +538,15 @@ mod tests {
     #[test]
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
-        let req = ExecutionRequest {
-            request_id: RequestId::new(),
-            execution_id: ExecutionId::new(),
-            execution_target: "local".into(),
-            execution_profile: "default".into(),
-            workspace_mode: WorkspaceMode::ReadOnly,
-            prompt: "hi".into(),
-            payload: Value::Null,
-            incarnation_runtime_handle: RuntimeHandle::default(),
-        };
+        let launch = mock_launch_snapshot();
+        let req = ExecutionRequest::from_launch(&launch);
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
         // identity was persisted. Reconciliation must locate the runtime by
         // request identity alone (spec 07: reconcile_start is UNCHANGED from
         // V0.1 and takes request_id + optional persisted handle).
-        let rec = fake.reconcile_start(&req.request_id, None).unwrap();
+        let rec = fake.reconcile_start(req.request_id(), None).unwrap();
         assert_eq!(rec.runtime_handle, start.runtime_handle);
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
@@ -284,5 +560,98 @@ mod tests {
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
         assert!(!rec.quiescent_confirmed);
+    }
+
+    #[test]
+    fn execution_request_constructed_from_launch_snapshot() {
+        let ws = WorkstreamId::new();
+        let inc_id = agentype_core::IncarnationId::new();
+        let launch = unsafe {
+            ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                ExecutionId::new(),
+                RequestId::new(),
+                agentype_core::TaskId::new(),
+                agentype_core::BatchId::new(),
+                agentype_core::AttemptId::new(),
+                1,
+                agentype_core::LeaseId::new(),
+                agentype_core::LeaseEpoch(1),
+                100.0,
+                agentype_core::LogicalAgentId::new(),
+                inc_id.clone(),
+                serde_json::json!({"proc": 42}),
+                "local".to_string(),
+                "default".to_string(),
+                WorkspaceMode::ReadOnly,
+                "my-task".to_string(),
+                serde_json::json!({"key": "val"}),
+                serde_json::json!({"criterion": "pass"}),
+                Some(ws.clone()),
+                CommittedContinuitySnapshot::new(
+                    agentype_core::ContinuityPreference::Required,
+                    3,
+                    serde_json::json!({"state": "saved"}),
+                ),
+                unisolated_local_safety(),
+            )
+        };
+        let req = ExecutionRequest::from_launch(&launch);
+        assert_eq!(req.request_id(), launch.request_id());
+        assert_eq!(req.execution_id(), launch.execution_id());
+        assert_eq!(req.task_id(), launch.task_id());
+        assert_eq!(req.batch_id(), launch.batch_id());
+        assert_eq!(req.attempt_id(), launch.attempt_id());
+        assert_eq!(req.attempt_number(), 1);
+        assert_eq!(req.lease_id(), launch.lease_id());
+        assert_eq!(req.lease_epoch(), LeaseEpoch(1));
+        assert_eq!(req.logical_agent_id(), launch.logical_agent_id());
+        assert_eq!(req.incarnation_id(), &inc_id);
+        assert_eq!(req.execution_target(), "local");
+        assert_eq!(req.execution_profile(), "default");
+        assert_eq!(req.workspace_mode(), WorkspaceMode::ReadOnly);
+        // The snapshot carries the durable Task label; the request prompt is
+        // deterministically derived from the protocol — never the label.
+        assert_eq!(launch.task_name(), "my-task");
+        assert_eq!(
+            req.prompt(),
+            RenderedWorkerPrompt::from_launch(&launch).as_str()
+        );
+        assert!(req.prompt().contains("OBJECTIVE\n{\"key\": \"val\"}"));
+        assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
+        assert_eq!(req.acceptance(), &serde_json::json!({"criterion": "pass"}));
+        assert_eq!(req.workstream_id(), Some(&ws));
+        assert_eq!(req.continuity().version(), 3);
+        assert_eq!(
+            req.continuity().capsule(),
+            &serde_json::json!({"state": "saved"})
+        );
+        assert_eq!(
+            req.continuity().preference(),
+            agentype_core::ContinuityPreference::Required
+        );
+        assert_eq!(
+            req.incarnation_runtime_handle(),
+            &RuntimeHandle(serde_json::json!({"proc": 42}))
+        );
+    }
+
+    /// Review P1: the worker instruction is a pure function of the launch
+    /// snapshot. There is no API path to inject arbitrary text, so the same
+    /// durable facts always produce the same protocol.
+    #[test]
+    fn worker_prompt_is_deterministic_and_cannot_be_injected() {
+        let launch = mock_launch_snapshot();
+        let first = ExecutionRequest::from_launch(&launch);
+        let second = ExecutionRequest::from_launch(&launch);
+        assert_eq!(first, second);
+        assert_eq!(
+            first.prompt(),
+            RenderedWorkerPrompt::from_launch(&launch).as_str()
+        );
+        assert!(first
+            .prompt()
+            .starts_with("LOCAL AGENT SCHEDULER TASK\n\nTASK_ID\n"));
+        // The mock snapshot is read-only: no writer instructions may appear.
+        assert!(!first.prompt().contains("WRITER RECOVERY RULES"));
     }
 }

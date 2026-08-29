@@ -6,6 +6,10 @@
 #![allow(dead_code)]
 
 use agentype_core::*;
+use agentype_execution_config::{
+    resolve_execution_environment, ExecutionProfileConfig, ExecutionRegistry,
+    ExecutionResolutionMode, ExecutionTargetConfig, FrozenExecutionSafety,
+};
 use agentype_storage_sqlite::Kernel;
 use rusqlite::Connection;
 use serde_json::json;
@@ -111,6 +115,22 @@ pub fn retryable_read(name: &str) -> TaskSpec {
     })
 }
 
+/// Durable-authority binding derived from a claim's validated identity,
+/// used to key configuration resolution and mint test safety proofs.
+pub fn binding_for(claim: &Claim) -> AuthoritativeExecutionBinding {
+    AuthoritativeExecutionBinding {
+        attempt_id: claim.attempt_id.clone(),
+        lease_epoch: claim.lease_epoch,
+        execution_target: claim.execution_target.clone(),
+        execution_profile: claim.execution_profile.clone(),
+    }
+}
+
+/// Attempt-bound unisolated proof for the claim's attempt (test harness).
+pub fn unisolated_safety(claim: &Claim) -> FrozenExecutionSafety {
+    FrozenExecutionSafety::unisolated(binding_for(claim))
+}
+
 pub fn run_claim(
     k: &Kernel,
     spec: TaskSpec,
@@ -118,15 +138,42 @@ pub fn run_claim(
 ) -> (BatchId, TaskId, Claim, ExecutionId) {
     let (batch, ids) = k.submit_batch(std::slice::from_ref(&spec)).unwrap();
     let claim = k.claim_next_available().unwrap().expect("claim");
-    let (execution_id, _) = k.create_execution(&claim, isolation).unwrap();
+    let safety = if isolation {
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new(
+                &claim.execution_target,
+                "test",
+                true,
+            ))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new(&claim.execution_profile))
+            .unwrap();
+        let env = resolve_execution_environment(
+            ExecutionResolutionMode::Authoritative(&registry),
+            &binding_for(&claim),
+        )
+        .unwrap();
+        env.safety()
+    } else {
+        unisolated_safety(&claim)
+    };
+    let launch = k.create_execution(&claim, safety).unwrap();
+    let execution_id = launch.execution_id().clone();
     k.confirm_running_and_renew(
         &claim.attempt_id,
         claim.lease_epoch,
         &execution_id,
-        &json!({"live": true}),
+        &json!({}),
     )
     .unwrap();
-    (batch, ids[&spec.name].clone(), claim, execution_id)
+    (
+        batch,
+        ids.values().next().unwrap().clone(),
+        claim,
+        execution_id,
+    )
 }
 
 // ---------------------------------------------------------------- fixtures

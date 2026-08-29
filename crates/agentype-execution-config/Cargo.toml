@@ -1,11 +1,10 @@
 [package]
-name = "agentype-adapter-api"
+name = "agentype-execution-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Generic ExecutionAdapter traits and opaque handles"
+description = "Pure execution configuration registry, resolution authority, and unforgeable launch proofs"
 
 [dependencies]
 agentype-core.workspace = true
-agentype-execution-config.workspace = true
 serde_json.workspace = true

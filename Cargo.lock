@@ -7,6 +7,7 @@ name = "agentype-adapter-api"
 version = "0.2.0"
 dependencies = [
  "agentype-core",
+ "agentype-execution-config",
  "serde_json",
 ]
 
@@ -20,11 +21,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentype-runtime"
+name = "agentype-execution-config"
 version = "0.2.0"
 dependencies = [
  "agentype-core",
+ "serde_json",
+]
+
+[[package]]
+name = "agentype-runtime"
+version = "0.2.0"
+dependencies = [
+ "agentype-adapter-api",
+ "agentype-core",
+ "agentype-execution-config",
  "agentype-storage-sqlite",
+ "serde_json",
 ]
 
 [[package]]
@@ -33,6 +45,7 @@ version = "0.2.0"
 dependencies = [
  "agentype-adapter-api",
  "agentype-core",
+ "agentype-execution-config",
  "rusqlite",
  "serde_json",
  "thiserror",

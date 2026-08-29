@@ -3,6 +3,7 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_core::*;
+use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenExecutionSafety};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -195,6 +196,23 @@ impl Kernel {
                     Ok(revision)
                 }
             }
+        })
+    }
+
+    pub fn create_workstream(
+        &self,
+        name: &str,
+        project_state_ref: Option<&str>,
+        workstream_id: Option<WorkstreamId>,
+    ) -> Result<WorkstreamId, Error> {
+        let id = workstream_id.unwrap_or_default();
+        self.tx(|tx, now| {
+            tx.execute(
+                "INSERT INTO workstreams(id,name,project_state_ref,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+                params![id.as_str(), name, project_state_ref, now],
+            )
+            .map_err(map_sqlite)?;
+            Ok(id)
         })
     }
 
@@ -840,13 +858,22 @@ impl Kernel {
         })
     }
 
-    pub fn create_execution(
+    /// Validate claim authority in a short transaction and derive the durable
+    /// execution binding used as the configuration-resolution key.
+    ///
+    /// Authority precedence: the resolution key (execution_target /
+    /// execution_profile) comes from the frozen Attempt row, never from the
+    /// Claim DTO's redundant copies. A stale or expired Claim fails authority
+    /// validation (StaleAuthority) and a Claim whose copies disagree with the
+    /// durable Attempt is rejected (InvalidAuthority) — both BEFORE any
+    /// configuration resolution, so a forged claim cannot turn a fully
+    /// configured Task into a RESOURCE_UNAVAILABLE preparation failure.
+    pub fn resolve_execution_binding(
         &self,
         claim: &Claim,
-        attempt_isolation: bool,
-    ) -> Result<(ExecutionId, RequestId), Error> {
+    ) -> Result<AuthoritativeExecutionBinding, Error> {
         self.tx(|tx, now| {
-            let (attempt, _, _task) =
+            let (attempt, _lease, _task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
             if claim.task_id.as_str() != attempt.task_id {
                 return Err(Error::invalid_authority(
@@ -868,14 +895,100 @@ impl Kernel {
                     "claim execution_profile does not match authoritative attempt",
                 ));
             }
-            let incarnation_id = match attempt.incarnation_id {
-                Some(id) => id,
-                None => ensure_incarnation(
-                    tx,
-                    &attempt.logical_agent_id,
-                    &attempt.execution_target,
-                    now,
-                )?,
+            Ok(AuthoritativeExecutionBinding {
+                attempt_id: claim.attempt_id.clone(),
+                lease_epoch: claim.lease_epoch,
+                execution_target: attempt.execution_target.clone(),
+                execution_profile: attempt.execution_profile.clone(),
+            })
+        })
+    }
+
+    pub fn create_execution(
+        &self,
+        claim: &Claim,
+        safety: FrozenExecutionSafety,
+    ) -> Result<ExecutionLaunchSnapshot, Error> {
+        self.tx(|tx, now| {
+            let (attempt, lease, task) =
+                validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
+            if claim.task_id.as_str() != attempt.task_id {
+                return Err(Error::invalid_authority(
+                    "claim task_id does not match authoritative attempt",
+                ));
+            }
+            if claim.logical_agent_id.as_str() != attempt.logical_agent_id {
+                return Err(Error::invalid_authority(
+                    "claim logical_agent_id does not match authoritative attempt",
+                ));
+            }
+            if claim.execution_target != attempt.execution_target {
+                return Err(Error::invalid_authority(
+                    "claim execution_target does not match authoritative attempt",
+                ));
+            }
+            if claim.execution_profile != attempt.execution_profile {
+                return Err(Error::invalid_authority(
+                    "claim execution_profile does not match authoritative attempt",
+                ));
+            }
+            // Attempt-bound proof: a safety fact minted for a different
+            // attempt (or a different lease epoch) is rejected even when the
+            // target and profile names coincide, closing cross-attempt
+            // replay of a stale isolated proof.
+            if safety.attempt_id().as_str() != attempt.id {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof is bound to attempt {} but the authoritative attempt is {}",
+                    safety.attempt_id().as_str(),
+                    attempt.id
+                )));
+            }
+            if safety.lease_epoch() != claim.lease_epoch {
+                return Err(Error::invalid_authority(
+                    "safety proof is bound to a different lease epoch",
+                ));
+            }
+            if safety.execution_target() != attempt.execution_target {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof target '{}' does not match authoritative attempt target '{}'",
+                    safety.execution_target(),
+                    attempt.execution_target
+                )));
+            }
+            if safety.execution_profile() != attempt.execution_profile {
+                return Err(Error::invalid_authority(format!(
+                    "safety proof profile '{}' does not match authoritative attempt profile '{}'",
+                    safety.execution_profile(),
+                    attempt.execution_profile
+                )));
+            }
+            let (incarnation_id, incarnation_handle_json) = match attempt.incarnation_id {
+                Some(id) => {
+                    let handle: String = tx
+                        .query_row(
+                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_sqlite)?;
+                    (id, handle)
+                }
+                None => {
+                    let id = ensure_incarnation(
+                        tx,
+                        &attempt.logical_agent_id,
+                        &attempt.execution_target,
+                        now,
+                    )?;
+                    let handle: String = tx
+                        .query_row(
+                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_sqlite)?;
+                    (id, handle)
+                }
             };
             let busy: Option<i64> = tx
                 .query_row(
@@ -898,6 +1011,7 @@ impl Kernel {
             .map_err(map_sqlite)?;
             let execution_id = ExecutionId::new();
             let request_id = RequestId::new();
+            let attempt_isolation = safety.attempt_isolation();
             tx.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,
                  execution_profile,attempt_isolation,state,started_at,updated_at)
@@ -915,7 +1029,48 @@ impl Kernel {
                 ],
             )
             .map_err(map_sqlite)?;
-            Ok((execution_id, request_id))
+
+            let payload = json_load(&task.payload_json)?;
+            let acceptance = json_load(&task.acceptance_json)?;
+            let workspace_mode = WorkspaceMode::parse_sql(&task.workspace_mode)?;
+
+            let agent = required_agent(tx, &attempt.logical_agent_id)?;
+            let continuity_capsule = json_load(&agent.continuity_json)?;
+            let continuity_pref = ContinuityPreference::parse_sql(&task.continuity)?;
+            let continuity = CommittedContinuitySnapshot::new(
+                continuity_pref,
+                agent.continuity_version,
+                continuity_capsule,
+            );
+            let incarnation_runtime_handle = json_load(&incarnation_handle_json)?;
+
+            // SAFETY: Atomically validated and reconstructed from durable storage within the
+            // Kernel execution creation transaction.
+            Ok(unsafe {
+                ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                    execution_id,
+                    request_id,
+                    TaskId::from_string(&attempt.task_id),
+                    BatchId::from_string(&task.batch_id),
+                    AttemptId::from_string(&attempt.id),
+                    attempt.attempt_number as u32,
+                    LeaseId::from_string(&lease.id),
+                    LeaseEpoch(lease.epoch),
+                    lease.expires_at,
+                    LogicalAgentId::from_string(&attempt.logical_agent_id),
+                    IncarnationId::from_string(&incarnation_id),
+                    incarnation_runtime_handle,
+                    attempt.execution_target,
+                    attempt.execution_profile,
+                    workspace_mode,
+                    task.name,
+                    payload,
+                    acceptance,
+                    task.workstream_id.map(WorkstreamId::from_string),
+                    continuity,
+                    safety,
+                )
+            })
         })
     }
 

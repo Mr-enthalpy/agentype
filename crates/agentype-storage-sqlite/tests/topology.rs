@@ -152,10 +152,15 @@ fn claim_on_source_then_merge_before_execution_preserves_frozen_target() {
     assert_eq!(lease.epoch, claim.lease_epoch);
 
     // create_execution MUST succeed even though task.partition is now "general"
-    let (exec_id, _) = k.create_execution(&claim, false).unwrap();
+    let launch = k
+        .create_execution(&claim, unisolated_safety(&claim))
+        .unwrap();
+    let exec_id = launch.execution_id().clone();
     let exec = k.execution(&exec_id).unwrap();
     assert_eq!(exec.execution_target, "local-b");
     assert_eq!(exec.execution_profile, "profile-b");
+    assert_eq!(launch.execution_target(), "local-b");
+    assert_eq!(launch.execution_profile(), "profile-b");
 
     k.confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
         .unwrap();
@@ -180,11 +185,15 @@ fn tampered_claim_target_or_profile_rejected() {
 
     let mut tampered_target = claim.clone();
     tampered_target.execution_target = "forged-target".to_string();
-    assert!(k.create_execution(&tampered_target, false).is_err());
+    assert!(k
+        .create_execution(&tampered_target, unisolated_safety(&tampered_target))
+        .is_err());
 
     let mut tampered_profile = claim.clone();
     tampered_profile.execution_profile = "forged-profile".to_string();
-    assert!(k.create_execution(&tampered_profile, false).is_err());
+    assert!(k
+        .create_execution(&tampered_profile, unisolated_safety(&tampered_profile))
+        .is_err());
 }
 
 #[test]
@@ -214,10 +223,15 @@ fn retry_after_merged_attempt_uses_new_partition_target() {
     k.merge_partitions("src", "general").unwrap();
 
     // Attempt 1 execution succeeds under frozen local-b/profile-b
-    let (exec_id1, _) = k.create_execution(&claim1, false).unwrap();
+    let launch1 = k
+        .create_execution(&claim1, unisolated_safety(&claim1))
+        .unwrap();
+    let exec_id1 = launch1.execution_id().clone();
     let exec1 = k.execution(&exec_id1).unwrap();
     assert_eq!(exec1.execution_target, "local-b");
     assert_eq!(exec1.execution_profile, "profile-b");
+    assert_eq!(launch1.execution_target(), "local-b");
+    assert_eq!(launch1.execution_profile(), "profile-b");
 
     // Attempt 1 fails with retryable TIMEOUT failure
     k.confirm_running_and_renew(
@@ -252,10 +266,15 @@ fn retry_after_merged_attempt_uses_new_partition_target() {
     assert_eq!(claim2.execution_target, "local");
     assert_eq!(claim2.execution_profile, "default");
 
-    let (exec_id2, _) = k.create_execution(&claim2, false).unwrap();
+    let launch2 = k
+        .create_execution(&claim2, unisolated_safety(&claim2))
+        .unwrap();
+    let exec_id2 = launch2.execution_id().clone();
     let exec2 = k.execution(&exec_id2).unwrap();
     assert_eq!(exec2.execution_target, "local");
     assert_eq!(exec2.execution_profile, "default");
+    assert_eq!(launch2.execution_target(), "local");
+    assert_eq!(launch2.execution_profile(), "default");
 }
 
 #[test]

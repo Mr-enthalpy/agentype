@@ -32,5 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Cargo test workspace
         run: cargo test --workspace
