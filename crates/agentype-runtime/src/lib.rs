@@ -747,6 +747,29 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
             });
         }
+        // Internally contradictory: LOST is never a confirmed end (core
+        // fences incarnation presence to LOST even under terminal/quiescence
+        // claims, and unresolved states carry no proof bits). A collected
+        // LOST is always unresolved physical reality — it must never take the
+        // terminal-NACK quiescence-safe path (which would unlock a WRITE
+        // replacement writer) nor be laundered into FAILED, which would
+        // foreclose the later LOST refinement.
+        if outcome.state == ExecutionState::Lost
+            && (outcome.terminal_confirmed || outcome.quiescent_confirmed)
+        {
+            let failure_class = FailureClass::AdapterProtocolFailure;
+            self.persist_unresolved_physical_then_nack(
+                claim,
+                execution_id,
+                failure_class,
+                Some(observed_handle),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
         // Internally contradictory: success claimed without terminal proof.
         if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
             let failure_class = FailureClass::InvalidResult;
@@ -3137,5 +3160,67 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // exactly what M5.4 physical cleanup will need.
         let task_id = exec.task_id.clone();
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+    }
+
+    /// Audit P1 (round 6): a collected LOST with terminal/quiescence claims
+    /// is never laundered into a quiescence-safe terminal NACK. LOST is
+    /// never a confirmed end (core fences incarnation presence to LOST and
+    /// refuses proof bits for unresolved states), so the outcome is treated
+    /// as unresolved: UNKNOWN, zero inherited proof, handle preserved — and
+    /// the WRITE task (EXECUTION_LOST allowed by policy) suspends with
+    /// WRITER_QUIESCENCE_UNKNOWN instead of unlocking a replacement writer.
+    #[test]
+    fn dispatch_lost_outcome_never_unlocks_writer_replacement() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("lost-laundering", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"lost": 1})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::ExecutionLost),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Lost,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::ExecutionLost),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"lost": 1})
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+        // EXECUTION_LOST is in the retry policy, but the writer is NOT
+        // quiescence-proven: suspension, never a replacement writer.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        let esc = kernel.open_escalation_for_task(&task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(fake.start_call_count(), 1);
     }
 }

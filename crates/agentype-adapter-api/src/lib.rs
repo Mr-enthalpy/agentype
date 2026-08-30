@@ -226,8 +226,10 @@ impl ExecutionRequest {
     ///
     /// Fail-closed pairing: the snapshot and the environment must describe
     /// the same attempt identity (attempt_id, lease_epoch, execution_target,
-    /// execution_profile); mixing launch semantics from one attempt with
-    /// runtime configuration from another is rejected.
+    /// execution_profile) and the same attempt_isolation fact; mixing launch
+    /// semantics from one attempt with runtime configuration from another —
+    /// including a same-named target re-registered with different isolation
+    /// in a different registry — is rejected.
     pub fn from_launch(
         launch: &ExecutionLaunchSnapshot,
         environment: &ResolvedExecutionEnvironment,
@@ -245,6 +247,9 @@ impl ExecutionRequest {
         }
         if launch.execution_profile() != safety.execution_profile() {
             mismatched.push("execution_profile");
+        }
+        if launch.safety().attempt_isolation() != safety.attempt_isolation() {
+            mismatched.push("attempt_isolation");
         }
         if !mismatched.is_empty() {
             return Err(LaunchEnvironmentMismatch {
@@ -880,5 +885,28 @@ mod tests {
         .unwrap();
         let err = ExecutionRequest::from_launch(&mock.snapshot, &wrong_target_env).unwrap_err();
         assert!(err.detail.contains("execution_target"), "got: {err:?}");
+
+        // The same attempt identity and target/profile names, but a
+        // differently-isolated environment (audit P1: same-named targets can
+        // be re-registered with different isolation in another registry).
+        let mut isolated_registry = agentype_execution_config::ExecutionRegistry::new();
+        isolated_registry
+            .register_target(agentype_execution_config::ExecutionTargetConfig::new(
+                "local", "process", true,
+            ))
+            .unwrap();
+        isolated_registry
+            .register_profile(agentype_execution_config::ExecutionProfileConfig::new(
+                "default",
+            ))
+            .unwrap();
+        let isolated_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::Authoritative(&isolated_registry),
+            &mock.binding,
+        )
+        .unwrap();
+        assert!(isolated_env.attempt_isolation());
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &isolated_env).unwrap_err();
+        assert!(err.detail.contains("attempt_isolation"), "got: {err:?}");
     }
 }
