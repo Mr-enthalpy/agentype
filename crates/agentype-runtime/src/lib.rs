@@ -511,8 +511,9 @@ impl<'a> Dispatcher<'a> {
                 // Invocation error ≠ absence of execution: the start may
                 // have had side effects. Nonterminal NACK (never quiescent)
                 // keeps writer ambiguity intact for WRITE tasks (task §28).
+                // No observation exists, so no handle can be preserved.
                 let failure_class = adapter_invocation_failure_class(&err);
-                self.nack_start(claim, &execution_id, failure_class, false, false)?;
+                self.nack_start(claim, &execution_id, failure_class, false, false, None)?;
                 return Ok(DispatchOneOutcome::StartFailed {
                     execution_id,
                     request_id,
@@ -608,6 +609,7 @@ impl<'a> Dispatcher<'a> {
                 FailureClass::ExecutionLost,
                 false,
                 false,
+                Some(&observation.runtime_handle.0),
             )?;
             return Ok(DispatchOneOutcome::StartAmbiguous {
                 execution_id: execution_id.clone(),
@@ -615,33 +617,22 @@ impl<'a> Dispatcher<'a> {
             });
         }
 
-        // Synchronous terminal success: retrieve the outcome through the
-        // adapter contract, then run the authoritative ACK path.
+        // Synchronous terminal success claimed by the start observation: the
+        // collected outcome is authoritative for ACK/NACK proof (spec 07) and
+        // must be re-classified before any authoritative mutation — a start
+        // that looked successful may collect a failure, an unresolved state,
+        // or an internally contradictory result.
         if observation.terminal_confirmed && observation.state == ExecutionState::Succeeded {
             let outcome = adapter
                 .collect_outcome(&observation.runtime_handle)
                 .map_err(DispatchError::AdapterInvocation)?;
-            let payload = outcome.payload.clone().unwrap_or(Value::Null);
-            let result_id = self
-                .kernel
-                .ack_success(
-                    &claim.attempt_id,
-                    claim.lease_epoch,
-                    Some(execution_id),
-                    &payload,
-                    outcome.summary.as_deref(),
-                    outcome.quiescent_confirmed,
-                    outcome.incarnation_reusable,
-                )
-                .map_err(|err| match err {
-                    Error::StorageFailure(_) => DispatchError::Persistence(err),
-                    authority => DispatchError::Authority(authority),
-                })?;
-            return Ok(DispatchOneOutcome::CompletedSynchronously {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                result_id,
-            });
+            return self.commit_collected_outcome(
+                claim,
+                execution_id,
+                request_id,
+                &observation.runtime_handle.0,
+                outcome,
+            );
         }
 
         // Terminal failure before RUNNING: the existing NACK rules apply
@@ -656,6 +647,7 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 true,
                 observation.quiescent_confirmed,
+                Some(&observation.runtime_handle.0),
             )?;
             return Ok(DispatchOneOutcome::StartFailed {
                 execution_id: execution_id.clone(),
@@ -671,6 +663,114 @@ impl<'a> Dispatcher<'a> {
             FailureClass::ExecutionLost,
             false,
             false,
+            Some(&observation.runtime_handle.0),
+        )?;
+        Ok(DispatchOneOutcome::StartAmbiguous {
+            execution_id: execution_id.clone(),
+            request_id: request_id.clone(),
+        })
+    }
+
+    /// Authoritative classification of the collected outcome (spec 07:
+    /// `collect_outcome` is authoritative for ACK/NACK proof). Only
+    /// `SUCCEEDED` with terminal proof can ACK; nonterminal collections
+    /// inherit zero terminal/quiescence proof; internally contradictory
+    /// results are never ACKed as success.
+    fn commit_collected_outcome(
+        &self,
+        claim: &Claim,
+        execution_id: &ExecutionId,
+        request_id: &RequestId,
+        observed_handle: &Value,
+        outcome: agentype_adapter_api::ExecutionOutcome,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        // Internally contradictory: success claimed without terminal proof.
+        if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
+            let failure_class = FailureClass::InvalidResult;
+            self.nack_start(
+                claim,
+                execution_id,
+                failure_class,
+                false,
+                false,
+                Some(observed_handle),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
+        // Internally contradictory: quiescence claimed without terminality.
+        if outcome.quiescent_confirmed && !outcome.terminal_confirmed {
+            let failure_class = FailureClass::AdapterProtocolFailure;
+            self.nack_start(
+                claim,
+                execution_id,
+                failure_class,
+                false,
+                false,
+                Some(observed_handle),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
+
+        if outcome.terminal_confirmed {
+            if outcome.state == ExecutionState::Succeeded {
+                // Authoritative success: the only path to ACK.
+                let payload = outcome.payload.clone().unwrap_or(Value::Null);
+                let result_id = self
+                    .kernel
+                    .ack_success(
+                        &claim.attempt_id,
+                        claim.lease_epoch,
+                        Some(execution_id),
+                        &payload,
+                        outcome.summary.as_deref(),
+                        outcome.quiescent_confirmed,
+                        outcome.incarnation_reusable,
+                    )
+                    .map_err(|err| match err {
+                        Error::StorageFailure(_) => DispatchError::Persistence(err),
+                        authority => DispatchError::Authority(authority),
+                    })?;
+                return Ok(DispatchOneOutcome::CompletedSynchronously {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                    result_id,
+                });
+            }
+            // Authoritative terminal failure.
+            let failure_class = outcome.failure_class.unwrap_or(FailureClass::StartFailure);
+            self.nack_start(
+                claim,
+                execution_id,
+                failure_class,
+                true,
+                outcome.quiescent_confirmed,
+                Some(observed_handle),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
+
+        // Nonterminal / unresolved collection: NO ACK, zero inherited
+        // terminal/quiescence proof — the physical state stays unresolved.
+        let failure_class = outcome.failure_class.unwrap_or(FailureClass::ExecutionLost);
+        self.nack_start(
+            claim,
+            execution_id,
+            failure_class,
+            false,
+            false,
+            Some(observed_handle),
         )?;
         Ok(DispatchOneOutcome::StartAmbiguous {
             execution_id: execution_id.clone(),
@@ -680,7 +780,8 @@ impl<'a> Dispatcher<'a> {
 
     /// Mechanical NACK through the existing scheduler semantics. On stale
     /// authority (task §27) only legal physical history is recorded — never
-    /// a Task-authority mutation.
+    /// a Task-authority mutation — and the observed runtime handle is kept
+    /// whenever the adapter produced one.
     fn nack_start(
         &self,
         claim: &Claim,
@@ -688,6 +789,7 @@ impl<'a> Dispatcher<'a> {
         failure_class: FailureClass,
         terminal_confirmed: bool,
         quiescent_confirmed: bool,
+        observed_handle: Option<&Value>,
     ) -> Result<(), DispatchError> {
         match self.kernel.nack(
             &claim.attempt_id,
@@ -708,7 +810,7 @@ impl<'a> Dispatcher<'a> {
                     } else {
                         ExecutionState::Unknown
                     },
-                    None,
+                    observed_handle,
                     None,
                     Some(failure_class),
                     terminal_confirmed,
@@ -2301,6 +2403,198 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
         assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (authoritative collect): a start that claimed SUCCEEDED but
+    /// collects a terminal failure is NACKed under the collected failure
+    /// class — no durable Result can exist.
+    #[test]
+    fn dispatch_collect_overrides_start_success_with_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("collect-fail", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class,
+                ..
+            } => {
+                assert_eq!(*failure_class, FailureClass::Timeout);
+                execution_id.clone()
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Failed
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// Audit P1 (authoritative collect): a nonterminal collection is never
+    /// ACKed and inherits zero terminal/quiescence proof — the physical
+    /// state stays unresolved even though the start looked successful.
+    #[test]
+    fn dispatch_collect_nonterminal_never_acks_or_inherits_proof() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("collect-running", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Running,
+            payload: Some(serde_json::json!({"forged": 1})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert!(kernel.result_for_task(&task_id).is_err());
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// Audit P1 (authoritative collect): a success collection without
+    /// terminal proof is internally contradictory — INVALID_RESULT, never
+    /// ACKed as success, zero inherited proof.
+    #[test]
+    fn dispatch_contradictory_success_collection_is_never_acked() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("collect-contradictory", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"forged": 1})),
+            summary: Some("forged".into()),
+            failure_class: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class,
+                ..
+            } => {
+                assert_eq!(*failure_class, FailureClass::InvalidResult);
+                execution_id.clone()
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert!(kernel.result_for_task(&task_id).is_err());
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+    }
+
+    /// Audit P1 (authoritative collect): quiescence claimed without
+    /// terminality is a protocol violation — never ACKed.
+    #[test]
+    fn dispatch_quiescence_without_terminal_is_protocol_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("collect-quiescent", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Running,
+            payload: None,
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        match &outcome {
+            DispatchOneOutcome::StartFailed {
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => {}
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        }
+        assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(fake.start_call_count(), 1);
     }
 }
