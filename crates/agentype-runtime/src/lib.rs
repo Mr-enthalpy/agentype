@@ -1,7 +1,8 @@
-//! M5 runtime configuration boundary, M4 recovery orchestration, and the
-//! M5.2 dispatch commit boundary (adapter composition + one authoritative
-//! physical start per claim). Heartbeat supervision, restart reconciliation,
-//! notifier delivery, and the daemon loop belong to subsequent M5 tasks.
+//! M5 runtime configuration boundary, M4 recovery orchestration, the M5.2
+//! dispatch commit boundary (adapter composition + one authoritative physical
+//! start per claim), and the M5.3 supervision admission / heartbeat ownership
+//! boundary (see the `supervision` module). Restart reconciliation, notifier
+//! delivery, and the daemon loop belong to subsequent M5 tasks.
 
 #![forbid(unsafe_code)]
 
@@ -404,22 +405,24 @@ pub fn resolve_physical_execution_environment(
     })
 }
 
-/// The authority identity confirmed by the fenced RUNNING transaction.
+/// The supervision authority identity minted exclusively after the fenced
+/// RUNNING confirmation + first lease renewal transaction succeeds.
 ///
-/// Generated exclusively after `confirm_running_and_renew` succeeds. It
-/// grants no new Scheduler authority; it carries exactly the identity the
+/// It grants no new Scheduler authority; it carries exactly the identity the
 /// fenced "Execution RUNNING + first lease renewal" transaction just
-/// confirmed, so M5.3 supervision can consume it without re-deriving
-/// launch authority.
+/// confirmed, so supervision consumes it without re-deriving launch
+/// authority. A persisted RUNNING Execution row can never produce one: the
+/// constructor is crate-private and the only call site is the dispatcher's
+/// post-commit branch of `confirm_running_and_renew`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SupervisionAdmissionSeed {
+pub struct SupervisionAdmission {
     execution_id: ExecutionId,
     request_id: RequestId,
     attempt_id: AttemptId,
     lease_epoch: LeaseEpoch,
 }
 
-impl SupervisionAdmissionSeed {
+impl SupervisionAdmission {
     pub(crate) fn new(
         execution_id: ExecutionId,
         request_id: RequestId,
@@ -452,6 +455,16 @@ impl SupervisionAdmissionSeed {
 }
 
 /// Immediate outcome of one dispatch attempt (task §25 vocabulary).
+///
+/// The vocabulary separates physical certainty from Scheduler/task
+/// consequences (M5.3 outcome-vocabulary closure): `StartIndeterminate`
+/// means the physical start MAY have happened and the durable Execution is
+/// unresolved — it must never be read as "the start definitely failed";
+/// `TerminalFailure` means an authoritative collected terminal failure was
+/// established and the NACK consequence already applied; `TaskCompleted`
+/// means the Task completed with a durable Result; and a physical success
+/// that writer safety refused to complete is its own variant, never
+/// `TaskCompleted`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchOneOutcome {
     /// Nothing was claimable; no state was touched.
@@ -466,32 +479,47 @@ pub enum DispatchOneOutcome {
     /// and no writer ambiguity is created (task §15).
     ConfigurationUnavailable { detail: String },
     /// The physical start reported RUNNING and the fenced RUNNING
-    /// confirmation + first lease renewal succeeded. Supervision admission
-    /// itself is M5.3 (task §13).
-    StartedRunning { admission: SupervisionAdmissionSeed },
-    /// The start is potentially side-effecting but unresolved (ambiguous
-    /// observation, UNKNOWN/STARTING state, or stale authority after a
-    /// RUNNING report). Ambiguous physical history is persisted; Task
-    /// authority was never restored and quiescence was never claimed.
-    StartAmbiguous {
+    /// confirmation + first lease renewal succeeded. This is the ONLY
+    /// outcome that may enter supervision: consume `admission` through
+    /// `SupervisionService::admit`.
+    RunningAdmitted { admission: SupervisionAdmission },
+    /// The physical start is potentially side-effecting but unresolved: an
+    /// ambiguous/unresolved observation, an invocation or collection error,
+    /// an internally contradictory observation, or stale authority after a
+    /// start that reported RUNNING. The durable Execution is unresolved
+    /// (UNKNOWN, or a stale-authority physical-history record); no
+    /// supervision admission exists and no blind restart is permitted.
+    /// `failure_class` is the mechanical class durably recorded with the
+    /// unresolved execution, when one was classified.
+    StartIndeterminate {
         execution_id: ExecutionId,
         request_id: RequestId,
+        failure_class: Option<FailureClass>,
     },
-    /// The start failed (terminal observation or invocation error). The
-    /// existing NACK rules applied: failure row, physical history, retry
-    /// policy, and writer safety.
-    StartFailed {
+    /// An authoritative collected terminal failure was established
+    /// (`collect_outcome` proved terminality); the NACK rules already
+    /// applied (failure row, physical history, retry policy, writer
+    /// safety). No supervision is required.
+    TerminalFailure {
         execution_id: ExecutionId,
         request_id: RequestId,
         failure_class: FailureClass,
     },
-    /// The adapter completed synchronously and the authoritative ACK path
-    /// ran. `result_id` is None only when writer safety suspended the task
-    /// instead of completing it.
-    CompletedSynchronously {
+    /// The adapter completed synchronously, the authoritative ACK path ran,
+    /// and the Task completed with exactly one durable Result.
+    TaskCompleted {
         execution_id: ExecutionId,
         request_id: RequestId,
-        result_id: Option<ResultId>,
+        result_id: ResultId,
+    },
+    /// The physical execution reported success, but the Task could not
+    /// safely complete because the writer quiescence condition was not
+    /// satisfied (WRITER_SUCCESS_NOT_QUIESCENT suspension): no Result was
+    /// committed and the Task is suspended/escalated. Deliberately NOT
+    /// `TaskCompleted`.
+    WriterSafetySuspendedAfterSuccess {
+        execution_id: ExecutionId,
+        request_id: RequestId,
     },
 }
 
@@ -597,10 +625,10 @@ impl<'a> Dispatcher<'a> {
                     failure_class,
                     None,
                 )?;
-                return Ok(DispatchOneOutcome::StartFailed {
+                return Ok(DispatchOneOutcome::StartIndeterminate {
                     execution_id,
                     request_id,
-                    failure_class,
+                    failure_class: Some(failure_class),
                 });
             }
         };
@@ -630,7 +658,7 @@ impl<'a> Dispatcher<'a> {
         // only a protocol-consistent observation may reach that admission.
         // An ACTIVE state carrying end-of-execution claims (terminal proof,
         // quiescence proof, or a failure class) is internally contradictory;
-        // fail closed as unresolved so no SupervisionAdmissionSeed can ever
+        // fail closed as unresolved so no SupervisionAdmission can ever
         // be minted from it (M5.3 prerequisite, audit round 10).
         if observation.state == ExecutionState::Running
             && !observation.ambiguous
@@ -645,10 +673,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(&observation.runtime_handle.0),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         if observation.state == ExecutionState::Running && !observation.ambiguous {
@@ -658,8 +686,8 @@ impl<'a> Dispatcher<'a> {
                 execution_id,
                 &observation.runtime_handle.0,
             ) {
-                Ok(_) => Ok(DispatchOneOutcome::StartedRunning {
-                    admission: SupervisionAdmissionSeed::new(
+                Ok(_) => Ok(DispatchOneOutcome::RunningAdmitted {
+                    admission: SupervisionAdmission::new(
                         execution_id.clone(),
                         request_id.clone(),
                         claim.attempt_id.clone(),
@@ -683,9 +711,10 @@ impl<'a> Dispatcher<'a> {
                             false,
                         )
                         .map_err(DispatchError::Persistence)?;
-                    Ok(DispatchOneOutcome::StartAmbiguous {
+                    Ok(DispatchOneOutcome::StartIndeterminate {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
+                        failure_class: None,
                     })
                 }
                 Err(err) => Err(DispatchError::Persistence(err)),
@@ -709,9 +738,10 @@ impl<'a> Dispatcher<'a> {
                 FailureClass::ExecutionLost,
                 Some(&observation.runtime_handle.0),
             )?;
-            return Ok(DispatchOneOutcome::StartAmbiguous {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
+                failure_class: Some(FailureClass::ExecutionLost),
             });
         }
 
@@ -740,10 +770,10 @@ impl<'a> Dispatcher<'a> {
                         failure_class,
                         Some(&observation.runtime_handle.0),
                     )?;
-                    return Ok(DispatchOneOutcome::StartFailed {
+                    return Ok(DispatchOneOutcome::StartIndeterminate {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
-                        failure_class,
+                        failure_class: Some(failure_class),
                     });
                 }
             };
@@ -763,9 +793,10 @@ impl<'a> Dispatcher<'a> {
             FailureClass::ExecutionLost,
             Some(&observation.runtime_handle.0),
         )?;
-        Ok(DispatchOneOutcome::StartAmbiguous {
+        Ok(DispatchOneOutcome::StartIndeterminate {
             execution_id: execution_id.clone(),
             request_id: request_id.clone(),
+            failure_class: Some(FailureClass::ExecutionLost),
         })
     }
 
@@ -797,10 +828,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: LOST is never a confirmed end (core
@@ -820,10 +851,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: success claimed without terminal proof.
@@ -835,10 +866,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: quiescence claimed without terminality.
@@ -850,10 +881,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
 
@@ -900,18 +931,29 @@ impl<'a> Dispatcher<'a> {
                                 outcome.quiescent_confirmed,
                             )
                             .map_err(DispatchError::Persistence)?;
-                        return Ok(DispatchOneOutcome::StartAmbiguous {
+                        return Ok(DispatchOneOutcome::StartIndeterminate {
                             execution_id: execution_id.clone(),
                             request_id: request_id.clone(),
+                            failure_class: None,
                         });
                     }
                     Err(err) => return Err(DispatchError::Persistence(err)),
                 };
-                return Ok(DispatchOneOutcome::CompletedSynchronously {
-                    execution_id: execution_id.clone(),
-                    request_id: request_id.clone(),
-                    result_id,
-                });
+                return match result_id {
+                    Some(result_id) => Ok(DispatchOneOutcome::TaskCompleted {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                        result_id,
+                    }),
+                    // ack_success returned None: the physical success was
+                    // durable but writer safety suspended the Task instead of
+                    // completing it (WRITER_SUCCESS_NOT_QUIESCENT). This is
+                    // NOT a Task completion.
+                    None => Ok(DispatchOneOutcome::WriterSafetySuspendedAfterSuccess {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                    }),
+                };
             }
             // Authoritative terminal failure. Physical evidence (the
             // locator) is committed BEFORE the authority consequence when
@@ -933,7 +975,7 @@ impl<'a> Dispatcher<'a> {
                 outcome.quiescent_confirmed,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::TerminalFailure {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
                 failure_class,
@@ -949,9 +991,10 @@ impl<'a> Dispatcher<'a> {
             failure_class,
             Some(observed_handle),
         )?;
-        Ok(DispatchOneOutcome::StartAmbiguous {
+        Ok(DispatchOneOutcome::StartIndeterminate {
             execution_id: execution_id.clone(),
             request_id: request_id.clone(),
+            failure_class: Some(failure_class),
         })
     }
 
@@ -2219,8 +2262,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let admission = match &outcome {
-            DispatchOneOutcome::StartedRunning { admission } => admission,
-            other => panic!("expected StartedRunning, got {other:?}"),
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
         };
         let execution_id = admission.execution_id().clone();
         let request_id = admission.request_id().clone();
@@ -2428,7 +2471,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         claim.batch_id = agentype_core::BatchId::new();
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         let last = fake.last_request().unwrap();
         assert_eq!(last.payload(), &durable_payload);
         assert_eq!(last.acceptance(), &durable_acceptance);
@@ -2447,7 +2493,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         claim.workspace_mode = agentype_core::WorkspaceMode::Write;
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         assert_eq!(
             fake.last_request().unwrap().workspace_mode(),
             agentype_core::WorkspaceMode::ReadOnly
@@ -2464,7 +2513,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         assert_eq!(
             fake.last_request().unwrap().workspace_mode(),
             agentype_core::WorkspaceMode::Write
@@ -2486,14 +2538,15 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
                 request_id,
+                ..
             } => {
                 assert_ne!(*request_id, agentype_core::RequestId::new());
                 execution_id.clone()
             }
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         assert_eq!(fake.start_call_count(), 1);
         assert_eq!(
@@ -2544,7 +2597,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::TerminalFailure {
                 execution_id,
                 failure_class,
                 ..
@@ -2552,7 +2605,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 assert_eq!(*failure_class, FailureClass::Timeout);
                 execution_id.clone()
             }
-            other => panic!("expected StartFailed, got {other:?}"),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Failed);
@@ -2591,10 +2644,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
-                assert!(result_id.is_some());
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => {
+                assert!(!result_id.as_str().is_empty());
             }
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
@@ -2612,7 +2665,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         let last = fake.last_request().unwrap();
         assert_eq!(
             last.target_options(),
@@ -2641,8 +2697,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2686,8 +2742,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartFailed, got {other:?}"),
+            DispatchOneOutcome::TerminalFailure { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -2713,8 +2769,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2759,7 +2815,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::TerminalFailure {
                 execution_id,
                 failure_class,
                 ..
@@ -2767,7 +2823,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 assert_eq!(*failure_class, FailureClass::Timeout);
                 execution_id.clone()
             }
-            other => panic!("expected StartFailed, got {other:?}"),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -2811,8 +2867,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2856,15 +2912,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class,
+                failure_class: Some(FailureClass::InvalidResult),
                 ..
-            } => {
-                assert_eq!(*failure_class, FailureClass::InvalidResult);
-                execution_id.clone()
-            }
-            other => panic!("expected StartFailed, got {other:?}"),
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate(InvalidResult), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2907,11 +2960,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::StartFailed {
-                failure_class: FailureClass::AdapterProtocolFailure,
+            DispatchOneOutcome::StartIndeterminate {
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => {}
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         }
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(fake.start_call_count(), 1);
@@ -2954,8 +3007,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3007,10 +3060,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
-                assert!(result_id.is_some());
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => {
+                assert!(!result_id.as_str().is_empty());
             }
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
@@ -3042,8 +3095,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3097,12 +3150,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3143,12 +3196,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3179,12 +3232,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3228,8 +3281,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartFailed, got {other:?}"),
+            DispatchOneOutcome::TerminalFailure { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Failed);
@@ -3283,12 +3336,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3443,16 +3496,14 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
 
         let outcome = d.dispatch_one().unwrap();
-        let (execution_id, result_id) = match &outcome {
-            DispatchOneOutcome::CompletedSynchronously {
-                execution_id,
-                result_id,
-                ..
-            } => (execution_id.clone(), result_id.clone()),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        let execution_id = match &outcome {
+            DispatchOneOutcome::WriterSafetySuspendedAfterSuccess { execution_id, .. } => {
+                execution_id.clone()
+            }
+            other => panic!("expected WriterSafetySuspendedAfterSuccess, got {other:?}"),
         };
         // Writer-unsafe success produces no durable Result.
-        assert!(result_id.is_none());
+        assert!(kernel.result_for_task(&task_id).is_err());
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Succeeded);
         assert!(exec.terminal_confirmed);
@@ -3699,7 +3750,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let d = Dispatcher::new(&kernel, &registry, &adapters);
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
 
         let conn = rusqlite::Connection::open(&path).unwrap();
         let (state, adapter_kind): (String, String) = conn
@@ -3718,7 +3772,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
     /// Audit P1 (round 10, M5.3 prerequisite): a RUNNING observation
     /// carrying end-of-execution claims is internally contradictory and must
-    /// never reach the RUNNING confirmation / SupervisionAdmissionSeed.
+    /// never reach the RUNNING confirmation / SupervisionAdmission.
     /// Fail closed: unresolved physical state, zero inherited proof, handle
     /// preserved, protocol failure.
     #[test]
@@ -3741,12 +3795,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3800,15 +3854,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        let (execution_id, result_id) = match &outcome {
-            DispatchOneOutcome::CompletedSynchronously {
-                execution_id,
-                result_id,
-                ..
-            } => (execution_id.clone(), result_id.clone()),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        let execution_id = match &outcome {
+            DispatchOneOutcome::TaskCompleted { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         };
-        assert!(result_id.is_some());
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Succeeded);
         let incarnation_id = exec.incarnation_id.clone();
@@ -3866,8 +3915,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
         let outcome1 = d.dispatch_claim(&claim1).unwrap();
         let execution_id1 = match &outcome1 {
-            DispatchOneOutcome::CompletedSynchronously { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            DispatchOneOutcome::TaskCompleted { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         };
         let incarnation_id = kernel
             .execution(&execution_id1)
@@ -3893,7 +3942,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let outcome2 = d.dispatch_claim(&claim2).unwrap();
         assert!(matches!(
             outcome2,
-            DispatchOneOutcome::StartedRunning { .. }
+            DispatchOneOutcome::RunningAdmitted { .. }
         ));
         let last = fake.last_request().unwrap();
         assert_eq!(last.incarnation_id(), &incarnation_id);
@@ -3903,5 +3952,135 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             last.incarnation_runtime_handle(),
             &RuntimeHandle(serde_json::json!({"session": 7}))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M5.3 outcome-vocabulary closure (M5.3 plan §2 / §47 #59-64): the
+    // public dispatch vocabulary separates physical certainty from
+    // Scheduler/task consequences.
+    // ------------------------------------------------------------------
+
+    /// #59: an adapter invocation error with possible side effects is
+    /// `StartIndeterminate` (the Execution is durably UNKNOWN with the
+    /// failure class recorded) — never a terminal failure, never an
+    /// admission.
+    #[test]
+    fn invocation_error_is_start_indeterminate_not_terminal_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("indeterminate", Value::Null)])
+            .unwrap();
+        fake.set_next_start_error(AdapterError::Unavailable("worker gone mid-start".into()));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                execution_id,
+                failure_class: Some(FailureClass::ResourceUnavailable),
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
+        };
+        assert!(matches!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        ));
+    }
+
+    /// #60: an ambiguous observation is `StartIndeterminate` (also asserted
+    /// end-to-end by `dispatch_ambiguous_start_is_persisted_and_never_restarted`).
+    #[test]
+    fn ambiguous_observation_maps_to_start_indeterminate() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ambig-vocab", Value::Null)])
+            .unwrap();
+        fake.set_next_start(ambiguous_start());
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::StartIndeterminate { .. }
+        ));
+    }
+
+    /// #62 + #64: a successful synchronous ACK returns `TaskCompleted` with
+    /// a concrete (non-optional) `ResultId`, and `RunningAdmitted` is the
+    /// only outcome that carries a `SupervisionAdmission` — structurally
+    /// guaranteed by the enum shape and asserted here on the admitted path.
+    #[test]
+    fn task_completed_carries_concrete_result_and_only_running_admitted_carries_admission() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("vocab-complete", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": "vocab"})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": "vocab"})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let result_id = match &outcome {
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => result_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        };
+        assert_eq!(kernel.result_for_task(&task_id).unwrap().id, result_id);
+    }
+
+    /// #63: a physical success that writer safety refuses to complete is
+    /// `WriterSafetySuspendedAfterSuccess` — a distinct outcome, never
+    /// `TaskCompleted`.
+    #[test]
+    fn writer_safety_suspension_is_distinct_from_task_completed() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("vocab-suspend", Value::Null).write()])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": "suspend"})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::WriterSafetySuspendedAfterSuccess { .. }
+        ));
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        assert!(kernel.result_for_task(&task_id).is_err());
     }
 }
