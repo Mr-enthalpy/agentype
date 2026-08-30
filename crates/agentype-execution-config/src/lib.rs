@@ -394,8 +394,9 @@ pub fn resolve_execution_environment(
 ///
 /// `task_name` is the durable human-readable Task label (a scheduling/display
 /// fact). It is NOT the worker prompt: the worker-facing prompt is a derived
-/// representation rendered by the runtime from the full launch protocol
-/// (IDs, epoch, payload, acceptance, continuity, workspace mode).
+/// representation rendered by the provider-neutral execution contract
+/// (`agentype-adapter-api`) from the full launch protocol (IDs, epoch,
+/// payload, acceptance, continuity, workspace mode).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionLaunchSnapshot {
     execution_id: ExecutionId,

@@ -831,6 +831,11 @@ impl<'a> Dispatcher<'a> {
                 outcome.quiescent_confirmed,
                 Some(observed_handle),
             )?;
+            self.retain_terminal_handle(
+                execution_id,
+                observed_handle,
+                outcome.quiescent_confirmed,
+            )?;
             return Ok(DispatchOneOutcome::StartFailed {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
@@ -892,6 +897,35 @@ impl<'a> Dispatcher<'a> {
             false,
             observed_handle,
         )
+    }
+
+    /// Design choice (audit round 5): a terminal-failure NACK does not write
+    /// the runtime handle (`Kernel::nack` has no handle parameter), but a
+    /// terminal failure WITHOUT quiescence proof leaves physical
+    /// cleanup/reconciliation to M5.4, so the observed handle is retained
+    /// explicitly. A quiescence-proven terminal execution needs no physical
+    /// cleanup, so its handle is deliberately not retained — the distinction
+    /// is by design, not an accident of the Kernel parameter list.
+    fn retain_terminal_handle(
+        &self,
+        execution_id: &ExecutionId,
+        observed_handle: &Value,
+        quiescent_confirmed: bool,
+    ) -> Result<(), DispatchError> {
+        if quiescent_confirmed {
+            return Ok(());
+        }
+        self.kernel
+            .record_physical_outcome(
+                execution_id,
+                ExecutionState::Failed,
+                Some(observed_handle),
+                None,
+                None,
+                true,
+                false,
+            )
+            .map_err(DispatchError::Persistence)
     }
 
     /// Mechanical NACK through the existing scheduler semantics. On stale
@@ -3051,5 +3085,57 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             ExecutionState::Unknown
         );
         assert!(kernel.result_for_task(&task_id).is_err());
+    }
+
+    /// Audit P2 / M5.4 hardening (round 5): a terminal failure NACK without
+    /// quiescence proof retains the observed runtime handle for M5.4 physical
+    /// cleanup — by explicit design, not by accident of Kernel::nack's
+    /// parameter list. WRITE + terminal-without-quiescence suspends, so the
+    /// durable handle is exactly what M5.4 cleanup will need.
+    #[test]
+    fn dispatch_terminal_failure_without_quiescence_retains_handle() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("terminal-handle", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"cleanup": 5})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartFailed, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Failed);
+        assert!(exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"cleanup": 5})
+        );
+        // WRITE + terminal-without-quiescence suspends: the durable handle is
+        // exactly what M5.4 physical cleanup will need.
+        let task_id = exec.task_id.clone();
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
     }
 }
