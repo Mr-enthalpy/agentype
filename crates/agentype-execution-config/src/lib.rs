@@ -272,11 +272,22 @@ pub struct FrozenPhysicalExecutionBinding {
 }
 
 impl FrozenPhysicalExecutionBinding {
-    pub fn new(safety: FrozenExecutionSafety, adapter_kind: impl Into<String>) -> Self {
-        Self {
-            safety,
-            adapter_kind: adapter_kind.into(),
+    /// Typed constructor validation (M5.3 §36): the adapter routing identity
+    /// frozen with an execution commitment must never be blank. Registry
+    /// registration already rejects blank kinds; this closes the direct
+    /// construction path.
+    pub fn new(
+        safety: FrozenExecutionSafety,
+        adapter_kind: impl Into<String>,
+    ) -> Result<Self, ConfigurationError> {
+        let adapter_kind = adapter_kind.into();
+        if adapter_kind.trim().is_empty() {
+            return Err(ConfigurationError::InvalidAdapterKind(adapter_kind));
         }
+        Ok(Self {
+            safety,
+            adapter_kind,
+        })
     }
 
     pub fn safety(&self) -> &FrozenExecutionSafety {
@@ -332,7 +343,7 @@ impl ResolvedExecutionEnvironment {
     /// The provider-neutral physical binding for this resolved environment:
     /// the Attempt-bound safety facts plus the target configuration's
     /// declared adapter_kind.
-    pub fn physical_binding(&self) -> FrozenPhysicalExecutionBinding {
+    pub fn physical_binding(&self) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
         FrozenPhysicalExecutionBinding::new(self.safety().clone(), self.target.adapter_kind.clone())
     }
 
@@ -794,5 +805,24 @@ mod tests {
         assert_eq!(env.profile().name, "default");
         assert!(!env.attempt_isolation());
         assert_eq!(env.safety(), FrozenExecutionSafety::unisolated(b));
+    }
+
+    /// M5.3 §36: the frozen physical binding rejects a blank adapter routing
+    /// identity at the typed-constructor layer (defense in depth behind
+    /// `register_target`).
+    #[test]
+    fn physical_binding_rejects_blank_adapter_kind() {
+        let b = AuthoritativeExecutionBinding {
+            attempt_id: AttemptId::new(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".into(),
+            execution_profile: "default".into(),
+        };
+        let safety = FrozenExecutionSafety::unisolated(b);
+        for blank in ["", "   ", "	"] {
+            let err = FrozenPhysicalExecutionBinding::new(safety.clone(), blank).unwrap_err();
+            assert!(matches!(err, ConfigurationError::InvalidAdapterKind(_)));
+        }
+        assert!(FrozenPhysicalExecutionBinding::new(safety, "process").is_ok());
     }
 }

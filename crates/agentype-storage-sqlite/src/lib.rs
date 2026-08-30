@@ -11,6 +11,6 @@ mod schema;
 mod store;
 pub mod txutil;
 
-pub use kernel::Kernel;
+pub use kernel::{Kernel, LeaseSupervisionView, SupervisedRenewal};
 pub use schema::SCHEMA_VERSION;
 pub use store::IMPLEMENTATION_LINE;

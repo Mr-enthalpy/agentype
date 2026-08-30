@@ -2,7 +2,7 @@
 //! Rust-era schema-family identity (fail-closed on foreign lineages).
 
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
-use agentype_core::{Error, UnixTime};
+use agentype_core::{Clock, Error, UnixTime};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
@@ -103,15 +103,35 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction<'_>, UnixTime) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        // Clock is supplied by Kernel; store-level helpers used only at init
-        // pass 0. Kernel wraps this with the real clock.
-        self.with_immediate_at(0.0, f)
+        // Store-level init helper (schema/identity bootstrap): no clock is
+        // available yet, so bootstrap timestamps are 0.0.
+        self.begin_immediate(|tx| f(tx, 0.0))
     }
 
-    pub fn with_immediate_at<T>(
+    /// Run one IMMEDIATE transaction, sampling the authoritative time
+    /// AFTER serialization is acquired (M5.3 audit P1-1).
+    ///
+    /// The timestamp handed to the transaction body is read only after the
+    /// connection mutex is held and BEGIN IMMEDIATE has succeeded — i.e.
+    /// after the transaction has actually won the SQLite write
+    /// serialization. Sampling earlier would let a caller that waited for a
+    /// contended writer lock validate authority against a stale reading and
+    /// resurrect a lease that already expired in real time, breaking the
+    /// frozen `now >= expires_at -> stale` boundary.
+    pub fn with_immediate_clock<T>(
         &self,
-        now: UnixTime,
+        clock: &dyn Clock,
         f: impl FnOnce(&Transaction<'_>, UnixTime) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.begin_immediate(|tx| {
+            let now = clock.now();
+            f(tx, now)
+        })
+    }
+
+    fn begin_immediate<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let mut conn = self
             .conn
@@ -120,7 +140,7 @@ impl Store {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
-        match f(&tx, now) {
+        match f(&tx) {
             Ok(val) => {
                 tx.commit().map_err(map_sqlite)?;
                 Ok(val)

@@ -1539,7 +1539,9 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     )
     .unwrap();
 
-    let launch = k.create_execution(&claim, env.physical_binding()).unwrap();
+    let launch = k
+        .create_execution(&claim, env.physical_binding().unwrap())
+        .unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
     assert_eq!(launch.logical_agent_id(), &claim.logical_agent_id);
@@ -1574,7 +1576,8 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
             FrozenPhysicalExecutionBinding::new(
                 FrozenExecutionSafety::unisolated(wrong_target),
                 "test",
-            ),
+            )
+            .unwrap(),
         )
         .unwrap_err();
     assert!(err
@@ -1590,7 +1593,8 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
             FrozenPhysicalExecutionBinding::new(
                 FrozenExecutionSafety::unisolated(wrong_profile),
                 "test",
-            ),
+            )
+            .unwrap(),
         )
         .unwrap_err();
     assert!(err

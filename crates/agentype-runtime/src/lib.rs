@@ -1,20 +1,30 @@
-//! M5 runtime configuration boundary, M4 recovery orchestration, and the
-//! M5.2 dispatch commit boundary (adapter composition + one authoritative
-//! physical start per claim). Heartbeat supervision, restart reconciliation,
-//! notifier delivery, and the daemon loop belong to subsequent M5 tasks.
+//! M5 runtime configuration boundary, M4 recovery orchestration, the M5.2
+//! dispatch commit boundary (adapter composition + one authoritative physical
+//! start per claim), and the M5.3 supervision admission / heartbeat ownership
+//! boundary (see the `supervision` module). Restart reconciliation, notifier
+//! delivery, and the daemon loop belong to subsequent M5 tasks.
 
 #![forbid(unsafe_code)]
 
 pub use agentype_execution_config::*;
 
+pub mod supervision;
+pub mod timing;
+
+pub use supervision::{
+    RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
+};
+pub use timing::{RuntimeTimingConfig, TimingConfigError};
+
 use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Preparation failure of the canonical launch façade.
@@ -31,6 +41,10 @@ pub enum ExecutionPreparationError {
     /// The authoritative registry lacks the Attempt-frozen target/profile or
     /// the pair is incompatible. Standardized as `FailureClass::ResourceUnavailable`.
     Configuration(ResolutionError),
+    /// The frozen physical binding was constructed with an invalid adapter
+    /// routing identity (blank adapter_kind). Standardized as
+    /// `FailureClass::ResourceUnavailable` (M5.3 §36).
+    InvalidBinding(ConfigurationError),
     /// Authority validation or the fenced execution-creation transaction
     /// rejected the launch (domain/authority error, e.g. stale or invalid
     /// authority, tampered Claim copies).
@@ -44,7 +58,9 @@ impl ExecutionPreparationError {
     /// Task execution failures and yield `None`.
     pub fn standard_failure_class(&self) -> Option<FailureClass> {
         match self {
-            Self::Configuration(_) => Some(FailureClass::ResourceUnavailable),
+            Self::Configuration(_) | Self::InvalidBinding(_) => {
+                Some(FailureClass::ResourceUnavailable)
+            }
             Self::Kernel(_) => None,
         }
     }
@@ -54,6 +70,7 @@ impl std::fmt::Display for ExecutionPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(e) => write!(f, "execution configuration unavailable: {e}"),
+            Self::InvalidBinding(e) => write!(f, "execution binding invalid: {e}"),
             Self::Kernel(e) => write!(f, "execution launch rejected: {e}"),
         }
     }
@@ -124,14 +141,13 @@ pub fn prepare_execution_launch(
         .map_err(ExecutionPreparationError::Configuration)?;
     // Standalone façade: no AdapterRegistry is consulted, so the frozen
     // adapter_kind is the target configuration's declared binding.
+    let physical_binding = FrozenPhysicalExecutionBinding::new(
+        environment.safety(),
+        environment.target().adapter_kind.clone(),
+    )
+    .map_err(ExecutionPreparationError::InvalidBinding)?;
     let snapshot = kernel
-        .create_execution(
-            claim,
-            FrozenPhysicalExecutionBinding::new(
-                environment.safety(),
-                environment.target().adapter_kind.clone(),
-            ),
-        )
+        .create_execution(claim, physical_binding)
         .map_err(ExecutionPreparationError::Kernel)?;
     let request = ExecutionRequest::from_launch(&snapshot, &environment)
         .map_err(|m| ExecutionPreparationError::Kernel(Error::invalid_authority(m.detail)))?;
@@ -356,7 +372,7 @@ impl ResolvedPhysicalExecutionEnvironment {
     /// commitment: the Attempt-bound safety facts plus the adapter_kind of
     /// the installed adapter resolved for this environment (the same kind
     /// string used for the AdapterRegistry lookup).
-    pub fn physical_binding(&self) -> FrozenPhysicalExecutionBinding {
+    pub fn physical_binding(&self) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
         self.environment.physical_binding()
     }
 }
@@ -404,33 +420,63 @@ pub fn resolve_physical_execution_environment(
     })
 }
 
-/// The authority identity confirmed by the fenced RUNNING transaction.
+/// The supervision authority identity minted exclusively after the fenced
+/// RUNNING confirmation + first lease renewal transaction succeeds.
 ///
-/// Generated exclusively after `confirm_running_and_renew` succeeds. It
-/// grants no new Scheduler authority; it carries exactly the identity the
+/// It grants no new Scheduler authority; it carries exactly the identity the
 /// fenced "Execution RUNNING + first lease renewal" transaction just
-/// confirmed, so M5.3 supervision can consume it without re-deriving
-/// launch authority.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SupervisionAdmissionSeed {
+/// confirmed, so supervision consumes it without re-deriving launch
+/// authority. A persisted RUNNING Execution row can never produce one: the
+/// constructor is crate-private and the only call site is the dispatcher's
+/// post-commit branch of `confirm_running_and_renew`.
+///
+/// This is a **move-only capability** (M5.3 audit P1-3): deliberately NOT
+/// `Clone`. `SupervisionService::admit` consumes the token, so one admission
+/// has exactly one supervisor owner — the same token can never be presented
+/// to a second registry, and a consumed/dropped token can never be replayed
+/// anywhere. The only re-admission path is a fresh authoritative mint (the
+/// M5.4 reconciliation shape).
+///
+/// `generation` is an ephemeral, process-local mint counter used by the
+/// supervision registry as concurrent-collection hygiene. It is deliberately
+/// distinct from `LeaseEpoch`, which is durable Scheduler fencing; every
+/// durable decision remains fenced by the epoch.
+///
+/// `first_renewed_at` / `lease_expires_at` carry the fenced first-renewal
+/// COMMIT timing (M5.3 audit P1-1): the supervision registry schedules its
+/// deadline from this anchor — never from the possibly-delayed handoff or
+/// insertion time — so the heartbeat can never be scheduled past the durable
+/// expiry under any legal timing.
+#[derive(Debug)]
+pub struct SupervisionAdmission {
     execution_id: ExecutionId,
     request_id: RequestId,
     attempt_id: AttemptId,
     lease_epoch: LeaseEpoch,
+    generation: u64,
+    first_renewed_at: UnixTime,
+    lease_expires_at: UnixTime,
 }
 
-impl SupervisionAdmissionSeed {
+static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl SupervisionAdmission {
     pub(crate) fn new(
         execution_id: ExecutionId,
         request_id: RequestId,
         attempt_id: AttemptId,
         lease_epoch: LeaseEpoch,
+        first_renewed_at: UnixTime,
+        lease_expires_at: UnixTime,
     ) -> Self {
         Self {
             execution_id,
             request_id,
             attempt_id,
             lease_epoch,
+            generation: NEXT_ADMISSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            first_renewed_at,
+            lease_expires_at,
         }
     }
 
@@ -449,10 +495,46 @@ impl SupervisionAdmissionSeed {
     pub fn lease_epoch(&self) -> LeaseEpoch {
         self.lease_epoch
     }
+
+    /// The fenced first-renewal commit time (the deadline-scheduling anchor).
+    pub fn first_renewed_at(&self) -> UnixTime {
+        self.first_renewed_at
+    }
+
+    /// The durable lease expiry produced by the fenced first renewal.
+    pub fn lease_expires_at(&self) -> UnixTime {
+        self.lease_expires_at
+    }
+
+    /// Extract the plain durable identity for registry bookkeeping. The
+    /// capability itself is consumed at admit and never stored.
+    pub(crate) fn identity(&self) -> crate::supervision::SupervisionIdentity {
+        crate::supervision::SupervisionIdentity::new(
+            self.execution_id.clone(),
+            self.request_id.clone(),
+            self.attempt_id.clone(),
+            self.lease_epoch,
+            self.generation,
+        )
+    }
 }
 
 /// Immediate outcome of one dispatch attempt (task §25 vocabulary).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The vocabulary separates physical certainty from Scheduler/task
+/// consequences (M5.3 outcome-vocabulary closure): `StartIndeterminate`
+/// means the physical start MAY have happened and the durable Execution is
+/// unresolved — it must never be read as "the start definitely failed";
+/// `TerminalFailure` means an authoritative collected terminal failure was
+/// established and the NACK consequence already applied; `TaskCompleted`
+/// means the Task completed with a durable Result; and a physical success
+/// that writer safety refused to complete is its own variant, never
+/// `TaskCompleted`.
+///
+/// Deliberately NOT `Clone`: `RunningAdmitted` carries the move-only
+/// `SupervisionAdmission` capability, and copying the outcome would copy a
+/// supervision capability (M5.3 audit P1-3).
+#[derive(Debug)]
 pub enum DispatchOneOutcome {
     /// Nothing was claimable; no state was touched.
     NoWork,
@@ -466,32 +548,47 @@ pub enum DispatchOneOutcome {
     /// and no writer ambiguity is created (task §15).
     ConfigurationUnavailable { detail: String },
     /// The physical start reported RUNNING and the fenced RUNNING
-    /// confirmation + first lease renewal succeeded. Supervision admission
-    /// itself is M5.3 (task §13).
-    StartedRunning { admission: SupervisionAdmissionSeed },
-    /// The start is potentially side-effecting but unresolved (ambiguous
-    /// observation, UNKNOWN/STARTING state, or stale authority after a
-    /// RUNNING report). Ambiguous physical history is persisted; Task
-    /// authority was never restored and quiescence was never claimed.
-    StartAmbiguous {
+    /// confirmation + first lease renewal succeeded. This is the ONLY
+    /// outcome that may enter supervision: consume `admission` through
+    /// `SupervisionService::admit`.
+    RunningAdmitted { admission: SupervisionAdmission },
+    /// The physical start is potentially side-effecting but unresolved: an
+    /// ambiguous/unresolved observation, an invocation or collection error,
+    /// an internally contradictory observation, or stale authority after a
+    /// start that reported RUNNING. The durable Execution is unresolved
+    /// (UNKNOWN, or a stale-authority physical-history record); no
+    /// supervision admission exists and no blind restart is permitted.
+    /// `failure_class` is the mechanical class durably recorded with the
+    /// unresolved execution, when one was classified.
+    StartIndeterminate {
         execution_id: ExecutionId,
         request_id: RequestId,
+        failure_class: Option<FailureClass>,
     },
-    /// The start failed (terminal observation or invocation error). The
-    /// existing NACK rules applied: failure row, physical history, retry
-    /// policy, and writer safety.
-    StartFailed {
+    /// An authoritative collected terminal failure was established
+    /// (`collect_outcome` proved terminality); the NACK rules already
+    /// applied (failure row, physical history, retry policy, writer
+    /// safety). No supervision is required.
+    TerminalFailure {
         execution_id: ExecutionId,
         request_id: RequestId,
         failure_class: FailureClass,
     },
-    /// The adapter completed synchronously and the authoritative ACK path
-    /// ran. `result_id` is None only when writer safety suspended the task
-    /// instead of completing it.
-    CompletedSynchronously {
+    /// The adapter completed synchronously, the authoritative ACK path ran,
+    /// and the Task completed with exactly one durable Result.
+    TaskCompleted {
         execution_id: ExecutionId,
         request_id: RequestId,
-        result_id: Option<ResultId>,
+        result_id: ResultId,
+    },
+    /// The physical execution reported success, but the Task could not
+    /// safely complete because the writer quiescence condition was not
+    /// satisfied (WRITER_SUCCESS_NOT_QUIESCENT suspension): no Result was
+    /// committed and the Task is suspended/escalated. Deliberately NOT
+    /// `TaskCompleted`.
+    WriterSafetySuspendedAfterSuccess {
+        execution_id: ExecutionId,
+        request_id: RequestId,
     },
 }
 
@@ -568,13 +665,26 @@ impl<'a> Dispatcher<'a> {
             Err(other) => return Err(other),
         };
 
+        // Freeze the physical binding before the commitment: a blank
+        // adapter routing identity is a pre-start composition failure (no
+        // Execution is fabricated, mechanically NACKed as
+        // RESOURCE_UNAVAILABLE, M5.3 §36).
+        let physical_binding = match physical.physical_binding() {
+            Ok(binding) => binding,
+            Err(err) => {
+                let detail = err.to_string();
+                self.nack_configuration_unavailable(claim)?;
+                return Ok(DispatchOneOutcome::ConfigurationUnavailable { detail });
+            }
+        };
+
         // Create and freeze the Execution (STARTING) in its own fenced
         // transaction. From here the start is treated as potentially
         // side-effecting (task §11): the stable RequestId is persisted with
         // the Execution and is never regenerated.
         let snapshot = self
             .kernel
-            .create_execution(claim, physical.physical_binding())
+            .create_execution(claim, physical_binding)
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
@@ -597,10 +707,10 @@ impl<'a> Dispatcher<'a> {
                     failure_class,
                     None,
                 )?;
-                return Ok(DispatchOneOutcome::StartFailed {
+                return Ok(DispatchOneOutcome::StartIndeterminate {
                     execution_id,
                     request_id,
-                    failure_class,
+                    failure_class: Some(failure_class),
                 });
             }
         };
@@ -630,7 +740,7 @@ impl<'a> Dispatcher<'a> {
         // only a protocol-consistent observation may reach that admission.
         // An ACTIVE state carrying end-of-execution claims (terminal proof,
         // quiescence proof, or a failure class) is internally contradictory;
-        // fail closed as unresolved so no SupervisionAdmissionSeed can ever
+        // fail closed as unresolved so no SupervisionAdmission can ever
         // be minted from it (M5.3 prerequisite, audit round 10).
         if observation.state == ExecutionState::Running
             && !observation.ambiguous
@@ -645,10 +755,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(&observation.runtime_handle.0),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         if observation.state == ExecutionState::Running && !observation.ambiguous {
@@ -658,12 +768,21 @@ impl<'a> Dispatcher<'a> {
                 execution_id,
                 &observation.runtime_handle.0,
             ) {
-                Ok(_) => Ok(DispatchOneOutcome::StartedRunning {
-                    admission: SupervisionAdmissionSeed::new(
+                Ok(expires_at) => Ok(DispatchOneOutcome::RunningAdmitted {
+                    admission: SupervisionAdmission::new(
                         execution_id.clone(),
                         request_id.clone(),
                         claim.attempt_id.clone(),
                         claim.lease_epoch,
+                        // The scheduling anchor is the fenced first-renewal
+                        // COMMIT time, recovered exactly from the
+                        // transaction's own expiry output (expires_at =
+                        // commit + lease_seconds). The supervision registry
+                        // schedules from this anchor — never from the
+                        // possibly-delayed handoff or insertion time (M5.3
+                        // audit P1-1: deadline phase correctness).
+                        expires_at - self.kernel.lease_seconds(),
+                        expires_at,
                     ),
                 }),
                 Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
@@ -683,9 +802,10 @@ impl<'a> Dispatcher<'a> {
                             false,
                         )
                         .map_err(DispatchError::Persistence)?;
-                    Ok(DispatchOneOutcome::StartAmbiguous {
+                    Ok(DispatchOneOutcome::StartIndeterminate {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
+                        failure_class: None,
                     })
                 }
                 Err(err) => Err(DispatchError::Persistence(err)),
@@ -709,9 +829,10 @@ impl<'a> Dispatcher<'a> {
                 FailureClass::ExecutionLost,
                 Some(&observation.runtime_handle.0),
             )?;
-            return Ok(DispatchOneOutcome::StartAmbiguous {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
+                failure_class: Some(FailureClass::ExecutionLost),
             });
         }
 
@@ -740,10 +861,10 @@ impl<'a> Dispatcher<'a> {
                         failure_class,
                         Some(&observation.runtime_handle.0),
                     )?;
-                    return Ok(DispatchOneOutcome::StartFailed {
+                    return Ok(DispatchOneOutcome::StartIndeterminate {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
-                        failure_class,
+                        failure_class: Some(failure_class),
                     });
                 }
             };
@@ -763,9 +884,10 @@ impl<'a> Dispatcher<'a> {
             FailureClass::ExecutionLost,
             Some(&observation.runtime_handle.0),
         )?;
-        Ok(DispatchOneOutcome::StartAmbiguous {
+        Ok(DispatchOneOutcome::StartIndeterminate {
             execution_id: execution_id.clone(),
             request_id: request_id.clone(),
+            failure_class: Some(FailureClass::ExecutionLost),
         })
     }
 
@@ -797,10 +919,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: LOST is never a confirmed end (core
@@ -820,10 +942,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: success claimed without terminal proof.
@@ -835,10 +957,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
         // Internally contradictory: quiescence claimed without terminality.
@@ -850,10 +972,10 @@ impl<'a> Dispatcher<'a> {
                 failure_class,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
-                failure_class,
+                failure_class: Some(failure_class),
             });
         }
 
@@ -900,18 +1022,29 @@ impl<'a> Dispatcher<'a> {
                                 outcome.quiescent_confirmed,
                             )
                             .map_err(DispatchError::Persistence)?;
-                        return Ok(DispatchOneOutcome::StartAmbiguous {
+                        return Ok(DispatchOneOutcome::StartIndeterminate {
                             execution_id: execution_id.clone(),
                             request_id: request_id.clone(),
+                            failure_class: None,
                         });
                     }
                     Err(err) => return Err(DispatchError::Persistence(err)),
                 };
-                return Ok(DispatchOneOutcome::CompletedSynchronously {
-                    execution_id: execution_id.clone(),
-                    request_id: request_id.clone(),
-                    result_id,
-                });
+                return match result_id {
+                    Some(result_id) => Ok(DispatchOneOutcome::TaskCompleted {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                        result_id,
+                    }),
+                    // ack_success returned None: the physical success was
+                    // durable but writer safety suspended the Task instead of
+                    // completing it (WRITER_SUCCESS_NOT_QUIESCENT). This is
+                    // NOT a Task completion.
+                    None => Ok(DispatchOneOutcome::WriterSafetySuspendedAfterSuccess {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                    }),
+                };
             }
             // Authoritative terminal failure. Physical evidence (the
             // locator) is committed BEFORE the authority consequence when
@@ -933,7 +1066,7 @@ impl<'a> Dispatcher<'a> {
                 outcome.quiescent_confirmed,
                 Some(observed_handle),
             )?;
-            return Ok(DispatchOneOutcome::StartFailed {
+            return Ok(DispatchOneOutcome::TerminalFailure {
                 execution_id: execution_id.clone(),
                 request_id: request_id.clone(),
                 failure_class,
@@ -949,9 +1082,10 @@ impl<'a> Dispatcher<'a> {
             failure_class,
             Some(observed_handle),
         )?;
-        Ok(DispatchOneOutcome::StartAmbiguous {
+        Ok(DispatchOneOutcome::StartIndeterminate {
             execution_id: execution_id.clone(),
             request_id: request_id.clone(),
+            failure_class: Some(failure_class),
         })
     }
 
@@ -1872,7 +2006,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Replay attempt A's proof onto attempt B: rejected on identity, even
         // though target and profile coincide.
         let err = kernel
-            .create_execution(&claim_b, env_a.physical_binding())
+            .create_execution(&claim_b, env_a.physical_binding().unwrap())
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidAuthority(_)),
@@ -2201,7 +2335,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     fn dispatch_one_returns_no_work_without_claimable_tasks() {
         let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
     }
 
     /// §1, §16-19, §21, §23: one eligible claim becomes exactly one
@@ -2219,8 +2356,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let admission = match &outcome {
-            DispatchOneOutcome::StartedRunning { admission } => admission,
-            other => panic!("expected StartedRunning, got {other:?}"),
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
         };
         let execution_id = admission.execution_id().clone();
         let request_id = admission.request_id().clone();
@@ -2366,10 +2503,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut claim = kernel.claim_next_available().unwrap().unwrap();
         claim.execution_target = "missing-target".to_string();
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2384,10 +2521,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut claim = kernel.claim_next_available().unwrap().unwrap();
         claim.execution_profile = "missing-profile".to_string();
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2402,10 +2539,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let claim = kernel.claim_next_available().unwrap().unwrap();
         clock.advance(25.0); // lease expired
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2428,7 +2565,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         claim.batch_id = agentype_core::BatchId::new();
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         let last = fake.last_request().unwrap();
         assert_eq!(last.payload(), &durable_payload);
         assert_eq!(last.acceptance(), &durable_acceptance);
@@ -2447,7 +2587,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         claim.workspace_mode = agentype_core::WorkspaceMode::Write;
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         assert_eq!(
             fake.last_request().unwrap().workspace_mode(),
             agentype_core::WorkspaceMode::ReadOnly
@@ -2464,7 +2607,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         assert_eq!(
             fake.last_request().unwrap().workspace_mode(),
             agentype_core::WorkspaceMode::Write
@@ -2486,14 +2632,15 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
                 request_id,
+                ..
             } => {
                 assert_ne!(*request_id, agentype_core::RequestId::new());
                 execution_id.clone()
             }
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         assert_eq!(fake.start_call_count(), 1);
         assert_eq!(
@@ -2507,7 +2654,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
         // No blind re-dispatch: the retry wait is not claimable and nothing
         // starts a second time.
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -2544,7 +2694,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::TerminalFailure {
                 execution_id,
                 failure_class,
                 ..
@@ -2552,7 +2702,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 assert_eq!(*failure_class, FailureClass::Timeout);
                 execution_id.clone()
             }
-            other => panic!("expected StartFailed, got {other:?}"),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Failed);
@@ -2591,10 +2741,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
-                assert!(result_id.is_some());
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => {
+                assert!(!result_id.as_str().is_empty());
             }
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
@@ -2612,7 +2762,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
         let last = fake.last_request().unwrap();
         assert_eq!(
             last.target_options(),
@@ -2641,8 +2794,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2686,8 +2839,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartFailed, got {other:?}"),
+            DispatchOneOutcome::TerminalFailure { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -2713,8 +2866,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2759,7 +2912,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::TerminalFailure {
                 execution_id,
                 failure_class,
                 ..
@@ -2767,7 +2920,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 assert_eq!(*failure_class, FailureClass::Timeout);
                 execution_id.clone()
             }
-            other => panic!("expected StartFailed, got {other:?}"),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -2811,8 +2964,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2856,15 +3009,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class,
+                failure_class: Some(FailureClass::InvalidResult),
                 ..
-            } => {
-                assert_eq!(*failure_class, FailureClass::InvalidResult);
-                execution_id.clone()
-            }
-            other => panic!("expected StartFailed, got {other:?}"),
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate(InvalidResult), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -2907,11 +3057,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::StartFailed {
-                failure_class: FailureClass::AdapterProtocolFailure,
+            DispatchOneOutcome::StartIndeterminate {
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => {}
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         }
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(fake.start_call_count(), 1);
@@ -2954,8 +3104,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3007,10 +3157,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         match &outcome {
-            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
-                assert!(result_id.is_some());
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => {
+                assert!(!result_id.as_str().is_empty());
             }
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
@@ -3042,8 +3192,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartAmbiguous, got {other:?}"),
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3097,12 +3247,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3143,12 +3293,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3179,12 +3329,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
@@ -3228,8 +3378,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected StartFailed, got {other:?}"),
+            DispatchOneOutcome::TerminalFailure { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TerminalFailure, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Failed);
@@ -3283,12 +3433,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3443,16 +3593,14 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
 
         let outcome = d.dispatch_one().unwrap();
-        let (execution_id, result_id) = match &outcome {
-            DispatchOneOutcome::CompletedSynchronously {
-                execution_id,
-                result_id,
-                ..
-            } => (execution_id.clone(), result_id.clone()),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        let execution_id = match &outcome {
+            DispatchOneOutcome::WriterSafetySuspendedAfterSuccess { execution_id, .. } => {
+                execution_id.clone()
+            }
+            other => panic!("expected WriterSafetySuspendedAfterSuccess, got {other:?}"),
         };
         // Writer-unsafe success produces no durable Result.
-        assert!(result_id.is_none());
+        assert!(kernel.result_for_task(&task_id).is_err());
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Succeeded);
         assert!(exec.terminal_confirmed);
@@ -3699,7 +3847,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let d = Dispatcher::new(&kernel, &registry, &adapters);
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
 
         let conn = rusqlite::Connection::open(&path).unwrap();
         let (state, adapter_kind): (String, String) = conn
@@ -3718,7 +3869,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
     /// Audit P1 (round 10, M5.3 prerequisite): a RUNNING observation
     /// carrying end-of-execution claims is internally contradictory and must
-    /// never reach the RUNNING confirmation / SupervisionAdmissionSeed.
+    /// never reach the RUNNING confirmation / SupervisionAdmission.
     /// Fail closed: unresolved physical state, zero inherited proof, handle
     /// preserved, protocol failure.
     #[test]
@@ -3741,12 +3892,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
-            DispatchOneOutcome::StartFailed {
+            DispatchOneOutcome::StartIndeterminate {
                 execution_id,
-                failure_class: FailureClass::AdapterProtocolFailure,
+                failure_class: Some(FailureClass::AdapterProtocolFailure),
                 ..
             } => execution_id.clone(),
-            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+            other => panic!("expected StartIndeterminate(AdapterProtocolFailure), got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Unknown);
@@ -3800,15 +3951,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
 
         let outcome = d.dispatch_claim(&claim).unwrap();
-        let (execution_id, result_id) = match &outcome {
-            DispatchOneOutcome::CompletedSynchronously {
-                execution_id,
-                result_id,
-                ..
-            } => (execution_id.clone(), result_id.clone()),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        let execution_id = match &outcome {
+            DispatchOneOutcome::TaskCompleted { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         };
-        assert!(result_id.is_some());
         let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Succeeded);
         let incarnation_id = exec.incarnation_id.clone();
@@ -3866,8 +4012,8 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         });
         let outcome1 = d.dispatch_claim(&claim1).unwrap();
         let execution_id1 = match &outcome1 {
-            DispatchOneOutcome::CompletedSynchronously { execution_id, .. } => execution_id.clone(),
-            other => panic!("expected CompletedSynchronously, got {other:?}"),
+            DispatchOneOutcome::TaskCompleted { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
         };
         let incarnation_id = kernel
             .execution(&execution_id1)
@@ -3893,7 +4039,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let outcome2 = d.dispatch_claim(&claim2).unwrap();
         assert!(matches!(
             outcome2,
-            DispatchOneOutcome::StartedRunning { .. }
+            DispatchOneOutcome::RunningAdmitted { .. }
         ));
         let last = fake.last_request().unwrap();
         assert_eq!(last.incarnation_id(), &incarnation_id);
@@ -3902,6 +4048,691 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(
             last.incarnation_runtime_handle(),
             &RuntimeHandle(serde_json::json!({"session": 7}))
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M5.3 outcome-vocabulary closure (M5.3 plan §2 / §47 #59-64): the
+    // public dispatch vocabulary separates physical certainty from
+    // Scheduler/task consequences.
+    // ------------------------------------------------------------------
+
+    /// #59: an adapter invocation error with possible side effects is
+    /// `StartIndeterminate` (the Execution is durably UNKNOWN with the
+    /// failure class recorded) — never a terminal failure, never an
+    /// admission.
+    #[test]
+    fn invocation_error_is_start_indeterminate_not_terminal_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("indeterminate", Value::Null)])
+            .unwrap();
+        fake.set_next_start_error(AdapterError::Unavailable("worker gone mid-start".into()));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                execution_id,
+                failure_class: Some(FailureClass::ResourceUnavailable),
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
+        };
+        assert!(matches!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        ));
+    }
+
+    /// #60: an ambiguous observation is `StartIndeterminate` (also asserted
+    /// end-to-end by `dispatch_ambiguous_start_is_persisted_and_never_restarted`).
+    #[test]
+    fn ambiguous_observation_maps_to_start_indeterminate() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ambig-vocab", Value::Null)])
+            .unwrap();
+        fake.set_next_start(ambiguous_start());
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::StartIndeterminate { .. }
+        ));
+    }
+
+    /// #62 + #64: a successful synchronous ACK returns `TaskCompleted` with
+    /// a concrete (non-optional) `ResultId`, and `RunningAdmitted` is the
+    /// only outcome that carries a `SupervisionAdmission` — structurally
+    /// guaranteed by the enum shape and asserted here on the admitted path.
+    #[test]
+    fn task_completed_carries_concrete_result_and_only_running_admitted_carries_admission() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("vocab-complete", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": "vocab"})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": "vocab"})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let result_id = match &outcome {
+            DispatchOneOutcome::TaskCompleted { result_id, .. } => result_id.clone(),
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        };
+        assert_eq!(kernel.result_for_task(&task_id).unwrap().id, result_id);
+    }
+
+    /// #63: a physical success that writer safety refuses to complete is
+    /// `WriterSafetySuspendedAfterSuccess` — a distinct outcome, never
+    /// `TaskCompleted`.
+    #[test]
+    fn writer_safety_suspension_is_distinct_from_task_completed() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("vocab-suspend", Value::Null).write()])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"sync": "suspend"})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::WriterSafetySuspendedAfterSuccess { .. }
+        ));
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        assert!(kernel.result_for_task(&task_id).is_err());
+    }
+
+    // ==================================================================
+    // M5.3 supervision integration: dispatcher -> RunningAdmitted ->
+    // SupervisionService::admit handoff, renewal races, and writer safety
+    // (M5.3 plan §19, §42-§46).
+    // ==================================================================
+
+    fn supervision_timing() -> RuntimeTimingConfig {
+        RuntimeTimingConfig::new(1.0, 2.0, 10.0).unwrap()
+    }
+
+    /// §19/§42 #1-5: the dispatcher's `RunningAdmitted` outcome carries the
+    /// exact fenced identity; admitting it establishes heartbeat ownership,
+    /// and the service renews through the fenced primitive. No other
+    /// outcome can carry an admission (structural: only this variant has
+    /// the field).
+    #[test]
+    fn running_admitted_handoff_enters_supervision_and_renews() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("handoff", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
+        // The admission carries exactly the identity the fenced RUNNING
+        // confirmation confirmed - attempt, epoch, execution, request.
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.task_id, task_id);
+        assert_eq!(&attempt_id, &exec.attempt_id);
+        assert_eq!(
+            lease_epoch,
+            kernel.lease_for_attempt(&attempt_id).unwrap().epoch
+        );
+        assert!(!admission.request_id().as_str().is_empty());
+
+        // Handoff: registry insertion follows the committed first renewal.
+        service.admit(admission).unwrap();
+        assert!(service.contains(&execution_id));
+        assert_eq!(service.active_count(), 1);
+
+        clock.advance(1.0);
+        let now = kernel.now();
+        assert!(matches!(
+            service.renew_one(&execution_id).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+        let lease = kernel.lease_supervision_view(&attempt_id).unwrap();
+        assert_eq!(lease.expires_at, now + 10.0);
+        assert_eq!(lease.heartbeat_at, now);
+    }
+
+    /// §42 #6/#7/#8/#9: STARTING, UNKNOWN/ambiguous, and contradictory
+    /// RUNNING observations are `StartIndeterminate` - no supervision
+    /// admission is ever created.
+    #[test]
+    fn unresolved_start_observations_never_admit() {
+        for (name, observation) in [
+            (
+                "starting",
+                StartObservation {
+                    state: ExecutionState::Starting,
+                    runtime_handle: RuntimeHandle(Value::Null),
+                    ambiguous: false,
+                    failure_class: None,
+                    detail: None,
+                    terminal_confirmed: false,
+                    quiescent_confirmed: false,
+                },
+            ),
+            ("ambiguous", ambiguous_start()),
+            (
+                "contradictory-running",
+                StartObservation {
+                    state: ExecutionState::Running,
+                    runtime_handle: RuntimeHandle(Value::Null),
+                    ambiguous: false,
+                    failure_class: None,
+                    detail: None,
+                    terminal_confirmed: true,
+                    quiescent_confirmed: false,
+                },
+            ),
+        ] {
+            let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+            let kernel = Arc::new(kernel);
+            let d = Dispatcher::new(&kernel, &registry, &adapters);
+            let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+            let (_batch, _ids) = kernel
+                .submit_batch(&[TaskSpec::new(name, Value::Null)])
+                .unwrap();
+            fake.set_next_start(observation);
+
+            let outcome = d.dispatch_one().unwrap();
+            assert!(
+                matches!(outcome, DispatchOneOutcome::StartIndeterminate { .. }),
+                "{name} must be StartIndeterminate"
+            );
+            assert_eq!(
+                service.active_count(),
+                0,
+                "{name} must never enter supervision"
+            );
+        }
+    }
+
+    /// §42 #10/#11: an authoritative collected terminal failure and a
+    /// synchronous Task completion never enter supervision.
+    #[test]
+    fn terminal_outcomes_never_admit() {
+        // Collected terminal failure.
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("term-fail", Value::Null)])
+            .unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::TerminalFailure { .. }
+        ));
+        assert_eq!(service.active_count(), 0);
+
+        // Synchronous Task completion.
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("term-ok", Value::Null)])
+            .unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(Value::Null),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::TaskCompleted { .. }));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §42 #12/#13: authority that goes stale (or expires) during the
+    /// confirmation creates NO admission; the outcome is
+    /// `StartIndeterminate` and the durable state keeps writer ambiguity.
+    #[test]
+    fn stale_confirmation_never_admits() {
+        let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", advancing).unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("stale-confirm", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::StartIndeterminate { .. }
+        ));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §42 #14: authority rejected before composition (a stale claim after
+    /// the Task was cancelled) creates no admission.
+    #[test]
+    fn authority_rejection_never_admits() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("rejected", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        kernel.cancel_task(&task_id, true).unwrap();
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::AuthorityRejected));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §45: ACK wins before the heartbeat - the heartbeat loses fencing,
+    /// supervision ownership is dropped, and the Task remains completed.
+    #[test]
+    fn race_ack_wins_before_heartbeat() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-ack", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
+        service.admit(admission).unwrap();
+
+        kernel
+            .ack_success(
+                &attempt_id,
+                lease_epoch,
+                Some(&execution_id),
+                &Value::Null,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            service.renew_one(&execution_id).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: execution_id.clone()
+            }
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
+        assert!(!service.contains(&execution_id));
+    }
+
+    /// §46: heartbeat wins immediately before the ACK - the lease extends
+    /// briefly, then the ACK closes authority normally and the Task
+    /// completes. No race may reopen a completed Task.
+    #[test]
+    fn race_heartbeat_wins_before_ack() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-heartbeat", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
+        service.admit(admission).unwrap();
+
+        clock.advance(1.0);
+        assert!(matches!(
+            service.renew_one(&execution_id).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+        kernel
+            .ack_success(
+                &attempt_id,
+                lease_epoch,
+                Some(&execution_id),
+                &Value::Null,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
+    }
+
+    /// §47: cancellation before the heartbeat closes current authority -
+    /// the renewal must lose fencing and the admission is dropped. The
+    /// heartbeat failure path itself never establishes a terminality or
+    /// quiescence proof (#53/#54): the proof bits stay untouched by
+    /// supervision.
+    #[test]
+    fn race_cancellation_closes_renewal_authority() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-cancel", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+
+        kernel.cancel_task(&task_id, true).unwrap();
+        assert_eq!(
+            service.renew_one(&execution_id).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: execution_id.clone()
+            }
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Cancelled);
+        assert!(!service.contains(&execution_id));
+        // The supervision drop itself wrote no proof bits anywhere: the
+        // execution row is exactly as cancellation left it.
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+    }
+
+    /// §49: MERGE during a running Attempt does not alter the heartbeat
+    /// authority identity - the frozen Attempt binding survives, and the
+    /// supervised renewal keeps succeeding under the same Attempt/epoch.
+    #[test]
+    fn race_merge_preserves_heartbeat_identity() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general2",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-merge", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+
+        kernel.merge_partitions("general", "general2").unwrap();
+        clock.advance(1.0);
+        assert!(matches!(
+            service.renew_one(&execution_id).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+    }
+
+    /// §55: lease expiry after supervision loss does NOT by itself permit a
+    /// duplicate unisolated WRITE writer - writer safety suspends with
+    /// WRITER_QUIESCENCE_UNKNOWN and no replacement is dispatched.
+    #[test]
+    fn supervision_loss_then_expiry_suspends_unisolated_writer() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-expiry", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+
+        // Supervision ownership is lost (e.g. local shutdown); nothing about
+        // the physical writer is proven.
+        service.remove(&execution_id).unwrap();
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+
+        let exec = kernel.execution(&execution_id).unwrap();
+        let task = kernel.task(&exec.task_id).unwrap();
+        assert_eq!(task.state, TaskState::Suspended);
+        // No duplicate writer: the suspended task is not dispatchable.
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+    }
+
+    /// §56: isolated-writer recovery continues to depend on the persisted
+    /// `attempt_isolation` fact, not on the supervision registry - after
+    /// supervision loss and expiry the Task retries under policy and a
+    /// fresh attempt is dispatchable.
+    #[test]
+    fn isolated_writer_recovery_follows_persisted_isolation_not_registry() {
+        let (kernel, clock, _registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        // An isolated registry generation: same target name, isolation on.
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default").with_timeout(30.0))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-isolated", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        assert!(kernel.execution(&execution_id).unwrap().attempt_isolation);
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
+
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+        let exec = kernel.execution(&execution_id).unwrap();
+        let task = kernel.task(&exec.task_id).unwrap();
+        assert_eq!(task.state, TaskState::RetryWait);
+
+        // The deterministic retry backoff must elapse before the retry
+        // wait is promoted back to QUEUED.
+        clock.advance(2.0);
+        kernel.promote_retry_wait().unwrap();
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
+        assert_eq!(fake.start_call_count(), 2);
+    }
+
+    /// §57: removing supervision ownership does not permit a WRITE
+    /// replacement - the Task authority is untouched and nothing is
+    /// re-dispatched.
+    #[test]
+    fn removing_ownership_does_not_permit_write_replacement() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-remove", Value::Null).write()])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
+
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Running);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+    }
+
+    /// §58: stale writer physical state remains recoverable/reconcilable -
+    /// after supervision loss and lease expiry the Execution row keeps its
+    /// physical state and observed handle untouched (M5.4 owns
+    /// reconciliation).
+    #[test]
+    fn supervision_loss_preserves_reconcilable_physical_state() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-reconcile", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
+
+        let before = kernel.execution(&execution_id).unwrap();
+        let handle_before = kernel.execution_runtime_handle(&execution_id).unwrap();
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+        let after = kernel.execution(&execution_id).unwrap();
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.terminal_confirmed, after.terminal_confirmed);
+        assert_eq!(before.quiescent_confirmed, after.quiescent_confirmed);
+        assert_eq!(
+            handle_before,
+            kernel.execution_runtime_handle(&execution_id).unwrap()
         );
     }
 }

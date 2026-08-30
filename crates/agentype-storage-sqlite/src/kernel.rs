@@ -8,6 +8,32 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Mechanical outcome of a supervised heartbeat renewal (M5.3 §10/§11).
+///
+/// `Renewed` means the Scheduler continues granting the current Attempt
+/// execution authority for another lease interval. `NotRunning` means the
+/// Execution exists, belongs to the Attempt, and the Attempt/Lease authority
+/// was still valid — but the Execution is no longer physically RUNNING;
+/// supervision ownership must be dropped and the durable physical state must
+/// NOT be repaired from heartbeat code. Authority loss and storage faults
+/// remain `Err(Error)` for the caller to classify: stale/invalid/not-found →
+/// authority loss, anything else → fatal persistence fault (M5.3 §15).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SupervisedRenewal {
+    Renewed(UnixTime),
+    NotRunning,
+}
+
+/// Narrow supervision view of a lease: renewal bookkeeping only (heartbeat
+/// bookkeeping, expiry, state). Test and timing assertion surface — it grants
+/// no authority.
+#[derive(Clone, Copy, Debug)]
+pub struct LeaseSupervisionView {
+    pub heartbeat_at: UnixTime,
+    pub expires_at: UnixTime,
+    pub state: LeaseState,
+}
 use std::sync::Arc;
 
 pub struct Kernel {
@@ -51,8 +77,13 @@ impl Kernel {
         lease_seconds: f64,
         continuity_max_bytes: usize,
     ) -> Result<Self, Error> {
-        if lease_seconds <= 0.0 {
-            return Err(Error::invalid_transition("lease_seconds must be positive"));
+        // Finite-authority gate (M5.3 audit P1-4): NaN passes `<= 0.0`
+        // comparisons and an infinite lease could never naturally expire,
+        // so lease authority must be finite AND positive.
+        if !(lease_seconds.is_finite() && lease_seconds > 0.0) {
+            return Err(Error::invalid_transition(
+                "lease_seconds must be finite and positive",
+            ));
         }
         if continuity_max_bytes == 0 {
             return Err(Error::invalid_transition(
@@ -71,12 +102,25 @@ impl Kernel {
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>, UnixTime) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let now = self.clock.now();
-        self.store.with_immediate_at(now, f)
+        // The transaction timestamp is sampled by the store AFTER the
+        // connection lock and BEGIN IMMEDIATE succeed (M5.3 audit P1-1):
+        // authority validation must never run against a clock reading
+        // taken before the transaction won the SQLite write
+        // serialization, or a contended renewal could resurrect an
+        // already-expired lease.
+        self.store.with_immediate_clock(self.clock.as_ref(), f)
     }
 
     pub fn now(&self) -> UnixTime {
         self.clock.now()
+    }
+
+    /// The lease duration this Kernel grants on every renewal. Read-only
+    /// configuration accessor so runtime composition can validate a
+    /// heartbeat policy against Kernel-owned lease authority without
+    /// duplicating it (M5.3 §30).
+    pub fn lease_seconds(&self) -> f64 {
+        self.lease_seconds
     }
 
     pub fn pragmas(&self) -> Result<(String, i64, i64), Error> {
@@ -910,6 +954,14 @@ impl Kernel {
         physical_binding: FrozenPhysicalExecutionBinding,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
         let safety = physical_binding.safety();
+        // Kernel invariant check (M5.3 §36): the frozen adapter routing
+        // identity is required for every execution commitment — defense in
+        // depth behind the typed constructor validation.
+        if physical_binding.adapter_kind().trim().is_empty() {
+            return Err(Error::invalid_authority(
+                "execution commitment requires a non-blank adapter routing identity",
+            ));
+        }
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
@@ -1911,6 +1963,12 @@ impl Kernel {
         })
     }
 
+    /// LEGACY M4 primitive (frozen test surface only). This renewal is
+    /// fenced by attempt_id + lease_epoch alone: it takes no execution
+    /// identity and is NOT wired to supervision admission. Production
+    /// periodic renewal MUST use `renew_supervised_execution`, which is
+    /// fenced by the positively admitted execution identity. Visibility
+    /// reduction is scheduled for the M5.8 composition freeze.
     pub fn heartbeat(
         &self,
         attempt_id: &AttemptId,
@@ -1940,6 +1998,69 @@ impl Kernel {
             )
             .map_err(map_sqlite)?;
             Ok(expires_at)
+        })
+    }
+
+    /// Fenced periodic renewal for a positively admitted Execution (M5.3).
+    ///
+    /// Every call revalidates current durable authority: the Attempt is
+    /// ACTIVE, the Lease is ACTIVE and unexpired, the fencing epoch matches,
+    /// `task.current_attempt_id` matches, and the named Execution belongs to
+    /// the Attempt and is physically RUNNING. Renewal is fenced by
+    /// `attempt_id` + `lease_epoch` + `execution_id` — never by TaskId or
+    /// LogicalAgentId alone. An already-expired lease fails stale; a renewal
+    /// can never revive expired authority.
+    pub fn renew_supervised_execution(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        execution_id: &ExecutionId,
+    ) -> Result<SupervisedRenewal, Error> {
+        let lease_seconds = self.lease_seconds;
+        self.tx(|tx, now| {
+            let (attempt, lease, _) =
+                validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            let execution = required_execution(tx, execution_id.as_str())?;
+            if execution.attempt_id != attempt.id {
+                return Err(Error::stale("execution does not belong to current attempt"));
+            }
+            if execution.state != "RUNNING" {
+                return Ok(SupervisedRenewal::NotRunning);
+            }
+            let expires_at = now + lease_seconds;
+            tx.execute(
+                "UPDATE leases SET heartbeat_at=?1,expires_at=?2 WHERE id=?3",
+                params![now, expires_at, lease.id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(SupervisedRenewal::Renewed(expires_at))
+        })
+    }
+
+    pub fn lease_supervision_view(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<LeaseSupervisionView, Error> {
+        self.store.query(|conn| {
+            conn.query_row(
+                "SELECT heartbeat_at,expires_at,state FROM leases WHERE attempt_id=?1",
+                params![attempt_id.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, UnixTime>(0)?,
+                        r.get::<_, UnixTime>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(map_sqlite)
+            .and_then(|(heartbeat_at, expires_at, state)| {
+                Ok(LeaseSupervisionView {
+                    heartbeat_at,
+                    expires_at,
+                    state: LeaseState::parse_sql(&state)?,
+                })
+            })
         })
     }
 
