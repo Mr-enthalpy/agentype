@@ -189,6 +189,9 @@ from a start that never happened.
 | 41a | audit r3: unresolved collect keeps observed handle | `dispatch_start_failure_claim_never_bypasses_collect` (handle assertion) |
 | 41b | audit r3: ambiguous observation keeps observed handle | `dispatch_ambiguous_start_is_persisted_and_never_restarted` (handle assertion) |
 | 41c | audit r3: unusual nonterminal shape keeps observed handle | `dispatch_unusual_nonterminal_observation_keeps_observed_handle` |
+| 42a | audit r4: RUNNING + terminal proof → protocol failure, WRITE suspends | `dispatch_running_state_with_terminal_proof_is_protocol_failure` |
+| 42b | audit r4: STARTING + terminal proof → protocol failure | `dispatch_starting_state_with_terminal_proof_is_protocol_failure` |
+| 42c | audit r4: UNKNOWN + terminal proof → protocol failure | `dispatch_unknown_state_with_terminal_proof_is_protocol_failure` |
 
 ---
 
@@ -237,19 +240,19 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 170 passed, 0 failed
+cargo test --workspace                                   → 173 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (170):
+Rust breakdown (173):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 45 (M5.1 façade 13 + composition 6 + dispatcher 26)
+- `agentype-runtime`: 48 (M5.1 façade 13 + composition 6 + dispatcher 29)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -359,3 +362,19 @@ Rust breakdown (170):
 10. **Registered for M5.4/M5.3 (not implemented in M5.2):** durable adapter binding identity
    (P1, M5.4 hard prerequisite — see §8), outcome vocabulary refinement (P2), no-start
    STARTING-row typed composition (P2). See §8 for the full statements.
+
+### Round 4 (fourth audit)
+
+11. **An ACTIVE physical state with terminal proof is rejected as contradictory (P1, merge
+    blocker, corrected).** `commit_collected_outcome` checked success-without-terminal-proof and
+    quiescence-without-terminality but accepted state=RUNNING/STARTING/UNKNOWN together with
+    `terminal_confirmed=true`, routing it into the terminal-failure NACK where
+    `durable_quiescent = terminal && quiescent` injected a quiescence proof through the failure
+    path — a WRITE task would RETRY_WAIT and permit a replacement writer while the adapter
+    reports the physical execution still active. `commit_collected_outcome` now fails closed at
+    its head on `terminal_confirmed && state.is_active_physical()`: unresolved physical state
+    (UNKNOWN, zero inherited proof), observed handle preserved, nonterminal NACK under
+    ADAPTER_PROTOCOL_FAILURE; for a WRITE task without attempt isolation this lands SUSPENDED
+    with WRITER_QUIESCENCE_UNKNOWN — never RETRY_WAIT. Regressions: RUNNING/STARTING/UNKNOWN
+    each with terminal+quiescent proof and a retryable failure class (mapping rows 42a-42c);
+    the RUNNING case asserts the full writer-safety discriminator.
