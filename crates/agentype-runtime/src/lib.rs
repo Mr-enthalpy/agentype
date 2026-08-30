@@ -626,7 +626,31 @@ impl<'a> Dispatcher<'a> {
         observation: StartObservation,
     ) -> Result<DispatchOneOutcome, DispatchError> {
         // RUNNING: fenced confirmation + first lease renewal must succeed
-        // atomically before any supervision admission (M4 invariant).
+        // atomically before any supervision admission (M4 invariant) — and
+        // only a protocol-consistent observation may reach that admission.
+        // An ACTIVE state carrying end-of-execution claims (terminal proof,
+        // quiescence proof, or a failure class) is internally contradictory;
+        // fail closed as unresolved so no SupervisionAdmissionSeed can ever
+        // be minted from it (M5.3 prerequisite, audit round 10).
+        if observation.state == ExecutionState::Running
+            && !observation.ambiguous
+            && (observation.terminal_confirmed
+                || observation.quiescent_confirmed
+                || observation.failure_class.is_some())
+        {
+            let failure_class = FailureClass::AdapterProtocolFailure;
+            self.persist_unresolved_physical_then_nack(
+                claim,
+                execution_id,
+                failure_class,
+                Some(&observation.runtime_handle.0),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
         if observation.state == ExecutionState::Running && !observation.ambiguous {
             return match self.kernel.confirm_running_and_renew(
                 &claim.attempt_id,
@@ -3681,5 +3705,51 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             adapter_kind, "process",
             "the commitment transaction must freeze the resolved adapter binding identity"
         );
+    }
+
+    /// Audit P1 (round 10, M5.3 prerequisite): a RUNNING observation
+    /// carrying end-of-execution claims is internally contradictory and must
+    /// never reach the RUNNING confirmation / SupervisionAdmissionSeed.
+    /// Fail closed: unresolved physical state, zero inherited proof, handle
+    /// preserved, protocol failure.
+    #[test]
+    fn dispatch_contradictory_running_observation_never_reaches_admission() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("contradictory-running", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Running,
+            runtime_handle: RuntimeHandle(serde_json::json!({"odd": 3})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"odd": 3})
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+        // No admission: the task is not RUNNING and no lease renewal happened.
+        assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Running);
+        assert_eq!(fake.start_call_count(), 1);
     }
 }
