@@ -861,9 +861,12 @@ impl<'a> Dispatcher<'a> {
             if outcome.state == ExecutionState::Succeeded {
                 // Authoritative success: the only path to ACK. Physical
                 // evidence (the locator) is committed BEFORE the authority
-                // consequence when quiescence is not proven.
+                // consequence when quiescence is not proven (cleanup locator)
+                // OR when the incarnation is reusable (continuity locator:
+                // a WARM promotion must keep the handle the next execution
+                // on this resident incarnation will need).
                 let payload = outcome.payload.clone().unwrap_or(Value::Null);
-                if !outcome.quiescent_confirmed {
+                if !outcome.quiescent_confirmed || outcome.incarnation_reusable {
                     self.persist_terminal_evidence(
                         execution_id,
                         observed_handle,
@@ -1001,10 +1004,16 @@ impl<'a> Dispatcher<'a> {
     /// physical locator crash-durable (audit round 8): a crash between the
     /// evidence transaction and the authority transaction leaves the locator
     /// durable with the authority consequence unapplied — safe to reconcile —
-    /// never the reverse. Only needed when quiescence is not proven; a
-    /// quiescence-proven end needs no physical-cleanup locator. The terminal
-    /// state itself is applied by the authority transaction (UNKNOWN ->
-    /// SUCCEEDED/FAILED), preserving the frozen Kernel API.
+    /// never the reverse. The terminal state itself is applied by the
+    /// authority transaction (UNKNOWN -> SUCCEEDED/FAILED), preserving the
+    /// frozen Kernel API.
+    ///
+    /// Two locator kinds justify the pre-persist (audit round 11): a CLEANUP
+    /// locator when quiescence is not proven (physical state unresolved), and
+    /// a CONTINUITY locator when the incarnation is reusable (a WARM
+    /// promotion must keep the handle the next execution on this resident
+    /// incarnation will read). Only a quiescence-proven, non-reusable end
+    /// deliberately skips it.
     fn persist_terminal_evidence(
         &self,
         execution_id: &ExecutionId,
@@ -3751,5 +3760,148 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // No admission: the task is not RUNNING and no lease renewal happened.
         assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Running);
         assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 11): a synchronous reusable success must preserve the
+    /// observed handle as the WARM incarnation's continuity locator — the
+    /// ack path never writes it, and the pre-ACK evidence record is what
+    /// keeps it durable.
+    #[test]
+    fn dispatch_reusable_sync_success_keeps_warm_incarnation_handle() {
+        let (kernel, path, claim) = file_dispatch_env("continuity-warm");
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", fake.clone()).unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"session": 7})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: Some("done".into()),
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: true,
+        });
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        let (execution_id, result_id) = match &outcome {
+            DispatchOneOutcome::CompletedSynchronously {
+                execution_id,
+                result_id,
+                ..
+            } => (execution_id.clone(), result_id.clone()),
+            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        };
+        assert!(result_id.is_some());
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Succeeded);
+        let incarnation_id = exec.incarnation_id.clone();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (inc_state, inc_handle): (String, String) = conn
+            .query_row(
+                "SELECT state,runtime_handle_json FROM incarnations WHERE id=?1",
+                [&incarnation_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inc_state, "WARM");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&inc_handle).unwrap(),
+            serde_json::json!({"session": 7})
+        );
+    }
+
+    /// Audit P1 (round 11): the continuity locator survives into the next
+    /// launch on the same resident incarnation — the next
+    /// ExecutionLaunchSnapshot carries the previously observed handle.
+    #[test]
+    fn dispatch_next_launch_carries_continuity_locator() {
+        let (kernel, _path, claim1) = file_dispatch_env("continuity-next");
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", fake.clone()).unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"session": 7})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: Some("done".into()),
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: true,
+        });
+        let outcome1 = d.dispatch_claim(&claim1).unwrap();
+        let execution_id1 = match &outcome1 {
+            DispatchOneOutcome::CompletedSynchronously { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        };
+        let incarnation_id = kernel
+            .execution(&execution_id1)
+            .unwrap()
+            .incarnation_id
+            .clone();
+
+        // Second task on the same resident LogicalAgent / WARM incarnation.
+        kernel
+            .submit_batch(&[TaskSpec::new("continuity-second", Value::Null)])
+            .unwrap();
+        let claim2 = kernel.claim_next_available().unwrap().unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Running,
+            runtime_handle: RuntimeHandle(serde_json::json!({"session": 8})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+
+        let outcome2 = d.dispatch_claim(&claim2).unwrap();
+        assert!(matches!(
+            outcome2,
+            DispatchOneOutcome::StartedRunning { .. }
+        ));
+        let last = fake.last_request().unwrap();
+        assert_eq!(last.incarnation_id(), &incarnation_id);
+        // The continuity locator observed on attempt 1 flows into attempt 2's
+        // launch snapshot.
+        assert_eq!(
+            last.incarnation_runtime_handle(),
+            &RuntimeHandle(serde_json::json!({"session": 7}))
+        );
     }
 }
