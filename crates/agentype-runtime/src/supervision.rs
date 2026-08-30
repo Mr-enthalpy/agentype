@@ -9,7 +9,11 @@
 //!   specific moment this runtime observed RUNNING and successfully committed
 //!   the fenced RUNNING + first-renewal transaction for this Attempt. It is
 //!   minted exclusively as the live return value of that transaction — a
-//!   persisted `state='RUNNING'` Execution row can never produce one.
+//!   persisted `state='RUNNING'` Execution row can never produce one. It is
+//!   a **move-only capability**: `admit` consumes the token, so one
+//!   admission has exactly one supervisor owner and a consumed/dropped
+//!   token can never be replayed anywhere (only a fresh authoritative mint
+//!   re-enters supervision — the M5.4 re-admission shape).
 //! - **Supervision ownership** (ephemeral, runtime-local): "this runtime
 //!   instance currently owns heartbeat responsibility for this admitted
 //!   Execution". It is NOT reconstructed from SQLite on startup; after a
@@ -21,6 +25,16 @@
 //! exists", or "the Task is running". The database remains authoritative for
 //! whether a renewal actually succeeds.
 //!
+//! Deadline scheduling (M5.3 audit P1-1): the heartbeat loop is a deadline
+//! scheduler, not a fixed-phase ticker. Every entry's `next_due_at` is
+//! anchored at the fenced first-renewal COMMIT time carried by the admission
+//! (never the handoff/insertion time); each successful renewal re-anchors at
+//! its own commit time; the loop sleeps until the earliest deadline and is
+//! woken on every ownership mutation, so a healthy supervisor can never
+//! schedule itself past the durable expiry under any legal timing
+//! (`dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`, with no
+//! `heartbeat <= lease/2` headroom requirement).
+//!
 //! Crash window (M5.3 plan §20): if the runtime crashes after the first
 //! renewal is committed but before the admission is inserted, no further
 //! renewal occurs, the Lease eventually expires, and M5.4 reconciliation
@@ -29,7 +43,7 @@
 
 use crate::timing::{validate_lease_authority_match, RuntimeTimingConfig};
 use crate::{Error, ExecutionId, SupervisionAdmission};
-use agentype_core::UnixTime;
+use agentype_core::{AttemptId, LeaseEpoch, RequestId, UnixTime};
 use agentype_storage_sqlite::{Kernel, SupervisedRenewal};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -73,6 +87,9 @@ pub enum SupervisionError {
     /// The same ExecutionId was presented with a different attempt_id,
     /// lease_epoch, or request_id. Never silently replaced.
     AdmissionIdentityConflict,
+    /// The admission capability's timing is malformed: non-finite anchor or
+    /// expiry, or an expiry that does not follow the first renewal.
+    InvalidAdmission(String),
     /// No registry entry under this execution id.
     NoSuchEntry,
     /// The composed timing configuration disagrees with the Kernel's actual
@@ -96,6 +113,9 @@ impl fmt::Display for SupervisionError {
                 f,
                 "supervision admission identity conflicts with the existing entry"
             ),
+            Self::InvalidAdmission(detail) => {
+                write!(f, "supervision admission is malformed: {detail}")
+            }
             Self::NoSuchEntry => write!(f, "no supervision entry for this execution"),
             Self::LeaseAuthorityMismatch { configured, kernel } => write!(
                 f,
@@ -108,11 +128,69 @@ impl fmt::Display for SupervisionError {
 
 impl std::error::Error for SupervisionError {}
 
-/// One supervised execution entry. Runtime-local bookkeeping only.
+/// The durable identity portion of an admission, used for registry
+/// bookkeeping and renewal snapshots (M5.3 audit P1-3): the move-only
+/// capability is consumed at `admit`, and the registry keeps ONLY this plain
+/// identity — the capability itself is never stored, cloned, or re-issuable.
+#[derive(Debug, Clone)]
+pub(crate) struct SupervisionIdentity {
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    lease_epoch: LeaseEpoch,
+    generation: u64,
+}
+
+impl SupervisionIdentity {
+    pub(crate) fn new(
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        attempt_id: AttemptId,
+        lease_epoch: LeaseEpoch,
+        generation: u64,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_id,
+            attempt_id,
+            lease_epoch,
+            generation,
+        }
+    }
+
+    pub(crate) fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub(crate) fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub(crate) fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Exact identity equality (the four durable identity fields). The
+    /// ephemeral generation is deliberately excluded: two admissions with
+    /// the same identity describe the same admitted authority.
+    pub(crate) fn same_identity(&self, other: &SupervisionIdentity) -> bool {
+        self.execution_id == other.execution_id
+            && self.request_id == other.request_id
+            && self.attempt_id == other.attempt_id
+            && self.lease_epoch == other.lease_epoch
+    }
+}
+
+/// One supervised execution entry. Runtime-local bookkeeping only: the
+/// plain identity snapshot plus the deadline-scheduling anchor.
 #[derive(Debug, Clone)]
 struct SupervisedExecution {
-    admission: SupervisionAdmission,
-    last_renewal_at: UnixTime,
+    identity: SupervisionIdentity,
+    next_due_at: UnixTime,
 }
 
 /// In-memory registry of the executions THIS runtime instance currently owns
@@ -120,13 +198,13 @@ struct SupervisedExecution {
 ///
 /// It starts empty on construction, is never restored from the database, and
 /// is authoritative only for "which executions this runtime may attempt to
-/// renew". Duplicate insertion is idempotent only when the admission
-/// identity is exactly identical; the same ExecutionId with a different
-/// attempt/epoch/request is an invariant violation (M5.3 §8). A removed
-/// admission's generation is consumed: re-presenting the same token can
-/// never resume renewal — only a fresh authoritative mint may re-admit
-/// (M5.3 §16/§41; the future M5.4 re-admission flow mints fresh tokens and
-/// is unaffected).
+/// renew". Admissions are move-only capabilities: `admit` consumes the token,
+/// so the same capability can never be presented to a second registry, and
+/// the only way to re-admit an execution is a fresh authoritative mint (the
+/// M5.4 re-admission shape). A duplicate insertion is idempotent only when
+/// the identity is exactly identical; the same ExecutionId with a different
+/// attempt/epoch/request is an invariant violation (M5.3 §8), never a silent
+/// replacement.
 #[derive(Default)]
 pub struct SupervisionRegistry {
     entries: HashMap<ExecutionId, SupervisedExecution>,
@@ -138,30 +216,33 @@ impl SupervisionRegistry {
         Self::default()
     }
 
-    /// Admit an execution for heartbeat supervision. The admission must be
-    /// the live return value of a successful fenced RUNNING confirmation +
-    /// first renewal transaction.
+    /// Admit an execution for heartbeat supervision, consuming the
+    /// admission capability. The admission must be the live return value of
+    /// a successful fenced RUNNING confirmation + first renewal transaction.
+    /// `next_due_at` is the deadline-scheduling anchor computed by the
+    /// service from the admission's first-renewal commit time.
     pub fn admit(
         &mut self,
         admission: SupervisionAdmission,
-        now: UnixTime,
+        next_due_at: UnixTime,
     ) -> Result<(), SupervisionError> {
-        if self.consumed_generations.contains(&admission.generation()) {
+        let identity = admission.identity();
+        if self.consumed_generations.contains(&identity.generation()) {
             return Err(SupervisionError::AdmissionConsumed);
         }
-        match self.entries.get(admission.execution_id()) {
-            Some(existing) if existing.admission.same_identity(&admission) => {
+        match self.entries.get(identity.execution_id()) {
+            Some(existing) if existing.identity.same_identity(&identity) => {
                 // Exactly identical identity: idempotent re-admission of the
-                // same authority.
+                // same admitted authority.
                 Ok(())
             }
             Some(_) => Err(SupervisionError::AdmissionIdentityConflict),
             None => {
                 self.entries.insert(
-                    admission.execution_id().clone(),
+                    identity.execution_id().clone(),
                     SupervisedExecution {
-                        last_renewal_at: now,
-                        admission,
+                        identity,
+                        next_due_at,
                     },
                 );
                 Ok(())
@@ -179,7 +260,7 @@ impl SupervisionRegistry {
             .remove(execution_id)
             .ok_or(SupervisionError::NoSuchEntry)?;
         self.consumed_generations
-            .insert(entry.admission.generation());
+            .insert(entry.identity.generation());
         Ok(())
     }
 
@@ -189,7 +270,7 @@ impl SupervisionRegistry {
     pub fn clear(&mut self) {
         for (_, entry) in self.entries.drain() {
             self.consumed_generations
-                .insert(entry.admission.generation());
+                .insert(entry.identity.generation());
         }
     }
 
@@ -205,46 +286,56 @@ impl SupervisionRegistry {
         self.entries.is_empty()
     }
 
-    fn entry_admission(&self, execution_id: &ExecutionId) -> Option<SupervisionAdmission> {
-        self.entries.get(execution_id).map(|e| e.admission.clone())
+    fn entry_identity(&self, execution_id: &ExecutionId) -> Option<SupervisionIdentity> {
+        self.entries.get(execution_id).map(|e| e.identity.clone())
     }
 
-    /// Snapshot the admissions due for renewal at `now`, cloned out so the
-    /// caller never holds the registry lock across the DB transaction
-    /// (M5.3 §51).
-    fn due(&self, now: UnixTime, interval_seconds: f64) -> Vec<SupervisionAdmission> {
+    /// Snapshot the entries due for renewal at `now`, cloned out as plain
+    /// identities so the caller never holds the registry lock across the DB
+    /// transaction (M5.3 §51) and never handles the admission capability.
+    fn due(&self, now: UnixTime) -> Vec<SupervisionIdentity> {
         self.entries
             .values()
-            .filter(|entry| now >= entry.last_renewal_at + interval_seconds)
-            .map(|entry| entry.admission.clone())
+            .filter(|entry| entry.next_due_at <= now)
+            .map(|entry| entry.identity.clone())
             .collect()
+    }
+
+    /// The earliest renewal deadline across all entries — the heartbeat
+    /// loop sleeps until exactly this point (M5.3 audit P1-1).
+    fn earliest_next_due(&self) -> Option<UnixTime> {
+        self.entries
+            .values()
+            .map(|e| e.next_due_at)
+            .reduce(f64::min)
     }
 
     /// Apply a successful renewal result, but only if the entry's admission
     /// generation is still the one the renewal was performed for — an old
     /// renewal result must never mutate a newer registry entry (M5.3 §52).
-    fn record_renewal(&mut self, admission: &SupervisionAdmission, at: UnixTime) {
+    /// `next_due_at` is re-anchored at the renewal's own commit time.
+    fn record_renewal(&mut self, identity: &SupervisionIdentity, next_due_at: UnixTime) {
         let current = self
             .entries
-            .get(admission.execution_id())
-            .is_some_and(|entry| entry.admission.generation() == admission.generation());
+            .get(identity.execution_id())
+            .is_some_and(|entry| entry.identity.generation() == identity.generation());
         if current {
-            if let Some(entry) = self.entries.get_mut(admission.execution_id()) {
-                entry.last_renewal_at = at;
+            if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
+                entry.next_due_at = next_due_at;
             }
         }
     }
 
     /// Apply a drop result (authority loss / no-longer-running), again only
     /// if the generation is still current.
-    fn remove_if_current(&mut self, admission: &SupervisionAdmission) {
+    fn remove_if_current(&mut self, identity: &SupervisionIdentity) {
         let current = self
             .entries
-            .get(admission.execution_id())
-            .is_some_and(|entry| entry.admission.generation() == admission.generation());
+            .get(identity.execution_id())
+            .is_some_and(|entry| entry.identity.generation() == identity.generation());
         if current {
-            drop(self.entries.remove(admission.execution_id()));
-            self.consumed_generations.insert(admission.generation());
+            drop(self.entries.remove(identity.execution_id()));
+            self.consumed_generations.insert(identity.generation());
         }
     }
 }
@@ -255,9 +346,16 @@ impl SupervisionRegistry {
 /// (`SupervisionRunner`) shares the same kernel + registry and wraps these
 /// operations in a dedicated thread.
 ///
-/// Cloning the service shares the same registry: the composition layer
-/// admits through one handle while the heartbeat loop renews through
-/// another.
+/// Cloning the service shares the same registry: it is one ownership domain
+/// with two handles, not two supervisors.
+///
+/// Fatal semantics (M5.3 §15, audit P2): this deterministic service is the
+/// primitive/testing surface — `renew_one`/`renew_due` return
+/// `Err(SupervisionError::Fatal)` and leave the entry in place; the service
+/// does not fail-stop by itself. The production fail-stop owner is
+/// [`SupervisionRunner`], which stops its loop and clears ownership on
+/// Fatal. A service that has produced a Fatal must not be reused for
+/// renewal; the Runner enforces this mechanically.
 pub struct SupervisionService {
     kernel: Arc<Kernel>,
     registry: Arc<Mutex<SupervisionRegistry>>,
@@ -301,14 +399,51 @@ impl SupervisionService {
         })
     }
 
+    /// The Kernel's current clock reading (the supervision clock IS the
+    /// Kernel clock — never an independent time source).
+    pub fn now(&self) -> UnixTime {
+        self.kernel.now()
+    }
+
+    /// The earliest renewal deadline across all owned entries, if any. The
+    /// heartbeat loop sleeps until exactly this point.
+    pub fn earliest_next_due(&self) -> Option<UnixTime> {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .earliest_next_due()
+    }
+
     /// Admit a successfully confirmed RUNNING execution for periodic
     /// renewal. The only way an execution enters supervision (M5.3 §21:
     /// registry insertion always follows the fenced first renewal, never
-    /// precedes it).
+    /// precedes it). This CONSUMES the move-only admission capability: the
+    /// same token can never be admitted anywhere again, which is what makes
+    /// "one runtime supervision owner per admitted Execution" structural
+    /// rather than per-registry discipline (M5.3 audit P1-3).
     pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
-        let now = self.kernel.now();
+        // Fail closed on a malformed capability: the scheduling anchor and
+        // the durable expiry must be finite, and the fenced first renewal
+        // must precede the expiry it produced.
+        if !admission.first_renewed_at().is_finite()
+            || !admission.lease_expires_at().is_finite()
+            || admission.lease_expires_at() <= admission.first_renewed_at()
+        {
+            return Err(SupervisionError::InvalidAdmission(format!(
+                "first_renewed_at={} lease_expires_at={}",
+                admission.first_renewed_at(),
+                admission.lease_expires_at()
+            )));
+        }
+        // Deadline scheduling (M5.3 audit P1-1): the next due point is
+        // anchored at the fenced first-renewal COMMIT time carried by the
+        // capability — never at the handoff/insertion time, so a delayed
+        // handoff cannot push the schedule past the durable expiry. With
+        // `heartbeat_interval < lease_seconds` (the §A2 gate), this due
+        // point is always strictly before the durable expiry.
+        let next_due_at = admission.first_renewed_at() + self.heartbeat_interval.as_secs_f64();
         let mut registry = self.registry.lock().expect("supervision registry lock");
-        registry.admit(admission, now)
+        registry.admit(admission, next_due_at)
     }
 
     /// Explicitly drop supervision ownership (terminal handling, invariant
@@ -337,28 +472,28 @@ impl SupervisionService {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<RenewalOutcome, SupervisionError> {
-        let admission = {
+        let identity = {
             let registry = self.registry.lock().expect("supervision registry lock");
             registry
-                .entry_admission(execution_id)
+                .entry_identity(execution_id)
                 .ok_or(SupervisionError::NoSuchEntry)?
         };
-        self.renew_admission(admission)
+        self.renew_identity(identity)
     }
 
-    /// Renew every entry whose renewal is due at `now` (deterministic tick).
-    /// A fatal persistence fault on any entry stops the batch and propagates.
+    /// Renew every entry whose deadline has arrived at `now` (deterministic
+    /// tick). A fatal persistence fault on any entry stops the batch and
+    /// propagates.
     pub fn renew_due(&self, now: UnixTime) -> Result<Vec<RenewalOutcome>, SupervisionError> {
-        let interval_seconds = self.heartbeat_interval.as_secs_f64();
         let due = {
             let registry = self.registry.lock().expect("supervision registry lock");
-            registry.due(now, interval_seconds)
+            registry.due(now)
         };
         let mut outcomes = Vec::with_capacity(due.len());
-        for admission in due {
+        for identity in due {
             // An entry removed concurrently between the snapshot and its
             // renewal is simply skipped: the drop already happened.
-            match self.renew_admission(admission) {
+            match self.renew_identity(identity) {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(SupervisionError::NoSuchEntry) => continue,
                 Err(e) => return Err(e),
@@ -376,14 +511,20 @@ impl SupervisionService {
     /// The renewal itself: short fenced Kernel transaction, registry lock
     /// NOT held (M5.3 §50/§51). The result is applied to the registry only
     /// if the admission generation is still current.
-    fn renew_admission(
+    fn renew_identity(
         &self,
-        admission: SupervisionAdmission,
+        identity: SupervisionIdentity,
     ) -> Result<RenewalOutcome, SupervisionError> {
-        let execution_id = admission.execution_id().clone();
+        let execution_id = identity.execution_id().clone();
+        // Anchor BEFORE the renewal (M5.3 audit P1-1): the next deadline is
+        // then anchor + interval, which is strictly earlier than the
+        // renewal's own new durable expiry (anchor + interval < anchor +
+        // lease under the §A2 gate) — a healthy supervisor can never
+        // schedule itself past the durable expiry.
+        let anchor = self.kernel.now();
         let outcome = match self.kernel.renew_supervised_execution(
-            admission.attempt_id(),
-            admission.lease_epoch(),
+            identity.attempt_id(),
+            identity.lease_epoch(),
             &execution_id,
         ) {
             Ok(SupervisedRenewal::Renewed(new_expires_at)) => RenewalOutcome::Renewed {
@@ -396,12 +537,12 @@ impl SupervisionService {
             }
             Err(err) => return Err(SupervisionError::Fatal(err)),
         };
-        let now = self.kernel.now();
+        let next_due_at = anchor + self.heartbeat_interval.as_secs_f64();
         let mut registry = self.registry.lock().expect("supervision registry lock");
         match &outcome {
-            RenewalOutcome::Renewed { .. } => registry.record_renewal(&admission, now),
+            RenewalOutcome::Renewed { .. } => registry.record_renewal(&identity, next_due_at),
             RenewalOutcome::AuthorityLost { .. } | RenewalOutcome::NoLongerRunning { .. } => {
-                registry.remove_if_current(&admission);
+                registry.remove_if_current(&identity);
             }
         }
         Ok(outcome)
@@ -429,13 +570,13 @@ struct RunnerShared {
     signal: Condvar,
 }
 
-/// The long-running heartbeat supervision loop (M5.3 §18): one dedicated
-/// thread owns a clone of the `SupervisionService` (sharing the same kernel
-/// and registry with the composition layer); a central loop wakes, snapshots
-/// the due admissions, renews each with a short fenced transaction, and
-/// sleeps until the next due point. No SQLite transaction is ever held
-/// across the wait, and no adapter I/O happens on the heartbeat path
-/// (M5.3 §27/§50).
+/// The long-running heartbeat supervision loop (M5.3 §18, audit P1-1): one
+/// dedicated thread owns a clone of the `SupervisionService` (sharing the
+/// same kernel and registry with the composition layer) and acts as a
+/// **deadline scheduler**: renew everything due → sleep until the earliest
+/// `next_due_at` (or the next ownership mutation, or shutdown) → repeat.
+/// No SQLite transaction is ever held across the wait, and no adapter I/O
+/// happens on the heartbeat path (M5.3 §27/§50).
 ///
 /// The thread is intentionally private and shared-nothing with the dispatcher
 /// thread(s); the future notifier (M5.5) will receive its own thread, so
@@ -445,6 +586,10 @@ struct RunnerShared {
 /// and is recorded on the runner. The loop is never restarted and the
 /// admissions are never reconstructed — that could renew stale authority.
 /// A panic in the loop surfaces through `shutdown`'s join.
+///
+/// Ownership lifecycle (M5.3 audit P1-2): dropping the runner stops and
+/// joins the heartbeat thread — ownership can never outlive its owner as a
+/// detached orphan that keeps renewing with no handle to stop or observe it.
 pub struct SupervisionRunner {
     service: SupervisionService,
     shared: Arc<RunnerShared>,
@@ -454,8 +599,8 @@ pub struct SupervisionRunner {
 impl SupervisionRunner {
     /// Start the heartbeat loop. Composition is validated before the thread
     /// spawns, so a timing/lease mismatch fails fast. Admissions enter
-    /// through the runner's service handles (`admit`), always AFTER the
-    /// dispatcher's fenced first renewal committed (M5.3 §21).
+    /// through the runner's handles (`admit`), always AFTER the dispatcher's
+    /// fenced first renewal committed (M5.3 §21).
     pub fn start(
         kernel: Arc<Kernel>,
         timing: RuntimeTimingConfig,
@@ -464,42 +609,56 @@ impl SupervisionRunner {
         let shared = Arc::new(RunnerShared::default());
         let thread_shared = shared.clone();
         let thread_service = service.clone();
-        let interval = timing.heartbeat_interval();
+        let idle_wait = timing.heartbeat_interval();
         let join = std::thread::Builder::new()
             .name("supervision-heartbeat".into())
             .spawn(move || {
-                loop {
-                    {
-                        let state = thread_shared.state.lock().expect("runner state lock");
+                'supervision: loop {
+                    // Renew everything whose deadline has arrived. Short
+                    // fenced transactions; no state lock held (M5.3 §50).
+                    if let Err(e) = thread_service.renew_due_now() {
+                        // Fatal (or unexpected) failure: stop the loop,
+                        // surface the fault, never restart, never
+                        // reconstruct admissions (M5.3 §34).
+                        let mut state = thread_shared.state.lock().expect("runner state lock");
+                        if state.fatal.is_none() {
+                            state.fatal = Some(e);
+                        }
+                        break 'supervision;
+                    }
+                    // Deadline wait (M5.3 audit P1-1): sleep until the
+                    // earliest next_due_at — recomputed under the state lock
+                    // so a concurrent ownership mutation (whose wake-up may
+                    // otherwise be lost) can never be overslept.
+                    let mut state = thread_shared.state.lock().expect("runner state lock");
+                    loop {
                         if state.shutting_down {
-                            break;
+                            break 'supervision;
                         }
-                    }
-                    match thread_service.renew_due_now() {
-                        Ok(_) => {}
-                        Err(e) => {
-                            // Fatal (or unexpected) failure: stop the loop,
-                            // surface the fault, never restart, never
-                            // reconstruct admissions (M5.3 §34).
-                            let mut state = thread_shared.state.lock().expect("runner state lock");
-                            if state.fatal.is_none() {
-                                state.fatal = Some(e);
+                        let wait: Duration = match thread_service.earliest_next_due() {
+                            Some(due) => {
+                                let remaining = due - thread_service.now();
+                                if remaining > 0.0 {
+                                    Duration::from_secs_f64(remaining)
+                                } else {
+                                    Duration::ZERO
+                                }
                             }
-                            break;
+                            None => idle_wait,
+                        };
+                        if wait == Duration::ZERO {
+                            // Something is due right now: renew outside the
+                            // state lock.
+                            drop(state);
+                            continue 'supervision;
                         }
-                    }
-                    let state = thread_shared.state.lock().expect("runner state lock");
-                    if state.shutting_down {
-                        drop(state);
-                        break;
-                    }
-                    let (state, _) = thread_shared
-                        .signal
-                        .wait_timeout(state, interval)
-                        .expect("runner state lock");
-                    if state.shutting_down {
-                        drop(state);
-                        break;
+                        let (s, _) = thread_shared
+                            .signal
+                            .wait_timeout(state, wait)
+                            .expect("runner state lock");
+                        state = s;
+                        // Woken by: shutdown, an ownership mutation, or the
+                        // earliest deadline — re-check and recompute.
                     }
                 }
                 // Local shutdown: drop ownership. No revocation, no
@@ -520,14 +679,31 @@ impl SupervisionRunner {
 
     /// Admit an execution whose fenced RUNNING confirmation + first renewal
     /// has just committed (dispatcher → supervision handoff, M5.3 §19).
+    /// Consumes the move-only admission capability.
     pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
-        self.service.admit(admission)
+        // Serialize the mutation with the loop's deadline computation (the
+        // loop reads the earliest deadline under the same state lock), so a
+        // new admission's wake-up can never be lost and the loop can never
+        // oversleep past its earlier deadline.
+        let state = self.shared.state.lock().expect("runner state lock");
+        let result = self.service.admit(admission);
+        if result.is_ok() {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
+        result
     }
 
     /// Drop supervision ownership for one execution. Never touches durable
     /// state.
     pub fn remove(&self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
-        self.service.remove(execution_id)
+        let state = self.shared.state.lock().expect("runner state lock");
+        let result = self.service.remove(execution_id);
+        if result.is_ok() {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
+        result
     }
 
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
@@ -548,11 +724,11 @@ impl SupervisionRunner {
             .clone()
     }
 
-    /// Stop the heartbeat loop and drop all local supervision ownership
-    /// (M5.3 §33). Returns the recorded fatal fault, if the loop stopped
-    /// because of one. The Leases simply stop being renewed and naturally
-    /// expire — no revocation, no terminality, no quiescence claim.
-    pub fn shutdown(mut self) -> Result<(), SupervisionError> {
+    /// Stop the heartbeat loop and drop all local supervision ownership.
+    /// The Leases simply stop being renewed and naturally expire — no
+    /// revocation, no terminality, no quiescence claim. Returns the recorded
+    /// fatal fault, if the loop stopped because of one.
+    fn stop_and_join(&mut self) -> Option<SupervisionError> {
         {
             let mut state = self.shared.state.lock().expect("runner state lock");
             state.shutting_down = true;
@@ -560,7 +736,8 @@ impl SupervisionRunner {
         self.shared.signal.notify_all();
         if let Some(join) = self.join.take() {
             if join.join().is_err() {
-                return Err(SupervisionError::Fatal(Error::invariant(
+                self.service.clear();
+                return Some(SupervisionError::Fatal(Error::invariant(
                     "the supervision heartbeat thread panicked",
                 )));
             }
@@ -568,17 +745,29 @@ impl SupervisionRunner {
         // Belt and suspenders: the thread cleared on its way out; clearing
         // here is idempotent (consumed generations persist).
         self.service.clear();
-        if let Some(fatal) = self
-            .shared
+        self.shared
             .state
             .lock()
             .expect("runner state lock")
             .fatal
             .clone()
-        {
-            return Err(fatal);
-        }
-        Ok(())
+    }
+
+    /// Graceful shutdown: stop the loop, drop ownership, and report the
+    /// recorded fatal fault, if any (M5.3 §33/§34).
+    pub fn shutdown(mut self) -> Result<(), SupervisionError> {
+        self.stop_and_join().map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SupervisionRunner {
+    fn drop(&mut self) {
+        // Ownership must not outlive its owner (M5.3 audit P1-2): a dropped
+        // runner stops and joins the heartbeat thread — it must never detach
+        // into an orphan that keeps renewing with no handle to stop or
+        // observe it. Drop cannot report the recorded fatal; `shutdown` is
+        // the observing path.
+        let _ = self.stop_and_join();
     }
 }
 
@@ -588,7 +777,7 @@ mod tests {
     use crate::timing::RuntimeTimingConfig;
     use agentype_core::{
         AuthoritativeExecutionBinding, Claim, Clock, ExecutionState, LeaseState, ManualClock,
-        PartitionSpec, RequestId, Retention, RetryPolicy, SystemClock, TaskSpec, TaskState,
+        PartitionSpec, Retention, RetryPolicy, SystemClock, TaskSpec, TaskState,
     };
     use agentype_execution_config::{FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
     use serde_json::json;
@@ -652,14 +841,27 @@ mod tests {
         (claim, exec)
     }
 
-    fn mint(claim: &Claim, exec: &ExecutionId) -> SupervisionAdmission {
-        // Crate-private mint: stands in for the dispatcher's post-commit
-        // branch, which is the only production mint site.
+    /// Mint an admission whose timing mirrors the production mint site: the
+    /// anchor is the fenced first-renewal commit time, the expiry is the
+    /// transaction's own output.
+    fn mint(claim: &Claim, exec: &ExecutionId, kernel: &Kernel) -> SupervisionAdmission {
+        let now = kernel.now();
+        mint_timed(claim, exec, now, now + kernel.lease_seconds())
+    }
+
+    fn mint_timed(
+        claim: &Claim,
+        exec: &ExecutionId,
+        first_renewed_at: UnixTime,
+        lease_expires_at: UnixTime,
+    ) -> SupervisionAdmission {
         SupervisionAdmission::new(
             exec.clone(),
             RequestId::new(),
             claim.attempt_id.clone(),
             claim.lease_epoch,
+            first_renewed_at,
+            lease_expires_at,
         )
     }
 
@@ -674,21 +876,38 @@ mod tests {
         assert!(registry.is_empty());
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "reg-one");
-        registry.admit(mint(&claim, &exec), kernel.now()).unwrap();
+        registry
+            .admit(mint(&claim, &exec, &kernel), kernel.now() + 2.0)
+            .unwrap();
         assert!(registry.contains(&exec));
         assert_eq!(registry.active_count(), 1);
     }
 
-    /// #16: an exactly-identical duplicate admission is idempotent.
+    /// #16: an exactly-identical duplicate admission is idempotent. The
+    /// capability is move-only, so the second presentation is necessarily a
+    /// fresh mint carrying the SAME identity.
     #[test]
     fn identical_duplicate_admission_is_idempotent() {
         let mut registry = SupervisionRegistry::new();
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "reg-idem");
-        let admission = mint(&claim, &exec);
-        registry.admit(admission.clone(), kernel.now()).unwrap();
-        // Re-presenting the SAME token while present is idempotent.
-        registry.admit(admission, kernel.now()).unwrap();
+        // The capability is move-only, so presenting the same identity
+        // twice requires two distinct mints sharing the SAME request_id
+        // (same durable identity, different generation).
+        let request_id = RequestId::new();
+        let now = kernel.now();
+        let mint_same_identity = || {
+            SupervisionAdmission::new(
+                exec.clone(),
+                request_id.clone(),
+                claim.attempt_id.clone(),
+                claim.lease_epoch,
+                now,
+                now + kernel.lease_seconds(),
+            )
+        };
+        registry.admit(mint_same_identity(), now + 2.0).unwrap();
+        registry.admit(mint_same_identity(), now + 2.0).unwrap();
         assert_eq!(registry.active_count(), 1);
     }
 
@@ -699,16 +918,20 @@ mod tests {
         let mut registry = SupervisionRegistry::new();
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "reg-conflict");
-        registry.admit(mint(&claim, &exec), kernel.now()).unwrap();
+        registry
+            .admit(mint(&claim, &exec, &kernel), kernel.now() + 2.0)
+            .unwrap();
 
         let different_attempt = SupervisionAdmission::new(
             exec.clone(),
             RequestId::new(),
             agentype_core::AttemptId::new(),
             claim.lease_epoch,
+            kernel.now(),
+            kernel.now() + LEASE_SECONDS,
         );
         assert!(matches!(
-            registry.admit(different_attempt, kernel.now()),
+            registry.admit(different_attempt, kernel.now() + 2.0),
             Err(SupervisionError::AdmissionIdentityConflict)
         ));
 
@@ -717,9 +940,11 @@ mod tests {
             RequestId::new(),
             claim.attempt_id.clone(),
             agentype_core::LeaseEpoch(claim.lease_epoch.get() + 1),
+            kernel.now(),
+            kernel.now() + LEASE_SECONDS,
         );
         assert!(matches!(
-            registry.admit(different_epoch, kernel.now()),
+            registry.admit(different_epoch, kernel.now() + 2.0),
             Err(SupervisionError::AdmissionIdentityConflict)
         ));
 
@@ -728,9 +953,11 @@ mod tests {
             RequestId::new(),
             claim.attempt_id.clone(),
             claim.lease_epoch,
+            kernel.now(),
+            kernel.now() + LEASE_SECONDS,
         );
         assert!(matches!(
-            registry.admit(different_request, kernel.now()),
+            registry.admit(different_request, kernel.now() + 2.0),
             Err(SupervisionError::AdmissionIdentityConflict)
         ));
         assert_eq!(registry.active_count(), 1);
@@ -758,7 +985,7 @@ mod tests {
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "reg-remove");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim, &exec)).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
         service.remove(&exec).unwrap();
 
         let execution = kernel.execution(&exec).unwrap();
@@ -791,7 +1018,7 @@ mod tests {
         let (clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "renew-ok");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim, &exec)).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         clock.advance(1.0);
         let now = kernel.now();
@@ -808,15 +1035,17 @@ mod tests {
         assert!(service.contains(&exec));
     }
 
-    /// #42: authority loss removes the admission, and the consumed token can
-    /// never resume renewal (#50): only a fresh mint may re-admit.
+    /// #42/#50: authority loss removes the admission. The consumed token is
+    /// move-only and structurally cannot be re-presented; the only
+    /// re-admission path is a fresh authoritative mint (the M5.4 shape),
+    /// whose renewal is still governed by durable Kernel fencing — it can
+    /// never resurrect stale authority.
     #[test]
-    fn authority_loss_removes_admission_and_consumes_the_token() {
+    fn after_authority_loss_only_a_fresh_mint_reenters_supervision() {
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "renew-lost");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        let admission = mint(&claim, &exec);
-        service.admit(admission.clone()).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         // ACK closes the durable authority; the heartbeat then loses fencing.
         kernel
@@ -838,11 +1067,17 @@ mod tests {
         );
         assert!(!service.contains(&exec));
 
-        // The consumed admission cannot re-enter supervision (#50).
-        assert!(matches!(
-            service.admit(admission),
-            Err(SupervisionError::AdmissionConsumed)
-        ));
+        // A fresh mint (new generation, same identity) may re-enter
+        // supervision — but the durable authority is gone, so the heartbeat
+        // immediately loses fencing again. No stale resurrection.
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
+        assert_eq!(
+            service.renew_one(&exec).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: exec.clone()
+            }
+        );
+        assert!(!service.contains(&exec));
     }
 
     /// #43: a non-RUNNING physical state removes the admission without any
@@ -852,7 +1087,7 @@ mod tests {
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "renew-notrunning");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim, &exec)).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         kernel
             .record_physical_outcome(
@@ -902,7 +1137,7 @@ mod tests {
             .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec, &json!({}))
             .unwrap();
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim, &exec)).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         clock.advance(11.0);
         kernel.expire_leases(false).unwrap();
@@ -942,7 +1177,7 @@ mod tests {
         kernel.reconcile_pool().unwrap();
         let (claim, exec) = running_execution(&kernel, "renew-fatal");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim, &exec)).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -973,7 +1208,7 @@ mod tests {
         let (claim_a, exec_a) = running_execution(&kernel, "due-a");
         let (_claim_b, exec_b) = running_execution(&kernel, "due-b");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
-        service.admit(mint(&claim_a, &exec_a)).unwrap();
+        service.admit(mint(&claim_a, &exec_a, &kernel)).unwrap();
 
         clock.advance(3.0);
         let outcomes = service.renew_due_now().unwrap();
@@ -1019,6 +1254,103 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Deadline scheduling and capability structure (audit P1-1 / P1-3)
+    // ------------------------------------------------------------------
+
+    /// With the LEGAL wide timing heartbeat=6 < lease=10 (no 2*heartbeat
+    /// headroom), a healthy deadline-scheduled supervisor renews every cycle
+    /// and never self-expires the lease. The schedule is anchored at the
+    /// fenced first-renewal commit time carried by the admission — a delayed
+    /// handoff does not delay it. Under the previous fixed-phase,
+    /// insertion-time scheduling this exact configuration expired the lease.
+    #[test]
+    fn wide_legal_timing_never_self_expires() {
+        let (clock, kernel) = env(); // lease 10.0
+        let (claim, exec) = running_execution(&kernel, "wide-timing"); // confirmed at 1000.0 → expiry 1010.0
+        let timing = RuntimeTimingConfig::new(1.0, 6.0, LEASE_SECONDS).unwrap();
+        let service = SupervisionService::new(kernel.clone(), &timing).unwrap();
+
+        // Handoff is delayed by 5.9s: the admission is inserted at 1005.9
+        // but carries the first-renewal anchor 1000.0.
+        clock.advance(5.9);
+        service
+            .admit(mint_timed(&claim, &exec, 1000.0, 1010.0))
+            .unwrap();
+        // The next due point is anchor + interval, NOT insertion + interval
+        // (which would be 1011.9 — already past the 1010.0 expiry).
+        assert_eq!(service.earliest_next_due(), Some(1006.0));
+
+        // Drive the deadline scheduler through three full cycles.
+        for cycle in 0..3u32 {
+            let due = service.earliest_next_due().unwrap();
+            clock.set(due);
+            let outcomes = service.renew_due_now().unwrap();
+            assert_eq!(outcomes.len(), 1, "cycle {cycle}");
+            assert!(matches!(outcomes[0], RenewalOutcome::Renewed { .. }));
+            let lease = kernel.lease_supervision_view(&claim.attempt_id).unwrap();
+            assert_eq!(lease.expires_at, due + LEASE_SECONDS, "cycle {cycle}");
+            assert_eq!(lease.state, LeaseState::Active, "cycle {cycle}");
+        }
+    }
+
+    /// A malformed capability (non-finite anchor/expiry, or an expiry that
+    /// does not follow the first renewal) is rejected fail-closed at admit.
+    #[test]
+    fn admit_fails_closed_on_malformed_admission_timing() {
+        let (_clock, kernel) = env();
+        let (claim, exec) = running_execution(&kernel, "bad-timing");
+        let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+
+        let err = service
+            .admit(mint_timed(&claim, &exec, 1010.0, 1000.0))
+            .unwrap_err();
+        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
+
+        let err = service
+            .admit(mint_timed(&claim, &exec, 1000.0, f64::INFINITY))
+            .unwrap_err();
+        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
+
+        let err = service
+            .admit(mint_timed(&claim, &exec, f64::NAN, 1010.0))
+            .unwrap_err();
+        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
+
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// P1-3 closure: the admission is a move-only capability. Admitting it
+    /// consumes the token — a second service can neither hold, re-admit, nor
+    /// renew the same execution, so "one runtime supervision owner per
+    /// admitted Execution" is structural, not per-registry discipline.
+    #[test]
+    fn move_only_capability_prevents_cross_service_replay() {
+        let (_clock, kernel) = env();
+        let (claim, exec) = running_execution(&kernel, "move-only");
+        let service_1 = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        service_1.admit(mint(&claim, &exec, &kernel)).unwrap();
+        assert!(service_1.contains(&exec));
+
+        let service_2 = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        assert_eq!(service_2.active_count(), 0);
+        // service_2 holds no token for this execution: it can neither renew
+        // it nor obtain a copy of the capability (there is no Clone, and the
+        // token was moved into service_1's registry).
+        assert!(matches!(
+            service_2.renew_one(&exec),
+            Err(SupervisionError::NoSuchEntry)
+        ));
+
+        // Removing the entry destroys the only token; service_1 itself can
+        // no longer renew it.
+        service_1.remove(&exec).unwrap();
+        assert!(matches!(
+            service_1.renew_one(&exec),
+            Err(SupervisionError::NoSuchEntry)
+        ));
+    }
+
+    // ------------------------------------------------------------------
     // Runner lifecycle (§18/§33/§34) — the only real-thread tests.
     // ------------------------------------------------------------------
 
@@ -1055,12 +1387,12 @@ mod tests {
     /// expires).
     #[test]
     fn runner_renews_admitted_execution_until_shutdown() {
-        let (_dir, kernel, (claim, exec)) = system_kernel("runner-smoke", 1.0);
+        let (dir, kernel, (claim, exec)) = system_kernel("runner-smoke", 1.0);
 
         // poll <= heartbeat < lease
         let timing = RuntimeTimingConfig::new(0.3, 0.4, 1.0).unwrap();
         let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
-        runner.admit(mint(&claim, &exec)).unwrap();
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
         assert!(runner.contains(&exec));
 
         let initial_expires = kernel
@@ -1099,6 +1431,82 @@ mod tests {
             expires_later, lease_after_shutdown,
             "no renewal may happen after shutdown"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-1 closure (real-thread smoke): with heartbeat=0.6 < lease=1.0 and
+    /// the admission inserted mid-phase (0.3s after start), the deadline
+    /// scheduler keeps the lease alive well past its original expiry. A
+    /// fixed-phase ticker sleeping full intervals from its own phase would
+    /// expire this lease under the same legal timing.
+    #[test]
+    fn runner_deadline_schedule_survives_wide_legal_timing() {
+        let (dir, kernel, (claim, exec)) = system_kernel("runner-wide", 1.0);
+        let timing = RuntimeTimingConfig::new(0.2, 0.6, 1.0).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+
+        // Admit mid-phase, well after the runner's loop has parked.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
+        let expires_at_admit = kernel
+            .lease_supervision_view(&claim.attempt_id)
+            .unwrap()
+            .expires_at;
+
+        // Wait past two full lease durations: repeated deadline renewals
+        // must keep the lease alive the whole time.
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        let expires_after = kernel
+            .lease_supervision_view(&claim.attempt_id)
+            .unwrap()
+            .expires_at;
+        assert!(
+            expires_after >= expires_at_admit + 1.5,
+            "the deadline scheduler must keep renewing under wide legal timing: {expires_at_admit} -> {expires_after}"
+        );
+        let exec_state = kernel.execution(&exec).unwrap();
+        assert_eq!(exec_state.state, ExecutionState::Running);
+        assert!(runner.take_fatal().is_none());
+        runner.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-2 closure: dropping the runner without calling shutdown stops the
+    /// heartbeat thread and joins it — supervision ownership can never
+    /// outlive its owner as a detached orphan that keeps renewing.
+    #[test]
+    fn drop_runner_stops_renewal() {
+        let (dir, kernel, (claim, exec)) = system_kernel("runner-drop", 1.0);
+        let timing = RuntimeTimingConfig::new(0.2, 0.3, 1.0).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
+
+        // At least one renewal happened before the drop.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let frozen = kernel
+            .lease_supervision_view(&claim.attempt_id)
+            .unwrap()
+            .expires_at;
+
+        // Drop WITHOUT shutdown: ownership must end here.
+        drop(runner);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let after = kernel
+            .lease_supervision_view(&claim.attempt_id)
+            .unwrap()
+            .expires_at;
+        assert_eq!(
+            after, frozen,
+            "no renewal may happen after the runner is dropped"
+        );
+
+        // The durable state is untouched: no revocation, no terminality,
+        // no quiescence claim.
+        let exec_state = kernel.execution(&exec).unwrap();
+        assert_eq!(exec_state.state, ExecutionState::Running);
+        assert!(!exec_state.terminal_confirmed);
+        assert!(!exec_state.quiescent_confirmed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fatal smoke: a corrupted durable lease row stops the loop and
@@ -1122,8 +1530,8 @@ mod tests {
         drop(conn);
 
         let timing = RuntimeTimingConfig::new(0.2, 0.3, 1.0).unwrap();
-        let runner = SupervisionRunner::start(kernel, timing).unwrap();
-        runner.admit(mint(&claim, &exec)).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(800));
         match runner.take_fatal() {

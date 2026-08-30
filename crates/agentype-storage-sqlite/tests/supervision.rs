@@ -360,6 +360,24 @@ fn corrupted_lease_is_a_persistence_fault_not_authority_loss() {
     );
 }
 
+/// P1-4 closure: Kernel lease authority must be finite and positive. NaN
+/// passes `<= 0.0` comparisons and an infinite lease could never naturally
+/// expire — both are rejected at construction, fail closed.
+#[test]
+fn kernel_rejects_non_finite_lease_seconds() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    for bad in [f64::NAN, f64::INFINITY] {
+        let err = match Kernel::open_memory(clock.clone(), bad, 16_384) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a construction rejection for {bad}"),
+        };
+        assert!(
+            matches!(err, Error::InvalidTransition(_)),
+            "expected a construction rejection for {bad}, got {err:?}"
+        );
+    }
+}
+
 fn kernel_task_completed(k: &Kernel, task: &TaskId) -> bool {
     k.task(task).unwrap().state == TaskState::Completed
 }

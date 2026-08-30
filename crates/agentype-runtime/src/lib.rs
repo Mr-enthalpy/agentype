@@ -19,7 +19,7 @@ pub use timing::{RuntimeTimingConfig, TimingConfigError};
 use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
@@ -430,18 +430,32 @@ pub fn resolve_physical_execution_environment(
 /// constructor is crate-private and the only call site is the dispatcher's
 /// post-commit branch of `confirm_running_and_renew`.
 ///
+/// This is a **move-only capability** (M5.3 audit P1-3): deliberately NOT
+/// `Clone`. `SupervisionService::admit` consumes the token, so one admission
+/// has exactly one supervisor owner — the same token can never be presented
+/// to a second registry, and a consumed/dropped token can never be replayed
+/// anywhere. The only re-admission path is a fresh authoritative mint (the
+/// M5.4 reconciliation shape).
+///
 /// `generation` is an ephemeral, process-local mint counter used by the
-/// supervision registry as concurrent-collection hygiene (telling a
-/// re-played consumed admission token from a freshly minted one). It is
-/// deliberately distinct from `LeaseEpoch`, which is durable Scheduler
-/// fencing; every durable decision remains fenced by the epoch.
-#[derive(Debug, Clone, PartialEq)]
+/// supervision registry as concurrent-collection hygiene. It is deliberately
+/// distinct from `LeaseEpoch`, which is durable Scheduler fencing; every
+/// durable decision remains fenced by the epoch.
+///
+/// `first_renewed_at` / `lease_expires_at` carry the fenced first-renewal
+/// COMMIT timing (M5.3 audit P1-1): the supervision registry schedules its
+/// deadline from this anchor — never from the possibly-delayed handoff or
+/// insertion time — so the heartbeat can never be scheduled past the durable
+/// expiry under any legal timing.
+#[derive(Debug)]
 pub struct SupervisionAdmission {
     execution_id: ExecutionId,
     request_id: RequestId,
     attempt_id: AttemptId,
     lease_epoch: LeaseEpoch,
     generation: u64,
+    first_renewed_at: UnixTime,
+    lease_expires_at: UnixTime,
 }
 
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -452,6 +466,8 @@ impl SupervisionAdmission {
         request_id: RequestId,
         attempt_id: AttemptId,
         lease_epoch: LeaseEpoch,
+        first_renewed_at: UnixTime,
+        lease_expires_at: UnixTime,
     ) -> Self {
         Self {
             execution_id,
@@ -459,6 +475,8 @@ impl SupervisionAdmission {
             attempt_id,
             lease_epoch,
             generation: NEXT_ADMISSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            first_renewed_at,
+            lease_expires_at,
         }
     }
 
@@ -478,18 +496,26 @@ impl SupervisionAdmission {
         self.lease_epoch
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
+    /// The fenced first-renewal commit time (the deadline-scheduling anchor).
+    pub fn first_renewed_at(&self) -> UnixTime {
+        self.first_renewed_at
     }
 
-    /// Exact identity equality (the four durable identity fields). The
-    /// ephemeral generation is deliberately excluded: two admissions with
-    /// the same identity describe the same admitted authority.
-    pub(crate) fn same_identity(&self, other: &SupervisionAdmission) -> bool {
-        self.execution_id == other.execution_id
-            && self.request_id == other.request_id
-            && self.attempt_id == other.attempt_id
-            && self.lease_epoch == other.lease_epoch
+    /// The durable lease expiry produced by the fenced first renewal.
+    pub fn lease_expires_at(&self) -> UnixTime {
+        self.lease_expires_at
+    }
+
+    /// Extract the plain durable identity for registry bookkeeping. The
+    /// capability itself is consumed at admit and never stored.
+    pub(crate) fn identity(&self) -> crate::supervision::SupervisionIdentity {
+        crate::supervision::SupervisionIdentity::new(
+            self.execution_id.clone(),
+            self.request_id.clone(),
+            self.attempt_id.clone(),
+            self.lease_epoch,
+            self.generation,
+        )
     }
 }
 
@@ -504,7 +530,11 @@ impl SupervisionAdmission {
 /// means the Task completed with a durable Result; and a physical success
 /// that writer safety refused to complete is its own variant, never
 /// `TaskCompleted`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Deliberately NOT `Clone`: `RunningAdmitted` carries the move-only
+/// `SupervisionAdmission` capability, and copying the outcome would copy a
+/// supervision capability (M5.3 audit P1-3).
+#[derive(Debug)]
 pub enum DispatchOneOutcome {
     /// Nothing was claimable; no state was touched.
     NoWork,
@@ -738,12 +768,21 @@ impl<'a> Dispatcher<'a> {
                 execution_id,
                 &observation.runtime_handle.0,
             ) {
-                Ok(_) => Ok(DispatchOneOutcome::RunningAdmitted {
+                Ok(expires_at) => Ok(DispatchOneOutcome::RunningAdmitted {
                     admission: SupervisionAdmission::new(
                         execution_id.clone(),
                         request_id.clone(),
                         claim.attempt_id.clone(),
                         claim.lease_epoch,
+                        // The scheduling anchor is the fenced first-renewal
+                        // COMMIT time, recovered exactly from the
+                        // transaction's own expiry output (expires_at =
+                        // commit + lease_seconds). The supervision registry
+                        // schedules from this anchor — never from the
+                        // possibly-delayed handoff or insertion time (M5.3
+                        // audit P1-1: deadline phase correctness).
+                        expires_at - self.kernel.lease_seconds(),
+                        expires_at,
                     ),
                 }),
                 Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
@@ -2296,7 +2335,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     fn dispatch_one_returns_no_work_without_claimable_tasks() {
         let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
     }
 
     /// §1, §16-19, §21, §23: one eligible claim becomes exactly one
@@ -2461,10 +2503,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut claim = kernel.claim_next_available().unwrap().unwrap();
         claim.execution_target = "missing-target".to_string();
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2479,10 +2521,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut claim = kernel.claim_next_available().unwrap().unwrap();
         claim.execution_profile = "missing-profile".to_string();
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2497,10 +2539,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let claim = kernel.claim_next_available().unwrap().unwrap();
         clock.advance(25.0); // lease expired
 
-        assert_eq!(
+        assert!(matches!(
             d.dispatch_claim(&claim).unwrap(),
             DispatchOneOutcome::AuthorityRejected
-        );
+        ));
         assert_eq!(fake.start_call_count(), 0);
     }
 
@@ -2612,7 +2654,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
         // No blind re-dispatch: the retry wait is not claimable and nothing
         // starts a second time.
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -4163,38 +4208,36 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let task_id = ids.values().next().unwrap().clone();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
+        let admission = match outcome {
             DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
         // The admission carries exactly the identity the fenced RUNNING
         // confirmation confirmed - attempt, epoch, execution, request.
-        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.task_id, task_id);
-        assert_eq!(admission.attempt_id(), &exec.attempt_id);
+        assert_eq!(&attempt_id, &exec.attempt_id);
         assert_eq!(
-            admission.lease_epoch(),
-            kernel
-                .lease_for_attempt(admission.attempt_id())
-                .unwrap()
-                .epoch
+            lease_epoch,
+            kernel.lease_for_attempt(&attempt_id).unwrap().epoch
         );
         assert!(!admission.request_id().as_str().is_empty());
 
         // Handoff: registry insertion follows the committed first renewal.
-        service.admit(admission.clone()).unwrap();
-        assert!(service.contains(admission.execution_id()));
+        service.admit(admission).unwrap();
+        assert!(service.contains(&execution_id));
         assert_eq!(service.active_count(), 1);
 
         clock.advance(1.0);
         let now = kernel.now();
         assert!(matches!(
-            service.renew_one(admission.execution_id()).unwrap(),
+            service.renew_one(&execution_id).unwrap(),
             RenewalOutcome::Renewed { .. }
         ));
-        let lease = kernel
-            .lease_supervision_view(admission.attempt_id())
-            .unwrap();
+        let lease = kernel.lease_supervision_view(&attempt_id).unwrap();
         assert_eq!(lease.expires_at, now + 10.0);
         assert_eq!(lease.heartbeat_at, now);
     }
@@ -4379,17 +4422,20 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let task_id = ids.values().next().unwrap().clone();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
+        service.admit(admission).unwrap();
 
         kernel
             .ack_success(
-                &admission.attempt_id().clone(),
-                admission.lease_epoch(),
-                Some(admission.execution_id()),
+                &attempt_id,
+                lease_epoch,
+                Some(&execution_id),
                 &Value::Null,
                 None,
                 true,
@@ -4397,14 +4443,14 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             )
             .unwrap();
         assert_eq!(
-            service.renew_one(admission.execution_id()).unwrap(),
+            service.renew_one(&execution_id).unwrap(),
             RenewalOutcome::AuthorityLost {
-                execution_id: admission.execution_id().clone()
+                execution_id: execution_id.clone()
             }
         );
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
-        assert!(!service.contains(admission.execution_id()));
+        assert!(!service.contains(&execution_id));
     }
 
     /// §46: heartbeat wins immediately before the ACK - the lease extends
@@ -4422,22 +4468,25 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let task_id = ids.values().next().unwrap().clone();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        let attempt_id = admission.attempt_id().clone();
+        let lease_epoch = admission.lease_epoch();
+        service.admit(admission).unwrap();
 
         clock.advance(1.0);
         assert!(matches!(
-            service.renew_one(admission.execution_id()).unwrap(),
+            service.renew_one(&execution_id).unwrap(),
             RenewalOutcome::Renewed { .. }
         ));
         kernel
             .ack_success(
-                &admission.attempt_id().clone(),
-                admission.lease_epoch(),
-                Some(admission.execution_id()),
+                &attempt_id,
+                lease_epoch,
+                Some(&execution_id),
                 &Value::Null,
                 None,
                 true,
@@ -4465,24 +4514,25 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let task_id = ids.values().next().unwrap().clone();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
 
         kernel.cancel_task(&task_id, true).unwrap();
         assert_eq!(
-            service.renew_one(admission.execution_id()).unwrap(),
+            service.renew_one(&execution_id).unwrap(),
             RenewalOutcome::AuthorityLost {
-                execution_id: admission.execution_id().clone()
+                execution_id: execution_id.clone()
             }
         );
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Cancelled);
-        assert!(!service.contains(admission.execution_id()));
+        assert!(!service.contains(&execution_id));
         // The supervision drop itself wrote no proof bits anywhere: the
         // execution row is exactly as cancellation left it.
-        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let exec = kernel.execution(&execution_id).unwrap();
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
     }
@@ -4511,16 +4561,17 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
 
         kernel.merge_partitions("general", "general2").unwrap();
         clock.advance(1.0);
         assert!(matches!(
-            service.renew_one(admission.execution_id()).unwrap(),
+            service.renew_one(&execution_id).unwrap(),
             RenewalOutcome::Renewed { .. }
         ));
     }
@@ -4541,23 +4592,27 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
 
         // Supervision ownership is lost (e.g. local shutdown); nothing about
         // the physical writer is proven.
-        service.remove(admission.execution_id()).unwrap();
+        service.remove(&execution_id).unwrap();
         clock.advance(11.0);
         kernel.expire_leases(false).unwrap();
 
-        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let exec = kernel.execution(&execution_id).unwrap();
         let task = kernel.task(&exec.task_id).unwrap();
         assert_eq!(task.state, TaskState::Suspended);
         // No duplicate writer: the suspended task is not dispatchable.
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
     }
 
     /// §56: isolated-writer recovery continues to depend on the persisted
@@ -4585,22 +4640,18 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        assert!(
-            kernel
-                .execution(admission.execution_id())
-                .unwrap()
-                .attempt_isolation
-        );
-        service.admit(admission.clone()).unwrap();
-        service.remove(admission.execution_id()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        assert!(kernel.execution(&execution_id).unwrap().attempt_isolation);
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
 
         clock.advance(11.0);
         kernel.expire_leases(false).unwrap();
-        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let exec = kernel.execution(&execution_id).unwrap();
         let task = kernel.task(&exec.task_id).unwrap();
         assert_eq!(task.state, TaskState::RetryWait);
 
@@ -4630,15 +4681,19 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
-        service.remove(admission.execution_id()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
 
-        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
-        let exec = kernel.execution(admission.execution_id()).unwrap();
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+        let exec = kernel.execution(&execution_id).unwrap();
         assert_eq!(exec.state, ExecutionState::Running);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
@@ -4659,28 +4714,25 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
 
         let outcome = d.dispatch_one().unwrap();
-        let admission = match &outcome {
-            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+        let admission = match outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
             other => panic!("expected RunningAdmitted, got {other:?}"),
         };
-        service.admit(admission.clone()).unwrap();
-        service.remove(admission.execution_id()).unwrap();
+        let execution_id = admission.execution_id().clone();
+        service.admit(admission).unwrap();
+        service.remove(&execution_id).unwrap();
 
-        let before = kernel.execution(admission.execution_id()).unwrap();
-        let handle_before = kernel
-            .execution_runtime_handle(admission.execution_id())
-            .unwrap();
+        let before = kernel.execution(&execution_id).unwrap();
+        let handle_before = kernel.execution_runtime_handle(&execution_id).unwrap();
         clock.advance(11.0);
         kernel.expire_leases(false).unwrap();
-        let after = kernel.execution(admission.execution_id()).unwrap();
+        let after = kernel.execution(&execution_id).unwrap();
         assert_eq!(before.state, after.state);
         assert_eq!(before.terminal_confirmed, after.terminal_confirmed);
         assert_eq!(before.quiescent_confirmed, after.quiescent_confirmed);
         assert_eq!(
             handle_before,
-            kernel
-                .execution_runtime_handle(admission.execution_id())
-                .unwrap()
+            kernel.execution_runtime_handle(&execution_id).unwrap()
         );
     }
 }

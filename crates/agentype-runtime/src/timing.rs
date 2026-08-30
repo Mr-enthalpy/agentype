@@ -26,6 +26,7 @@ pub struct RuntimeTimingConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimingConfigError {
     NonPositiveDuration { field: &'static str, value: f64 },
+    NonFiniteDuration { field: &'static str, value: f64 },
     PollExceedsHeartbeat { poll: f64, heartbeat: f64 },
     HeartbeatNotBelowLease { heartbeat: f64, lease: f64 },
 }
@@ -35,6 +36,9 @@ impl fmt::Display for TimingConfigError {
         match self {
             Self::NonPositiveDuration { field, value } => {
                 write!(f, "timing {field} must be positive, got {value}")
+            }
+            Self::NonFiniteDuration { field, value } => {
+                write!(f, "timing {field} must be finite, got {value}")
             }
             Self::PollExceedsHeartbeat { poll, heartbeat } => write!(
                 f,
@@ -68,11 +72,16 @@ impl RuntimeTimingConfig {
             ("heartbeat_seconds", heartbeat_seconds),
             ("lease_seconds", lease_seconds),
         ] {
-            // `value > 0.0` is false for zero, negatives, and NaN.
-            if value > 0.0 {
-                continue;
+            // Finite-authority gate (M5.3 audit P1-4): NaN and the
+            // infinities are rejected explicitly — an infinite duration
+            // would pass every ordering check and a NaN would silently
+            // disable them.
+            if !value.is_finite() {
+                return Err(TimingConfigError::NonFiniteDuration { field, value });
             }
-            return Err(TimingConfigError::NonPositiveDuration { field, value });
+            if value <= 0.0 {
+                return Err(TimingConfigError::NonPositiveDuration { field, value });
+            }
         }
         if dispatcher_poll_seconds > heartbeat_seconds {
             return Err(TimingConfigError::PollExceedsHeartbeat {
@@ -124,6 +133,14 @@ pub(crate) fn validate_lease_authority_match(
     timing: &RuntimeTimingConfig,
     kernel_lease_seconds: f64,
 ) -> Result<(), Error> {
+    // Fail closed on any non-finite input (M5.3 audit P1-4): inf - inf =
+    // NaN and NaN comparisons are false, which would otherwise let two
+    // infinite lease authorities "match".
+    if !timing.lease_seconds().is_finite() || !kernel_lease_seconds.is_finite() {
+        return Err(Error::invariant(
+            "lease authority must be finite on both the timing configuration and the Kernel",
+        ));
+    }
     if (timing.lease_seconds() - kernel_lease_seconds).abs() > f64::EPSILON {
         return Err(Error::invariant(format!(
             "timing configuration lease_seconds ({}) does not match the Kernel lease authority ({})",
@@ -180,7 +197,6 @@ mod tests {
             (0.0, 2.0, 10.0),
             (-1.0, 2.0, 10.0),
             (1.0, 0.0, 10.0),
-            (1.0, f64::NAN, 10.0),
             (1.0, 2.0, 0.0),
             (1.0, 2.0, -3.0),
         ] {
@@ -190,6 +206,42 @@ mod tests {
                 "expected NonPositiveDuration for ({poll}, {heartbeat}, {lease}), got {err:?}"
             );
         }
+    }
+
+    /// +inf is rejected for every field (audit P1-4): it passes every
+    /// ordering check, so it must be rejected explicitly.
+    #[test]
+    fn non_finite_durations_are_rejected() {
+        for (poll, heartbeat, lease) in [
+            (f64::NAN, 2.0, 10.0),
+            (f64::INFINITY, 2.0, 10.0),
+            (1.0, f64::INFINITY, 10.0),
+            (1.0, 2.0, f64::INFINITY),
+        ] {
+            let err = RuntimeTimingConfig::new(poll, heartbeat, lease).unwrap_err();
+            assert!(
+                matches!(err, TimingConfigError::NonFiniteDuration { .. }),
+                "expected NonFiniteDuration for ({poll}, {heartbeat}, {lease}), got {err:?}"
+            );
+        }
+    }
+
+    /// The lease-authority matcher fails closed on ANY non-finite input on
+    /// either side — inf - inf = NaN must never read as "match".
+    #[test]
+    fn lease_authority_matcher_fails_closed_on_non_finite_input() {
+        let t = RuntimeTimingConfig::new(1.0, 2.0, 10.0).unwrap();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(validate_lease_authority_match(&t, bad).is_err());
+        }
+        // A non-finite configured value cannot be constructed through the
+        // gate; the matcher still fails closed if one is handed to it.
+        let forged = RuntimeTimingConfig {
+            dispatcher_poll_seconds: 1.0,
+            heartbeat_seconds: 2.0,
+            lease_seconds: f64::INFINITY,
+        };
+        assert!(validate_lease_authority_match(&forged, 10.0).is_err());
     }
 
     /// Lease-authority match: a drift between the configured lease duration

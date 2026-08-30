@@ -77,8 +77,13 @@ impl Kernel {
         lease_seconds: f64,
         continuity_max_bytes: usize,
     ) -> Result<Self, Error> {
-        if lease_seconds <= 0.0 {
-            return Err(Error::invalid_transition("lease_seconds must be positive"));
+        // Finite-authority gate (M5.3 audit P1-4): NaN passes `<= 0.0`
+        // comparisons and an infinite lease could never naturally expire,
+        // so lease authority must be finite AND positive.
+        if !(lease_seconds.is_finite() && lease_seconds > 0.0) {
+            return Err(Error::invalid_transition(
+                "lease_seconds must be finite and positive",
+            ));
         }
         if continuity_max_bytes == 0 {
             return Err(Error::invalid_transition(
