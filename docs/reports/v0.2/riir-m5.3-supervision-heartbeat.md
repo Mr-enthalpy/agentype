@@ -421,3 +421,105 @@ enforces this mechanically).
 | P1-2 runner Drop | `drop_runner_stops_renewal` |
 | P1-3 move-only capability / replay | `move_only_capability_prevents_cross_service_replay`, `after_authority_loss_only_a_fresh_mint_reenters_supervision` |
 | P1-4 finite timing | `non_finite_durations_are_rejected`, `lease_authority_matcher_fails_closed_on_non_finite_input`, `kernel_rejects_non_finite_lease_seconds`, `admit_fails_closed_on_malformed_admission_timing` |
+
+
+### Round 2 (second request-changes review, closed as two commits)
+
+#### P1-1 — Transaction timestamps were sampled before the write serialization
+
+Root cause: `Kernel::tx` sampled `clock.now()` at caller entry, then handed
+the reading to `Store::with_immediate_at`, which acquired the connection
+mutex and BEGIN IMMEDIATE afterwards. Under legitimate writer contention a
+renewal could capture `now` before expiry, block on the SQLite write lock
+past the durable expiry, then validate and renew with the stale reading —
+resurrecting a lease that had already lost authority between the two points.
+This is a latent M4 flaw that only became reachable with M5.3's concurrent
+heartbeat.
+
+Fix: `Store::begin_immediate` carries the lock/commit/rollback mechanics;
+the new `Store::with_immediate_clock(&dyn Clock, f)` samples the
+authoritative time ONLY after the connection lock is held and BEGIN
+IMMEDIATE has succeeded — i.e. after the transaction has actually won the
+SQLite write serialization. `Kernel::tx` routes every transaction through
+it, so all authority validation (heartbeat, ACK, NACK, expiry, claims) runs
+against a post-serialization reading. The schema-bootstrap helper keeps its
+0.0 timestamps (no clock exists at init). The exact-boundary semantics are
+unchanged; only the sampling point moved.
+
+Regression: `renewal_timestamp_is_sampled_after_transaction_serialization`
+(storage suite) — a second connection holds `BEGIN IMMEDIATE` while the
+clock moves past the durable expiry; the blocked renewal must fail stale.
+The pre-fix kernel samples at caller entry and renews, so the test fails on
+the old implementation.
+
+#### P1-2 — The runner accepted admissions after fail-stop (and a clear/admit race)
+
+`SupervisionRunner::admit` did not consult the loop's health: after a fatal
+the thread exited but `admit` kept returning `Ok`, leaving registry entries
+with no supervisor behind them; the fatal-path registry clear also raced
+in-flight admits.
+
+Fix: an explicit runner lifecycle — `Running → ShuttingDown → Stopped` and
+`Running → Failed` — replaces the shutdown bool. `admit` is accepted ONLY in
+`Running` (otherwise `SupervisionError::RunnerStopped`); the fatal path
+flips the phase to `Failed` under the same state lock admissions serialize
+on and clears ownership afterwards, so an in-flight admit either completes
+before `Failed` (its entry is cleared) or is rejected after — an unowned
+entry can never survive. The thread body is wrapped in `catch_unwind`: any
+unexpected exit (panic) marks the runner `Failed` with a fatal fault — a
+dead supervisor must never look alive. `remove`/`contains`/`active_count`
+stay ungated (releasing or observing ownership is legal in any phase).
+
+Regressions: the fatal smoke now asserts post-fatal admit rejection with an
+empty registry; `heartbeat_thread_panic_marks_runner_failed_and_rejects_admit`
+drives a deterministic thread panic through a tripped test clock
+(`TripwireClock` delegates to a `ManualClock` until armed).
+
+#### P1-3 — NotFound during renewal was classified as ordinary authority loss
+
+`renew_identity` mapped `StaleAuthority | InvalidAuthority | NotFound` to
+`AuthorityLost` (quiet drop). But an admitted execution's durable identity
+(Execution/Attempt/Lease) existed at mint time and Agentype never deletes
+execution history: a `NotFound` after admission is durable corruption or an
+impossible identity — for a WRITE worker precisely the case that must not
+masquerade as a normal expiry.
+
+Fix: only `StaleAuthority | InvalidAuthority` are `AuthorityLost`; every
+other kernel fault (NotFound, InvariantViolation, StorageFailure,
+RecoveryRequired) is `Fatal` (fail-stop). The Kernel primitive still reports
+the durable fact (`NotFound`); classification is the caller's responsibility
+— the storage-suite helper was narrowed accordingly and the
+unknown-execution case now asserts `NotFound` explicitly.
+
+Regression: `missing_execution_is_fatal_not_authority_loss` (runtime) — the
+durable execution row is deleted below the API boundary after admission;
+renewal returns `Err(Fatal(NotFound))` and the service leaves the entry in
+place (the production runner fail-stops on the same classification).
+
+#### P2-1 — Legacy `Kernel::heartbeat` documented
+
+The attempt/epoch-only M4 primitive remains public solely for the frozen M4
+test surface (its only callers are m4_kernel tests). It now carries an
+explicit LEGACY doc: no execution fence, not wired to supervision admission,
+production renewal must use `renew_supervised_execution`, visibility
+reduction scheduled for the M5.8 composition freeze.
+
+#### P2-2 — Duration representability + liveness wording
+
+`RuntimeTimingConfig` now rejects finite-but-unrepresentable durations
+(`Duration::try_from_secs_f64` gate; new `UnrepresentableDuration` variant —
+`from_secs_f64` panics beyond the Duration range). The deadline-scheduler
+guarantee wording was weakened to the accurate liveness claim: the scheduler
+introduces no deterministic phase drift that places a renewal deadline
+beyond the durable expiry; external OS/storage stalls can still delay a tick
+past its deadline, in which case the frozen expiry fencing fails closed.
+
+#### Round-2 test mapping
+
+| Finding | Regression(s) |
+|---|---|
+| P1-1 clock sampled before serialization | `renewal_timestamp_is_sampled_after_transaction_serialization` (fails on the pre-fix kernel) |
+| P1-2 lifecycle / fatal admit / panic exit | fatal-smoke extension, `heartbeat_thread_panic_marks_runner_failed_and_rejects_admit` |
+| P1-3 NotFound fatality | `missing_execution_is_fatal_not_authority_loss`, storage helper narrowed |
+| P2-1 legacy heartbeat | doc-only (no behavior change) |
+| P2-2 representability + wording | `unrepresentable_durations_are_rejected`, doc-only |
