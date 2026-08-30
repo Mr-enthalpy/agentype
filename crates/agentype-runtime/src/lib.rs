@@ -665,15 +665,51 @@ impl<'a> Dispatcher<'a> {
             });
         }
 
-        // Synchronous terminal success claimed by the start observation: the
-        // collected outcome is authoritative for ACK/NACK proof (spec 07) and
-        // must be re-classified before any authoritative mutation — a start
-        // that looked successful may collect a failure, an unresolved state,
-        // or an internally contradictory result.
-        if observation.terminal_confirmed && observation.state == ExecutionState::Succeeded {
-            let outcome = adapter
-                .collect_outcome(&observation.runtime_handle)
-                .map_err(DispatchError::AdapterInvocation)?;
+        // Terminal observation (success OR failure): the collected outcome is
+        // authoritative for ACK/NACK proof (spec 07) and must be re-classified
+        // before any authoritative mutation. The start observation's own
+        // terminal/quiescence claims are never trusted on their own — a start
+        // that claims FAILED+quiescent while the physical execution may still
+        // be RUNNING must not unlock a WRITE replacement, and a start that
+        // claims SUCCEEDED may collect a failure, an unresolved state, or an
+        // internally contradictory result.
+        if observation.terminal_confirmed {
+            let outcome = match adapter.collect_outcome(&observation.runtime_handle) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // Collection failed after a terminal claim: the physical
+                    // reality is unresolved, so the start's terminal/quiescence
+                    // claims are NOT inherited. Persist unresolved history with
+                    // the observed handle, then a nonterminal NACK — the
+                    // Execution does not stay in STARTING with the handle
+                    // missing from durable history.
+                    let failure_class = adapter_invocation_failure_class(&err);
+                    self.kernel
+                        .record_physical_outcome(
+                            execution_id,
+                            ExecutionState::Unknown,
+                            Some(&observation.runtime_handle.0),
+                            None,
+                            Some(failure_class),
+                            false,
+                            false,
+                        )
+                        .map_err(DispatchError::Persistence)?;
+                    self.nack_start(
+                        claim,
+                        execution_id,
+                        failure_class,
+                        false,
+                        false,
+                        Some(&observation.runtime_handle.0),
+                    )?;
+                    return Ok(DispatchOneOutcome::StartFailed {
+                        execution_id: execution_id.clone(),
+                        request_id: request_id.clone(),
+                        failure_class,
+                    });
+                }
+            };
             return self.commit_collected_outcome(
                 claim,
                 execution_id,
@@ -681,27 +717,6 @@ impl<'a> Dispatcher<'a> {
                 &observation.runtime_handle.0,
                 outcome,
             );
-        }
-
-        // Terminal failure before RUNNING: the existing NACK rules apply
-        // (failure row, physical history, retry policy, writer safety).
-        if observation.terminal_confirmed {
-            let failure_class = observation
-                .failure_class
-                .unwrap_or(FailureClass::StartFailure);
-            self.nack_start(
-                claim,
-                execution_id,
-                failure_class,
-                true,
-                observation.quiescent_confirmed,
-                Some(&observation.runtime_handle.0),
-            )?;
-            return Ok(DispatchOneOutcome::StartFailed {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class,
-            });
         }
 
         // Any other observation shape is unresolved by definition.
@@ -771,21 +786,39 @@ impl<'a> Dispatcher<'a> {
             if outcome.state == ExecutionState::Succeeded {
                 // Authoritative success: the only path to ACK.
                 let payload = outcome.payload.clone().unwrap_or(Value::Null);
-                let result_id = self
-                    .kernel
-                    .ack_success(
-                        &claim.attempt_id,
-                        claim.lease_epoch,
-                        Some(execution_id),
-                        &payload,
-                        outcome.summary.as_deref(),
-                        outcome.quiescent_confirmed,
-                        outcome.incarnation_reusable,
-                    )
-                    .map_err(|err| match err {
-                        Error::StorageFailure(_) => DispatchError::Persistence(err),
-                        authority => DispatchError::Authority(authority),
-                    })?;
+                let result_id = match self.kernel.ack_success(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    Some(execution_id),
+                    &payload,
+                    outcome.summary.as_deref(),
+                    outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
+                ) {
+                    Ok(result_id) => result_id,
+                    Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                        // §27: authority expired between the start and the
+                        // authoritative ACK — persist physical history only
+                        // (the collected success and its handle survive),
+                        // never a Task-authority mutation.
+                        self.kernel
+                            .record_physical_outcome(
+                                execution_id,
+                                ExecutionState::Succeeded,
+                                Some(observed_handle),
+                                outcome.payload.as_ref(),
+                                None,
+                                true,
+                                outcome.quiescent_confirmed,
+                            )
+                            .map_err(DispatchError::Persistence)?;
+                        return Ok(DispatchOneOutcome::StartAmbiguous {
+                            execution_id: execution_id.clone(),
+                            request_id: request_id.clone(),
+                        });
+                    }
+                    Err(err) => return Err(DispatchError::Persistence(err)),
+                };
                 return Ok(DispatchOneOutcome::CompletedSynchronously {
                     execution_id: execution_id.clone(),
                     request_id: request_id.clone(),
@@ -2320,6 +2353,15 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             terminal_confirmed: true,
             quiescent_confirmed: true,
         });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
@@ -2446,6 +2488,15 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
+        });
+        advancing.inner.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::StartFailure),
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
         });
         let mut adapters = AdapterRegistry::new();
         adapters.register("process", advancing).unwrap();
@@ -2685,5 +2736,99 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 2): a terminal failure claim never bypasses the
+    /// authoritative collect. A start claiming FAILED+quiescent while the
+    /// physical execution may still be RUNNING collects a nonterminal
+    /// outcome — the start's quiescence is not inherited, and a WRITE task
+    /// suspends with WRITER_QUIESCENCE_UNKNOWN instead of unlocking a
+    /// replacement writer.
+    #[test]
+    fn dispatch_start_failure_claim_never_bypasses_collect() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("collect-writer", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"maybe": 1})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Running,
+            payload: None,
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert!(kernel.result_for_task(&task_id).is_err());
+        // The start's quiescence claim was NOT used: no retryable WRITE
+        // replacement — the writer-safety suspension stands.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        let esc = kernel.open_escalation_for_task(&task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 2): the collected outcome also overrides a start that
+    /// claimed terminal failure — collected success semantics (authoritative
+    /// ACK) apply, not the start's failure classification.
+    #[test]
+    fn dispatch_collected_success_overrides_start_failure_claim() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("collect-success", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"actually": 1})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: Some("done".into()),
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        match &outcome {
+            DispatchOneOutcome::CompletedSynchronously { result_id, .. } => {
+                assert!(result_id.is_some());
+            }
+            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        }
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
     }
 }
