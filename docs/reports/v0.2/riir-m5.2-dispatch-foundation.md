@@ -76,8 +76,13 @@ classify + persist observation (fenced primitives only)
       │                             + nonterminal NACK (ExecutionLost, never
       │                             quiescent) → writer safety decides
       │                             RETRY_WAIT vs WRITER_QUIESCENCE_UNKNOWN
-      ├─ terminal failure         → NACK (normalized FailureClass, terminal bit)
-      ├─ synchronous success      → collect_outcome → ack_success
+      ├─ terminal observation (success OR failure) → collect_outcome first,
+      │        then authoritative classification: ACK only on SUCCEEDED +
+      │        terminal proof; terminal failure → NACK under the collected
+      │        class; nonterminal/contradictory (active or LOST state with
+      │        proof, success without proof, quiescence without terminality)
+      │        → UNKNOWN with zero inherited proof + nonterminal NACK
+      │        (ADAPTER_PROTOCOL_FAILURE / INVALID_RESULT)
       ├─ invocation error         → normalized class + nonterminal NACK
       └─ stale authority after start → physical history ONLY (never restores
                                       Task authority; handle preserved for M5.4)
@@ -193,6 +198,8 @@ from a start that never happened.
 | 42b | audit r4: STARTING + terminal proof → protocol failure | `dispatch_starting_state_with_terminal_proof_is_protocol_failure` |
 | 42c | audit r4: UNKNOWN + terminal proof → protocol failure | `dispatch_unknown_state_with_terminal_proof_is_protocol_failure` |
 | 43 | audit r5: terminal failure without quiescence retains handle | `dispatch_terminal_failure_without_quiescence_retains_handle` |
+| 44 | audit r6: collected LOST never unlocks writer replacement | `dispatch_lost_outcome_never_unlocks_writer_replacement` |
+| — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
 
@@ -241,19 +248,20 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 174 passed, 0 failed
+cargo test --workspace                                   → 175 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (174):
+Rust breakdown (175):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
-  coherence §21; deterministic prompt; launch/environment pairing validation)
+  coherence §21; deterministic prompt; launch/environment pairing validation
+  including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 49 (M5.1 façade 13 + composition 6 + dispatcher 30)
+- `agentype-runtime`: 50 (M5.1 façade 13 + composition 6 + dispatcher 31)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -396,3 +404,22 @@ Rust breakdown (174):
 13. **Registered:** the StartFailed vocabulary split (see §8) and the
     `ExecutionLaunchSnapshot` layering-wording fix — the worker prompt is rendered by the
     provider-neutral execution contract (agentype-adapter-api), not "the runtime".
+
+### Round 6 (sixth audit)
+
+14. **Collected LOST never unlocks writer replacement (P1, merge blocker, corrected).**
+    `is_active_physical()` excludes LOST, so a collected LOST+terminal+quiescent outcome slipped
+    past the round-4 gate into the terminal-failure NACK, where `durable_quiescent = true` let an
+    unisolated WRITE task RETRY_WAIT and unlock a replacement writer — despite core semantics
+    that LOST is never a confirmed end (incarnation presence stays LOST under terminal/quiescence
+    claims; `record_physical_outcome` refuses proof bits for unresolved states) and that
+    laundering LOST into FAILED forecloses the later LOST refinement. Any collected LOST carrying
+    terminal or quiescence claims is now ADAPTER_PROTOCOL_FAILURE: unresolved (UNKNOWN, zero
+    inherited proof), handle preserved, nonterminal NACK. Regression: WRITE with EXECUTION_LOST
+    in the retry policy → SUSPENDED with WRITER_QUIESCENCE_UNKNOWN, never RETRY_WAIT.
+15. **Pairing validation covers attempt_isolation (P1, corrected).** The same attempt identity
+    and target/profile names can be re-resolved under a different registry whose target carries
+    different isolation; `from_launch` now rejects the mixed pair (`attempt_isolation` mismatch)
+    so a durable isolated safety proof can never be combined with a non-isolated physical request
+    configuration. Registered P2s from this round (outcome vocabulary split, pipeline wording)
+    are tracked in §8 / the diagram above.
