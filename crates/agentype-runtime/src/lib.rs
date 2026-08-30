@@ -819,8 +819,18 @@ impl<'a> Dispatcher<'a> {
 
         if outcome.terminal_confirmed {
             if outcome.state == ExecutionState::Succeeded {
-                // Authoritative success: the only path to ACK.
+                // Authoritative success: the only path to ACK. Physical
+                // evidence (the locator) is committed BEFORE the authority
+                // consequence when quiescence is not proven.
                 let payload = outcome.payload.clone().unwrap_or(Value::Null);
+                if !outcome.quiescent_confirmed {
+                    self.persist_terminal_evidence(
+                        execution_id,
+                        observed_handle,
+                        outcome.payload.as_ref(),
+                        None,
+                    )?;
+                }
                 let result_id = match self.kernel.ack_success(
                     &claim.attempt_id,
                     claim.lease_epoch,
@@ -854,20 +864,24 @@ impl<'a> Dispatcher<'a> {
                     }
                     Err(err) => return Err(DispatchError::Persistence(err)),
                 };
-                self.retain_collected_handle(
-                    execution_id,
-                    ExecutionState::Succeeded,
-                    observed_handle,
-                    outcome.quiescent_confirmed,
-                )?;
                 return Ok(DispatchOneOutcome::CompletedSynchronously {
                     execution_id: execution_id.clone(),
                     request_id: request_id.clone(),
                     result_id,
                 });
             }
-            // Authoritative terminal failure.
+            // Authoritative terminal failure. Physical evidence (the
+            // locator) is committed BEFORE the authority consequence when
+            // quiescence is not proven.
             let failure_class = outcome.failure_class.unwrap_or(FailureClass::StartFailure);
+            if !outcome.quiescent_confirmed {
+                self.persist_terminal_evidence(
+                    execution_id,
+                    observed_handle,
+                    None,
+                    Some(failure_class),
+                )?;
+            }
             self.nack_start(
                 claim,
                 execution_id,
@@ -875,12 +889,6 @@ impl<'a> Dispatcher<'a> {
                 true,
                 outcome.quiescent_confirmed,
                 Some(observed_handle),
-            )?;
-            self.retain_collected_handle(
-                execution_id,
-                ExecutionState::Failed,
-                observed_handle,
-                outcome.quiescent_confirmed,
             )?;
             return Ok(DispatchOneOutcome::StartFailed {
                 execution_id: execution_id.clone(),
@@ -945,33 +953,33 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// Design choice (audit rounds 5/7): Kernel mutation primitives do not
-    /// write runtime_handle_json (`nack`/`ack_success` have no handle
-    /// parameter), so the dispatcher retains the observed handle explicitly
-    /// whenever the collected end is NOT quiescence-proven — the state whose
-    /// physical cleanup/reconciliation M5.4 owns. A quiescence-proven
-    /// terminal execution deliberately does not retain its handle (no
-    /// physical cleanup needed) — by design, not by accident of the Kernel
-    /// parameter lists. Symmetric for collected terminal failures and
-    /// collected successes.
-    fn retain_collected_handle(
+    /// Persist the collected terminal evidence BEFORE the authority
+    /// consequence: UNKNOWN with the observed handle and zero proof bits.
+    ///
+    /// Kernel mutation primitives (`nack`/`ack_success`) do not write
+    /// runtime_handle_json, so recording the evidence first is what makes the
+    /// physical locator crash-durable (audit round 8): a crash between the
+    /// evidence transaction and the authority transaction leaves the locator
+    /// durable with the authority consequence unapplied — safe to reconcile —
+    /// never the reverse. Only needed when quiescence is not proven; a
+    /// quiescence-proven end needs no physical-cleanup locator. The terminal
+    /// state itself is applied by the authority transaction (UNKNOWN ->
+    /// SUCCEEDED/FAILED), preserving the frozen Kernel API.
+    fn persist_terminal_evidence(
         &self,
         execution_id: &ExecutionId,
-        state: ExecutionState,
         observed_handle: &Value,
-        quiescent_confirmed: bool,
+        payload: Option<&Value>,
+        failure_class: Option<FailureClass>,
     ) -> Result<(), DispatchError> {
-        if quiescent_confirmed {
-            return Ok(());
-        }
         self.kernel
             .record_physical_outcome(
                 execution_id,
-                state,
+                ExecutionState::Unknown,
                 Some(observed_handle),
-                None,
-                None,
-                true,
+                payload,
+                failure_class,
+                false,
                 false,
             )
             .map_err(DispatchError::Persistence)
@@ -3408,5 +3416,217 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
         assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    }
+
+    /// Test adapter whose collect_outcome corrupts one durable column below
+    /// the API boundary before reporting, forcing the subsequent authority
+    /// consequence (ack/nack) to fail hard. This exposes what is durable at
+    /// the crash window between the physical-evidence transaction and the
+    /// authority-consequence transaction.
+    struct CollectCorruptingAdapter {
+        inner: FakeAdapter,
+        path: std::path::PathBuf,
+        corrupt_sql: String,
+    }
+
+    impl CollectCorruptingAdapter {
+        fn new(path: std::path::PathBuf, corrupt_sql: String) -> Self {
+            Self {
+                inner: FakeAdapter::new(),
+                path,
+                corrupt_sql,
+            }
+        }
+    }
+
+    impl ExecutionAdapter for CollectCorruptingAdapter {
+        fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+            self.inner.start_execution(request)
+        }
+
+        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+            let conn = rusqlite::Connection::open(&self.path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            conn.execute(&self.corrupt_sql, []).unwrap();
+            self.inner.collect_outcome(handle)
+        }
+
+        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle)
+        }
+
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.interrupt_execution(handle)
+        }
+
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.terminate_execution(handle)
+        }
+
+        fn reconcile_start(
+            &self,
+            request_id: &RequestId,
+            persisted_handle: Option<&RuntimeHandle>,
+        ) -> AdapterResult<StartObservation> {
+            self.inner.reconcile_start(request_id, persisted_handle)
+        }
+    }
+
+    fn file_dispatch_env(tag: &str) -> (Kernel, std::path::PathBuf, Claim) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentype-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("crash-window", Value::Null).write()])
+            .unwrap();
+        let _task_id = ids.values().next().unwrap().clone();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        (kernel, path, claim)
+    }
+
+    fn durable_execution_state_and_handle(
+        path: &std::path::Path,
+        attempt_id: &AttemptId,
+    ) -> (String, String) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT state,runtime_handle_json FROM executions WHERE attempt_id=?1",
+            [attempt_id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Audit P1 (round 8): the physical locator must be durable BEFORE the
+    /// authority consequence. A collected SUCCEEDED without quiescence proof
+    /// whose ack then fails hard leaves the Execution UNKNOWN with the
+    /// observed handle durable (evidence committed, consequence unapplied —
+    /// safe to reconcile). The pre-evidence order would have left STARTING
+    /// with no handle at this point.
+    #[test]
+    fn dispatch_collected_success_evidence_durable_before_ack_consequence() {
+        let (kernel, path, claim) = file_dispatch_env("crash-success");
+        let wrapper = Arc::new(CollectCorruptingAdapter::new(
+            path.clone(),
+            format!(
+                "UPDATE leases SET expires_at='not-a-number' WHERE attempt_id='{}'",
+                claim.attempt_id.as_str()
+            ),
+        ));
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", wrapper.clone()).unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+
+        wrapper.inner.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"crash": 1})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        wrapper.inner.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let err = d.dispatch_claim(&claim).unwrap_err();
+        assert!(matches!(err, DispatchError::Persistence(_)));
+        // Crash-window state: evidence and locator durable, consequence
+        // unapplied.
+        let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
+        assert_eq!(state, "UNKNOWN");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
+            serde_json::json!({"crash": 1})
+        );
+    }
+
+    /// Audit P1 (round 8): the same crash-window guarantee for the terminal
+    /// failure path — the locator is durable before the NACK consequence.
+    #[test]
+    fn dispatch_collected_failure_evidence_durable_before_nack_consequence() {
+        let (kernel, path, claim) = file_dispatch_env("crash-failure");
+        let wrapper = Arc::new(CollectCorruptingAdapter::new(
+            path.clone(),
+            format!(
+                "UPDATE tasks SET retry_classes_json='NOT_JSON' WHERE id='{}'",
+                claim.task_id.as_str()
+            ),
+        ));
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", wrapper.clone()).unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+
+        wrapper.inner.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"crash": 2})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        wrapper.inner.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let err = d.dispatch_claim(&claim).unwrap_err();
+        assert!(matches!(err, DispatchError::Persistence(_)));
+        let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
+        assert_eq!(state, "UNKNOWN");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
+            serde_json::json!({"crash": 2})
+        );
     }
 }
