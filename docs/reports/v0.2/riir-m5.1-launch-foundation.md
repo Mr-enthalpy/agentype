@@ -20,7 +20,7 @@ In M4, `Claim` was returned to callers as a composite DTO carrying both authorit
 - `ExecutionLaunchSnapshot::from_persisted_kernel_authority` defines the explicit **storage trust boundary** between `agentype-storage-sqlite` and `agentype-core` / `agentype-execution-config`. Its contract requires: *"The only safe production construction path is the fenced Kernel execution-creation transaction."*
 - Publicly-enableable test bypasses (`test-support` Cargo features and public `for_testing` constructors) have been eliminated across all workspace crates.
 - `#![forbid(unsafe_code)]` is enforced on `agentype-runtime`, and `#![deny(unsafe_code)]` is enforced on `agentype-adapter-api`.
-- `ExecutionRequest::from_launch(&launch)` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot`, with the worker prompt deterministically derived as a `RenderedWorkerPrompt` (no caller-supplied text is accepted), binding both `incarnation_id` and `incarnation_runtime_handle` directly from durable storage without caller handle injection.
+- `ExecutionRequest::from_launch(&launch, &resolved_environment)` in `agentype-adapter-api` ensures physical execution requests are constructed exclusively from `ExecutionLaunchSnapshot` plus the authoritative resolved environment, with the worker prompt deterministically derived as a `RenderedWorkerPrompt` (no caller-supplied text is accepted), binding both `incarnation_id` and `incarnation_runtime_handle` directly from durable storage without caller handle injection. (M5.2 audit refinement: the resolved environment also carries target options, profile options, and the configured timeout input into the request.)
 
 ```text
 Claim (receipt)
@@ -56,7 +56,7 @@ Kernel::create_execution(&claim, env.safety())
 PreparedExecutionLaunch { snapshot, request, resolved_environment }
       ├─ snapshot: ExecutionLaunchSnapshot (private fields, readonly getters;
       │            task_name = durable Task label)
-      ├─ request: ExecutionRequest::from_launch(&launch)
+      ├─ request: ExecutionRequest::from_launch(&launch, &resolved_environment)
       │           └─ prompt = RenderedWorkerPrompt::from_launch(&launch):
       │              deterministic V0.1 protocol (IDs, epoch, workstream,
       │              objective = payload, acceptance, continuity, + writer
@@ -93,7 +93,7 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
       │ (depends on core + config)
 [agentype-adapter-api] (#![deny(unsafe_code)])
       ├── RenderedWorkerPrompt::from_launch(&launch) (deterministic V0.1 protocol)
-      ├── ExecutionRequest::from_launch(&launch)
+      ├── ExecutionRequest::from_launch(&launch, &resolved_environment)
       └── ExecutionAdapter trait
 ```
 
@@ -149,7 +149,7 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
 - Returns `PreparedExecutionLaunch { snapshot, request, resolved_environment }`. Configuration resolution is keyed by the durable `AuthoritativeExecutionBinding` and runs inside the façade between the authority-validation transaction and the fenced execution-creation transaction, so the persisted `attempt_isolation` fact and the environment exposed for physical start are bound to the same resolved environment (resolution followed by fenced revalidation — not a cross registry+SQLite atomic transaction). The dispatcher MUST select the adapter binding, options, and timeouts from `resolved_environment` and MUST NOT re-resolve; a pre-resolved environment is not an accepted parameter.
 - `Kernel::resolve_execution_binding(&claim)` (storage crate): a short authority-validation transaction producing `AuthoritativeExecutionBinding` from the frozen Attempt row. A stale/expired Claim fails with `StaleAuthority` and a Claim whose task/agent/target/profile copies disagree with the Attempt fails with `InvalidAuthority` — both BEFORE any configuration resolution, so a tampered Claim cannot masquerade as a configuration failure.
 - `ExecutionPreparationError` freezes configuration-resolution failures to the standardized Task failure class `RESOURCE_UNAVAILABLE` (`standard_failure_class()`), anchored on `core::authority::unavailable_configuration_failure` and spec 16 §A2 (the supplied registry is authoritative, no adapter default). Kernel authority errors are deliberately NOT mapped to a Task failure class.
-- The worker prompt is not a façade concern: `ExecutionRequest::from_launch(&launch)` derives it deterministically via `RenderedWorkerPrompt` (see adapter-api).
+- The worker prompt is not a façade concern: `ExecutionRequest::from_launch(&launch, &resolved_environment)` derives it deterministically via `RenderedWorkerPrompt` (see adapter-api).
 - Recovery orchestration: `recover_authority(&kernel) -> Result<ExpireReport, Error>`.
 - Verified regressions: `launch_binds_current_registry_state_not_a_stale_resolved_environment` (a registry generation swap between attempts binds the current generation), `preparation_errors_standardize_configuration_failures_as_resource_unavailable`, the discriminating pair `recovery_follows_persisted_isolation_fact_despite_registry_reconfiguration` / `unisolated_writer_expiry_without_quiescence_suspends` (identical retryable WRITE policy: recovery follows the persisted `attempt_isolation` fact to RETRY_WAIT and a replacement Attempt, while the unisolated control suspends with `WRITER_QUIESCENCE_UNKNOWN`), the worker-prompt protocol regressions, and `stale_safety_proof_cannot_authorize_later_attempt_after_registry_reconfiguration` (a proof minted for attempt A cannot authorize attempt B even with identical target/profile).
 
@@ -157,10 +157,13 @@ PreparedExecutionLaunch { snapshot, request, resolved_environment }
 - Enforces `#![deny(unsafe_code)]`.
 - `RenderedWorkerPrompt`: the deterministic, provider-neutral worker protocol (V0.1 task protocol sections) with private text and the sole constructor `from_launch(&ExecutionLaunchSnapshot)`. Given the same snapshot, the worker instruction is uniquely determined; no constructor accepts arbitrary text.
 - `ExecutionRequest` retains complete structured worker contract:
-  - `request_id`, `execution_id`, `task_id`, `batch_id`, `attempt_id`, `attempt_number`, `lease_id`, `lease_epoch`, `logical_agent_id`, `incarnation_id`, `execution_target`, `execution_profile`, `workspace_mode`, `prompt` (deterministically derived V0.1 worker protocol via `RenderedWorkerPrompt`; not a parameter), `payload`, `acceptance`, `workstream_id`, `continuity`, `incarnation_runtime_handle`.
+  - `request_id`, `execution_id`, `task_id`, `batch_id`, `attempt_id`, `attempt_number`, `lease_id`, `lease_epoch`, `logical_agent_id`, `incarnation_id`, `execution_target`, `execution_profile`, `workspace_mode`, `prompt` (deterministically derived V0.1 worker protocol via `RenderedWorkerPrompt`; not a parameter), `payload`, `acceptance`, `workstream_id`, `continuity`, `incarnation_runtime_handle`, plus runtime-configuration inputs from the resolved environment (`target_options`, `profile_options`, `profile_timeout_seconds`; M5.2 audit refinement — scheduler semantics come exclusively from the snapshot, physical runtime configuration exclusively from the resolved environment).
 - Closed derivation constructor:
   ```rust
-  pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> ExecutionRequest
+  pub fn from_launch(
+      launch: &ExecutionLaunchSnapshot,
+      environment: &ResolvedExecutionEnvironment,
+  ) -> ExecutionRequest
   ```
 - Readonly getters for all fields including `incarnation_id` and `incarnation_runtime_handle`.
 

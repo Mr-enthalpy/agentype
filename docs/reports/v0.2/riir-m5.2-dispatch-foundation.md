@@ -180,6 +180,12 @@ from a start that never happened.
 | 36 | retry after MERGE adopts new target/profile | M4 suite `retry_after_merged_attempt_uses_new_partition_target` (green) |
 | 37 | persisted attempt_isolation creation-time immutable | M4/M5.1 suites (green, incl. `stale_safety_proof_cannot_authorize_later_attempt_after_registry_reconfiguration`) |
 | 38 | Python oracle green | 160 passed, 2 skipped |
+| 39a | audit: collect overrides start success with failure | `dispatch_collect_overrides_start_success_with_failure` |
+| 39b | audit: nonterminal collection never ACKs / inherits proof | `dispatch_collect_nonterminal_never_acks_or_inherits_proof` |
+| 39c | audit: contradictory success collection → INVALID_RESULT | `dispatch_contradictory_success_collection_is_never_acked` |
+| 39d | audit: quiescence without terminality → ADAPTER_PROTOCOL_FAILURE | `dispatch_quiescence_without_terminal_is_protocol_failure` |
+| 40 | audit: resolved options/timeout reach the adapter request | `dispatch_request_carries_resolved_runtime_configuration` |
+| — | audit: admission seed matches durable attempt + live lease epoch | asserted in `dispatch_one_starts_running_exactly_once` |
 
 ---
 
@@ -228,7 +234,7 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 161 passed, 0 failed
+cargo test --workspace                                   → 166 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
@@ -240,7 +246,7 @@ Rust breakdown (161):
   coherence §21; deterministic prompt)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 37 (M5.1 façade 13 + composition 6 + dispatcher 18)
+- `agentype-runtime`: 42 (M5.1 façade 13 + composition 6 + dispatcher 23)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -254,3 +260,35 @@ Rust breakdown (161):
   untouched; reconciliation of stale physical rows is M5.4.
 - Supervision admission, heartbeat, notifier, restart barrier: M5.3/M5.4/M5.5.
 - First real (reference) adapter: M5.7.
+
+---
+
+## 9. Audit round corrections (post-PR review)
+
+1. **collect_outcome is authoritative for ACK/NACK proof (P1, merge blocker, corrected).** The
+   synchronous-success path consumed only the collected payload/summary/quiescence/incarnation
+   fields and never re-classified `outcome.state`/`outcome.terminal_confirmed`, so a start that
+   claimed SUCCEEDED could collect a failure, an unresolved state, or a contradictory result and
+   still ACK the Task into a durable Result. `commit_collected_outcome` now classifies
+   authoritatively: SUCCEEDED+terminal is the only ACK path; terminal failures NACK under the
+   collected class; nonterminal/unresolved collections are NO-ACK with zero inherited
+   terminal/quiescence proof (execution stays UNKNOWN); contradictory collections (success without
+   terminal proof → INVALID_RESULT; quiescence without terminality → ADAPTER_PROTOCOL_FAILURE)
+   are never ACKed as success. Four negative regressions added (mapping rows 39a-39d).
+2. **Authoritative runtime configuration now crosses the composition boundary (P1, merge blocker,
+   corrected).** Only adapter_kind and attempt_isolation previously reached the physical start;
+   target options, profile options, and the configured profile timeout were resolved and then
+   dropped. `ExecutionRequest::from_launch(launch, environment)` enforces the two-source rule
+   structurally: scheduler semantics come exclusively from the authoritative launch snapshot;
+   physical runtime configuration (target options, profile options, configured timeout input)
+   comes exclusively from the authoritative resolved environment — whose fields are private and
+   only obtainable through authoritative resolution, so options cannot be fabricated. Deadline
+   *enforcement* remains M5.6; the configured input is carried from M5.2.
+3. **SupervisionAdmissionSeed (P1, M5.3 prerequisite, corrected).** `StartedRunning` now carries
+   `SupervisionAdmissionSeed { execution_id, request_id, attempt_id, lease_epoch }`, generated
+   exclusively after `confirm_running_and_renew` succeeds. It grants no new authority — it
+   carries exactly the identity the fenced transaction just confirmed, so M5.3 supervision does
+   not re-derive launch authority from the database.
+4. **Observed handle preservation on stale-authority NACK paths (P2, corrected).** `nack_start`
+   threads the observed runtime handle through every path; the stale-authority physical-history
+   fallback no longer drops it, and the stale-failure regression exercises a non-null handle.
