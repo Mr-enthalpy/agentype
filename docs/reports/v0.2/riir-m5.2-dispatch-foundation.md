@@ -65,7 +65,7 @@ ResolvedPhysicalExecutionEnvironment (binding + config + installed adapter)
 Kernel::create_execution(&claim, env.safety())   [fenced tx; Execution STARTING;
       │                                           stable RequestId persisted]
       ↓
-ExecutionRequest::from_launch(&snapshot)         [deterministic worker protocol]
+ExecutionRequest::from_launch(&snapshot, &resolved environment)         [deterministic worker protocol]
       ↓
 adapter.start_execution(&request)                [EXACTLY ONCE; outside any tx]
       ↓
@@ -234,19 +234,19 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 166 passed, 0 failed
+cargo test --workspace                                   → 169 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (161):
+Rust breakdown (169):
 
-- `agentype-adapter-api`: 7 (FakeAdapter invocation controls; fixture identity
-  coherence §21; deterministic prompt)
+- `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
+  coherence §21; deterministic prompt; launch/environment pairing validation)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 42 (M5.1 façade 13 + composition 6 + dispatcher 23)
+- `agentype-runtime`: 44 (M5.1 façade 13 + composition 6 + dispatcher 25)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -292,3 +292,29 @@ Rust breakdown (161):
 4. **Observed handle preservation on stale-authority NACK paths (P2, corrected).** `nack_start`
    threads the observed runtime handle through every path; the stale-authority physical-history
    fallback no longer drops it, and the stale-failure regression exercises a non-null handle.
+
+### Round 2 (second audit)
+
+5. **Every terminal start observation goes through authoritative collect (P1, merge blocker,
+   corrected).** Only the SUCCEEDED branch previously called `collect_outcome`; a start claiming
+   FAILED (or Terminated/Lost) with terminal+quiescent bits NACKed directly from the
+   StartObservation, bypassing the authoritative ACK/NACK proof source — and for WRITE tasks
+   potentially unlocking a replacement writer while the physical execution may still be RUNNING
+   (duplicate-writer violation). All terminal observations now collect first and
+   `commit_collected_outcome` remains the sole classifier: collected terminal failures NACK under
+   the collected class; collected nonterminal outcomes land UNKNOWN with zero inherited proof
+   (the start's quiescence claim is never used, so writer safety suspends instead of retrying);
+   collected success overrides a failure claim. Regressions: start FAILED+quiescent / collect
+   RUNNING nonterminal → WRITE suspends with WRITER_QUIESCENCE_UNKNOWN (no replacement writer);
+   start FAILED / collect SUCCEEDED → collected success semantics ACK.
+6. **collect error after a terminal claim is handled as unresolved (adjacent, corrected).** When
+   `collect_outcome` itself errors, the start's terminal/quiescence claims are not inherited:
+   unresolved physical history is persisted with the observed handle (the Execution no longer
+   lingers in STARTING) and a nonterminal NACK runs. The collected-ACK path also handles stale
+   authority by recording physical history only (§27 alignment).
+7. **from_launch verifies launch/environment pairing (P2, corrected).** The constructor now
+   verifies attempt_id, lease_epoch, execution_target, and execution_profile across the two
+   sources and returns `LaunchEnvironmentMismatch` (fail closed) instead of assembling a mixed
+   request.
+8. **Report arithmetic and pipeline drift (P2, corrected).** Breakdown heading (161→169) and the
+   pipeline's two-source `from_launch` signature reconciled.
