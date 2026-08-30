@@ -122,8 +122,16 @@ pub fn prepare_execution_launch(
         .map_err(ExecutionPreparationError::Kernel)?;
     let environment = resolve_execution_environment(mode, &binding)
         .map_err(ExecutionPreparationError::Configuration)?;
+    // Standalone façade: no AdapterRegistry is consulted, so the frozen
+    // adapter_kind is the target configuration's declared binding.
     let snapshot = kernel
-        .create_execution(claim, environment.safety())
+        .create_execution(
+            claim,
+            FrozenPhysicalExecutionBinding::new(
+                environment.safety(),
+                environment.target().adapter_kind.clone(),
+            ),
+        )
         .map_err(ExecutionPreparationError::Kernel)?;
     let request = ExecutionRequest::from_launch(&snapshot, &environment)
         .map_err(|m| ExecutionPreparationError::Kernel(Error::invalid_authority(m.detail)))?;
@@ -343,6 +351,14 @@ impl ResolvedPhysicalExecutionEnvironment {
     pub fn attempt_isolation(&self) -> bool {
         self.environment.attempt_isolation()
     }
+
+    /// The provider-neutral physical binding frozen with the execution
+    /// commitment: the Attempt-bound safety facts plus the adapter_kind of
+    /// the installed adapter resolved for this environment (the same kind
+    /// string used for the AdapterRegistry lookup).
+    pub fn physical_binding(&self) -> FrozenPhysicalExecutionBinding {
+        self.environment.physical_binding()
+    }
 }
 
 impl std::fmt::Debug for ResolvedPhysicalExecutionEnvironment {
@@ -558,7 +574,7 @@ impl<'a> Dispatcher<'a> {
         // the Execution and is never regenerated.
         let snapshot = self
             .kernel
-            .create_execution(claim, physical.environment().safety())
+            .create_execution(claim, physical.physical_binding())
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
@@ -1823,7 +1839,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Replay attempt A's proof onto attempt B: rejected on identity, even
         // though target and profile coincide.
         let err = kernel
-            .create_execution(&claim_b, env_a.safety())
+            .create_execution(&claim_b, env_a.physical_binding())
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidAuthority(_)),
@@ -3627,6 +3643,43 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 2})
+        );
+    }
+
+    /// Audit P1 (round 9): the execution-commitment transaction freezes the
+    /// adapter binding identity — the row carries the adapter_kind of the
+    /// installed adapter resolved for this dispatch, so a later registry
+    /// configuration drift can never change who owns the physical start.
+    #[test]
+    fn execution_commitment_freezes_adapter_kind() {
+        let (kernel, path, claim) = file_dispatch_env("freeze-kind");
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", fake.clone()).unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (state, adapter_kind): (String, String) = conn
+            .query_row(
+                "SELECT state,adapter_kind FROM executions WHERE attempt_id=?1",
+                [claim.attempt_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "RUNNING");
+        assert_eq!(
+            adapter_kind, "process",
+            "the commitment transaction must freeze the resolved adapter binding identity"
         );
     }
 }

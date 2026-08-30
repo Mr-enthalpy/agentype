@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS executions (
     incarnation_id TEXT NOT NULL REFERENCES incarnations(id) ON DELETE RESTRICT,
     execution_target TEXT NOT NULL,
     execution_profile TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL,
     attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
