@@ -854,6 +854,12 @@ impl<'a> Dispatcher<'a> {
                     }
                     Err(err) => return Err(DispatchError::Persistence(err)),
                 };
+                self.retain_collected_handle(
+                    execution_id,
+                    ExecutionState::Succeeded,
+                    observed_handle,
+                    outcome.quiescent_confirmed,
+                )?;
                 return Ok(DispatchOneOutcome::CompletedSynchronously {
                     execution_id: execution_id.clone(),
                     request_id: request_id.clone(),
@@ -870,8 +876,9 @@ impl<'a> Dispatcher<'a> {
                 outcome.quiescent_confirmed,
                 Some(observed_handle),
             )?;
-            self.retain_terminal_handle(
+            self.retain_collected_handle(
                 execution_id,
+                ExecutionState::Failed,
                 observed_handle,
                 outcome.quiescent_confirmed,
             )?;
@@ -938,16 +945,19 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// Design choice (audit round 5): a terminal-failure NACK does not write
-    /// the runtime handle (`Kernel::nack` has no handle parameter), but a
-    /// terminal failure WITHOUT quiescence proof leaves physical
-    /// cleanup/reconciliation to M5.4, so the observed handle is retained
-    /// explicitly. A quiescence-proven terminal execution needs no physical
-    /// cleanup, so its handle is deliberately not retained — the distinction
-    /// is by design, not an accident of the Kernel parameter list.
-    fn retain_terminal_handle(
+    /// Design choice (audit rounds 5/7): Kernel mutation primitives do not
+    /// write runtime_handle_json (`nack`/`ack_success` have no handle
+    /// parameter), so the dispatcher retains the observed handle explicitly
+    /// whenever the collected end is NOT quiescence-proven — the state whose
+    /// physical cleanup/reconciliation M5.4 owns. A quiescence-proven
+    /// terminal execution deliberately does not retain its handle (no
+    /// physical cleanup needed) — by design, not by accident of the Kernel
+    /// parameter lists. Symmetric for collected terminal failures and
+    /// collected successes.
+    fn retain_collected_handle(
         &self,
         execution_id: &ExecutionId,
+        state: ExecutionState,
         observed_handle: &Value,
         quiescent_confirmed: bool,
     ) -> Result<(), DispatchError> {
@@ -957,7 +967,7 @@ impl<'a> Dispatcher<'a> {
         self.kernel
             .record_physical_outcome(
                 execution_id,
-                ExecutionState::Failed,
+                state,
                 Some(observed_handle),
                 None,
                 None,
@@ -3342,5 +3352,61 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             "a durable-state fault must be Persistence, never AuthorityRejected: {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit P2 / M5.4 hardening (round 7): a collected success WITHOUT
+    /// quiescence proof suspends the task (WRITER_SUCCESS_NOT_QUIESCENT) and
+    /// must still retain the observed runtime handle — symmetric with the
+    /// terminal-failure retention.
+    #[test]
+    fn dispatch_success_without_quiescence_retains_handle() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("success-handle", Value::Null).write()])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(serde_json::json!({"won": 1})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(serde_json::json!({"ok": true})),
+            summary: Some("done".into()),
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let (execution_id, result_id) = match &outcome {
+            DispatchOneOutcome::CompletedSynchronously {
+                execution_id,
+                result_id,
+                ..
+            } => (execution_id.clone(), result_id.clone()),
+            other => panic!("expected CompletedSynchronously, got {other:?}"),
+        };
+        // Writer-unsafe success produces no durable Result.
+        assert!(result_id.is_none());
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Succeeded);
+        assert!(exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"won": 1})
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        let esc = kernel.open_escalation_for_task(&task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
     }
 }
