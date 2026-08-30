@@ -125,7 +125,7 @@ pub fn prepare_execution_launch(
     let snapshot = kernel
         .create_execution(claim, environment.safety())
         .map_err(ExecutionPreparationError::Kernel)?;
-    let request = ExecutionRequest::from_launch(&snapshot);
+    let request = ExecutionRequest::from_launch(&snapshot, &environment);
     Ok(PreparedExecutionLaunch {
         snapshot,
         request,
@@ -501,7 +501,7 @@ impl<'a> Dispatcher<'a> {
             })?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
-        let request = ExecutionRequest::from_launch(&snapshot);
+        let request = ExecutionRequest::from_launch(&snapshot, physical.environment());
 
         // Physical start — exactly once (task §16), outside any SQLite
         // transaction (task §26).
@@ -1839,10 +1839,17 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let mut registry = ExecutionRegistry::new();
         registry
-            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .register_target(
+                ExecutionTargetConfig::new("local", "process", false)
+                    .with_options(serde_json::json!({"endpoint": "local://dispatch"})),
+            )
             .unwrap();
         registry
-            .register_profile(ExecutionProfileConfig::new("default"))
+            .register_profile(
+                ExecutionProfileConfig::new("default")
+                    .with_timeout(30.0)
+                    .with_options(serde_json::json!({"model_tier": "standard"})),
+            )
             .unwrap();
 
         let fake = Arc::new(FakeAdapter::new());
@@ -2313,6 +2320,31 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
+    }
+
+    /// Audit P1: the authoritative runtime configuration (target options,
+    /// profile options, configured timeout input) crosses the composition
+    /// boundary into the request the adapter actually receives.
+    #[test]
+    fn dispatch_request_carries_resolved_runtime_configuration() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("opts", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::StartedRunning { .. }));
+        let last = fake.last_request().unwrap();
+        assert_eq!(
+            last.target_options(),
+            &serde_json::json!({"endpoint": "local://dispatch"})
+        );
+        assert_eq!(
+            last.profile_options(),
+            &serde_json::json!({"model_tier": "standard"})
+        );
+        assert_eq!(last.profile_timeout_seconds(), Some(30.0));
     }
 
     /// §27: authority expiring between Execution creation and a RUNNING

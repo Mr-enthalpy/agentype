@@ -10,7 +10,7 @@ use agentype_core::{
     IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
     WorkstreamId,
 };
-use agentype_execution_config::ExecutionLaunchSnapshot;
+use agentype_execution_config::{ExecutionLaunchSnapshot, ResolvedExecutionEnvironment};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -161,10 +161,14 @@ fn python_json_string(s: &str) -> String {
 /// Complete structured execution request passed to an ExecutionAdapter.
 ///
 /// Encapsulates all execution metadata as private fields with readonly getters.
-/// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
+/// Constructible exclusively from the two authoritative sources:
 ///
-/// `prompt` is deterministically derived from the snapshot (see
-/// `RenderedWorkerPrompt`); it is not a parameter and cannot be injected.
+/// - the `ExecutionLaunchSnapshot` — durable Scheduler semantics (identities,
+///   workspace, payload, acceptance, continuity, incarnation binding);
+/// - the `ResolvedExecutionEnvironment` — authoritative runtime configuration
+///   (target options, profile options, configured timeout inputs).
+///
+/// The Claim is part of neither source and can never reach this request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     request_id: RequestId,
@@ -186,17 +190,26 @@ pub struct ExecutionRequest {
     workstream_id: Option<WorkstreamId>,
     continuity: CommittedContinuitySnapshot,
     incarnation_runtime_handle: RuntimeHandle,
+    target_options: Value,
+    profile_options: Value,
+    profile_timeout_seconds: Option<f64>,
 }
 
 impl ExecutionRequest {
-    /// Assemble the worker request from an authoritative launch snapshot.
+    /// Assemble the worker request from the authoritative launch snapshot and
+    /// the authoritative resolved environment.
     ///
-    /// The worker prompt is not a parameter: it is deterministically derived
-    /// from the snapshot as the provider-neutral V0.1 worker protocol (see
-    /// `RenderedWorkerPrompt`). Every caller receives the same instruction
-    /// for the same durable launch facts; there is no path to inject
-    /// arbitrary text between the scheduler and the worker.
-    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
+    /// Two-source rule: scheduler semantics come exclusively from the
+    /// snapshot; physical runtime configuration comes exclusively from the
+    /// resolved environment (which can only be produced by authoritative
+    /// configuration resolution — its fields are private, so callers cannot
+    /// inject fabricated options). The worker prompt is deterministically
+    /// derived from the snapshot as the provider-neutral V0.1 worker protocol
+    /// (see `RenderedWorkerPrompt`).
+    pub fn from_launch(
+        launch: &ExecutionLaunchSnapshot,
+        environment: &ResolvedExecutionEnvironment,
+    ) -> Self {
         Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
@@ -217,6 +230,9 @@ impl ExecutionRequest {
             workstream_id: launch.workstream_id().cloned(),
             continuity: launch.continuity().clone(),
             incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
+            target_options: environment.target().options.clone(),
+            profile_options: environment.profile().options.clone(),
+            profile_timeout_seconds: environment.profile().timeout_seconds,
         }
     }
 
@@ -296,6 +312,24 @@ impl ExecutionRequest {
 
     pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
         &self.incarnation_runtime_handle
+    }
+
+    /// Authoritative target options resolved from the ExecutionRegistry
+    /// (host/endpoint settings of the requested environment).
+    pub fn target_options(&self) -> &Value {
+        &self.target_options
+    }
+
+    /// Authoritative profile options resolved from the ExecutionRegistry
+    /// (model settings / provider-neutral tuning of the requested profile).
+    pub fn profile_options(&self) -> &Value {
+        &self.profile_options
+    }
+
+    /// Configured profile timeout input (seconds). Deadline *enforcement* is
+    /// a later-milestone adapter concern; this is the configured input only.
+    pub fn profile_timeout_seconds(&self) -> Option<f64> {
+        self.profile_timeout_seconds
     }
 }
 
@@ -516,10 +550,13 @@ mod tests {
     /// its Attempt-bound safety proof share one `AuthoritativeExecutionBinding`
     /// (review §21 fixture hygiene — never hand a snapshot a safety proof
     /// minted for a different synthetic attempt).
-    fn mock_launch_fixture() -> (
-        ExecutionLaunchSnapshot,
-        agentype_core::AuthoritativeExecutionBinding,
-    ) {
+    struct MockLaunch {
+        snapshot: ExecutionLaunchSnapshot,
+        binding: agentype_core::AuthoritativeExecutionBinding,
+        environment: ResolvedExecutionEnvironment,
+    }
+
+    fn mock_launch() -> MockLaunch {
         let attempt_id = agentype_core::AttemptId::new();
         let binding = agentype_core::AuthoritativeExecutionBinding {
             attempt_id: attempt_id.clone(),
@@ -527,6 +564,11 @@ mod tests {
             execution_target: "local".to_string(),
             execution_profile: "default".to_string(),
         };
+        let environment = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &binding,
+        )
+        .unwrap();
         let snapshot = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
@@ -552,18 +594,19 @@ mod tests {
                 FrozenExecutionSafety::unisolated(binding.clone()),
             )
         };
-        (snapshot, binding)
-    }
-
-    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
-        mock_launch_fixture().0
+        MockLaunch {
+            snapshot,
+            binding,
+            environment,
+        }
     }
 
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
-        let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -577,8 +620,9 @@ mod tests {
     #[test]
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
-        let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -614,6 +658,11 @@ mod tests {
             execution_target: "local".to_string(),
             execution_profile: "default".to_string(),
         };
+        let environment = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &binding,
+        )
+        .unwrap();
         let launch = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
@@ -640,13 +689,13 @@ mod tests {
                     3,
                     serde_json::json!({"state": "saved"}),
                 ),
-                FrozenExecutionSafety::unisolated(binding),
+                FrozenExecutionSafety::unisolated(binding.clone()),
             )
         };
         // The safety proof is bound to the snapshot's own attempt identity.
         assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
         assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
-        let req = ExecutionRequest::from_launch(&launch);
+        let req = ExecutionRequest::from_launch(&launch, &environment);
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -684,6 +733,14 @@ mod tests {
             req.incarnation_runtime_handle(),
             &RuntimeHandle(serde_json::json!({"proc": 42}))
         );
+        // Two-source rule: runtime configuration comes from the resolved
+        // environment, never from the snapshot or the Claim.
+        assert_eq!(req.target_options(), &environment.target().options);
+        assert_eq!(req.profile_options(), &environment.profile().options);
+        assert_eq!(
+            req.profile_timeout_seconds(),
+            environment.profile().timeout_seconds
+        );
     }
 
     /// Review P1: the worker instruction is a pure function of the launch
@@ -691,9 +748,10 @@ mod tests {
     /// durable facts always produce the same protocol.
     #[test]
     fn worker_prompt_is_deterministic_and_cannot_be_injected() {
-        let launch = mock_launch_snapshot();
-        let first = ExecutionRequest::from_launch(&launch);
-        let second = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let first = ExecutionRequest::from_launch(&launch, &mock.environment);
+        let second = ExecutionRequest::from_launch(&launch, &mock.environment);
         assert_eq!(first, second);
         assert_eq!(
             first.prompt(),
@@ -710,7 +768,8 @@ mod tests {
     /// Attempt-bound safety proof share one attempt identity.
     #[test]
     fn fixture_safety_is_bound_to_the_snapshot_attempt_identity() {
-        let (launch, binding) = mock_launch_fixture();
+        let mock = mock_launch();
+        let (launch, binding) = (&mock.snapshot, &mock.binding);
         assert_eq!(launch.attempt_id(), &binding.attempt_id);
         assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
         assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
@@ -726,8 +785,9 @@ mod tests {
     fn fake_adapter_records_invocation_count_and_last_request() {
         let fake = FakeAdapter::new();
         assert_eq!(fake.start_call_count(), 0);
-        let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
         let _ = fake.start_execution(&req).unwrap();
         let _ = fake.start_execution(&req).unwrap();
         assert_eq!(fake.start_call_count(), 2);
