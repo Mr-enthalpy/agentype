@@ -298,7 +298,7 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
         .unwrap();
     let execution_id = launch.execution_id().clone();
     clock.advance(9.5);
-    let expires = k
+    let grant = k
         .confirm_running_and_renew(
             &claim.attempt_id,
             claim.lease_epoch,
@@ -306,7 +306,8 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
             &json!({"thread": 1}),
         )
         .unwrap();
-    assert!(expires > clock.now());
+    assert!(grant.expires_at() > clock.now());
+    assert_eq!(grant.execution_id(), &execution_id);
     let lease = k.lease_for_attempt(&claim.attempt_id).unwrap();
     assert_eq!(lease.state, LeaseState::Active);
     assert_eq!(

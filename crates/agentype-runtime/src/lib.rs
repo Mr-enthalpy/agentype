@@ -21,7 +21,7 @@ use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
     ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
 };
-use agentype_storage_sqlite::Kernel;
+use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -461,7 +461,31 @@ pub struct SupervisionAdmission {
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl SupervisionAdmission {
-    pub(crate) fn new(
+    /// The ONLY constructor (M5.4 §4 API freeze): admissions are minted
+    /// exclusively from a Kernel-produced `RunningAuthorityGrant` - the live
+    /// return value of a fenced RUNNING-confirmation-and-renewal
+    /// transaction. There is no raw-IDs path, so a persisted
+    /// `state='RUNNING'` row can never become an admission, and the
+    /// live-dispatch and restart-reconciliation flows share one authority
+    /// boundary by construction.
+    pub fn from_grant(grant: RunningAuthorityGrant) -> Self {
+        Self {
+            execution_id: grant.execution_id().clone(),
+            request_id: grant.request_id().clone(),
+            attempt_id: grant.attempt_id().clone(),
+            lease_epoch: grant.lease_epoch(),
+            generation: NEXT_ADMISSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            first_renewed_at: grant.renewed_at(),
+            lease_expires_at: grant.expires_at(),
+        }
+    }
+
+    /// TEST-ONLY construction seam (crate tests): the registry's
+    /// identity-conflict rejection logic needs capabilities that violate
+    /// identity consistency, which no legitimate Kernel grant can produce.
+    /// Production code has no path to this constructor (cfg(test)).
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
         execution_id: ExecutionId,
         request_id: RequestId,
         attempt_id: AttemptId,
@@ -768,22 +792,14 @@ impl<'a> Dispatcher<'a> {
                 execution_id,
                 &observation.runtime_handle.0,
             ) {
-                Ok(expires_at) => Ok(DispatchOneOutcome::RunningAdmitted {
-                    admission: SupervisionAdmission::new(
-                        execution_id.clone(),
-                        request_id.clone(),
-                        claim.attempt_id.clone(),
-                        claim.lease_epoch,
-                        // The scheduling anchor is the fenced first-renewal
-                        // COMMIT time, recovered exactly from the
-                        // transaction's own expiry output (expires_at =
-                        // commit + lease_seconds). The supervision registry
-                        // schedules from this anchor — never from the
-                        // possibly-delayed handoff or insertion time (M5.3
-                        // audit P1-1: deadline phase correctness).
-                        expires_at - self.kernel.lease_seconds(),
-                        expires_at,
-                    ),
+                Ok(grant) => Ok(DispatchOneOutcome::RunningAdmitted {
+                    // The grant IS the fenced first-renewal output: its
+                    // renewed_at is the exact commit time (the
+                    // deadline-scheduling anchor - never the
+                    // possibly-delayed handoff or insertion time, M5.3
+                    // audit P1-1). The admission is minted exclusively
+                    // from this Kernel-produced capability (M5.4 S4).
+                    admission: SupervisionAdmission::from_grant(grant),
                 }),
                 Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                     // Task §27: authority became stale between Execution

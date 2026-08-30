@@ -25,6 +25,73 @@ pub enum SupervisedRenewal {
     NotRunning,
 }
 
+/// The authoritative output of the fenced RUNNING-confirmation-and-renewal
+/// transaction (M5.4 §4 API freeze): the ONLY object from which a
+/// `SupervisionAdmission` may be minted.
+///
+/// Produced exclusively by `Kernel::confirm_running_and_renew` — i.e. by a
+/// transaction that validated current Attempt/Lease/epoch authority and
+/// atomically committed Execution=RUNNING + the first/next Lease renewal —
+/// so both live-dispatch admission and restart-reconciliation re-admission
+/// share one authority boundary. A persisted `state='RUNNING'` row can never
+/// produce one: the constructor is crate-private and there is no read path
+/// that returns a grant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningAuthorityGrant {
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    lease_epoch: LeaseEpoch,
+    renewed_at: UnixTime,
+    expires_at: UnixTime,
+}
+
+impl RunningAuthorityGrant {
+    pub(crate) fn new(
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        attempt_id: AttemptId,
+        lease_epoch: LeaseEpoch,
+        renewed_at: UnixTime,
+        expires_at: UnixTime,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_id,
+            attempt_id,
+            lease_epoch,
+            renewed_at,
+            expires_at,
+        }
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    /// The fenced renewal commit time (the deadline-scheduling anchor).
+    pub fn renewed_at(&self) -> UnixTime {
+        self.renewed_at
+    }
+
+    /// The durable lease expiry produced by the fenced renewal.
+    pub fn expires_at(&self) -> UnixTime {
+        self.expires_at
+    }
+}
+
 /// Narrow supervision view of a lease: renewal bookkeeping only (heartbeat
 /// bookkeeping, expiry, state). Test and timing assertion surface — it grants
 /// no authority.
@@ -1134,7 +1201,7 @@ impl Kernel {
         lease_epoch: LeaseEpoch,
         execution_id: &ExecutionId,
         runtime_handle: &Value,
-    ) -> Result<UnixTime, Error> {
+    ) -> Result<RunningAuthorityGrant, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
             let (attempt, lease, task) =
@@ -1149,6 +1216,13 @@ impl Kernel {
                     execution.id, execution.state
                 )));
             }
+            let request_id: String = tx
+                .query_row(
+                    "SELECT request_id FROM executions WHERE id=?1",
+                    params![execution.id],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)?;
             let expires_at = now + lease_seconds;
             tx.execute(
                 "UPDATE executions SET state='RUNNING',runtime_handle_json=?1,updated_at=?2 WHERE id=?3",
@@ -1178,7 +1252,14 @@ impl Kernel {
                     "lease expired before RUNNING supervision was established",
                 ));
             }
-            Ok(expires_at)
+            Ok(RunningAuthorityGrant::new(
+                ExecutionId::from_string(&execution.id),
+                RequestId::from_string(&request_id),
+                AttemptId::from_string(&attempt.id),
+                LeaseEpoch(lease.epoch),
+                now,
+                expires_at,
+            ))
         })
     }
 

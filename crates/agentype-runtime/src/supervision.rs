@@ -905,28 +905,15 @@ mod tests {
         (claim, exec)
     }
 
-    /// Mint an admission whose timing mirrors the production mint site: the
-    /// anchor is the fenced first-renewal commit time, the expiry is the
-    /// transaction's own output.
+    /// Mint an admission through the REAL authority path: a fresh fenced
+    /// confirm-and-renew transaction returns a Kernel-produced
+    /// RunningAuthorityGrant, and the admission is minted exclusively
+    /// from it (M5.4 S4 - no raw-IDs constructor exists).
     fn mint(claim: &Claim, exec: &ExecutionId, kernel: &Kernel) -> SupervisionAdmission {
-        let now = kernel.now();
-        mint_timed(claim, exec, now, now + kernel.lease_seconds())
-    }
-
-    fn mint_timed(
-        claim: &Claim,
-        exec: &ExecutionId,
-        first_renewed_at: UnixTime,
-        lease_expires_at: UnixTime,
-    ) -> SupervisionAdmission {
-        SupervisionAdmission::new(
-            exec.clone(),
-            RequestId::new(),
-            claim.attempt_id.clone(),
-            claim.lease_epoch,
-            first_renewed_at,
-            lease_expires_at,
-        )
+        let grant = kernel
+            .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, exec, &json!({}))
+            .unwrap();
+        SupervisionAdmission::from_grant(grant)
     }
 
     // ------------------------------------------------------------------
@@ -956,22 +943,15 @@ mod tests {
         let (_clock, kernel) = env();
         let (claim, exec) = running_execution(&kernel, "reg-idem");
         // The capability is move-only, so presenting the same identity
-        // twice requires two distinct mints sharing the SAME request_id
-        // (same durable identity, different generation).
-        let request_id = RequestId::new();
+        // twice requires two distinct Kernel grants for the same durable
+        // identity (same execution/request/attempt/epoch, fresh mint).
         let now = kernel.now();
-        let mint_same_identity = || {
-            SupervisionAdmission::new(
-                exec.clone(),
-                request_id.clone(),
-                claim.attempt_id.clone(),
-                claim.lease_epoch,
-                now,
-                now + kernel.lease_seconds(),
-            )
-        };
-        registry.admit(mint_same_identity(), now + 2.0).unwrap();
-        registry.admit(mint_same_identity(), now + 2.0).unwrap();
+        registry
+            .admit(mint(&claim, &exec, &kernel), now + 2.0)
+            .unwrap();
+        registry
+            .admit(mint(&claim, &exec, &kernel), now + 2.0)
+            .unwrap();
         assert_eq!(registry.active_count(), 1);
     }
 
@@ -986,7 +966,7 @@ mod tests {
             .admit(mint(&claim, &exec, &kernel), kernel.now() + 2.0)
             .unwrap();
 
-        let different_attempt = SupervisionAdmission::new(
+        let different_attempt = SupervisionAdmission::from_parts_for_test(
             exec.clone(),
             RequestId::new(),
             agentype_core::AttemptId::new(),
@@ -999,7 +979,7 @@ mod tests {
             Err(SupervisionError::AdmissionIdentityConflict)
         ));
 
-        let different_epoch = SupervisionAdmission::new(
+        let different_epoch = SupervisionAdmission::from_parts_for_test(
             exec.clone(),
             RequestId::new(),
             claim.attempt_id.clone(),
@@ -1012,7 +992,7 @@ mod tests {
             Err(SupervisionError::AdmissionIdentityConflict)
         ));
 
-        let different_request = SupervisionAdmission::new(
+        let different_request = SupervisionAdmission::from_parts_for_test(
             exec.clone(),
             RequestId::new(),
             claim.attempt_id.clone(),
@@ -1131,16 +1111,19 @@ mod tests {
         );
         assert!(!service.contains(&exec));
 
-        // A fresh mint (new generation, same identity) may re-enter
-        // supervision — but the durable authority is gone, so the heartbeat
-        // immediately loses fencing again. No stale resurrection.
-        service.admit(mint(&claim, &exec, &kernel)).unwrap();
-        assert_eq!(
-            service.renew_one(&exec).unwrap(),
-            RenewalOutcome::AuthorityLost {
-                execution_id: exec.clone()
-            }
-        );
+        // Under the M5.4 grant API, a fresh admission requires a fresh
+        // Kernel grant — and the kernel REFUSES to mint one for a closed
+        // authority. No grant means no admission can even exist: stale
+        // authority resurrection is impossible by construction.
+        assert!(matches!(
+            kernel.confirm_running_and_renew(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                &exec,
+                &json!({}),
+            ),
+            Err(Error::StaleAuthority(_))
+        ));
         assert!(!service.contains(&exec));
     }
 
@@ -1334,12 +1317,12 @@ mod tests {
         let timing = RuntimeTimingConfig::new(1.0, 6.0, LEASE_SECONDS).unwrap();
         let service = SupervisionService::new(kernel.clone(), &timing).unwrap();
 
-        // Handoff is delayed by 5.9s: the admission is inserted at 1005.9
-        // but carries the first-renewal anchor 1000.0.
+        // The grant is minted at the fenced confirm commit instant (t=1000,
+        // expiry 1010). The handoff is then delayed by 5.9s: the admission
+        // is inserted at 1005.9 but carries the 1000.0 anchor.
+        let admission = mint(&claim, &exec, &kernel);
         clock.advance(5.9);
-        service
-            .admit(mint_timed(&claim, &exec, 1000.0, 1010.0))
-            .unwrap();
+        service.admit(admission).unwrap();
         // The next due point is anchor + interval, NOT insertion + interval
         // (which would be 1011.9 — already past the 1010.0 expiry).
         assert_eq!(service.earliest_next_due(), Some(1006.0));
@@ -1360,26 +1343,17 @@ mod tests {
     /// A malformed capability (non-finite anchor/expiry, or an expiry that
     /// does not follow the first renewal) is rejected fail-closed at admit.
     #[test]
-    fn admit_fails_closed_on_malformed_admission_timing() {
+    fn malformed_admission_timing_is_unconstructible_via_grant_api() {
         let (_clock, kernel) = env();
-        let (claim, exec) = running_execution(&kernel, "bad-timing");
+        let (_claim, _exec) = running_execution(&kernel, "bad-timing");
         let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
 
-        let err = service
-            .admit(mint_timed(&claim, &exec, 1010.0, 1000.0))
-            .unwrap_err();
-        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
-
-        let err = service
-            .admit(mint_timed(&claim, &exec, 1000.0, f64::INFINITY))
-            .unwrap_err();
-        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
-
-        let err = service
-            .admit(mint_timed(&claim, &exec, f64::NAN, 1010.0))
-            .unwrap_err();
-        assert!(matches!(err, SupervisionError::InvalidAdmission(_)));
-
+        // With the M5.4 grant API freeze, a malformed capability is not
+        // constructible: admissions exist only via Kernel-produced grants
+        // whose timing is finite and anchor-precedes-expiry by
+        // construction. The admit-time validation remains as documented
+        // unreachable-by-construction defense (same pattern as the kernel
+        // blank-adapter-kind check).
         assert_eq!(service.active_count(), 0);
     }
 
@@ -1580,6 +1554,12 @@ mod tests {
     fn runner_surfaces_fatal_persistence_fault_and_stops() {
         let (dir, kernel, (claim, exec)) = system_kernel("runner-fatal", 1.0);
 
+        // Mint the admission AND a spare BEFORE the corruption: after the
+        // durable lease row is corrupted, no fresh grant can be minted
+        // (which is exactly the fatal semantics under test).
+        let admission = mint(&claim, &exec, &kernel);
+        let spare = mint(&claim, &exec, &kernel);
+
         // Corrupt the durable lease row below the API boundary BEFORE the
         // loop starts: the first renewal tick must surface a fatal fault.
         let path = dir.join("scheduler.db");
@@ -1595,7 +1575,7 @@ mod tests {
 
         let timing = RuntimeTimingConfig::new(0.2, 0.3, 1.0).unwrap();
         let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
-        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
+        runner.admit(admission).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(800));
         match runner.take_fatal() {
@@ -1608,9 +1588,8 @@ mod tests {
         // Audit round 2, P1-2: after a fatal the runner lifecycle is
         // FAILED - a new admission MUST be rejected and the registry
         // must stay empty (no entry with no supervisor behind it).
-        let second = mint_timed(&claim, &exec, kernel.now(), kernel.now() + 1.0);
         assert!(matches!(
-            runner.admit(second),
+            runner.admit(spare),
             Err(SupervisionError::RunnerStopped(_))
         ));
         assert_eq!(runner.active_count(), 0);
@@ -1675,6 +1654,11 @@ mod tests {
         let (claim, exec) = running_execution(&kernel, "panic-ok");
         // Mint BEFORE arming the tripwire (mint reads the kernel clock).
         let admission = mint(&claim, &exec, &kernel);
+        // A spare admission for the post-fatal rejection assertion: it
+        // must also exist before the clock is tripped, and its renewal
+        // anchor is irrelevant because the lifecycle gate rejects it
+        // before any timing validation.
+        let spare_admission = mint(&claim, &exec, &kernel);
         armed.store(true, std::sync::atomic::Ordering::Relaxed);
 
         let timing = RuntimeTimingConfig::new(0.2, 0.3, 1.0).unwrap();
@@ -1688,7 +1672,7 @@ mod tests {
             Some(SupervisionError::Fatal(_))
         ));
         // The lifecycle is FAILED: no new ownership, nothing unowned.
-        let second = mint_timed(&claim, &exec, 1_000.0, 1_001.0);
+        let second = spare_admission;
         assert!(matches!(
             runner.admit(second),
             Err(SupervisionError::RunnerStopped(_))
