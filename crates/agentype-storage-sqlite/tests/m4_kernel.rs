@@ -20,7 +20,7 @@ fn wal_full_and_foreign_keys() {
     assert_eq!(journal.to_uppercase(), "WAL");
     assert_eq!(sync, 2, "synchronous=FULL");
     assert_eq!(fk, 1);
-    assert_eq!(env.k.schema_version().unwrap(), 1);
+    assert_eq!(env.k.schema_version().unwrap(), 2);
 }
 
 /// A database carrying the Rust-era identity survives reopen; a foreign
@@ -44,7 +44,7 @@ fn fresh_database_carries_rust_identity_and_reopens() {
     }
     // Reopen must succeed: same family, version 1.
     let env = file_env(&db);
-    assert_eq!(env.k.schema_version().unwrap(), 1);
+    assert_eq!(env.k.schema_version().unwrap(), 2);
 }
 
 /// A simulated Python-lineage database (schema_migrations present at version
@@ -294,7 +294,7 @@ fn running_confirmation_and_first_lease_renewal_are_atomic() {
     let (_b, _ids) = k.submit_batch(&[read_task("near-deadline")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let execution_id = launch.execution_id().clone();
     clock.advance(9.5);
@@ -541,7 +541,7 @@ fn unresolved_physical_outcome_rejects_proof_bits() {
     let (_b, _ids) = k.submit_batch(&[read_task("amb")]).unwrap();
     let claim = k.claim_next_available().unwrap().unwrap();
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let execution_id = launch.execution_id().clone();
 
@@ -696,7 +696,7 @@ fn unresolved_record_clears_stored_proof() {
     let claim = env.k.claim_next_available().unwrap().unwrap();
     let launch = env
         .k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let execution_id = launch.execution_id().clone();
     // Simulate corrupted pre-fix history below the API boundary...
@@ -743,7 +743,7 @@ fn multi_task_batch_partial_completion_and_suspension() {
     let first = env.k.claim_next_available().unwrap().unwrap();
     let launch1 = env
         .k
-        .create_execution(&first, unisolated_safety(&first))
+        .create_execution(&first, unisolated_launch_binding(&first))
         .unwrap();
     let exec1 = launch1.execution_id().clone();
     env.k
@@ -777,7 +777,7 @@ fn multi_task_batch_partial_completion_and_suspension() {
         let second = env.k.claim_next_available().unwrap().unwrap();
         let launch2 = env
             .k
-            .create_execution(&second, unisolated_safety(&second))
+            .create_execution(&second, unisolated_launch_binding(&second))
             .unwrap();
         let exec2 = launch2.execution_id().clone();
         env.k
@@ -884,7 +884,7 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     let first = env.k.claim_next_available().unwrap().unwrap();
     let launch1 = env
         .k
-        .create_execution(&first, unisolated_safety(&first))
+        .create_execution(&first, unisolated_launch_binding(&first))
         .unwrap();
     let exec1 = launch1.execution_id().clone();
     env.k
@@ -908,7 +908,7 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
         let second = env.k.claim_next_available().unwrap().unwrap();
         let launch2 = env
             .k
-            .create_execution(&second, unisolated_safety(&second))
+            .create_execution(&second, unisolated_launch_binding(&second))
             .unwrap();
         let exec2 = launch2.execution_id().clone();
         env.k
@@ -1026,7 +1026,7 @@ fn heartbeat_requires_running_execution() {
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let execution_id = launch.execution_id().clone();
     let err = k
@@ -1146,7 +1146,7 @@ fn partial_batch_cancellation_preserves_completed_task_and_result() {
     // Claim and complete one task
     let claim_a = k.claim_next_available().unwrap().unwrap();
     let launch_a = k
-        .create_execution(&claim_a, unisolated_safety(&claim_a))
+        .create_execution(&claim_a, unisolated_launch_binding(&claim_a))
         .unwrap();
     let exec_a = launch_a.execution_id().clone();
     k.confirm_running_and_renew(
@@ -1213,7 +1213,7 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_task_claim = claim.clone();
     bad_task_claim.task_id = TaskId::new();
     let err = k
-        .create_execution(&bad_task_claim, unisolated_safety(&bad_task_claim))
+        .create_execution(&bad_task_claim, unisolated_launch_binding(&bad_task_claim))
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1221,7 +1221,10 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_agent_claim = claim.clone();
     bad_agent_claim.logical_agent_id = LogicalAgentId::new();
     let err = k
-        .create_execution(&bad_agent_claim, unisolated_safety(&bad_agent_claim))
+        .create_execution(
+            &bad_agent_claim,
+            unisolated_launch_binding(&bad_agent_claim),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1229,7 +1232,10 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_target_claim = claim.clone();
     bad_target_claim.execution_target = "foreign-target".to_string();
     let err = k
-        .create_execution(&bad_target_claim, unisolated_safety(&bad_target_claim))
+        .create_execution(
+            &bad_target_claim,
+            unisolated_launch_binding(&bad_target_claim),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
@@ -1237,13 +1243,16 @@ fn create_execution_rejects_tampered_claim_identities() {
     let mut bad_profile_claim = claim.clone();
     bad_profile_claim.execution_profile = "foreign-profile".to_string();
     let err = k
-        .create_execution(&bad_profile_claim, unisolated_safety(&bad_profile_claim))
+        .create_execution(
+            &bad_profile_claim,
+            unisolated_launch_binding(&bad_profile_claim),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
 
     // Original valid claim succeeds
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let exec_id = launch.execution_id().clone();
     assert!(!exec_id.as_str().is_empty());
@@ -1291,7 +1300,7 @@ fn quiescent_confirmed_requires_terminal_confirmed_db_constraint() {
     let claim = env.k.claim_next_available().unwrap().unwrap();
     let launch = env
         .k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     let exec_id = launch.execution_id().clone();
 
@@ -1443,7 +1452,7 @@ fn mutated_claim_payload_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST contain the durable payload
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     assert_eq!(
         launch.payload(),
@@ -1465,7 +1474,7 @@ fn mutated_claim_acceptance_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST contain durable acceptance
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     assert_eq!(
         launch.acceptance(),
@@ -1485,7 +1494,7 @@ fn mutated_claim_workspace_mode_cannot_widen_launch_authority() {
 
     // Authoritative launch snapshot MUST remain ReadOnly
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     assert_eq!(launch.workspace_mode(), WorkspaceMode::ReadOnly);
 }
@@ -1502,7 +1511,7 @@ fn mutated_claim_workstream_does_not_alter_launch_snapshot() {
 
     // Authoritative launch snapshot MUST remain None
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     assert!(launch.workstream_id().is_none());
 }
@@ -1530,7 +1539,7 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     )
     .unwrap();
 
-    let launch = k.create_execution(&claim, env.safety()).unwrap();
+    let launch = k.create_execution(&claim, env.physical_binding()).unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
     assert_eq!(launch.logical_agent_id(), &claim.logical_agent_id);
@@ -1560,7 +1569,13 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
     let mut wrong_target = binding_for(&claim);
     wrong_target.execution_target = "remote".to_string();
     let err = k
-        .create_execution(&claim, FrozenExecutionSafety::unisolated(wrong_target))
+        .create_execution(
+            &claim,
+            FrozenPhysicalExecutionBinding::new(
+                FrozenExecutionSafety::unisolated(wrong_target),
+                "test",
+            ),
+        )
         .unwrap_err();
     assert!(err
         .to_string()
@@ -1570,7 +1585,13 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
     let mut wrong_profile = binding_for(&claim);
     wrong_profile.execution_profile = "isolated".to_string();
     let err = k
-        .create_execution(&claim, FrozenExecutionSafety::unisolated(wrong_profile))
+        .create_execution(
+            &claim,
+            FrozenPhysicalExecutionBinding::new(
+                FrozenExecutionSafety::unisolated(wrong_profile),
+                "test",
+            ),
+        )
         .unwrap_err();
     assert!(err
         .to_string()
@@ -1578,7 +1599,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
 
     // 3. Matching target & profile succeeds
     let launch = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap();
     assert_eq!(launch.execution_target(), "local");
     assert_eq!(launch.execution_profile(), "default");
@@ -1596,7 +1617,7 @@ fn expired_lease_cannot_create_execution_before_expiry_sweep() {
 
     // create_execution must fail closed on expired authority
     let err = k
-        .create_execution(&claim, unisolated_safety(&claim))
+        .create_execution(&claim, unisolated_launch_binding(&claim))
         .unwrap_err();
     assert!(matches!(err, Error::StaleAuthority(_)));
 }
@@ -1636,7 +1657,7 @@ fn launch_snapshot_carries_committed_continuity_and_preference() {
 
     // 3. create_execution must bundle the agent's committed continuity capsule & monotonic version
     let launch2 = k
-        .create_execution(&claim2, unisolated_safety(&claim2))
+        .create_execution(&claim2, unisolated_launch_binding(&claim2))
         .unwrap();
     assert_eq!(
         launch2.continuity().preference(),
@@ -1702,4 +1723,52 @@ fn birth_agent_fails_closed_on_unknown_workstream() {
     let tx = conn.transaction().unwrap();
     let err = txutil::birth_agent(&tx, "general", Some("ws-missing"), None, 5_000.0).unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+}
+
+/// Audit P1 (round 10): a structurally valid rust-v0.2 database at schema
+/// version 1 (no executions.adapter_kind column) must be rejected at open —
+/// claiming compatibility would defer the failure to the first
+/// execution-commitment INSERT. A fresh v2 database opens and freezes the
+/// column.
+#[test]
+fn schema_v1_database_is_rejected_after_adapter_kind_column() {
+    let db = FixtureDb::new("schema-v2");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), 2);
+    }
+    // Downgrade the database to the M5.1-era shape: version 1, no
+    // adapter_kind column.
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=1", [])
+        .unwrap();
+    conn.execute("ALTER TABLE executions DROP COLUMN adapter_kind", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v1 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string().contains("does not match expected 2"),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+
+    // A fresh v2 database opens and carries the frozen column.
+    let fresh = FixtureDb::new("schema-v2-fresh");
+    {
+        let env = file_env(&fresh);
+        assert_eq!(env.k.schema_version().unwrap(), 2);
+        let conn = rusqlite::Connection::open(&fresh.path).unwrap();
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('executions') WHERE name='adapter_kind')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+    }
 }

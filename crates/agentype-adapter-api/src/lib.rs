@@ -10,7 +10,7 @@ use agentype_core::{
     IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
     WorkstreamId,
 };
-use agentype_execution_config::ExecutionLaunchSnapshot;
+use agentype_execution_config::{ExecutionLaunchSnapshot, ResolvedExecutionEnvironment};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,23 @@ impl std::fmt::Display for AdapterError {
 }
 
 impl std::error::Error for AdapterError {}
+
+/// The launch snapshot and the resolved environment handed to
+/// `ExecutionRequest::from_launch` do not describe the same attempt identity.
+/// Mixing scheduler semantics from one attempt with runtime configuration
+/// from another is rejected fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnvironmentMismatch {
+    pub detail: String,
+}
+
+impl std::fmt::Display for LaunchEnvironmentMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "launch/environment pairing mismatch: {}", self.detail)
+    }
+}
+
+impl std::error::Error for LaunchEnvironmentMismatch {}
 
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
@@ -161,10 +178,14 @@ fn python_json_string(s: &str) -> String {
 /// Complete structured execution request passed to an ExecutionAdapter.
 ///
 /// Encapsulates all execution metadata as private fields with readonly getters.
-/// Constructible exclusively from an authoritative `ExecutionLaunchSnapshot`.
+/// Constructible exclusively from the two authoritative sources:
 ///
-/// `prompt` is deterministically derived from the snapshot (see
-/// `RenderedWorkerPrompt`); it is not a parameter and cannot be injected.
+/// - the `ExecutionLaunchSnapshot` — durable Scheduler semantics (identities,
+///   workspace, payload, acceptance, continuity, incarnation binding);
+/// - the `ResolvedExecutionEnvironment` — authoritative runtime configuration
+///   (target options, profile options, configured timeout inputs).
+///
+/// The Claim is part of neither source and can never reach this request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     request_id: RequestId,
@@ -186,18 +207,58 @@ pub struct ExecutionRequest {
     workstream_id: Option<WorkstreamId>,
     continuity: CommittedContinuitySnapshot,
     incarnation_runtime_handle: RuntimeHandle,
+    target_options: Value,
+    profile_options: Value,
+    profile_timeout_seconds: Option<f64>,
 }
 
 impl ExecutionRequest {
-    /// Assemble the worker request from an authoritative launch snapshot.
+    /// Assemble the worker request from the authoritative launch snapshot and
+    /// the authoritative resolved environment.
     ///
-    /// The worker prompt is not a parameter: it is deterministically derived
-    /// from the snapshot as the provider-neutral V0.1 worker protocol (see
-    /// `RenderedWorkerPrompt`). Every caller receives the same instruction
-    /// for the same durable launch facts; there is no path to inject
-    /// arbitrary text between the scheduler and the worker.
-    pub fn from_launch(launch: &ExecutionLaunchSnapshot) -> Self {
-        Self {
+    /// Two-source rule: scheduler semantics come exclusively from the
+    /// snapshot; physical runtime configuration comes exclusively from the
+    /// resolved environment (which can only be produced by authoritative
+    /// configuration resolution — its fields are private, so callers cannot
+    /// inject fabricated options). The worker prompt is deterministically
+    /// derived from the snapshot as the provider-neutral V0.1 worker protocol
+    /// (see `RenderedWorkerPrompt`).
+    ///
+    /// Fail-closed pairing: the snapshot and the environment must describe
+    /// the same attempt identity (attempt_id, lease_epoch, execution_target,
+    /// execution_profile) and the same attempt_isolation fact; mixing launch
+    /// semantics from one attempt with runtime configuration from another —
+    /// including a same-named target re-registered with different isolation
+    /// in a different registry — is rejected.
+    pub fn from_launch(
+        launch: &ExecutionLaunchSnapshot,
+        environment: &ResolvedExecutionEnvironment,
+    ) -> Result<Self, LaunchEnvironmentMismatch> {
+        let safety = environment.safety();
+        let mut mismatched: Vec<&'static str> = Vec::new();
+        if launch.safety().attempt_id().as_str() != safety.attempt_id().as_str() {
+            mismatched.push("attempt_id");
+        }
+        if launch.safety().lease_epoch() != safety.lease_epoch() {
+            mismatched.push("lease_epoch");
+        }
+        if launch.execution_target() != safety.execution_target() {
+            mismatched.push("execution_target");
+        }
+        if launch.execution_profile() != safety.execution_profile() {
+            mismatched.push("execution_profile");
+        }
+        if launch.safety().attempt_isolation() != safety.attempt_isolation() {
+            mismatched.push("attempt_isolation");
+        }
+        if !mismatched.is_empty() {
+            return Err(LaunchEnvironmentMismatch {
+                detail: format!(
+                    "launch snapshot and resolved environment describe different attempts: {mismatched:?}"
+                ),
+            });
+        }
+        Ok(Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
             task_id: launch.task_id().clone(),
@@ -217,7 +278,10 @@ impl ExecutionRequest {
             workstream_id: launch.workstream_id().cloned(),
             continuity: launch.continuity().clone(),
             incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
-        }
+            target_options: environment.target().options.clone(),
+            profile_options: environment.profile().options.clone(),
+            profile_timeout_seconds: environment.profile().timeout_seconds,
+        })
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -297,6 +361,24 @@ impl ExecutionRequest {
     pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
         &self.incarnation_runtime_handle
     }
+
+    /// Authoritative target options resolved from the ExecutionRegistry
+    /// (host/endpoint settings of the requested environment).
+    pub fn target_options(&self) -> &Value {
+        &self.target_options
+    }
+
+    /// Authoritative profile options resolved from the ExecutionRegistry
+    /// (model settings / provider-neutral tuning of the requested profile).
+    pub fn profile_options(&self) -> &Value {
+        &self.profile_options
+    }
+
+    /// Configured profile timeout input (seconds). Deadline *enforcement* is
+    /// a later-milestone adapter concern; this is the configured input only.
+    pub fn profile_timeout_seconds(&self) -> Option<f64> {
+        self.profile_timeout_seconds
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -346,7 +428,9 @@ pub trait ExecutionAdapter: Send + Sync {
     ) -> AdapterResult<StartObservation>;
 }
 
-/// In-memory fake used by M4 tests. No process, no vendor protocol.
+/// In-memory fake used by M4 tests and M5.2 dispatch tests. No process, no
+/// vendor protocol. Deterministic controls let tests assert invocation
+/// counts, inspect the exact request received, and inject outcomes/errors.
 #[derive(Clone, Default)]
 pub struct FakeAdapter {
     inner: Arc<Mutex<FakeState>>,
@@ -356,9 +440,12 @@ pub struct FakeAdapter {
 struct FakeState {
     by_request: HashMap<String, RuntimeHandle>,
     next_start: Option<StartObservation>,
+    next_start_error: Option<AdapterError>,
     next_observe: Option<ExecutionObservation>,
     next_outcome: Option<ExecutionOutcome>,
     unavailable: bool,
+    start_call_count: usize,
+    last_request: Option<ExecutionRequest>,
 }
 
 impl FakeAdapter {
@@ -374,19 +461,44 @@ impl FakeAdapter {
         self.inner.lock().expect("fake adapter").next_start = Some(obs);
     }
 
+    /// Inject an error for the next `start_execution` call (after this one
+    /// call the injection is consumed).
+    pub fn set_next_start_error(&self, err: AdapterError) {
+        self.inner.lock().expect("fake adapter").next_start_error = Some(err);
+    }
+
     pub fn set_next_outcome(&self, outcome: ExecutionOutcome) {
         self.inner.lock().expect("fake adapter").next_outcome = Some(outcome);
+    }
+
+    /// How many times `start_execution` was invoked in total.
+    pub fn start_call_count(&self) -> usize {
+        self.inner.lock().expect("fake adapter").start_call_count
+    }
+
+    /// The request received by the most recent `start_execution` call.
+    pub fn last_request(&self) -> Option<ExecutionRequest> {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .last_request
+            .clone()
     }
 }
 
 impl ExecutionAdapter for FakeAdapter {
     fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
+        g.start_call_count += 1;
+        g.last_request = Some(request.clone());
         if g.unavailable {
             return Err(AdapterError::Unavailable(format!(
                 "target {} unavailable",
                 request.execution_target()
             )));
+        }
+        if let Some(err) = g.next_start_error.take() {
+            return Err(err);
         }
         let handle = RuntimeHandle(serde_json::json!({
             "fake": true,
@@ -482,14 +594,36 @@ mod tests {
     use super::*;
     use agentype_execution_config::FrozenExecutionSafety;
 
-    fn mock_launch_snapshot() -> ExecutionLaunchSnapshot {
-        unsafe {
+    /// Coherent synthetic launch fixture: the snapshot's attempt identity and
+    /// its Attempt-bound safety proof share one `AuthoritativeExecutionBinding`
+    /// (review §21 fixture hygiene — never hand a snapshot a safety proof
+    /// minted for a different synthetic attempt).
+    struct MockLaunch {
+        snapshot: ExecutionLaunchSnapshot,
+        binding: agentype_core::AuthoritativeExecutionBinding,
+        environment: ResolvedExecutionEnvironment,
+    }
+
+    fn mock_launch() -> MockLaunch {
+        let attempt_id = agentype_core::AttemptId::new();
+        let binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let environment = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &binding,
+        )
+        .unwrap();
+        let snapshot = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
                 RequestId::new(),
                 TaskId::new(),
                 BatchId::new(),
-                AttemptId::new(),
+                attempt_id,
                 1,
                 LeaseId::new(),
                 LeaseEpoch(1),
@@ -497,34 +631,30 @@ mod tests {
                 LogicalAgentId::new(),
                 IncarnationId::new(),
                 Value::Null,
-                "local".to_string(),
-                "default".to_string(),
+                binding.execution_target.clone(),
+                binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
                 "hi".to_string(),
                 Value::Null,
                 Value::Null,
                 None,
                 CommittedContinuitySnapshot::stateless(),
-                unisolated_local_safety(),
+                FrozenExecutionSafety::unisolated(binding.clone()),
             )
+        };
+        MockLaunch {
+            snapshot,
+            binding,
+            environment,
         }
-    }
-
-    /// Attempt-bound unisolated proof for the mock snapshot's synthetic attempt.
-    fn unisolated_local_safety() -> FrozenExecutionSafety {
-        FrozenExecutionSafety::unisolated(agentype_core::AuthoritativeExecutionBinding {
-            attempt_id: agentype_core::AttemptId::new(),
-            lease_epoch: agentype_core::LeaseEpoch(1),
-            execution_target: "local".to_string(),
-            execution_profile: "default".to_string(),
-        })
     }
 
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
-        let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -538,8 +668,9 @@ mod tests {
     #[test]
     fn reconcile_can_restore_handle_by_request_id_alone() {
         let fake = FakeAdapter::new();
-        let launch = mock_launch_snapshot();
-        let req = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -566,22 +697,36 @@ mod tests {
     fn execution_request_constructed_from_launch_snapshot() {
         let ws = WorkstreamId::new();
         let inc_id = agentype_core::IncarnationId::new();
+        // §21 fixture hygiene: one attempt identity shared by the snapshot
+        // and its Attempt-bound safety proof.
+        let attempt_id = agentype_core::AttemptId::new();
+        let binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let environment = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &binding,
+        )
+        .unwrap();
         let launch = unsafe {
             ExecutionLaunchSnapshot::from_persisted_kernel_authority(
                 ExecutionId::new(),
                 RequestId::new(),
                 agentype_core::TaskId::new(),
                 agentype_core::BatchId::new(),
-                agentype_core::AttemptId::new(),
+                attempt_id,
                 1,
                 agentype_core::LeaseId::new(),
-                agentype_core::LeaseEpoch(1),
+                LeaseEpoch(1),
                 100.0,
                 agentype_core::LogicalAgentId::new(),
                 inc_id.clone(),
                 serde_json::json!({"proc": 42}),
-                "local".to_string(),
-                "default".to_string(),
+                binding.execution_target.clone(),
+                binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
                 "my-task".to_string(),
                 serde_json::json!({"key": "val"}),
@@ -592,10 +737,13 @@ mod tests {
                     3,
                     serde_json::json!({"state": "saved"}),
                 ),
-                unisolated_local_safety(),
+                FrozenExecutionSafety::unisolated(binding.clone()),
             )
         };
-        let req = ExecutionRequest::from_launch(&launch);
+        // The safety proof is bound to the snapshot's own attempt identity.
+        assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
+        assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
+        let req = ExecutionRequest::from_launch(&launch, &environment).unwrap();
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -633,6 +781,14 @@ mod tests {
             req.incarnation_runtime_handle(),
             &RuntimeHandle(serde_json::json!({"proc": 42}))
         );
+        // Two-source rule: runtime configuration comes from the resolved
+        // environment, never from the snapshot or the Claim.
+        assert_eq!(req.target_options(), &environment.target().options);
+        assert_eq!(req.profile_options(), &environment.profile().options);
+        assert_eq!(
+            req.profile_timeout_seconds(),
+            environment.profile().timeout_seconds
+        );
     }
 
     /// Review P1: the worker instruction is a pure function of the launch
@@ -640,9 +796,10 @@ mod tests {
     /// durable facts always produce the same protocol.
     #[test]
     fn worker_prompt_is_deterministic_and_cannot_be_injected() {
-        let launch = mock_launch_snapshot();
-        let first = ExecutionRequest::from_launch(&launch);
-        let second = ExecutionRequest::from_launch(&launch);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let first = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let second = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first.prompt(),
@@ -653,5 +810,103 @@ mod tests {
             .starts_with("LOCAL AGENT SCHEDULER TASK\n\nTASK_ID\n"));
         // The mock snapshot is read-only: no writer instructions may appear.
         assert!(!first.prompt().contains("WRITER RECOVERY RULES"));
+    }
+
+    /// §21 fixture hygiene regression: the synthetic snapshot and its
+    /// Attempt-bound safety proof share one attempt identity.
+    #[test]
+    fn fixture_safety_is_bound_to_the_snapshot_attempt_identity() {
+        let mock = mock_launch();
+        let (launch, binding) = (&mock.snapshot, &mock.binding);
+        assert_eq!(launch.attempt_id(), &binding.attempt_id);
+        assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
+        assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
+        assert_eq!(launch.execution_target(), binding.execution_target.as_str());
+        assert_eq!(
+            launch.execution_profile(),
+            binding.execution_profile.as_str()
+        );
+    }
+
+    /// §30: deterministic FakeAdapter controls for dispatch tests.
+    #[test]
+    fn fake_adapter_records_invocation_count_and_last_request() {
+        let fake = FakeAdapter::new();
+        assert_eq!(fake.start_call_count(), 0);
+        let mock = mock_launch();
+        let launch = mock.snapshot;
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let _ = fake.start_execution(&req).unwrap();
+        let _ = fake.start_execution(&req).unwrap();
+        assert_eq!(fake.start_call_count(), 2);
+        assert_eq!(fake.last_request().as_ref(), Some(&req));
+
+        // An injected start error is consumed exactly once.
+        fake.set_next_start_error(AdapterError::DeadlineExceeded("cleanup".into()));
+        assert!(fake.start_execution(&req).is_err());
+        assert_eq!(fake.start_call_count(), 3);
+        assert!(fake.start_execution(&req).is_ok());
+    }
+
+    /// Audit P2: from_launch fails closed when the launch snapshot and the
+    /// resolved environment do not describe the same attempt identity —
+    /// scheduler semantics from one attempt can never be combined with
+    /// runtime configuration from another.
+    #[test]
+    fn from_launch_rejects_mixed_launch_environment_pairs() {
+        let mock = mock_launch();
+
+        // A different attempt identity.
+        let foreign_binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: agentype_core::AttemptId::new(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let foreign_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &foreign_binding,
+        )
+        .unwrap();
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &foreign_env).unwrap_err();
+        assert!(err.detail.contains("attempt_id"), "got: {err:?}");
+
+        // The same attempt, but a different configured target.
+        let wrong_target_binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: mock.binding.attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "elsewhere".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let wrong_target_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &wrong_target_binding,
+        )
+        .unwrap();
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &wrong_target_env).unwrap_err();
+        assert!(err.detail.contains("execution_target"), "got: {err:?}");
+
+        // The same attempt identity and target/profile names, but a
+        // differently-isolated environment (audit P1: same-named targets can
+        // be re-registered with different isolation in another registry).
+        let mut isolated_registry = agentype_execution_config::ExecutionRegistry::new();
+        isolated_registry
+            .register_target(agentype_execution_config::ExecutionTargetConfig::new(
+                "local", "process", true,
+            ))
+            .unwrap();
+        isolated_registry
+            .register_profile(agentype_execution_config::ExecutionProfileConfig::new(
+                "default",
+            ))
+            .unwrap();
+        let isolated_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::Authoritative(&isolated_registry),
+            &mock.binding,
+        )
+        .unwrap();
+        assert!(isolated_env.attempt_isolation());
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &isolated_env).unwrap_err();
+        assert!(err.detail.contains("attempt_isolation"), "got: {err:?}");
     }
 }

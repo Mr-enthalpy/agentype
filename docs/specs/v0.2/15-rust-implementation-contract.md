@@ -18,7 +18,8 @@ runtime
     dispatcher, reconciler, recovery, notifier isolation
 
 adapter-api
-    generic traits/DTOs only
+    provider-neutral execution contract:
+    traits, adapter-facing DTOs, and deterministic worker execution protocol
 
 adapter implementations
     depend on adapter-api / core DTOs; MUST NOT leak into core

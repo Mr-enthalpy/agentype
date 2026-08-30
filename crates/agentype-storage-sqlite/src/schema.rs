@@ -1,7 +1,12 @@
 //! Rust-era schema (fresh database). D-DB-MIGRATE is unresolved; this is not
 //! an in-place Python V0.1 upgrade.
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Schema version 2 adds `executions.adapter_kind` (the durable physical
+/// adapter binding identity frozen at execution commitment). Version 1
+/// databases structurally lack the column while claiming the same identity,
+/// so they are rejected at open (fail closed) instead of failing later at
+/// the first execution-commitment INSERT.
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -169,6 +174,7 @@ CREATE TABLE IF NOT EXISTS executions (
     incarnation_id TEXT NOT NULL REFERENCES incarnations(id) ON DELETE RESTRICT,
     execution_target TEXT NOT NULL,
     execution_profile TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL,
     attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',

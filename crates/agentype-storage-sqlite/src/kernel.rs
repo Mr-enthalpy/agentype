@@ -3,7 +3,7 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_core::*;
-use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenExecutionSafety};
+use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenPhysicalExecutionBinding};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -907,8 +907,9 @@ impl Kernel {
     pub fn create_execution(
         &self,
         claim: &Claim,
-        safety: FrozenExecutionSafety,
+        physical_binding: FrozenPhysicalExecutionBinding,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
+        let safety = physical_binding.safety();
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
@@ -1014,8 +1015,8 @@ impl Kernel {
             let attempt_isolation = safety.attempt_isolation();
             tx.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,
-                 execution_profile,attempt_isolation,state,started_at,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'STARTING',?9,?9)",
+                 execution_profile,adapter_kind,attempt_isolation,state,started_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'STARTING',?10,?10)",
                 params![
                     execution_id.as_str(),
                     request_id.as_str(),
@@ -1024,6 +1025,7 @@ impl Kernel {
                     incarnation_id,
                     attempt.execution_target,
                     attempt.execution_profile,
+                    physical_binding.adapter_kind(),
                     attempt_isolation as i64,
                     now
                 ],
@@ -1068,7 +1070,7 @@ impl Kernel {
                     acceptance,
                     task.workstream_id.map(WorkstreamId::from_string),
                     continuity,
-                    safety,
+                    safety.clone(),
                 )
             })
         })
@@ -2432,6 +2434,26 @@ impl Kernel {
                     quiescent_confirmed: row.quiescent_confirmed,
                 })
             })
+        })
+    }
+
+    /// Durable runtime handle of an Execution (M5.2 physical-history
+    /// verification reader).
+    ///
+    /// Narrow persistence-level reader for verifying that unresolved start
+    /// observations keep their observed adapter handle. The full M5.4
+    /// reconciliation identity reader (request_id + handle by attempt) is
+    /// deliberately deferred to M5.4.
+    pub fn execution_runtime_handle(&self, id: &ExecutionId) -> Result<Value, Error> {
+        self.tx(|tx, _| {
+            let handle: String = tx
+                .query_row(
+                    "SELECT runtime_handle_json FROM executions WHERE id=?1",
+                    params![id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)?;
+            json_load(&handle)
         })
     }
 

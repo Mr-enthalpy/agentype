@@ -9,6 +9,7 @@ use agentype_core::*;
 use agentype_execution_config::{
     resolve_execution_environment, ExecutionProfileConfig, ExecutionRegistry,
     ExecutionResolutionMode, ExecutionTargetConfig, FrozenExecutionSafety,
+    FrozenPhysicalExecutionBinding,
 };
 use agentype_storage_sqlite::Kernel;
 use rusqlite::Connection;
@@ -131,6 +132,13 @@ pub fn unisolated_safety(claim: &Claim) -> FrozenExecutionSafety {
     FrozenExecutionSafety::unisolated(binding_for(claim))
 }
 
+/// Attempt-bound unisolated launch binding for the claim's attempt: the
+/// frozen safety facts plus the test adapter_kind, ready for
+/// `Kernel::create_execution`.
+pub fn unisolated_launch_binding(claim: &Claim) -> FrozenPhysicalExecutionBinding {
+    FrozenPhysicalExecutionBinding::new(unisolated_safety(claim), "test")
+}
+
 pub fn run_claim(
     k: &Kernel,
     spec: TaskSpec,
@@ -155,9 +163,9 @@ pub fn run_claim(
             &binding_for(&claim),
         )
         .unwrap();
-        env.safety()
+        env.physical_binding()
     } else {
-        unisolated_safety(&claim)
+        unisolated_launch_binding(&claim)
     };
     let launch = k.create_execution(&claim, safety).unwrap();
     let execution_id = launch.execution_id().clone();

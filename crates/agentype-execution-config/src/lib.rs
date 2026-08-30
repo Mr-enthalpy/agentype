@@ -253,6 +253,41 @@ impl FrozenExecutionSafety {
     }
 }
 
+/// The provider-neutral physical binding frozen with the STARTING
+/// Execution: the Attempt-bound safety facts plus the `adapter_kind` of the
+/// installed adapter implementation that owns the physical start.
+///
+/// Persisting `adapter_kind` inside the execution-commitment transaction is
+/// the M5.2 commitment invariant: anything required to identify the physical
+/// start owner after a crash must be frozen no later than the transaction
+/// that creates the STARTING Execution, so M5.4 reconciliation can route the
+/// execution to the adapter that actually started it even if the registry
+/// configuration has drifted. Provider-neutral binding metadata only — not a
+/// vendor concept, and not a plugin-identity framework (a stronger
+/// adapter_binding_id/config fingerprint is deferred to M5.4/M5.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenPhysicalExecutionBinding {
+    safety: FrozenExecutionSafety,
+    adapter_kind: String,
+}
+
+impl FrozenPhysicalExecutionBinding {
+    pub fn new(safety: FrozenExecutionSafety, adapter_kind: impl Into<String>) -> Self {
+        Self {
+            safety,
+            adapter_kind: adapter_kind.into(),
+        }
+    }
+
+    pub fn safety(&self) -> &FrozenExecutionSafety {
+        &self.safety
+    }
+
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+}
+
 /// Resolved physical execution environment for an authoritative launch.
 ///
 /// Fields are encapsulated as private and readonly to prevent post-resolution
@@ -292,6 +327,13 @@ impl ResolvedExecutionEnvironment {
 
     pub fn attempt_isolation(&self) -> bool {
         self.attempt_isolation
+    }
+
+    /// The provider-neutral physical binding for this resolved environment:
+    /// the Attempt-bound safety facts plus the target configuration's
+    /// declared adapter_kind.
+    pub fn physical_binding(&self) -> FrozenPhysicalExecutionBinding {
+        FrozenPhysicalExecutionBinding::new(self.safety().clone(), self.target.adapter_kind.clone())
     }
 
     /// The durable authority binding this environment was resolved for.
@@ -394,8 +436,9 @@ pub fn resolve_execution_environment(
 ///
 /// `task_name` is the durable human-readable Task label (a scheduling/display
 /// fact). It is NOT the worker prompt: the worker-facing prompt is a derived
-/// representation rendered by the runtime from the full launch protocol
-/// (IDs, epoch, payload, acceptance, continuity, workspace mode).
+/// representation rendered by the provider-neutral execution contract
+/// (`agentype-adapter-api`) from the full launch protocol (IDs, epoch,
+/// payload, acceptance, continuity, workspace mode).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionLaunchSnapshot {
     execution_id: ExecutionId,
