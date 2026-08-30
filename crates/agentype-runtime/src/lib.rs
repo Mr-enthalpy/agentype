@@ -4135,4 +4135,552 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         assert!(kernel.result_for_task(&task_id).is_err());
     }
+
+    // ==================================================================
+    // M5.3 supervision integration: dispatcher -> RunningAdmitted ->
+    // SupervisionService::admit handoff, renewal races, and writer safety
+    // (M5.3 plan §19, §42-§46).
+    // ==================================================================
+
+    fn supervision_timing() -> RuntimeTimingConfig {
+        RuntimeTimingConfig::new(1.0, 2.0, 10.0).unwrap()
+    }
+
+    /// §19/§42 #1-5: the dispatcher's `RunningAdmitted` outcome carries the
+    /// exact fenced identity; admitting it establishes heartbeat ownership,
+    /// and the service renews through the fenced primitive. No other
+    /// outcome can carry an admission (structural: only this variant has
+    /// the field).
+    #[test]
+    fn running_admitted_handoff_enters_supervision_and_renews() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("handoff", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission,
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        // The admission carries exactly the identity the fenced RUNNING
+        // confirmation confirmed - attempt, epoch, execution, request.
+        let exec = kernel.execution(admission.execution_id()).unwrap();
+        assert_eq!(exec.task_id, task_id);
+        assert_eq!(admission.attempt_id(), &exec.attempt_id);
+        assert_eq!(
+            admission.lease_epoch(),
+            kernel
+                .lease_for_attempt(admission.attempt_id())
+                .unwrap()
+                .epoch
+        );
+        assert!(!admission.request_id().as_str().is_empty());
+
+        // Handoff: registry insertion follows the committed first renewal.
+        service.admit(admission.clone()).unwrap();
+        assert!(service.contains(admission.execution_id()));
+        assert_eq!(service.active_count(), 1);
+
+        clock.advance(1.0);
+        let now = kernel.now();
+        assert!(matches!(
+            service.renew_one(admission.execution_id()).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+        let lease = kernel
+            .lease_supervision_view(admission.attempt_id())
+            .unwrap();
+        assert_eq!(lease.expires_at, now + 10.0);
+        assert_eq!(lease.heartbeat_at, now);
+    }
+
+    /// §42 #6/#7/#8/#9: STARTING, UNKNOWN/ambiguous, and contradictory
+    /// RUNNING observations are `StartIndeterminate` - no supervision
+    /// admission is ever created.
+    #[test]
+    fn unresolved_start_observations_never_admit() {
+        for (name, observation) in [
+            (
+                "starting",
+                StartObservation {
+                    state: ExecutionState::Starting,
+                    runtime_handle: RuntimeHandle(Value::Null),
+                    ambiguous: false,
+                    failure_class: None,
+                    detail: None,
+                    terminal_confirmed: false,
+                    quiescent_confirmed: false,
+                },
+            ),
+            ("ambiguous", ambiguous_start()),
+            (
+                "contradictory-running",
+                StartObservation {
+                    state: ExecutionState::Running,
+                    runtime_handle: RuntimeHandle(Value::Null),
+                    ambiguous: false,
+                    failure_class: None,
+                    detail: None,
+                    terminal_confirmed: true,
+                    quiescent_confirmed: false,
+                },
+            ),
+        ] {
+            let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+            let kernel = Arc::new(kernel);
+            let d = Dispatcher::new(&kernel, &registry, &adapters);
+            let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+            let (_batch, _ids) = kernel
+                .submit_batch(&[TaskSpec::new(name, Value::Null)])
+                .unwrap();
+            fake.set_next_start(observation);
+
+            let outcome = d.dispatch_one().unwrap();
+            assert!(
+                matches!(outcome, DispatchOneOutcome::StartIndeterminate { .. }),
+                "{name} must be StartIndeterminate"
+            );
+            assert_eq!(
+                service.active_count(),
+                0,
+                "{name} must never enter supervision"
+            );
+        }
+    }
+
+    /// §42 #10/#11: an authoritative collected terminal failure and a
+    /// synchronous Task completion never enter supervision.
+    #[test]
+    fn terminal_outcomes_never_admit() {
+        // Collected terminal failure.
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("term-fail", Value::Null)])
+            .unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Failed,
+            payload: None,
+            summary: None,
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::TerminalFailure { .. }
+        ));
+        assert_eq!(service.active_count(), 0);
+
+        // Synchronous Task completion.
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("term-ok", Value::Null)])
+            .unwrap();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(Value::Null),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(ExecutionOutcome {
+            state: ExecutionState::Succeeded,
+            payload: Some(Value::Null),
+            summary: None,
+            failure_class: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        });
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::TaskCompleted { .. }));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §42 #12/#13: authority that goes stale (or expires) during the
+    /// confirmation creates NO admission; the outcome is
+    /// `StartIndeterminate` and the durable state keeps writer ambiguity.
+    #[test]
+    fn stale_confirmation_never_admits() {
+        let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", advancing).unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("stale-confirm", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::StartIndeterminate { .. }
+        ));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §42 #14: authority rejected before composition (a stale claim after
+    /// the Task was cancelled) creates no admission.
+    #[test]
+    fn authority_rejection_never_admits() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("rejected", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        kernel.cancel_task(&task_id, true).unwrap();
+
+        let outcome = d.dispatch_claim(&claim).unwrap();
+        assert!(matches!(outcome, DispatchOneOutcome::AuthorityRejected));
+        assert_eq!(service.active_count(), 0);
+    }
+
+    /// §45: ACK wins before the heartbeat - the heartbeat loses fencing,
+    /// supervision ownership is dropped, and the Task remains completed.
+    #[test]
+    fn race_ack_wins_before_heartbeat() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-ack", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+
+        kernel
+            .ack_success(
+                &admission.attempt_id().clone(),
+                admission.lease_epoch(),
+                Some(admission.execution_id()),
+                &Value::Null,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            service.renew_one(admission.execution_id()).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: admission.execution_id().clone()
+            }
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
+        assert!(!service.contains(admission.execution_id()));
+    }
+
+    /// §46: heartbeat wins immediately before the ACK - the lease extends
+    /// briefly, then the ACK closes authority normally and the Task
+    /// completes. No race may reopen a completed Task.
+    #[test]
+    fn race_heartbeat_wins_before_ack() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-heartbeat", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+
+        clock.advance(1.0);
+        assert!(matches!(
+            service.renew_one(admission.execution_id()).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+        kernel
+            .ack_success(
+                &admission.attempt_id().clone(),
+                admission.lease_epoch(),
+                Some(admission.execution_id()),
+                &Value::Null,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_ok());
+    }
+
+    /// §47: cancellation before the heartbeat closes current authority -
+    /// the renewal must lose fencing and the admission is dropped. The
+    /// heartbeat failure path itself never establishes a terminality or
+    /// quiescence proof (#53/#54): the proof bits stay untouched by
+    /// supervision.
+    #[test]
+    fn race_cancellation_closes_renewal_authority() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-cancel", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+
+        kernel.cancel_task(&task_id, true).unwrap();
+        assert_eq!(
+            service.renew_one(admission.execution_id()).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: admission.execution_id().clone()
+            }
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Cancelled);
+        assert!(!service.contains(admission.execution_id()));
+        // The supervision drop itself wrote no proof bits anywhere: the
+        // execution row is exactly as cancellation left it.
+        let exec = kernel.execution(admission.execution_id()).unwrap();
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+    }
+
+    /// §49: MERGE during a running Attempt does not alter the heartbeat
+    /// authority identity - the frozen Attempt binding survives, and the
+    /// supervised renewal keeps succeeding under the same Attempt/epoch.
+    #[test]
+    fn race_merge_preserves_heartbeat_identity() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general2",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("race-merge", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+
+        kernel.merge_partitions("general", "general2").unwrap();
+        clock.advance(1.0);
+        assert!(matches!(
+            service.renew_one(admission.execution_id()).unwrap(),
+            RenewalOutcome::Renewed { .. }
+        ));
+    }
+
+    /// §55: lease expiry after supervision loss does NOT by itself permit a
+    /// duplicate unisolated WRITE writer - writer safety suspends with
+    /// WRITER_QUIESCENCE_UNKNOWN and no replacement is dispatched.
+    #[test]
+    fn supervision_loss_then_expiry_suspends_unisolated_writer() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-expiry", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+
+        // Supervision ownership is lost (e.g. local shutdown); nothing about
+        // the physical writer is proven.
+        service.remove(admission.execution_id()).unwrap();
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+
+        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let task = kernel.task(&exec.task_id).unwrap();
+        assert_eq!(task.state, TaskState::Suspended);
+        // No duplicate writer: the suspended task is not dispatchable.
+        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+    }
+
+    /// §56: isolated-writer recovery continues to depend on the persisted
+    /// `attempt_isolation` fact, not on the supervision registry - after
+    /// supervision loss and expiry the Task retries under policy and a
+    /// fresh attempt is dispatchable.
+    #[test]
+    fn isolated_writer_recovery_follows_persisted_isolation_not_registry() {
+        let (kernel, clock, _registry, adapters, fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        // An isolated registry generation: same target name, isolation on.
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default").with_timeout(30.0))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-isolated", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        assert!(
+            kernel
+                .execution(admission.execution_id())
+                .unwrap()
+                .attempt_isolation
+        );
+        service.admit(admission.clone()).unwrap();
+        service.remove(admission.execution_id()).unwrap();
+
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+        let exec = kernel.execution(admission.execution_id()).unwrap();
+        let task = kernel.task(&exec.task_id).unwrap();
+        assert_eq!(task.state, TaskState::RetryWait);
+
+        // The deterministic retry backoff must elapse before the retry
+        // wait is promoted back to QUEUED.
+        clock.advance(2.0);
+        kernel.promote_retry_wait().unwrap();
+        let outcome = d.dispatch_one().unwrap();
+        assert!(matches!(
+            outcome,
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
+        assert_eq!(fake.start_call_count(), 2);
+    }
+
+    /// §57: removing supervision ownership does not permit a WRITE
+    /// replacement - the Task authority is untouched and nothing is
+    /// re-dispatched.
+    #[test]
+    fn removing_ownership_does_not_permit_write_replacement() {
+        let (kernel, _clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-remove", Value::Null).write()])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+        service.remove(admission.execution_id()).unwrap();
+
+        assert_eq!(d.dispatch_one().unwrap(), DispatchOneOutcome::NoWork);
+        let exec = kernel.execution(admission.execution_id()).unwrap();
+        assert_eq!(exec.state, ExecutionState::Running);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+    }
+
+    /// §58: stale writer physical state remains recoverable/reconcilable -
+    /// after supervision loss and lease expiry the Execution row keeps its
+    /// physical state and observed handle untouched (M5.4 owns
+    /// reconciliation).
+    #[test]
+    fn supervision_loss_preserves_reconcilable_physical_state() {
+        let (kernel, clock, registry, adapters, _fake) = dispatch_env();
+        let kernel = Arc::new(kernel);
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("ws-reconcile", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let admission = match &outcome {
+            DispatchOneOutcome::RunningAdmitted { admission } => admission.clone(),
+            other => panic!("expected RunningAdmitted, got {other:?}"),
+        };
+        service.admit(admission.clone()).unwrap();
+        service.remove(admission.execution_id()).unwrap();
+
+        let before = kernel.execution(admission.execution_id()).unwrap();
+        let handle_before = kernel
+            .execution_runtime_handle(admission.execution_id())
+            .unwrap();
+        clock.advance(11.0);
+        kernel.expire_leases(false).unwrap();
+        let after = kernel.execution(admission.execution_id()).unwrap();
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.terminal_confirmed, after.terminal_confirmed);
+        assert_eq!(before.quiescent_confirmed, after.quiescent_confirmed);
+        assert_eq!(
+            handle_before,
+            kernel
+                .execution_runtime_handle(admission.execution_id())
+                .unwrap()
+        );
+    }
 }
