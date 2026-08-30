@@ -202,6 +202,8 @@ from a start that never happened.
 | 45 | audit r7: kernel faults classify as Persistence, never Authority | `kernel_faults_are_never_classified_as_authority` |
 | 46 | audit r7: durable-state fault during binding resolution is fatal | `dispatch_surfaces_kernel_faults_as_persistence_not_authority_rejection` |
 | 47 | audit r7: success without quiescence retains handle | `dispatch_success_without_quiescence_retains_handle` |
+| 48 | audit r8: collected-success locator durable before a hard ack failure | `dispatch_collected_success_evidence_durable_before_ack_consequence` |
+| 49 | audit r8: collected-failure locator durable before a hard nack failure | `dispatch_collected_failure_evidence_durable_before_nack_consequence` |
 | — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
@@ -251,20 +253,20 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 178 passed, 0 failed
+cargo test --workspace                                   → 180 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (178):
+Rust breakdown (180):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation
   including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 53 (M5.1 façade 13 + composition 6 + dispatcher 34)
+- `agentype-runtime`: 55 (M5.1 façade 13 + composition 6 + dispatcher 36)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -453,3 +455,19 @@ Rust breakdown (178):
 18. **Registered (unchanged):** the StartFailed/StartIndeterminate vocabulary split before M5.3
     consumes the boundary (§8), and the no-start STARTING-row typed composition note — the
     latter's risk is further reduced now that pairing validation covers attempt_isolation.
+
+### Round 8 (eighth audit)
+
+19. **Terminal physical evidence commits before the authority consequence (P1, merge blocker,
+    corrected).** The collected terminal paths ran the authority consequence first
+    (`ack_success`/`nack` commit their own transactions) and retained the observed handle after
+    (`retain_collected_handle`) — a crash between the two transactions left the authority
+    consequence durable (WRITE task suspended) with no physical locator in durable history. The
+    order is now evidence-first: a collected terminal outcome whose quiescence is NOT proven is
+    pre-persisted as UNKNOWN with the observed handle and zero proof bits BEFORE
+    `ack_success`/`nack` run; the terminal state itself is applied by the authority transaction
+    (UNKNOWN → SUCCEEDED/FAILED), preserving the frozen M4 Kernel API. A quiescence-proven end
+    needs no locator and skips the pre-persist. Regressions: a `CollectCorruptingAdapter`
+    corrupts one durable column during `collect_outcome`, forcing the ack (corrupted lease read)
+    / nack (corrupted retry-policy decode) to fail hard — the Execution is left UNKNOWN with
+    the observed handle durable; the pre-evidence order would have left STARTING with no handle.
