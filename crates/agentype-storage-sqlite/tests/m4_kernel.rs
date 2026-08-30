@@ -20,7 +20,7 @@ fn wal_full_and_foreign_keys() {
     assert_eq!(journal.to_uppercase(), "WAL");
     assert_eq!(sync, 2, "synchronous=FULL");
     assert_eq!(fk, 1);
-    assert_eq!(env.k.schema_version().unwrap(), 1);
+    assert_eq!(env.k.schema_version().unwrap(), 2);
 }
 
 /// A database carrying the Rust-era identity survives reopen; a foreign
@@ -44,7 +44,7 @@ fn fresh_database_carries_rust_identity_and_reopens() {
     }
     // Reopen must succeed: same family, version 1.
     let env = file_env(&db);
-    assert_eq!(env.k.schema_version().unwrap(), 1);
+    assert_eq!(env.k.schema_version().unwrap(), 2);
 }
 
 /// A simulated Python-lineage database (schema_migrations present at version
@@ -1723,4 +1723,52 @@ fn birth_agent_fails_closed_on_unknown_workstream() {
     let tx = conn.transaction().unwrap();
     let err = txutil::birth_agent(&tx, "general", Some("ws-missing"), None, 5_000.0).unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+}
+
+/// Audit P1 (round 10): a structurally valid rust-v0.2 database at schema
+/// version 1 (no executions.adapter_kind column) must be rejected at open —
+/// claiming compatibility would defer the failure to the first
+/// execution-commitment INSERT. A fresh v2 database opens and freezes the
+/// column.
+#[test]
+fn schema_v1_database_is_rejected_after_adapter_kind_column() {
+    let db = FixtureDb::new("schema-v2");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), 2);
+    }
+    // Downgrade the database to the M5.1-era shape: version 1, no
+    // adapter_kind column.
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=1", [])
+        .unwrap();
+    conn.execute("ALTER TABLE executions DROP COLUMN adapter_kind", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v1 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string().contains("does not match expected 2"),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+
+    // A fresh v2 database opens and carries the frozen column.
+    let fresh = FixtureDb::new("schema-v2-fresh");
+    {
+        let env = file_env(&fresh);
+        assert_eq!(env.k.schema_version().unwrap(), 2);
+        let conn = rusqlite::Connection::open(&fresh.path).unwrap();
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('executions') WHERE name='adapter_kind')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+    }
 }
