@@ -204,6 +204,7 @@ from a start that never happened.
 | 47 | audit r7: success without quiescence retains handle | `dispatch_success_without_quiescence_retains_handle` |
 | 48 | audit r8: collected-success locator durable before a hard ack failure | `dispatch_collected_success_evidence_durable_before_ack_consequence` |
 | 49 | audit r8: collected-failure locator durable before a hard nack failure | `dispatch_collected_failure_evidence_durable_before_nack_consequence` |
+| 50 | audit r9: execution commitment freezes the adapter binding identity | `execution_commitment_freezes_adapter_kind` |
 | — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
@@ -253,20 +254,20 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 180 passed, 0 failed
+cargo test --workspace                                   → 181 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (180):
+Rust breakdown (181):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation
   including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 55 (M5.1 façade 13 + composition 6 + dispatcher 36)
+- `agentype-runtime`: 56 (M5.1 façade 13 + composition 6 + dispatcher 37)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -280,24 +281,37 @@ Rust breakdown (180):
   deferred to M5.4.
 - `expire_leases` leaves orphaned STARTING/RUNNING/UNKNOWN execution rows
   untouched; reconciliation of stale physical rows is M5.4.
-- **P1 — M5.4 hard prerequisite: durable adapter binding identity.** The schema
-  freezes `execution_target`/`execution_profile` on an Execution but not the
-  resolved `adapter_kind`. If the registry configuration drifts between a crash
-  and recovery (target "local" served by `codex-a` at T0, by `codex-b` at T1),
-  an M5.4 reconciler that re-resolves the current target would hand the old
-  physical execution to an adapter implementation that never started it.
-  Before M5.4 begins, the adapter binding identity must be frozen durably
-  (minimum: `executions.adapter_kind`; whether an adapter instance/config
-  fingerprint is additionally required is decided with the first real
-  adapter's reconciliation identity — no generic plugin identity framework).
+- **Adapter binding identity — frozen in M5.2 (was an M5.4 hard prerequisite).**
+  `executions.adapter_kind TEXT NOT NULL` is persisted inside the
+  execution-commitment transaction via `FrozenPhysicalExecutionBinding`, so a
+  registry configuration drift between a crash and recovery (target "local"
+  served by `codex-a` at T0, by `codex-b` at T1) can never hand the old
+  physical execution to an adapter implementation that never started it. What
+  remains open for M5.4/M5.7: whether an adapter instance/config fingerprint
+  beyond `adapter_kind` is required by the first real adapter's reconciliation
+  identity — no generic plugin identity framework either way.
 - **P2 — outcome vocabulary.** `DispatchOneOutcome::StartFailed` currently also
   covers physically-unresolved paths (adapter invocation errors, collection
   errors — durable state UNKNOWN), which could mislead a daemon into reading
   "start definitely failed". Before M5.3 consumes the boundary, split into
-  `StartFailed` (collected terminal failure) vs `StartIndeterminate` (invocation
-  /collection errors), or fold the indeterminate case into `StartAmbiguous`
-  carrying the failure class. The type name must not imply physical execution
-  is definitely absent.
+  `StartFailed` (authoritative collected terminal failure) vs
+  `StartIndeterminate` (start/collect invocation uncertainty — the Execution
+  may be UNKNOWN with a preserved handle), or fold the indeterminate case into
+  `StartAmbiguous` carrying the failure class. The type name must not imply
+  physical execution is definitely absent.
+- **P2 — CompletedSynchronously mixes physical and Task completion.**
+  `result_id: Option<ResultId>` is None when the worker physically SUCCEEDED
+  but WRITE quiescence was not proven (WRITER_SUCCESS_NOT_QUIESCENT suspension)
+  — easily read as "Task completed". Before M5.3/M5.8 consume the outcome,
+  split into `CompletedSynchronously { result_id: ResultId }` plus
+  `WriterSafetySuspendedAfterSuccess` (or an explicit authority-consequence
+  enum). Not a current correctness issue: the durable states are correct.
+- **P2 — no-start STARTING row.** `create_execution` commits STARTING before
+  `from_launch` pairing validation runs; unreachable on the canonical path
+  (both sides share one attempt-bound safety proof, runtime forbids unsafe)
+  and further reduced by the isolation pairing check. If the physical-binding
+  freeze refactor naturally absorbs it, resolve it then; no typestate rework
+  for its own sake.
 - **P2 — no-start STARTING row robustness.** `create_execution` persists
   STARTING before `from_launch` pairing validation runs; on the canonical path
   that validation cannot fail (same attempt-bound safety on both sides,
@@ -471,3 +485,21 @@ Rust breakdown (180):
     corrupts one durable column during `collect_outcome`, forcing the ack (corrupted lease read)
     / nack (corrupted retry-policy decode) to fail hard — the Execution is left UNKNOWN with
     the observed handle durable; the pre-evidence order would have left STARTING with no handle.
+
+### Round 9 (ninth audit)
+
+20. **The adapter binding identity is frozen at the execution-commitment transaction (P1, merge
+    blocker, corrected).** Once `start_execution` may have run, the durable Execution did not
+    record WHICH adapter binding owns the physical start — `adapter_kind` lived only in the
+    in-memory composition, and M5.4 cannot recover information M5.2 did not record. The M5.2
+    commitment invariant is now enforced: `executions.adapter_kind TEXT NOT NULL` is persisted
+    inside the same fenced transaction as `request_id` and STARTING, carried by
+    `FrozenPhysicalExecutionBinding { safety, adapter_kind }` (execution-config) through
+    `Kernel::create_execution`; the canonical dispatcher freezes
+    `ResolvedPhysicalExecutionEnvironment::physical_binding()` (the same kind string used for the
+    AdapterRegistry lookup), and the standalone facade freezes the target configuration's
+    declared binding. Regression: the commitment row carries the resolved adapter_kind after a
+    normal dispatch. Provider-neutral metadata only; a stronger
+    adapter_binding_id/config fingerprint is deferred to M5.4/M5.7 (§8 updated). Registered
+    P2s from this round: the CompletedSynchronously physical/Task completion split, and the
+    no-start STARTING-row typed composition (§8).
