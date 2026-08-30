@@ -92,6 +92,11 @@ pub enum SupervisionError {
     InvalidAdmission(String),
     /// No registry entry under this execution id.
     NoSuchEntry,
+    /// The runner lifecycle is not RUNNING (shutting down, failed, or
+    /// stopped): admissions are only accepted from a live heartbeat
+    /// loop, otherwise an execution could sit in the registry with no
+    /// supervisor behind it.
+    RunnerStopped(&'static str),
     /// The composed timing configuration disagrees with the Kernel's actual
     /// lease authority. The supervisor must never compute renewal durations
     /// independently from the Kernel.
@@ -117,6 +122,9 @@ impl fmt::Display for SupervisionError {
                 write!(f, "supervision admission is malformed: {detail}")
             }
             Self::NoSuchEntry => write!(f, "no supervision entry for this execution"),
+            Self::RunnerStopped(detail) => {
+                write!(f, "supervision runner is not running: {detail}")
+            }
             Self::LeaseAuthorityMismatch { configured, kernel } => write!(
                 f,
                 "configured lease_seconds ({configured}) does not match the Kernel lease authority ({kernel})"
@@ -532,9 +540,17 @@ impl SupervisionService {
                 new_expires_at,
             },
             Ok(SupervisedRenewal::NotRunning) => RenewalOutcome::NoLongerRunning { execution_id },
-            Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_) | Error::NotFound(_)) => {
+            Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                 RenewalOutcome::AuthorityLost { execution_id }
             }
+            // Everything else is fatal (M5.3 audit round 2, P1-3): an
+            // admitted execution's durable identity (Execution/Attempt/
+            // Lease) existed at mint time and Agentype never deletes
+            // execution history — a NotFound here is durable corruption or
+            // an impossible identity, never an ordinary expiry the
+            // supervisor may quietly drop. For a WRITE worker this must
+            // not masquerade as a normal stale-authority drop; fail-stop
+            // and let M5.4 reconciliation handle the physical reality.
             Err(err) => return Err(SupervisionError::Fatal(err)),
         };
         let next_due_at = anchor + self.heartbeat_interval.as_secs_f64();
@@ -557,11 +573,32 @@ impl SupervisionService {
     }
 }
 
+/// Runner lifecycle (M5.3 audit round 2, P1-2): admissions are accepted
+/// ONLY in `Running`; a failed or stopping loop can never take new
+/// ownership, so the registry can never hold an entry with no live
+/// supervisor behind it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RunnerPhase {
+    Running,
+    ShuttingDown,
+    Failed,
+    Stopped,
+}
+
 /// Shared runner state between the supervision thread and its handle.
-#[derive(Default)]
+#[derive(Debug)]
 struct RunnerState {
-    shutting_down: bool,
+    phase: RunnerPhase,
     fatal: Option<SupervisionError>,
+}
+
+impl Default for RunnerState {
+    fn default() -> Self {
+        Self {
+            phase: RunnerPhase::Running,
+            fatal: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -613,52 +650,68 @@ impl SupervisionRunner {
         let join = std::thread::Builder::new()
             .name("supervision-heartbeat".into())
             .spawn(move || {
-                'supervision: loop {
-                    // Renew everything whose deadline has arrived. Short
-                    // fenced transactions; no state lock held (M5.3 §50).
-                    if let Err(e) = thread_service.renew_due_now() {
-                        // Fatal (or unexpected) failure: stop the loop,
-                        // surface the fault, never restart, never
-                        // reconstruct admissions (M5.3 §34).
-                        let mut state = thread_shared.state.lock().expect("runner state lock");
-                        if state.fatal.is_none() {
-                            state.fatal = Some(e);
-                        }
-                        break 'supervision;
-                    }
-                    // Deadline wait (M5.3 audit P1-1): sleep until the
-                    // earliest next_due_at — recomputed under the state lock
-                    // so a concurrent ownership mutation (whose wake-up may
-                    // otherwise be lost) can never be overslept.
-                    let mut state = thread_shared.state.lock().expect("runner state lock");
-                    loop {
-                        if state.shutting_down {
+                // Exit guard (M5.3 audit round 2, P1-2): ANY unexpected
+                // thread exit - a panic above all - must mark the runner
+                // FAILED. A missing supervisor must never look alive.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    'supervision: loop {
+                        // Renew everything whose deadline has arrived. Short
+                        // fenced transactions; no state lock held (M5.3 §50).
+                        if let Err(e) = thread_service.renew_due_now() {
+                            // Fatal (or unexpected) failure: stop the loop,
+                            // surface the fault, never restart, never
+                            // reconstruct admissions (M5.3 §34).
+                            let mut state = thread_shared.state.lock().expect("runner state lock");
+                            if state.fatal.is_none() {
+                                state.fatal = Some(e);
+                            }
+                            state.phase = RunnerPhase::Failed;
+                            drop(state);
                             break 'supervision;
                         }
-                        let wait: Duration = match thread_service.earliest_next_due() {
-                            Some(due) => {
-                                let remaining = due - thread_service.now();
-                                if remaining > 0.0 {
-                                    Duration::from_secs_f64(remaining)
-                                } else {
-                                    Duration::ZERO
-                                }
+                        // Deadline wait (M5.3 audit P1-1): sleep until the
+                        // earliest next_due_at — recomputed under the state lock
+                        // so a concurrent ownership mutation (whose wake-up may
+                        // otherwise be lost) can never be overslept.
+                        let mut state = thread_shared.state.lock().expect("runner state lock");
+                        loop {
+                            if state.phase != RunnerPhase::Running {
+                                break 'supervision;
                             }
-                            None => idle_wait,
-                        };
-                        if wait == Duration::ZERO {
-                            // Something is due right now: renew outside the
-                            // state lock.
-                            drop(state);
-                            continue 'supervision;
+                            let wait: Duration = match thread_service.earliest_next_due() {
+                                Some(due) => {
+                                    let remaining = due - thread_service.now();
+                                    if remaining > 0.0 {
+                                        Duration::from_secs_f64(remaining)
+                                    } else {
+                                        Duration::ZERO
+                                    }
+                                }
+                                None => idle_wait,
+                            };
+                            if wait == Duration::ZERO {
+                                // Something is due right now: renew outside the
+                                // state lock.
+                                drop(state);
+                                continue 'supervision;
+                            }
+                            let (s, _) = thread_shared
+                                .signal
+                                .wait_timeout(state, wait)
+                                .expect("runner state lock");
+                            state = s;
+                            // Woken by: shutdown, an ownership mutation, or the
+                            // earliest deadline — re-check and recompute.
                         }
-                        let (s, _) = thread_shared
-                            .signal
-                            .wait_timeout(state, wait)
-                            .expect("runner state lock");
-                        state = s;
-                        // Woken by: shutdown, an ownership mutation, or the
-                        // earliest deadline — re-check and recompute.
+                    }
+                }));
+                if result.is_err() {
+                    let mut state = thread_shared.state.lock().expect("runner state lock");
+                    state.phase = RunnerPhase::Failed;
+                    if state.fatal.is_none() {
+                        state.fatal = Some(SupervisionError::Fatal(Error::invariant(
+                            "the supervision heartbeat thread panicked",
+                        )));
                     }
                 }
                 // Local shutdown: drop ownership. No revocation, no
@@ -686,6 +739,16 @@ impl SupervisionRunner {
         // new admission's wake-up can never be lost and the loop can never
         // oversleep past its earlier deadline.
         let state = self.shared.state.lock().expect("runner state lock");
+        // Lifecycle gate (M5.3 audit round 2, P1-2): admissions are
+        // accepted ONLY while the heartbeat loop is Running - after a
+        // fatal or during shutdown there is no supervisor behind the
+        // entry, and an unowned entry is exactly the state this milestone
+        // exists to prevent.
+        if state.phase != RunnerPhase::Running {
+            return Err(SupervisionError::RunnerStopped(
+                "admission is only accepted while the heartbeat loop is running",
+            ));
+        }
         let result = self.service.admit(admission);
         if result.is_ok() {
             self.shared.signal.notify_all();
@@ -731,7 +794,9 @@ impl SupervisionRunner {
     fn stop_and_join(&mut self) -> Option<SupervisionError> {
         {
             let mut state = self.shared.state.lock().expect("runner state lock");
-            state.shutting_down = true;
+            if state.phase == RunnerPhase::Running {
+                state.phase = RunnerPhase::ShuttingDown;
+            }
         }
         self.shared.signal.notify_all();
         if let Some(join) = self.join.take() {
@@ -745,12 +810,11 @@ impl SupervisionRunner {
         // Belt and suspenders: the thread cleared on its way out; clearing
         // here is idempotent (consumed generations persist).
         self.service.clear();
-        self.shared
-            .state
-            .lock()
-            .expect("runner state lock")
-            .fatal
-            .clone()
+        let mut state = self.shared.state.lock().expect("runner state lock");
+        if state.phase == RunnerPhase::ShuttingDown {
+            state.phase = RunnerPhase::Stopped;
+        }
+        state.fatal.clone()
     }
 
     /// Graceful shutdown: stop the loop, drop ownership, and report the
@@ -1541,8 +1605,150 @@ mod tests {
             )),
             other => panic!("expected a fatal fault from the heartbeat loop, got {other:?}"),
         }
+        // Audit round 2, P1-2: after a fatal the runner lifecycle is
+        // FAILED - a new admission MUST be rejected and the registry
+        // must stay empty (no entry with no supervisor behind it).
+        let second = mint_timed(&claim, &exec, kernel.now(), kernel.now() + 1.0);
+        assert!(matches!(
+            runner.admit(second),
+            Err(SupervisionError::RunnerStopped(_))
+        ));
+        assert_eq!(runner.active_count(), 0);
         // Shutdown still cleans up and re-surfaces the fatal fault.
         assert!(runner.shutdown().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clock that panics once armed: turns the first post-arm kernel
+    /// clock read into a heartbeat-thread panic, deterministically.
+    struct TripwireClock {
+        inner: Arc<ManualClock>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Clock for TripwireClock {
+        fn now(&self) -> f64 {
+            if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                panic!("supervision clock tripped");
+            }
+            self.inner.now()
+        }
+    }
+
+    /// P1-2 (audit round 2): an unexpected heartbeat-thread exit (panic)
+    /// must flip the runner lifecycle to FAILED - fatal observable, later
+    /// admissions rejected, registry empty. A dead supervisor must never
+    /// look alive.
+    #[test]
+    fn heartbeat_thread_panic_marks_runner_failed_and_rejects_admit() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentype-runner-panic-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+        let clock_inner = Arc::new(ManualClock::new(1_000.0));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kernel = Arc::new(
+            Kernel::open(
+                &path,
+                Arc::new(TripwireClock {
+                    inner: clock_inner.clone(),
+                    armed: armed.clone(),
+                }),
+                1.0,
+                16_384,
+            )
+            .unwrap(),
+        );
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let (claim, exec) = running_execution(&kernel, "panic-ok");
+        // Mint BEFORE arming the tripwire (mint reads the kernel clock).
+        let admission = mint(&claim, &exec, &kernel);
+        armed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let timing = RuntimeTimingConfig::new(0.2, 0.3, 1.0).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+        // The loop is still Running here, so the admission is accepted...
+        runner.admit(admission).unwrap();
+        // ...and the first tick then hits the tripped clock and panics.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(matches!(
+            runner.take_fatal(),
+            Some(SupervisionError::Fatal(_))
+        ));
+        // The lifecycle is FAILED: no new ownership, nothing unowned.
+        let second = mint_timed(&claim, &exec, 1_000.0, 1_001.0);
+        assert!(matches!(
+            runner.admit(second),
+            Err(SupervisionError::RunnerStopped(_))
+        ));
+        assert_eq!(runner.active_count(), 0);
+        assert!(runner.shutdown().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-3 (audit round 2): an admitted execution whose durable row has
+    /// disappeared is durable corruption, not ordinary authority loss -
+    /// renewal fails FATAL (the service leaves the entry in place; the
+    /// production runner fail-stops on the same classification).
+    #[test]
+    fn missing_execution_is_fatal_not_authority_loss() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentype-missing-exec-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel =
+            Arc::new(Kernel::open(&path, clock as Arc<dyn Clock>, LEASE_SECONDS, 16_384).unwrap());
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let (claim, exec) = running_execution(&kernel, "missing-exec");
+        let service = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        service.admit(mint(&claim, &exec, &kernel)).unwrap();
+
+        // Delete the durable execution row below the API boundary: an
+        // admitted identity cannot legitimately disappear.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "DELETE FROM executions WHERE id=?1",
+            rusqlite::params![exec.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        match service.renew_one(&exec).unwrap_err() {
+            SupervisionError::Fatal(inner) => {
+                assert!(matches!(inner, Error::NotFound(_)), "got {inner:?}")
+            }
+            other => panic!("expected a fatal fault for a vanished execution, got {other:?}"),
+        }
+        // Service (non-runner) semantics: the entry stays in place on
+        // Fatal; the production Runner fail-stops on the same outcome.
+        assert!(service.contains(&exec));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

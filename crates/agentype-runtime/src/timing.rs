@@ -27,6 +27,7 @@ pub struct RuntimeTimingConfig {
 pub enum TimingConfigError {
     NonPositiveDuration { field: &'static str, value: f64 },
     NonFiniteDuration { field: &'static str, value: f64 },
+    UnrepresentableDuration { field: &'static str, value: f64 },
     PollExceedsHeartbeat { poll: f64, heartbeat: f64 },
     HeartbeatNotBelowLease { heartbeat: f64, lease: f64 },
 }
@@ -39,6 +40,12 @@ impl fmt::Display for TimingConfigError {
             }
             Self::NonFiniteDuration { field, value } => {
                 write!(f, "timing {field} must be finite, got {value}")
+            }
+            Self::UnrepresentableDuration { field, value } => {
+                write!(
+                    f,
+                    "timing {field} is not representable as a Duration, got {value}"
+                )
             }
             Self::PollExceedsHeartbeat { poll, heartbeat } => write!(
                 f,
@@ -81,6 +88,12 @@ impl RuntimeTimingConfig {
             }
             if value <= 0.0 {
                 return Err(TimingConfigError::NonPositiveDuration { field, value });
+            }
+            // Fail closed on finite-but-unrepresentable durations (M5.3
+            // audit round 2, P2): Duration::from_secs_f64 panics on values
+            // beyond the Duration range, so the gate converts first.
+            if Duration::try_from_secs_f64(value).is_err() {
+                return Err(TimingConfigError::UnrepresentableDuration { field, value });
             }
         }
         if dispatcher_poll_seconds > heartbeat_seconds {
@@ -242,6 +255,17 @@ mod tests {
             lease_seconds: f64::INFINITY,
         };
         assert!(validate_lease_authority_match(&forged, 10.0).is_err());
+    }
+
+    /// A huge finite duration passes the ordering checks but would panic
+    /// inside Duration::from_secs_f64 - rejected at construction (P2).
+    #[test]
+    fn unrepresentable_durations_are_rejected() {
+        let err = RuntimeTimingConfig::new(1.0, 2.0, 1.0e20).unwrap_err();
+        assert!(matches!(
+            err,
+            TimingConfigError::UnrepresentableDuration { .. }
+        ));
     }
 
     /// Lease-authority match: a drift between the configured lease duration
