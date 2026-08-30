@@ -207,6 +207,8 @@ from a start that never happened.
 | 50 | audit r9: execution commitment freezes the adapter binding identity | `execution_commitment_freezes_adapter_kind` |
 | 51 | audit r10: schema v1 database rejected at open after the adapter_kind change | `schema_v1_database_is_rejected_after_adapter_kind_column` |
 | 52 | audit r10: contradictory RUNNING observation never reaches admission | `dispatch_contradictory_running_observation_never_reaches_admission` |
+| 53 | audit r11: reusable sync success keeps the WARM incarnation handle | `dispatch_reusable_sync_success_keeps_warm_incarnation_handle` |
+| 54 | audit r11: continuity locator flows into the next launch snapshot | `dispatch_next_launch_carries_continuity_locator` |
 | — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
@@ -256,20 +258,20 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 183 passed, 0 failed
+cargo test --workspace                                   → 185 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (183):
+Rust breakdown (185):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation
   including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 58 (M5.1 façade 13 + composition 6 + dispatcher 39)
+- `agentype-runtime`: 60 (M5.1 façade 13 + composition 6 + dispatcher 41)
 - `agentype-storage-sqlite`: 91 (m4_kernel 64, recovery 11, topology 16)
 
 ---
@@ -537,3 +539,17 @@ Rust breakdown (183):
     ADAPTER_PROTOCOL_FAILURE — no SupervisionAdmissionSeed. Regression included.
 23. **Wording:** `adapter_kind` described as the adapter ROUTING key / binding family identity,
     not the full implementation/configuration identity (see §8).
+
+### Round 11 (eleventh audit)
+
+26. **A reusable synchronous success preserves the WARM incarnation's continuity locator (P1,
+    corrected).** A collected SUCCEEDED with terminal+quiescent+incarnation_reusable skipped
+    handle persistence (the round-5 rule considered only the cleanup locator) while ack_success
+    promoted the Incarnation to WARM without writing runtime_handle_json — and the synchronous
+    path never ran confirm_running_and_renew (the only primitive that writes it). The next task
+    on the same resident incarnation therefore read an empty continuity locator: the system
+    claimed reusability while discarding the locator needed to reuse it. The pre-ACK evidence
+    record now also fires when the incarnation is reusable (persist_terminal_evidence writes the
+    handle into executions AND incarnations via COALESCE; the WARM promotion preserves it).
+    Regressions: reusable sync success leaves the incarnation WARM with runtime_handle_json ==
+    the adapter handle; the next launch snapshot carries that locator forward.
