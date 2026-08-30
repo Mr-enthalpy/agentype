@@ -102,8 +102,13 @@ impl Kernel {
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>, UnixTime) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let now = self.clock.now();
-        self.store.with_immediate_at(now, f)
+        // The transaction timestamp is sampled by the store AFTER the
+        // connection lock and BEGIN IMMEDIATE succeed (M5.3 audit P1-1):
+        // authority validation must never run against a clock reading
+        // taken before the transaction won the SQLite write
+        // serialization, or a contended renewal could resurrect an
+        // already-expired lease.
+        self.store.with_immediate_clock(self.clock.as_ref(), f)
     }
 
     pub fn now(&self) -> UnixTime {
@@ -1958,6 +1963,12 @@ impl Kernel {
         })
     }
 
+    /// LEGACY M4 primitive (frozen test surface only). This renewal is
+    /// fenced by attempt_id + lease_epoch alone: it takes no execution
+    /// identity and is NOT wired to supervision admission. Production
+    /// periodic renewal MUST use `renew_supervised_execution`, which is
+    /// fenced by the positively admitted execution identity. Visibility
+    /// reduction is scheduled for the M5.8 composition freeze.
     pub fn heartbeat(
         &self,
         attempt_id: &AttemptId,

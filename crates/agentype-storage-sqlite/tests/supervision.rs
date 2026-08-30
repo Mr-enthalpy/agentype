@@ -13,12 +13,14 @@ use common::*;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Authority loss at the Kernel-primitive level: stale or invalid durable
+/// authority. NotFound is deliberately NOT authority loss (audit P1-3):
+/// an admitted execution's durable identity cannot legitimately
+/// disappear, so the supervision service classifies it as a fatal
+/// persistence fault, not an ordinary expiry drop.
 fn assert_authority_loss(err: Error) {
     assert!(
-        matches!(
-            err,
-            Error::StaleAuthority(_) | Error::InvalidAuthority(_) | Error::NotFound(_)
-        ),
+        matches!(err, Error::StaleAuthority(_) | Error::InvalidAuthority(_)),
         "expected an authority-loss error, got {err:?}"
     );
 }
@@ -96,12 +98,14 @@ fn supervised_renewal_requires_exact_attempt_epoch_and_execution() {
             .renew_supervised_execution(&claim1.attempt_id, claim1.lease_epoch, &exec2)
             .unwrap_err(),
     );
-    // Unknown execution.
-    assert_authority_loss(
+    // Unknown execution: the kernel reports the durable fact (NotFound);
+    // the supervision service classifies it as fatal, not authority loss.
+    assert!(matches!(
         env.k
             .renew_supervised_execution(&claim1.attempt_id, claim1.lease_epoch, &ExecutionId::new())
             .unwrap_err(),
-    );
+        Error::NotFound(_)
+    ));
     // Wrong attempt with the right execution is still a rejection.
     assert_authority_loss(
         env.k
@@ -376,6 +380,61 @@ fn kernel_rejects_non_finite_lease_seconds() {
             "expected a construction rejection for {bad}, got {err:?}"
         );
     }
+}
+
+/// P1-1 (M5.3 audit round 2): the transaction timestamp must be sampled
+/// AFTER the transaction has won the SQLite write serialization — never at
+/// caller entry. A renewal that invoked the primitive before expiry but
+/// was blocked from beginning its authority transaction while the clock
+/// moved past the expiry MUST fail stale; sampling early would resurrect
+/// an already-expired lease. The pre-fix kernel sampled the clock before
+/// BEGIN IMMEDIATE and renews here (test fails); the fixed kernel samples
+/// inside the serialization point and fails stale (test passes).
+#[test]
+fn renewal_timestamp_is_sampled_after_transaction_serialization() {
+    let db = FixtureDb::new("tx-clock");
+    let env = file_env(&db);
+    let (_batch, _task, claim, exec) = run_claim(&env.k, read_task("tx-clock"), false);
+    let expires_at = env
+        .k
+        .lease_supervision_view(&claim.attempt_id)
+        .unwrap()
+        .expires_at;
+
+    // Renewal is legal right now (just before expiry).
+    env.clock.advance(9.9);
+    assert!(env.clock.now() < expires_at);
+
+    // A second kernel on the same database: its renew invocation is what
+    // gets blocked mid-flight below.
+    let background_clock = env.clock.clone();
+    let background_kernel =
+        Kernel::open(&db.path, background_clock as Arc<dyn Clock>, 10.0, 16_384).unwrap();
+
+    // Hold the SQLite write serialization from a second connection: the
+    // background renewal now blocks at BEGIN IMMEDIATE.
+    let blocker = rusqlite::Connection::open(&db.path).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let handle = std::thread::spawn(move || {
+        background_kernel.renew_supervised_execution(&claim.attempt_id, claim.lease_epoch, &exec)
+    });
+
+    // Give the background thread time to reach the blocked BEGIN IMMEDIATE
+    // (deterministic: the write lock stays held until we release it).
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Real time moves past the durable expiry while serialization is held.
+    env.clock.advance(2.1);
+    assert!(env.clock.now() >= expires_at);
+    blocker.execute_batch("ROLLBACK;").unwrap();
+
+    let result = handle.join().unwrap();
+    // The transaction sampled the clock after acquiring serialization: the
+    // lease is already expired and renewal MUST fail stale.
+    assert_authority_loss(result.unwrap_err());
 }
 
 fn kernel_task_completed(k: &Kernel, task: &TaskId) -> bool {
