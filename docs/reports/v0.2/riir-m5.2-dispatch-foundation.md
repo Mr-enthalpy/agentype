@@ -205,6 +205,8 @@ from a start that never happened.
 | 48 | audit r8: collected-success locator durable before a hard ack failure | `dispatch_collected_success_evidence_durable_before_ack_consequence` |
 | 49 | audit r8: collected-failure locator durable before a hard nack failure | `dispatch_collected_failure_evidence_durable_before_nack_consequence` |
 | 50 | audit r9: execution commitment freezes the adapter binding identity | `execution_commitment_freezes_adapter_kind` |
+| 51 | audit r10: schema v1 database rejected at open after the adapter_kind change | `schema_v1_database_is_rejected_after_adapter_kind_column` |
+| 52 | audit r10: contradictory RUNNING observation never reaches admission | `dispatch_contradictory_running_observation_never_reaches_admission` |
 | — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
@@ -254,21 +256,21 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 181 passed, 0 failed
+cargo test --workspace                                   → 183 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (181):
+Rust breakdown (183):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation
   including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 56 (M5.1 façade 13 + composition 6 + dispatcher 37)
-- `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
+- `agentype-runtime`: 58 (M5.1 façade 13 + composition 6 + dispatcher 39)
+- `agentype-storage-sqlite`: 91 (m4_kernel 64, recovery 11, topology 16)
 
 ---
 
@@ -281,15 +283,26 @@ Rust breakdown (181):
   deferred to M5.4.
 - `expire_leases` leaves orphaned STARTING/RUNNING/UNKNOWN execution rows
   untouched; reconciliation of stale physical rows is M5.4.
-- **Adapter binding identity — frozen in M5.2 (was an M5.4 hard prerequisite).**
+- **Adapter routing identity — frozen in M5.2 (was an M5.4 hard prerequisite).**
   `executions.adapter_kind TEXT NOT NULL` is persisted inside the
   execution-commitment transaction via `FrozenPhysicalExecutionBinding`, so a
   registry configuration drift between a crash and recovery (target "local"
   served by `codex-a` at T0, by `codex-b` at T1) can never hand the old
-  physical execution to an adapter implementation that never started it. What
-  remains open for M5.4/M5.7: whether an adapter instance/config fingerprint
-  beyond `adapter_kind` is required by the first real adapter's reconciliation
-  identity — no generic plugin identity framework either way.
+  physical execution to an adapter of a different binding family. Scope note
+  (audit round 10): `adapter_kind` is the adapter ROUTING key / binding family
+  identity, not the specific implementation/configuration identity — the same
+  kind may bind to a different implementation instance across a restart. M5.4
+  must therefore not read "adapter_kind present" as "recovery identity fully
+  solved"; whether an adapter instance/config fingerprint beyond the routing
+  key is required is decided with the first real adapter's reconciliation
+  identity (M5.4/M5.7) — no generic plugin identity framework either way.
+- **Schema version 2.** The adapter_kind structural change is gated by
+  `SCHEMA_VERSION = 2`: a structurally valid rust-v0.2 database at version 1
+  (no adapter_kind column) is rejected at open (fail closed, "does not match
+  expected 2") instead of failing later at the first execution-commitment
+  INSERT; a fresh v2 database is required. Backfilling adapter_kind from
+  current configuration would violate the binding-frozen-at-commitment
+  invariant, so no repair is attempted (D-DB-MIGRATE unresolved).
 - **P2 — outcome vocabulary.** `DispatchOneOutcome::StartFailed` currently also
   covers physically-unresolved paths (adapter invocation errors, collection
   errors — durable state UNKNOWN), which could mislead a daemon into reading
@@ -503,3 +516,24 @@ Rust breakdown (181):
     adapter_binding_id/config fingerprint is deferred to M5.4/M5.7 (§8 updated). Registered
     P2s from this round: the CompletedSynchronously physical/Task completion split, and the
     no-start STARTING-row typed composition (§8).
+
+### Round 10 (tenth audit)
+
+21. **Schema version gates the adapter_kind structural change (P1, merge blocker, corrected).**
+    `executions.adapter_kind` was added to the CREATE TABLE while `SCHEMA_VERSION` stayed 1, so an
+    M5.1-era Rust database (version 1, no adapter_kind column) passed the lineage and version
+    gates — CREATE TABLE IF NOT EXISTS does not alter existing tables — and the incompatibility
+    only surfaced at the first execution-commitment INSERT as a raw storage failure. The store
+    now claims version 2 and the existing strict gate rejects a v1 database at open ("does not
+    match expected 2"), explicitly requiring a fresh v2 database; backfilling adapter_kind from
+    current configuration was rejected as a violation of the binding-frozen-at-commitment
+    invariant. Regression: a downgraded v1 database is refused at open; a fresh v2 database
+    carries the column.
+22. **Contradictory RUNNING observations never reach supervision admission (P1, M5.3
+    prerequisite, closed early in M5.2).** The RUNNING branch consumed state/ambiguous alone; a
+    RUNNING observation carrying terminal/quiescence claims or a failure class is internally
+    contradictory (an active state cannot carry end-of-execution semantics). Fail closed before
+    the confirmation: unresolved physical state, zero inherited proof, handle preserved,
+    ADAPTER_PROTOCOL_FAILURE — no SupervisionAdmissionSeed. Regression included.
+23. **Wording:** `adapter_kind` described as the adapter ROUTING key / binding family identity,
+    not the full implementation/configuration identity (see §8).
