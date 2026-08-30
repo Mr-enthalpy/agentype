@@ -136,7 +136,7 @@ pub fn unisolated_safety(claim: &Claim) -> FrozenExecutionSafety {
 /// frozen safety facts plus the test adapter_kind, ready for
 /// `Kernel::create_execution`.
 pub fn unisolated_launch_binding(claim: &Claim) -> FrozenPhysicalExecutionBinding {
-    FrozenPhysicalExecutionBinding::new(unisolated_safety(claim), "test")
+    FrozenPhysicalExecutionBinding::new(unisolated_safety(claim), "test").unwrap()
 }
 
 pub fn run_claim(
@@ -163,7 +163,7 @@ pub fn run_claim(
             &binding_for(&claim),
         )
         .unwrap();
-        env.physical_binding()
+        env.physical_binding().unwrap()
     } else {
         unisolated_launch_binding(&claim)
     };

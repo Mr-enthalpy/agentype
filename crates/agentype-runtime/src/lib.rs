@@ -32,6 +32,10 @@ pub enum ExecutionPreparationError {
     /// The authoritative registry lacks the Attempt-frozen target/profile or
     /// the pair is incompatible. Standardized as `FailureClass::ResourceUnavailable`.
     Configuration(ResolutionError),
+    /// The frozen physical binding was constructed with an invalid adapter
+    /// routing identity (blank adapter_kind). Standardized as
+    /// `FailureClass::ResourceUnavailable` (M5.3 §36).
+    InvalidBinding(ConfigurationError),
     /// Authority validation or the fenced execution-creation transaction
     /// rejected the launch (domain/authority error, e.g. stale or invalid
     /// authority, tampered Claim copies).
@@ -45,7 +49,9 @@ impl ExecutionPreparationError {
     /// Task execution failures and yield `None`.
     pub fn standard_failure_class(&self) -> Option<FailureClass> {
         match self {
-            Self::Configuration(_) => Some(FailureClass::ResourceUnavailable),
+            Self::Configuration(_) | Self::InvalidBinding(_) => {
+                Some(FailureClass::ResourceUnavailable)
+            }
             Self::Kernel(_) => None,
         }
     }
@@ -55,6 +61,7 @@ impl std::fmt::Display for ExecutionPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(e) => write!(f, "execution configuration unavailable: {e}"),
+            Self::InvalidBinding(e) => write!(f, "execution binding invalid: {e}"),
             Self::Kernel(e) => write!(f, "execution launch rejected: {e}"),
         }
     }
@@ -125,14 +132,13 @@ pub fn prepare_execution_launch(
         .map_err(ExecutionPreparationError::Configuration)?;
     // Standalone façade: no AdapterRegistry is consulted, so the frozen
     // adapter_kind is the target configuration's declared binding.
+    let physical_binding = FrozenPhysicalExecutionBinding::new(
+        environment.safety(),
+        environment.target().adapter_kind.clone(),
+    )
+    .map_err(ExecutionPreparationError::InvalidBinding)?;
     let snapshot = kernel
-        .create_execution(
-            claim,
-            FrozenPhysicalExecutionBinding::new(
-                environment.safety(),
-                environment.target().adapter_kind.clone(),
-            ),
-        )
+        .create_execution(claim, physical_binding)
         .map_err(ExecutionPreparationError::Kernel)?;
     let request = ExecutionRequest::from_launch(&snapshot, &environment)
         .map_err(|m| ExecutionPreparationError::Kernel(Error::invalid_authority(m.detail)))?;
@@ -357,7 +363,7 @@ impl ResolvedPhysicalExecutionEnvironment {
     /// commitment: the Attempt-bound safety facts plus the adapter_kind of
     /// the installed adapter resolved for this environment (the same kind
     /// string used for the AdapterRegistry lookup).
-    pub fn physical_binding(&self) -> FrozenPhysicalExecutionBinding {
+    pub fn physical_binding(&self) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
         self.environment.physical_binding()
     }
 }
@@ -596,13 +602,26 @@ impl<'a> Dispatcher<'a> {
             Err(other) => return Err(other),
         };
 
+        // Freeze the physical binding before the commitment: a blank
+        // adapter routing identity is a pre-start composition failure (no
+        // Execution is fabricated, mechanically NACKed as
+        // RESOURCE_UNAVAILABLE, M5.3 §36).
+        let physical_binding = match physical.physical_binding() {
+            Ok(binding) => binding,
+            Err(err) => {
+                let detail = err.to_string();
+                self.nack_configuration_unavailable(claim)?;
+                return Ok(DispatchOneOutcome::ConfigurationUnavailable { detail });
+            }
+        };
+
         // Create and freeze the Execution (STARTING) in its own fenced
         // transaction. From here the start is treated as potentially
         // side-effecting (task §11): the stable RequestId is persisted with
         // the Execution and is never regenerated.
         let snapshot = self
             .kernel
-            .create_execution(claim, physical.physical_binding())
+            .create_execution(claim, physical_binding)
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
@@ -1915,7 +1934,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Replay attempt A's proof onto attempt B: rejected on identity, even
         // though target and profile coincide.
         let err = kernel
-            .create_execution(&claim_b, env_a.physical_binding())
+            .create_execution(&claim_b, env_a.physical_binding().unwrap())
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidAuthority(_)),

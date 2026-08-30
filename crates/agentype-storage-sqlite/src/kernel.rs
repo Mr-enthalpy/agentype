@@ -944,6 +944,14 @@ impl Kernel {
         physical_binding: FrozenPhysicalExecutionBinding,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
         let safety = physical_binding.safety();
+        // Kernel invariant check (M5.3 §36): the frozen adapter routing
+        // identity is required for every execution commitment — defense in
+        // depth behind the typed constructor validation.
+        if physical_binding.adapter_kind().trim().is_empty() {
+            return Err(Error::invalid_authority(
+                "execution commitment requires a non-blank adapter routing identity",
+            ));
+        }
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
