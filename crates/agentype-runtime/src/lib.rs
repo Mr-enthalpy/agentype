@@ -9,8 +9,8 @@ pub use agentype_execution_config::*;
 
 use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
 use agentype_core::{
-    AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState, ExpireReport,
-    FailureClass, RequestId, ResultId,
+    AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
@@ -368,6 +368,53 @@ pub fn resolve_physical_execution_environment(
     })
 }
 
+/// The authority identity confirmed by the fenced RUNNING transaction.
+///
+/// Generated exclusively after `confirm_running_and_renew` succeeds. It
+/// grants no new Scheduler authority; it carries exactly the identity the
+/// fenced "Execution RUNNING + first lease renewal" transaction just
+/// confirmed, so M5.3 supervision can consume it without re-deriving
+/// launch authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupervisionAdmissionSeed {
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    lease_epoch: LeaseEpoch,
+}
+
+impl SupervisionAdmissionSeed {
+    pub(crate) fn new(
+        execution_id: ExecutionId,
+        request_id: RequestId,
+        attempt_id: AttemptId,
+        lease_epoch: LeaseEpoch,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_id,
+            attempt_id,
+            lease_epoch,
+        }
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+}
+
 /// Immediate outcome of one dispatch attempt (task §25 vocabulary).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchOneOutcome {
@@ -385,10 +432,7 @@ pub enum DispatchOneOutcome {
     /// The physical start reported RUNNING and the fenced RUNNING
     /// confirmation + first lease renewal succeeded. Supervision admission
     /// itself is M5.3 (task §13).
-    StartedRunning {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-    },
+    StartedRunning { admission: SupervisionAdmissionSeed },
     /// The start is potentially side-effecting but unresolved (ambiguous
     /// observation, UNKNOWN/STARTING state, or stale authority after a
     /// RUNNING report). Ambiguous physical history is persisted; Task
@@ -552,8 +596,12 @@ impl<'a> Dispatcher<'a> {
                 &observation.runtime_handle.0,
             ) {
                 Ok(_) => Ok(DispatchOneOutcome::StartedRunning {
-                    execution_id: execution_id.clone(),
-                    request_id: request_id.clone(),
+                    admission: SupervisionAdmissionSeed::new(
+                        execution_id.clone(),
+                        request_id.clone(),
+                        claim.attempt_id.clone(),
+                        claim.lease_epoch,
+                    ),
                 }),
                 Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                     // Task §27: authority became stale between Execution
@@ -1962,13 +2010,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let task_id = ids.values().next().unwrap().clone();
 
         let outcome = d.dispatch_one().unwrap();
-        let (execution_id, request_id) = match &outcome {
-            DispatchOneOutcome::StartedRunning {
-                execution_id,
-                request_id,
-            } => (execution_id.clone(), request_id.clone()),
+        let admission = match &outcome {
+            DispatchOneOutcome::StartedRunning { admission } => admission,
             other => panic!("expected StartedRunning, got {other:?}"),
         };
+        let execution_id = admission.execution_id().clone();
+        let request_id = admission.request_id().clone();
 
         assert_eq!(fake.start_call_count(), 1);
         let last = fake.last_request().unwrap();
@@ -1978,6 +2025,16 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(exec.id, execution_id);
         assert_eq!(exec.task_id, task_id);
         assert_eq!(last.incarnation_id(), &exec.incarnation_id);
+        // The seed carries exactly the authority identity the fenced RUNNING
+        // transaction just confirmed - nothing re-derived.
+        assert_eq!(admission.attempt_id(), &exec.attempt_id);
+        assert_eq!(
+            admission.lease_epoch(),
+            kernel
+                .lease_for_attempt(admission.attempt_id())
+                .unwrap()
+                .epoch
+        );
         assert_eq!(last.payload(), &payload);
         assert_eq!(
             last.workspace_mode(),
@@ -2383,7 +2440,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
         advancing.inner.set_next_start(StartObservation {
             state: ExecutionState::Failed,
-            runtime_handle: RuntimeHandle(Value::Null),
+            runtime_handle: RuntimeHandle(serde_json::json!({"stale": 7})),
             ambiguous: false,
             failure_class: Some(FailureClass::StartFailure),
             detail: None,
