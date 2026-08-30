@@ -296,6 +296,25 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+/// Classify a Kernel error into the dispatch error model.
+///
+/// `Authority` means ONLY "this claim no longer holds execution authority"
+/// (stale/expired, forged identity, or a receipt referencing durable state
+/// that does not exist). Storage faults, corrupted durable state
+/// (invariant violations), and recovery-required conditions mean the
+/// Scheduler cannot even CONFIRM whether the claim holds authority — they
+/// are persistence faults and must surface as fatal errors, never as
+/// `AuthorityRejected` (which would let a daemon keep running on an
+/// unverified durable state).
+fn classify_kernel_authority_error(err: Error) -> DispatchError {
+    match err {
+        Error::StaleAuthority(_) | Error::InvalidAuthority(_) | Error::NotFound(_) => {
+            DispatchError::Authority(err)
+        }
+        other => DispatchError::Persistence(other),
+    }
+}
+
 /// The complete physical environment required for a dispatch start.
 ///
 /// The single source the Dispatcher uses for physical start: the durable
@@ -353,7 +372,7 @@ pub fn resolve_physical_execution_environment(
 ) -> Result<ResolvedPhysicalExecutionEnvironment, DispatchError> {
     let binding = kernel
         .resolve_execution_binding(claim)
-        .map_err(DispatchError::Authority)?;
+        .map_err(classify_kernel_authority_error)?;
     let environment = resolve_execution_environment(
         ExecutionResolutionMode::Authoritative(execution_registry),
         &binding,
@@ -540,10 +559,7 @@ impl<'a> Dispatcher<'a> {
         let snapshot = self
             .kernel
             .create_execution(claim, physical.environment().safety())
-            .map_err(|err| match err {
-                Error::StorageFailure(_) => DispatchError::Persistence(err),
-                authority => DispatchError::Authority(authority),
-            })?;
+            .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
         let request = ExecutionRequest::from_launch(&snapshot, physical.environment())
@@ -3222,5 +3238,109 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
         assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
         assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 7): AuthorityRejected can only ever mean "this claim
+    /// no longer holds execution authority". Storage faults, corrupted
+    /// durable state, and recovery-required conditions mean the Scheduler
+    /// cannot CONFIRM authority — they classify as persistence faults.
+    #[test]
+    fn kernel_faults_are_never_classified_as_authority() {
+        // Authority: the claim no longer holds execution authority.
+        assert!(matches!(
+            classify_kernel_authority_error(Error::StaleAuthority("s".into())),
+            DispatchError::Authority(_)
+        ));
+        assert!(matches!(
+            classify_kernel_authority_error(Error::InvalidAuthority("i".into())),
+            DispatchError::Authority(_)
+        ));
+        assert!(matches!(
+            classify_kernel_authority_error(Error::NotFound("n".into())),
+            DispatchError::Authority(_)
+        ));
+        // Fatal kernel faults: the Scheduler cannot confirm authority.
+        for err in [
+            Error::StorageFailure("f".into()),
+            Error::InvariantViolation("v".into()),
+            Error::RecoveryRequired("r".into()),
+            Error::InvalidTransition("t".into()),
+            Error::Conflict("c".into()),
+            Error::ConfigurationUnavailable("u".into()),
+        ] {
+            assert!(
+                matches!(
+                    classify_kernel_authority_error(err.clone()),
+                    DispatchError::Persistence(_)
+                ),
+                "must classify as Persistence, never Authority: {err:?}"
+            );
+        }
+    }
+
+    /// Audit P1 (round 7): a durable-state corruption hit during binding
+    /// resolution surfaces as a fatal Persistence error — never as
+    /// AuthorityRejected, which would tell the daemon the claim merely
+    /// expired while the Scheduler cannot even confirm the durable state.
+    #[test]
+    fn dispatch_surfaces_kernel_faults_as_persistence_not_authority_rejection() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentype-dispatch-fault-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        kernel
+            .submit_batch(&[TaskSpec::new("durable-fault", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+
+        // Corrupt the durable lease epoch below the API boundary (stored as
+        // TEXT in the INTEGER column, passing the schema constraints but
+        // failing the typed read): binding resolution must surface the
+        // storage fault, never classify it as an authority rejection.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "UPDATE leases SET epoch='not-an-integer' WHERE attempt_id=?1",
+            rusqlite::params![claim.attempt_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register("process", Arc::new(FakeAdapter::new()))
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+
+        let err = d.dispatch_claim(&claim).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::Persistence(_)),
+            "a durable-state fault must be Persistence, never AuthorityRejected: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

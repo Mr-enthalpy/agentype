@@ -36,6 +36,7 @@ dependencies = [
  "agentype-core",
  "agentype-execution-config",
  "agentype-storage-sqlite",
+ "rusqlite",
  "serde_json",
 ]
 
