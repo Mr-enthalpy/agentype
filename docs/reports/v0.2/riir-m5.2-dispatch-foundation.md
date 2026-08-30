@@ -199,6 +199,9 @@ from a start that never happened.
 | 42c | audit r4: UNKNOWN + terminal proof → protocol failure | `dispatch_unknown_state_with_terminal_proof_is_protocol_failure` |
 | 43 | audit r5: terminal failure without quiescence retains handle | `dispatch_terminal_failure_without_quiescence_retains_handle` |
 | 44 | audit r6: collected LOST never unlocks writer replacement | `dispatch_lost_outcome_never_unlocks_writer_replacement` |
+| 45 | audit r7: kernel faults classify as Persistence, never Authority | `kernel_faults_are_never_classified_as_authority` |
+| 46 | audit r7: durable-state fault during binding resolution is fatal | `dispatch_surfaces_kernel_faults_as_persistence_not_authority_rejection` |
+| 47 | audit r7: success without quiescence retains handle | `dispatch_success_without_quiescence_retains_handle` |
 | — | audit r6: pairing rejects attempt_isolation drift | asserted in `from_launch_rejects_mixed_launch_environment_pairs` |
 
 ---
@@ -248,20 +251,20 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 175 passed, 0 failed
+cargo test --workspace                                   → 178 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (175):
+Rust breakdown (178):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation
   including attempt_isolation drift)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 50 (M5.1 façade 13 + composition 6 + dispatcher 31)
+- `agentype-runtime`: 53 (M5.1 façade 13 + composition 6 + dispatcher 34)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
@@ -423,3 +426,30 @@ Rust breakdown (175):
     so a durable isolated safety proof can never be combined with a non-isolated physical request
     configuration. Registered P2s from this round (outcome vocabulary split, pipeline wording)
     are tracked in §8 / the diagram above.
+
+### Round 7 (seventh audit)
+
+16. **Kernel faults during binding resolution are persistence faults, never AuthorityRejected
+    (P1, corrected).** `resolve_physical_execution_environment` mapped every
+    `resolve_execution_binding` error to `DispatchError::Authority`, and `dispatch_claim` folds
+    Authority into `Ok(AuthorityRejected)` — so a SQLite storage fault or corrupted durable
+    state was reported as "this claim is no longer authorized", letting a daemon keep running on
+    an unverified durable state. `classify_kernel_authority_error` now draws the line the error
+    model promises: StaleAuthority/InvalidAuthority/NotFound-as-stale-receipt → Authority;
+    StorageFailure/InvariantViolation/RecoveryRequired/anything else a normal claim validation
+    should not produce → Persistence. Wired through binding resolution and `create_execution`.
+    Regressions: exhaustive classifier unit test, plus an end-to-end durable-corruption test
+    (lease epoch corrupted below the API boundary → `dispatch_claim` returns
+    `Err(DispatchError::Persistence)`, never AuthorityRejected).
+17. **Collected success without quiescence retains the observed handle (P2 / M5.4 hardening,
+    corrected).** `ack_success` writes state/outcome/proof bits but not `runtime_handle_json`,
+    and the success branch had no retention — a collected SUCCEEDED with
+    `quiescent_confirmed=false` (unisolated WRITE: WRITER_SUCCESS_NOT_QUIESCENT suspension)
+    dropped the adapter-returned handle. `retain_terminal_handle` generalized to
+    `retain_collected_handle`, applied symmetrically to collected failures and successes; a
+    quiescence-proven end deliberately retains nothing (no physical cleanup needed). Regression:
+    WRITE + collected success without quiescence → Execution SUCCEEDED (terminal bit set, no
+    Result), task SUSPENDED, handle durable.
+18. **Registered (unchanged):** the StartFailed/StartIndeterminate vocabulary split before M5.3
+    consumes the boundary (§8), and the no-start STARTING-row typed composition note — the
+    latter's risk is further reduced now that pairing validation covers attempt_isolation.
