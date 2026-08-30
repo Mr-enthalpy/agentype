@@ -726,6 +726,27 @@ impl<'a> Dispatcher<'a> {
         observed_handle: &Value,
         outcome: agentype_adapter_api::ExecutionOutcome,
     ) -> Result<DispatchOneOutcome, DispatchError> {
+        // Internally contradictory: an ACTIVE physical state cannot carry
+        // terminal proof. STARTING/RUNNING/UNKNOWN reported with
+        // terminal/quiescence bits would otherwise inject a quiescence proof
+        // through the failure path (durable_quiescent = terminal &&
+        // quiescent) and unlock a WRITE replacement writer while the
+        // physical execution is still active. Fail closed: unresolved
+        // physical state, zero inherited proof, observed handle preserved.
+        if outcome.terminal_confirmed && outcome.state.is_active_physical() {
+            let failure_class = FailureClass::AdapterProtocolFailure;
+            self.persist_unresolved_physical_then_nack(
+                claim,
+                execution_id,
+                failure_class,
+                Some(observed_handle),
+            )?;
+            return Ok(DispatchOneOutcome::StartFailed {
+                execution_id: execution_id.clone(),
+                request_id: request_id.clone(),
+                failure_class,
+            });
+        }
         // Internally contradictory: success claimed without terminal proof.
         if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
             let failure_class = FailureClass::InvalidResult;
@@ -2894,5 +2915,141 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
         assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 4): an ACTIVE physical state with terminal proof is a
+    /// contradictory adapter outcome — the most dangerous shape, because
+    /// durable_quiescent = terminal && quiescent would otherwise unlock a
+    /// WRITE replacement writer while the execution is still RUNNING. Fail
+    /// closed: UNKNOWN, zero proof, handle preserved, protocol failure.
+    fn contradictory_active_outcome(state: ExecutionState) -> ExecutionOutcome {
+        ExecutionOutcome {
+            state,
+            payload: Some(serde_json::json!({"forged": 1})),
+            summary: Some("forged".into()),
+            failure_class: Some(FailureClass::Timeout),
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+            incarnation_reusable: false,
+        }
+    }
+
+    #[test]
+    fn dispatch_running_state_with_terminal_proof_is_protocol_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("active-terminal", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"live": 1})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(contradictory_active_outcome(ExecutionState::Running));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"live": 1})
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+        // The forged terminal+quiescent proof must NOT unlock a replacement
+        // writer: the task suspends instead of retrying.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+        let esc = kernel.open_escalation_for_task(&task_id).unwrap();
+        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// Audit P1 (round 4): STARTING + terminal proof — same contradiction.
+    #[test]
+    fn dispatch_starting_state_with_terminal_proof_is_protocol_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("active-starting", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"live": 2})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(contradictory_active_outcome(ExecutionState::Starting));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
+    }
+
+    /// Audit P1 (round 4): UNKNOWN + terminal proof — same contradiction.
+    #[test]
+    fn dispatch_unknown_state_with_terminal_proof_is_protocol_failure() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("active-unknown", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Failed,
+            runtime_handle: RuntimeHandle(serde_json::json!({"live": 3})),
+            ambiguous: false,
+            failure_class: Some(FailureClass::Timeout),
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_outcome(contradictory_active_outcome(ExecutionState::Unknown));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartFailed {
+                execution_id,
+                failure_class: FailureClass::AdapterProtocolFailure,
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartFailed(AdapterProtocolFailure), got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert!(kernel.result_for_task(&task_id).is_err());
     }
 }
