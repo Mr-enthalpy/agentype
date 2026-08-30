@@ -266,24 +266,24 @@ Commands run at head `rust/m5.3-supervision`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 231 passed, 0 failed
+cargo test --workspace                                   → 239 passed, 0 failed
 python -m compileall -q src tests                        → OK   (py -3 = Python 3.13.5)
 python -m unittest discover -s tests -t .                → 162 ran: 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (231):
+Rust breakdown (239):
 
 - `agentype-adapter-api`: 8
 - `agentype-core`: 20 (unchanged M4 domain suite; zero core changes in M5.3)
 - `agentype-execution-config`: 8 (7 prior + blank-adapter-kind constructor test)
-- `agentype-runtime`: 95
+- `agentype-runtime`: 102
   - dispatch/launch suite: 76 (60 M5.2 + 4 outcome-vocabulary closure + 12 supervision integration)
-  - `supervision` module: 14 (12 deterministic registry/service/crash-window + 2 real-thread runner smokes)
-  - `timing` module: 5
-- `agentype-storage-sqlite`: 100
+  - `supervision` module: 19 (12 deterministic registry/service/crash-window + 4 audit-closure regressions + 3 real-thread runner smokes)
+  - `timing` module: 7
+- `agentype-storage-sqlite`: 101
   - `m4_kernel` 64, `recovery` 11, `topology` 16 (all untouched semantics)
-  - `supervision` (new): 9 (fenced renewal primitive conformance)
+  - `supervision` (new): 10 (fenced renewal primitive conformance + finite lease authority)
 
 All prior suites remain green: M4 correctness kernel, M5.1 launch authority,
 M5.2 dispatch commitment, Python V0.1 oracle (160 passed / 2 skipped, unchanged).
@@ -305,3 +305,119 @@ M5.2 dispatch commitment, Python V0.1 oracle (160 passed / 2 skipped, unchanged)
   adapter (M5.4/M5.7), unchanged from the M5.2 report.
 - `recover_authority` remains the M4 authority half of the startup barrier;
   adapter physical reconcile and the full daemon startup order are M5.4.
+## 14. Post-PR audit round (request-changes review, closed as one commit set)
+
+The PR #9 review returned 4 P1 findings and 1 P2. All four P1s were closed in
+a single closure commit (`fix(runtime): M5.3 audit closure ...`); each fix
+lands with its own regression. No fix tightens the timing gate to
+`heartbeat <= lease/2` — the §A2 normative chain is unchanged; the
+implementation was corrected instead.
+
+### P1-1 — Healthy supervisor could self-expire a lease under legal timing (deadline phase)
+
+Root cause: the registry anchored `last_renewal_at` at admission INSERTION
+time and the runner was a fixed-phase ticker sleeping full heartbeat
+intervals from its own phase. With the fully legal `heartbeat=6 < lease=10`
+(no `2*heartbeat <= lease` headroom), a tick at t=6.0 found the entry not due
+(anchor 0.1 → elapsed 5.9), slept 6 more seconds, and the lease expired at
+10.1 — a healthy supervisor lost authority. Second layer: insertion time is
+not the fenced first-renewal commit time, so handoff delay pushed the
+schedule while the durable expiry stayed put.
+
+Fix:
+
+- `SupervisionAdmission` carries the fenced first-renewal COMMIT timing:
+  `first_renewed_at` is recovered exactly from the admission transaction's
+  own output (`expires_at - kernel.lease_seconds()`), and `lease_expires_at`
+  is carried verbatim. The mint site is unchanged (dispatcher post-commit).
+- The registry stores `next_due_at = first_renewed_at + heartbeat_interval`;
+  insertion time no longer participates in scheduling.
+- Each successful renewal re-anchors at ITS OWN commit time (the anchor is
+  taken BEFORE the renewal, so `anchor + interval` is strictly earlier than
+  the renewal's new durable expiry — mathematically safe under the §A2 gate).
+- The runner is a deadline scheduler: renew due → sleep until
+  `earliest_next_due` → repeat. The earliest deadline is read under the same
+  state lock that `admit`/`remove` serialize on, so a mutation's wake-up can
+  never be lost and the loop can never oversleep past an earlier deadline.
+  Idle (no entries) falls back to the heartbeat interval.
+
+Regressions: `wide_legal_timing_never_self_expires` (deterministic: anchor
+1000.0, handoff delayed to 1005.9, asserts `earliest_next_due == 1006.0` —
+the old implementation computed 1011.9, already past expiry — then drives
+three full renewal cycles; the old code fails this test),
+`runner_deadline_schedule_survives_wide_legal_timing` (real-thread smoke,
+heartbeat 0.6 / lease 1.0, mid-phase admission).
+
+### P1-2 — Dropping the runner detached the heartbeat thread
+
+`JoinHandle` dropped = detached thread still owning a service clone and the
+registry, still renewing, with no handle to stop or observe it — ownership
+outliving its owner.
+
+Fix: internal `stop_and_join(&mut self)` (set shutting_down → notify → join →
+clear ownership → return recorded fatal) is now the single stop path used by
+both `shutdown(mut self)` and `Drop::drop` (Drop cannot report the fatal;
+the semantic requirement is set/notify/join, never detach).
+
+Regression: `drop_runner_stops_renewal` (drop without shutdown; the lease
+expiry freezes for ≥2 heartbeat intervals; durable state untouched).
+
+### P1-3 — A cloneable admission made "one supervisor per Execution" only per-registry
+
+`SupervisionAdmission: Clone` + registry-local consumed sets allowed
+`service_1.admit(A.clone())` + `service_2.admit(A.clone())` — two renewals
+both pass kernel fencing — and a `Dropped → Admitted` replay in a fresh
+service without any fresh mint.
+
+Fix: the admission is a **move-only capability** (`Clone`/`PartialEq`
+removed from the admission AND from `DispatchOneOutcome`, which carries it).
+`admit` consumes the token; the registry stores only a plain
+`SupervisionIdentity` snapshot (identity fields + generation). The same
+token can therefore never exist in two registries: single ownership is
+structural, cross-service replay is impossible, and the only re-admission
+path is a fresh authoritative mint through the same `admit` API (the M5.4
+shape, unbroken). `SupervisionService::new` islands are harmless by the same
+argument — a service without the token can only observe `NoSuchEntry`.
+
+Regressions: `move_only_capability_prevents_cross_service_replay`
+(`service_2` sees an empty registry and `NoSuchEntry`; removal destroys the
+only token), `after_authority_loss_only_a_fresh_mint_reenters_supervision`
+(a fresh mint re-enters — M5.4 shape — but durable fencing still refuses the
+renewal; no stale resurrection).
+
+### P1-4 — Non-finite timing authorities were not fail-closed
+
+`+inf` passed every ordering check in the timing gate, `Kernel::from_store`
+only checked `lease_seconds <= 0.0` (NaN passes; `+inf` lease never expires),
+and the lease-authority matcher compared with `inf - inf = NaN`, whose
+comparison is false — two infinite authorities "matched".
+
+Fix: `RuntimeTimingConfig` rejects non-finite durations (new
+`TimingConfigError::NonFiniteDuration`); the Kernel requires
+`lease_seconds.is_finite() && lease_seconds > 0.0`; the matcher fails closed
+on any non-finite input on either side before comparing.
+
+Regressions: `non_finite_durations_are_rejected`,
+`lease_authority_matcher_fails_closed_on_non_finite_input`,
+`kernel_rejects_non_finite_lease_seconds`,
+`admit_fails_closed_on_malformed_admission_timing` (the admission capability
+itself is validated at admit: finite anchor/expiry, expiry strictly after
+the anchor).
+
+### P2 — Fatal semantics documented per surface
+
+`SupervisionService` (deterministic primitive/testing surface) returns
+`Err(SupervisionError::Fatal)` and leaves the entry in place — it does not
+fail-stop by itself. `SupervisionRunner` is the production fail-stop owner:
+Fatal stops the loop and clears ownership. Documented on the type; a service
+that has produced a Fatal must not be reused for renewal (the Runner
+enforces this mechanically).
+
+### Audit-round test mapping additions
+
+| Finding | Regression(s) |
+|---|---|
+| P1-1 deadline phase / delayed handoff | `wide_legal_timing_never_self_expires`, `runner_deadline_schedule_survives_wide_legal_timing` |
+| P1-2 runner Drop | `drop_runner_stops_renewal` |
+| P1-3 move-only capability / replay | `move_only_capability_prevents_cross_service_replay`, `after_authority_loss_only_a_fresh_mint_reenters_supervision` |
+| P1-4 finite timing | `non_finite_durations_are_rejected`, `lease_authority_matcher_fails_closed_on_non_finite_input`, `kernel_rejects_non_finite_lease_seconds`, `admit_fails_closed_on_malformed_admission_timing` |
