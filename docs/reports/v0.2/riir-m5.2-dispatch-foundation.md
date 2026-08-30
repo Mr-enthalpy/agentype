@@ -186,6 +186,9 @@ from a start that never happened.
 | 39d | audit: quiescence without terminality → ADAPTER_PROTOCOL_FAILURE | `dispatch_quiescence_without_terminal_is_protocol_failure` |
 | 40 | audit: resolved options/timeout reach the adapter request | `dispatch_request_carries_resolved_runtime_configuration` |
 | — | audit: admission seed matches durable attempt + live lease epoch | asserted in `dispatch_one_starts_running_exactly_once` |
+| 41a | audit r3: unresolved collect keeps observed handle | `dispatch_start_failure_claim_never_bypasses_collect` (handle assertion) |
+| 41b | audit r3: ambiguous observation keeps observed handle | `dispatch_ambiguous_start_is_persisted_and_never_restarted` (handle assertion) |
+| 41c | audit r3: unusual nonterminal shape keeps observed handle | `dispatch_unusual_nonterminal_observation_keeps_observed_handle` |
 
 ---
 
@@ -234,30 +237,53 @@ Commands run at head `rust/m5.2-dispatch`:
 ```text
 cargo fmt --all --check                                  → clean
 cargo clippy --workspace --all-targets -- -D warnings    → 0 warnings
-cargo test --workspace                                   → 169 passed, 0 failed
+cargo test --workspace                                   → 170 passed, 0 failed
 python -m compileall -q src tests                        → OK
 python -m unittest discover -s tests -t .                → 160 passed, 2 skipped, 0 failed
 git diff --check                                         → clean
 ```
 
-Rust breakdown (169):
+Rust breakdown (170):
 
 - `agentype-adapter-api`: 8 (FakeAdapter invocation controls; fixture identity
   coherence §21; deterministic prompt; launch/environment pairing validation)
 - `agentype-core`: 20 (unchanged M4 domain suite)
 - `agentype-execution-config`: 7 (registry fail-closed, Attempt-bound proofs)
-- `agentype-runtime`: 44 (M5.1 façade 13 + composition 6 + dispatcher 25)
+- `agentype-runtime`: 45 (M5.1 façade 13 + composition 6 + dispatcher 26)
 - `agentype-storage-sqlite`: 90 (m4_kernel 63, recovery 11, topology 16)
 
 ---
 
 ## 8. Known boundaries handed to M5.3+
 
-- `executions.request_id` and `runtime_handle_json` are durably persisted (the
-  ambiguous-start path preserves the observed handle), but there is no public
-  kernel reader exposing them yet — the M5.4 reconciler will need one.
+- `executions.request_id` and `runtime_handle_json` are durably persisted, and
+  every unresolved dispatch path now preserves the observed handle; a narrow
+  verification reader (`Kernel::execution_runtime_handle`) exists, but the full
+  M5.4 reconciliation identity reader (request_id + handle by attempt) is
+  deferred to M5.4.
 - `expire_leases` leaves orphaned STARTING/RUNNING/UNKNOWN execution rows
   untouched; reconciliation of stale physical rows is M5.4.
+- **P1 — M5.4 hard prerequisite: durable adapter binding identity.** The schema
+  freezes `execution_target`/`execution_profile` on an Execution but not the
+  resolved `adapter_kind`. If the registry configuration drifts between a crash
+  and recovery (target "local" served by `codex-a` at T0, by `codex-b` at T1),
+  an M5.4 reconciler that re-resolves the current target would hand the old
+  physical execution to an adapter implementation that never started it.
+  Before M5.4 begins, the adapter binding identity must be frozen durably
+  (minimum: `executions.adapter_kind`; whether an adapter instance/config
+  fingerprint is additionally required is decided with the first real
+  adapter's reconciliation identity — no generic plugin identity framework).
+- **P2 — outcome vocabulary.** `DispatchOneOutcome::StartFailed` currently also
+  covers physically-unresolved paths (adapter invocation errors, collection
+  errors — durable state UNKNOWN), which could mislead a daemon into reading
+  "start definitely failed". Before M5.3 consumes the boundary, consider
+  `StartUnresolved`/`StartIndeterminate` or unifying with `StartAmbiguous` +
+  failure class.
+- **P2 — no-start STARTING row robustness.** `create_execution` persists
+  STARTING before `from_launch` pairing validation runs; on the canonical path
+  that validation cannot fail (same attempt-bound safety on both sides,
+  runtime forbids unsafe), but a stronger typed composition could express the
+  invariant so future changes cannot reintroduce a no-start STARTING row.
 - Supervision admission, heartbeat, notifier, restart barrier: M5.3/M5.4/M5.5.
 - First real (reference) adapter: M5.7.
 
@@ -318,3 +344,18 @@ Rust breakdown (169):
    request.
 8. **Report arithmetic and pipeline drift (P2, corrected).** Breakdown heading (161→169) and the
    pipeline's two-source `from_launch` signature reconciled.
+
+### Round 3 (third audit)
+
+9. **Every unresolved dispatch path preserves the observed runtime handle (P1, merge blocker,
+   corrected).** `nack_start` threaded the handle only into its stale-authority fallback record;
+   on the normal path `Kernel::nack` does not write `runtime_handle_json`, so collected-nonterminal,
+   contradictory, and generic-unresolved branches landed the Execution in UNKNOWN while dropping
+   the adapter-returned handle. A runtime-private `persist_unresolved_physical_then_nack` helper
+   now records UNKNOWN + handle (zero proof bits) before the NACK on every unresolved branch,
+   and a narrow `Kernel::execution_runtime_handle` reader verifies persistence (the full M5.4
+   identity reader remains M5.4). Regressions: three handle-preservation assertions/tests across
+   the collect, ambiguous, and generic-fallback paths.
+10. **Registered for M5.4/M5.3 (not implemented in M5.2):** durable adapter binding identity
+   (P1, M5.4 hard prerequisite — see §8), outcome vocabulary refinement (P2), no-start
+   STARTING-row typed composition (P2). See §8 for the full statements.
