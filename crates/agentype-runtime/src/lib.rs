@@ -8,6 +8,14 @@
 
 pub use agentype_execution_config::*;
 
+pub mod supervision;
+pub mod timing;
+
+pub use supervision::{
+    RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
+};
+pub use timing::{RuntimeTimingConfig, TimingConfigError};
+
 use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
@@ -16,6 +24,7 @@ use agentype_core::{
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Preparation failure of the canonical launch façade.
@@ -420,13 +429,22 @@ pub fn resolve_physical_execution_environment(
 /// authority. A persisted RUNNING Execution row can never produce one: the
 /// constructor is crate-private and the only call site is the dispatcher's
 /// post-commit branch of `confirm_running_and_renew`.
+///
+/// `generation` is an ephemeral, process-local mint counter used by the
+/// supervision registry as concurrent-collection hygiene (telling a
+/// re-played consumed admission token from a freshly minted one). It is
+/// deliberately distinct from `LeaseEpoch`, which is durable Scheduler
+/// fencing; every durable decision remains fenced by the epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupervisionAdmission {
     execution_id: ExecutionId,
     request_id: RequestId,
     attempt_id: AttemptId,
     lease_epoch: LeaseEpoch,
+    generation: u64,
 }
+
+static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl SupervisionAdmission {
     pub(crate) fn new(
@@ -440,6 +458,7 @@ impl SupervisionAdmission {
             request_id,
             attempt_id,
             lease_epoch,
+            generation: NEXT_ADMISSION_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -457,6 +476,20 @@ impl SupervisionAdmission {
 
     pub fn lease_epoch(&self) -> LeaseEpoch {
         self.lease_epoch
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Exact identity equality (the four durable identity fields). The
+    /// ephemeral generation is deliberately excluded: two admissions with
+    /// the same identity describe the same admitted authority.
+    pub(crate) fn same_identity(&self, other: &SupervisionAdmission) -> bool {
+        self.execution_id == other.execution_id
+            && self.request_id == other.request_id
+            && self.attempt_id == other.attempt_id
+            && self.lease_epoch == other.lease_epoch
     }
 }
 
