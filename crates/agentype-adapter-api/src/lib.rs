@@ -36,6 +36,23 @@ impl std::fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// The launch snapshot and the resolved environment handed to
+/// `ExecutionRequest::from_launch` do not describe the same attempt identity.
+/// Mixing scheduler semantics from one attempt with runtime configuration
+/// from another is rejected fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnvironmentMismatch {
+    pub detail: String,
+}
+
+impl std::fmt::Display for LaunchEnvironmentMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "launch/environment pairing mismatch: {}", self.detail)
+    }
+}
+
+impl std::error::Error for LaunchEnvironmentMismatch {}
+
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
 /// Opaque JSON-serializable runtime handle stored by the scheduler across crash/reconciliation.
@@ -206,11 +223,37 @@ impl ExecutionRequest {
     /// inject fabricated options). The worker prompt is deterministically
     /// derived from the snapshot as the provider-neutral V0.1 worker protocol
     /// (see `RenderedWorkerPrompt`).
+    ///
+    /// Fail-closed pairing: the snapshot and the environment must describe
+    /// the same attempt identity (attempt_id, lease_epoch, execution_target,
+    /// execution_profile); mixing launch semantics from one attempt with
+    /// runtime configuration from another is rejected.
     pub fn from_launch(
         launch: &ExecutionLaunchSnapshot,
         environment: &ResolvedExecutionEnvironment,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, LaunchEnvironmentMismatch> {
+        let safety = environment.safety();
+        let mut mismatched: Vec<&'static str> = Vec::new();
+        if launch.safety().attempt_id().as_str() != safety.attempt_id().as_str() {
+            mismatched.push("attempt_id");
+        }
+        if launch.safety().lease_epoch() != safety.lease_epoch() {
+            mismatched.push("lease_epoch");
+        }
+        if launch.execution_target() != safety.execution_target() {
+            mismatched.push("execution_target");
+        }
+        if launch.execution_profile() != safety.execution_profile() {
+            mismatched.push("execution_profile");
+        }
+        if !mismatched.is_empty() {
+            return Err(LaunchEnvironmentMismatch {
+                detail: format!(
+                    "launch snapshot and resolved environment describe different attempts: {mismatched:?}"
+                ),
+            });
+        }
+        Ok(Self {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
             task_id: launch.task_id().clone(),
@@ -233,7 +276,7 @@ impl ExecutionRequest {
             target_options: environment.target().options.clone(),
             profile_options: environment.profile().options.clone(),
             profile_timeout_seconds: environment.profile().timeout_seconds,
-        }
+        })
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -606,7 +649,7 @@ mod tests {
         let fake = FakeAdapter::new();
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -622,7 +665,7 @@ mod tests {
         let fake = FakeAdapter::new();
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -695,7 +738,7 @@ mod tests {
         // The safety proof is bound to the snapshot's own attempt identity.
         assert_eq!(launch.safety().attempt_id(), launch.attempt_id());
         assert_eq!(launch.safety().lease_epoch(), launch.lease_epoch());
-        let req = ExecutionRequest::from_launch(&launch, &environment);
+        let req = ExecutionRequest::from_launch(&launch, &environment).unwrap();
         assert_eq!(req.request_id(), launch.request_id());
         assert_eq!(req.execution_id(), launch.execution_id());
         assert_eq!(req.task_id(), launch.task_id());
@@ -750,8 +793,8 @@ mod tests {
     fn worker_prompt_is_deterministic_and_cannot_be_injected() {
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let first = ExecutionRequest::from_launch(&launch, &mock.environment);
-        let second = ExecutionRequest::from_launch(&launch, &mock.environment);
+        let first = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let second = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first.prompt(),
@@ -787,7 +830,7 @@ mod tests {
         assert_eq!(fake.start_call_count(), 0);
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment);
+        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let _ = fake.start_execution(&req).unwrap();
         let _ = fake.start_execution(&req).unwrap();
         assert_eq!(fake.start_call_count(), 2);
@@ -798,5 +841,44 @@ mod tests {
         assert!(fake.start_execution(&req).is_err());
         assert_eq!(fake.start_call_count(), 3);
         assert!(fake.start_execution(&req).is_ok());
+    }
+
+    /// Audit P2: from_launch fails closed when the launch snapshot and the
+    /// resolved environment do not describe the same attempt identity —
+    /// scheduler semantics from one attempt can never be combined with
+    /// runtime configuration from another.
+    #[test]
+    fn from_launch_rejects_mixed_launch_environment_pairs() {
+        let mock = mock_launch();
+
+        // A different attempt identity.
+        let foreign_binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: agentype_core::AttemptId::new(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "local".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let foreign_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &foreign_binding,
+        )
+        .unwrap();
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &foreign_env).unwrap_err();
+        assert!(err.detail.contains("attempt_id"), "got: {err:?}");
+
+        // The same attempt, but a different configured target.
+        let wrong_target_binding = agentype_core::AuthoritativeExecutionBinding {
+            attempt_id: mock.binding.attempt_id.clone(),
+            lease_epoch: LeaseEpoch(1),
+            execution_target: "elsewhere".to_string(),
+            execution_profile: "default".to_string(),
+        };
+        let wrong_target_env = agentype_execution_config::resolve_execution_environment(
+            agentype_execution_config::ExecutionResolutionMode::DirectUnconfigured,
+            &wrong_target_binding,
+        )
+        .unwrap();
+        let err = ExecutionRequest::from_launch(&mock.snapshot, &wrong_target_env).unwrap_err();
+        assert!(err.detail.contains("execution_target"), "got: {err:?}");
     }
 }

@@ -125,7 +125,8 @@ pub fn prepare_execution_launch(
     let snapshot = kernel
         .create_execution(claim, environment.safety())
         .map_err(ExecutionPreparationError::Kernel)?;
-    let request = ExecutionRequest::from_launch(&snapshot, &environment);
+    let request = ExecutionRequest::from_launch(&snapshot, &environment)
+        .map_err(|m| ExecutionPreparationError::Kernel(Error::invalid_authority(m.detail)))?;
     Ok(PreparedExecutionLaunch {
         snapshot,
         request,
@@ -545,7 +546,8 @@ impl<'a> Dispatcher<'a> {
             })?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
-        let request = ExecutionRequest::from_launch(&snapshot, physical.environment());
+        let request = ExecutionRequest::from_launch(&snapshot, physical.environment())
+            .map_err(|m| DispatchError::Authority(Error::invalid_authority(m.detail)))?;
 
         // Physical start — exactly once (task §16), outside any SQLite
         // transaction (task §26).
