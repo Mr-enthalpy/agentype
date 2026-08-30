@@ -2435,6 +2435,26 @@ impl Kernel {
         })
     }
 
+    /// Durable runtime handle of an Execution (M5.2 physical-history
+    /// verification reader).
+    ///
+    /// Narrow persistence-level reader for verifying that unresolved start
+    /// observations keep their observed adapter handle. The full M5.4
+    /// reconciliation identity reader (request_id + handle by attempt) is
+    /// deliberately deferred to M5.4.
+    pub fn execution_runtime_handle(&self, id: &ExecutionId) -> Result<Value, Error> {
+        self.tx(|tx, _| {
+            let handle: String = tx
+                .query_row(
+                    "SELECT runtime_handle_json FROM executions WHERE id=?1",
+                    params![id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)?;
+            json_load(&handle)
+        })
+    }
+
     pub fn open_escalation_for_task(&self, task_id: &TaskId) -> Result<EscalationRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(

@@ -559,7 +559,12 @@ impl<'a> Dispatcher<'a> {
                 // keeps writer ambiguity intact for WRITE tasks (task §28).
                 // No observation exists, so no handle can be preserved.
                 let failure_class = adapter_invocation_failure_class(&err);
-                self.nack_start(claim, &execution_id, failure_class, false, false, None)?;
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    &execution_id,
+                    failure_class,
+                    None,
+                )?;
                 return Ok(DispatchOneOutcome::StartFailed {
                     execution_id,
                     request_id,
@@ -642,23 +647,10 @@ impl<'a> Dispatcher<'a> {
                 ExecutionState::Unknown | ExecutionState::Starting
             )
         {
-            self.kernel
-                .record_physical_outcome(
-                    execution_id,
-                    ExecutionState::Unknown,
-                    Some(&observation.runtime_handle.0),
-                    None,
-                    None,
-                    false,
-                    false,
-                )
-                .map_err(DispatchError::Persistence)?;
-            self.nack_start(
+            self.persist_unresolved_physical_then_nack(
                 claim,
                 execution_id,
                 FailureClass::ExecutionLost,
-                false,
-                false,
                 Some(&observation.runtime_handle.0),
             )?;
             return Ok(DispatchOneOutcome::StartAmbiguous {
@@ -686,23 +678,10 @@ impl<'a> Dispatcher<'a> {
                     // Execution does not stay in STARTING with the handle
                     // missing from durable history.
                     let failure_class = adapter_invocation_failure_class(&err);
-                    self.kernel
-                        .record_physical_outcome(
-                            execution_id,
-                            ExecutionState::Unknown,
-                            Some(&observation.runtime_handle.0),
-                            None,
-                            Some(failure_class),
-                            false,
-                            false,
-                        )
-                        .map_err(DispatchError::Persistence)?;
-                    self.nack_start(
+                    self.persist_unresolved_physical_then_nack(
                         claim,
                         execution_id,
                         failure_class,
-                        false,
-                        false,
                         Some(&observation.runtime_handle.0),
                     )?;
                     return Ok(DispatchOneOutcome::StartFailed {
@@ -722,12 +701,10 @@ impl<'a> Dispatcher<'a> {
         }
 
         // Any other observation shape is unresolved by definition.
-        self.nack_start(
+        self.persist_unresolved_physical_then_nack(
             claim,
             execution_id,
             FailureClass::ExecutionLost,
-            false,
-            false,
             Some(&observation.runtime_handle.0),
         )?;
         Ok(DispatchOneOutcome::StartAmbiguous {
@@ -752,12 +729,10 @@ impl<'a> Dispatcher<'a> {
         // Internally contradictory: success claimed without terminal proof.
         if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
             let failure_class = FailureClass::InvalidResult;
-            self.nack_start(
+            self.persist_unresolved_physical_then_nack(
                 claim,
                 execution_id,
                 failure_class,
-                false,
-                false,
                 Some(observed_handle),
             )?;
             return Ok(DispatchOneOutcome::StartFailed {
@@ -769,12 +744,10 @@ impl<'a> Dispatcher<'a> {
         // Internally contradictory: quiescence claimed without terminality.
         if outcome.quiescent_confirmed && !outcome.terminal_confirmed {
             let failure_class = FailureClass::AdapterProtocolFailure;
-            self.nack_start(
+            self.persist_unresolved_physical_then_nack(
                 claim,
                 execution_id,
                 failure_class,
-                false,
-                false,
                 Some(observed_handle),
             )?;
             return Ok(DispatchOneOutcome::StartFailed {
@@ -847,18 +820,57 @@ impl<'a> Dispatcher<'a> {
         // Nonterminal / unresolved collection: NO ACK, zero inherited
         // terminal/quiescence proof — the physical state stays unresolved.
         let failure_class = outcome.failure_class.unwrap_or(FailureClass::ExecutionLost);
-        self.nack_start(
+        self.persist_unresolved_physical_then_nack(
             claim,
             execution_id,
             failure_class,
-            false,
-            false,
             Some(observed_handle),
         )?;
         Ok(DispatchOneOutcome::StartAmbiguous {
             execution_id: execution_id.clone(),
             request_id: request_id.clone(),
         })
+    }
+
+    /// Persist an unresolved physical observation and then run the mechanical
+    /// nonterminal NACK.
+    ///
+    /// EVERY unresolved path (ambiguous observation, nonterminal or
+    /// contradictory collected outcome, unusual observation shapes) MUST go
+    /// through this helper: `Kernel::nack` itself does not write
+    /// `runtime_handle_json`, so an observed adapter handle would be lost
+    /// from durable history exactly when the scheduler considers the physical
+    /// reality unresolved — the state M5.4 reconciliation depends on. The
+    /// handle is recorded first (UNKNOWN with zero proof bits), then the NACK
+    /// applies the scheduler's mechanical consequence.
+    fn persist_unresolved_physical_then_nack(
+        &self,
+        claim: &Claim,
+        execution_id: &ExecutionId,
+        failure_class: FailureClass,
+        observed_handle: Option<&Value>,
+    ) -> Result<(), DispatchError> {
+        if let Some(handle) = observed_handle {
+            self.kernel
+                .record_physical_outcome(
+                    execution_id,
+                    ExecutionState::Unknown,
+                    Some(handle),
+                    None,
+                    Some(failure_class),
+                    false,
+                    false,
+                )
+                .map_err(DispatchError::Persistence)?;
+        }
+        self.nack_start(
+            claim,
+            execution_id,
+            failure_class,
+            false,
+            false,
+            observed_handle,
+        )
     }
 
     /// Mechanical NACK through the existing scheduler semantics. On stale
@@ -2327,6 +2339,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             kernel.execution(&execution_id).unwrap().state,
             ExecutionState::Unknown
         );
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"probe": 1})
+        );
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
         // No blind re-dispatch: the retry wait is not claimable and nothing
         // starts a second time.
@@ -2784,6 +2800,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert_eq!(exec.state, ExecutionState::Unknown);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
+        // The observed handle survives the unresolved path (M5.4 needs it).
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"maybe": 1})
+        );
         assert!(kernel.result_for_task(&task_id).is_err());
         // The start's quiescence claim was NOT used: no retryable WRITE
         // replacement — the writer-safety suspension stands.
@@ -2832,5 +2853,46 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_ok());
+    }
+
+    /// Audit P1 (round 3): an unusual nonterminal observation shape falls
+    /// into the generic unresolved branch and must still keep its observed
+    /// runtime handle — `Kernel::nack` does not write handles, so the
+    /// unresolved history is persisted before the NACK.
+    #[test]
+    fn dispatch_unusual_nonterminal_observation_keeps_observed_handle() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(
+                &[TaskSpec::new("odd-shape", Value::Null).retry(retryable_write_policy())],
+            )
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Lost,
+            runtime_handle: RuntimeHandle(serde_json::json!({"odd": 9})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartAmbiguous { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartAmbiguous, got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            serde_json::json!({"odd": 9})
+        );
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+        assert_eq!(fake.start_call_count(), 1);
     }
 }
