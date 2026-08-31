@@ -113,17 +113,33 @@ same functions as recovery. One vocabulary.
 
 ## 6. Terminal replay (D)
 
-Crash window: `collect_outcome` persisted evidence (`outcome_json` and/or
-`failure_class` on STARTING/RUNNING/UNKNOWN) then crashed before ACK/NACK.
+Physical history and ACK/NACK are different machines (PR #10 audit P1-1).
+After `collect_outcome`, the dispatcher/recovery collect path persists an
+honest pending terminal fact via `Kernel::record_pending_physical_terminal`
+(`SUCCEEDED`/`FAILED` + `terminal_confirmed`, handle copied, **no**
+incarnation presence) **before** ACK/NACK. Incarnation WARM/TERMINATED is
+decided by the subsequent authority transaction (`incarnation_reusable`).
 
-- success evidence + current authority → `ack_success` (exactly one Result,
-  or writer-safety suspension)
-- success evidence + stale → physical history only, never a Result
-- failure evidence → mechanical NACK; does **not** invent terminality
-- already has a Result → `AlreadyApplied`
-- durable `SUCCEEDED`/`FAILED`/`TERMINATED` **with current authority** is
-  inconsistent (Kernel ACK/NACK is atomic with authority close) →
-  startup-fatal
+Legal crash window:
+
+```text
+Execution = SUCCEEDED, terminal_confirmed = true
+Attempt ACTIVE, Lease ACTIVE, Task RUNNING, Result = none
+```
+
+Replay matrix:
+
+- `SUCCEEDED` + `terminal_confirmed` + current → `ack_success` (one Result,
+  or writer-safety suspension). `ack_success` accepts an already-SUCCEEDED
+  row without requiring a fake UNKNOWN rewrite.
+- `FAILED`/`TERMINATED` + `terminal_confirmed` + current → `nack` (skips
+  rewriting already-terminal/LOST physical history).
+- terminal physical + stale → physical history only, never a Result.
+- Result already exists → `AlreadyApplied`.
+- STARTING/RUNNING/UNKNOWN/LOST → not Category A (`outcome_json` on UNKNOWN
+  is **not** success proof).
+- `SUCCEEDED` without `terminal_confirmed`, or `SUCCEEDED` plus a
+  `failure_class` → inconsistent durable evidence, startup-fatal.
 
 ---
 
@@ -189,25 +205,22 @@ Steady-state "worker dies 30s after admission" is not solved here.
 
 ## 10. Test mapping (plan §26)
 
-Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 126 +
-storage 107 = **269** rust tests. Clippy `-D warnings` clean.
+Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 132 +
+storage 107 = **275** rust tests. Clippy `-D warnings` clean.
+
+Exact-head CI also ran the Python V0.1 oracle: Ubuntu 3.11 `Ran 162 tests`,
+**160 passed + 2 skipped**.
 
 | Group | Coverage |
 |---|---|
 | A Candidate identity (1–7) | `tests/reconciliation.rs` — STARTING/UNKNOWN/RUNNING RequestId, frozen adapter_kind, blank/corrupt fail-closed, read is not a grant |
-| B Re-admission (8–20) | UNKNOWN→RUNNING grant+admit; persisted RUNNING / adapter presence never admit alone; stale cannot admit; `start_execution` count stays 0. Exact expiry-boundary and ACK-vs-grant serialization inherit M5.3 kernel tests |
+| B Re-admission (8–20) | UNKNOWN→RUNNING grant+admit; persisted RUNNING / adapter presence never admit alone; stale cannot admit; `start_execution` count stays 0; `now == expires_at` on reconcile; ACK/cancel vs re-admission both orders |
 | C Unresolved (21–29) | default reconcile UNKNOWN; LOST never admitted; missing adapter is availability; unisolated WRITE → SUSPENDED |
 | D Terminal collection (30–37) | terminal-looking reconcile requires collect; collected success ACKs |
-| E Durable replay (38–43) | evidence-before-ACK Result; evidence-before-NACK; stale success no Result; SUCCEEDED+current invariant; exactly-one Result on replay |
-| F Startup lifecycle (44–52) | empty recover; readmit during barrier; failed startup returns no READY |
-| G Final barrier (53–60) | READY invariant in `recover_runtime`; no dispatch inside recovery; promote/pool/revive after physical work |
+| E Durable replay (38–43) | physical SUCCEEDED+current → Result; FAILED+current → NACK; stale success no Result; UNKNOWN+outcome_json is **not** proof; exactly-one Result |
+| F Startup lifecycle (44–52) | empty recover; readmit during barrier; **readmit then later fatal clears admissions** (StartupGuard Drop) |
+| G Final barrier (53–60) | READY invariant uses `looks_current_at(now)`; lease expiry during adapter I/O swept before READY; no dispatch inside recovery |
 | H Regression (61–66) | M4/M5.1–M5.3 suites green; no M6 types |
-
-Not every numbered row has a dedicated new test. Dedicated follow-ups if
-needed: exact `now == expires_at` during re-admission (kernel already
-fail-closes), ACK-vs-re-admission serialization order, cancel-vs-re-admission,
-isolated WRITE retry under persisted isolation in the coordinator path,
-RETIRED-not-revived as a `recover_runtime` test (kernel already refuses).
 
 ---
 
@@ -247,3 +260,28 @@ recover_runtime(Arc<Kernel>, &AdapterRegistry, RuntimeTimingConfig)
 
 Dispatch is a separate object. Callers MUST NOT `Dispatcher::dispatch_one`
 until `recover_runtime` returns. There is no daemon `run()` (M5.8).
+
+---
+
+## 13. PR #10 audit closure
+
+REQUEST CHANGES on `515c195` closed in this order, no extra scope:
+
+**P1-1.** Physical terminal + current authority is a legal pending
+consequence. `UNKNOWN + outcome_json` is not success proof.
+`record_pending_physical_terminal` writes the Execution row without
+applying incarnation presence (so reusable WARM continuity still belongs
+to ACK). `ack_success` accepts already-SUCCEEDED; `nack` skips rewrite of
+FAILED/TERMINATED/LOST.
+
+**P1-2.** `RunningAuthorityGrant` is move-only (`#[derive(Debug)]` only).
+One confirm+renew commit → one grant → `from_grant` consumes it → one
+admission. A later confirm still mints a **new** grant.
+
+**P1-3.** Recovery-level proofs: post-admit startup fatal cleanup, ACK vs
+re-admission both orders, cancel vs re-admission both orders, exact expiry
+boundary, lease expiry during adapter I/O before READY.
+
+**P2.** `structurally_current()` vs `looks_current_at(now)` (READY uses the
+latter). Python oracle evidence is the exact-head CI result (160 passed,
+2 skipped), not “not re-run this session”.
