@@ -112,7 +112,7 @@ fn starting_unknown_and_running_candidates_carry_persisted_request_id() {
     assert_eq!(running.persisted_state(), ExecutionState::Running);
     assert_eq!(running.request_id(), launch_running.request_id());
     assert_eq!(running.runtime_handle(), &json!({"hint": "running"}));
-    assert!(running.current_authority_hint().looks_current());
+    assert!(running.current_authority_hint().structurally_current());
 }
 
 /// #4/#5: recovery identity is the frozen `adapter_kind`. Current
@@ -182,7 +182,7 @@ fn blank_or_corrupt_durable_adapter_identity_fails_closed() {
 }
 
 /// #7: the candidate reader is not an authority path. It does not renew,
-/// does not produce a grant, and `looks_current` is only a routing hint.
+/// does not produce a grant, and `structurally_current` is only a routing hint.
 #[test]
 fn candidate_read_does_not_grant_or_renew_authority() {
     let Env { k, clock: _ } = memory_env();
@@ -208,7 +208,7 @@ fn candidate_read_does_not_grant_or_renew_authority() {
     assert_eq!(before.state, after.state);
 
     let snap = &candidates[0];
-    assert!(snap.current_authority_hint().looks_current());
+    assert!(snap.current_authority_hint().structurally_current());
     assert_eq!(snap.persisted_state(), ExecutionState::Running);
     // Fact record, not a capability: Clone is legal and does not consume
     // anything (contrast SupervisionAdmission).
@@ -258,7 +258,11 @@ fn current_authority_candidates_are_ordered_before_stale_history() {
     let candidates = k.reconciliation_candidates().unwrap();
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0].execution_id(), launch_current.execution_id());
-    assert!(candidates[0].current_authority_hint().looks_current());
+    assert!(candidates[0]
+        .current_authority_hint()
+        .structurally_current());
     assert_eq!(candidates[1].execution_id(), launch_stale.execution_id());
-    assert!(!candidates[1].current_authority_hint().looks_current());
+    assert!(!candidates[1]
+        .current_authority_hint()
+        .structurally_current());
 }

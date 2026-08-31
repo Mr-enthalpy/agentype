@@ -874,19 +874,19 @@ impl<'a> Dispatcher<'a> {
                 })
             }
             CollectedOutcomeKind::TerminalSuccess => {
-                // Authoritative success: the only path to ACK. Physical
-                // evidence (the locator) is committed BEFORE the authority
-                // consequence when quiescence is not proven (cleanup locator)
-                // OR when the incarnation is reusable (continuity locator).
+                // Authoritative success: persist the physical terminal fact
+                // BEFORE the ACK consequence (M5.4 P1-1). The two machines
+                // stay separate: Execution=SUCCEEDED+terminal_confirmed may
+                // be durable while Attempt/Lease are still ACTIVE.
                 let payload = outcome.payload.clone().unwrap_or(Value::Null);
-                if !outcome.quiescent_confirmed || outcome.incarnation_reusable {
-                    self.persist_terminal_evidence(
-                        execution_id,
-                        observed_handle,
-                        outcome.payload.as_ref(),
-                        None,
-                    )?;
-                }
+                self.persist_terminal_evidence(
+                    execution_id,
+                    ExecutionState::Succeeded,
+                    observed_handle,
+                    outcome.payload.as_ref(),
+                    None,
+                    outcome.quiescent_confirmed,
+                )?;
                 let result_id = match self.kernel.ack_success(
                     &claim.attempt_id,
                     claim.lease_epoch,
@@ -930,14 +930,14 @@ impl<'a> Dispatcher<'a> {
                 }
             }
             CollectedOutcomeKind::TerminalFailure { failure_class } => {
-                if !outcome.quiescent_confirmed {
-                    self.persist_terminal_evidence(
-                        execution_id,
-                        observed_handle,
-                        None,
-                        Some(failure_class),
-                    )?;
-                }
+                self.persist_terminal_evidence(
+                    execution_id,
+                    ExecutionState::Failed,
+                    observed_handle,
+                    None,
+                    Some(failure_class),
+                    outcome.quiescent_confirmed,
+                )?;
                 self.nack_start(
                     claim,
                     execution_id,
@@ -996,40 +996,28 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// Persist the collected terminal evidence BEFORE the authority
-    /// consequence: UNKNOWN with the observed handle and zero proof bits.
-    ///
-    /// Kernel mutation primitives (`nack`/`ack_success`) do not write
-    /// runtime_handle_json, so recording the evidence first is what makes the
-    /// physical locator crash-durable (audit round 8): a crash between the
-    /// evidence transaction and the authority transaction leaves the locator
-    /// durable with the authority consequence unapplied — safe to reconcile —
-    /// never the reverse. The terminal state itself is applied by the
-    /// authority transaction (UNKNOWN -> SUCCEEDED/FAILED), preserving the
-    /// frozen Kernel API.
-    ///
-    /// Two locator kinds justify the pre-persist (audit round 11): a CLEANUP
-    /// locator when quiescence is not proven (physical state unresolved), and
-    /// a CONTINUITY locator when the incarnation is reusable (a WARM
-    /// promotion must keep the handle the next execution on this resident
-    /// incarnation will read). Only a quiescence-proven, non-reusable end
-    /// deliberately skips it.
+    /// Persist the collected terminal physical fact BEFORE the ACK/NACK
+    /// authority consequence (M5.4 P1-1). Physical history (`SUCCEEDED` /
+    /// `FAILED` + `terminal_confirmed`) is a different machine from Task
+    /// authority; a crash between the two leaves a legal pending-consequence
+    /// row, never an invented UNKNOWN stand-in.
     fn persist_terminal_evidence(
         &self,
         execution_id: &ExecutionId,
+        state: ExecutionState,
         observed_handle: &Value,
         payload: Option<&Value>,
         failure_class: Option<FailureClass>,
+        quiescent_confirmed: bool,
     ) -> Result<(), DispatchError> {
         self.kernel
-            .record_physical_outcome(
+            .record_pending_physical_terminal(
                 execution_id,
-                ExecutionState::Unknown,
+                state,
                 Some(observed_handle),
                 payload,
                 failure_class,
-                false,
-                false,
+                quiescent_confirmed,
             )
             .map_err(DispatchError::Persistence)
     }
@@ -3578,12 +3566,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         .unwrap()
     }
 
-    /// Audit P1 (round 8): the physical locator must be durable BEFORE the
-    /// authority consequence. A collected SUCCEEDED without quiescence proof
-    /// whose ack then fails hard leaves the Execution UNKNOWN with the
-    /// observed handle durable (evidence committed, consequence unapplied —
-    /// safe to reconcile). The pre-evidence order would have left STARTING
-    /// with no handle at this point.
+    /// Audit P1 (round 8 / M5.4 P1-1): the physical terminal fact must be
+    /// durable BEFORE the authority consequence. A collected SUCCEEDED
+    /// whose ack then fails hard leaves Execution=SUCCEEDED+terminal
+    /// (pending consequence, Attempt still current) with the observed
+    /// handle durable — never an UNKNOWN stand-in.
     #[test]
     fn dispatch_collected_success_evidence_durable_before_ack_consequence() {
         let (kernel, path, claim) = file_dispatch_env("crash-success");
@@ -3626,10 +3613,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let err = d.dispatch_claim(&claim).unwrap_err();
         assert!(matches!(err, DispatchError::Persistence(_)));
-        // Crash-window state: evidence and locator durable, consequence
-        // unapplied.
+        // Crash-window state: physical terminal + locator durable,
+        // authority consequence unapplied.
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "SUCCEEDED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 1})
@@ -3681,7 +3668,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let err = d.dispatch_claim(&claim).unwrap_err();
         assert!(matches!(err, DispatchError::Persistence(_)));
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "FAILED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 2})

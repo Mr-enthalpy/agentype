@@ -36,7 +36,12 @@ pub enum SupervisedRenewal {
 /// share one authority boundary. A persisted `state='RUNNING'` row can never
 /// produce one: the constructor is crate-private and there is no read path
 /// that returns a grant.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Move-only (M5.4 P1-2): one fenced confirm+renew commit produces one grant,
+/// which `SupervisionAdmission::from_grant` consumes into one admission.
+/// A later `confirm_running_and_renew` may mint a *new* grant (a new fenced
+/// validation). Cloning one grant into many admissions is forbidden.
+#[derive(Debug)]
 pub struct RunningAuthorityGrant {
     execution_id: ExecutionId,
     request_id: RequestId,
@@ -162,11 +167,17 @@ impl CurrentAuthorityHint {
         self.is_current_attempt
     }
 
-    /// Availability diagnostic: the joined rows currently look like a
-    /// live Attempt/Lease that is this Task's current attempt. NOT a
-    /// grant — `confirm_running_and_renew` must still succeed.
-    pub fn looks_current(&self) -> bool {
+    /// Structural diagnostic only: Attempt ACTIVE ∧ Lease ACTIVE ∧ current
+    /// attempt. Does NOT inspect `lease_expires_at`. NOT a grant.
+    pub fn structurally_current(&self) -> bool {
         self.attempt_is_active && self.lease_is_active && self.is_current_attempt
+    }
+
+    /// Time-aware routing hint for READY: structurally current and the
+    /// durable expiry is still strictly in the future. Authority-bearing
+    /// operations must still re-enter a Kernel transaction.
+    pub fn looks_current_at(&self, now: UnixTime) -> bool {
+        self.structurally_current() && self.lease_expires_at.map(|t| now < t).unwrap_or(false)
     }
 }
 
@@ -1511,6 +1522,63 @@ impl Kernel {
         })
     }
 
+    /// Persist a collected terminal physical fact without applying
+    /// incarnation presence or Task authority (M5.4 P1-1). Physical history
+    /// and Scheduler consequence are different machines: a crash after this
+    /// commit leaves `SUCCEEDED`/`FAILED` + `terminal_confirmed` with
+    /// Attempt/Lease still ACTIVE. Incarnation WARM/TERMINATED is decided
+    /// by the subsequent ACK/NACK (`incarnation_reusable`).
+    pub fn record_pending_physical_terminal(
+        &self,
+        execution_id: &ExecutionId,
+        state: ExecutionState,
+        runtime_handle: Option<&Value>,
+        payload: Option<&Value>,
+        failure_class: Option<FailureClass>,
+        quiescent_confirmed: bool,
+    ) -> Result<(), Error> {
+        if !matches!(
+            state,
+            ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Terminated
+        ) {
+            return Err(Error::invalid_transition(
+                "pending physical terminal must be SUCCEEDED, FAILED, or TERMINATED",
+            ));
+        }
+        self.tx(|tx, now| {
+            let execution = required_execution(tx, execution_id.as_str())?;
+            let from = ExecutionState::parse_sql(&execution.state)?;
+            require_physical_transition(from, state)?;
+            let handle_json = runtime_handle.map(json_dump);
+            let outcome_json = payload.map(json_dump);
+            tx.execute(
+                "UPDATE executions SET state=?1,runtime_handle_json=COALESCE(?2,runtime_handle_json),
+                 outcome_json=COALESCE(?3,outcome_json),
+                 failure_class=COALESCE(?4,failure_class),
+                 terminal_confirmed=1,quiescent_confirmed=?5,updated_at=?6,ended_at=?6
+                 WHERE id=?7",
+                params![
+                    state.as_sql(),
+                    handle_json,
+                    outcome_json,
+                    failure_class.map(|c| c.as_sql().to_string()),
+                    quiescent_confirmed as i64,
+                    now,
+                    execution.id
+                ],
+            )
+            .map_err(map_sqlite)?;
+            if let Some(h) = &handle_json {
+                tx.execute(
+                    "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
+                    params![h, execution.incarnation_id],
+                )
+                .map_err(map_sqlite)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn ack_success(
         &self,
         attempt_id: &AttemptId,
@@ -1581,7 +1649,14 @@ impl Kernel {
                 return Ok(None);
             }
             if let Some(exec) = &execution {
-                if !matches!(exec.state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
+                // SUCCEEDED is a legal pending-consequence row: physical
+                // terminal evidence may already be durable while Attempt/
+                // Lease are still ACTIVE (M5.4 P1-1). Apply the authority
+                // close without requiring a fake UNKNOWN rewrite.
+                if !matches!(
+                    exec.state.as_str(),
+                    "STARTING" | "RUNNING" | "UNKNOWN" | "SUCCEEDED"
+                ) {
                     return Err(Error::invalid_transition(format!(
                         "execution {} cannot succeed from {}",
                         exec.id, exec.state
@@ -1674,9 +1749,10 @@ impl Kernel {
                 now,
             )?;
             if let Some(exec) = &execution {
-                if exec.state == "LOST" {
-                    // LOST is already "not RUNNING". Closing current authority
-                    // must not rewrite physical history (M5.4 plan §10-C).
+                if matches!(exec.state.as_str(), "LOST" | "FAILED" | "TERMINATED") {
+                    // Physical history is already non-RUNNING (including a
+                    // durable FAILED/TERMINATED pending-consequence row).
+                    // Closing current authority must not rewrite it.
                 } else if !matches!(exec.state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
                     return Err(Error::invalid_transition(format!(
                         "execution {} cannot fail from {}",

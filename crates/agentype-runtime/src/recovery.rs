@@ -116,14 +116,12 @@ pub enum ReconcileExecutionOutcome {
     },
 }
 
-/// Category A: replay a persisted terminal consequence, or report that this
-/// snapshot is not a terminal-replay candidate.
+/// Category A: replay a persisted terminal *authority* consequence.
 ///
-/// Legal crash window: `collect_outcome` persisted evidence (`outcome_json`
-/// and/or `failure_class` on an still-active physical state) then crashed
-/// before ACK/NACK. Kernel ACK/NACK is atomic with closing Attempt/Lease, so
-/// a row already in SUCCEEDED/FAILED/TERMINATED MUST NOT still hold current
-/// authority — that is inconsistent durable evidence and fails closed.
+/// Physical terminal evidence (`SUCCEEDED`/`FAILED`/`TERMINATED` +
+/// `terminal_confirmed`) is a different machine from ACK/NACK. The legal
+/// crash window is physical terminal durable, Attempt/Lease still ACTIVE,
+/// Result none — never inferred from `outcome_json` on an UNKNOWN row.
 pub fn replay_persisted_terminal_consequence(
     kernel: &Kernel,
     snapshot: &ExecutionReconciliationSnapshot,
@@ -138,36 +136,37 @@ pub fn replay_persisted_terminal_consequence(
         Err(err) => return Err(RecoveryError::from(err)),
     }
 
-    let current = snapshot.current_authority_hint().looks_current();
     match snapshot.persisted_state() {
-        ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Terminated => {
-            if current {
+        ExecutionState::Succeeded => {
+            if !snapshot.terminal_confirmed() || snapshot.failure_class().is_some() {
                 return Err(RecoveryError::invariant(format!(
-                    "execution {} is durable {} but still holds current Attempt/Lease authority; \
-                     ACK/NACK is atomic with authority close",
+                    "execution {} is SUCCEEDED with inconsistent terminal evidence \
+                     (terminal_confirmed={}, failure_class={:?})",
+                    snapshot.execution_id(),
+                    snapshot.terminal_confirmed(),
+                    snapshot.failure_class()
+                )));
+            }
+            replay_success_consequence(kernel, snapshot)
+        }
+        ExecutionState::Failed | ExecutionState::Terminated => {
+            if !snapshot.terminal_confirmed() {
+                return Err(RecoveryError::invariant(format!(
+                    "execution {} is {} without terminal_confirmed",
                     snapshot.execution_id(),
                     snapshot.persisted_state().as_sql()
                 )));
             }
-            Ok(TerminalReplayOutcome::PhysicalHistoryOnly)
+            replay_failure_consequence(kernel, snapshot)
         }
-        ExecutionState::Starting | ExecutionState::Running | ExecutionState::Unknown => {
-            let success_evidence =
-                snapshot.outcome_json().is_some() && snapshot.failure_class().is_none();
-            let failure_evidence = snapshot.failure_class().is_some();
-            if success_evidence {
-                replay_success_evidence(kernel, snapshot)
-            } else if failure_evidence {
-                replay_failure_evidence(kernel, snapshot)
-            } else {
-                Ok(TerminalReplayOutcome::NotApplicable)
-            }
-        }
-        ExecutionState::Lost => Ok(TerminalReplayOutcome::NotApplicable),
+        ExecutionState::Starting
+        | ExecutionState::Running
+        | ExecutionState::Unknown
+        | ExecutionState::Lost => Ok(TerminalReplayOutcome::NotApplicable),
     }
 }
 
-fn replay_success_evidence(
+fn replay_success_consequence(
     kernel: &Kernel,
     snapshot: &ExecutionReconciliationSnapshot,
 ) -> Result<TerminalReplayOutcome, RecoveryError> {
@@ -184,59 +183,33 @@ fn replay_success_evidence(
         Ok(Some(result_id)) => Ok(TerminalReplayOutcome::ResultReplayed { result_id }),
         Ok(None) => Ok(TerminalReplayOutcome::WriterSafetySuspended),
         Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-            persist_stale_success_history(kernel, snapshot)?;
             Ok(TerminalReplayOutcome::PhysicalHistoryOnly)
         }
         Err(err) => Err(RecoveryError::from(err)),
     }
 }
 
-fn persist_stale_success_history(
-    kernel: &Kernel,
-    snapshot: &ExecutionReconciliationSnapshot,
-) -> Result<(), RecoveryError> {
-    if matches!(
-        snapshot.persisted_state(),
-        ExecutionState::Starting | ExecutionState::Running | ExecutionState::Unknown
-    ) {
-        kernel
-            .record_physical_outcome(
-                snapshot.execution_id(),
-                ExecutionState::Succeeded,
-                Some(snapshot.runtime_handle()),
-                snapshot.outcome_json(),
-                None,
-                true,
-                snapshot.quiescent_confirmed(),
-            )
-            .map_err(RecoveryError::from)?;
-    }
-    Ok(())
-}
-
-fn replay_failure_evidence(
+fn replay_failure_consequence(
     kernel: &Kernel,
     snapshot: &ExecutionReconciliationSnapshot,
 ) -> Result<TerminalReplayOutcome, RecoveryError> {
     let failure_class = snapshot
         .failure_class()
-        .expect("failure evidence carries a class");
-    // Crash-before-NACK evidence is UNKNOWN with a failure class and zero
-    // proof bits. Replay the mechanical NACK; do not invent terminality or
-    // quiescence (the evidence row itself recorded neither).
-    match apply_nack(
-        kernel,
-        snapshot,
+        .unwrap_or(FailureClass::StartFailure);
+    match kernel.nack(
+        snapshot.attempt_id(),
+        snapshot.lease_epoch(),
         failure_class,
-        snapshot.terminal_confirmed(),
+        Some(snapshot.execution_id()),
+        true,
         snapshot.quiescent_confirmed(),
-        Some(snapshot.runtime_handle()),
+        false,
     ) {
-        Ok(()) => Ok(TerminalReplayOutcome::FailureReplayed { failure_class }),
-        Err(RecoveryError::Persistence(Error::StaleAuthority(_) | Error::InvalidAuthority(_))) => {
+        Ok(_) => Ok(TerminalReplayOutcome::FailureReplayed { failure_class }),
+        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
             Ok(TerminalReplayOutcome::PhysicalHistoryOnly)
         }
-        Err(err) => Err(err),
+        Err(err) => Err(RecoveryError::from(err)),
     }
 }
 
@@ -331,7 +304,7 @@ fn close_lost(
     kernel: &Kernel,
     snapshot: &ExecutionReconciliationSnapshot,
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
-    if !snapshot.current_authority_hint().looks_current() {
+    if !snapshot.current_authority_hint().structurally_current() {
         return Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly);
     }
     match apply_nack(
@@ -481,19 +454,16 @@ fn collect_and_apply(
         ),
         CollectedOutcomeKind::TerminalSuccess => {
             let payload = outcome.payload.clone().unwrap_or(Value::Null);
-            if !outcome.quiescent_confirmed || outcome.incarnation_reusable {
-                kernel
-                    .record_physical_outcome(
-                        snapshot.execution_id(),
-                        ExecutionState::Unknown,
-                        Some(&observation.runtime_handle.0),
-                        outcome.payload.as_ref(),
-                        None,
-                        false,
-                        false,
-                    )
-                    .map_err(RecoveryError::from)?;
-            }
+            kernel
+                .record_pending_physical_terminal(
+                    snapshot.execution_id(),
+                    ExecutionState::Succeeded,
+                    Some(&observation.runtime_handle.0),
+                    outcome.payload.as_ref(),
+                    None,
+                    outcome.quiescent_confirmed,
+                )
+                .map_err(RecoveryError::from)?;
             match kernel.ack_success(
                 snapshot.attempt_id(),
                 snapshot.lease_epoch(),
@@ -523,32 +493,30 @@ fn collect_and_apply(
             }
         }
         CollectedOutcomeKind::TerminalFailure { failure_class } => {
-            match apply_nack(
-                kernel,
-                snapshot,
+            kernel
+                .record_pending_physical_terminal(
+                    snapshot.execution_id(),
+                    ExecutionState::Failed,
+                    Some(&observation.runtime_handle.0),
+                    None,
+                    Some(failure_class),
+                    outcome.quiescent_confirmed,
+                )
+                .map_err(RecoveryError::from)?;
+            match kernel.nack(
+                snapshot.attempt_id(),
+                snapshot.lease_epoch(),
                 failure_class,
+                Some(snapshot.execution_id()),
                 true,
                 outcome.quiescent_confirmed,
-                Some(&observation.runtime_handle.0),
+                false,
             ) {
-                Ok(()) => Ok(ReconcileExecutionOutcome::TerminalFailure { failure_class }),
-                Err(RecoveryError::Persistence(
-                    Error::StaleAuthority(_) | Error::InvalidAuthority(_),
-                )) => {
-                    kernel
-                        .record_physical_outcome(
-                            snapshot.execution_id(),
-                            ExecutionState::Failed,
-                            Some(&observation.runtime_handle.0),
-                            None,
-                            Some(failure_class),
-                            true,
-                            outcome.quiescent_confirmed,
-                        )
-                        .map_err(RecoveryError::from)?;
+                Ok(_) => Ok(ReconcileExecutionOutcome::TerminalFailure { failure_class }),
+                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                     Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(RecoveryError::from(err)),
             }
         }
     }
@@ -637,6 +605,15 @@ pub fn recover_runtime(
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,
 ) -> Result<RecoveredRuntime, RecoveryError> {
+    recover_runtime_inner(kernel, adapters, timing, None)
+}
+
+fn recover_runtime_inner(
+    kernel: Arc<Kernel>,
+    adapters: &AdapterRegistry,
+    timing: RuntimeTimingConfig,
+    fail_after_readmits: Option<usize>,
+) -> Result<RecoveredRuntime, RecoveryError> {
     kernel.expire_leases(true).map_err(RecoveryError::from)?;
 
     let runner =
@@ -655,11 +632,22 @@ pub fn recover_runtime(
     let candidates = kernel
         .reconciliation_candidates()
         .map_err(RecoveryError::from)?;
+    let mut readmits = 0usize;
     for snap in &candidates {
         guard.check_healthy()?;
         match snap.persisted_state() {
             ExecutionState::Starting | ExecutionState::Unknown | ExecutionState::Running => {
-                reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
+                if matches!(
+                    reconcile_one_execution(&kernel, adapters, snap, guard.runner())?,
+                    ReconcileExecutionOutcome::Readmitted
+                ) {
+                    readmits += 1;
+                    if fail_after_readmits == Some(readmits) {
+                        return Err(RecoveryError::invariant(
+                            "injected startup fatal after successful readmission",
+                        ));
+                    }
+                }
             }
             ExecutionState::Lost => {
                 reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
@@ -683,6 +671,16 @@ pub fn recover_runtime(
     Ok(RecoveredRuntime { runner })
 }
 
+#[cfg(test)]
+fn recover_runtime_failing_after_readmits(
+    kernel: Arc<Kernel>,
+    adapters: &AdapterRegistry,
+    timing: RuntimeTimingConfig,
+    after: usize,
+) -> Result<RecoveredRuntime, RecoveryError> {
+    recover_runtime_inner(kernel, adapters, timing, Some(after))
+}
+
 /// READY invariant: every Task that still holds current Attempt/Lease
 /// authority and has an Execution is supervised, or that authority is gone.
 fn assert_ready_invariant(
@@ -693,7 +691,7 @@ fn assert_ready_invariant(
         .reconciliation_candidates()
         .map_err(RecoveryError::from)?;
     for snap in candidates {
-        if !snap.current_authority_hint().looks_current() {
+        if !snap.current_authority_hint().looks_current_at(kernel.now()) {
             continue;
         }
         match snap.persisted_state() {
@@ -736,9 +734,13 @@ fn persisted_handle_hint(value: &Value) -> Option<RuntimeHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
     use crate::{AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
-    use agentype_adapter_api::{FakeAdapter, StartObservation};
+    use agentype_adapter_api::{
+        AdapterResult, ExecutionAdapter, ExecutionObservation, ExecutionOutcome, FakeAdapter,
+        RuntimeHandle, StartObservation,
+    };
     use agentype_core::{
         AuthoritativeExecutionBinding, Claim, ExecutionState, FailureClass, ManualClock,
         PartitionSpec, Retention, RetryPolicy, TaskSpec, TaskState,
@@ -822,24 +824,25 @@ mod tests {
         }
     }
 
-    /// #38/#42: crash after terminal success evidence, before ACK, replays
-    /// into exactly one Result while authority is current.
+    /// #38/#42: crash after physical SUCCEEDED is durable, before ACK,
+    /// replays into exactly one Result while authority is current.
     #[test]
     fn crash_evidence_before_ack_replays_success() {
         let (_clock, k) = env();
         let (_claim, launch) = start_named(&k, TaskSpec::new("replay-ok", json!({"o": 1})));
         k.record_physical_outcome(
             launch.execution_id(),
-            ExecutionState::Unknown,
+            ExecutionState::Succeeded,
             Some(&json!({"h": 1})),
             Some(&json!({"answer": 7})),
             None,
-            false,
-            false,
+            true,
+            true,
         )
         .unwrap();
 
         let snap = snapshot_of(&k, launch.execution_id());
+        assert!(snap.current_authority_hint().structurally_current());
         match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
             TerminalReplayOutcome::ResultReplayed { result_id } => {
                 let stored = k.result_for_task(launch.task_id()).unwrap();
@@ -857,8 +860,8 @@ mod tests {
         }
     }
 
-    /// #39: crash after failure evidence, before NACK, replays the mechanical
-    /// NACK. Does not invent terminality.
+    /// #39: crash after physical FAILED is durable, before NACK, replays
+    /// the fenced NACK. Does not create a Result.
     #[test]
     fn crash_evidence_before_nack_replays_failure() {
         let (_clock, k) = env();
@@ -871,12 +874,12 @@ mod tests {
         let (_claim, launch) = start_named(&k, spec);
         k.record_physical_outcome(
             launch.execution_id(),
-            ExecutionState::Unknown,
+            ExecutionState::Failed,
             Some(&json!({"h": 1})),
             None,
             Some(FailureClass::Timeout),
-            false,
-            false,
+            true,
+            true,
         )
         .unwrap();
 
@@ -891,40 +894,11 @@ mod tests {
         assert!(k.result_for_task(snap.task_id()).is_err());
     }
 
-    /// #41: stale success evidence cannot create a Result.
+    /// #41: stale physical success cannot create a Result.
     #[test]
     fn stale_persisted_success_produces_no_result() {
         let (clock, k) = env();
         let (_claim, launch) = start_named(&k, TaskSpec::new("stale-ok", json!({"o": 1})));
-        k.record_physical_outcome(
-            launch.execution_id(),
-            ExecutionState::Unknown,
-            Some(&json!({"h": 1})),
-            Some(&json!({"answer": 1})),
-            None,
-            false,
-            false,
-        )
-        .unwrap();
-        clock.advance(20.0);
-        k.expire_leases(true).unwrap();
-
-        let snap = snapshot_of(&k, launch.execution_id());
-        assert!(!snap.current_authority_hint().looks_current());
-        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
-            TerminalReplayOutcome::PhysicalHistoryOnly => {}
-            other => panic!("expected PhysicalHistoryOnly, got {other:?}"),
-        }
-        assert!(k.result_for_task(snap.task_id()).is_err());
-        assert_ne!(k.task(snap.task_id()).unwrap().state, TaskState::Completed);
-    }
-
-    /// #43: SUCCEEDED while Attempt/Lease still current is inconsistent —
-    /// Kernel ACK is atomic with authority close.
-    #[test]
-    fn succeeded_with_current_authority_fails_closed() {
-        let (_clock, k) = env();
-        let (_claim, launch) = start_named(&k, TaskSpec::new("inconsistent", json!({"o": 1})));
         k.record_physical_outcome(
             launch.execution_id(),
             ExecutionState::Succeeded,
@@ -935,13 +909,39 @@ mod tests {
             true,
         )
         .unwrap();
+        clock.advance(20.0);
+        k.expire_leases(true).unwrap();
+
         let snap = snapshot_of(&k, launch.execution_id());
-        assert!(snap.current_authority_hint().looks_current());
-        let err = replay_persisted_terminal_consequence(&k, &snap).unwrap_err();
-        assert!(
-            matches!(err, RecoveryError::Invariant(_)),
-            "expected invariant, got {err:?}"
-        );
+        assert!(!snap.current_authority_hint().structurally_current());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::PhysicalHistoryOnly => {}
+            other => panic!("expected PhysicalHistoryOnly, got {other:?}"),
+        }
+        assert!(k.result_for_task(snap.task_id()).is_err());
+        assert_ne!(k.task(snap.task_id()).unwrap().state, TaskState::Completed);
+    }
+
+    /// UNKNOWN + outcome_json is NOT authoritative terminal success proof.
+    #[test]
+    fn unknown_plus_outcome_json_is_not_success_evidence() {
+        let (_clock, k) = env();
+        let (_claim, launch) = start_named(&k, TaskSpec::new("not-proof", json!({"o": 1})));
+        k.record_physical_outcome(
+            launch.execution_id(),
+            ExecutionState::Unknown,
+            Some(&json!({"h": 1})),
+            Some(&json!({"answer": 7})),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let snap = snapshot_of(&k, launch.execution_id());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::NotApplicable => {}
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
         assert!(k.result_for_task(snap.task_id()).is_err());
     }
 
@@ -1038,7 +1038,7 @@ mod tests {
         clock.advance(20.0);
         kernel.expire_leases(true).unwrap();
         let snap = snapshot_of(&kernel, launch.execution_id());
-        assert!(!snap.current_authority_hint().looks_current());
+        assert!(!snap.current_authority_hint().structurally_current());
 
         match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
             ReconcileExecutionOutcome::PhysicalHistoryOnly => {}
@@ -1199,34 +1199,272 @@ mod tests {
         assert_eq!(fake.reconcile_call_count(), 0);
     }
 
-    /// #43/#46/#47: a later recovery invariant failure does not return READY
-    /// and does not leave a renewable admission behind.
+    /// Successful readmission then later startup fatal: StartupGuard stops
+    /// the runner, clears admissions, and the lease is not renewed further.
     #[test]
-    fn failed_startup_does_not_return_ready() {
-        let (_clock, k) = env();
+    fn successful_readmission_then_later_fatal_clears_admissions() {
+        let (clock, k) = env();
         let kernel = Arc::new(k);
-        let (_claim, launch) = start_named(&kernel, TaskSpec::new("bad", json!({"o": 1})));
-        kernel
-            .record_physical_outcome(
-                launch.execution_id(),
-                ExecutionState::Succeeded,
-                Some(&json!({"h": 1})),
-                Some(&json!({"answer": 1})),
-                None,
-                true,
-                true,
-            )
-            .unwrap();
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("then-fatal", json!({"o": 1})));
         let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
         let adapters = adapters(&fake);
-        let err = match recover_runtime(kernel.clone(), &adapters, timing()) {
-            Err(err) => err,
-            Ok(_) => panic!("expected failed startup"),
-        };
+        let err =
+            match recover_runtime_failing_after_readmits(kernel.clone(), &adapters, timing(), 1) {
+                Err(err) => err,
+                Ok(_) => panic!("expected injected startup fatal"),
+            };
         assert!(
             matches!(err, RecoveryError::Invariant(_)),
             "expected invariant, got {err:?}"
         );
+        let after_fail = kernel
+            .lease_supervision_view(&_claim.attempt_id)
+            .unwrap()
+            .heartbeat_at;
+        clock.advance(1.0);
+        let later = kernel
+            .lease_supervision_view(&_claim.attempt_id)
+            .unwrap()
+            .heartbeat_at;
+        assert_eq!(later, after_fail);
         assert_eq!(fake.start_call_count(), 0);
+        let _ = launch;
+    }
+
+    /// ACK before re-admission: grant rejected, no admit, Task never reopens.
+    #[test]
+    fn ack_wins_before_re_admission() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let (claim, launch) = start_named(&kernel, TaskSpec::new("ack-first", json!({"o": 1})));
+        kernel
+            .confirm_running_and_renew(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                launch.execution_id(),
+                &json!({"live": true}),
+            )
+            .unwrap();
+        kernel
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(launch.execution_id()),
+                &json!({"ok": true}),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc) {
+            Err(RecoveryError::Invariant(_)) => {}
+            Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly) => {}
+            other => panic!("expected no admission after ACK, got {other:?}"),
+        }
+        assert_eq!(svc.active_count(), 0);
+        assert_eq!(
+            kernel.task(launch.task_id()).unwrap().state,
+            TaskState::Completed
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// Re-admission before ACK: lease briefly renewed, ACK closes, later
+    /// heartbeat is AuthorityLost. Task never reopens.
+    #[test]
+    fn re_admission_wins_before_ack() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let (claim, launch) = start_named(&kernel, TaskSpec::new("grant-first", json!({"o": 1})));
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Readmitted => {}
+            other => panic!("expected Readmitted, got {other:?}"),
+        }
+        assert!(svc.contains(launch.execution_id()));
+        kernel
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(launch.execution_id()),
+                &json!({"ok": true}),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            svc.renew_one(launch.execution_id()).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: launch.execution_id().clone(),
+            }
+        );
+        assert_eq!(
+            kernel.task(launch.task_id()).unwrap().state,
+            TaskState::Completed
+        );
+        assert!(!svc.contains(launch.execution_id()));
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// Cancellation before re-admission: no grant.
+    #[test]
+    fn cancellation_wins_before_re_admission() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("cancel-first", json!({"o": 1})));
+        kernel.cancel_task(launch.task_id(), false).unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::PhysicalHistoryOnly => {}
+            other => panic!("expected PhysicalHistoryOnly, got {other:?}"),
+        }
+        assert_eq!(svc.active_count(), 0);
+        assert_eq!(
+            kernel.task(launch.task_id()).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// Re-admission before cancellation: cancel later closes authority.
+    #[test]
+    fn re_admission_wins_before_cancellation() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let (_claim, launch) =
+            start_named(&kernel, TaskSpec::new("grant-then-cancel", json!({"o": 1})));
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Readmitted => {}
+            other => panic!("expected Readmitted, got {other:?}"),
+        }
+        kernel.cancel_task(launch.task_id(), false).unwrap();
+        assert_eq!(
+            svc.renew_one(launch.execution_id()).unwrap(),
+            RenewalOutcome::AuthorityLost {
+                execution_id: launch.execution_id().clone(),
+            }
+        );
+        assert_eq!(
+            kernel.task(launch.task_id()).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// Exact expiry boundary during recovery grant is STALE.
+    #[test]
+    fn exact_expiry_boundary_cannot_admit_during_recovery() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let (claim, launch) = start_named(&kernel, TaskSpec::new("exact-exp", json!({"o": 1})));
+        let expiry = kernel
+            .lease_supervision_view(&claim.attempt_id)
+            .unwrap()
+            .expires_at;
+        clock.advance(expiry - kernel.now());
+        assert_eq!(kernel.now(), expiry);
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::PhysicalHistoryOnly => {}
+            other => panic!("expected STALE PhysicalHistoryOnly, got {other:?}"),
+        }
+        assert_eq!(svc.active_count(), 0);
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// Lease expires during adapter I/O; final sweep leaves no unsupervised
+    /// current authority at READY.
+    #[test]
+    fn lease_expiring_during_adapter_io_is_swept_before_ready() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("io-expire", json!({"o": 1})));
+        let inner = FakeAdapter::new();
+        inner.set_next_reconcile(running_obs());
+        let advancing = Arc::new(ClockAdvancingAdapter {
+            inner,
+            clock: clock.clone(),
+            advance: 20.0,
+        });
+        let mut adapters = AdapterRegistry::new();
+        adapters.register("process", advancing.clone()).unwrap();
+        let recovered = recover_runtime(kernel.clone(), &adapters, timing()).unwrap();
+        assert_eq!(recovered.runner().active_count(), 0);
+        assert!(!recovered.runner().contains(launch.execution_id()));
+        assert_ne!(
+            kernel.task(launch.task_id()).unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(advancing.inner.start_call_count(), 0);
+    }
+
+    struct ClockAdvancingAdapter {
+        inner: FakeAdapter,
+        clock: Arc<ManualClock>,
+        advance: f64,
+    }
+
+    impl ExecutionAdapter for ClockAdvancingAdapter {
+        fn start_execution(
+            &self,
+            request: &agentype_adapter_api::ExecutionRequest,
+        ) -> AdapterResult<StartObservation> {
+            self.inner.start_execution(request)
+        }
+
+        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle)
+        }
+
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.interrupt_execution(handle)
+        }
+
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.terminate_execution(handle)
+        }
+
+        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+            self.inner.collect_outcome(handle)
+        }
+
+        fn reconcile_start(
+            &self,
+            request_id: &agentype_core::RequestId,
+            persisted_handle: Option<&RuntimeHandle>,
+        ) -> AdapterResult<StartObservation> {
+            self.clock.advance(self.advance);
+            self.inner.reconcile_start(request_id, persisted_handle)
+        }
     }
 }
