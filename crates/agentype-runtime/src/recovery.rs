@@ -176,9 +176,9 @@ fn replay_success_consequence(
         snapshot.lease_epoch(),
         Some(snapshot.execution_id()),
         &payload,
-        None,
+        snapshot.summary(),
         snapshot.quiescent_confirmed(),
-        false,
+        snapshot.incarnation_reusable(),
     ) {
         Ok(Some(result_id)) => Ok(TerminalReplayOutcome::ResultReplayed { result_id }),
         Ok(None) => Ok(TerminalReplayOutcome::WriterSafetySuspended),
@@ -203,7 +203,7 @@ fn replay_failure_consequence(
         Some(snapshot.execution_id()),
         true,
         snapshot.quiescent_confirmed(),
-        false,
+        snapshot.incarnation_reusable(),
     ) {
         Ok(_) => Ok(TerminalReplayOutcome::FailureReplayed { failure_class }),
         Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
@@ -460,8 +460,10 @@ fn collect_and_apply(
                     ExecutionState::Succeeded,
                     Some(&observation.runtime_handle.0),
                     outcome.payload.as_ref(),
+                    outcome.summary.as_deref(),
                     None,
                     outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                 )
                 .map_err(RecoveryError::from)?;
             match kernel.ack_success(
@@ -499,8 +501,10 @@ fn collect_and_apply(
                     ExecutionState::Failed,
                     Some(&observation.runtime_handle.0),
                     None,
+                    outcome.summary.as_deref(),
                     Some(failure_class),
                     outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                 )
                 .map_err(RecoveryError::from)?;
             match kernel.nack(
@@ -510,7 +514,7 @@ fn collect_and_apply(
                 Some(snapshot.execution_id()),
                 true,
                 outcome.quiescent_confirmed,
-                false,
+                outcome.incarnation_reusable,
             ) {
                 Ok(_) => Ok(ReconcileExecutionOutcome::TerminalFailure { failure_class }),
                 Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
@@ -564,9 +568,10 @@ impl StartupGuard {
         Ok(())
     }
 
-    fn commit(mut self) -> SupervisionRunner {
+    fn commit(mut self) -> Result<SupervisionRunner, RecoveryError> {
+        self.check_healthy()?;
         self.committed = true;
-        self.runner.take().expect("startup runner")
+        Ok(self.runner.take().expect("startup runner"))
     }
 }
 
@@ -663,11 +668,8 @@ fn recover_runtime_inner(
     kernel
         .revive_eligible_agents()
         .map_err(RecoveryError::from)?;
-    guard.check_healthy()?;
-
     assert_ready_invariant(&kernel, guard.runner())?;
-
-    let runner = guard.commit();
+    let runner = guard.commit()?;
     Ok(RecoveredRuntime { runner })
 }
 
@@ -742,8 +744,9 @@ mod tests {
         RuntimeHandle, StartObservation,
     };
     use agentype_core::{
-        AuthoritativeExecutionBinding, Claim, ExecutionState, FailureClass, ManualClock,
-        PartitionSpec, Retention, RetryPolicy, TaskSpec, TaskState,
+        AttemptState, AuthoritativeExecutionBinding, Claim, ExecutionState, FailureClass,
+        IncarnationState, LeaseState, ManualClock, PartitionSpec, Retention, RetryPolicy, TaskSpec,
+        TaskState,
     };
     use agentype_storage_sqlite::Kernel;
     use serde_json::json;
@@ -920,6 +923,145 @@ mod tests {
         }
         assert!(k.result_for_task(snap.task_id()).is_err());
         assert_ne!(k.task(snap.task_id()).unwrap().state, TaskState::Completed);
+    }
+
+    /// Crash-before-ACK must equal no-crash for summary + reusable WARM.
+    #[test]
+    fn crash_replay_matches_live_ack_for_reusable_success() {
+        fn run(
+            crash: bool,
+        ) -> (
+            String,
+            serde_json::Value,
+            TaskState,
+            AttemptState,
+            LeaseState,
+            IncarnationState,
+        ) {
+            let (_clock, k) = env();
+            let (claim, launch) = start_named(&k, TaskSpec::new("eq", json!({"o": 1})));
+            k.record_pending_physical_terminal(
+                launch.execution_id(),
+                ExecutionState::Succeeded,
+                Some(&json!({"session": 7})),
+                Some(&json!({"ok": true})),
+                Some("implemented parser"),
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+            if crash {
+                let snap = snapshot_of(&k, launch.execution_id());
+                match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+                    TerminalReplayOutcome::ResultReplayed { .. } => {}
+                    other => panic!("expected ResultReplayed, got {other:?}"),
+                }
+            } else {
+                k.ack_success(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    Some(launch.execution_id()),
+                    &json!({"ok": true}),
+                    Some("implemented parser"),
+                    true,
+                    true,
+                )
+                .unwrap();
+            }
+            let stored = k.result_for_task(launch.task_id()).unwrap();
+            let task = k.task(launch.task_id()).unwrap().state;
+            let attempt = k.attempt(&claim.attempt_id).unwrap().state;
+            let lease = k.lease_supervision_view(&claim.attempt_id).unwrap().state;
+            let inc = k.incarnation(launch.incarnation_id()).unwrap().state;
+            (
+                stored.summary.clone().unwrap_or_default(),
+                stored.payload,
+                task,
+                attempt,
+                lease,
+                inc,
+            )
+        }
+
+        let live = run(false);
+        let crashed = run(true);
+        assert_eq!(live.0, "implemented parser");
+        assert_eq!(crashed, live);
+        assert_eq!(live.5, IncarnationState::Warm);
+    }
+
+    /// Old UNKNOWN failure_class must not contaminate a later terminal success.
+    #[test]
+    fn pending_terminal_success_overwrites_old_failure_class() {
+        let (_clock, k) = env();
+        let (_claim, launch) = start_named(&k, TaskSpec::new("overwrite-class", json!({"o": 1})));
+        k.record_physical_outcome(
+            launch.execution_id(),
+            ExecutionState::Unknown,
+            Some(&json!({"h": 1})),
+            None,
+            Some(FailureClass::ExecutionLost),
+            false,
+            false,
+        )
+        .unwrap();
+        k.record_pending_physical_terminal(
+            launch.execution_id(),
+            ExecutionState::Succeeded,
+            Some(&json!({"h": 1})),
+            Some(&json!({"ok": true})),
+            Some("done"),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let snap = snapshot_of(&k, launch.execution_id());
+        assert!(snap.failure_class().is_none());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::ResultReplayed { .. } => {}
+            other => panic!("expected ResultReplayed, got {other:?}"),
+        }
+        let stored = k.result_for_task(launch.task_id()).unwrap();
+        assert_eq!(stored.payload, json!({"ok": true}));
+        assert_eq!(stored.summary.as_deref(), Some("done"));
+    }
+
+    /// Old UNKNOWN outcome_json must not become the Result body when the
+    /// collected success payload is None.
+    #[test]
+    fn pending_terminal_success_overwrites_old_outcome_json() {
+        let (_clock, k) = env();
+        let (_claim, launch) = start_named(&k, TaskSpec::new("overwrite-payload", json!({"o": 1})));
+        k.record_physical_outcome(
+            launch.execution_id(),
+            ExecutionState::Unknown,
+            Some(&json!({"h": 1})),
+            Some(&json!({"stale": true})),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        k.record_pending_physical_terminal(
+            launch.execution_id(),
+            ExecutionState::Succeeded,
+            Some(&json!({"h": 1})),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let snap = snapshot_of(&k, launch.execution_id());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::ResultReplayed { .. } => {}
+            other => panic!("expected ResultReplayed, got {other:?}"),
+        }
+        let stored = k.result_for_task(launch.task_id()).unwrap();
+        assert_eq!(stored.payload, serde_json::Value::Null);
     }
 
     /// UNKNOWN + outcome_json is NOT authoritative terminal success proof.

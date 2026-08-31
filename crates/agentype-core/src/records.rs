@@ -227,6 +227,7 @@ pub struct ResultRecord {
     pub batch_id: BatchId,
     pub state: ResultState,
     pub payload: Value,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug)]

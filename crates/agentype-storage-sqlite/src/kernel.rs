@@ -127,6 +127,8 @@ pub struct ExecutionReconciliationSnapshot {
     terminal_confirmed: bool,
     quiescent_confirmed: bool,
     outcome_json: Option<Value>,
+    summary: Option<String>,
+    incarnation_reusable: bool,
     failure_class: Option<FailureClass>,
     /// Creation-time writer-safety evidence (frozen at commitment).
     attempt_isolation: bool,
@@ -202,6 +204,8 @@ impl ExecutionReconciliationSnapshot {
             terminal_confirmed: row.terminal_confirmed,
             quiescent_confirmed: row.quiescent_confirmed,
             outcome_json: row.outcome_json.map(|o| json_load(&o)).transpose()?,
+            summary: row.summary,
+            incarnation_reusable: row.incarnation_reusable,
             failure_class: row
                 .failure_class
                 .map(|c| FailureClass::parse_sql(&c))
@@ -269,6 +273,14 @@ impl ExecutionReconciliationSnapshot {
 
     pub fn outcome_json(&self) -> Option<&Value> {
         self.outcome_json.as_ref()
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    pub fn incarnation_reusable(&self) -> bool {
+        self.incarnation_reusable
     }
 
     pub fn failure_class(&self) -> Option<FailureClass> {
@@ -1534,8 +1546,10 @@ impl Kernel {
         state: ExecutionState,
         runtime_handle: Option<&Value>,
         payload: Option<&Value>,
+        summary: Option<&str>,
         failure_class: Option<FailureClass>,
         quiescent_confirmed: bool,
+        incarnation_reusable: bool,
     ) -> Result<(), Error> {
         if !matches!(
             state,
@@ -1550,18 +1564,21 @@ impl Kernel {
             let from = ExecutionState::parse_sql(&execution.state)?;
             require_physical_transition(from, state)?;
             let handle_json = runtime_handle.map(json_dump);
-            let outcome_json = payload.map(json_dump);
+            // Covering snapshot of the collected outcome: overwrite/clear, never
+            // COALESCE old UNKNOWN evidence into the pending terminal envelope.
+            let outcome_json = json_dump(&payload.cloned().unwrap_or(Value::Null));
             tx.execute(
                 "UPDATE executions SET state=?1,runtime_handle_json=COALESCE(?2,runtime_handle_json),
-                 outcome_json=COALESCE(?3,outcome_json),
-                 failure_class=COALESCE(?4,failure_class),
-                 terminal_confirmed=1,quiescent_confirmed=?5,updated_at=?6,ended_at=?6
-                 WHERE id=?7",
+                 outcome_json=?3,summary=?4,failure_class=?5,incarnation_reusable=?6,
+                 terminal_confirmed=1,quiescent_confirmed=?7,updated_at=?8,ended_at=?8
+                 WHERE id=?9",
                 params![
                     state.as_sql(),
                     handle_json,
                     outcome_json,
+                    summary,
                     failure_class.map(|c| c.as_sql().to_string()),
+                    incarnation_reusable as i64,
                     quiescent_confirmed as i64,
                     now,
                     execution.id
@@ -2394,7 +2411,7 @@ impl Kernel {
                     "SELECT e.id,e.request_id,e.task_id,e.attempt_id,e.incarnation_id,
                             e.adapter_kind,e.state,e.runtime_handle_json,
                             e.terminal_confirmed,e.quiescent_confirmed,e.outcome_json,
-                            e.failure_class,e.attempt_isolation,
+                            e.summary,e.incarnation_reusable,e.failure_class,e.attempt_isolation,
                             a.lease_epoch,a.state,l.state,l.expires_at,t.state,t.current_attempt_id
                      FROM executions e
                      JOIN attempts a ON a.id=e.attempt_id
@@ -2418,14 +2435,16 @@ impl Kernel {
                         terminal_confirmed: r.get::<_, i64>(8)? != 0,
                         quiescent_confirmed: r.get::<_, i64>(9)? != 0,
                         outcome_json: r.get(10)?,
-                        failure_class: r.get(11)?,
-                        attempt_isolation: r.get::<_, i64>(12)? != 0,
-                        lease_epoch: r.get(13)?,
-                        attempt_state: r.get(14)?,
-                        lease_state: r.get(15)?,
-                        lease_expires_at: r.get(16)?,
-                        task_state: r.get(17)?,
-                        current_attempt_id: r.get(18)?,
+                        summary: r.get(11)?,
+                        incarnation_reusable: r.get::<_, i64>(12)? != 0,
+                        failure_class: r.get(13)?,
+                        attempt_isolation: r.get::<_, i64>(14)? != 0,
+                        lease_epoch: r.get(15)?,
+                        attempt_state: r.get(16)?,
+                        lease_state: r.get(17)?,
+                        lease_expires_at: r.get(18)?,
+                        task_state: r.get(19)?,
+                        current_attempt_id: r.get(20)?,
                     })
                 })
                 .map_err(map_sqlite)?;
@@ -2788,7 +2807,7 @@ impl Kernel {
     pub fn result_for_task(&self, task_id: &TaskId) -> Result<ResultRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(
-                "SELECT id,task_id,batch_id,state,payload_json FROM results WHERE task_id=?1",
+                "SELECT id,task_id,batch_id,state,payload_json,summary FROM results WHERE task_id=?1",
                 params![task_id.as_str()],
                 |r| {
                     Ok((
@@ -2797,6 +2816,7 @@ impl Kernel {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
@@ -2806,13 +2826,14 @@ impl Kernel {
                 }
                 other => map_sqlite(other),
             })
-            .and_then(|(id, tid, bid, state, payload)| {
+            .and_then(|(id, tid, bid, state, payload, summary)| {
                 Ok(ResultRecord {
                     id: ResultId::from_string(id),
                     task_id: TaskId::from_string(tid),
                     batch_id: BatchId::from_string(bid),
                     state: ResultState::parse_sql(&state)?,
                     payload: json_load(&payload)?,
+                    summary,
                 })
             })
         })
@@ -3093,6 +3114,8 @@ struct ReconciliationRow {
     terminal_confirmed: bool,
     quiescent_confirmed: bool,
     outcome_json: Option<String>,
+    summary: Option<String>,
+    incarnation_reusable: bool,
     failure_class: Option<String>,
     attempt_isolation: bool,
     lease_epoch: i64,

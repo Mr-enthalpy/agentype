@@ -884,8 +884,10 @@ impl<'a> Dispatcher<'a> {
                     ExecutionState::Succeeded,
                     observed_handle,
                     outcome.payload.as_ref(),
+                    outcome.summary.as_deref(),
                     None,
                     outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                 )?;
                 let result_id = match self.kernel.ack_success(
                     &claim.attempt_id,
@@ -935,8 +937,10 @@ impl<'a> Dispatcher<'a> {
                     ExecutionState::Failed,
                     observed_handle,
                     None,
+                    outcome.summary.as_deref(),
                     Some(failure_class),
                     outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                 )?;
                 self.nack_start(
                     claim,
@@ -1001,14 +1005,17 @@ impl<'a> Dispatcher<'a> {
     /// `FAILED` + `terminal_confirmed`) is a different machine from Task
     /// authority; a crash between the two leaves a legal pending-consequence
     /// row, never an invented UNKNOWN stand-in.
+    #[allow(clippy::too_many_arguments)]
     fn persist_terminal_evidence(
         &self,
         execution_id: &ExecutionId,
         state: ExecutionState,
         observed_handle: &Value,
         payload: Option<&Value>,
+        summary: Option<&str>,
         failure_class: Option<FailureClass>,
         quiescent_confirmed: bool,
+        incarnation_reusable: bool,
     ) -> Result<(), DispatchError> {
         self.kernel
             .record_pending_physical_terminal(
@@ -1016,8 +1023,10 @@ impl<'a> Dispatcher<'a> {
                 state,
                 Some(observed_handle),
                 payload,
+                summary,
                 failure_class,
                 quiescent_confirmed,
+                incarnation_reusable,
             )
             .map_err(DispatchError::Persistence)
     }

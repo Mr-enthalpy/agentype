@@ -114,11 +114,19 @@ same functions as recovery. One vocabulary.
 ## 6. Terminal replay (D)
 
 Physical history and ACK/NACK are different machines (PR #10 audit P1-1).
-After `collect_outcome`, the dispatcher/recovery collect path persists an
-honest pending terminal fact via `Kernel::record_pending_physical_terminal`
-(`SUCCEEDED`/`FAILED` + `terminal_confirmed`, handle copied, **no**
-incarnation presence) **before** ACK/NACK. Incarnation WARM/TERMINATED is
-decided by the subsequent authority transaction (`incarnation_reusable`).
+After `collect_outcome`, the dispatcher/recovery collect path persists a
+**lossless covering snapshot** of the collected outcome via
+`Kernel::record_pending_physical_terminal` (`state`, payload as JSON —
+including `null`, `summary`, `failure_class` cleared on success,
+`terminal_confirmed`, `quiescent_confirmed`, `incarnation_reusable`,
+handle) **before** ACK/NACK. Terminal fields overwrite; they never
+`COALESCE` UNKNOWN-era evidence. Incarnation WARM/TERMINATED is still
+decided by the subsequent ACK/NACK. Schema version **3** holds `summary`
+and `incarnation_reusable` on `executions` (the proven bump exception).
+
+Replay uses those same inputs: `ack_success(payload, summary, quiescent,
+reusable)`. Crash-before-ACK ≡ no-crash for Result body/summary and
+Incarnation continuity.
 
 Legal crash window:
 
@@ -205,8 +213,8 @@ Steady-state "worker dies 30s after admission" is not solved here.
 
 ## 10. Test mapping (plan §26)
 
-Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 132 +
-storage 107 = **275** rust tests. Clippy `-D warnings` clean.
+Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 135 +
+storage 108 = **279** rust tests. Clippy `-D warnings` clean.
 
 Exact-head CI also ran the Python V0.1 oracle: Ubuntu 3.11 `Ran 162 tests`,
 **160 passed + 2 skipped**.
@@ -217,7 +225,7 @@ Exact-head CI also ran the Python V0.1 oracle: Ubuntu 3.11 `Ran 162 tests`,
 | B Re-admission (8–20) | UNKNOWN→RUNNING grant+admit; persisted RUNNING / adapter presence never admit alone; stale cannot admit; `start_execution` count stays 0; `now == expires_at` on reconcile; ACK/cancel vs re-admission both orders |
 | C Unresolved (21–29) | default reconcile UNKNOWN; LOST never admitted; missing adapter is availability; unisolated WRITE → SUSPENDED |
 | D Terminal collection (30–37) | terminal-looking reconcile requires collect; collected success ACKs |
-| E Durable replay (38–43) | physical SUCCEEDED+current → Result; FAILED+current → NACK; stale success no Result; UNKNOWN+outcome_json is **not** proof; exactly-one Result |
+| E Durable replay (38–43) | physical SUCCEEDED+current → Result; FAILED+current → NACK; stale success no Result; UNKNOWN+outcome_json is **not** proof; exactly-one Result; crash≡no-crash for summary+WARM; old failure_class/outcome_json overwritten |
 | F Startup lifecycle (44–52) | empty recover; readmit during barrier; **readmit then later fatal clears admissions** (StartupGuard Drop) |
 | G Final barrier (53–60) | READY invariant uses `looks_current_at(now)`; lease expiry during adapter I/O swept before READY; no dispatch inside recovery |
 | H Regression (61–66) | M4/M5.1–M5.3 suites green; no M6 types |
@@ -283,5 +291,11 @@ re-admission both orders, cancel vs re-admission both orders, exact expiry
 boundary, lease expiry during adapter I/O before READY.
 
 **P2.** `structurally_current()` vs `looks_current_at(now)` (READY uses the
-latter). Python oracle evidence is the exact-head CI result (160 passed,
-2 skipped), not “not re-run this session”.
+latter). `StartupGuard::commit()` performs the last runner health check
+together with ownership transfer. Python oracle evidence is the exact-head
+CI result (160 passed, 2 skipped).
+
+**Second-audit P1 (durability).** Pending terminal is a covering overwrite
+of the collected outcome (`summary`, `incarnation_reusable`, JSON-null
+payload, cleared `failure_class`). Schema v3. Crash-before-ACK ≡ no-crash
+for Result summary and Incarnation WARM.
