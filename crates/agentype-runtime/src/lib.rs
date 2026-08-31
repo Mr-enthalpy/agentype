@@ -948,6 +948,7 @@ impl<'a> Dispatcher<'a> {
                     failure_class,
                     true,
                     outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                     Some(observed_handle),
                 )?;
                 Ok(DispatchOneOutcome::TerminalFailure {
@@ -996,6 +997,7 @@ impl<'a> Dispatcher<'a> {
             failure_class,
             false,
             false,
+            false,
             observed_handle,
         )
     }
@@ -1035,6 +1037,7 @@ impl<'a> Dispatcher<'a> {
     /// authority (task §27) only legal physical history is recorded — never
     /// a Task-authority mutation — and the observed runtime handle is kept
     /// whenever the adapter produced one.
+    #[allow(clippy::too_many_arguments)]
     fn nack_start(
         &self,
         claim: &Claim,
@@ -1042,6 +1045,7 @@ impl<'a> Dispatcher<'a> {
         failure_class: FailureClass,
         terminal_confirmed: bool,
         quiescent_confirmed: bool,
+        incarnation_reusable: bool,
         observed_handle: Option<&Value>,
     ) -> Result<(), DispatchError> {
         match self.kernel.nack(
@@ -1051,7 +1055,7 @@ impl<'a> Dispatcher<'a> {
             Some(execution_id),
             terminal_confirmed,
             quiescent_confirmed,
-            false,
+            incarnation_reusable,
         ) {
             Ok(_) => Ok(()),
             Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => self

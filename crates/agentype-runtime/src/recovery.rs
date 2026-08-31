@@ -991,6 +991,62 @@ mod tests {
         assert_eq!(live.5, IncarnationState::Warm);
     }
 
+    /// Crash-before-NACK must equal live NACK for reusable terminal failure.
+    #[test]
+    fn crash_replay_matches_live_nack_for_reusable_failure() {
+        fn run(crash: bool) -> (TaskState, AttemptState, IncarnationState) {
+            let (_clock, k) = env();
+            let spec = TaskSpec::new("fail-eq", json!({"o": 1})).retry(RetryPolicy {
+                max_attempts: 3,
+                retry_classes: vec![FailureClass::Timeout],
+                base_backoff_seconds: 1.0,
+                max_backoff_seconds: 8.0,
+            });
+            let (claim, launch) = start_named(&k, spec);
+            k.record_pending_physical_terminal(
+                launch.execution_id(),
+                ExecutionState::Failed,
+                Some(&json!({"session": 7})),
+                None,
+                Some("worker failed"),
+                Some(FailureClass::Timeout),
+                true,
+                true,
+            )
+            .unwrap();
+            if crash {
+                let snap = snapshot_of(&k, launch.execution_id());
+                match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+                    TerminalReplayOutcome::FailureReplayed { .. } => {}
+                    other => panic!("expected FailureReplayed, got {other:?}"),
+                }
+            } else {
+                k.nack(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    FailureClass::Timeout,
+                    Some(launch.execution_id()),
+                    true,
+                    true,
+                    true,
+                )
+                .unwrap();
+            }
+            assert!(k.result_for_task(launch.task_id()).is_err());
+            (
+                k.task(launch.task_id()).unwrap().state,
+                k.attempt(&claim.attempt_id).unwrap().state,
+                k.incarnation(launch.incarnation_id()).unwrap().state,
+            )
+        }
+
+        let live = run(false);
+        let crashed = run(true);
+        assert_eq!(crashed, live);
+        assert_eq!(live.2, IncarnationState::Warm);
+        assert_eq!(live.0, TaskState::RetryWait);
+    }
+
     /// Old UNKNOWN failure_class must not contaminate a later terminal success.
     #[test]
     fn pending_terminal_success_overwrites_old_failure_class() {

@@ -92,7 +92,8 @@ Corrupt/blank durable `adapter_kind` or unparsable JSON fails the whole
 read (internal durable uncertainty stops the Scheduler). Order is
 availability-only: current-authority first by nearest expiry.
 
-No schema version bump (stays at 2).
+Schema version **3** (pending-terminal envelope: `summary`,
+`incarnation_reusable`). Older files fail closed at open.
 
 ---
 
@@ -213,8 +214,8 @@ Steady-state "worker dies 30s after admission" is not solved here.
 
 ## 10. Test mapping (plan §26)
 
-Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 135 +
-storage 108 = **279** rust tests. Clippy `-D warnings` clean.
+Workspace: adapter-api 8 + core 20 + execution-config 8 + runtime 136 +
+storage 108 = **280** rust tests. Clippy `-D warnings` clean.
 
 Exact-head CI also ran the Python V0.1 oracle: Ubuntu 3.11 `Ran 162 tests`,
 **160 passed + 2 skipped**.
@@ -299,3 +300,8 @@ CI result (160 passed, 2 skipped).
 of the collected outcome (`summary`, `incarnation_reusable`, JSON-null
 payload, cleared `failure_class`). Schema v3. Crash-before-ACK ≡ no-crash
 for Result summary and Incarnation WARM.
+
+**Third-audit P1 (failure crash-equivalence).** Live collected terminal
+failure NACK now passes `outcome.incarnation_reusable` through `nack_start`
+(unresolved NACK still uses `false`). Crash-before-NACK ≡ live NACK for
+reusable FAILED (Incarnation WARM, no Result).
