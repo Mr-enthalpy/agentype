@@ -1,16 +1,27 @@
 //! M5 runtime configuration boundary, M4 recovery orchestration, the M5.2
 //! dispatch commit boundary (adapter composition + one authoritative physical
-//! start per claim), and the M5.3 supervision admission / heartbeat ownership
-//! boundary (see the `supervision` module). Restart reconciliation, notifier
-//! delivery, and the daemon loop belong to subsequent M5 tasks.
+//! start per claim), the M5.3 supervision admission / heartbeat ownership
+//! boundary (see the `supervision` module), and the M5.4 restart
+//! reconciliation barrier (see the `recovery` module). Notifier delivery and
+//! the daemon loop belong to subsequent M5 tasks.
 
 #![forbid(unsafe_code)]
 
 pub use agentype_execution_config::*;
 
+pub mod observation;
+pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
+pub use observation::{
+    adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
+    CollectedOutcomeKind, StartObservationKind,
+};
+pub use recovery::{
+    reconcile_one_execution, recover_runtime, replay_persisted_terminal_consequence, AdmissionSink,
+    ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
+};
 pub use supervision::{
     RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
 };
@@ -21,7 +32,7 @@ use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
     ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
 };
-use agentype_storage_sqlite::Kernel;
+use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,19 +262,6 @@ impl AdapterRegistry {
     }
 }
 
-/// Mechanical normalization of adapter invocation errors into the existing
-/// `FailureClass` vocabulary (task §14). Vendor-specific classification
-/// belongs inside adapter implementations; no provider strings are parsed
-/// at the runtime or core layer.
-pub fn adapter_invocation_failure_class(err: &AdapterError) -> FailureClass {
-    match err {
-        AdapterError::Unavailable(_) => FailureClass::ResourceUnavailable,
-        AdapterError::DeadlineExceeded(_) => FailureClass::Timeout,
-        AdapterError::Protocol(_) => FailureClass::AdapterProtocolFailure,
-        AdapterError::Other(_) => FailureClass::StartFailure,
-    }
-}
-
 /// Failure to compose or execute the dispatch path.
 ///
 /// Error-model categories (task §31): Authority, Configuration,
@@ -461,7 +459,31 @@ pub struct SupervisionAdmission {
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl SupervisionAdmission {
-    pub(crate) fn new(
+    /// The ONLY constructor (M5.4 §4 API freeze): admissions are minted
+    /// exclusively from a Kernel-produced `RunningAuthorityGrant` - the live
+    /// return value of a fenced RUNNING-confirmation-and-renewal
+    /// transaction. There is no raw-IDs path, so a persisted
+    /// `state='RUNNING'` row can never become an admission, and the
+    /// live-dispatch and restart-reconciliation flows share one authority
+    /// boundary by construction.
+    pub fn from_grant(grant: RunningAuthorityGrant) -> Self {
+        Self {
+            execution_id: grant.execution_id().clone(),
+            request_id: grant.request_id().clone(),
+            attempt_id: grant.attempt_id().clone(),
+            lease_epoch: grant.lease_epoch(),
+            generation: NEXT_ADMISSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            first_renewed_at: grant.renewed_at(),
+            lease_expires_at: grant.expires_at(),
+        }
+    }
+
+    /// TEST-ONLY construction seam (crate tests): the registry's
+    /// identity-conflict rejection logic needs capabilities that violate
+    /// identity consistency, which no legitimate Kernel grant can produce.
+    /// Production code has no path to this constructor (cfg(test)).
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
         execution_id: ExecutionId,
         request_id: RequestId,
         attempt_id: AttemptId,
@@ -725,8 +747,8 @@ impl<'a> Dispatcher<'a> {
     }
 
     /// Classify and durably persist the immediate start observation using
-    /// the existing fenced scheduler primitives (task §12). No heartbeat, no
-    /// supervision admission (M5.3), no reconciliation loop (M5.4).
+    /// the shared M5.4-C classifier and the existing fenced scheduler
+    /// primitives (task §12). Dispatch and recovery share one vocabulary.
     fn commit_start_observation(
         &self,
         claim: &Claim,
@@ -735,167 +757,100 @@ impl<'a> Dispatcher<'a> {
         request_id: &RequestId,
         observation: StartObservation,
     ) -> Result<DispatchOneOutcome, DispatchError> {
-        // RUNNING: fenced confirmation + first lease renewal must succeed
-        // atomically before any supervision admission (M4 invariant) — and
-        // only a protocol-consistent observation may reach that admission.
-        // An ACTIVE state carrying end-of-execution claims (terminal proof,
-        // quiescence proof, or a failure class) is internally contradictory;
-        // fail closed as unresolved so no SupervisionAdmission can ever
-        // be minted from it (M5.3 prerequisite, audit round 10).
-        if observation.state == ExecutionState::Running
-            && !observation.ambiguous
-            && (observation.terminal_confirmed
-                || observation.quiescent_confirmed
-                || observation.failure_class.is_some())
-        {
-            let failure_class = FailureClass::AdapterProtocolFailure;
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                failure_class,
-                Some(&observation.runtime_handle.0),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(failure_class),
-            });
-        }
-        if observation.state == ExecutionState::Running && !observation.ambiguous {
-            return match self.kernel.confirm_running_and_renew(
-                &claim.attempt_id,
-                claim.lease_epoch,
-                execution_id,
-                &observation.runtime_handle.0,
-            ) {
-                Ok(expires_at) => Ok(DispatchOneOutcome::RunningAdmitted {
-                    admission: SupervisionAdmission::new(
-                        execution_id.clone(),
-                        request_id.clone(),
-                        claim.attempt_id.clone(),
-                        claim.lease_epoch,
-                        // The scheduling anchor is the fenced first-renewal
-                        // COMMIT time, recovered exactly from the
-                        // transaction's own expiry output (expires_at =
-                        // commit + lease_seconds). The supervision registry
-                        // schedules from this anchor — never from the
-                        // possibly-delayed handoff or insertion time (M5.3
-                        // audit P1-1: deadline phase correctness).
-                        expires_at - self.kernel.lease_seconds(),
-                        expires_at,
-                    ),
-                }),
-                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                    // Task §27: authority became stale between Execution
-                    // creation and the start result. Never restore Task
-                    // authority and never admit supervision; persist physical
-                    // history only where legal (the observed handle is kept
-                    // for M5.4 reconcile_start).
-                    self.kernel
-                        .record_physical_outcome(
+        match normalize_start_observation(&observation) {
+            StartObservationKind::ExactRunning => {
+                match self.kernel.confirm_running_and_renew(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    execution_id,
+                    &observation.runtime_handle.0,
+                ) {
+                    Ok(grant) => Ok(DispatchOneOutcome::RunningAdmitted {
+                        // The grant IS the fenced first-renewal output: its
+                        // renewed_at is the exact commit time (the
+                        // deadline-scheduling anchor - never the
+                        // possibly-delayed handoff or insertion time, M5.3
+                        // audit P1-1). The admission is minted exclusively
+                        // from this Kernel-produced capability (M5.4 S4).
+                        admission: SupervisionAdmission::from_grant(grant),
+                    }),
+                    Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                        // Task §27: authority became stale between Execution
+                        // creation and the start result. Never restore Task
+                        // authority and never admit supervision; persist
+                        // physical history only (the observed handle is kept
+                        // for M5.4 reconcile_start).
+                        self.kernel
+                            .record_physical_outcome(
+                                execution_id,
+                                ExecutionState::Unknown,
+                                Some(&observation.runtime_handle.0),
+                                None,
+                                None,
+                                false,
+                                false,
+                            )
+                            .map_err(DispatchError::Persistence)?;
+                        Ok(DispatchOneOutcome::StartIndeterminate {
+                            execution_id: execution_id.clone(),
+                            request_id: request_id.clone(),
+                            failure_class: None,
+                        })
+                    }
+                    Err(err) => Err(DispatchError::Persistence(err)),
+                }
+            }
+            StartObservationKind::TerminalCandidate => {
+                // The start observation's own terminal/quiescence claims are
+                // never trusted on their own — collect_outcome is
+                // authoritative for ACK/NACK proof (spec 07).
+                let outcome = match adapter.collect_outcome(&observation.runtime_handle) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        let failure_class = adapter_invocation_failure_class(&err);
+                        self.persist_unresolved_physical_then_nack(
+                            claim,
                             execution_id,
-                            ExecutionState::Unknown,
+                            failure_class,
                             Some(&observation.runtime_handle.0),
-                            None,
-                            None,
-                            false,
-                            false,
-                        )
-                        .map_err(DispatchError::Persistence)?;
-                    Ok(DispatchOneOutcome::StartIndeterminate {
-                        execution_id: execution_id.clone(),
-                        request_id: request_id.clone(),
-                        failure_class: None,
-                    })
-                }
-                Err(err) => Err(DispatchError::Persistence(err)),
-            };
+                        )?;
+                        return Ok(DispatchOneOutcome::StartIndeterminate {
+                            execution_id: execution_id.clone(),
+                            request_id: request_id.clone(),
+                            failure_class: Some(failure_class),
+                        });
+                    }
+                };
+                self.commit_collected_outcome(
+                    claim,
+                    execution_id,
+                    request_id,
+                    &observation.runtime_handle.0,
+                    outcome,
+                )
+            }
+            StartObservationKind::Unresolved { failure_class } => {
+                // Ambiguous / unresolved / protocol-invalid: potentially
+                // side-effecting, never quiescent, never blindly restarted.
+                // Mechanical nonterminal NACK lets writer-safety decide.
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    execution_id,
+                    failure_class,
+                    Some(&observation.runtime_handle.0),
+                )?;
+                Ok(DispatchOneOutcome::StartIndeterminate {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                    failure_class: Some(failure_class),
+                })
+            }
         }
-
-        // Ambiguous / unresolved start: potentially side-effecting, never
-        // quiescent, never blindly restarted. The observed physical history
-        // (with the handle) is persisted, then the mechanical nonterminal
-        // NACK lets the existing writer-safety rules decide between policy
-        // retry and WRITER_QUIESCENCE_UNKNOWN suspension (task §28).
-        if observation.ambiguous
-            || matches!(
-                observation.state,
-                ExecutionState::Unknown | ExecutionState::Starting
-            )
-        {
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                FailureClass::ExecutionLost,
-                Some(&observation.runtime_handle.0),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(FailureClass::ExecutionLost),
-            });
-        }
-
-        // Terminal observation (success OR failure): the collected outcome is
-        // authoritative for ACK/NACK proof (spec 07) and must be re-classified
-        // before any authoritative mutation. The start observation's own
-        // terminal/quiescence claims are never trusted on their own — a start
-        // that claims FAILED+quiescent while the physical execution may still
-        // be RUNNING must not unlock a WRITE replacement, and a start that
-        // claims SUCCEEDED may collect a failure, an unresolved state, or an
-        // internally contradictory result.
-        if observation.terminal_confirmed {
-            let outcome = match adapter.collect_outcome(&observation.runtime_handle) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    // Collection failed after a terminal claim: the physical
-                    // reality is unresolved, so the start's terminal/quiescence
-                    // claims are NOT inherited. Persist unresolved history with
-                    // the observed handle, then a nonterminal NACK — the
-                    // Execution does not stay in STARTING with the handle
-                    // missing from durable history.
-                    let failure_class = adapter_invocation_failure_class(&err);
-                    self.persist_unresolved_physical_then_nack(
-                        claim,
-                        execution_id,
-                        failure_class,
-                        Some(&observation.runtime_handle.0),
-                    )?;
-                    return Ok(DispatchOneOutcome::StartIndeterminate {
-                        execution_id: execution_id.clone(),
-                        request_id: request_id.clone(),
-                        failure_class: Some(failure_class),
-                    });
-                }
-            };
-            return self.commit_collected_outcome(
-                claim,
-                execution_id,
-                request_id,
-                &observation.runtime_handle.0,
-                outcome,
-            );
-        }
-
-        // Any other observation shape is unresolved by definition.
-        self.persist_unresolved_physical_then_nack(
-            claim,
-            execution_id,
-            FailureClass::ExecutionLost,
-            Some(&observation.runtime_handle.0),
-        )?;
-        Ok(DispatchOneOutcome::StartIndeterminate {
-            execution_id: execution_id.clone(),
-            request_id: request_id.clone(),
-            failure_class: Some(FailureClass::ExecutionLost),
-        })
     }
 
     /// Authoritative classification of the collected outcome (spec 07:
-    /// `collect_outcome` is authoritative for ACK/NACK proof). Only
-    /// `SUCCEEDED` with terminal proof can ACK; nonterminal collections
-    /// inherit zero terminal/quiescence proof; internally contradictory
-    /// results are never ACKed as success.
+    /// `collect_outcome` is authoritative for ACK/NACK proof). Dispatch and
+    /// recovery share `normalize_collected_outcome`.
     fn commit_collected_outcome(
         &self,
         claim: &Claim,
@@ -904,98 +859,36 @@ impl<'a> Dispatcher<'a> {
         observed_handle: &Value,
         outcome: agentype_adapter_api::ExecutionOutcome,
     ) -> Result<DispatchOneOutcome, DispatchError> {
-        // Internally contradictory: an ACTIVE physical state cannot carry
-        // terminal proof. STARTING/RUNNING/UNKNOWN reported with
-        // terminal/quiescence bits would otherwise inject a quiescence proof
-        // through the failure path (durable_quiescent = terminal &&
-        // quiescent) and unlock a WRITE replacement writer while the
-        // physical execution is still active. Fail closed: unresolved
-        // physical state, zero inherited proof, observed handle preserved.
-        if outcome.terminal_confirmed && outcome.state.is_active_physical() {
-            let failure_class = FailureClass::AdapterProtocolFailure;
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                failure_class,
-                Some(observed_handle),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(failure_class),
-            });
-        }
-        // Internally contradictory: LOST is never a confirmed end (core
-        // fences incarnation presence to LOST even under terminal/quiescence
-        // claims, and unresolved states carry no proof bits). A collected
-        // LOST is always unresolved physical reality — it must never take the
-        // terminal-NACK quiescence-safe path (which would unlock a WRITE
-        // replacement writer) nor be laundered into FAILED, which would
-        // foreclose the later LOST refinement.
-        if outcome.state == ExecutionState::Lost
-            && (outcome.terminal_confirmed || outcome.quiescent_confirmed)
-        {
-            let failure_class = FailureClass::AdapterProtocolFailure;
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                failure_class,
-                Some(observed_handle),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(failure_class),
-            });
-        }
-        // Internally contradictory: success claimed without terminal proof.
-        if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
-            let failure_class = FailureClass::InvalidResult;
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                failure_class,
-                Some(observed_handle),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(failure_class),
-            });
-        }
-        // Internally contradictory: quiescence claimed without terminality.
-        if outcome.quiescent_confirmed && !outcome.terminal_confirmed {
-            let failure_class = FailureClass::AdapterProtocolFailure;
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                execution_id,
-                failure_class,
-                Some(observed_handle),
-            )?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class: Some(failure_class),
-            });
-        }
-
-        if outcome.terminal_confirmed {
-            if outcome.state == ExecutionState::Succeeded {
-                // Authoritative success: the only path to ACK. Physical
-                // evidence (the locator) is committed BEFORE the authority
-                // consequence when quiescence is not proven (cleanup locator)
-                // OR when the incarnation is reusable (continuity locator:
-                // a WARM promotion must keep the handle the next execution
-                // on this resident incarnation will need).
+        match normalize_collected_outcome(&outcome) {
+            CollectedOutcomeKind::Unresolved { failure_class } => {
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    execution_id,
+                    failure_class,
+                    Some(observed_handle),
+                )?;
+                Ok(DispatchOneOutcome::StartIndeterminate {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                    failure_class: Some(failure_class),
+                })
+            }
+            CollectedOutcomeKind::TerminalSuccess => {
+                // Authoritative success: persist the physical terminal fact
+                // BEFORE the ACK consequence (M5.4 P1-1). The two machines
+                // stay separate: Execution=SUCCEEDED+terminal_confirmed may
+                // be durable while Attempt/Lease are still ACTIVE.
                 let payload = outcome.payload.clone().unwrap_or(Value::Null);
-                if !outcome.quiescent_confirmed || outcome.incarnation_reusable {
-                    self.persist_terminal_evidence(
-                        execution_id,
-                        observed_handle,
-                        outcome.payload.as_ref(),
-                        None,
-                    )?;
-                }
+                self.persist_terminal_evidence(
+                    execution_id,
+                    ExecutionState::Succeeded,
+                    observed_handle,
+                    outcome.payload.as_ref(),
+                    outcome.summary.as_deref(),
+                    None,
+                    outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
+                )?;
                 let result_id = match self.kernel.ack_success(
                     &claim.attempt_id,
                     claim.lease_epoch,
@@ -1007,10 +900,6 @@ impl<'a> Dispatcher<'a> {
                 ) {
                     Ok(result_id) => result_id,
                     Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                        // §27: authority expired between the start and the
-                        // authoritative ACK — persist physical history only
-                        // (the collected success and its handle survive),
-                        // never a Task-authority mutation.
                         self.kernel
                             .record_physical_outcome(
                                 execution_id,
@@ -1030,63 +919,45 @@ impl<'a> Dispatcher<'a> {
                     }
                     Err(err) => return Err(DispatchError::Persistence(err)),
                 };
-                return match result_id {
+                match result_id {
                     Some(result_id) => Ok(DispatchOneOutcome::TaskCompleted {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
                         result_id,
                     }),
-                    // ack_success returned None: the physical success was
-                    // durable but writer safety suspended the Task instead of
-                    // completing it (WRITER_SUCCESS_NOT_QUIESCENT). This is
-                    // NOT a Task completion.
                     None => Ok(DispatchOneOutcome::WriterSafetySuspendedAfterSuccess {
                         execution_id: execution_id.clone(),
                         request_id: request_id.clone(),
                     }),
-                };
+                }
             }
-            // Authoritative terminal failure. Physical evidence (the
-            // locator) is committed BEFORE the authority consequence when
-            // quiescence is not proven.
-            let failure_class = outcome.failure_class.unwrap_or(FailureClass::StartFailure);
-            if !outcome.quiescent_confirmed {
+            CollectedOutcomeKind::TerminalFailure { failure_class } => {
                 self.persist_terminal_evidence(
                     execution_id,
+                    ExecutionState::Failed,
                     observed_handle,
                     None,
+                    outcome.summary.as_deref(),
                     Some(failure_class),
+                    outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
                 )?;
+                self.nack_start(
+                    claim,
+                    execution_id,
+                    failure_class,
+                    true,
+                    outcome.quiescent_confirmed,
+                    outcome.incarnation_reusable,
+                    Some(observed_handle),
+                )?;
+                Ok(DispatchOneOutcome::TerminalFailure {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                    failure_class,
+                })
             }
-            self.nack_start(
-                claim,
-                execution_id,
-                failure_class,
-                true,
-                outcome.quiescent_confirmed,
-                Some(observed_handle),
-            )?;
-            return Ok(DispatchOneOutcome::TerminalFailure {
-                execution_id: execution_id.clone(),
-                request_id: request_id.clone(),
-                failure_class,
-            });
         }
-
-        // Nonterminal / unresolved collection: NO ACK, zero inherited
-        // terminal/quiescence proof — the physical state stays unresolved.
-        let failure_class = outcome.failure_class.unwrap_or(FailureClass::ExecutionLost);
-        self.persist_unresolved_physical_then_nack(
-            claim,
-            execution_id,
-            failure_class,
-            Some(observed_handle),
-        )?;
-        Ok(DispatchOneOutcome::StartIndeterminate {
-            execution_id: execution_id.clone(),
-            request_id: request_id.clone(),
-            failure_class: Some(failure_class),
-        })
     }
 
     /// Persist an unresolved physical observation and then run the mechanical
@@ -1126,44 +997,38 @@ impl<'a> Dispatcher<'a> {
             failure_class,
             false,
             false,
+            false,
             observed_handle,
         )
     }
 
-    /// Persist the collected terminal evidence BEFORE the authority
-    /// consequence: UNKNOWN with the observed handle and zero proof bits.
-    ///
-    /// Kernel mutation primitives (`nack`/`ack_success`) do not write
-    /// runtime_handle_json, so recording the evidence first is what makes the
-    /// physical locator crash-durable (audit round 8): a crash between the
-    /// evidence transaction and the authority transaction leaves the locator
-    /// durable with the authority consequence unapplied — safe to reconcile —
-    /// never the reverse. The terminal state itself is applied by the
-    /// authority transaction (UNKNOWN -> SUCCEEDED/FAILED), preserving the
-    /// frozen Kernel API.
-    ///
-    /// Two locator kinds justify the pre-persist (audit round 11): a CLEANUP
-    /// locator when quiescence is not proven (physical state unresolved), and
-    /// a CONTINUITY locator when the incarnation is reusable (a WARM
-    /// promotion must keep the handle the next execution on this resident
-    /// incarnation will read). Only a quiescence-proven, non-reusable end
-    /// deliberately skips it.
+    /// Persist the collected terminal physical fact BEFORE the ACK/NACK
+    /// authority consequence (M5.4 P1-1). Physical history (`SUCCEEDED` /
+    /// `FAILED` + `terminal_confirmed`) is a different machine from Task
+    /// authority; a crash between the two leaves a legal pending-consequence
+    /// row, never an invented UNKNOWN stand-in.
+    #[allow(clippy::too_many_arguments)]
     fn persist_terminal_evidence(
         &self,
         execution_id: &ExecutionId,
+        state: ExecutionState,
         observed_handle: &Value,
         payload: Option<&Value>,
+        summary: Option<&str>,
         failure_class: Option<FailureClass>,
+        quiescent_confirmed: bool,
+        incarnation_reusable: bool,
     ) -> Result<(), DispatchError> {
         self.kernel
-            .record_physical_outcome(
+            .record_pending_physical_terminal(
                 execution_id,
-                ExecutionState::Unknown,
+                state,
                 Some(observed_handle),
                 payload,
+                summary,
                 failure_class,
-                false,
-                false,
+                quiescent_confirmed,
+                incarnation_reusable,
             )
             .map_err(DispatchError::Persistence)
     }
@@ -1172,6 +1037,7 @@ impl<'a> Dispatcher<'a> {
     /// authority (task §27) only legal physical history is recorded — never
     /// a Task-authority mutation — and the observed runtime handle is kept
     /// whenever the adapter produced one.
+    #[allow(clippy::too_many_arguments)]
     fn nack_start(
         &self,
         claim: &Claim,
@@ -1179,6 +1045,7 @@ impl<'a> Dispatcher<'a> {
         failure_class: FailureClass,
         terminal_confirmed: bool,
         quiescent_confirmed: bool,
+        incarnation_reusable: bool,
         observed_handle: Option<&Value>,
     ) -> Result<(), DispatchError> {
         match self.kernel.nack(
@@ -1188,7 +1055,7 @@ impl<'a> Dispatcher<'a> {
             Some(execution_id),
             terminal_confirmed,
             quiescent_confirmed,
-            false,
+            incarnation_reusable,
         ) {
             Ok(_) => Ok(()),
             Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => self
@@ -1225,14 +1092,9 @@ impl<'a> Dispatcher<'a> {
     }
 }
 
-/// Restart authority barrier. Dispatch MUST NOT run until this returns.
-///
-/// Order (spec 14):
-/// 1. expire/revoke overdue authority and claims with no Execution
-/// 2. promote eligible retry waits
-/// 3. reconcile pool / revive eligible non-RETIRED agents
-///
-/// Adapter physical reconcile is M5. This function is the M4 authority half.
+/// M4 authority-only recovery convenience (expire + promote + pool + revive).
+/// M5.4 `recover_runtime` must NOT call this as Phase 1: promote/pool/revive
+/// belong after physical reconciliation (spec 14 / plan §17).
 pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
     kernel.recover_authority()
 }
@@ -3717,12 +3579,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         .unwrap()
     }
 
-    /// Audit P1 (round 8): the physical locator must be durable BEFORE the
-    /// authority consequence. A collected SUCCEEDED without quiescence proof
-    /// whose ack then fails hard leaves the Execution UNKNOWN with the
-    /// observed handle durable (evidence committed, consequence unapplied —
-    /// safe to reconcile). The pre-evidence order would have left STARTING
-    /// with no handle at this point.
+    /// Audit P1 (round 8 / M5.4 P1-1): the physical terminal fact must be
+    /// durable BEFORE the authority consequence. A collected SUCCEEDED
+    /// whose ack then fails hard leaves Execution=SUCCEEDED+terminal
+    /// (pending consequence, Attempt still current) with the observed
+    /// handle durable — never an UNKNOWN stand-in.
     #[test]
     fn dispatch_collected_success_evidence_durable_before_ack_consequence() {
         let (kernel, path, claim) = file_dispatch_env("crash-success");
@@ -3765,10 +3626,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let err = d.dispatch_claim(&claim).unwrap_err();
         assert!(matches!(err, DispatchError::Persistence(_)));
-        // Crash-window state: evidence and locator durable, consequence
-        // unapplied.
+        // Crash-window state: physical terminal + locator durable,
+        // authority consequence unapplied.
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "SUCCEEDED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 1})
@@ -3820,7 +3681,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let err = d.dispatch_claim(&claim).unwrap_err();
         assert!(matches!(err, DispatchError::Persistence(_)));
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "FAILED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 2})

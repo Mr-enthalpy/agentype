@@ -1,12 +1,12 @@
 //! Rust-era schema (fresh database). D-DB-MIGRATE is unresolved; this is not
 //! an in-place Python V0.1 upgrade.
 
-/// Schema version 2 adds `executions.adapter_kind` (the durable physical
-/// adapter binding identity frozen at execution commitment). Version 1
-/// databases structurally lack the column while claiming the same identity,
-/// so they are rejected at open (fail closed) instead of failing later at
-/// the first execution-commitment INSERT.
-pub const SCHEMA_VERSION: i64 = 2;
+/// Schema version 2 added `executions.adapter_kind`. Version 3 adds the
+/// lossless pending-terminal envelope (`summary`, `incarnation_reusable`)
+/// so crash-before-ACK/NACK can replay the same authority inputs as the
+/// live path (M5.4 P1). Older files are rejected at open (fail closed);
+/// D-DB-MIGRATE is still unresolved.
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -179,6 +179,8 @@ CREATE TABLE IF NOT EXISTS executions (
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
     outcome_json TEXT,
+    summary TEXT,
+    incarnation_reusable INTEGER NOT NULL DEFAULT 0 CHECK (incarnation_reusable IN (0,1)),
     failure_class TEXT,
     failure_code TEXT,
     failure_signature TEXT,
