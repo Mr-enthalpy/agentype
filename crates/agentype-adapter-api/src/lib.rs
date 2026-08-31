@@ -443,9 +443,15 @@ struct FakeState {
     next_start_error: Option<AdapterError>,
     next_observe: Option<ExecutionObservation>,
     next_outcome: Option<ExecutionOutcome>,
+    next_collect_error: Option<AdapterError>,
+    next_reconcile: Option<StartObservation>,
+    next_reconcile_error: Option<AdapterError>,
     unavailable: bool,
     start_call_count: usize,
+    reconcile_call_count: usize,
+    collect_call_count: usize,
     last_request: Option<ExecutionRequest>,
+    last_reconcile_request_id: Option<RequestId>,
 }
 
 impl FakeAdapter {
@@ -482,6 +488,43 @@ impl FakeAdapter {
             .lock()
             .expect("fake adapter")
             .last_request
+            .clone()
+    }
+
+    /// Inject the next `reconcile_start` observation (consumed once).
+    pub fn set_next_reconcile(&self, obs: StartObservation) {
+        self.inner.lock().expect("fake adapter").next_reconcile = Some(obs);
+    }
+
+    /// Inject an error for the next `reconcile_start` call (consumed once).
+    pub fn set_next_reconcile_error(&self, err: AdapterError) {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .next_reconcile_error = Some(err);
+    }
+
+    /// Inject an error for the next `collect_outcome` call (consumed once).
+    pub fn set_next_collect_error(&self, err: AdapterError) {
+        self.inner.lock().expect("fake adapter").next_collect_error = Some(err);
+    }
+
+    pub fn reconcile_call_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .reconcile_call_count
+    }
+
+    pub fn collect_call_count(&self) -> usize {
+        self.inner.lock().expect("fake adapter").collect_call_count
+    }
+
+    pub fn last_reconcile_request_id(&self) -> Option<RequestId> {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .last_reconcile_request_id
             .clone()
     }
 }
@@ -546,6 +589,13 @@ impl ExecutionAdapter for FakeAdapter {
 
     fn collect_outcome(&self, _handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
         let mut g = self.inner.lock().expect("fake adapter");
+        g.collect_call_count += 1;
+        if g.unavailable {
+            return Err(AdapterError::Unavailable("adapter unavailable".into()));
+        }
+        if let Some(err) = g.next_collect_error.take() {
+            return Err(err);
+        }
         Ok(g.next_outcome.take().unwrap_or(ExecutionOutcome {
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
@@ -562,7 +612,15 @@ impl ExecutionAdapter for FakeAdapter {
         request_id: &RequestId,
         persisted_handle: Option<&RuntimeHandle>,
     ) -> AdapterResult<StartObservation> {
-        let g = self.inner.lock().expect("fake adapter");
+        let mut g = self.inner.lock().expect("fake adapter");
+        g.reconcile_call_count += 1;
+        g.last_reconcile_request_id = Some(request_id.clone());
+        if g.unavailable {
+            return Err(AdapterError::Unavailable("adapter unavailable".into()));
+        }
+        if let Some(err) = g.next_reconcile_error.take() {
+            return Err(err);
+        }
         let non_empty = |h: &RuntimeHandle| {
             h.0.as_object()
                 .map(|o| !o.is_empty())
@@ -576,7 +634,7 @@ impl ExecutionAdapter for FakeAdapter {
                 .cloned()
                 .unwrap_or_default(),
         };
-        Ok(StartObservation {
+        Ok(g.next_reconcile.take().unwrap_or(StartObservation {
             state: ExecutionState::Unknown,
             runtime_handle: handle,
             ambiguous: true,
@@ -584,7 +642,7 @@ impl ExecutionAdapter for FakeAdapter {
             detail: Some("fake reconcile is identity-preserving by request".into()),
             terminal_confirmed: false,
             quiescent_confirmed: false,
-        })
+        }))
     }
 }
 
