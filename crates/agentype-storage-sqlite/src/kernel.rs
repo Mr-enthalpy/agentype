@@ -92,6 +92,187 @@ impl RunningAuthorityGrant {
     }
 }
 
+/// Non-authoritative persisted facts for one reconcilable Execution
+/// (M5.4 plan §5): everything recovery needs to route and interpret a
+/// candidate, and nothing that grants permission. Any ACK/NACK/re-renew
+/// must re-enter a Kernel transaction for current authority validation.
+///
+/// This type is Clone because it is a fact record, not a capability —
+/// contrast `RunningAuthorityGrant`, which is the only object from which
+/// a `SupervisionAdmission` may be minted. There is no conversion from
+/// snapshot to grant.
+///
+/// Deliberately EXCLUDED: current Claim DTOs, current target/profile
+/// resolution, model/provider identity, SpawnSource, terminal/session
+/// semantics (M5.4 plan §5 forbidden list).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionReconciliationSnapshot {
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    task_id: TaskId,
+    attempt_id: AttemptId,
+    /// Historical fencing identity of the attempt — NOT an authority grant.
+    lease_epoch: LeaseEpoch,
+    incarnation_id: IncarnationId,
+    /// Adapter routing identity frozen at execution commitment (M5.2):
+    /// recovery routes by THIS, never by current target/profile config.
+    adapter_kind: String,
+    persisted_state: ExecutionState,
+    runtime_handle: Value,
+    terminal_confirmed: bool,
+    quiescent_confirmed: bool,
+    outcome_json: Option<Value>,
+    failure_class: Option<FailureClass>,
+    /// Creation-time writer-safety evidence (frozen at commitment).
+    attempt_isolation: bool,
+    current_authority_hint: CurrentAuthorityHint,
+}
+
+/// Joined Attempt/Lease/Task facts used only to *route and order*
+/// reconciliation work (M5.4 plan §10/§21). Re-validated by every
+/// authority-bearing Kernel transaction; never a grant, never sufficient
+/// to mint a `SupervisionAdmission`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentAuthorityHint {
+    attempt_is_active: bool,
+    lease_is_active: bool,
+    lease_expires_at: Option<UnixTime>,
+    task_state: TaskState,
+    is_current_attempt: bool,
+}
+
+impl CurrentAuthorityHint {
+    pub fn attempt_is_active(&self) -> bool {
+        self.attempt_is_active
+    }
+
+    pub fn lease_is_active(&self) -> bool {
+        self.lease_is_active
+    }
+
+    pub fn lease_expires_at(&self) -> Option<UnixTime> {
+        self.lease_expires_at
+    }
+
+    pub fn task_state(&self) -> TaskState {
+        self.task_state
+    }
+
+    pub fn is_current_attempt(&self) -> bool {
+        self.is_current_attempt
+    }
+
+    /// Availability diagnostic: the joined rows currently look like a
+    /// live Attempt/Lease that is this Task's current attempt. NOT a
+    /// grant — `confirm_running_and_renew` must still succeed.
+    pub fn looks_current(&self) -> bool {
+        self.attempt_is_active && self.lease_is_active && self.is_current_attempt
+    }
+}
+
+impl ExecutionReconciliationSnapshot {
+    fn from_row(row: ReconciliationRow) -> Result<Self, Error> {
+        if row.adapter_kind.trim().is_empty() {
+            return Err(Error::invariant(format!(
+                "execution {} has a blank durable adapter routing identity",
+                row.execution_id
+            )));
+        }
+        Ok(Self {
+            execution_id: ExecutionId::from_string(&row.execution_id),
+            request_id: RequestId::from_string(&row.request_id),
+            task_id: TaskId::from_string(&row.task_id),
+            attempt_id: AttemptId::from_string(&row.attempt_id),
+            lease_epoch: LeaseEpoch(row.lease_epoch as u64),
+            incarnation_id: IncarnationId::from_string(&row.incarnation_id),
+            adapter_kind: row.adapter_kind,
+            persisted_state: ExecutionState::parse_sql(&row.state)?,
+            runtime_handle: json_load(&row.runtime_handle)?,
+            terminal_confirmed: row.terminal_confirmed,
+            quiescent_confirmed: row.quiescent_confirmed,
+            outcome_json: row.outcome_json.map(|o| json_load(&o)).transpose()?,
+            failure_class: row
+                .failure_class
+                .map(|c| FailureClass::parse_sql(&c))
+                .transpose()?,
+            attempt_isolation: row.attempt_isolation,
+            current_authority_hint: CurrentAuthorityHint {
+                attempt_is_active: row.attempt_state == "ACTIVE",
+                lease_is_active: row.lease_state.as_deref() == Some("ACTIVE"),
+                lease_expires_at: row.lease_expires_at,
+                task_state: TaskState::parse_sql(&row.task_state)?,
+                is_current_attempt: row
+                    .current_attempt_id
+                    .as_deref()
+                    .map(|cur| cur == row.attempt_id)
+                    .unwrap_or(false),
+            },
+        })
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    /// Historical fencing identity. Not permission to renew.
+    pub fn lease_epoch(&self) -> LeaseEpoch {
+        self.lease_epoch
+    }
+
+    pub fn incarnation_id(&self) -> &IncarnationId {
+        &self.incarnation_id
+    }
+
+    /// Frozen at execution commitment. Recovery MUST route by this value.
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+
+    pub fn persisted_state(&self) -> ExecutionState {
+        self.persisted_state
+    }
+
+    pub fn runtime_handle(&self) -> &Value {
+        &self.runtime_handle
+    }
+
+    pub fn terminal_confirmed(&self) -> bool {
+        self.terminal_confirmed
+    }
+
+    pub fn quiescent_confirmed(&self) -> bool {
+        self.quiescent_confirmed
+    }
+
+    pub fn outcome_json(&self) -> Option<&Value> {
+        self.outcome_json.as_ref()
+    }
+
+    pub fn failure_class(&self) -> Option<FailureClass> {
+        self.failure_class
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+
+    pub fn current_authority_hint(&self) -> CurrentAuthorityHint {
+        self.current_authority_hint
+    }
+}
+
 /// Narrow supervision view of a lease: renewal bookkeeping only (heartbeat
 /// bookkeeping, expiry, state). Test and timing assertion surface — it grants
 /// no authority.
@@ -1493,27 +1674,31 @@ impl Kernel {
                 now,
             )?;
             if let Some(exec) = &execution {
-                if !matches!(exec.state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
+                if exec.state == "LOST" {
+                    // LOST is already "not RUNNING". Closing current authority
+                    // must not rewrite physical history (M5.4 plan §10-C).
+                } else if !matches!(exec.state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
                     return Err(Error::invalid_transition(format!(
                         "execution {} cannot fail from {}",
                         exec.id, exec.state
                     )));
+                } else {
+                    let next = if terminal_confirmed { "FAILED" } else { "UNKNOWN" };
+                    tx.execute(
+                        "UPDATE executions SET state=?1,failure_class=?2,terminal_confirmed=?3,
+                         quiescent_confirmed=CASE WHEN ?3 THEN ?4 ELSE 0 END,
+                         updated_at=?5,ended_at=CASE WHEN ?3 THEN ?5 ELSE ended_at END WHERE id=?6",
+                        params![
+                            next,
+                            failure_class.as_sql(),
+                            terminal_confirmed as i64,
+                            quiescent_confirmed as i64,
+                            now,
+                            exec.id
+                        ],
+                    )
+                    .map_err(map_sqlite)?;
                 }
-                let next = if terminal_confirmed { "FAILED" } else { "UNKNOWN" };
-                tx.execute(
-                    "UPDATE executions SET state=?1,failure_class=?2,terminal_confirmed=?3,
-                     quiescent_confirmed=CASE WHEN ?3 THEN ?4 ELSE 0 END,
-                     updated_at=?5,ended_at=CASE WHEN ?3 THEN ?5 ELSE ended_at END WHERE id=?6",
-                    params![
-                        next,
-                        failure_class.as_sql(),
-                        terminal_confirmed as i64,
-                        quiescent_confirmed as i64,
-                        now,
-                        exec.id
-                    ],
-                )
-                .map_err(map_sqlite)?;
             }
             let presence = if failure_class == FailureClass::ExecutionLost {
                 ExecutionState::Lost
@@ -2115,6 +2300,66 @@ impl Kernel {
             )
             .map_err(map_sqlite)?;
             Ok(SupervisedRenewal::Renewed(expires_at))
+        })
+    }
+
+    /// Read every persisted Execution with its current-authority context
+    /// for restart reconciliation (M5.4 plan §5/§10). Read-only, non-
+    /// authority-bearing: this never renews a Lease and never produces a
+    /// `RunningAuthorityGrant`.
+    ///
+    /// Ordering is an availability optimization only (M5.4 plan §21) —
+    /// correctness never depends on it: current-authority candidates first
+    /// (by nearest lease expiry), stale physical-history candidates last.
+    pub fn reconciliation_candidates(&self) -> Result<Vec<ExecutionReconciliationSnapshot>, Error> {
+        self.store.query(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.id,e.request_id,e.task_id,e.attempt_id,e.incarnation_id,
+                            e.adapter_kind,e.state,e.runtime_handle_json,
+                            e.terminal_confirmed,e.quiescent_confirmed,e.outcome_json,
+                            e.failure_class,e.attempt_isolation,
+                            a.lease_epoch,a.state,l.state,l.expires_at,t.state,t.current_attempt_id
+                     FROM executions e
+                     JOIN attempts a ON a.id=e.attempt_id
+                     LEFT JOIN leases l ON l.attempt_id=a.id
+                     JOIN tasks t ON t.id=e.task_id
+                     ORDER BY CASE WHEN a.state='ACTIVE' AND l.state='ACTIVE' THEN 0 ELSE 1 END,
+                              l.expires_at ASC",
+                )
+                .map_err(map_sqlite)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ReconciliationRow {
+                        execution_id: r.get(0)?,
+                        request_id: r.get(1)?,
+                        task_id: r.get(2)?,
+                        attempt_id: r.get(3)?,
+                        incarnation_id: r.get(4)?,
+                        adapter_kind: r.get(5)?,
+                        state: r.get(6)?,
+                        runtime_handle: r.get(7)?,
+                        terminal_confirmed: r.get::<_, i64>(8)? != 0,
+                        quiescent_confirmed: r.get::<_, i64>(9)? != 0,
+                        outcome_json: r.get(10)?,
+                        failure_class: r.get(11)?,
+                        attempt_isolation: r.get::<_, i64>(12)? != 0,
+                        lease_epoch: r.get(13)?,
+                        attempt_state: r.get(14)?,
+                        lease_state: r.get(15)?,
+                        lease_expires_at: r.get(16)?,
+                        task_state: r.get(17)?,
+                        current_attempt_id: r.get(18)?,
+                    })
+                })
+                .map_err(map_sqlite)?;
+            let collected: Vec<ReconciliationRow> = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)?;
+            collected
+                .into_iter()
+                .map(ExecutionReconciliationSnapshot::from_row)
+                .collect()
         })
     }
 
@@ -2756,6 +3001,30 @@ impl Kernel {
             })
         })
     }
+}
+
+/// Raw reconciliation join row (typed decode happens per field so corrupt
+/// durable values surface as typed errors, not silent defaults).
+struct ReconciliationRow {
+    execution_id: String,
+    request_id: String,
+    task_id: String,
+    attempt_id: String,
+    incarnation_id: String,
+    adapter_kind: String,
+    state: String,
+    runtime_handle: String,
+    terminal_confirmed: bool,
+    quiescent_confirmed: bool,
+    outcome_json: Option<String>,
+    failure_class: Option<String>,
+    attempt_isolation: bool,
+    lease_epoch: i64,
+    attempt_state: String,
+    lease_state: Option<String>,
+    lease_expires_at: Option<UnixTime>,
+    task_state: String,
+    current_attempt_id: Option<String>,
 }
 
 fn claim_selected(

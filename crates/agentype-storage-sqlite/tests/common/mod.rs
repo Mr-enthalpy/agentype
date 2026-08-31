@@ -249,6 +249,18 @@ pub fn fixture_incarnation(
     id
 }
 
+/// Rewrite the frozen adapter routing identity (fail-closed fixture).
+pub fn fixture_execution_adapter_kind(db: &FixtureDb, exec: &ExecutionId, kind: &str) {
+    let conn = connect(&db.path);
+    let n = conn
+        .execute(
+            "UPDATE executions SET adapter_kind=?1 WHERE id=?2",
+            rusqlite::params![kind, exec.as_str()],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "fixture execution row missing");
+}
+
 pub fn fixture_execution(
     db: &FixtureDb,
     exec: &ExecutionId,
