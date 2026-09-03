@@ -1014,7 +1014,9 @@ mod tests {
             .unwrap();
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         k.submit_batch(&[TaskSpec::new("while-blocked", json!({"o": 1}))])
             .unwrap();
         let d = Dispatcher::new(k.as_ref(), &registry, &adapters);

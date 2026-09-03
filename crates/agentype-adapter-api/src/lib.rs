@@ -1,9 +1,14 @@
 //! Generic ExecutionAdapter traits and opaque handles.
 //!
 //! Core MUST NOT import vendor names. Adapters own process/session mapping.
-//! M4 ships the trait surface and an in-memory fake; a reference adapter is M5.
+//! Every Scheduler-facing method receives one absolute monotonic deadline
+//! (M5.6). A reference adapter that proves real I/O is M5.7.
 
 #![deny(unsafe_code)]
+
+mod deadline;
+
+pub use deadline::{AdapterDeadline, AdapterOperation, DeadlineConfigError};
 
 use agentype_core::{
     AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, FailureClass,
@@ -15,21 +20,108 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Mechanical class of a failed Scheduler-facing adapter invocation.
+/// This is not a Scheduler `FailureClass` and does not prove physical state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterErrorKind {
+    DeadlineExceeded,
+    Unavailable,
+    Protocol,
+    Other,
+}
+
+const ADAPTER_DIAGNOSTIC_MAX_CHARS: usize = 512;
+
+/// Bounded adapter diagnostic. The adapter MUST sanitize secrets, tokens,
+/// Authorization headers, env, worker payload, and full provider bodies.
+/// The type only enforces length.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdapterError {
-    DeadlineExceeded(String),
-    Protocol(String),
-    Unavailable(String),
-    Other(String),
+pub struct AdapterDiagnostic(String);
+
+impl AdapterDiagnostic {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(
+            raw.into()
+                .chars()
+                .take(ADAPTER_DIAGNOSTIC_MAX_CHARS)
+                .collect(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Failed Scheduler-facing adapter operation. Optional `runtime_handle_hint`
+/// is physical locator evidence only: not RUNNING, not terminal, not
+/// quiescent, not Task authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterError {
+    kind: AdapterErrorKind,
+    diagnostic: Option<AdapterDiagnostic>,
+    runtime_handle_hint: Option<RuntimeHandle>,
+}
+
+impl AdapterError {
+    pub fn new(kind: AdapterErrorKind) -> Self {
+        Self {
+            kind,
+            diagnostic: None,
+            runtime_handle_hint: None,
+        }
+    }
+
+    pub fn deadline_exceeded(msg: impl Into<String>) -> Self {
+        Self::new(AdapterErrorKind::DeadlineExceeded).with_diagnostic(msg)
+    }
+
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self::new(AdapterErrorKind::Unavailable).with_diagnostic(msg)
+    }
+
+    pub fn protocol(msg: impl Into<String>) -> Self {
+        Self::new(AdapterErrorKind::Protocol).with_diagnostic(msg)
+    }
+
+    pub fn other(msg: impl Into<String>) -> Self {
+        Self::new(AdapterErrorKind::Other).with_diagnostic(msg)
+    }
+
+    pub fn with_diagnostic(mut self, msg: impl Into<String>) -> Self {
+        self.diagnostic = Some(AdapterDiagnostic::new(msg));
+        self
+    }
+
+    pub fn with_handle_hint(mut self, handle: RuntimeHandle) -> Self {
+        self.runtime_handle_hint = Some(handle);
+        self
+    }
+
+    pub fn kind(&self) -> AdapterErrorKind {
+        self.kind
+    }
+
+    pub fn diagnostic(&self) -> Option<&str> {
+        self.diagnostic.as_ref().map(AdapterDiagnostic::as_str)
+    }
+
+    pub fn runtime_handle_hint(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle_hint.as_ref()
+    }
 }
 
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DeadlineExceeded(m) => write!(f, "execution deadline exceeded: {m}"),
-            Self::Protocol(m) => write!(f, "adapter protocol violation: {m}"),
-            Self::Unavailable(m) => write!(f, "adapter runtime unavailable: {m}"),
-            Self::Other(m) => write!(f, "adapter error: {m}"),
+        let kind = match self.kind {
+            AdapterErrorKind::DeadlineExceeded => "execution deadline exceeded",
+            AdapterErrorKind::Protocol => "adapter protocol violation",
+            AdapterErrorKind::Unavailable => "adapter runtime unavailable",
+            AdapterErrorKind::Other => "adapter error",
+        };
+        match self.diagnostic() {
+            Some(d) => write!(f, "{kind}: {d}"),
+            None => write!(f, "{kind}"),
         }
     }
 }
@@ -374,8 +466,15 @@ impl ExecutionRequest {
         &self.profile_options
     }
 
-    /// Configured profile timeout input (seconds). Deadline *enforcement* is
-    /// a later-milestone adapter concern; this is the configured input only.
+    /// Configured profile timeout input (seconds). This is execution/profile
+    /// configuration ONLY (M5.6 §5): it MAY configure a provider turn or
+    /// worker execution timeout inside a real adapter, but it MUST NOT be
+    /// auto-copied onto any Scheduler-facing operation deadline
+    /// (start/observe/reconcile/collect/interrupt/terminate). Operation
+    /// latency bounds come exclusively from the installed
+    /// `AdapterDeadlinePolicy`; a real adapter may consider both this input
+    /// and `AdapterDeadline::remaining()`, but the Scheduler-facing call
+    /// always returns by its `AdapterDeadline`.
     pub fn profile_timeout_seconds(&self) -> Option<f64> {
         self.profile_timeout_seconds
     }
@@ -412,19 +511,41 @@ pub struct ExecutionOutcome {
 }
 
 pub trait ExecutionAdapter: Send + Sync {
-    fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation>;
-    fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
-    fn interrupt_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
-    fn terminate_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation>;
-    fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome>;
+    fn start_execution(
+        &self,
+        request: &ExecutionRequest,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<StartObservation>;
+    fn observe_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation>;
+    fn interrupt_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation>;
+    fn terminate_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation>;
+    fn collect_outcome(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionOutcome>;
     /// Spec 07: narrow interface UNCHANGED from V0.1. Reconciliation is keyed
     /// by the stable start request identity because an ambiguous start may
     /// leave the scheduler without a complete runtime handle; the persisted
-    /// handle, when present, is only a hint for the adapter.
+    /// handle, when present, is only a hint for the adapter. The deadline is
+    /// one absolute endpoint for this Scheduler-facing call, including cleanup.
     fn reconcile_start(
         &self,
         request_id: &RequestId,
         persisted_handle: Option<&RuntimeHandle>,
+        deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation>;
 }
 
@@ -442,12 +563,21 @@ struct FakeState {
     next_start: Option<StartObservation>,
     next_start_error: Option<AdapterError>,
     next_observe: Option<ExecutionObservation>,
+    next_observe_error: Option<AdapterError>,
+    next_interrupt_error: Option<AdapterError>,
+    next_terminate_error: Option<AdapterError>,
     next_outcome: Option<ExecutionOutcome>,
     next_collect_error: Option<AdapterError>,
     next_reconcile: Option<StartObservation>,
     next_reconcile_error: Option<AdapterError>,
+    last_deadline: Option<AdapterDeadline>,
+    last_operation: Option<AdapterOperation>,
+    deadline_by_operation: HashMap<AdapterOperation, AdapterDeadline>,
     unavailable: bool,
     start_call_count: usize,
+    observe_call_count: usize,
+    interrupt_call_count: usize,
+    terminate_call_count: usize,
     reconcile_call_count: usize,
     collect_call_count: usize,
     last_request: Option<ExecutionRequest>,
@@ -509,6 +639,56 @@ impl FakeAdapter {
         self.inner.lock().expect("fake adapter").next_collect_error = Some(err);
     }
 
+    /// Inject an error for the next `observe_execution` call (consumed once).
+    pub fn set_next_observe_error(&self, err: AdapterError) {
+        self.inner.lock().expect("fake adapter").next_observe_error = Some(err);
+    }
+
+    /// Inject an error for the next `interrupt_execution` call (consumed once).
+    pub fn set_next_interrupt_error(&self, err: AdapterError) {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .next_interrupt_error = Some(err);
+    }
+
+    /// Inject an error for the next `terminate_execution` call (consumed once).
+    pub fn set_next_terminate_error(&self, err: AdapterError) {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .next_terminate_error = Some(err);
+    }
+
+    pub fn observe_call_count(&self) -> usize {
+        self.inner.lock().expect("fake adapter").observe_call_count
+    }
+
+    pub fn interrupt_call_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .interrupt_call_count
+    }
+
+    pub fn terminate_call_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .terminate_call_count
+    }
+
+    /// The most recent deadline a given Scheduler-facing operation received
+    /// (per-operation recorder; independent of `last_deadline()`).
+    pub fn deadline_for(&self, op: AdapterOperation) -> Option<AdapterDeadline> {
+        self.inner
+            .lock()
+            .expect("fake adapter")
+            .deadline_by_operation
+            .get(&op)
+            .copied()
+    }
+
     pub fn reconcile_call_count(&self) -> usize {
         self.inner
             .lock()
@@ -527,15 +707,31 @@ impl FakeAdapter {
             .last_reconcile_request_id
             .clone()
     }
+
+    pub fn last_deadline(&self) -> Option<AdapterDeadline> {
+        self.inner.lock().expect("fake adapter").last_deadline
+    }
+
+    pub fn last_operation(&self) -> Option<AdapterOperation> {
+        self.inner.lock().expect("fake adapter").last_operation
+    }
 }
 
 impl ExecutionAdapter for FakeAdapter {
-    fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+    fn start_execution(
+        &self,
+        request: &ExecutionRequest,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<StartObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
         g.start_call_count += 1;
         g.last_request = Some(request.clone());
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::StartExecution);
+        g.deadline_by_operation
+            .insert(AdapterOperation::StartExecution, *deadline);
         if g.unavailable {
-            return Err(AdapterError::Unavailable(format!(
+            return Err(AdapterError::unavailable(format!(
                 "target {} unavailable",
                 request.execution_target()
             )));
@@ -560,10 +756,22 @@ impl ExecutionAdapter for FakeAdapter {
         }))
     }
 
-    fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
+    fn observe_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
+        g.observe_call_count += 1;
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::ObserveExecution);
+        g.deadline_by_operation
+            .insert(AdapterOperation::ObserveExecution, *deadline);
         if g.unavailable {
-            return Err(AdapterError::Unavailable("adapter unavailable".into()));
+            return Err(AdapterError::unavailable("adapter unavailable"));
+        }
+        if let Some(err) = g.next_observe_error.take() {
+            return Err(err);
         }
         Ok(g.next_observe.take().unwrap_or(ExecutionObservation {
             state: ExecutionState::Running,
@@ -573,12 +781,49 @@ impl ExecutionAdapter for FakeAdapter {
         }))
     }
 
-    fn interrupt_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
-        self.observe_execution(handle)
+    fn interrupt_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation> {
+        let mut g = self.inner.lock().expect("fake adapter");
+        g.interrupt_call_count += 1;
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::InterruptExecution);
+        g.deadline_by_operation
+            .insert(AdapterOperation::InterruptExecution, *deadline);
+        if g.unavailable {
+            return Err(AdapterError::unavailable("adapter unavailable"));
+        }
+        if let Some(err) = g.next_interrupt_error.take() {
+            return Err(err);
+        }
+        Ok(g.next_observe.take().unwrap_or(ExecutionObservation {
+            state: ExecutionState::Running,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            detail: Some(handle.0.to_string()),
+        }))
     }
 
-    fn terminate_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
+    fn terminate_execution(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionObservation> {
         let _ = handle;
+        let mut g = self.inner.lock().expect("fake adapter");
+        g.terminate_call_count += 1;
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::TerminateExecution);
+        g.deadline_by_operation
+            .insert(AdapterOperation::TerminateExecution, *deadline);
+        if g.unavailable {
+            return Err(AdapterError::unavailable("adapter unavailable"));
+        }
+        if let Some(err) = g.next_terminate_error.take() {
+            return Err(err);
+        }
         Ok(ExecutionObservation {
             state: ExecutionState::Terminated,
             terminal_confirmed: true,
@@ -587,11 +832,19 @@ impl ExecutionAdapter for FakeAdapter {
         })
     }
 
-    fn collect_outcome(&self, _handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+    fn collect_outcome(
+        &self,
+        _handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ExecutionOutcome> {
         let mut g = self.inner.lock().expect("fake adapter");
         g.collect_call_count += 1;
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::CollectOutcome);
+        g.deadline_by_operation
+            .insert(AdapterOperation::CollectOutcome, *deadline);
         if g.unavailable {
-            return Err(AdapterError::Unavailable("adapter unavailable".into()));
+            return Err(AdapterError::unavailable("adapter unavailable"));
         }
         if let Some(err) = g.next_collect_error.take() {
             return Err(err);
@@ -611,12 +864,17 @@ impl ExecutionAdapter for FakeAdapter {
         &self,
         request_id: &RequestId,
         persisted_handle: Option<&RuntimeHandle>,
+        deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
         g.reconcile_call_count += 1;
         g.last_reconcile_request_id = Some(request_id.clone());
+        g.last_deadline = Some(*deadline);
+        g.last_operation = Some(AdapterOperation::ReconcileStart);
+        g.deadline_by_operation
+            .insert(AdapterOperation::ReconcileStart, *deadline);
         if g.unavailable {
-            return Err(AdapterError::Unavailable("adapter unavailable".into()));
+            return Err(AdapterError::unavailable("adapter unavailable"));
         }
         if let Some(err) = g.next_reconcile_error.take() {
             return Err(err);
@@ -651,6 +909,7 @@ impl ExecutionAdapter for FakeAdapter {
 mod tests {
     use super::*;
     use agentype_execution_config::FrozenExecutionSafety;
+    use std::time::Instant;
 
     /// Coherent synthetic launch fixture: the snapshot's attempt identity and
     /// its Attempt-bound safety proof share one `AuthoritativeExecutionBinding`
@@ -707,17 +966,21 @@ mod tests {
         }
     }
 
+    fn dl() -> AdapterDeadline {
+        AdapterDeadline::after(std::time::Duration::from_secs(5)).unwrap()
+    }
+
     #[test]
     fn fake_does_not_invent_quiescence_from_enum_names() {
         let fake = FakeAdapter::new();
         let mock = mock_launch();
         let launch = mock.snapshot;
         let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
-        let start = fake.start_execution(&req).unwrap();
+        let start = fake.start_execution(&req, &dl()).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
         let rec = fake
-            .reconcile_start(req.request_id(), Some(&start.runtime_handle))
+            .reconcile_start(req.request_id(), Some(&start.runtime_handle), &dl())
             .unwrap();
         assert!(rec.ambiguous);
         assert!(!rec.quiescent_confirmed);
@@ -729,13 +992,13 @@ mod tests {
         let mock = mock_launch();
         let launch = mock.snapshot;
         let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
-        let start = fake.start_execution(&req).unwrap();
+        let start = fake.start_execution(&req, &dl()).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
         // identity was persisted. Reconciliation must locate the runtime by
         // request identity alone (spec 07: reconcile_start is UNCHANGED from
         // V0.1 and takes request_id + optional persisted handle).
-        let rec = fake.reconcile_start(req.request_id(), None).unwrap();
+        let rec = fake.reconcile_start(req.request_id(), None, &dl()).unwrap();
         assert_eq!(rec.runtime_handle, start.runtime_handle);
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
@@ -745,7 +1008,9 @@ mod tests {
     #[test]
     fn unknown_request_reconciles_ambiguous_without_proof() {
         let fake = FakeAdapter::new();
-        let rec = fake.reconcile_start(&RequestId::new(), None).unwrap();
+        let rec = fake
+            .reconcile_start(&RequestId::new(), None, &dl())
+            .unwrap();
         assert!(rec.ambiguous);
         assert!(!rec.terminal_confirmed);
         assert!(!rec.quiescent_confirmed);
@@ -894,16 +1159,21 @@ mod tests {
         let mock = mock_launch();
         let launch = mock.snapshot;
         let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
-        let _ = fake.start_execution(&req).unwrap();
-        let _ = fake.start_execution(&req).unwrap();
+        let _ = fake.start_execution(&req, &dl()).unwrap();
+        let _ = fake.start_execution(&req, &dl()).unwrap();
         assert_eq!(fake.start_call_count(), 2);
         assert_eq!(fake.last_request().as_ref(), Some(&req));
+        assert_eq!(
+            fake.last_operation(),
+            Some(AdapterOperation::StartExecution)
+        );
+        assert!(fake.last_deadline().is_some());
 
         // An injected start error is consumed exactly once.
-        fake.set_next_start_error(AdapterError::DeadlineExceeded("cleanup".into()));
-        assert!(fake.start_execution(&req).is_err());
+        fake.set_next_start_error(AdapterError::deadline_exceeded("cleanup"));
+        assert!(fake.start_execution(&req, &dl()).is_err());
         assert_eq!(fake.start_call_count(), 3);
-        assert!(fake.start_execution(&req).is_ok());
+        assert!(fake.start_execution(&req, &dl()).is_ok());
     }
 
     /// Audit P2: from_launch fails closed when the launch snapshot and the
@@ -966,5 +1236,278 @@ mod tests {
         assert!(isolated_env.attempt_isolation());
         let err = ExecutionRequest::from_launch(&mock.snapshot, &isolated_env).unwrap_err();
         assert!(err.detail.contains("attempt_isolation"), "got: {err:?}");
+    }
+
+    /// M5.6 §20/#30-31: an AdapterError can carry partial runtime-handle
+    /// evidence learned before failure. The hint is physical locator
+    /// history only — it is not RUNNING, terminal, or quiescence proof.
+    #[test]
+    fn adapter_error_carries_handle_hint_without_terminal_proof() {
+        let hint = RuntimeHandle(serde_json::json!({"thread_id": 7}));
+        let err = AdapterError::deadline_exceeded("turn/start exceeded operation budget")
+            .with_handle_hint(hint.clone());
+        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+        assert_eq!(err.runtime_handle_hint(), Some(&hint));
+        // The error exposes no state, terminal, or quiescence accessor: the
+        // locator says "the adapter learned this", nothing more.
+        let bare = AdapterError::protocol("no locator earned");
+        assert_eq!(bare.runtime_handle_hint(), None);
+        assert_eq!(bare.kind(), AdapterErrorKind::Protocol);
+    }
+
+    /// Deterministic M5.6 conformance probe (plan §42/§50). Simulates one
+    /// Scheduler-facing operation whose internal stages and exception
+    /// cleanup all observe ONE absolute endpoint. Determinism comes from
+    /// `AdapterDeadline::from_instant` + `remaining_at`; there is no OS
+    /// timing and no sleep.
+    struct DeadlineProbe {
+        endpoints: std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>,
+        fail_primary: bool,
+        cleanup_exhausts: bool,
+    }
+
+    impl DeadlineProbe {
+        fn new(fail_primary: bool, cleanup_exhausts: bool) -> Self {
+            Self {
+                endpoints: std::sync::Mutex::new(Vec::new()),
+                fail_primary,
+                cleanup_exhausts,
+            }
+        }
+
+        fn stage(&self, name: &'static str, deadline: &AdapterDeadline) {
+            self.endpoints
+                .lock()
+                .expect("probe")
+                .push((name, deadline.expires_at()));
+        }
+
+        fn endpoints(&self) -> Vec<(&'static str, std::time::Instant)> {
+            self.endpoints.lock().expect("probe").clone()
+        }
+
+        /// §16/#70: cleanup after exhaustion has no budget to open — a
+        /// conformant adapter may only take an immediate best-effort action.
+        fn cleanup_budget(
+            deadline: &AdapterDeadline,
+            now: std::time::Instant,
+        ) -> Option<std::time::Duration> {
+            if deadline.is_expired_at(now) {
+                None
+            } else {
+                Some(deadline.remaining_at(now))
+            }
+        }
+
+        /// §17/#71-72: if cleanup consumes the deadline the whole operation
+        /// normalizes to DeadlineExceeded; if cleanup finishes within the
+        /// remaining budget the original failure kind survives.
+        fn classify_after_cleanup(
+            original: AdapterErrorKind,
+            cleanup_ended_at: std::time::Instant,
+            deadline: &AdapterDeadline,
+        ) -> AdapterErrorKind {
+            if deadline.is_expired_at(cleanup_ended_at) {
+                AdapterErrorKind::DeadlineExceeded
+            } else {
+                original
+            }
+        }
+    }
+
+    impl ExecutionAdapter for DeadlineProbe {
+        fn start_execution(
+            &self,
+            request: &ExecutionRequest,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            let _ = request;
+            self.stage("stage-a", deadline);
+            self.stage("stage-b", deadline);
+            if self.fail_primary {
+                self.stage("cleanup", deadline);
+                // Deterministic cleanup end: exactly at the endpoint when
+                // cleanup is scripted to exhaust it, strictly before it
+                // otherwise.
+                let cleanup_ended_at = if self.cleanup_exhausts {
+                    deadline.expires_at()
+                } else {
+                    deadline.expires_at() - std::time::Duration::from_millis(1)
+                };
+                let kind = Self::classify_after_cleanup(
+                    AdapterErrorKind::Protocol,
+                    cleanup_ended_at,
+                    deadline,
+                );
+                return Err(AdapterError::new(kind).with_diagnostic("probe primary failure"));
+            }
+            Ok(StartObservation {
+                state: ExecutionState::Running,
+                runtime_handle: RuntimeHandle(serde_json::json!({"probe": true})),
+                ambiguous: false,
+                failure_class: None,
+                detail: None,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+            })
+        }
+
+        fn observe_execution(
+            &self,
+            _handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.stage("observe", deadline);
+            Ok(ExecutionObservation {
+                state: ExecutionState::Running,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+                detail: None,
+            })
+        }
+
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+
+        fn collect_outcome(
+            &self,
+            _handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionOutcome> {
+            self.stage("collect", deadline);
+            Ok(ExecutionOutcome {
+                state: ExecutionState::Succeeded,
+                payload: None,
+                summary: None,
+                failure_class: None,
+                terminal_confirmed: true,
+                quiescent_confirmed: true,
+                incarnation_reusable: false,
+            })
+        }
+
+        fn reconcile_start(
+            &self,
+            _request_id: &RequestId,
+            _persisted_handle: Option<&RuntimeHandle>,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            self.stage("reconcile", deadline);
+            Ok(StartObservation {
+                state: ExecutionState::Unknown,
+                runtime_handle: RuntimeHandle::default(),
+                ambiguous: true,
+                failure_class: None,
+                detail: None,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+            })
+        }
+    }
+
+    /// M5.6 §50 #65-67: one Scheduler-facing call receives one deadline;
+    /// internal stage A, stage B, and exception cleanup observe the SAME
+    /// endpoint.
+    #[test]
+    fn probe_shares_one_endpoint_across_stages_and_cleanup() {
+        let probe = DeadlineProbe::new(true, false);
+        let base = Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = AdapterDeadline::from_instant(base);
+        let mock = mock_launch();
+        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        assert!(probe.start_execution(&req, &deadline).is_err());
+        let endpoints = probe.endpoints();
+        assert_eq!(endpoints.len(), 3);
+        for (stage, endpoint) in &endpoints {
+            assert_eq!(*endpoint, base, "stage {stage} saw a different endpoint");
+        }
+        // The second Scheduler-facing call gets its own independent deadline
+        // (#65 is per-operation: distinct calls, distinct endpoints).
+        let other = AdapterDeadline::from_instant(base + std::time::Duration::from_secs(5));
+        probe
+            .reconcile_start(req.request_id(), None, &other)
+            .unwrap();
+        assert_eq!(probe.endpoints().last().unwrap().1, other.expires_at());
+    }
+
+    /// M5.6 §50 #68: the remaining budget decreases across stages rather
+    /// than resetting — every stage derives from the same endpoint.
+    #[test]
+    fn probe_remaining_budget_decreases_across_stages() {
+        let base = Instant::now();
+        let deadline = AdapterDeadline::from_instant(base + std::time::Duration::from_secs(10));
+        let t1 = base + std::time::Duration::from_secs(2);
+        let t2 = base + std::time::Duration::from_secs(6);
+        let r0 = deadline.remaining_at(base);
+        let r1 = deadline.remaining_at(t1);
+        let r2 = deadline.remaining_at(t2);
+        assert!(r0 > r1 && r1 > r2, "remaining must strictly decrease");
+        assert_eq!(r2, std::time::Duration::from_secs(4));
+        // Reads never reset the budget back to the full operation timeout.
+        assert_eq!(deadline.remaining_at(t2), r2);
+    }
+
+    /// M5.6 §50 #69-70: an exhausted deadline yields zero remaining and no
+    /// fresh cleanup budget may be opened after exhaustion.
+    #[test]
+    fn probe_cleanup_budget_is_none_after_exhaustion() {
+        let base = Instant::now();
+        let deadline = AdapterDeadline::from_instant(base + std::time::Duration::from_secs(1));
+        assert_eq!(
+            deadline.remaining_at(base + std::time::Duration::from_secs(1)),
+            std::time::Duration::ZERO
+        );
+        // Before exhaustion: bounded cleanup budget exists.
+        assert!(DeadlineProbe::cleanup_budget(&deadline, base).is_some());
+        // At and after exhaustion: only immediate best-effort action.
+        assert!(
+            DeadlineProbe::cleanup_budget(&deadline, base + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(
+            DeadlineProbe::cleanup_budget(&deadline, base + std::time::Duration::from_secs(9))
+                .is_none()
+        );
+    }
+
+    /// M5.6 §50 #71: cleanup that consumes the deadline normalizes the
+    /// whole operation to DeadlineExceeded.
+    #[test]
+    fn probe_cleanup_exhaustion_normalizes_to_deadline_exceeded() {
+        let probe = DeadlineProbe::new(true, true);
+        let base = Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = AdapterDeadline::from_instant(base);
+        let mock = mock_launch();
+        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        let err = probe.start_execution(&req, &deadline).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+        assert!(probe.endpoints().iter().any(|(s, _)| *s == "cleanup"));
+    }
+
+    /// M5.6 §50 #72: cleanup that finishes within the remaining budget
+    /// preserves the original failure kind.
+    #[test]
+    fn probe_timely_cleanup_preserves_original_kind() {
+        let probe = DeadlineProbe::new(true, false);
+        let base = Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = AdapterDeadline::from_instant(base);
+        let mock = mock_launch();
+        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        let err = probe.start_execution(&req, &deadline).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+        assert!(probe.endpoints().iter().any(|(s, _)| *s == "cleanup"));
     }
 }
