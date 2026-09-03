@@ -29,12 +29,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentype-root-bridge"
+version = "0.2.0"
+dependencies = [
+ "agentype-core",
+ "serde_json",
+]
+
+[[package]]
 name = "agentype-runtime"
 version = "0.2.0"
 dependencies = [
  "agentype-adapter-api",
  "agentype-core",
  "agentype-execution-config",
+ "agentype-root-bridge",
  "agentype-storage-sqlite",
  "rusqlite",
  "serde_json",

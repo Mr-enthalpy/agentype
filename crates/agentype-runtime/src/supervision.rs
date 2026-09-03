@@ -787,11 +787,10 @@ impl SupervisionRunner {
             .clone()
     }
 
-    /// Stop the heartbeat loop and drop all local supervision ownership.
-    /// The Leases simply stop being renewed and naturally expire — no
-    /// revocation, no terminality, no quiescence claim. Returns the recorded
-    /// fatal fault, if the loop stopped because of one.
-    fn stop_and_join(&mut self) -> Option<SupervisionError> {
+    /// Signal stop without joining. StartupGuard issues this together with
+    /// notifier stop before any join so heartbeat cannot keep renewing while
+    /// a bounded RootBridge call is finishing.
+    pub fn request_stop(&self) {
         {
             let mut state = self.shared.state.lock().expect("runner state lock");
             if state.phase == RunnerPhase::Running {
@@ -799,6 +798,14 @@ impl SupervisionRunner {
             }
         }
         self.shared.signal.notify_all();
+    }
+
+    /// Stop the heartbeat loop and drop all local supervision ownership.
+    /// The Leases simply stop being renewed and naturally expire — no
+    /// revocation, no terminality, no quiescence claim. Returns the recorded
+    /// fatal fault, if the loop stopped because of one.
+    fn stop_and_join(&mut self) -> Option<SupervisionError> {
+        self.request_stop();
         if let Some(join) = self.join.take() {
             if join.join().is_err() {
                 self.service.clear();

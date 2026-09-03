@@ -1,26 +1,32 @@
 //! M5 runtime configuration boundary, M4 recovery orchestration, the M5.2
 //! dispatch commit boundary (adapter composition + one authoritative physical
 //! start per claim), the M5.3 supervision admission / heartbeat ownership
-//! boundary (see the `supervision` module), and the M5.4 restart
-//! reconciliation barrier (see the `recovery` module). Notifier delivery and
-//! the daemon loop belong to subsequent M5 tasks.
+//! boundary (see the `supervision` module), the M5.4 restart reconciliation
+//! barrier (see the `recovery` module), and the M5.5 notifier / RootBridge
+//! delivery isolation (see the `notifier` module). The daemon loop is M5.8.
 
 #![forbid(unsafe_code)]
 
 pub use agentype_execution_config::*;
 
+pub mod notifier;
 pub mod observation;
 pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
+pub use notifier::{
+    DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
+    NotifierRunner, NotifierService,
+};
 pub use observation::{
     adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
     CollectedOutcomeKind, StartObservationKind,
 };
 pub use recovery::{
-    reconcile_one_execution, recover_runtime, replay_persisted_terminal_consequence, AdmissionSink,
-    ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
+    reconcile_one_execution, recover_runtime, recover_runtime_without_notifier,
+    replay_persisted_terminal_consequence, AdmissionSink, ReconcileExecutionOutcome,
+    RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 pub use supervision::{
     RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
