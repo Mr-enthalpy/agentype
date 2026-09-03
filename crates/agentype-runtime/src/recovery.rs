@@ -1,12 +1,20 @@
 //! M5.4 restart reconciliation: durable terminal replay and single-Execution
-//! reconcile. The coordinator / StartupGuard (M5.4-F) compose these
-//! primitives; they are not an authority path on their own.
+//! reconcile. The coordinator / StartupGuard compose these primitives; they
+//! are not an authority path on their own.
+//!
+//! M5.5 extends StartupGuard so an uncommitted recovery also owns the
+//! NotifierRunner. Cleanup signals both services to stop, then joins
+//! supervision before notifier, so heartbeat cannot keep renewing while a
+//! bounded RootBridge call finishes. Stopping the notifier stops delivery
+//! work only: it does not ACK events, revert DELIVERED, revoke a Lease, or
+//! terminate a worker.
 //!
 //! Category A (terminal replay) runs before any `reconcile_start`.
 //! Category B (`reconcile_start`) is identity-preserving and never calls
 //! `start_execution`. A persisted `state='RUNNING'` row never mints
 //! admission: only a fresh `RunningAuthorityGrant` can.
 
+use crate::notifier::{NotifierBinding, NotifierError, NotifierRunner};
 use crate::observation::{
     adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
     CollectedOutcomeKind, StartObservationKind,
@@ -47,6 +55,7 @@ pub enum RecoveryError {
     Persistence(Error),
     Invariant(String),
     Supervision(SupervisionError),
+    Notifier(NotifierError),
 }
 
 impl RecoveryError {
@@ -70,6 +79,7 @@ impl std::fmt::Display for RecoveryError {
             Self::Persistence(e) => write!(f, "recovery persistence fault: {e}"),
             Self::Invariant(m) => write!(f, "recovery invariant violation: {m}"),
             Self::Supervision(e) => write!(f, "recovery supervision fault: {e}"),
+            Self::Notifier(e) => write!(f, "recovery notifier fault: {e}"),
         }
     }
 }
@@ -541,18 +551,25 @@ fn unresolved_or_history(
     }
 }
 
-/// Process-local startup cleanup scope (M5.4 plan §9). Dropping an
-/// uncommitted guard stops the runner and clears every in-memory
-/// admission. Cleanup ≠ revoke Lease ≠ terminate worker ≠ quiescence.
+/// Process-local startup cleanup scope (M5.4 plan §9, M5.5 §39-§41).
+/// Dropping an uncommitted guard stops supervision and notifier and
+/// clears every in-memory admission. Cleanup ≠ revoke Lease ≠ terminate
+/// worker ≠ quiescence ≠ ACK/revert outbox delivery.
+///
+/// Stop-signal order: notifier first, then supervision. Join order:
+/// supervision first, then notifier. Heartbeat must not continue merely
+/// because notifier shutdown is waiting on a bounded RootBridge call.
 struct StartupGuard {
     runner: Option<SupervisionRunner>,
+    notifier: Option<NotifierRunner>,
     committed: bool,
 }
 
 impl StartupGuard {
-    fn new(runner: SupervisionRunner) -> Self {
+    fn new(runner: SupervisionRunner, notifier: Option<NotifierRunner>) -> Self {
         Self {
             runner: Some(runner),
+            notifier,
             committed: false,
         }
     }
@@ -565,22 +582,43 @@ impl StartupGuard {
         if let Some(fatal) = self.runner().take_fatal() {
             return Err(RecoveryError::Supervision(fatal));
         }
+        if let Some(notifier) = self.notifier.as_ref() {
+            if let Some(fatal) = notifier.take_fatal() {
+                return Err(RecoveryError::Notifier(fatal));
+            }
+        }
         Ok(())
     }
 
-    fn commit(mut self) -> Result<SupervisionRunner, RecoveryError> {
+    fn abort_uncommitted(&mut self) {
+        if let Some(notifier) = self.notifier.as_ref() {
+            notifier.request_stop();
+        }
+        if let Some(runner) = self.runner.as_ref() {
+            runner.request_stop();
+        }
+        if let Some(runner) = self.runner.take() {
+            let _ = runner.shutdown();
+        }
+        if let Some(notifier) = self.notifier.take() {
+            let _ = notifier.shutdown();
+        }
+    }
+
+    fn commit(mut self) -> Result<RecoveredRuntime, RecoveryError> {
         self.check_healthy()?;
         self.committed = true;
-        Ok(self.runner.take().expect("startup runner"))
+        Ok(RecoveredRuntime {
+            runner: self.runner.take().expect("startup runner"),
+            notifier: self.notifier.take(),
+        })
     }
 }
 
 impl Drop for StartupGuard {
     fn drop(&mut self) {
         if !self.committed {
-            if let Some(runner) = self.runner.take() {
-                let _ = runner.shutdown();
-            }
+            self.abort_uncommitted();
         }
     }
 }
@@ -588,6 +626,7 @@ impl Drop for StartupGuard {
 /// A Runtime that has passed the restart barrier and may dispatch.
 pub struct RecoveredRuntime {
     runner: SupervisionRunner,
+    notifier: Option<NotifierRunner>,
 }
 
 impl RecoveredRuntime {
@@ -595,35 +634,63 @@ impl RecoveredRuntime {
         &self.runner
     }
 
+    pub fn notifier(&self) -> Option<&NotifierRunner> {
+        self.notifier.as_ref()
+    }
+
     pub fn into_runner(self) -> SupervisionRunner {
         self.runner
     }
 }
 
-/// Full M5.4 recovery barrier. Dispatch MUST NOT run until this returns.
+/// Full recovery barrier. Dispatch MUST NOT run until this returns.
 ///
-/// Order (plan §17): expire → empty runner → terminal replay → reconcile
+/// Order: expire → empty SupervisionRunner → NotifierRunner (same
+/// uncommitted cleanup scope) → terminal replay → reconcile
 /// STARTING/UNKNOWN/RUNNING/LOST → final expiry sweep → promote retry →
-/// pool → revive → runner health → READY.
+/// pool → revive → both runners healthy → READY.
+///
+/// Delivery during RECOVERY is legal: a wakeup asserts a durable event
+/// exists, not that the daemon is READY. Ordinary RootBridge unavailability
+/// does not prevent READY. Durable notifier corruption does.
 pub fn recover_runtime(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,
+    notifier: NotifierBinding,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, None)
+    recover_runtime_inner(kernel, adapters, timing, notifier, None)
+}
+
+/// Explicit test-only recovery without a notifier. Does NOT mark outbox
+/// events DELIVERED and is not a production "no RootBridge" success path.
+pub fn recover_runtime_without_notifier(
+    kernel: Arc<Kernel>,
+    adapters: &AdapterRegistry,
+    timing: RuntimeTimingConfig,
+) -> Result<RecoveredRuntime, RecoveryError> {
+    recover_runtime(kernel, adapters, timing, NotifierBinding::DisabledForTests)
 }
 
 fn recover_runtime_inner(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,
+    notifier: NotifierBinding,
     fail_after_readmits: Option<usize>,
 ) -> Result<RecoveredRuntime, RecoveryError> {
     kernel.expire_leases(true).map_err(RecoveryError::from)?;
 
     let runner =
         SupervisionRunner::start(kernel.clone(), timing).map_err(RecoveryError::Supervision)?;
-    let guard = StartupGuard::new(runner);
+    let notifier_runner = match notifier {
+        NotifierBinding::Enabled { config, bridge } => Some(
+            NotifierRunner::start(kernel.clone(), bridge, config)
+                .map_err(RecoveryError::Notifier)?,
+        ),
+        NotifierBinding::DisabledForTests => None,
+    };
+    let guard = StartupGuard::new(runner, notifier_runner);
     guard.check_healthy()?;
 
     let candidates = kernel
@@ -669,8 +736,7 @@ fn recover_runtime_inner(
         .revive_eligible_agents()
         .map_err(RecoveryError::from)?;
     assert_ready_invariant(&kernel, guard.runner())?;
-    let runner = guard.commit()?;
-    Ok(RecoveredRuntime { runner })
+    guard.commit()
 }
 
 #[cfg(test)]
@@ -680,7 +746,13 @@ fn recover_runtime_failing_after_readmits(
     timing: RuntimeTimingConfig,
     after: usize,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, Some(after))
+    recover_runtime_inner(
+        kernel,
+        adapters,
+        timing,
+        NotifierBinding::DisabledForTests,
+        Some(after),
+    )
 }
 
 /// READY invariant: every Task that still holds current Attempt/Lease
@@ -736,6 +808,7 @@ fn persisted_handle_hint(value: &Value) -> Option<RuntimeHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::{NotifierBinding, NotifierConfig, NotifierRetryPolicy};
     use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
     use crate::{AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
@@ -744,16 +817,48 @@ mod tests {
         RuntimeHandle, StartObservation,
     };
     use agentype_core::{
-        AttemptState, AuthoritativeExecutionBinding, Claim, ExecutionState, FailureClass,
-        IncarnationState, LeaseState, ManualClock, PartitionSpec, Retention, RetryPolicy, TaskSpec,
-        TaskState,
+        AttemptState, AuthoritativeExecutionBinding, Claim, Clock, ExecutionState, FailureClass,
+        IncarnationState, LeaseState, ManualClock, OutboxState, PartitionSpec, Retention,
+        RetryPolicy, TaskSpec, TaskState, BATCH_RESULTS_READY,
     };
+    use agentype_root_bridge::{RecordingRootBridge, RootBridgeError};
     use agentype_storage_sqlite::Kernel;
     use serde_json::json;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     fn timing() -> RuntimeTimingConfig {
         RuntimeTimingConfig::new(1.0, 2.0, 10.0).unwrap()
+    }
+
+    fn notifier_cfg() -> NotifierConfig {
+        NotifierConfig::new(0.05, 8, NotifierRetryPolicy::new(1.0, 8.0).unwrap()).unwrap()
+    }
+
+    fn complete_batch(k: &Kernel) -> agentype_core::OutboxEventId {
+        let (claim, launch) = start_named(k, TaskSpec::new("notify", json!({"o": 1})));
+        k.confirm_running_and_renew(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            launch.execution_id(),
+            &json!({}),
+        )
+        .unwrap();
+        k.ack_success(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            Some(launch.execution_id()),
+            &json!({"ok": true}),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        k.outbox_for_batch(launch.batch_id(), BATCH_RESULTS_READY)
+            .unwrap()[0]
+            .id
+            .clone()
     }
 
     fn env() -> (Arc<ManualClock>, Kernel) {
@@ -1372,7 +1477,8 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new());
         fake.set_next_reconcile(running_obs());
         let adapters = adapters(&fake);
-        let recovered = recover_runtime(kernel.clone(), &adapters, timing()).unwrap();
+        let recovered =
+            recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
         assert_eq!(fake.start_call_count(), 0);
         assert_eq!(fake.reconcile_call_count(), 1);
         assert!(recovered.runner().contains(launch.execution_id()));
@@ -1391,7 +1497,8 @@ mod tests {
         let kernel = Arc::new(k);
         let fake = Arc::new(FakeAdapter::new());
         let adapters = adapters(&fake);
-        let recovered = recover_runtime(kernel.clone(), &adapters, timing()).unwrap();
+        let recovered =
+            recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
         assert_eq!(recovered.runner().active_count(), 0);
         assert_eq!(fake.start_call_count(), 0);
         assert_eq!(fake.reconcile_call_count(), 0);
@@ -1610,7 +1717,8 @@ mod tests {
         });
         let mut adapters = AdapterRegistry::new();
         adapters.register("process", advancing.clone()).unwrap();
-        let recovered = recover_runtime(kernel.clone(), &adapters, timing()).unwrap();
+        let recovered =
+            recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
         assert_eq!(recovered.runner().active_count(), 0);
         assert!(!recovered.runner().contains(launch.execution_id()));
         assert_ne!(
@@ -1618,6 +1726,159 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(advancing.inner.start_call_count(), 0);
+    }
+
+    #[test]
+    fn recovery_starts_notifier_and_returns_ownership() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let event = complete_batch(&kernel);
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let recovered = recover_runtime(
+            kernel.clone(),
+            &adapters,
+            timing(),
+            NotifierBinding::Enabled {
+                config: notifier_cfg(),
+                bridge: bridge.clone(),
+            },
+        )
+        .unwrap();
+        assert!(recovered.notifier().is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while kernel.outbox_delivery(&event).unwrap().state != OutboxState::Delivered {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "notifier did not deliver during/after recovery"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(recovered);
+    }
+
+    #[test]
+    fn ordinary_rootbridge_unavailability_does_not_prevent_ready() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let event = complete_batch(&kernel);
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let bridge = Arc::new(RecordingRootBridge::new());
+        bridge.script_err(RootBridgeError::Unavailable("root down".into()));
+        let recovered = recover_runtime(
+            kernel.clone(),
+            &adapters,
+            timing(),
+            NotifierBinding::Enabled {
+                config: notifier_cfg(),
+                bridge,
+            },
+        )
+        .unwrap();
+        assert!(recovered.notifier().is_some());
+        assert!(!recovered.notifier().unwrap().is_failed());
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            kernel.outbox_delivery(&event).unwrap().state,
+            OutboxState::Pending
+        );
+        drop(recovered);
+    }
+
+    #[test]
+    fn later_recovery_fatal_stops_notifier_and_supervision() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let event = complete_batch(&kernel);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("fatal-both", json!({"o": 1})));
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let err = match recover_runtime_inner(
+            kernel.clone(),
+            &adapters,
+            timing(),
+            NotifierBinding::Enabled {
+                config: notifier_cfg(),
+                bridge: bridge.clone(),
+            },
+            Some(1),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("expected injected startup fatal"),
+        };
+        assert!(matches!(err, RecoveryError::Invariant(_)));
+        thread::sleep(Duration::from_millis(50));
+        let delivered_after = bridge.deliver_count();
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            bridge.deliver_count(),
+            delivered_after,
+            "notifier must not keep selecting after failed recovery"
+        );
+        let _ = (event, launch);
+    }
+
+    #[test]
+    fn delivered_event_is_not_redelivered_after_restart() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let event = complete_batch(&kernel);
+        kernel.commit_outbox_delivery_success(&event).unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let recovered = recover_runtime(
+            kernel.clone(),
+            &adapters,
+            timing(),
+            NotifierBinding::Enabled {
+                config: notifier_cfg(),
+                bridge: bridge.clone(),
+            },
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(bridge.deliver_count(), 0);
+        assert_eq!(
+            kernel.outbox_delivery(&event).unwrap().state,
+            OutboxState::Delivered
+        );
+        drop(recovered);
+    }
+
+    #[test]
+    fn pending_future_backoff_stays_deferred_after_restart() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let event = complete_batch(&kernel);
+        kernel
+            .commit_outbox_delivery_failure(&event, 30.0, "later")
+            .unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let recovered = recover_runtime(
+            kernel.clone(),
+            &adapters,
+            timing(),
+            NotifierBinding::Enabled {
+                config: notifier_cfg(),
+                bridge: bridge.clone(),
+            },
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(bridge.deliver_count(), 0);
+        assert_eq!(
+            kernel.outbox_delivery(&event).unwrap().state,
+            OutboxState::Pending
+        );
+        assert!(kernel.outbox_delivery(&event).unwrap().next_delivery_at > clock.now());
+        drop(recovered);
     }
 
     struct ClockAdvancingAdapter {
