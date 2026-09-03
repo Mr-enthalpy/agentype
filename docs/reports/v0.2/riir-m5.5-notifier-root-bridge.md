@@ -550,5 +550,23 @@ API.
 **P2-1 closed.** `NotifierService::kernel()` removed; runner uses
 `NotifierService::now()`.
 
-**P2-2 recorded, not implemented.** Bounded `last_error` only; sanitization
-vocabulary waits for the first real RootBridge.
+Second review: **PASS** for M5.5 merge. Remaining items are hung, not
+reopened on this PR.
+
+**P1 — `last_error` still accepts arbitrary bridge strings.**
+`BLOCKS_REAL_ROOT_BRIDGE`. `DOES_NOT_BLOCK_M5.5_GENERIC_RUNTIME`.
+Today `bridge_diagnostic` is `format!("{err}")` then truncate 512:
+bounded, not sanitized. A vendor
+`RootBridgeError::Protocol("Authorization: Bearer sk-...")` would persist
+into `notification_outbox.last_error`. Before **any** first real
+RootBridge, freeze persist-only `safe category + bridge-defined sanitized
+short diagnostic` (conceptually `PersistedBridgeFailure`). Do not wait
+until Codex/Grok transport is written. Do not open M5.5.1 for this.
+
+**P2 — `RecordingRootBridge` is on the production crate API.** Move to
+`#[cfg(test)]` / test-support later. Not this PR.
+
+**P2 — `Kernel::mark_outbox_delivered` remains public** (M4 helper, can
+skip RootBridge proof). Canonical path is
+`commit_outbox_delivery_success`. Delete / test-only / deprecated at M5.8
+API cleanup. Not M5.5.1.
