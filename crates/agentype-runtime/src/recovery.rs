@@ -624,6 +624,11 @@ impl Drop for StartupGuard {
 }
 
 /// A Runtime that has passed the restart barrier and may dispatch.
+///
+/// Production recovery with `NotifierBinding::Enabled` owns both runners.
+/// There is no API that consumes supervision while dropping notifier
+/// (`into_runner` was the silent discard hatch). Test-only recovery without
+/// a notifier is `NotifierBinding::DisabledForTests`.
 pub struct RecoveredRuntime {
     runner: SupervisionRunner,
     notifier: Option<NotifierRunner>,
@@ -636,10 +641,6 @@ impl RecoveredRuntime {
 
     pub fn notifier(&self) -> Option<&NotifierRunner> {
         self.notifier.as_ref()
-    }
-
-    pub fn into_runner(self) -> SupervisionRunner {
-        self.runner
     }
 }
 

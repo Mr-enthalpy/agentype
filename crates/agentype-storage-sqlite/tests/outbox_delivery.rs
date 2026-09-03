@@ -31,9 +31,9 @@ fn due_reader_returns_only_pending() {
     let (_batch, _task, id) = ready_event(&k);
     let due = k.due_outbox(clock.now(), 10).unwrap();
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].event_id, id);
-    assert_eq!(due[0].event_type, BATCH_RESULTS_READY);
-    assert_eq!(due[0].delivery_attempts, 0);
+    assert_eq!(due[0].event_id(), &id);
+    assert_eq!(due[0].event_type(), BATCH_RESULTS_READY);
+    assert_eq!(due[0].delivery_attempts(), 0);
 
     k.commit_outbox_delivery_success(&id).unwrap();
     assert!(k.due_outbox(clock.now(), 10).unwrap().is_empty());
@@ -57,7 +57,7 @@ fn exact_next_delivery_at_equals_now_is_due() {
     let created = k.outbox_delivery(&id).unwrap().next_delivery_at;
     let due = k.due_outbox(created, 10).unwrap();
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].event_id, id);
+    assert_eq!(due[0].event_id(), &id);
 }
 
 #[test]
@@ -89,10 +89,10 @@ fn due_ordering_is_deterministic() {
     let (_b2, _t2, second) = ready_event(&k);
     let due = k.due_outbox(clock.now(), 10).unwrap();
     assert_eq!(due.len(), 2);
-    assert_eq!(due[0].event_id, first);
-    assert_eq!(due[1].event_id, second);
-    assert!(due[0].next_delivery_at <= due[1].next_delivery_at);
-    assert!(due[0].created_at <= due[1].created_at);
+    assert_eq!(due[0].event_id(), &first);
+    assert_eq!(due[1].event_id(), &second);
+    assert!(due[0].next_delivery_at() <= due[1].next_delivery_at());
+    assert!(due[0].created_at() <= due[1].created_at());
 }
 
 #[test]
@@ -254,5 +254,5 @@ fn first_batch_completion_still_inserts_exactly_one_batch_results_ready() {
     assert_eq!(events[0].state, OutboxState::Pending);
     let due = k.due_outbox(clock.now(), 10).unwrap();
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].payload["batch_id"], json!(batch.as_str()));
+    assert_eq!(due[0].payload()["batch_id"], json!(batch.as_str()));
 }

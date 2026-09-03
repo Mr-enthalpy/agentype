@@ -308,16 +308,54 @@ pub struct LeaseSupervisionView {
 
 /// Delivery work data for one due outbox event. Not authority: no token
 /// or capability is required to read it.
+///
+/// Fields are private so a caller cannot forge wakeup content against a
+/// real `event_id` and then mark that durable row DELIVERED. The only
+/// production constructor is `Kernel::due_outbox`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutboxDeliveryCandidate {
-    pub event_id: OutboxEventId,
-    pub event_type: String,
-    pub aggregate_type: String,
-    pub aggregate_id: String,
-    pub payload: Value,
-    pub delivery_attempts: u32,
-    pub next_delivery_at: UnixTime,
-    pub created_at: UnixTime,
+    event_id: OutboxEventId,
+    event_type: String,
+    aggregate_type: String,
+    aggregate_id: String,
+    payload: Value,
+    delivery_attempts: u32,
+    next_delivery_at: UnixTime,
+    created_at: UnixTime,
+}
+
+impl OutboxDeliveryCandidate {
+    pub fn event_id(&self) -> &OutboxEventId {
+        &self.event_id
+    }
+
+    pub fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    pub fn aggregate_type(&self) -> &str {
+        &self.aggregate_type
+    }
+
+    pub fn aggregate_id(&self) -> &str {
+        &self.aggregate_id
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn delivery_attempts(&self) -> u32 {
+        self.delivery_attempts
+    }
+
+    pub fn next_delivery_at(&self) -> UnixTime {
+        self.next_delivery_at
+    }
+
+    pub fn created_at(&self) -> UnixTime {
+        self.created_at
+    }
 }
 
 /// Retained delivery bookkeeping for one outbox event.

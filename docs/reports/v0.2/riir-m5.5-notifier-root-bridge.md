@@ -217,9 +217,11 @@ Correct: `next_delivery_at = t_completion + delay`.
 matching state update commits. Crash-before-commit leaving attempts
 unchanged is acceptable bookkeeping, not an exactly-once counter.
 
-`last_error` is a bounded sanitized diagnostic (512 characters). Secrets,
-credentials, env, full provider responses, Task/Result payload are not
-persisted.
+`last_error` is currently a **bounded** diagnostic (512 characters) from
+`format!("{RootBridgeError}")`. That is not a fully sanitized vocabulary:
+a vendor bridge could still put a token in the error string. First real
+RootBridge MUST persist `safe category + bridge-defined sanitized short
+detail`, not an arbitrary error string. Not an M5.5 merge blocker.
 
 Hard invariant: **never hold a SQLite transaction across RootBridge I/O.**
 
@@ -338,7 +340,13 @@ RecoveredRuntime { supervision, notifier }
 Canonical `recover_runtime(kernel, adapters, timing, NotifierBinding)`.
 `NotifierBinding::Enabled` is production. `NotifierBinding::DisabledForTests`
 / `recover_runtime_without_notifier` is the **named** test-only path. There
-is no silent “no RootBridge configured” success path.
+is no silent “no RootBridge configured” success path. There is no
+`RecoveredRuntime::into_runner()` that would keep heartbeat and drop
+notifier.
+
+`OutboxDeliveryCandidate` fields are private. Only `Kernel::due_outbox`
+constructs it. `deliver_one` cannot mark a real event DELIVERED from a
+caller-forged type/aggregate/payload.
 
 Cleanup ordering (documented in `recovery.rs`):
 
@@ -421,7 +429,7 @@ Recorded on `rust/m5.5-notifier` after `cargo fmt --all --check` (via
 `cargo fmt --all`), `cargo clippy --workspace --all-targets -- -D warnings`,
 and `cargo test --workspace`.
 
-**Rust: 329 passed, 0 failed**
+**Rust: 328 passed, 0 failed** (audit-closure head; removed the synthetic-candidate test)
 
 | Crate / suite | Count |
 |---|---|
@@ -429,7 +437,7 @@ and `cargo test --workspace`.
 | core | 20 |
 | execution-config | 8 |
 | root-bridge | 8 |
-| runtime | 160 |
+| runtime | 159 |
 | storage m4_kernel | 65 |
 | storage outbox_delivery | 17 |
 | storage reconciliation | 5 |
@@ -438,9 +446,9 @@ and `cargo test --workspace`.
 | storage topology | 16 |
 
 storage 125 = 65 + 17 + 5 + 11 + 11 + 16.
-Total 8 + 20 + 8 + 8 + 160 + 125 = 329.
+Total 8 + 20 + 8 + 8 + 159 + 125 = 328.
 
-Do not reuse M5.4's 280.
+Do not reuse M5.4's 280 or the pre-audit 329.
 
 **Python oracle** (`py -3`, 3.13 local; CI Ubuntu 3.11 is the oracle
 environment): 160 passed, 2 skipped (Ran 162 tests).
@@ -518,3 +526,29 @@ M6 Generation/WorkIntent/AgentType/Transform/MemoryCapsule.
 20. Does M5.5 require a schema bump? — NO
 21. Is normal Root wakeup still BATCH_RESULTS_READY rather than per-Result? — YES
 22. Does M5.5 introduce any M6 semantic object? — NO
+23. Can a caller-built delivery candidate forge wakeup content for a real event_id? — NO (storage-produced, private fields)
+24. Can RecoveredRuntime discard notifier while retaining supervision? — NO (`into_runner` removed)
+
+---
+
+## 17. PR #11 audit closure
+
+First review: REQUEST CHANGES on two public-API escape hatches. Internal
+state machine stayed frozen.
+
+**P1-1 closed.** `OutboxDeliveryCandidate` is opaque. Regression:
+`malformed_index_is_fatal_not_bridge_failure` writes a real durable
+malformed `payload_json` then `due_outbox` → `deliver_one`; envelope
+fatal, row stays PENDING. Positive path:
+`successful_bridge_marks_delivered_and_does_not_ack` asserts candidate
+getters match the durable row before delivery.
+
+**P1-2 closed.** `RecoveredRuntime::into_runner()` deleted. Production
+recovery with `NotifierBinding::Enabled` has no consume-supervision-only
+API.
+
+**P2-1 closed.** `NotifierService::kernel()` removed; runner uses
+`NotifierService::now()`.
+
+**P2-2 recorded, not implemented.** Bounded `last_error` only; sanitization
+vocabulary waits for the first real RootBridge.

@@ -208,8 +208,8 @@ impl NotifierService {
         }
     }
 
-    pub fn kernel(&self) -> &Kernel {
-        &self.kernel
+    fn now(&self) -> UnixTime {
+        self.kernel.now()
     }
 
     /// Read-only due snapshot. The SQLite lock is released before return.
@@ -243,11 +243,11 @@ impl NotifierService {
         candidate: &OutboxDeliveryCandidate,
     ) -> Result<DeliveryOutcome, NotifierError> {
         let wakeup = RootWakeup::from_outbox(
-            candidate.event_id.clone(),
-            candidate.event_type.clone(),
-            candidate.aggregate_type.clone(),
-            candidate.aggregate_id.clone(),
-            &candidate.payload,
+            candidate.event_id().clone(),
+            candidate.event_type(),
+            candidate.aggregate_type(),
+            candidate.aggregate_id(),
+            candidate.payload(),
         )
         .map_err(|e: WakeupEnvelopeError| NotifierError::Envelope(e.to_string()))?;
 
@@ -256,22 +256,22 @@ impl NotifierService {
             Ok(_receipt) => {
                 let state = self
                     .kernel
-                    .commit_outbox_delivery_success(&candidate.event_id)
+                    .commit_outbox_delivery_success(candidate.event_id())
                     .map_err(NotifierError::from_kernel)?;
-                Ok(classify_commit(&candidate.event_id, state, true))
+                Ok(classify_commit(candidate.event_id(), state, true))
             }
             Err(err) => {
-                let next_attempt = candidate.delivery_attempts.saturating_add(1);
+                let next_attempt = candidate.delivery_attempts().saturating_add(1);
                 let delay = self.retry.delay_for(next_attempt);
                 let state = self
                     .kernel
                     .commit_outbox_delivery_failure(
-                        &candidate.event_id,
+                        candidate.event_id(),
                         delay,
                         &bridge_diagnostic(&err),
                     )
                     .map_err(NotifierError::from_kernel)?;
-                Ok(classify_commit(&candidate.event_id, state, false))
+                Ok(classify_commit(candidate.event_id(), state, false))
             }
         }
     }
@@ -359,7 +359,7 @@ impl NotifierRunner {
                     if RunnerShared::is_stopping(&thread_shared.state) {
                         break;
                     }
-                    let now = service.kernel().now();
+                    let now = service.now();
                     let candidates = match service.due(now, batch_limit) {
                         Ok(c) => c,
                         Err(e) => {
@@ -485,13 +485,12 @@ mod tests {
     use agentype_root_bridge::{RecordingRootBridge, RootIndex};
     use agentype_storage_sqlite::Kernel;
     use serde_json::{json, Value};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
-    fn env() -> (Arc<ManualClock>, Arc<Kernel>) {
-        let clock = Arc::new(ManualClock::new(1_000.0));
-        let k = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+    fn seeded_kernel(clock: Arc<ManualClock>, k: Kernel) -> (Arc<ManualClock>, Arc<Kernel>) {
         k.upsert_partition(&PartitionSpec::new(
             "general",
             2,
@@ -502,6 +501,39 @@ mod tests {
         .unwrap();
         k.reconcile_pool().unwrap();
         (clock, Arc::new(k))
+    }
+
+    fn env() -> (Arc<ManualClock>, Arc<Kernel>) {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let k = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        seeded_kernel(clock, k)
+    }
+
+    struct FileEnv {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Drop for FileEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn file_env() -> (Arc<ManualClock>, Arc<Kernel>, FileEnv) {
+        let dir = std::env::temp_dir().join(format!(
+            "agentype-m55-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let k = Kernel::open(&path, clock.clone(), 10.0, 16_384).unwrap();
+        let (clock, k) = seeded_kernel(clock, k);
+        (clock, k, FileEnv { dir, path })
     }
 
     fn binding(claim: &Claim) -> FrozenPhysicalExecutionBinding {
@@ -574,8 +606,15 @@ mod tests {
         let (clock, k) = env();
         let (batch, task_id, event) = complete_one(&k, "ok", json!({"o": 1}));
         let result_before = k.result_for_task(&task_id).unwrap();
+        let durable = k.outbox_delivery(&event).unwrap();
         let bridge = Arc::new(RecordingRootBridge::new());
         let svc = service(k.clone(), bridge.clone());
+        let due = svc.due(clock.now(), 8).unwrap();
+        assert_eq!(due[0].event_id(), &durable.event_id);
+        assert_eq!(due[0].event_type(), durable.event_type);
+        assert_eq!(due[0].aggregate_type(), durable.aggregate_type);
+        assert_eq!(due[0].aggregate_id(), durable.aggregate_id);
+        assert_eq!(due[0].payload(), &durable.payload);
         let outcomes = svc.deliver_due(clock.now(), 8).unwrap();
         assert!(matches!(outcomes[0], DeliveryOutcome::Delivered { .. }));
         let snap = k.outbox_delivery(&event).unwrap();
@@ -725,23 +764,28 @@ mod tests {
 
     #[test]
     fn malformed_index_is_fatal_not_bridge_failure() {
-        let (clock, k) = env();
+        let (clock, k, db) = file_env();
         let (_batch, _task, event) = complete_one(&k, "bad-index", json!({"o": 1}));
-        let candidate = OutboxDeliveryCandidate {
-            event_id: event,
-            event_type: BATCH_RESULTS_READY.into(),
-            aggregate_type: "batch".into(),
-            aggregate_id: "batch-x".into(),
-            payload: json!({"batch_id": 1}),
-            delivery_attempts: 0,
-            next_delivery_at: clock.now(),
-            created_at: clock.now(),
-        };
+        {
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute(
+                "UPDATE notification_outbox SET payload_json=?1 WHERE id=?2",
+                rusqlite::params![r#"{"batch_id":1}"#, event.as_str()],
+            )
+            .unwrap();
+        }
+        let due = k.due_outbox(clock.now(), 8).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].event_id(), &event);
         let bridge = Arc::new(RecordingRootBridge::new());
-        let svc = service(k, bridge.clone());
-        let err = svc.deliver_one(&candidate).unwrap_err();
+        let svc = service(k.clone(), bridge.clone());
+        let err = svc.deliver_one(&due[0]).unwrap_err();
         assert!(matches!(err, NotifierError::Envelope(_)));
         assert_eq!(bridge.deliver_count(), 0);
+        assert_eq!(
+            k.outbox_delivery(&event).unwrap().state,
+            OutboxState::Pending
+        );
     }
 
     #[test]
@@ -950,26 +994,6 @@ mod tests {
         );
         assert_eq!(exec_before, ExecutionState::Running);
         assert_eq!(lease_before, LeaseState::Active);
-    }
-
-    #[test]
-    fn missing_selected_identity_is_fatal() {
-        let (clock, k) = env();
-        let candidate = OutboxDeliveryCandidate {
-            event_id: OutboxEventId::from_string("event_missing"),
-            event_type: BATCH_RESULTS_READY.into(),
-            aggregate_type: "batch".into(),
-            aggregate_id: "batch-x".into(),
-            payload: json!({"batch_id": "batch-x"}),
-            delivery_attempts: 0,
-            next_delivery_at: clock.now(),
-            created_at: clock.now(),
-        };
-        let bridge = Arc::new(RecordingRootBridge::new());
-        let svc = service(k, bridge.clone());
-        let err = svc.deliver_one(&candidate).unwrap_err();
-        assert!(matches!(err, NotifierError::Invariant(_)));
-        assert_eq!(bridge.deliver_count(), 1);
     }
 
     #[test]
