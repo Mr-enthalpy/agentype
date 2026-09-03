@@ -305,6 +305,116 @@ pub struct LeaseSupervisionView {
     pub expires_at: UnixTime,
     pub state: LeaseState,
 }
+
+/// Delivery work data for one due outbox event. Not authority: no token
+/// or capability is required to read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboxDeliveryCandidate {
+    pub event_id: OutboxEventId,
+    pub event_type: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub payload: Value,
+    pub delivery_attempts: u32,
+    pub next_delivery_at: UnixTime,
+    pub created_at: UnixTime,
+}
+
+/// Retained delivery bookkeeping for one outbox event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboxDeliverySnapshot {
+    pub event_id: OutboxEventId,
+    pub event_type: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub state: OutboxState,
+    pub payload: Value,
+    pub delivery_attempts: u32,
+    pub next_delivery_at: UnixTime,
+    pub created_at: UnixTime,
+    pub delivered_at: Option<UnixTime>,
+    pub acknowledged_at: Option<UnixTime>,
+    pub last_error: Option<String>,
+}
+
+const LAST_ERROR_MAX_CHARS: usize = 512;
+
+enum DeliveryCommit {
+    Success,
+    Failure { delay: f64, diagnostic: String },
+}
+
+fn bound_last_error(diagnostic: &str) -> String {
+    diagnostic.chars().take(LAST_ERROR_MAX_CHARS).collect()
+}
+
+fn parse_delivery_attempts(value: i64) -> Result<u32, Error> {
+    u32::try_from(value)
+        .map_err(|_| Error::invariant(format!("negative delivery_attempts is corrupt: {value}")))
+}
+
+fn missing_outbox(event_id: &OutboxEventId) -> Error {
+    Error::invariant(format!(
+        "outbox event {} is missing; retained events cannot disappear",
+        event_id.as_str()
+    ))
+}
+
+fn commit_outbox_delivery_locked(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: &OutboxEventId,
+    commit: DeliveryCommit,
+    now: UnixTime,
+) -> Result<OutboxState, Error> {
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM notification_outbox WHERE id=?1",
+            params![event_id.as_str()],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => missing_outbox(event_id),
+            other => map_sqlite(other),
+        })?;
+    let parsed = OutboxState::parse_sql(&state)?;
+    match parsed {
+        OutboxState::Delivered | OutboxState::Acked => Ok(parsed),
+        OutboxState::Pending => match commit {
+            DeliveryCommit::Success => {
+                tx.execute(
+                    "UPDATE notification_outbox
+                     SET state='DELIVERED',
+                         delivery_attempts=delivery_attempts+1,
+                         delivered_at=?1,
+                         last_error=NULL
+                     WHERE id=?2 AND state='PENDING'",
+                    params![now, event_id.as_str()],
+                )
+                .map_err(map_sqlite)?;
+                Ok(OutboxState::Delivered)
+            }
+            DeliveryCommit::Failure { delay, diagnostic } => {
+                let next_at = now + delay;
+                if !next_at.is_finite() {
+                    return Err(Error::invariant(
+                        "outbox next_delivery_at overflowed to non-finite",
+                    ));
+                }
+                tx.execute(
+                    "UPDATE notification_outbox
+                     SET delivery_attempts=delivery_attempts+1,
+                         next_delivery_at=?1,
+                         last_error=?2
+                     WHERE id=?3 AND state='PENDING'",
+                    params![next_at, diagnostic, event_id.as_str()],
+                )
+                .map_err(map_sqlite)?;
+                Ok(OutboxState::Pending)
+            }
+        },
+    }
+}
+
 use std::sync::Arc;
 
 pub struct Kernel {
@@ -2319,6 +2429,179 @@ impl Kernel {
                 return OutboxState::parse_sql(&state);
             }
             Ok(OutboxState::Delivered)
+        })
+    }
+
+    /// Due PENDING events for notifier delivery. Read-only work data, not
+    /// authority. Ordering is deterministic and MUST NOT be a correctness
+    /// dependency. The SQLite write lock is not held across RootBridge I/O;
+    /// callers must drop this snapshot before `deliver()`.
+    pub fn due_outbox(
+        &self,
+        now: UnixTime,
+        limit: usize,
+    ) -> Result<Vec<OutboxDeliveryCandidate>, Error> {
+        if !now.is_finite() {
+            return Err(Error::invariant("due_outbox now must be finite"));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.store.query(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id,event_type,aggregate_type,aggregate_id,payload_json,
+                            delivery_attempts,next_delivery_at,created_at
+                     FROM notification_outbox
+                     WHERE state='PENDING' AND next_delivery_at<=?1
+                     ORDER BY next_delivery_at, created_at, id
+                     LIMIT ?2",
+                )
+                .map_err(map_sqlite)?;
+            let rows = stmt
+                .query_map(params![now, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, f64>(6)?,
+                        r.get::<_, f64>(7)?,
+                    ))
+                })
+                .map_err(map_sqlite)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, et, at, aid, payload, attempts, next_at, created) =
+                    row.map_err(map_sqlite)?;
+                out.push(OutboxDeliveryCandidate {
+                    event_id: OutboxEventId::from_string(id),
+                    event_type: et,
+                    aggregate_type: at,
+                    aggregate_id: aid,
+                    payload: json_load(&payload)?,
+                    delivery_attempts: parse_delivery_attempts(attempts)?,
+                    next_delivery_at: next_at,
+                    created_at: created,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    /// Full retained delivery bookkeeping for one outbox event.
+    pub fn outbox_delivery(
+        &self,
+        event_id: &OutboxEventId,
+    ) -> Result<OutboxDeliverySnapshot, Error> {
+        self.store.query(|conn| {
+            conn.query_row(
+                "SELECT id,event_type,aggregate_type,aggregate_id,payload_json,state,
+                        delivery_attempts,next_delivery_at,created_at,delivered_at,
+                        acknowledged_at,last_error
+                 FROM notification_outbox WHERE id=?1",
+                params![event_id.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, f64>(7)?,
+                        r.get::<_, f64>(8)?,
+                        r.get::<_, Option<f64>>(9)?,
+                        r.get::<_, Option<f64>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::invariant(format!(
+                    "outbox event {} is missing; retained events cannot disappear",
+                    event_id.as_str()
+                )),
+                other => map_sqlite(other),
+            })
+            .and_then(
+                |(
+                    id,
+                    et,
+                    at,
+                    aid,
+                    payload,
+                    state,
+                    attempts,
+                    next_at,
+                    created,
+                    delivered,
+                    acked,
+                    last_error,
+                )| {
+                    Ok(OutboxDeliverySnapshot {
+                        event_id: OutboxEventId::from_string(id),
+                        event_type: et,
+                        aggregate_type: at,
+                        aggregate_id: aid,
+                        payload: json_load(&payload)?,
+                        state: OutboxState::parse_sql(&state)?,
+                        delivery_attempts: parse_delivery_attempts(attempts)?,
+                        next_delivery_at: next_at,
+                        created_at: created,
+                        delivered_at: delivered,
+                        acknowledged_at: acked,
+                        last_error,
+                    })
+                },
+            )
+        })
+    }
+
+    /// Short post-bridge success commit. Timestamp is sampled after
+    /// BEGIN IMMEDIATE, which cannot start until `deliver()` has returned,
+    /// so retry bookkeeping is completion-anchored.
+    ///
+    /// PENDING → DELIVERED (attempts++, delivered_at, last_error NULL).
+    /// DELIVERED / ACKED → no-op (do not regress ACKED to DELIVERED).
+    /// Missing identity is an invariant failure.
+    pub fn commit_outbox_delivery_success(
+        &self,
+        event_id: &OutboxEventId,
+    ) -> Result<OutboxState, Error> {
+        self.tx(|tx, now| commit_outbox_delivery_locked(tx, event_id, DeliveryCommit::Success, now))
+    }
+
+    /// Short post-bridge failure commit. `delay` is applied to the
+    /// completion timestamp sampled after BEGIN IMMEDIATE.
+    ///
+    /// PENDING → PENDING (attempts++, next_delivery_at = now+delay, last_error).
+    /// DELIVERED / ACKED → no-op (do not restore PENDING, do not schedule retry).
+    /// Missing identity is an invariant failure.
+    pub fn commit_outbox_delivery_failure(
+        &self,
+        event_id: &OutboxEventId,
+        delay: f64,
+        diagnostic: &str,
+    ) -> Result<OutboxState, Error> {
+        if !(delay.is_finite() && delay >= 0.0) {
+            return Err(Error::invariant(
+                "outbox failure delay must be finite and non-negative",
+            ));
+        }
+        self.tx(|tx, now| {
+            commit_outbox_delivery_locked(
+                tx,
+                event_id,
+                DeliveryCommit::Failure {
+                    delay,
+                    diagnostic: bound_last_error(diagnostic),
+                },
+                now,
+            )
         })
     }
 

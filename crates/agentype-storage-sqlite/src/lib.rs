@@ -13,7 +13,7 @@ pub mod txutil;
 
 pub use kernel::{
     CurrentAuthorityHint, ExecutionReconciliationSnapshot, Kernel, LeaseSupervisionView,
-    RunningAuthorityGrant, SupervisedRenewal,
+    OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant, SupervisedRenewal,
 };
 pub use schema::SCHEMA_VERSION;
 pub use store::IMPLEMENTATION_LINE;
