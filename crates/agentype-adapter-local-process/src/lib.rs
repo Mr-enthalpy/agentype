@@ -24,6 +24,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+mod pin;
+
 /// Frozen adapter_kind for this environment domain: this host's process
 /// table as spawned by this runtime. Not a vendor/model name.
 pub const ADAPTER_KIND: &str = "local_process";
@@ -409,14 +411,9 @@ fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResu
 }
 
 fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
-    loop {
-        if !instance_alive(pid, birth, deadline)? {
-            return Ok(true);
-        }
-        match wait_slice(deadline) {
-            None => return Ok(false),
-            Some(slice) => thread::sleep(slice),
-        }
+    match pin::pin_instance(pid, birth, deadline)? {
+        None => Ok(true),
+        Some(pinned) => pinned.wait_exit(deadline),
     }
 }
 
@@ -583,130 +580,6 @@ fn kill_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn kill_pid(pid: u32) {
-    #[cfg(windows)]
-    {
-        kill_pid_windows(pid);
-    }
-    #[cfg(unix)]
-    {
-        signal_pid_unix(pid, 9);
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = pid;
-    }
-}
-
-fn interrupt_pid(pid: u32) -> AdapterResult<()> {
-    #[cfg(unix)]
-    {
-        match signal_pid_unix_result(pid, 2) {
-            Ok(()) => Ok(()),
-            Err(esrch) if esrch => Ok(()), // gone: observe will report UNKNOWN
-            Err(_) => Err(AdapterError::unavailable("interrupt SIGINT not delivered")),
-        }
-    }
-    #[cfg(windows)]
-    {
-        interrupt_pid_windows(pid)
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = pid;
-        Err(AdapterError::unavailable(
-            "interrupt unsupported on this platform",
-        ))
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn kill_pid_windows(pid: u32) {
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
-        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
-        fn TerminateProcess(handle: *mut core::ffi::c_void, code: u32) -> i32;
-    }
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle.is_null() {
-            return;
-        }
-        let _ = TerminateProcess(handle, 1);
-        CloseHandle(handle);
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn interrupt_pid_windows(pid: u32) -> AdapterResult<()> {
-    const CTRL_BREAK_EVENT: u32 = 1;
-    extern "system" {
-        fn AttachConsole(pid: u32) -> i32;
-        fn FreeConsole() -> i32;
-        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-    }
-    // SAFETY: AttachConsole/GenerateConsoleCtrlEvent/FreeConsole are the
-    // documented best-effort console interrupt; we detach if we attached.
-    unsafe {
-        let attached = AttachConsole(pid) != 0;
-        let ok = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
-        if attached {
-            let _ = FreeConsole();
-        }
-        if ok {
-            Ok(())
-        } else {
-            Err(AdapterError::unavailable(
-                "interrupt not delivered (ctrl event failed)",
-            ))
-        }
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn signal_pid_unix(pid: u32, sig: i32) -> bool {
-    signal_pid_unix_result(pid, sig).is_ok()
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn signal_pid_unix_result(pid: u32, sig: i32) -> Result<(), bool> {
-    const ESRCH: i32 = 3;
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    let Ok(raw) = i32::try_from(pid) else {
-        return Err(false);
-    };
-    unsafe {
-        if kill(raw, sig) == 0 {
-            Ok(())
-        } else {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            Err(errno == ESRCH)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn reap_pid(pid: u32) {
-    const WNOHANG: i32 = 1;
-    extern "C" {
-        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-    }
-    let Ok(raw) = i32::try_from(pid) else {
-        return;
-    };
-    unsafe {
-        let _ = waitpid(raw, std::ptr::null_mut(), WNOHANG);
-    }
-}
-
 fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
     require_deadline(
         deadline,
@@ -719,15 +592,10 @@ fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
 }
 
 fn instance_alive(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        require_deadline(deadline, "deadline exhausted before waitpid", None)?;
-        reap_pid(pid);
+    match pin::pin_instance(pid, birth, deadline)? {
+        None => Ok(false),
+        Some(pinned) => pinned.is_alive(deadline),
     }
-    Ok(match process_stat(pid, deadline)? {
-        Some((state, found)) => !matches!(state, 'Z' | 'X' | 'x') && found == birth,
-        None => false,
-    })
 }
 
 fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(char, u64)>> {
@@ -794,7 +662,7 @@ fn process_birth_windows(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_stat_linux(pid: u32) -> Option<(char, u64)> {
+pub(crate) fn process_stat_linux(pid: u32) -> Option<(char, u64)> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat_identity(&text)
 }
@@ -1106,9 +974,12 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
-        // Physical interrupt is attempted even if the live Child is gone.
-        // Failure to deliver is explicit Unavailable, not a silent observe.
-        interrupt_pid(parsed.pid)?;
+        match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+            None => {}
+            Some(pinned) => {
+                pinned.interrupt()?;
+            }
+        }
         require_deadline(
             deadline,
             "interrupt deadline exhausted after signal",
@@ -1136,7 +1007,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         };
         if let Some(mut proc) = proc {
-            kill_child(&mut proc.child);
+            match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+                Some(pinned) => pinned.kill()?,
+                None => {
+                    let _ = proc.child.try_wait();
+                    return Ok(liveness_observation(false));
+                }
+            }
             if wait_child_exit(&mut proc.child, deadline)? {
                 require_deadline(
                     deadline,
@@ -1151,9 +1028,9 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 handle.clone(),
             ));
         }
-        if instance_alive(parsed.pid, parsed.birth, deadline)? {
-            kill_pid(parsed.pid);
-            if wait_instance_exit(parsed.pid, parsed.birth, deadline)? {
+        if let Some(pinned) = pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+            pinned.kill()?;
+            if pinned.wait_exit(deadline)? {
                 require_deadline(
                     deadline,
                     "terminate deadline exhausted after wait",

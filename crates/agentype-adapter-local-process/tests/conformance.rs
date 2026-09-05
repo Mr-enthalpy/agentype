@@ -383,6 +383,42 @@ fn interrupt_attempts_physical_signal_or_reports_unsupported() {
 }
 
 #[test]
+fn forged_handle_must_not_control_another_process() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let (_req, start) = start_hang(&adapter);
+    let (pid, birth, request_id, stdout) = handle_fields(&start.runtime_handle);
+    let mut forged = start.runtime_handle.0.clone();
+    forged["birth"] = json!(birth.wrapping_add(1));
+    let forged = RuntimeHandle(forged);
+    assert_ne!(birth, birth.wrapping_add(1));
+    let _ = (pid, request_id, stdout);
+
+    let _ = adapter.interrupt_execution(&forged, &long_deadline());
+    let still = adapter
+        .observe_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+    assert_eq!(
+        still.state,
+        ExecutionState::Running,
+        "forged interrupt must not affect the real instance"
+    );
+
+    let _ = adapter.terminate_execution(&forged, &long_deadline());
+    let still = adapter
+        .observe_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+    assert_eq!(
+        still.state,
+        ExecutionState::Running,
+        "forged terminate must not affect the real instance"
+    );
+
+    adapter
+        .terminate_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+}
+
+#[test]
 fn terminate_kill_is_not_quiescence_or_task_cancel() {
     let adapter = LocalProcessAgentAdapter::new();
     let (_req, start) = start_hang(&adapter);

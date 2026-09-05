@@ -204,3 +204,40 @@ fn recovery_does_not_readmit_foreign_binding_key() {
         )
         .ok();
 }
+
+#[test]
+fn isolated_target_cannot_use_local_process_adapter() {
+    let (_clock, kernel) = kernel();
+    let adapter = Arc::new(LocalProcessAgentAdapter::new());
+    let mut adapters = AdapterRegistry::new();
+    adapters
+        .register(
+            ADAPTER_KIND,
+            adapter.binding_key().clone(),
+            adapter,
+            policy(),
+        )
+        .unwrap();
+    let mut registry = ExecutionRegistry::new();
+    registry
+        .register_target(
+            ExecutionTargetConfig::new("local", ADAPTER_KIND, true).with_options(json!({
+                "command": fake_bin(),
+                "args": [],
+                "env": {},
+            })),
+        )
+        .unwrap();
+    registry
+        .register_profile(ExecutionProfileConfig::new("default"))
+        .unwrap();
+    kernel
+        .submit_batch(&[TaskSpec::new("isolated-local", json!({}))])
+        .unwrap();
+    let d = Dispatcher::new(&kernel, &registry, &adapters);
+    match d.dispatch_one().unwrap() {
+        DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
+        other => panic!("expected ConfigurationUnavailable, got {other:?}"),
+    }
+    assert!(kernel.reconciliation_candidates().unwrap().is_empty());
+}

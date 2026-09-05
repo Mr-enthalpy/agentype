@@ -20,6 +20,7 @@ dependencies = [
  "agentype-execution-config",
  "agentype-runtime",
  "agentype-storage-sqlite",
+ "libc",
  "serde_json",
 ]
 

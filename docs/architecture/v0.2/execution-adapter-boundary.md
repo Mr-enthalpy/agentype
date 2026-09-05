@@ -171,6 +171,15 @@ Recovery uses `resolve_exact(kind, key)` with no fallback. Launch without
 a SpawnSource uses `resolve_unique(kind)` and fails closed if two
 installations of that driver are present. Core does not interpret the key.
 
+Control (interrupt/terminate/reap) MUST target a pinned process instance
+(Linux `pidfd`, Windows one PROCESS handle used for both birth check and
+act). A stale handle with a reused PID MUST NOT affect the new occupant.
+
+`attempt_isolation` on `ExecutionTargetConfig` is a requirement, not a
+proof. It intersects the installed binding's `AdapterSafetyEnvelope`.
+`LocalProcessAgentAdapter` cannot enforce isolation; a target that requires
+it is `RESOURCE_UNAVAILABLE` before Execution creation.
+
 ---
 
 ## 6. Capability model
@@ -279,8 +288,8 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 | --- | --- |
 | start | spawn (deadline-staged) + immediate deadline check + birth probe under the same endpoint + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. If spawn returns after expiry, kill the uncommitted child — no birth I/O. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. |
 | observe | live `Child` with matching `birth`, else `pid+birth` and non-zombie state. Alive → RUNNING; mismatch/dead/zombie → UNKNOWN. Never SUCCEEDED. |
-| interrupt | Unix `SIGINT` (ESRCH → observe; other errno → Unavailable) / Windows `CTRL_BREAK`. Not Task cancellation. |
-| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
+| interrupt | Pin the process instance (Linux pidfd / Windows PROCESS handle), verify birth, then signal through that pin. Stale pid+wrong birth MUST NOT interrupt another occupant. Unpinned control is Unavailable. Not Task cancellation. |
+| terminate | Pin, verify birth, kill through the same pin, wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
 | collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol, not Failed. |
 | reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. No handle → ambiguous UNKNOWN. |
 

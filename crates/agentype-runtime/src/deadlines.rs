@@ -70,6 +70,29 @@ impl AdapterDeadlinePolicy {
     }
 }
 
+/// Physical safety the installed execution source can actually enforce.
+/// Target configuration may *require* isolation; this envelope says whether
+/// the imported binding can back that claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterSafetyEnvelope {
+    attempt_isolation: bool,
+}
+
+impl AdapterSafetyEnvelope {
+    pub fn unenforceable() -> Self {
+        Self::default()
+    }
+
+    pub fn with_attempt_isolation(mut self, attempt_isolation: bool) -> Self {
+        self.attempt_isolation = attempt_isolation;
+        self
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+}
+
 /// Installed adapter plus its operation policy. Production code invokes
 /// through these methods so a deadline is always constructed. The raw
 /// `ExecutionAdapter` is not exposed.
@@ -79,6 +102,7 @@ pub struct ResolvedAdapterBinding {
     adapter_binding_key: AdapterBindingKey,
     adapter: Arc<dyn ExecutionAdapter>,
     deadlines: AdapterDeadlinePolicy,
+    safety: AdapterSafetyEnvelope,
 }
 
 impl ResolvedAdapterBinding {
@@ -87,13 +111,19 @@ impl ResolvedAdapterBinding {
         adapter_binding_key: AdapterBindingKey,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
     ) -> Self {
         Self {
             adapter_kind,
             adapter_binding_key,
             adapter,
             deadlines,
+            safety,
         }
+    }
+
+    pub fn enforces_attempt_isolation(&self) -> bool {
+        self.safety.attempt_isolation()
     }
 
     pub fn adapter_kind(&self) -> &str {
@@ -204,6 +234,7 @@ mod tests {
             AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(9)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         // No request: just mint via a dummy? start needs ExecutionRequest.
         // Endpoint inspection: call observe with empty handle after we have
@@ -245,6 +276,7 @@ mod tests {
             AdapterBindingKey::for_tests(),
             fake.clone(),
             policy,
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let handle = RuntimeHandle(serde_json::json!({"h": 1}));
 
@@ -346,6 +378,7 @@ mod tests {
             AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .observe_execution(&RuntimeHandle(serde_json::json!({})))
@@ -377,6 +410,7 @@ mod tests {
             AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .interrupt_execution(&RuntimeHandle(serde_json::json!({})))
@@ -405,6 +439,7 @@ mod tests {
             AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .terminate_execution(&RuntimeHandle(serde_json::json!({})))

@@ -16,7 +16,7 @@ pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
-pub use deadlines::{AdapterDeadlinePolicy, ResolvedAdapterBinding};
+pub use deadlines::{AdapterDeadlinePolicy, AdapterSafetyEnvelope, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
     NotifierRunner, NotifierService,
@@ -224,12 +224,15 @@ impl std::error::Error for AdapterRegistryError {}
 pub enum AdapterUnavailable {
     Missing { adapter_kind: String },
     Ambiguous { adapter_kind: String },
+    IsolationNotEnforceable { adapter_kind: String },
 }
 
 impl AdapterUnavailable {
     pub fn adapter_kind(&self) -> &str {
         match self {
-            Self::Missing { adapter_kind } | Self::Ambiguous { adapter_kind } => adapter_kind,
+            Self::Missing { adapter_kind }
+            | Self::Ambiguous { adapter_kind }
+            | Self::IsolationNotEnforceable { adapter_kind } => adapter_kind,
         }
     }
 }
@@ -244,6 +247,10 @@ impl std::fmt::Display for AdapterUnavailable {
             Self::Ambiguous { adapter_kind } => write!(
                 f,
                 "multiple adapter bindings installed for kind '{adapter_kind}' (exact binding key required)"
+            ),
+            Self::IsolationNotEnforceable { adapter_kind } => write!(
+                f,
+                "installed adapter for kind '{adapter_kind}' cannot enforce attempt_isolation"
             ),
         }
     }
@@ -275,6 +282,24 @@ impl AdapterRegistry {
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
     ) -> Result<(), AdapterRegistryError> {
+        self.register_with_safety(
+            adapter_kind,
+            adapter_binding_key,
+            adapter,
+            deadlines,
+            AdapterSafetyEnvelope::unenforceable(),
+        )
+    }
+
+    /// Import an adapter together with the physical safety it can enforce.
+    pub fn register_with_safety(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
+    ) -> Result<(), AdapterRegistryError> {
         let kind = adapter_kind.into();
         if kind.trim().is_empty() {
             return Err(AdapterRegistryError::InvalidKind(
@@ -286,6 +311,17 @@ impl AdapterRegistry {
                 "adapter binding key cannot be empty".into(),
             ));
         }
+        self.insert_binding(kind, adapter_binding_key, adapter, deadlines, safety)
+    }
+
+    fn insert_binding(
+        &mut self,
+        kind: String,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
+    ) -> Result<(), AdapterRegistryError> {
         let by_key = self.adapters.entry(kind.clone()).or_default();
         if by_key.contains_key(&adapter_binding_key) {
             return Err(AdapterRegistryError::DuplicateBinding {
@@ -295,7 +331,7 @@ impl AdapterRegistry {
         }
         by_key.insert(
             adapter_binding_key.clone(),
-            ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines),
+            ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines, safety),
         );
         Ok(())
     }
@@ -504,6 +540,13 @@ pub fn resolve_physical_execution_environment(
     let adapter_binding = adapters
         .resolve_unique(environment.target().adapter_kind.as_str())
         .map_err(DispatchError::AdapterAvailability)?;
+    if environment.attempt_isolation() && !adapter_binding.enforces_attempt_isolation() {
+        return Err(DispatchError::AdapterAvailability(
+            AdapterUnavailable::IsolationNotEnforceable {
+                adapter_kind: environment.target().adapter_kind.clone(),
+            },
+        ));
+    }
     Ok(ResolvedPhysicalExecutionEnvironment {
         binding,
         environment,
@@ -2180,6 +2223,51 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(adapters
             .resolve_exact("codex", &AdapterBindingKey::new("install-c").unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn isolated_target_requires_enforceable_adapter_safety() {
+        let (kernel, registry) = prompt_env();
+        // prompt_env target is unisolated "local"/"process". Rebuild isolated.
+        let mut isolated = ExecutionRegistry::new();
+        isolated
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap();
+        isolated
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let adapters = fake_adapters("process");
+        kernel
+            .submit_batch(&[TaskSpec::new("need-isolation", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        let err = resolve_physical_execution_environment(&kernel, &claim, &isolated, &adapters)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DispatchError::AdapterAvailability(
+                    AdapterUnavailable::IsolationNotEnforceable { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+        assert!(kernel.reconciliation_candidates().unwrap().is_empty());
+
+        let mut enforcing = AdapterRegistry::new();
+        enforcing
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                Arc::new(FakeAdapter::new()),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
+            .unwrap();
+        let ok =
+            resolve_physical_execution_environment(&kernel, &claim, &isolated, &enforcing).unwrap();
+        assert!(ok.attempt_isolation());
+        let _ = registry;
     }
 
     #[test]
@@ -4385,7 +4473,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                fake.clone(),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
             .unwrap();
 
         let d = Dispatcher::new(&kernel, &registry, &adapters);
@@ -4981,7 +5075,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     /// fresh attempt is dispatchable.
     #[test]
     fn isolated_writer_recovery_follows_persisted_isolation_not_registry() {
-        let (kernel, clock, _registry, adapters, fake) = dispatch_env();
+        let (kernel, clock, _registry, _adapters, fake) = dispatch_env();
         let kernel = Arc::new(kernel);
         // An isolated registry generation: same target name, isolation on.
         let mut registry = ExecutionRegistry::new();
@@ -4990,6 +5084,16 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
         registry
             .register_profile(ExecutionProfileConfig::new("default").with_timeout(30.0))
+            .unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                fake.clone(),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();

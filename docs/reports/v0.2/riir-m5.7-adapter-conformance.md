@@ -189,6 +189,10 @@ Closed in-milestone, not deferred to M5.8:
   Category A is driven by `terminal_confirmed`, not the enum
 - spawn returns → immediate deadline check before birth probe; liveness
   probes take the same `AdapterDeadline`
+- interrupt/terminate pin the process instance (pidfd / PROCESS handle)
+  before any signal; forged pid+wrong birth must not control a decoy
+- `attempt_isolation` ∩ installed `AdapterSafetyEnvelope`; local_process
+  cannot enforce isolation
 - Generic prompt and adapter-authored `FailureClass` removed from DTOs
 - Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
   aligned (host-kernel progress assumption; no watchdog)
