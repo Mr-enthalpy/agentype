@@ -16,7 +16,7 @@ pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
-pub use deadlines::{AdapterDeadlinePolicy, ResolvedAdapterBinding};
+pub use deadlines::{AdapterDeadlinePolicy, AdapterSafetyEnvelope, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
     NotifierRunner, NotifierService,
@@ -148,21 +148,26 @@ impl PreparedExecutionLaunch {
 /// The configuration-resolution key therefore always comes from durable
 /// Attempt state, never from the Claim DTO, so a tampered claim cannot steer
 /// resolution or masquerade as a configuration failure.
+///
+/// `adapter_binding_key` is the concrete imported domain. This façade does
+/// not consult `AdapterRegistry` and MUST NOT invent a `"test"` key.
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,
     mode: ExecutionResolutionMode<'_>,
+    adapter_binding_key: AdapterBindingKey,
 ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
     let binding = kernel
         .resolve_execution_binding(claim)
         .map_err(ExecutionPreparationError::Kernel)?;
     let environment = resolve_execution_environment(mode, &binding)
         .map_err(ExecutionPreparationError::Configuration)?;
-    // Standalone façade: no AdapterRegistry is consulted, so the frozen
-    // adapter_kind is the target configuration's declared binding.
+    // Standalone façade: no AdapterRegistry is consulted. The caller must
+    // supply the concrete domain key; this path never invents `"test"`.
     let physical_binding = FrozenPhysicalExecutionBinding::new(
         environment.safety(),
         environment.target().adapter_kind.clone(),
+        adapter_binding_key,
     )
     .map_err(ExecutionPreparationError::InvalidBinding)?;
     let snapshot = kernel
@@ -185,52 +190,84 @@ pub fn prepare_execution_launch(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterRegistryError {
     InvalidKind(String),
-    DuplicateKind(String),
+    InvalidBindingKey(String),
+    DuplicateBinding {
+        adapter_kind: String,
+        adapter_binding_key: String,
+    },
 }
 
 impl std::fmt::Display for AdapterRegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidKind(m) => write!(f, "invalid adapter kind: {m}"),
-            Self::DuplicateKind(k) => write!(f, "duplicate adapter kind registration: '{k}'"),
+            Self::InvalidBindingKey(m) => write!(f, "invalid adapter binding key: {m}"),
+            Self::DuplicateBinding {
+                adapter_kind,
+                adapter_binding_key,
+            } => write!(
+                f,
+                "duplicate adapter binding registration: kind '{adapter_kind}' key '{adapter_binding_key}'"
+            ),
         }
     }
 }
 
 impl std::error::Error for AdapterRegistryError {}
 
-/// The configured adapter kind is not installed in the runtime.
+/// The configured adapter kind is not uniquely resolvable in the runtime.
 ///
 /// Authoritative empty resolution: there is no fallback to a first-available,
-/// target-named, "default", or direct-mode adapter.
+/// target-named, "default", or direct-mode adapter. Two installations of the
+/// same driver family fail closed until the caller uses `resolve_exact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterUnavailable {
-    pub adapter_kind: String,
+pub enum AdapterUnavailable {
+    Missing { adapter_kind: String },
+    Ambiguous { adapter_kind: String },
+    IsolationNotEnforceable { adapter_kind: String },
+}
+
+impl AdapterUnavailable {
+    pub fn adapter_kind(&self) -> &str {
+        match self {
+            Self::Missing { adapter_kind }
+            | Self::Ambiguous { adapter_kind }
+            | Self::IsolationNotEnforceable { adapter_kind } => adapter_kind,
+        }
+    }
 }
 
 impl std::fmt::Display for AdapterUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "no adapter installed for configured kind '{}'",
-            self.adapter_kind
-        )
+        match self {
+            Self::Missing { adapter_kind } => write!(
+                f,
+                "no adapter installed for configured kind '{adapter_kind}'"
+            ),
+            Self::Ambiguous { adapter_kind } => write!(
+                f,
+                "multiple adapter bindings installed for kind '{adapter_kind}' (exact binding key required)"
+            ),
+            Self::IsolationNotEnforceable { adapter_kind } => write!(
+                f,
+                "installed adapter for kind '{adapter_kind}' cannot enforce attempt_isolation"
+            ),
+        }
     }
 }
 
 impl std::error::Error for AdapterUnavailable {}
 
-/// Registry of installed physical adapter implementations, keyed by the
-/// `adapter_kind` named by `ExecutionTargetConfig`.
+/// Registry of installed physical adapter implementations, keyed by
+/// `(adapter_kind, adapter_binding_key)`.
 ///
-/// This represents physical implementation availability only. It is NOT
-/// SpawnSource and carries no semantic scheduling authority: target
-/// configuration says what execution environment is requested, and this
-/// registry says which physical implementation is currently installed. An
-/// explicitly empty registry is authoritative — resolution fails closed.
+/// `adapter_kind` is the driver family; `adapter_binding_key` is one concrete
+/// imported execution domain. This is NOT SpawnSource and carries no
+/// semantic scheduling authority. An explicitly empty registry is
+/// authoritative — resolution fails closed.
 #[derive(Default)]
 pub struct AdapterRegistry {
-    adapters: HashMap<String, ResolvedAdapterBinding>,
+    adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
 }
 
 impl AdapterRegistry {
@@ -241,8 +278,27 @@ impl AdapterRegistry {
     pub fn register(
         &mut self,
         adapter_kind: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.register_with_safety(
+            adapter_kind,
+            adapter_binding_key,
+            adapter,
+            deadlines,
+            AdapterSafetyEnvelope::unenforceable(),
+        )
+    }
+
+    /// Import an adapter together with the physical safety it can enforce.
+    pub fn register_with_safety(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
     ) -> Result<(), AdapterRegistryError> {
         let kind = adapter_kind.into();
         if kind.trim().is_empty() {
@@ -250,26 +306,83 @@ impl AdapterRegistry {
                 "adapter kind cannot be empty".into(),
             ));
         }
-        if self.adapters.contains_key(&kind) {
-            return Err(AdapterRegistryError::DuplicateKind(kind));
+        if adapter_binding_key.as_str().trim().is_empty() {
+            return Err(AdapterRegistryError::InvalidBindingKey(
+                "adapter binding key cannot be empty".into(),
+            ));
         }
-        self.adapters.insert(
-            kind.clone(),
-            ResolvedAdapterBinding::new(kind, adapter, deadlines),
+        self.insert_binding(kind, adapter_binding_key, adapter, deadlines, safety)
+    }
+
+    fn insert_binding(
+        &mut self,
+        kind: String,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
+    ) -> Result<(), AdapterRegistryError> {
+        let by_key = self.adapters.entry(kind.clone()).or_default();
+        if by_key.contains_key(&adapter_binding_key) {
+            return Err(AdapterRegistryError::DuplicateBinding {
+                adapter_kind: kind,
+                adapter_binding_key: adapter_binding_key.as_str().to_string(),
+            });
+        }
+        by_key.insert(
+            adapter_binding_key.clone(),
+            ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines, safety),
         );
         Ok(())
     }
 
-    /// Fail-closed lookup by the configured `adapter_kind`. No fallback.
-    /// Returns a binding that always constructs an operation deadline.
-    pub fn resolve(
+    /// Test helper: register with `AdapterBindingKey::for_tests()`.
+    #[cfg(test)]
+    pub fn register_kind(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.register(
+            adapter_kind,
+            AdapterBindingKey::for_tests(),
+            adapter,
+            deadlines,
+        )
+    }
+
+    /// Legacy launch lookup: succeed only when this kind has exactly one
+    /// installed binding. Two Codex/local installations of the same driver
+    /// fail closed (`Ambiguous`); M6 SpawnSource will call `resolve_exact`.
+    pub fn resolve_unique(
         &self,
         adapter_kind: &str,
     ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
+        match self.adapters.get(adapter_kind) {
+            None => Err(AdapterUnavailable::Missing {
+                adapter_kind: adapter_kind.to_string(),
+            }),
+            Some(by_key) if by_key.len() == 1 => {
+                Ok(by_key.values().next().expect("len == 1").clone())
+            }
+            Some(_) => Err(AdapterUnavailable::Ambiguous {
+                adapter_kind: adapter_kind.to_string(),
+            }),
+        }
+    }
+
+    /// Recovery lookup: kind AND frozen key must match the installed adapter.
+    pub fn resolve_exact(
+        &self,
+        adapter_kind: &str,
+        adapter_binding_key: &AdapterBindingKey,
+    ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
         self.adapters
             .get(adapter_kind)
+            .and_then(|by_key| by_key.get(adapter_binding_key))
             .cloned()
-            .ok_or_else(|| AdapterUnavailable {
+            .ok_or_else(|| AdapterUnavailable::Missing {
                 adapter_kind: adapter_kind.to_string(),
             })
     }
@@ -386,7 +499,8 @@ impl ResolvedPhysicalExecutionEnvironment {
     /// the installed adapter resolved for this environment (the same kind
     /// string used for the AdapterRegistry lookup).
     pub fn physical_binding(&self) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
-        self.environment.physical_binding()
+        self.environment
+            .physical_binding(self.adapter_binding.adapter_binding_key().clone())
     }
 }
 
@@ -424,8 +538,15 @@ pub fn resolve_physical_execution_environment(
     )
     .map_err(DispatchError::Configuration)?;
     let adapter_binding = adapters
-        .resolve(environment.target().adapter_kind.as_str())
+        .resolve_unique(environment.target().adapter_kind.as_str())
         .map_err(DispatchError::AdapterAvailability)?;
+    if environment.attempt_isolation() && !adapter_binding.enforces_attempt_isolation() {
+        return Err(DispatchError::AdapterAvailability(
+            AdapterUnavailable::IsolationNotEnforceable {
+                adapter_kind: environment.target().adapter_kind.clone(),
+            },
+        ));
+    }
     Ok(ResolvedPhysicalExecutionEnvironment {
         binding,
         environment,
@@ -1125,6 +1246,14 @@ mod tests {
     use serde_json::Value;
     use std::sync::Arc;
 
+    fn prepare_execution_launch(
+        kernel: &Kernel,
+        claim: &Claim,
+        mode: ExecutionResolutionMode<'_>,
+    ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
+        super::prepare_execution_launch(kernel, claim, mode, AdapterBindingKey::for_tests())
+    }
+
     /// Synthetic durable binding for registry-only assertions (the attempt
     /// identity is irrelevant when only target/profile resolution is probed).
     fn synthetic_binding(target: &str, profile: &str) -> AuthoritativeExecutionBinding {
@@ -1245,6 +1374,7 @@ mod tests {
                 FailureClass::ExecutionLost,
                 FailureClass::Timeout,
                 FailureClass::TransientExternal,
+                FailureClass::StartFailure,
             ],
             base_backoff_seconds: 1.0,
             max_backoff_seconds: 8.0,
@@ -1485,12 +1615,10 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
             prepared.snapshot().attempt_id().as_str(),
             prepared.snapshot().lease_epoch(),
         );
-        assert_eq!(prepared.request().prompt(), expected);
+        let protocol = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot());
+        assert_eq!(protocol.as_str(), expected);
         assert!(
-            !prepared
-                .request()
-                .prompt()
-                .contains("WRITER RECOVERY RULES"),
+            !protocol.as_str().contains("WRITER RECOVERY RULES"),
             "read-only workers must not receive writer instructions"
         );
         // The durable label survives on the snapshot but is not the prompt.
@@ -1509,7 +1637,9 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
         .workstream(ws.clone());
         let prepared = launch_spec(&kernel, &registry, spec);
 
-        let prompt = prepared.request().prompt();
+        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
+            .as_str()
+            .to_string();
         assert!(
             prompt.contains(
                 "WRITER RECOVERY RULES\n\
@@ -1544,7 +1674,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
 
         assert_eq!(prepared.snapshot().task_name(), "implement-foo");
-        let prompt = prepared.request().prompt();
+        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
+            .as_str()
+            .to_string();
         assert!(
             prompt.contains("OBJECTIVE\n{\"objective\": \"build feature foo\"}"),
             "the objective is the task payload, not the task name"
@@ -1881,7 +2013,12 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Replay attempt A's proof onto attempt B: rejected on identity, even
         // though target and profile coincide.
         let err = kernel
-            .create_execution(&claim_b, env_a.physical_binding().unwrap())
+            .create_execution(
+                &claim_b,
+                env_a
+                    .physical_binding(AdapterBindingKey::for_tests())
+                    .unwrap(),
+            )
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidAuthority(_)),
@@ -1929,7 +2066,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     fn fake_adapters(kind: &str) -> AdapterRegistry {
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 kind,
                 Arc::new(FakeAdapter::new()),
                 crate::deadlines::test_deadlines(),
@@ -1990,7 +2127,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         assert_eq!(
             composed.unwrap_err(),
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "process".to_string()
             })
         );
@@ -2010,7 +2147,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         assert_eq!(
             composed.unwrap_err(),
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "process".to_string()
             })
         );
@@ -2021,7 +2158,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut adapters = AdapterRegistry::new();
         assert_eq!(
             adapters
-                .register(
+                .register_kind(
                     "   ",
                     Arc::new(FakeAdapter::new()),
                     crate::deadlines::test_deadlines()
@@ -2030,7 +2167,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             AdapterRegistryError::InvalidKind("adapter kind cannot be empty".into())
         );
         adapters
-            .register(
+            .register_kind(
                 "process",
                 Arc::new(FakeAdapter::new()),
                 crate::deadlines::test_deadlines(),
@@ -2038,14 +2175,99 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
         assert_eq!(
             adapters
-                .register(
+                .register_kind(
                     "process",
                     Arc::new(FakeAdapter::new()),
                     crate::deadlines::test_deadlines()
                 )
                 .unwrap_err(),
-            AdapterRegistryError::DuplicateKind("process".into())
+            AdapterRegistryError::DuplicateBinding {
+                adapter_kind: "process".into(),
+                adapter_binding_key: AdapterBindingKey::for_tests().as_str().to_string(),
+            }
         );
+    }
+
+    #[test]
+    fn adapter_registry_allows_same_kind_distinct_binding_keys() {
+        let mut adapters = AdapterRegistry::new();
+        let policy = crate::deadlines::test_deadlines();
+        adapters
+            .register(
+                "codex",
+                AdapterBindingKey::new("install-a").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                policy,
+            )
+            .unwrap();
+        adapters
+            .register(
+                "codex",
+                AdapterBindingKey::new("install-b").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                policy,
+            )
+            .unwrap();
+        assert!(matches!(
+            adapters.resolve_unique("codex"),
+            Err(AdapterUnavailable::Ambiguous { .. })
+        ));
+        let a = adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-a").unwrap())
+            .unwrap();
+        let b = adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-b").unwrap())
+            .unwrap();
+        assert_eq!(a.adapter_binding_key().as_str(), "install-a");
+        assert_eq!(b.adapter_binding_key().as_str(), "install-b");
+        assert!(adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-c").unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn isolated_target_requires_enforceable_adapter_safety() {
+        let (kernel, registry) = prompt_env();
+        // prompt_env target is unisolated "local"/"process". Rebuild isolated.
+        let mut isolated = ExecutionRegistry::new();
+        isolated
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap();
+        isolated
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let adapters = fake_adapters("process");
+        kernel
+            .submit_batch(&[TaskSpec::new("need-isolation", Value::Null)])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        let err = resolve_physical_execution_environment(&kernel, &claim, &isolated, &adapters)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DispatchError::AdapterAvailability(
+                    AdapterUnavailable::IsolationNotEnforceable { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+        assert!(kernel.reconciliation_candidates().unwrap().is_empty());
+
+        let mut enforcing = AdapterRegistry::new();
+        enforcing
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                Arc::new(FakeAdapter::new()),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
+            .unwrap();
+        let ok =
+            resolve_physical_execution_environment(&kernel, &claim, &isolated, &enforcing).unwrap();
+        assert!(ok.attempt_isolation());
+        let _ = registry;
     }
 
     #[test]
@@ -2056,7 +2278,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             Some(FailureClass::ResourceUnavailable)
         );
         assert_eq!(
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "k".into()
             })
             .standard_failure_class(),
@@ -2134,7 +2356,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         (kernel, clock, registry, adapters, fake)
     }
@@ -2158,13 +2380,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Unknown,
             runtime_handle: RuntimeHandle(serde_json::json!({"probe": 1})),
             ambiguous: true,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
         }
     }
-
     /// Test adapter that advances the shared manual clock inside
     /// start_execution, creating the real-world window in which Scheduler
     /// authority can expire between Execution creation and the start result
@@ -2584,7 +2804,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(Value::Null),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2593,7 +2812,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -2606,7 +2824,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 failure_class,
                 ..
             } => {
-                assert_eq!(*failure_class, FailureClass::Timeout);
+                assert_eq!(*failure_class, FailureClass::StartFailure);
                 execution_id.clone()
             }
             other => panic!("expected TerminalFailure, got {other:?}"),
@@ -2631,7 +2849,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2640,7 +2857,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -2694,7 +2910,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, _ids) = kernel
@@ -2725,7 +2941,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"stale": 7})),
             ambiguous: false,
-            failure_class: Some(FailureClass::StartFailure),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -2734,14 +2949,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::StartFailure),
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
         });
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, _ids) = kernel
@@ -2806,7 +3020,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2815,7 +3028,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -2828,7 +3040,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                 failure_class,
                 ..
             } => {
-                assert_eq!(*failure_class, FailureClass::Timeout);
+                assert_eq!(*failure_class, FailureClass::StartFailure);
                 execution_id.clone()
             }
             other => panic!("expected TerminalFailure, got {other:?}"),
@@ -2858,7 +3070,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2867,7 +3078,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Running,
             payload: Some(serde_json::json!({"forged": 1})),
             summary: None,
-            failure_class: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -2903,7 +3113,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2912,7 +3121,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"forged": 1})),
             summary: Some("forged".into()),
-            failure_class: None,
             terminal_confirmed: false,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -2951,7 +3159,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -2960,7 +3167,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Running,
             payload: None,
             summary: None,
-            failure_class: None,
             terminal_confirmed: false,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -2998,7 +3204,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"maybe": 1})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3007,7 +3212,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Running,
             payload: None,
             summary: None,
-            failure_class: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -3051,7 +3255,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"actually": 1})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -3060,7 +3263,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -3095,7 +3297,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Lost,
             runtime_handle: RuntimeHandle(serde_json::json!({"odd": 9})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
@@ -3128,13 +3329,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state,
             payload: Some(serde_json::json!({"forged": 1})),
             summary: Some("forged".into()),
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
         }
     }
-
     #[test]
     fn dispatch_running_state_with_terminal_proof_is_protocol_failure() {
         let (kernel, _clock, registry, adapters, fake) = dispatch_env();
@@ -3149,7 +3348,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"live": 1})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3195,7 +3393,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"live": 2})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3231,7 +3428,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"live": 3})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3272,7 +3468,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"cleanup": 5})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -3281,7 +3476,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -3327,7 +3521,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"lost": 1})),
             ambiguous: false,
-            failure_class: Some(FailureClass::ExecutionLost),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3336,7 +3529,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Lost,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::ExecutionLost),
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -3460,7 +3652,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 "process",
                 Arc::new(FakeAdapter::new()),
                 crate::deadlines::test_deadlines(),
@@ -3492,7 +3684,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"won": 1})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -3501,7 +3692,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -3665,7 +3855,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         ));
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 "process",
                 wrapper.clone(),
                 crate::deadlines::test_deadlines(),
@@ -3684,7 +3874,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"crash": 1})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -3693,7 +3882,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: None,
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -3725,7 +3913,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         ));
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 "process",
                 wrapper.clone(),
                 crate::deadlines::test_deadlines(),
@@ -3744,7 +3932,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(serde_json::json!({"crash": 2})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -3753,7 +3940,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -3779,7 +3965,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
@@ -3828,7 +4014,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Running,
             runtime_handle: RuntimeHandle(serde_json::json!({"odd": 3})),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3867,7 +4052,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
@@ -3881,7 +4066,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"session": 7})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3890,7 +4074,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: true,
@@ -3929,7 +4112,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
@@ -3944,7 +4127,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"session": 7})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -3953,7 +4135,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: true,
@@ -3978,7 +4159,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Running,
             runtime_handle: RuntimeHandle(serde_json::json!({"session": 8})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
@@ -4057,7 +4237,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (kernel, _clock, registry, _adapters, fake) = dispatch_env();
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), m56_policy())
+            .register_kind("process", fake.clone(), m56_policy())
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         kernel
@@ -4207,7 +4387,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, _ids) = kernel
@@ -4293,7 +4473,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                fake.clone(),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
             .unwrap();
 
         let d = Dispatcher::new(&kernel, &registry, &adapters);
@@ -4395,7 +4581,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": "vocab"})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -4404,7 +4589,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": "vocab"})),
             summary: None,
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -4433,7 +4617,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(serde_json::json!({"sync": "suspend"})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
@@ -4442,7 +4625,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: None,
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
@@ -4530,7 +4712,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                     state: ExecutionState::Starting,
                     runtime_handle: RuntimeHandle(Value::Null),
                     ambiguous: false,
-                    failure_class: None,
                     detail: None,
                     terminal_confirmed: false,
                     quiescent_confirmed: false,
@@ -4543,7 +4724,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                     state: ExecutionState::Running,
                     runtime_handle: RuntimeHandle(Value::Null),
                     ambiguous: false,
-                    failure_class: None,
                     detail: None,
                     terminal_confirmed: true,
                     quiescent_confirmed: false,
@@ -4588,7 +4768,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             runtime_handle: RuntimeHandle(Value::Null),
             ambiguous: false,
-            failure_class: Some(FailureClass::Timeout),
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -4597,7 +4776,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Failed,
             payload: None,
             summary: None,
-            failure_class: Some(FailureClass::Timeout),
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -4621,7 +4799,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(Value::Null),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -4630,7 +4807,6 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             state: ExecutionState::Succeeded,
             payload: Some(Value::Null),
             summary: None,
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -4650,7 +4826,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
@@ -4899,7 +5075,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     /// fresh attempt is dispatchable.
     #[test]
     fn isolated_writer_recovery_follows_persisted_isolation_not_registry() {
-        let (kernel, clock, _registry, adapters, fake) = dispatch_env();
+        let (kernel, clock, _registry, _adapters, fake) = dispatch_env();
         let kernel = Arc::new(kernel);
         // An isolated registry generation: same target name, isolation on.
         let mut registry = ExecutionRegistry::new();
@@ -4908,6 +5084,16 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
         registry
             .register_profile(ExecutionProfileConfig::new("default").with_timeout(30.0))
+            .unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_with_safety(
+                "process",
+                AdapterBindingKey::for_tests(),
+                fake.clone(),
+                crate::deadlines::test_deadlines(),
+                AdapterSafetyEnvelope::unenforceable().with_attempt_isolation(true),
+            )
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();

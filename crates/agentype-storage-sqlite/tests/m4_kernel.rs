@@ -20,7 +20,7 @@ fn wal_full_and_foreign_keys() {
     assert_eq!(journal.to_uppercase(), "WAL");
     assert_eq!(sync, 2, "synchronous=FULL");
     assert_eq!(fk, 1);
-    assert_eq!(env.k.schema_version().unwrap(), 3);
+    assert_eq!(env.k.schema_version().unwrap(), 4);
 }
 
 /// A database carrying the Rust-era identity survives reopen; a foreign
@@ -44,7 +44,7 @@ fn fresh_database_carries_rust_identity_and_reopens() {
     }
     // Reopen must succeed: same family, version 1.
     let env = file_env(&db);
-    assert_eq!(env.k.schema_version().unwrap(), 3);
+    assert_eq!(env.k.schema_version().unwrap(), 4);
 }
 
 /// A simulated Python-lineage database (schema_migrations present at version
@@ -1541,7 +1541,11 @@ fn launch_snapshot_matches_persisted_execution_identity_and_isolation() {
     .unwrap();
 
     let launch = k
-        .create_execution(&claim, env.physical_binding().unwrap())
+        .create_execution(
+            &claim,
+            env.physical_binding(AdapterBindingKey::for_tests())
+                .unwrap(),
+        )
         .unwrap();
     assert_eq!(launch.task_id(), &claim.task_id);
     assert_eq!(launch.attempt_id(), &claim.attempt_id);
@@ -1577,6 +1581,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
             FrozenPhysicalExecutionBinding::new(
                 FrozenExecutionSafety::unisolated(wrong_target),
                 "test",
+                agentype_execution_config::AdapterBindingKey::for_tests(),
             )
             .unwrap(),
         )
@@ -1594,6 +1599,7 @@ fn mismatched_target_or_profile_safety_proof_rejected() {
             FrozenPhysicalExecutionBinding::new(
                 FrozenExecutionSafety::unisolated(wrong_profile),
                 "test",
+                agentype_execution_config::AdapterBindingKey::for_tests(),
             )
             .unwrap(),
         )
@@ -1738,7 +1744,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
     let db = FixtureDb::new("schema-v3");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 3);
+        assert_eq!(env.k.schema_version().unwrap(), 4);
     }
     // Downgrade the database to the M5.1-era shape: version 1, no
     // adapter_kind column.
@@ -1755,7 +1761,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
         Ok(_) => panic!("schema v1 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 3"),
+        err.to_string().contains("does not match expected 4"),
         "the rejection must be the schema-version gate: {err:?}"
     );
 
@@ -1763,7 +1769,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
     let fresh = FixtureDb::new("schema-v3-fresh");
     {
         let env = file_env(&fresh);
-        assert_eq!(env.k.schema_version().unwrap(), 3);
+        assert_eq!(env.k.schema_version().unwrap(), 4);
         let conn = rusqlite::Connection::open(&fresh.path).unwrap();
         let has_kind: i64 = conn
             .query_row(
@@ -1789,6 +1795,14 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
             )
             .unwrap();
         assert_eq!(has_reusable, 1);
+        let has_key: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('executions') WHERE name='adapter_binding_key')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_key, 1);
     }
 }
 
@@ -1797,7 +1811,7 @@ fn schema_v2_database_is_rejected_after_pending_terminal_envelope() {
     let db = FixtureDb::new("schema-v2-old");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 3);
+        assert_eq!(env.k.schema_version().unwrap(), 4);
     }
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     conn.execute("UPDATE schema_migrations SET version=2", [])
@@ -1817,7 +1831,32 @@ fn schema_v2_database_is_rejected_after_pending_terminal_envelope() {
         Ok(_) => panic!("schema v2 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 3"),
+        err.to_string().contains("does not match expected 4"),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+}
+
+#[test]
+fn schema_v3_database_is_rejected_after_adapter_binding_key() {
+    let db = FixtureDb::new("schema-v3-old");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), 4);
+    }
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=3", [])
+        .unwrap();
+    conn.execute("ALTER TABLE executions DROP COLUMN adapter_binding_key", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v3 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string().contains("does not match expected 4"),
         "the rejection must be the schema-version gate: {err:?}"
     );
 }

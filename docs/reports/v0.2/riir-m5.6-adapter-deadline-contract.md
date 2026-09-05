@@ -5,6 +5,15 @@ Applies to: branch `rust/m5.6-adapter-deadlines` (base: main @ M5.5 merge `d1ad3
 Canonical path: `docs/reports/v0.2/riir-m5.6-adapter-deadline-contract.md`
 Not a specification.
 
+Superseded by M5.7 (do not treat the following M5.6-era facts as current):
+
+- registry identity is now `(adapter_kind, adapter_binding_key)`, not kind-only
+- recovery routes with `resolve_exact(kind, key)`, not `resolve(kind)`
+- `SCHEMA_VERSION` is 4 (`adapter_binding_key` column)
+
+Deadline algebra, `AdapterError` mapping, and the production façade remain
+frozen as written below.
+
 Despite the historical `riir-` directory naming, this milestone is **native Rust
 runtime work**. It consumes the frozen M4 kernel and the M5.1–M5.5 runtime
 boundaries and freezes the provider-neutral Scheduler-facing
@@ -38,6 +47,21 @@ return before deadline
 There is NEVER `stage A timeout → stage B receives fresh timeout`, and NEVER
 `operation fails → cleanup receives a new cleanup timeout`. Every internal
 wait derives `remaining()` from the same endpoint.
+
+M5.7 aligned the **normative** wording (spec 07) with what a userspace
+adapter can actually guarantee. The algebra above is unchanged. The
+precision is:
+
+> All adapter-controlled waits, retries, protocol stages, cleanup waits and
+> additional side-effect stages MUST obey the single absolute deadline.
+> Under the host-kernel progress assumption, the Scheduler-facing operation
+> MUST return within that deadline. An OS/kernel primitive that cannot be
+> interrupted by the process is outside the in-process liveness guarantee;
+> after such a primitive returns, an expired deadline MUST prohibit any new
+> blocking/side-effect stage except immediate allowed cleanup.
+
+This does not unfreeze Instant/`AdapterError` mapping, does not add a
+watchdog, and does not allow a fresh per-stage timeout.
 
 M5.6 makes this mechanically true for all six operations:
 `start_execution`, `reconcile_start`, `observe_execution`,

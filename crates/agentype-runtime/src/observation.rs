@@ -21,13 +21,6 @@ pub fn adapter_invocation_failure_class(err: &AdapterError) -> FailureClass {
     }
 }
 
-fn mechanical_failure_class(class: Option<FailureClass>) -> Option<FailureClass> {
-    match class {
-        Some(c) if !c.is_mechanical() => Some(FailureClass::AdapterProtocolFailure),
-        other => other,
-    }
-}
-
 /// What a `StartObservation` means. `reconcile_start` returns the same
 /// type as `start_execution`; both MUST go through this classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,23 +57,11 @@ pub enum CollectedOutcomeKind {
 /// dispatcher (contradictory RUNNING, then exact RUNNING, then
 /// ambiguous/unresolved, then terminal-looking, then catch-all).
 pub fn normalize_start_observation(observation: &StartObservation) -> StartObservationKind {
-    if mechanical_failure_class(observation.failure_class)
-        == Some(FailureClass::AdapterProtocolFailure)
-        && observation
-            .failure_class
-            .is_some_and(|c| !c.is_mechanical())
-    {
-        return StartObservationKind::Unresolved {
-            failure_class: FailureClass::AdapterProtocolFailure,
-        };
-    }
     // An ACTIVE state carrying end-of-execution claims is internally
     // contradictory; fail closed as unresolved so no grant can be minted.
     if observation.state == ExecutionState::Running
         && !observation.ambiguous
-        && (observation.terminal_confirmed
-            || observation.quiescent_confirmed
-            || observation.failure_class.is_some())
+        && (observation.terminal_confirmed || observation.quiescent_confirmed)
     {
         return StartObservationKind::Unresolved {
             failure_class: FailureClass::AdapterProtocolFailure,
@@ -112,11 +93,6 @@ pub fn normalize_start_observation(observation: &StartObservation) -> StartObser
 /// quiescence-without-terminality, then terminal success/failure, then
 /// nonterminal catch-all).
 pub fn normalize_collected_outcome(outcome: &ExecutionOutcome) -> CollectedOutcomeKind {
-    if outcome.failure_class.is_some_and(|c| !c.is_mechanical()) {
-        return CollectedOutcomeKind::Unresolved {
-            failure_class: FailureClass::AdapterProtocolFailure,
-        };
-    }
     if outcome.terminal_confirmed && outcome.state.is_active_physical() {
         return CollectedOutcomeKind::Unresolved {
             failure_class: FailureClass::AdapterProtocolFailure,
@@ -144,11 +120,11 @@ pub fn normalize_collected_outcome(outcome: &ExecutionOutcome) -> CollectedOutco
             return CollectedOutcomeKind::TerminalSuccess;
         }
         return CollectedOutcomeKind::TerminalFailure {
-            failure_class: outcome.failure_class.unwrap_or(FailureClass::StartFailure),
+            failure_class: FailureClass::StartFailure,
         };
     }
     CollectedOutcomeKind::Unresolved {
-        failure_class: outcome.failure_class.unwrap_or(FailureClass::ExecutionLost),
+        failure_class: FailureClass::ExecutionLost,
     }
 }
 
@@ -168,24 +144,17 @@ mod tests {
             state,
             runtime_handle: RuntimeHandle(json!({"h": 1})),
             ambiguous,
-            failure_class: None,
             detail: None,
             terminal_confirmed: terminal,
             quiescent_confirmed: quiescent,
         }
     }
 
-    fn outcome(
-        state: ExecutionState,
-        terminal: bool,
-        quiescent: bool,
-        failure_class: Option<FailureClass>,
-    ) -> ExecutionOutcome {
+    fn outcome(state: ExecutionState, terminal: bool, quiescent: bool) -> ExecutionOutcome {
         ExecutionOutcome {
             state,
             payload: None,
             summary: None,
-            failure_class,
             terminal_confirmed: terminal,
             quiescent_confirmed: quiescent,
             incarnation_reusable: false,
@@ -218,13 +187,6 @@ mod tests {
             }
         );
         obs.quiescent_confirmed = false;
-        obs.failure_class = Some(FailureClass::Timeout);
-        assert_eq!(
-            normalize_start_observation(&obs),
-            StartObservationKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
-            }
-        );
     }
 
     #[test]
@@ -274,22 +236,17 @@ mod tests {
     #[test]
     fn collected_success_and_failure() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, true, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, true, true)),
             CollectedOutcomeKind::TerminalSuccess
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(
-                ExecutionState::Failed,
-                true,
-                true,
-                Some(FailureClass::Timeout)
-            )),
+            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
             CollectedOutcomeKind::TerminalFailure {
-                failure_class: FailureClass::Timeout
+                failure_class: FailureClass::StartFailure
             }
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Terminated, true, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Terminated, true, true)),
             CollectedOutcomeKind::TerminalFailure {
                 failure_class: FailureClass::StartFailure
             }
@@ -299,25 +256,25 @@ mod tests {
     #[test]
     fn collected_contradictions_are_unresolved() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Running, true, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Running, true, true)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::AdapterProtocolFailure
             }
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Lost, true, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Lost, true, true)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::AdapterProtocolFailure
             }
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, false, false, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, false, false)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::InvalidResult
             }
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, true)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::AdapterProtocolFailure
             }
@@ -327,7 +284,7 @@ mod tests {
     #[test]
     fn nonterminal_collect_cannot_inherit_reconcile_proof() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, false, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, false)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::ExecutionLost
             }
@@ -365,7 +322,7 @@ mod tests {
         // A proven terminal collection without an explicit class may still
         // produce START_FAILURE — only physical/protocol evidence earns it.
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true, None)),
+            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
             CollectedOutcomeKind::TerminalFailure {
                 failure_class: FailureClass::StartFailure
             }
@@ -377,24 +334,20 @@ mod tests {
     /// rejected as an adapter protocol failure — writer-safety escalation
     /// stays exclusively Scheduler policy.
     #[test]
-    fn scheduler_derived_quiescence_class_is_rejected_as_protocol_failure() {
-        let mut obs = start(ExecutionState::Failed, false, true, true);
-        obs.failure_class = Some(FailureClass::WriterQuiescenceUnknown);
+    fn adapter_cannot_author_scheduler_failure_class() {
+        // ExecutionOutcome no longer carries FailureClass. Terminal Failed
+        // is classified by Runtime as StartFailure; writer-safety remains
+        // Scheduler-only (invocation Protocol still maps via AdapterError).
         assert_eq!(
-            normalize_start_observation(&obs),
-            StartObservationKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
-            }
+            adapter_invocation_failure_class(&AdapterError::protocol(
+                "scheduler-derived failure_class is not adapter-authored"
+            )),
+            FailureClass::AdapterProtocolFailure
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(
-                ExecutionState::Failed,
-                true,
-                true,
-                Some(FailureClass::WriterQuiescenceUnknown)
-            )),
-            CollectedOutcomeKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
+            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
+            CollectedOutcomeKind::TerminalFailure {
+                failure_class: FailureClass::StartFailure
             }
         );
     }

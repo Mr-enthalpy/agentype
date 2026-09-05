@@ -1,0 +1,28 @@
+[package]
+name = "agentype-adapter-local-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference Execution Environment Adapter: spawn and control a local process"
+
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+
+[[bin]]
+name = "print-binding-key"
+path = "src/bin/print-binding-key.rs"
+
+[dependencies]
+agentype-adapter-api.workspace = true
+agentype-core.workspace = true
+agentype-execution-config.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+agentype-runtime.workspace = true
+agentype-storage-sqlite.workspace = true
+agentype-execution-config = { workspace = true, features = ["test-support"] }

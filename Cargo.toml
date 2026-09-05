@@ -5,6 +5,7 @@ members = [
     "crates/agentype-execution-config",
     "crates/agentype-storage-sqlite",
     "crates/agentype-adapter-api",
+    "crates/agentype-adapter-local-process",
     "crates/agentype-root-bridge",
     "crates/agentype-runtime",
 ]
@@ -18,9 +19,12 @@ version = "0.2.0"
 agentype-core = { path = "crates/agentype-core" }
 agentype-execution-config = { path = "crates/agentype-execution-config" }
 agentype-adapter-api = { path = "crates/agentype-adapter-api" }
+agentype-adapter-local-process = { path = "crates/agentype-adapter-local-process" }
 agentype-root-bridge = { path = "crates/agentype-root-bridge" }
+agentype-runtime = { path = "crates/agentype-runtime" }
 agentype-storage-sqlite = { path = "crates/agentype-storage-sqlite" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
+libc = "0.2"

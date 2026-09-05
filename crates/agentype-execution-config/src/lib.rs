@@ -46,7 +46,7 @@ impl ExecutionTargetConfig {
     }
 }
 
-/// Configuration for an execution profile (model settings, timeouts, options, compatibility).
+/// Configuration for an execution profile (timeouts, options, target compatibility).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionProfileConfig {
     pub name: String,
@@ -90,6 +90,7 @@ pub enum ConfigurationError {
     DuplicateProfile(String),
     InvalidName(String),
     InvalidAdapterKind(String),
+    InvalidAdapterBindingKey(String),
     InvalidTimeout(String),
 }
 
@@ -104,6 +105,7 @@ impl std::fmt::Display for ConfigurationError {
             }
             Self::InvalidName(m) => write!(f, "invalid configuration name: {m}"),
             Self::InvalidAdapterKind(m) => write!(f, "invalid adapter kind: {m}"),
+            Self::InvalidAdapterBindingKey(m) => write!(f, "invalid adapter binding key: {m}"),
             Self::InvalidTimeout(m) => write!(f, "invalid timeout: {m}"),
         }
     }
@@ -253,22 +255,47 @@ impl FrozenExecutionSafety {
     }
 }
 
+/// Opaque, provider-neutral identity of one concrete execution domain
+/// (host/boot/pid-namespace/installation). Core MUST NOT interpret it.
+/// `adapter_kind` is the driver family; this key is the installed instance.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AdapterBindingKey(String);
+
+impl AdapterBindingKey {
+    pub fn new(raw: impl Into<String>) -> Result<Self, ConfigurationError> {
+        let key = raw.into();
+        if key.trim().is_empty() {
+            return Err(ConfigurationError::InvalidAdapterBindingKey(
+                "adapter binding key cannot be empty".into(),
+            ));
+        }
+        Ok(Self(key))
+    }
+
+    /// Stable key for tests. Not a production host/boot fingerprint.
+    /// Production code must capture the adapter's real domain key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests() -> Self {
+        Self("test".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The provider-neutral physical binding frozen with the STARTING
-/// Execution: the Attempt-bound safety facts plus the `adapter_kind` of the
-/// installed adapter implementation that owns the physical start.
+/// Execution: Attempt-bound safety facts, the `adapter_kind` driver family,
+/// and the opaque `adapter_binding_key` of the installed domain.
 ///
-/// Persisting `adapter_kind` inside the execution-commitment transaction is
-/// the M5.2 commitment invariant: anything required to identify the physical
-/// start owner after a crash must be frozen no later than the transaction
-/// that creates the STARTING Execution, so M5.4 reconciliation can route the
-/// execution to the adapter that actually started it even if the registry
-/// configuration has drifted. Provider-neutral binding metadata only — not a
-/// vendor concept, and not a plugin-identity framework (a stronger
-/// adapter_binding_id/config fingerprint is deferred to M5.4/M5.7).
+/// Both identities are frozen in the execution-commitment transaction so
+/// M5.4 reconciliation can route to the exact environment that started the
+/// Execution. Core does not interpret the key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenPhysicalExecutionBinding {
     safety: FrozenExecutionSafety,
     adapter_kind: String,
+    adapter_binding_key: AdapterBindingKey,
 }
 
 impl FrozenPhysicalExecutionBinding {
@@ -279,14 +306,21 @@ impl FrozenPhysicalExecutionBinding {
     pub fn new(
         safety: FrozenExecutionSafety,
         adapter_kind: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
     ) -> Result<Self, ConfigurationError> {
         let adapter_kind = adapter_kind.into();
         if adapter_kind.trim().is_empty() {
             return Err(ConfigurationError::InvalidAdapterKind(adapter_kind));
         }
+        if adapter_binding_key.as_str().trim().is_empty() {
+            return Err(ConfigurationError::InvalidAdapterBindingKey(
+                "adapter binding key cannot be empty".into(),
+            ));
+        }
         Ok(Self {
             safety,
             adapter_kind,
+            adapter_binding_key,
         })
     }
 
@@ -296,6 +330,10 @@ impl FrozenPhysicalExecutionBinding {
 
     pub fn adapter_kind(&self) -> &str {
         &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
+        &self.adapter_binding_key
     }
 }
 
@@ -340,11 +378,17 @@ impl ResolvedExecutionEnvironment {
         self.attempt_isolation
     }
 
-    /// The provider-neutral physical binding for this resolved environment:
-    /// the Attempt-bound safety facts plus the target configuration's
-    /// declared adapter_kind.
-    pub fn physical_binding(&self) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
-        FrozenPhysicalExecutionBinding::new(self.safety().clone(), self.target.adapter_kind.clone())
+    /// Attempt-bound safety facts plus adapter_kind and the caller's
+    /// installed-domain `adapter_binding_key`.
+    pub fn physical_binding(
+        &self,
+        adapter_binding_key: AdapterBindingKey,
+    ) -> Result<FrozenPhysicalExecutionBinding, ConfigurationError> {
+        FrozenPhysicalExecutionBinding::new(
+            self.safety().clone(),
+            self.target.adapter_kind.clone(),
+            adapter_binding_key,
+        )
     }
 
     /// The durable authority binding this environment was resolved for.
@@ -819,10 +863,13 @@ mod tests {
             execution_profile: "default".into(),
         };
         let safety = FrozenExecutionSafety::unisolated(b);
-        for blank in ["", "   ", "	"] {
-            let err = FrozenPhysicalExecutionBinding::new(safety.clone(), blank).unwrap_err();
+        let key = AdapterBindingKey::for_tests();
+        for blank in ["", "   ", "\t"] {
+            let err = FrozenPhysicalExecutionBinding::new(safety.clone(), blank, key.clone())
+                .unwrap_err();
             assert!(matches!(err, ConfigurationError::InvalidAdapterKind(_)));
         }
-        assert!(FrozenPhysicalExecutionBinding::new(safety, "process").is_ok());
+        assert!(AdapterBindingKey::new("").is_err());
+        assert!(FrozenPhysicalExecutionBinding::new(safety, "process", key).is_ok());
     }
 }

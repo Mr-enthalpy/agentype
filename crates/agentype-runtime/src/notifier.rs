@@ -476,9 +476,9 @@ mod tests {
     use crate::supervision::SupervisionRunner;
     use crate::timing::RuntimeTimingConfig;
     use crate::{
-        AdapterRegistry, DispatchOneOutcome, Dispatcher, ExecutionProfileConfig, ExecutionRegistry,
-        ExecutionTargetConfig, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
-        SupervisionAdmission,
+        AdapterBindingKey, AdapterRegistry, DispatchOneOutcome, Dispatcher, ExecutionProfileConfig,
+        ExecutionRegistry, ExecutionTargetConfig, FrozenExecutionSafety,
+        FrozenPhysicalExecutionBinding, SupervisionAdmission,
     };
     use agentype_adapter_api::FakeAdapter;
     use agentype_core::*;
@@ -545,6 +545,7 @@ mod tests {
                 execution_profile: claim.execution_profile.clone(),
             }),
             "process",
+            AdapterBindingKey::for_tests(),
         )
         .unwrap()
     }
@@ -1015,7 +1016,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         k.submit_batch(&[TaskSpec::new("while-blocked", json!({"o": 1}))])
             .unwrap();
