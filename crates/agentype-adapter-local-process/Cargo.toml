@@ -1,0 +1,18 @@
+[package]
+name = "agentype-adapter-local-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference Execution Environment Adapter: spawn and control a local process"
+
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+
+[dependencies]
+agentype-adapter-api.workspace = true
+agentype-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agentype-execution-config.workspace = true

@@ -12,6 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentype-adapter-local-process"
+version = "0.2.0"
+dependencies = [
+ "agentype-adapter-api",
+ "agentype-core",
+ "agentype-execution-config",
+ "serde_json",
+]
+
+[[package]]
 name = "agentype-core"
 version = "0.2.0"
 dependencies = [
