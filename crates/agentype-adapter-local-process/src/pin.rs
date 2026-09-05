@@ -1,13 +1,13 @@
 //! Pin a process instance before any control side effect.
-#![allow(unsafe_code)]
 //!
 //! Stale RuntimeHandle must never signal or reap another occupant of the
 //! same PID. Linux uses pidfd; Windows keeps one PROCESS handle for verify
 //! and act. If the platform cannot pin, control is Unavailable.
+#![allow(unsafe_code)]
 
-use super::{require_deadline, AdapterDeadline, AdapterError, AdapterResult};
 #[cfg(target_os = "linux")]
 use super::process_stat;
+use super::{require_deadline, AdapterDeadline, AdapterError, AdapterResult};
 use std::time::Duration;
 
 pub(crate) struct PinnedInstance {
