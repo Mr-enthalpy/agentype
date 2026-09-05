@@ -152,9 +152,19 @@ creation FILETIME). Missing `birth` or `request_id` is Protocol, not a
 wildcard. Birth mismatch is UNKNOWN, never positive re-admission.
 
 `adapter_kind` is the driver family (`local_process`). The opaque
-`adapter_binding_key` (schema v4) is the concrete domain (host/boot/
-process-namespace fingerprint), frozen at Execution creation. Recovery
-resolves `(kind, key)` with no fallback. Core does not interpret the key.
+`adapter_binding_key` (schema v4) is the concrete domain, frozen at
+Execution creation:
+
+- Linux: `linux:<boot_id>:<pid_ns>` (`/proc/sys/kernel/random/boot_id` plus
+  `/proc/self/ns/pid` inode). Same host boot in a new PID namespace is a
+  different domain.
+- Windows: `win:<COMPUTERNAME>:<BootIdentifier>` from
+  `NtQuerySystemInformation(SystemBootEnvironmentInformation)`. Not
+  wall-clock minus `GetTickCount64`.
+
+Recovery uses `resolve_exact(kind, key)` with no fallback. Launch without
+a SpawnSource uses `resolve_unique(kind)` and fails closed if two
+installations of that driver are present. Core does not interpret the key.
 
 ---
 
@@ -234,9 +244,18 @@ The reference adapter:
 - on terminate wait exhaustion, `DeadlineExceeded` with hint
   ("kill sent is not quiescence").
 
-Absolute deadlines cover adapter-controlled user-space waits and staged
-syscalls. An uninterruptible kernel/filesystem/hardware call is outside
-the in-process software liveness guarantee. There is no watchdog thread.
+Normative contract (spec 07, aligned here; this file is not itself a spec):
+
+All adapter-controlled waits, retries, protocol stages, cleanup waits and
+additional side-effect stages MUST obey the single absolute deadline.
+Under the host-kernel progress assumption, the Scheduler-facing operation
+MUST return within that deadline. An OS/kernel primitive that cannot be
+interrupted by the process is outside the in-process liveness guarantee;
+after such a primitive returns, an expired deadline MUST prohibit any new
+blocking/side-effect stage except immediate allowed cleanup.
+
+There is no watchdog thread. A helper thread, detached watchdog, or fresh
+per-stage timeout MUST NOT paper over an uninterruptible kernel wait.
 
 ---
 
@@ -257,7 +276,7 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 | observe | live `Child` with matching `birth`, else `pid+birth` and non-zombie state. Alive → RUNNING; mismatch/dead/zombie → UNKNOWN. Never SUCCEEDED. |
 | interrupt | Unix `SIGINT` (ESRCH → observe; other errno → Unavailable) / Windows `CTRL_BREAK`. Not Task cancellation. |
 | terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. |
-| collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). |
+| collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol, not Failed. |
 | reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. No handle → ambiguous UNKNOWN. |
 
 Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via

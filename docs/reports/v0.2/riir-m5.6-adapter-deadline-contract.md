@@ -39,6 +39,21 @@ There is NEVER `stage A timeout → stage B receives fresh timeout`, and NEVER
 `operation fails → cleanup receives a new cleanup timeout`. Every internal
 wait derives `remaining()` from the same endpoint.
 
+M5.7 aligned the **normative** wording (spec 07) with what a userspace
+adapter can actually guarantee. The algebra above is unchanged. The
+precision is:
+
+> All adapter-controlled waits, retries, protocol stages, cleanup waits and
+> additional side-effect stages MUST obey the single absolute deadline.
+> Under the host-kernel progress assumption, the Scheduler-facing operation
+> MUST return within that deadline. An OS/kernel primitive that cannot be
+> interrupted by the process is outside the in-process liveness guarantee;
+> after such a primitive returns, an expired deadline MUST prohibit any new
+> blocking/side-effect stage except immediate allowed cleanup.
+
+This does not unfreeze Instant/`AdapterError` mapping, does not add a
+watchdog, and does not allow a fresh per-stage timeout.
+
 M5.6 makes this mechanically true for all six operations:
 `start_execution`, `reconcile_start`, `observe_execution`,
 `collect_outcome`, `interrupt_execution`, `terminate_execution`.

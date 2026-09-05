@@ -9,6 +9,10 @@ description = "Reference Execution Environment Adapter: spawn and control a loca
 name = "fake-agent"
 path = "src/bin/fake-agent.rs"
 
+[[bin]]
+name = "print-binding-key"
+path = "src/bin/print-binding-key.rs"
+
 [dependencies]
 agentype-adapter-api.workspace = true
 agentype-core.workspace = true
@@ -18,3 +22,4 @@ serde_json.workspace = true
 [dev-dependencies]
 agentype-runtime.workspace = true
 agentype-storage-sqlite.workspace = true
+agentype-execution-config = { workspace = true, features = ["test-support"] }

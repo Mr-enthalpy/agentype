@@ -92,7 +92,7 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
             drop(admission);
             let execution_id = only_execution_id(&kernel);
             let handle = RuntimeHandle(kernel.execution_runtime_handle(&execution_id).unwrap());
-            let binding = adapters.resolve(ADAPTER_KIND).unwrap();
+            let binding = adapters.resolve_unique(ADAPTER_KIND).unwrap();
             let collected = binding.collect_outcome(&handle).unwrap();
             assert_eq!(collected.state, agentype_core::ExecutionState::Succeeded);
         }

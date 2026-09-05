@@ -148,22 +148,26 @@ impl PreparedExecutionLaunch {
 /// The configuration-resolution key therefore always comes from durable
 /// Attempt state, never from the Claim DTO, so a tampered claim cannot steer
 /// resolution or masquerade as a configuration failure.
+///
+/// `adapter_binding_key` is the concrete imported domain. This façade does
+/// not consult `AdapterRegistry` and MUST NOT invent a `"test"` key.
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,
     mode: ExecutionResolutionMode<'_>,
+    adapter_binding_key: AdapterBindingKey,
 ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
     let binding = kernel
         .resolve_execution_binding(claim)
         .map_err(ExecutionPreparationError::Kernel)?;
     let environment = resolve_execution_environment(mode, &binding)
         .map_err(ExecutionPreparationError::Configuration)?;
-    // Standalone façade: no AdapterRegistry is consulted, so the frozen
-    // adapter_kind is the target configuration's declared binding.
+    // Standalone façade: no AdapterRegistry is consulted. The caller must
+    // supply the concrete domain key; this path never invents `"test"`.
     let physical_binding = FrozenPhysicalExecutionBinding::new(
         environment.safety(),
         environment.target().adapter_kind.clone(),
-        AdapterBindingKey::for_tests(),
+        adapter_binding_key,
     )
     .map_err(ExecutionPreparationError::InvalidBinding)?;
     let snapshot = kernel
@@ -187,7 +191,10 @@ pub fn prepare_execution_launch(
 pub enum AdapterRegistryError {
     InvalidKind(String),
     InvalidBindingKey(String),
-    DuplicateKind(String),
+    DuplicateBinding {
+        adapter_kind: String,
+        adapter_binding_key: String,
+    },
 }
 
 impl std::fmt::Display for AdapterRegistryError {
@@ -195,45 +202,65 @@ impl std::fmt::Display for AdapterRegistryError {
         match self {
             Self::InvalidKind(m) => write!(f, "invalid adapter kind: {m}"),
             Self::InvalidBindingKey(m) => write!(f, "invalid adapter binding key: {m}"),
-            Self::DuplicateKind(k) => write!(f, "duplicate adapter kind registration: '{k}'"),
+            Self::DuplicateBinding {
+                adapter_kind,
+                adapter_binding_key,
+            } => write!(
+                f,
+                "duplicate adapter binding registration: kind '{adapter_kind}' key '{adapter_binding_key}'"
+            ),
         }
     }
 }
 
 impl std::error::Error for AdapterRegistryError {}
 
-/// The configured adapter kind is not installed in the runtime.
+/// The configured adapter kind is not uniquely resolvable in the runtime.
 ///
 /// Authoritative empty resolution: there is no fallback to a first-available,
-/// target-named, "default", or direct-mode adapter.
+/// target-named, "default", or direct-mode adapter. Two installations of the
+/// same driver family fail closed until the caller uses `resolve_exact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterUnavailable {
-    pub adapter_kind: String,
+pub enum AdapterUnavailable {
+    Missing { adapter_kind: String },
+    Ambiguous { adapter_kind: String },
+}
+
+impl AdapterUnavailable {
+    pub fn adapter_kind(&self) -> &str {
+        match self {
+            Self::Missing { adapter_kind } | Self::Ambiguous { adapter_kind } => adapter_kind,
+        }
+    }
 }
 
 impl std::fmt::Display for AdapterUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "no adapter installed for configured kind '{}'",
-            self.adapter_kind
-        )
+        match self {
+            Self::Missing { adapter_kind } => write!(
+                f,
+                "no adapter installed for configured kind '{adapter_kind}'"
+            ),
+            Self::Ambiguous { adapter_kind } => write!(
+                f,
+                "multiple adapter bindings installed for kind '{adapter_kind}' (exact binding key required)"
+            ),
+        }
     }
 }
 
 impl std::error::Error for AdapterUnavailable {}
 
-/// Registry of installed physical adapter implementations, keyed by the
-/// `adapter_kind` named by `ExecutionTargetConfig`.
+/// Registry of installed physical adapter implementations, keyed by
+/// `(adapter_kind, adapter_binding_key)`.
 ///
-/// This represents physical implementation availability only. It is NOT
-/// SpawnSource and carries no semantic scheduling authority: target
-/// configuration says what execution environment is requested, and this
-/// registry says which physical implementation is currently installed. An
-/// explicitly empty registry is authoritative — resolution fails closed.
+/// `adapter_kind` is the driver family; `adapter_binding_key` is one concrete
+/// imported execution domain. This is NOT SpawnSource and carries no
+/// semantic scheduling authority. An explicitly empty registry is
+/// authoritative — resolution fails closed.
 #[derive(Default)]
 pub struct AdapterRegistry {
-    adapters: HashMap<String, ResolvedAdapterBinding>,
+    adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
 }
 
 impl AdapterRegistry {
@@ -259,17 +286,22 @@ impl AdapterRegistry {
                 "adapter binding key cannot be empty".into(),
             ));
         }
-        if self.adapters.contains_key(&kind) {
-            return Err(AdapterRegistryError::DuplicateKind(kind));
+        let by_key = self.adapters.entry(kind.clone()).or_default();
+        if by_key.contains_key(&adapter_binding_key) {
+            return Err(AdapterRegistryError::DuplicateBinding {
+                adapter_kind: kind,
+                adapter_binding_key: adapter_binding_key.as_str().to_string(),
+            });
         }
-        self.adapters.insert(
-            kind.clone(),
+        by_key.insert(
+            adapter_binding_key.clone(),
             ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines),
         );
         Ok(())
     }
 
     /// Test helper: register with `AdapterBindingKey::for_tests()`.
+    #[cfg(test)]
     pub fn register_kind(
         &mut self,
         adapter_kind: impl Into<String>,
@@ -284,18 +316,24 @@ impl AdapterRegistry {
         )
     }
 
-    /// Fail-closed lookup by the configured `adapter_kind`. No fallback.
-    /// Returns a binding that always constructs an operation deadline.
-    pub fn resolve(
+    /// Legacy launch lookup: succeed only when this kind has exactly one
+    /// installed binding. Two Codex/local installations of the same driver
+    /// fail closed (`Ambiguous`); M6 SpawnSource will call `resolve_exact`.
+    pub fn resolve_unique(
         &self,
         adapter_kind: &str,
     ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
-        self.adapters
-            .get(adapter_kind)
-            .cloned()
-            .ok_or_else(|| AdapterUnavailable {
+        match self.adapters.get(adapter_kind) {
+            None => Err(AdapterUnavailable::Missing {
                 adapter_kind: adapter_kind.to_string(),
-            })
+            }),
+            Some(by_key) if by_key.len() == 1 => {
+                Ok(by_key.values().next().expect("len == 1").clone())
+            }
+            Some(_) => Err(AdapterUnavailable::Ambiguous {
+                adapter_kind: adapter_kind.to_string(),
+            }),
+        }
     }
 
     /// Recovery lookup: kind AND frozen key must match the installed adapter.
@@ -304,13 +342,13 @@ impl AdapterRegistry {
         adapter_kind: &str,
         adapter_binding_key: &AdapterBindingKey,
     ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
-        let binding = self.resolve(adapter_kind)?;
-        if binding.adapter_binding_key() != adapter_binding_key {
-            return Err(AdapterUnavailable {
+        self.adapters
+            .get(adapter_kind)
+            .and_then(|by_key| by_key.get(adapter_binding_key))
+            .cloned()
+            .ok_or_else(|| AdapterUnavailable::Missing {
                 adapter_kind: adapter_kind.to_string(),
-            });
-        }
-        Ok(binding)
+            })
     }
 }
 
@@ -464,7 +502,7 @@ pub fn resolve_physical_execution_environment(
     )
     .map_err(DispatchError::Configuration)?;
     let adapter_binding = adapters
-        .resolve(environment.target().adapter_kind.as_str())
+        .resolve_unique(environment.target().adapter_kind.as_str())
         .map_err(DispatchError::AdapterAvailability)?;
     Ok(ResolvedPhysicalExecutionEnvironment {
         binding,
@@ -1164,6 +1202,14 @@ mod tests {
     };
     use serde_json::Value;
     use std::sync::Arc;
+
+    fn prepare_execution_launch(
+        kernel: &Kernel,
+        claim: &Claim,
+        mode: ExecutionResolutionMode<'_>,
+    ) -> Result<PreparedExecutionLaunch, ExecutionPreparationError> {
+        super::prepare_execution_launch(kernel, claim, mode, AdapterBindingKey::for_tests())
+    }
 
     /// Synthetic durable binding for registry-only assertions (the attempt
     /// identity is irrelevant when only target/profile resolution is probed).
@@ -2038,7 +2084,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         assert_eq!(
             composed.unwrap_err(),
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "process".to_string()
             })
         );
@@ -2058,7 +2104,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
         assert_eq!(
             composed.unwrap_err(),
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "process".to_string()
             })
         );
@@ -2092,8 +2138,48 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
                     crate::deadlines::test_deadlines()
                 )
                 .unwrap_err(),
-            AdapterRegistryError::DuplicateKind("process".into())
+            AdapterRegistryError::DuplicateBinding {
+                adapter_kind: "process".into(),
+                adapter_binding_key: AdapterBindingKey::for_tests().as_str().to_string(),
+            }
         );
+    }
+
+    #[test]
+    fn adapter_registry_allows_same_kind_distinct_binding_keys() {
+        let mut adapters = AdapterRegistry::new();
+        let policy = crate::deadlines::test_deadlines();
+        adapters
+            .register(
+                "codex",
+                AdapterBindingKey::new("install-a").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                policy,
+            )
+            .unwrap();
+        adapters
+            .register(
+                "codex",
+                AdapterBindingKey::new("install-b").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                policy,
+            )
+            .unwrap();
+        assert!(matches!(
+            adapters.resolve_unique("codex"),
+            Err(AdapterUnavailable::Ambiguous { .. })
+        ));
+        let a = adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-a").unwrap())
+            .unwrap();
+        let b = adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-b").unwrap())
+            .unwrap();
+        assert_eq!(a.adapter_binding_key().as_str(), "install-a");
+        assert_eq!(b.adapter_binding_key().as_str(), "install-b");
+        assert!(adapters
+            .resolve_exact("codex", &AdapterBindingKey::new("install-c").unwrap())
+            .is_err());
     }
 
     #[test]
@@ -2104,7 +2190,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             Some(FailureClass::ResourceUnavailable)
         );
         assert_eq!(
-            DispatchError::AdapterAvailability(AdapterUnavailable {
+            DispatchError::AdapterAvailability(AdapterUnavailable::Missing {
                 adapter_kind: "k".into()
             })
             .standard_failure_class(),

@@ -58,8 +58,14 @@ RootBridge change. M5.8 composition root is still later.
 ## 3. Reference adapter
 
 `adapter_kind = local_process` is the driver family. The opaque
-`adapter_binding_key` (Linux boot_id / Windows host+boot, process-local
-`OnceLock`) is the concrete domain. The executable is user configuration.
+`adapter_binding_key` is the concrete domain:
+
+- Linux: `linux:<boot_id>:<pid_ns>`
+- Windows: `win:<COMPUTERNAME>:<BootIdentifier GUID>`
+
+`OnceLock` only caches a stable computation in-process; same-boot identity
+is proven by a child process (`print-binding-key`) recomputing the key.
+The executable is user configuration.
 
 Handle:
 
@@ -79,6 +85,7 @@ SUCCEEDED.
 `quiescent_confirmed` is always false. Process death is UNKNOWN on
 observe, never SUCCEEDED. Kill-sent is not quiescence.
 Any `failure_class` key in agent JSON is `AdapterError::Protocol`.
+`ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol.
 Terminal `ok:false` is Failed; Runtime maps it to `StartFailure`.
 
 Stdin is opaque payload JSON on the calling thread (PIPE_NOWAIT /
@@ -137,8 +144,10 @@ sanitization.
 
 ## 7. Hung P1s (must not be lost)
 
-- **adapter_binding_key** — closed (schema v4). Core does not interpret it.
-  Future Codex installations are additional keys.
+- **adapter_binding_key** — closed (schema v4; Linux boot+pid-ns, Windows
+  boot GUID; Registry is `(kind, key)` with `resolve_unique` /
+  `resolve_exact`). Core does not interpret it. Future Codex
+  installations are additional keys of kind `codex`.
 - **last_error sanitization** — BLOCKS_REAL_ROOT_BRIDGE (M5.5). Not M5.7.
 - **M5.8** — composition root must mechanically run process lock →
   RECOVERING → `RecoveredRuntime` → enable Dispatcher → READY; one
@@ -170,10 +179,14 @@ sanitization.
 Closed in-milestone, not deferred to M5.8:
 
 - Linux zombie/reap: no `mem::forget`; `Z` is not RUNNING; `waitpid(WNOHANG)`
-- `adapter_binding_key` schema v4; `resolve_exact(kind, key)`
+- `adapter_binding_key` schema v4; Linux pid namespace; Windows boot GUID;
+  cross-process same-boot regression; Registry `(kind, key)`;
+  `resolve_unique` / `resolve_exact`; no production `"test"` key
 - Generic prompt and adapter-authored `FailureClass` removed from DTOs
-- Staged spawn deadline; honest kernel-syscall caveat
+- Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
+  aligned (host-kernel progress assumption; no watchdog)
 - Dispatcher/Recovery path through real `fake-agent`
+- Collect `ok` must be an explicit JSON boolean (else Protocol)
 
 ## 9. Future Codex strategy
 

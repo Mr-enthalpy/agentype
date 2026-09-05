@@ -73,17 +73,24 @@ fn capture_domain_key() -> AdapterBindingKey {
 fn compute_domain_key() -> AdapterBindingKey {
     #[cfg(target_os = "linux")]
     {
-        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-        let raw = format!("linux:{}", boot.trim());
-        AdapterBindingKey::new(raw)
-            .unwrap_or_else(|_| AdapterBindingKey::new("linux:unknown-boot").expect("static key"))
+        let boot = read_trimmed("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_else(|| "unknown-boot".into());
+        let ns = std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown-ns".into());
+        AdapterBindingKey::new(format!("linux:{boot}:{ns}")).unwrap_or_else(|_| {
+            AdapterBindingKey::new("linux:unknown-boot:unknown-ns").expect("static key")
+        })
     }
     #[cfg(windows)]
     {
         let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
-        let boot = windows_boot_token();
-        AdapterBindingKey::new(format!("win:{host}:{boot}"))
-            .unwrap_or_else(|_| AdapterBindingKey::new("win:unknown").expect("static key"))
+        let boot = windows_boot_identifier().unwrap_or_else(|| "unknown-boot".into());
+        AdapterBindingKey::new(format!("win:{host}:{boot}")).unwrap_or_else(|_| {
+            AdapterBindingKey::new("win:unknown:unknown-boot").expect("static key")
+        })
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -91,19 +98,68 @@ fn compute_domain_key() -> AdapterBindingKey {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn windows_boot_token() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    extern "system" {
-        fn GetTickCount64() -> u64;
+fn windows_boot_identifier() -> Option<String> {
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
     }
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let uptime = unsafe { GetTickCount64() };
-    now_ms.saturating_sub(uptime)
+    #[repr(C)]
+    struct SystemBootEnvironmentInformation {
+        boot_identifier: Guid,
+        firmware_type: u32,
+        boot_flags: u64,
+    }
+    const SYSTEM_BOOT_ENVIRONMENT_INFORMATION: u32 = 90;
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySystemInformation(
+            class: u32,
+            info: *mut SystemBootEnvironmentInformation,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    let mut info = std::mem::MaybeUninit::<SystemBootEnvironmentInformation>::zeroed();
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_BOOT_ENVIRONMENT_INFORMATION,
+            info.as_mut_ptr(),
+            std::mem::size_of::<SystemBootEnvironmentInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let g = info.boot_identifier;
+    Some(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7]
+    ))
 }
 
 impl Drop for LocalProcessAgentAdapter {
@@ -783,7 +839,14 @@ fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
     let obj = value
         .as_object()
         .ok_or_else(|| AdapterError::protocol("process stdout JSON must be an object"))?;
-    let ok = obj.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let ok = match obj.get("ok") {
+        Some(Value::Bool(flag)) => *flag,
+        _ => {
+            return Err(AdapterError::protocol(
+                "process stdout JSON must include boolean ok",
+            ))
+        }
+    };
     let summary = obj
         .get("summary")
         .and_then(Value::as_str)
@@ -1288,6 +1351,23 @@ mod tests {
         let out = parse_outcome_json(r#"{"ok":false,"summary":"nope"}"#).unwrap();
         assert_eq!(out.state, ExecutionState::Failed);
         assert!(!out.quiescent_confirmed);
+    }
+
+    #[test]
+    fn missing_or_non_bool_ok_is_protocol_not_failed() {
+        for raw in [
+            "{}",
+            r#"{"ok":"banana"}"#,
+            r#"{"ok":1}"#,
+            r#"{"summary":"x"}"#,
+        ] {
+            let err = parse_outcome_json(raw).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                AdapterErrorKind::Protocol,
+                "stdout {raw} must not become terminal Failed"
+            );
+        }
     }
 
     #[test]

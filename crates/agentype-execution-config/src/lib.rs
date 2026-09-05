@@ -272,8 +272,9 @@ impl AdapterBindingKey {
         Ok(Self(key))
     }
 
-    /// Stable key for tests and the standalone launch façade (no registry).
-    /// Not a production host/boot fingerprint.
+    /// Stable key for tests. Not a production host/boot fingerprint.
+    /// Production code must capture the adapter's real domain key.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests() -> Self {
         Self("test".to_string())
     }

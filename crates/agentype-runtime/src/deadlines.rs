@@ -297,7 +297,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             adapters
-                .resolve("fast")
+                .resolve_unique("fast")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::ReconcileStart),
@@ -305,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             adapters
-                .resolve("slow")
+                .resolve_unique("slow")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::CollectOutcome),
