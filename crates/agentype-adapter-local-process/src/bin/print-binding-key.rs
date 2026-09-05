@@ -1,8 +1,9 @@
 fn main() {
-    print!(
-        "{}",
-        agentype_adapter_local_process::LocalProcessAgentAdapter::new()
-            .binding_key()
-            .as_str()
-    );
+    match agentype_adapter_local_process::LocalProcessAgentAdapter::try_new() {
+        Ok(adapter) => print!("{}", adapter.binding_key().as_str()),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
 }

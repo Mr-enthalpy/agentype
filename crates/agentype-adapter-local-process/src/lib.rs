@@ -53,11 +53,18 @@ impl Default for LocalProcessAgentAdapter {
 }
 
 impl LocalProcessAgentAdapter {
-    pub fn new() -> Self {
-        Self {
+    /// Install this adapter only when the host domain identity can be proved.
+    /// Missing boot, PID namespace, or mount namespace is Unavailable — never
+    /// a synthetic `unknown-*` key.
+    pub fn try_new() -> AdapterResult<Self> {
+        Ok(Self {
             live: Mutex::new(HashMap::new()),
-            binding_key: capture_domain_key(),
-        }
+            binding_key: capture_domain_key()?,
+        })
+    }
+
+    pub fn new() -> Self {
+        Self::try_new().expect("local-process domain identity is required")
     }
 
     pub fn binding_key(&self) -> &AdapterBindingKey {
@@ -65,37 +72,64 @@ impl LocalProcessAgentAdapter {
     }
 }
 
-fn capture_domain_key() -> AdapterBindingKey {
-    static DOMAIN: OnceLock<AdapterBindingKey> = OnceLock::new();
+fn capture_domain_key() -> AdapterResult<AdapterBindingKey> {
+    static DOMAIN: OnceLock<AdapterResult<AdapterBindingKey>> = OnceLock::new();
     DOMAIN.get_or_init(compute_domain_key).clone()
 }
 
-fn compute_domain_key() -> AdapterBindingKey {
+fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
     #[cfg(target_os = "linux")]
     {
         let boot = read_trimmed("/proc/sys/kernel/random/boot_id")
-            .unwrap_or_else(|| "unknown-boot".into());
-        let ns = std::fs::read_link("/proc/self/ns/pid")
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown-ns".into());
-        AdapterBindingKey::new(format!("linux:{boot}:{ns}")).unwrap_or_else(|_| {
-            AdapterBindingKey::new("linux:unknown-boot:unknown-ns").expect("static key")
-        })
+            .ok_or_else(|| AdapterError::unavailable("linux boot_id unavailable"))?;
+        let pid_ns = read_ns("pid")?;
+        let mnt_ns = read_ns("mnt")?;
+        linux_domain_key(&boot, &pid_ns, &mnt_ns)
     }
     #[cfg(windows)]
     {
-        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
-        let boot = windows_boot_identifier().unwrap_or_else(|| "unknown-boot".into());
-        AdapterBindingKey::new(format!("win:{host}:{boot}")).unwrap_or_else(|_| {
-            AdapterBindingKey::new("win:unknown:unknown-boot").expect("static key")
-        })
+        let host = std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AdapterError::unavailable("windows COMPUTERNAME unavailable"))?;
+        let boot = windows_boot_identifier()
+            .ok_or_else(|| AdapterError::unavailable("windows boot identifier unavailable"))?;
+        AdapterBindingKey::new(format!("win:{host}:{boot}"))
+            .map_err(|_| AdapterError::unavailable("windows domain key invalid"))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        AdapterBindingKey::new("unsupported-os").expect("static key")
+        Err(AdapterError::unavailable(
+            "local_process adapter unsupported on this OS",
+        ))
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_domain_key(boot: &str, pid_ns: &str, mnt_ns: &str) -> AdapterResult<AdapterBindingKey> {
+    if boot.trim().is_empty() || pid_ns.trim().is_empty() || mnt_ns.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "linux domain identity components cannot be empty",
+        ));
+    }
+    if boot.contains("unknown") || pid_ns.contains("unknown") || mnt_ns.contains("unknown") {
+        return Err(AdapterError::unavailable(
+            "linux domain identity cannot use unknown placeholders",
+        ));
+    }
+    AdapterBindingKey::new(format!("linux:{boot}:{pid_ns}:{mnt_ns}"))
+        .map_err(|_| AdapterError::unavailable("linux domain key invalid"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_ns(kind: &str) -> AdapterResult<String> {
+    let path = format!("/proc/self/ns/{kind}");
+    std::fs::read_link(&path)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AdapterError::unavailable(format!("linux {kind} namespace unavailable")))
 }
 
 #[cfg(target_os = "linux")]
@@ -374,13 +408,13 @@ fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResu
     }
 }
 
-fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> bool {
+fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
     loop {
-        if !instance_alive(pid, birth) {
-            return true;
+        if !instance_alive(pid, birth, deadline)? {
+            return Ok(true);
         }
         match wait_slice(deadline) {
-            None => return false,
+            None => return Ok(false),
             Some(slice) => thread::sleep(slice),
         }
     }
@@ -673,34 +707,47 @@ fn reap_pid(pid: u32) {
     }
 }
 
-fn process_birth(pid: u32) -> Option<u64> {
-    process_stat(pid).map(|(_, birth)| birth)
+fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
+    require_deadline(
+        deadline,
+        "deadline exhausted before process birth probe",
+        None,
+    )?;
+    process_stat(pid, deadline)?
+        .map(|(_, birth)| birth)
+        .ok_or_else(|| AdapterError::unavailable("cannot read process birth identity"))
 }
 
-fn instance_alive(pid: u32, birth: u64) -> bool {
+fn instance_alive(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
     #[cfg(target_os = "linux")]
     {
+        require_deadline(deadline, "deadline exhausted before waitpid", None)?;
         reap_pid(pid);
     }
-    match process_stat(pid) {
+    Ok(match process_stat(pid, deadline)? {
         Some((state, found)) => !matches!(state, 'Z' | 'X' | 'x') && found == birth,
         None => false,
-    }
+    })
 }
 
-fn process_stat(pid: u32) -> Option<(char, u64)> {
+fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(char, u64)>> {
+    require_deadline(
+        deadline,
+        "deadline exhausted before process stat probe",
+        None,
+    )?;
     #[cfg(windows)]
     {
-        process_birth_windows(pid).map(|b| ('R', b))
+        Ok(process_birth_windows(pid).map(|b| ('R', b)))
     }
     #[cfg(target_os = "linux")]
     {
-        process_stat_linux(pid)
+        Ok(process_stat_linux(pid))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = pid;
-        None
+        Ok(None)
     }
 }
 
@@ -921,12 +968,17 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         require_deadline(deadline, "start deadline exhausted before spawn", None)?;
         let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
-        let birth = match process_birth(pid) {
-            Some(b) => b,
-            None => {
+        if let Err(err) = require_deadline(deadline, "start deadline exhausted after spawn", None) {
+            kill_child(&mut child);
+            let _ = child.try_wait();
+            return Err(err);
+        }
+        let birth = match process_birth(pid, deadline) {
+            Ok(b) => b,
+            Err(err) => {
                 kill_child(&mut child);
                 let _ = child.try_wait();
-                return Err(diagnostic("cannot read process birth identity"));
+                return Err(err);
             }
         };
         let parsed = ParsedHandle {
@@ -1017,7 +1069,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         if let Some(proc) = live.get_mut(&parsed.pid) {
             if proc.birth != parsed.birth {
                 drop(live);
-                let alive = instance_alive(parsed.pid, parsed.birth);
+                let alive = instance_alive(parsed.pid, parsed.birth, deadline)?;
                 require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
                 return Ok(liveness_observation(alive));
             }
@@ -1035,7 +1087,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         }
         drop(live);
-        let alive = instance_alive(parsed.pid, parsed.birth);
+        let alive = instance_alive(parsed.pid, parsed.birth, deadline)?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
         if alive {
             require_deadline(
@@ -1099,9 +1151,9 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 handle.clone(),
             ));
         }
-        if instance_alive(parsed.pid, parsed.birth) {
+        if instance_alive(parsed.pid, parsed.birth, deadline)? {
             kill_pid(parsed.pid);
-            if wait_instance_exit(parsed.pid, parsed.birth, deadline) {
+            if wait_instance_exit(parsed.pid, parsed.birth, deadline)? {
                 require_deadline(
                     deadline,
                     "terminate deadline exhausted after wait",
@@ -1144,7 +1196,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     handle.clone(),
                 ));
             }
-        } else if !wait_instance_exit(parsed.pid, parsed.birth, deadline) {
+        } else if !wait_instance_exit(parsed.pid, parsed.birth, deadline)? {
             return Err(deadline_exceeded_hint(
                 "collect deadline exhausted before process exit",
                 handle.clone(),
@@ -1204,7 +1256,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             if let Some(proc) = live.get_mut(&parsed.pid) {
                 if proc.birth != parsed.birth {
                     drop(live);
-                    instance_alive(parsed.pid, parsed.birth)
+                    instance_alive(parsed.pid, parsed.birth, deadline)?
                 } else {
                     match proc.child.try_wait() {
                         Ok(Some(_)) => {
@@ -1217,7 +1269,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 }
             } else {
                 drop(live);
-                instance_alive(parsed.pid, parsed.birth)
+                instance_alive(parsed.pid, parsed.birth, deadline)?
             }
         };
         if alive {
@@ -1399,5 +1451,22 @@ mod tests {
         let line = "1234 (fake-agent) Z 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99999 0";
         assert_eq!(parse_stat_identity(line), Some(('Z', 99999)));
         assert!(matches!(parse_stat_identity(line), Some(('Z', _))));
+    }
+
+    #[test]
+    fn domain_key_rejects_empty_or_unknown_placeholders() {
+        for (boot, pid, mnt) in [
+            ("", "pid:[1]", "mnt:[1]"),
+            ("boot", "", "mnt:[1]"),
+            ("boot", "pid:[1]", ""),
+            ("unknown-boot", "pid:[1]", "mnt:[1]"),
+            ("boot", "unknown-ns", "mnt:[1]"),
+        ] {
+            let err = linux_domain_key(boot, pid, mnt).unwrap_err();
+            assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+        }
+        let key = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]").unwrap();
+        assert_eq!(key.as_str(), "linux:boot-id:pid:[1]:mnt:[2]");
+        assert!(!key.as_str().contains("unknown"));
     }
 }

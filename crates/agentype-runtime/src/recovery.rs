@@ -158,12 +158,20 @@ pub fn replay_persisted_terminal_consequence(
             }
             replay_success_consequence(kernel, snapshot)
         }
-        ExecutionState::Failed | ExecutionState::Terminated => {
+        ExecutionState::Terminated => {
+            // Physical process exit without collect proof is history, not
+            // Category A authority. Dispatcher must not mint ACK/NACK from a
+            // terminal-looking enum; Recovery obeys the same rule.
+            if !snapshot.terminal_confirmed() {
+                return Ok(TerminalReplayOutcome::NotApplicable);
+            }
+            replay_failure_consequence(kernel, snapshot)
+        }
+        ExecutionState::Failed => {
             if !snapshot.terminal_confirmed() {
                 return Err(RecoveryError::invariant(format!(
-                    "execution {} is {} without terminal_confirmed",
+                    "execution {} is FAILED without terminal_confirmed",
                     snapshot.execution_id(),
-                    snapshot.persisted_state().as_sql()
                 )));
             }
             replay_failure_consequence(kernel, snapshot)
@@ -296,8 +304,11 @@ pub fn reconcile_one_execution(
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
     match snapshot.persisted_state() {
         ExecutionState::Lost => close_lost(kernel, snapshot),
+        ExecutionState::Terminated if !snapshot.terminal_confirmed() => {
+            reconcile_active_physical(kernel, adapters, snapshot, supervisor)
+        }
         ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Terminated => {
-            // Category A owns these. Reaching here is a coordinator bug.
+            // Category A owns proven terminals. Reaching here is a coordinator bug.
             Err(RecoveryError::invariant(format!(
                 "reconcile_one_execution called for terminal execution {}",
                 snapshot.execution_id()
@@ -722,6 +733,9 @@ fn recover_runtime_inner(
                     }
                 }
             }
+            ExecutionState::Terminated if !snap.terminal_confirmed() => {
+                reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
+            }
             ExecutionState::Lost => {
                 reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
             }
@@ -970,6 +984,38 @@ mod tests {
             TerminalReplayOutcome::AlreadyApplied { .. } => {}
             other => panic!("expected AlreadyApplied, got {other:?}"),
         }
+    }
+
+    /// TERMINATED without terminal_confirmed is physical history, not
+    /// Category A authority. Recovery must not treat it as durable corruption.
+    #[test]
+    fn terminated_without_terminal_confirmed_is_physical_history() {
+        let (_clock, k) = env();
+        let (_claim, launch) = start_named(&k, TaskSpec::new("term-hist", json!({"o": 1})));
+        k.record_physical_outcome(
+            launch.execution_id(),
+            ExecutionState::Terminated,
+            Some(&json!({"h": 1})),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let snap = snapshot_of(&k, launch.execution_id());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::NotApplicable => {}
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
+        assert!(k.result_for_task(launch.task_id()).is_err());
+        assert_ne!(k.task(snap.task_id()).unwrap().state, TaskState::Completed);
+
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let kernel = Arc::new(k);
+        recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
+        assert!(kernel.result_for_task(launch.task_id()).is_err());
     }
 
     /// #39: crash after physical FAILED is durable, before NACK, replays

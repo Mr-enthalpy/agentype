@@ -58,11 +58,13 @@ RootBridge change. M5.8 composition root is still later.
 ## 3. Reference adapter
 
 `adapter_kind = local_process` is the driver family. The opaque
-`adapter_binding_key` is the concrete domain:
+`adapter_binding_key` is the concrete domain, fail-closed at
+`LocalProcessAgentAdapter::try_new()`:
 
-- Linux: `linux:<boot_id>:<pid_ns>`
+- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>`
 - Windows: `win:<COMPUTERNAME>:<BootIdentifier GUID>`
 
+Missing identity is `Unavailable`. There is no `unknown-*` key.
 `OnceLock` only caches a stable computation in-process; same-boot identity
 is proven by a child process (`print-binding-key`) recomputing the key.
 The executable is user configuration.
@@ -129,7 +131,9 @@ Collection: success / structured failure / malformed protocol / oversize / `WRIT
 Restart: reconnect live handle; failed reconnect UNKNOWN; no handle is not a new start; mismatched `request_id` is Protocol; birth mismatch is UNKNOWN
 Lifecycle: `adapter_drop_does_not_kill_committed_execution`
 
-Boundary extras: opaque `target_options` keys are not Core fields; worker prompt is the V0.1 protocol, never caller text.
+Boundary extras: opaque `target_options` keys are not Core fields; stdin is
+opaque payload JSON. `RenderedWorkerPrompt` remains an optional V0.1
+renderer, not an Adapter input.
 
 ---
 
@@ -144,10 +148,10 @@ sanitization.
 
 ## 7. Hung P1s (must not be lost)
 
-- **adapter_binding_key** — closed (schema v4; Linux boot+pid-ns, Windows
-  boot GUID; Registry is `(kind, key)` with `resolve_unique` /
-  `resolve_exact`). Core does not interpret it. Future Codex
-  installations are additional keys of kind `codex`.
+- **adapter_binding_key** — closed (schema v4; fail-closed `try_new`;
+  Linux boot+pid-ns+mnt-ns; Windows boot GUID; Registry `(kind, key)`).
+  Core does not interpret it. Future Codex installations are additional
+  keys of kind `codex`.
 - **last_error sanitization** — BLOCKS_REAL_ROOT_BRIDGE (M5.5). Not M5.7.
 - **M5.8** — composition root must mechanically run process lock →
   RECOVERING → `RecoveredRuntime` → enable Dispatcher → READY; one
@@ -179,9 +183,12 @@ sanitization.
 Closed in-milestone, not deferred to M5.8:
 
 - Linux zombie/reap: no `mem::forget`; `Z` is not RUNNING; `waitpid(WNOHANG)`
-- `adapter_binding_key` schema v4; Linux pid namespace; Windows boot GUID;
-  cross-process same-boot regression; Registry `(kind, key)`;
-  `resolve_unique` / `resolve_exact`; no production `"test"` key
+- `adapter_binding_key` schema v4; fail-closed `try_new` (no `unknown-*`);
+  Linux pid **and** mount namespaces; Windows boot GUID; Registry `(kind, key)`
+- `TERMINATED` + `terminal_confirmed=false` is physical history; Recovery
+  Category A is driven by `terminal_confirmed`, not the enum
+- spawn returns → immediate deadline check before birth probe; liveness
+  probes take the same `AdapterDeadline`
 - Generic prompt and adapter-authored `FailureClass` removed from DTOs
 - Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
   aligned (host-kernel progress assumption; no watchdog)

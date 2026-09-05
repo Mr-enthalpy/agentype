@@ -22,21 +22,29 @@ fn domain_key_is_stable_across_processes() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_domain_key_includes_pid_namespace() {
-    let key = LocalProcessAgentAdapter::new()
+fn linux_domain_key_includes_pid_and_mount_namespaces() {
+    let key = LocalProcessAgentAdapter::try_new()
+        .expect("domain identity")
         .binding_key()
         .as_str()
         .to_string();
-    let ns = std::fs::read_link("/proc/self/ns/pid").expect("read pid ns");
-    let ns = ns.to_str().expect("pid ns utf-8");
+    let pid_ns = std::fs::read_link("/proc/self/ns/pid").expect("read pid ns");
+    let mnt_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read mnt ns");
+    let pid_ns = pid_ns.to_str().expect("pid ns utf-8");
+    let mnt_ns = mnt_ns.to_str().expect("mnt ns utf-8");
     assert!(
         key.starts_with("linux:"),
         "linux key must start with linux:, got {key}"
     );
     assert!(
-        key.contains(ns),
-        "linux key {key} must include pid namespace {ns}"
+        key.contains(pid_ns),
+        "linux key {key} must include pid namespace {pid_ns}"
     );
+    assert!(
+        key.contains(mnt_ns),
+        "linux key {key} must include mount namespace {mnt_ns}"
+    );
+    assert!(!key.contains("unknown"));
 }
 
 #[cfg(windows)]

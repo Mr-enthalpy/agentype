@@ -5,6 +5,15 @@ Applies to: branch `rust/m5.6-adapter-deadlines` (base: main @ M5.5 merge `d1ad3
 Canonical path: `docs/reports/v0.2/riir-m5.6-adapter-deadline-contract.md`
 Not a specification.
 
+Superseded by M5.7 (do not treat the following M5.6-era facts as current):
+
+- registry identity is now `(adapter_kind, adapter_binding_key)`, not kind-only
+- recovery routes with `resolve_exact(kind, key)`, not `resolve(kind)`
+- `SCHEMA_VERSION` is 4 (`adapter_binding_key` column)
+
+Deadline algebra, `AdapterError` mapping, and the production façade remain
+frozen as written below.
+
 Despite the historical `riir-` directory naming, this milestone is **native Rust
 runtime work**. It consumes the frozen M4 kernel and the M5.1–M5.5 runtime
 boundaries and freezes the provider-neutral Scheduler-facing

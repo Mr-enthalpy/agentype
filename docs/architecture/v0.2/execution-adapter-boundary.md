@@ -153,14 +153,19 @@ wildcard. Birth mismatch is UNKNOWN, never positive re-admission.
 
 `adapter_kind` is the driver family (`local_process`). The opaque
 `adapter_binding_key` (schema v4) is the concrete domain, frozen at
-Execution creation:
+Execution creation. It MUST cover every RuntimeHandle locator this adapter
+will re-interpret after restart:
 
-- Linux: `linux:<boot_id>:<pid_ns>` (`/proc/sys/kernel/random/boot_id` plus
-  `/proc/self/ns/pid` inode). Same host boot in a new PID namespace is a
-  different domain.
+- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>` (`/proc/sys/kernel/random/boot_id`,
+  `/proc/self/ns/pid`, `/proc/self/ns/mnt`). stdout/stderr paths are
+  filesystem locators, so mount namespace is part of the domain.
 - Windows: `win:<COMPUTERNAME>:<BootIdentifier>` from
   `NtQuerySystemInformation(SystemBootEnvironmentInformation)`. Not
   wall-clock minus `GetTickCount64`.
+
+Missing boot, namespace, or boot-GUID identity is `Unavailable`. The
+adapter MUST NOT mint `unknown-*` keys. Installation is
+`LocalProcessAgentAdapter::try_new()`.
 
 Recovery uses `resolve_exact(kind, key)` with no fallback. Launch without
 a SpawnSource uses `resolve_unique(kind)` and fails closed if two
@@ -204,10 +209,10 @@ Diagnostics are bounded (512 chars) and MUST be sanitized by the adapter
 (secrets, tokens, Authorization, env, worker payload, full provider bodies).
 The type enforces length only.
 
-`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. External JSON that names
-it, or any unknown `failure_class`, is `AdapterError::Protocol` — not
-silently rewritten to `START_FAILURE`. Omitted `failure_class` on
-`ok:false` defaults to mechanical `StartFailure` only.
+`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. Any `failure_class` key in
+external JSON is `AdapterError::Protocol`. `ok:false` without that key is
+physical `Failed`; Runtime maps a collected Failed to mechanical
+`StartFailure`. The adapter does not author Scheduler failure classes.
 
 Timeout, kill-sent, and process-not-running prove nothing about Task
 cancellation, writer safety, or quiescence. Successful validated
@@ -272,10 +277,10 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 
 | Operation | Mechanics |
 | --- | --- |
-| start | spawn (deadline-staged) + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. Uncommitted start failure may kill that child. |
+| start | spawn (deadline-staged) + immediate deadline check + birth probe under the same endpoint + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. If spawn returns after expiry, kill the uncommitted child — no birth I/O. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. |
 | observe | live `Child` with matching `birth`, else `pid+birth` and non-zombie state. Alive → RUNNING; mismatch/dead/zombie → UNKNOWN. Never SUCCEEDED. |
 | interrupt | Unix `SIGINT` (ESRCH → observe; other errno → Unavailable) / Windows `CTRL_BREAK`. Not Task cancellation. |
-| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. |
+| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
 | collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol, not Failed. |
 | reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. No handle → ambiguous UNKNOWN. |
 
