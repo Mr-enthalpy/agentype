@@ -220,15 +220,20 @@ fn wait_slice(deadline: &AdapterDeadline) -> Option<Duration> {
     }
 }
 
-fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResult<Option<i32>> {
+/// Wait until the child is reaped or the deadline expires.
+///
+/// `true` means the process exited (including Unix signal death, where
+/// `ExitStatus::code()` is `None`). `false` means the deadline ended while
+/// the child was still running — not proof of TERMINATED or quiescence.
+fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResult<bool> {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.code()),
+            Ok(Some(_status)) => return Ok(true),
             Ok(None) => {}
             Err(_) => return Err(AdapterError::other("wait on child failed")),
         }
         match wait_slice(deadline) {
-            None => return Ok(None),
+            None => return Ok(false),
             Some(slice) => thread::sleep(slice),
         }
     }
@@ -532,22 +537,18 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         };
         if let Some(mut proc) = proc {
             kill_child(&mut proc.child);
-            match wait_child_exit(&mut proc.child, deadline)? {
-                Some(_) => {
-                    return Ok(ExecutionObservation {
-                        state: ExecutionState::Terminated,
-                        terminal_confirmed: false,
-                        quiescent_confirmed: false,
-                        detail: Some("kill issued; process exited".into()),
-                    });
-                }
-                None => {
-                    return Err(deadline_exceeded_hint(
-                        "terminate wait exhausted; kill sent is not quiescence",
-                        handle.clone(),
-                    ));
-                }
+            if wait_child_exit(&mut proc.child, deadline)? {
+                return Ok(ExecutionObservation {
+                    state: ExecutionState::Terminated,
+                    terminal_confirmed: false,
+                    quiescent_confirmed: false,
+                    detail: Some("kill issued; process exited".into()),
+                });
             }
+            return Err(deadline_exceeded_hint(
+                "terminate wait exhausted; kill sent is not quiescence",
+                handle.clone(),
+            ));
         }
         // No live Child: best-effort observation only. We do not invent
         // TERMINATED/quiescence from a pid that we cannot wait on.
@@ -570,17 +571,14 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             live.remove(&parsed.pid)
         };
         if let Some(mut proc) = proc {
-            match wait_child_exit(&mut proc.child, deadline)? {
-                Some(_) => {}
-                None => {
-                    kill_child(&mut proc.child);
-                    let _ = proc.child.try_wait();
-                    self.live.lock().expect("live map").insert(parsed.pid, proc);
-                    return Err(deadline_exceeded_hint(
-                        "collect deadline exhausted before process exit",
-                        handle.clone(),
-                    ));
-                }
+            if !wait_child_exit(&mut proc.child, deadline)? {
+                kill_child(&mut proc.child);
+                let _ = proc.child.try_wait();
+                self.live.lock().expect("live map").insert(parsed.pid, proc);
+                return Err(deadline_exceeded_hint(
+                    "collect deadline exhausted before process exit",
+                    handle.clone(),
+                ));
             }
         } else {
             while pid_alive(parsed.pid) {

@@ -468,10 +468,11 @@ fn reconcile_reconnects_persisted_handle() {
 fn reconcile_failed_reconnect_is_ambiguous_unknown() {
     let adapter = LocalProcessAgentAdapter::new();
     let req = request(AgentSpec::default());
+    // Not pid 1: on Linux that is init and pid_alive is true.
     let ghost = RuntimeHandle(json!({
         "v": 1,
         "kind": ADAPTER_KIND,
-        "pid": 1,
+        "pid": u32::MAX,
         "request_id": req.request_id().as_str(),
         "stdout": "stdout.txt",
         "stderr": "stderr.txt",
