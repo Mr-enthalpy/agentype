@@ -27,7 +27,40 @@ fn hang() -> ! {
     }
 }
 
+fn trap_interrupt() {
+    #[cfg(unix)]
+    {
+        const SIGINT: i32 = 2;
+        const SIG_IGN: usize = 1;
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        unsafe {
+            let _ = signal(SIGINT, SIG_IGN);
+        }
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" fn ignore(_ctrl: u32) -> i32 {
+            1
+        }
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        unsafe {
+            let _ = SetConsoleCtrlHandler(Some(ignore), 1);
+        }
+    }
+}
+
 fn main() {
+    if flag("FAKE_AGENT_TRAP_INT") {
+        trap_interrupt();
+    }
+
     // Optional delay after process creation (pid already assigned).
     sleep_ms_from_env();
 

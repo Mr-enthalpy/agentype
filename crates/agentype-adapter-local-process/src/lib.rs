@@ -4,8 +4,9 @@
 //! contract without leaking model, provider, prompt orchestration, or
 //! harness ownership into the Scheduler. The executable is user-owned
 //! configuration (`target_options.command`); Core never sees it.
-
-// Windows process-liveness query requires a tiny FFI surface. No other unsafe.
+//!
+//! Platform FFI is confined to pid liveness, process birth, cancellable
+//! stdin, interrupt, and pid-level terminate. No helper threads.
 
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterResult, ExecutionAdapter, ExecutionObservation,
@@ -15,9 +16,9 @@ use agentype_core::{ExecutionState, FailureClass, RequestId};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -26,11 +27,16 @@ use std::time::Duration;
 /// table as spawned by this runtime. Not a vendor/model name.
 pub const ADAPTER_KIND: &str = "local_process";
 
+/// Collectable stdout is bounded. Arbitrary file slurps are not evidence.
+pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
+
 const HANDLE_VERSION: i64 = 1;
 const WAIT_SLICE: Duration = Duration::from_millis(10);
+const READ_CHUNK: usize = 8 * 1024;
 
 struct LiveProcess {
     child: Child,
+    birth: u64,
 }
 
 /// Spawn and control a user-configured local executable.
@@ -54,11 +60,11 @@ impl LocalProcessAgentAdapter {
 
 impl Drop for LocalProcessAgentAdapter {
     fn drop(&mut self) {
-        // Best-effort: do not wait. A dropped adapter must not leak OS processes.
+        // Dropping adapter ownership is not terminate_execution. Child::drop
+        // waits, so the live Child is forgotten: the OS process continues.
         if let Ok(mut live) = self.live.lock() {
-            for (_, mut proc) in live.drain() {
-                kill_child(&mut proc.child);
-                let _ = proc.child.try_wait();
+            for (_, proc) in live.drain() {
+                std::mem::forget(proc.child);
             }
         }
     }
@@ -75,6 +81,7 @@ struct ProcessSpec {
 #[derive(Debug)]
 struct ParsedHandle {
     pid: u32,
+    birth: u64,
     request_id: String,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -149,6 +156,7 @@ fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
         "v": HANDLE_VERSION,
         "kind": ADAPTER_KIND,
         "pid": parsed.pid,
+        "birth": parsed.birth,
         "request_id": parsed.request_id,
         "stdout": parsed.stdout_path.to_string_lossy(),
         "stderr": parsed.stderr_path.to_string_lossy(),
@@ -177,10 +185,16 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
         .and_then(Value::as_u64)
         .ok_or_else(|| AdapterError::protocol("handle.pid missing"))?;
     let pid = u32::try_from(pid).map_err(|_| AdapterError::protocol("handle.pid out of range"))?;
+    let birth = obj
+        .get("birth")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AdapterError::protocol("handle.birth missing"))?;
     let request_id = obj
         .get("request_id")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AdapterError::protocol("handle.request_id missing"))?
         .to_string();
     let stdout = obj
         .get("stdout")
@@ -192,6 +206,7 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
         .ok_or_else(|| AdapterError::protocol("handle.stderr missing"))?;
     Ok(ParsedHandle {
         pid,
+        birth,
         request_id,
         stdout_path: PathBuf::from(stdout),
         stderr_path: PathBuf::from(stderr),
@@ -204,6 +219,21 @@ fn diagnostic(msg: &'static str) -> AdapterError {
 
 fn deadline_exceeded_hint(msg: &'static str, handle: RuntimeHandle) -> AdapterError {
     AdapterError::deadline_exceeded(msg).with_handle_hint(handle)
+}
+
+fn require_deadline(
+    deadline: &AdapterDeadline,
+    msg: &'static str,
+    hint: Option<&RuntimeHandle>,
+) -> AdapterResult<()> {
+    if deadline.is_expired() {
+        let err = AdapterError::deadline_exceeded(msg);
+        return Err(match hint {
+            Some(h) => err.with_handle_hint(h.clone()),
+            None => err,
+        });
+    }
+    Ok(())
 }
 
 fn wait_slice(deadline: &AdapterDeadline) -> Option<Duration> {
@@ -239,77 +269,346 @@ fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResu
     }
 }
 
-fn write_all_bounded<W>(writer: W, bytes: Vec<u8>, deadline: &AdapterDeadline) -> AdapterResult<()>
-where
-    W: Write + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut writer = writer;
-        let result = writer
-            .write_all(&bytes)
-            .and_then(|_| writer.flush())
-            .map_err(|_| ());
-        drop(writer);
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(deadline.remaining()) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(())) => Err(AdapterError::other("stdin write failed")),
-        Err(_) => Err(AdapterError::deadline_exceeded("stdin write blocked")),
+fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> bool {
+    loop {
+        if !instance_alive(pid, birth) {
+            return true;
+        }
+        match wait_slice(deadline) {
+            None => return false,
+            Some(slice) => thread::sleep(slice),
+        }
     }
+}
+
+fn write_stdin_deadline(
+    stdin: ChildStdin,
+    bytes: &[u8],
+    deadline: &AdapterDeadline,
+) -> AdapterResult<()> {
+    #[cfg(windows)]
+    {
+        write_stdin_windows(stdin, bytes, deadline)
+    }
+    #[cfg(unix)]
+    {
+        write_stdin_unix(stdin, bytes, deadline)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (stdin, bytes, deadline);
+        Err(AdapterError::unavailable(
+            "local_process stdin I/O unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn write_stdin_windows(
+    stdin: ChildStdin,
+    bytes: &[u8],
+    deadline: &AdapterDeadline,
+) -> AdapterResult<()> {
+    use std::os::windows::io::AsRawHandle;
+    const PIPE_NOWAIT: u32 = 0x0000_0001;
+    const ERROR_NO_DATA: u32 = 232;
+    const ERROR_BROKEN_PIPE: u32 = 109;
+    extern "system" {
+        fn SetNamedPipeHandleState(
+            h: *mut core::ffi::c_void,
+            mode: *mut u32,
+            max_col: *mut u32,
+            timeout: *mut u32,
+        ) -> i32;
+        fn WriteFile(
+            h: *mut core::ffi::c_void,
+            buf: *const u8,
+            n: u32,
+            written: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    let handle = stdin.as_raw_handle();
+    // SAFETY: handle is the owned ChildStdin pipe; PIPE_NOWAIT and WriteFile
+    // use it until stdin is dropped at the end of this function.
+    unsafe {
+        let mut mode = PIPE_NOWAIT;
+        if SetNamedPipeHandleState(
+            handle,
+            &mut mode,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(AdapterError::other("cannot set stdin PIPE_NOWAIT"));
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            if deadline.is_expired() {
+                return Err(AdapterError::deadline_exceeded("stdin write blocked"));
+            }
+            let want = (bytes.len() - off).min(u32::MAX as usize) as u32;
+            let mut written = 0u32;
+            let ok = WriteFile(
+                handle,
+                bytes.as_ptr().add(off),
+                want,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+            if ok != 0 && written > 0 {
+                off += written as usize;
+                continue;
+            }
+            let err = if ok == 0 {
+                GetLastError()
+            } else {
+                ERROR_NO_DATA
+            };
+            if err == ERROR_BROKEN_PIPE {
+                return Err(AdapterError::other("stdin write failed"));
+            }
+            if err != ERROR_NO_DATA && ok == 0 && written == 0 && err != 0 {
+                // Would-block or empty write: poll remaining.
+            }
+            match wait_slice(deadline) {
+                None => return Err(AdapterError::deadline_exceeded("stdin write blocked")),
+                Some(slice) => thread::sleep(slice),
+            }
+        }
+    }
+    drop(stdin);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn write_stdin_unix(
+    stdin: ChildStdin,
+    bytes: &[u8],
+    deadline: &AdapterDeadline,
+) -> AdapterResult<()> {
+    use std::os::unix::io::AsRawFd;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: i32 = 0o4000;
+    const POLLOUT: i16 = 0x0004;
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    }
+    let fd = stdin.as_raw_fd();
+    // SAFETY: fd is the owned ChildStdin; O_NONBLOCK + poll + write stay on
+    // this thread until stdin is dropped.
+    unsafe {
+        let flags = fcntl(fd, F_GETFL, 0);
+        if flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+            return Err(AdapterError::other("cannot set stdin O_NONBLOCK"));
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            if deadline.is_expired() {
+                return Err(AdapterError::deadline_exceeded("stdin write blocked"));
+            }
+            let n = write(fd, bytes.as_ptr().add(off), bytes.len() - off);
+            if n > 0 {
+                off += n as usize;
+                continue;
+            }
+            let timeout_ms = match wait_slice(deadline) {
+                None => return Err(AdapterError::deadline_exceeded("stdin write blocked")),
+                Some(slice) => i32::try_from(slice.as_millis()).unwrap_or(i32::MAX),
+            };
+            let mut pfd = PollFd {
+                fd,
+                events: POLLOUT,
+                revents: 0,
+            };
+            let _ = poll(&mut pfd, 1, timeout_ms);
+        }
+    }
+    drop(stdin);
+    Ok(())
 }
 
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn pid_alive(pid: u32) -> bool {
+fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
-        pid_alive_windows(pid)
+        kill_pid_windows(pid);
     }
     #[cfg(unix)]
     {
-        pid_alive_unix(pid)
+        signal_pid_unix(pid, 9);
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = pid;
-        false
+    }
+}
+
+fn interrupt_pid(pid: u32) -> AdapterResult<()> {
+    #[cfg(unix)]
+    {
+        let _ = signal_pid_unix(pid, 2);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        interrupt_pid_windows(pid)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        Err(AdapterError::unavailable(
+            "interrupt unsupported on this platform",
+        ))
     }
 }
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn pid_alive_windows(pid: u32) -> bool {
-    // PROCESS_QUERY_LIMITED_INFORMATION + GetExitCodeProcess STILL_ACTIVE.
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
+fn kill_pid_windows(pid: u32) {
+    const PROCESS_TERMINATE: u32 = 0x0001;
     extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
         fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
-        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn TerminateProcess(handle: *mut core::ffi::c_void, code: u32) -> i32;
     }
-    // SAFETY: OpenProcess returns either null or an owned handle we CloseHandle
-    // before return. GetExitCodeProcess is only called on that live handle.
-    // No other alias of the handle exists in this function.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
         if handle.is_null() {
-            return false;
+            return;
         }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code);
+        let _ = TerminateProcess(handle, 1);
         CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn interrupt_pid_windows(pid: u32) -> AdapterResult<()> {
+    const CTRL_BREAK_EVENT: u32 = 1;
+    extern "system" {
+        fn AttachConsole(pid: u32) -> i32;
+        fn FreeConsole() -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    // SAFETY: AttachConsole/GenerateConsoleCtrlEvent/FreeConsole are the
+    // documented best-effort console interrupt; we detach if we attached.
+    unsafe {
+        let attached = AttachConsole(pid) != 0;
+        let ok = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+        if attached {
+            let _ = FreeConsole();
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err(AdapterError::unavailable(
+                "interrupt not delivered (ctrl event failed)",
+            ))
+        }
     }
 }
 
 #[cfg(unix)]
-fn pid_alive_unix(pid: u32) -> bool {
-    let path = format!("/proc/{pid}");
-    Path::new(&path).exists()
+#[allow(unsafe_code)]
+fn signal_pid_unix(pid: u32, sig: i32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    unsafe { kill(raw, sig) == 0 }
+}
+
+fn process_birth(pid: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        process_birth_windows(pid)
+    }
+    #[cfg(unix)]
+    {
+        process_birth_unix(pid)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn instance_alive(pid: u32, birth: u64) -> bool {
+    process_birth(pid) == Some(birth)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn process_birth_windows(pid: u32) -> Option<u64> {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn GetProcessTimes(
+            handle: *mut core::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let times = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if !alive || times == 0 {
+            return None;
+        }
+        Some(((creation.high as u64) << 32) | creation.low as u64)
+    }
+}
+
+#[cfg(unix)]
+fn process_birth_unix(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_starttime(&text)
+}
+
+#[cfg(any(unix, test))]
+fn parse_stat_starttime(stat: &str) -> Option<u64> {
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 1..)?;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn spawn_child(spec: &ProcessSpec, stdout_path: &Path, stderr_path: &Path) -> AdapterResult<Child> {
@@ -330,18 +629,35 @@ fn spawn_child(spec: &ProcessSpec, stdout_path: &Path, stderr_path: &Path) -> Ad
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn()
         .map_err(|_| AdapterError::unavailable("failed to spawn local process"))
 }
 
-fn read_file_lossy(path: &Path) -> String {
-    let mut buf = String::new();
-    if let Ok(mut f) = File::open(path) {
-        let _ = f.read_to_string(&mut buf);
+fn read_stdout_bounded(path: &Path, deadline: &AdapterDeadline) -> AdapterResult<String> {
+    require_deadline(deadline, "collect stdout read: deadline exhausted", None)?;
+    let mut f = File::open(path).map_err(|_| AdapterError::protocol("cannot open stdout file"))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        require_deadline(deadline, "collect stdout read: deadline exhausted", None)?;
+        match f.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len().saturating_add(n) > MAX_STDOUT_BYTES {
+                    return Err(AdapterError::protocol(
+                        "process stdout exceeds collect size bound",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(AdapterError::other("stdout read failed")),
+        }
     }
-    buf
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
@@ -373,12 +689,23 @@ fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
             incarnation_reusable: false,
         });
     }
-    let failure_class = obj
-        .get("failure_class")
-        .and_then(Value::as_str)
-        .and_then(|s| FailureClass::parse_sql(s).ok())
-        .filter(|c| c.is_mechanical())
-        .unwrap_or(FailureClass::StartFailure);
+    let failure_class = match obj.get("failure_class") {
+        None | Some(Value::Null) => FailureClass::StartFailure,
+        Some(Value::String(s)) => match FailureClass::parse_sql(s) {
+            Ok(c) if c.is_mechanical() => c,
+            Ok(_) => {
+                return Err(AdapterError::protocol(
+                    "scheduler-derived failure_class is not adapter-authored",
+                ));
+            }
+            Err(_) => {
+                return Err(AdapterError::protocol("unknown failure_class"));
+            }
+        },
+        Some(_) => {
+            return Err(AdapterError::protocol("failure_class must be a string"));
+        }
+    };
     Ok(ExecutionOutcome {
         state: ExecutionState::Failed,
         payload: None,
@@ -408,32 +735,53 @@ fn liveness_observation(alive: bool) -> ExecutionObservation {
     }
 }
 
+fn terminated_observation() -> ExecutionObservation {
+    ExecutionObservation {
+        state: ExecutionState::Terminated,
+        terminal_confirmed: false,
+        quiescent_confirmed: false,
+        detail: Some("kill issued; process exited".into()),
+    }
+}
+
 impl ExecutionAdapter for LocalProcessAgentAdapter {
     fn start_execution(
         &self,
         request: &ExecutionRequest,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
-        if deadline.is_expired() {
-            return Err(AdapterError::deadline_exceeded(
-                "start deadline already expired",
-            ));
-        }
+        require_deadline(deadline, "start deadline already expired", None)?;
         let spec = spec_from_options(request.target_options())?;
+        require_deadline(deadline, "start deadline exhausted before spawn", None)?;
         let exec_dir =
             std::env::temp_dir().join(format!("agentype-exec-{}", request.request_id().as_str()));
         fs::create_dir_all(&exec_dir).map_err(|_| diagnostic("cannot create execution dir"))?;
         let stdout_path = exec_dir.join("stdout.txt");
         let stderr_path = exec_dir.join("stderr.txt");
+        require_deadline(deadline, "start deadline exhausted before spawn", None)?;
         let mut child = spawn_child(&spec, &stdout_path, &stderr_path)?;
         let pid = child.id();
+        let birth = match process_birth(pid) {
+            Some(b) => b,
+            None => {
+                kill_child(&mut child);
+                let _ = child.try_wait();
+                return Err(diagnostic("cannot read process birth identity"));
+            }
+        };
         let parsed = ParsedHandle {
             pid,
+            birth,
             request_id: request.request_id().as_str().to_string(),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
         };
         let handle = encode_handle(&parsed);
+        require_deadline(
+            deadline,
+            "start deadline exhausted after spawn",
+            Some(&handle),
+        )?;
 
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
@@ -443,29 +791,46 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         };
         let prompt = request.prompt().as_bytes().to_vec();
-        if let Err(err) = write_all_bounded(stdin, prompt, deadline) {
+        if let Err(err) = write_stdin_deadline(stdin, &prompt, deadline) {
             kill_child(&mut child);
             let _ = child.try_wait();
             return Err(err.with_handle_hint(handle));
         }
+        require_deadline(
+            deadline,
+            "start deadline exhausted after stdin",
+            Some(&handle),
+        )?;
 
         // Start creates the environment and returns a handle. Waiting for the
         // agent to finish is collect_outcome's operation (its own deadline).
         match child.try_wait() {
-            Ok(Some(_)) => Ok(StartObservation {
-                state: ExecutionState::Unknown,
-                runtime_handle: handle,
-                ambiguous: true,
-                failure_class: None,
-                detail: Some("process exited during start; collect for outcome".into()),
-                terminal_confirmed: false,
-                quiescent_confirmed: false,
-            }),
+            Ok(Some(_)) => {
+                require_deadline(
+                    deadline,
+                    "start deadline exhausted before observation",
+                    Some(&handle),
+                )?;
+                Ok(StartObservation {
+                    state: ExecutionState::Unknown,
+                    runtime_handle: handle,
+                    ambiguous: true,
+                    failure_class: None,
+                    detail: Some("process exited during start; collect for outcome".into()),
+                    terminal_confirmed: false,
+                    quiescent_confirmed: false,
+                })
+            }
             Ok(None) => {
+                require_deadline(
+                    deadline,
+                    "start deadline exhausted before RUNNING",
+                    Some(&handle),
+                )?;
                 self.live
                     .lock()
                     .expect("live map")
-                    .insert(pid, LiveProcess { child });
+                    .insert(pid, LiveProcess { child, birth });
                 Ok(StartObservation {
                     state: ExecutionState::Running,
                     runtime_handle: handle,
@@ -488,25 +853,40 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
-        if deadline.is_expired() {
-            return Err(AdapterError::deadline_exceeded(
-                "observe deadline already expired",
-            ));
-        }
+        require_deadline(deadline, "observe deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
         let mut live = self.live.lock().expect("live map");
         if let Some(proc) = live.get_mut(&parsed.pid) {
+            if proc.birth != parsed.birth {
+                drop(live);
+                let alive = instance_alive(parsed.pid, parsed.birth);
+                require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
+                return Ok(liveness_observation(alive));
+            }
             match proc.child.try_wait() {
                 Ok(Some(_)) => {
                     live.remove(&parsed.pid);
+                    require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
                     return Ok(liveness_observation(false));
                 }
-                Ok(None) => return Ok(liveness_observation(true)),
+                Ok(None) => {
+                    require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
+                    return Ok(liveness_observation(true));
+                }
                 Err(_) => return Err(AdapterError::other("observe wait failed")),
             }
         }
         drop(live);
-        Ok(liveness_observation(pid_alive(parsed.pid)))
+        let alive = instance_alive(parsed.pid, parsed.birth);
+        require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
+        if alive {
+            require_deadline(
+                deadline,
+                "observe deadline exhausted before RUNNING",
+                Some(handle),
+            )?;
+        }
+        Ok(liveness_observation(alive))
     }
 
     fn interrupt_execution(
@@ -514,9 +894,16 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
-        // Cooperative/platform interrupt is best-effort. This call must
-        // still return by the deadline and MUST NOT claim Task cancellation,
-        // writer safety, or quiescence.
+        require_deadline(deadline, "interrupt deadline already expired", None)?;
+        let parsed = parse_handle(handle)?;
+        // Physical interrupt is attempted even if the live Child is gone.
+        // Failure to deliver is explicit Unavailable, not a silent observe.
+        interrupt_pid(parsed.pid)?;
+        require_deadline(
+            deadline,
+            "interrupt deadline exhausted after signal",
+            Some(handle),
+        )?;
         self.observe_execution(handle, deadline)
     }
 
@@ -525,34 +912,52 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
-        if deadline.is_expired() {
-            return Err(AdapterError::deadline_exceeded(
-                "terminate deadline already expired",
-            ));
-        }
+        require_deadline(deadline, "terminate deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
         let proc = {
             let mut live = self.live.lock().expect("live map");
-            live.remove(&parsed.pid)
+            match live.remove(&parsed.pid) {
+                Some(proc) if proc.birth == parsed.birth => Some(proc),
+                Some(proc) => {
+                    live.insert(parsed.pid, proc);
+                    None
+                }
+                None => None,
+            }
         };
         if let Some(mut proc) = proc {
             kill_child(&mut proc.child);
             if wait_child_exit(&mut proc.child, deadline)? {
-                return Ok(ExecutionObservation {
-                    state: ExecutionState::Terminated,
-                    terminal_confirmed: false,
-                    quiescent_confirmed: false,
-                    detail: Some("kill issued; process exited".into()),
-                });
+                require_deadline(
+                    deadline,
+                    "terminate deadline exhausted after wait",
+                    Some(handle),
+                )?;
+                return Ok(terminated_observation());
+            }
+            std::mem::forget(proc.child);
+            return Err(deadline_exceeded_hint(
+                "terminate wait exhausted; kill sent is not quiescence",
+                handle.clone(),
+            ));
+        }
+        if instance_alive(parsed.pid, parsed.birth) {
+            kill_pid(parsed.pid);
+            if wait_instance_exit(parsed.pid, parsed.birth, deadline) {
+                require_deadline(
+                    deadline,
+                    "terminate deadline exhausted after wait",
+                    Some(handle),
+                )?;
+                return Ok(terminated_observation());
             }
             return Err(deadline_exceeded_hint(
                 "terminate wait exhausted; kill sent is not quiescence",
                 handle.clone(),
             ));
         }
-        // No live Child: best-effort observation only. We do not invent
-        // TERMINATED/quiescence from a pid that we cannot wait on.
-        Ok(liveness_observation(pid_alive(parsed.pid)))
+        require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
+        Ok(liveness_observation(false))
     }
 
     fn collect_outcome(
@@ -560,39 +965,49 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionOutcome> {
-        if deadline.is_expired() {
-            return Err(AdapterError::deadline_exceeded(
-                "collect deadline already expired",
-            ));
-        }
+        require_deadline(deadline, "collect deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
         let proc = {
             let mut live = self.live.lock().expect("live map");
-            live.remove(&parsed.pid)
+            match live.remove(&parsed.pid) {
+                Some(proc) if proc.birth == parsed.birth => Some(proc),
+                Some(proc) => {
+                    live.insert(parsed.pid, proc);
+                    None
+                }
+                None => None,
+            }
         };
         if let Some(mut proc) = proc {
             if !wait_child_exit(&mut proc.child, deadline)? {
-                kill_child(&mut proc.child);
-                let _ = proc.child.try_wait();
                 self.live.lock().expect("live map").insert(parsed.pid, proc);
                 return Err(deadline_exceeded_hint(
                     "collect deadline exhausted before process exit",
                     handle.clone(),
                 ));
             }
-        } else {
-            while pid_alive(parsed.pid) {
-                match wait_slice(deadline) {
-                    None => {
-                        return Err(AdapterError::deadline_exceeded(
-                            "collect deadline exhausted before process exit",
-                        ));
-                    }
-                    Some(slice) => thread::sleep(slice),
-                }
-            }
+        } else if !wait_instance_exit(parsed.pid, parsed.birth, deadline) {
+            return Err(deadline_exceeded_hint(
+                "collect deadline exhausted before process exit",
+                handle.clone(),
+            ));
         }
-        let stdout = read_file_lossy(&parsed.stdout_path);
+        require_deadline(
+            deadline,
+            "collect deadline exhausted before stdout read",
+            Some(handle),
+        )?;
+        let stdout = read_stdout_bounded(&parsed.stdout_path, deadline).map_err(|err| match err
+            .runtime_handle_hint()
+        {
+            Some(_) => err,
+            None => err.with_handle_hint(handle.clone()),
+        })?;
+        require_deadline(
+            deadline,
+            "collect deadline exhausted before outcome parse",
+            Some(handle),
+        )?;
         parse_outcome_json(&stdout)
     }
 
@@ -602,11 +1017,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         persisted_handle: Option<&RuntimeHandle>,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
-        if deadline.is_expired() {
-            return Err(AdapterError::deadline_exceeded(
-                "reconcile deadline already expired",
-            ));
-        }
+        require_deadline(deadline, "reconcile deadline already expired", None)?;
         let Some(handle) = persisted_handle else {
             return Ok(StartObservation {
                 state: ExecutionState::Unknown,
@@ -632,7 +1043,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 });
             }
         };
-        if !parsed.request_id.is_empty() && parsed.request_id != request_id.as_str() {
+        if parsed.request_id != request_id.as_str() {
             return Err(AdapterError::protocol(
                 "persisted handle request_id does not match reconcile identity",
             ));
@@ -640,19 +1051,31 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let alive = {
             let mut live = self.live.lock().expect("live map");
             if let Some(proc) = live.get_mut(&parsed.pid) {
-                match proc.child.try_wait() {
-                    Ok(Some(_)) => {
-                        live.remove(&parsed.pid);
-                        false
+                if proc.birth != parsed.birth {
+                    drop(live);
+                    instance_alive(parsed.pid, parsed.birth)
+                } else {
+                    match proc.child.try_wait() {
+                        Ok(Some(_)) => {
+                            live.remove(&parsed.pid);
+                            false
+                        }
+                        Ok(None) => true,
+                        Err(_) => false,
                     }
-                    Ok(None) => true,
-                    Err(_) => false,
                 }
             } else {
                 drop(live);
-                pid_alive(parsed.pid)
+                instance_alive(parsed.pid, parsed.birth)
             }
         };
+        if alive {
+            require_deadline(
+                deadline,
+                "reconcile deadline exhausted before RUNNING",
+                Some(handle),
+            )?;
+        }
         Ok(StartObservation {
             state: if alive {
                 ExecutionState::Running
@@ -669,65 +1092,10 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     }
 }
 
-// Live process tests live in tests/conformance.rs so CARGO_BIN_EXE_fake-agent
-// is set. Helper-level deadline tests stay here (no binary required).
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agentype_adapter_api::AdapterErrorKind;
-    use std::io::{self, Write};
-    use std::time::Instant;
-
-    struct BlockingWrite;
-    impl Write for BlockingWrite {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            thread::sleep(Duration::from_secs(60));
-            Ok(0)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct BlockingFlush;
-    impl Write for BlockingFlush {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            thread::sleep(Duration::from_secs(60));
-            Ok(())
-        }
-    }
-
-    fn assert_returns_by_deadline(started: Instant, budget: Duration) {
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < budget + Duration::from_secs(1),
-            "call ignored deadline: elapsed {elapsed:?} budget {budget:?}"
-        );
-    }
-
-    #[test]
-    fn blocked_request_write_respects_deadline() {
-        let budget = Duration::from_millis(200);
-        let deadline = AdapterDeadline::after(budget).unwrap();
-        let started = Instant::now();
-        let err = write_all_bounded(BlockingWrite, vec![1, 2, 3], &deadline).unwrap_err();
-        assert_returns_by_deadline(started, budget);
-        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
-    }
-
-    #[test]
-    fn blocked_flush_respects_deadline() {
-        let budget = Duration::from_millis(200);
-        let deadline = AdapterDeadline::after(budget).unwrap();
-        let started = Instant::now();
-        let err = write_all_bounded(BlockingFlush, vec![1, 2, 3], &deadline).unwrap_err();
-        assert_returns_by_deadline(started, budget);
-        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
-    }
 
     #[test]
     fn spec_rejects_missing_command_as_unavailable() {
@@ -743,10 +1111,58 @@ mod tests {
 
     #[test]
     fn parse_handle_rejects_wrong_kind() {
-        let handle =
-            RuntimeHandle(json!({"v": 1, "kind": "codex", "pid": 1, "stdout": "a", "stderr": "b"}));
+        let handle = RuntimeHandle(json!({
+            "v": 1,
+            "kind": "codex",
+            "pid": 1,
+            "birth": 1,
+            "request_id": "r",
+            "stdout": "a",
+            "stderr": "b"
+        }));
         let err = parse_handle(&handle).unwrap_err();
         assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+    }
+
+    #[test]
+    fn parse_handle_rejects_missing_request_id_and_birth() {
+        let no_req = RuntimeHandle(json!({
+            "v": 1,
+            "kind": ADAPTER_KIND,
+            "pid": 1,
+            "birth": 9,
+            "stdout": "a",
+            "stderr": "b"
+        }));
+        assert_eq!(
+            parse_handle(&no_req).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
+        let no_birth = RuntimeHandle(json!({
+            "v": 1,
+            "kind": ADAPTER_KIND,
+            "pid": 1,
+            "request_id": "r",
+            "stdout": "a",
+            "stderr": "b"
+        }));
+        assert_eq!(
+            parse_handle(&no_birth).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
+        let empty_req = RuntimeHandle(json!({
+            "v": 1,
+            "kind": ADAPTER_KIND,
+            "pid": 1,
+            "birth": 9,
+            "request_id": "",
+            "stdout": "a",
+            "stderr": "b"
+        }));
+        assert_eq!(
+            parse_handle(&empty_req).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
     }
 
     #[test]
@@ -766,20 +1182,33 @@ mod tests {
     }
 
     #[test]
-    fn writer_quiescence_unknown_is_not_accepted_from_agent_json() {
-        let out = parse_outcome_json(
+    fn writer_quiescence_unknown_from_json_is_protocol() {
+        let err = parse_outcome_json(
             r#"{"ok":false,"failure_class":"WRITER_QUIESCENCE_UNKNOWN","summary":"nope"}"#,
         )
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+    }
+
+    #[test]
+    fn unknown_failure_class_from_json_is_protocol() {
+        let err = parse_outcome_json(r#"{"ok":false,"failure_class":"NOT_A_CLASS"}"#).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+    }
+
+    #[test]
+    fn omitted_failure_class_defaults_to_start_failure() {
+        let out = parse_outcome_json(r#"{"ok":false,"summary":"nope"}"#).unwrap();
         assert_eq!(out.state, ExecutionState::Failed);
         assert_eq!(out.failure_class, Some(FailureClass::StartFailure));
         assert!(!out.quiescent_confirmed);
     }
 
     #[test]
-    fn handle_json_roundtrip_preserves_locator() {
+    fn handle_json_roundtrip_preserves_locator_and_birth() {
         let parsed = ParsedHandle {
             pid: 4242,
+            birth: 99,
             request_id: "req-1".into(),
             stdout_path: PathBuf::from("stdout.txt"),
             stderr_path: PathBuf::from("stderr.txt"),
@@ -789,6 +1218,13 @@ mod tests {
         let restored = RuntimeHandle(serde_json::from_str(&text).unwrap());
         let again = parse_handle(&restored).unwrap();
         assert_eq!(again.pid, 4242);
+        assert_eq!(again.birth, 99);
         assert_eq!(again.request_id, "req-1");
+    }
+
+    #[test]
+    fn proc_stat_starttime_is_field_22() {
+        let line = "1234 (fake-agent) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99999 0";
+        assert_eq!(parse_stat_starttime(line), Some(99999));
     }
 }

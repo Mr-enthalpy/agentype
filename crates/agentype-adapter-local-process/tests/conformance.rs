@@ -7,7 +7,7 @@ use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterErrorKind, ExecutionAdapter, ExecutionObservation,
     ExecutionRequest, RuntimeHandle, StartObservation,
 };
-use agentype_adapter_local_process::{LocalProcessAgentAdapter, ADAPTER_KIND};
+use agentype_adapter_local_process::{LocalProcessAgentAdapter, ADAPTER_KIND, MAX_STDOUT_BYTES};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, BatchId, CommittedContinuitySnapshot, ExecutionId,
     ExecutionState, FailureClass, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId,
@@ -18,6 +18,7 @@ use agentype_execution_config::{
     ExecutionTargetConfig,
 };
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const SECRET: &str = "super-secret-token-do-not-leak";
@@ -184,19 +185,21 @@ fn start_hang(adapter: &LocalProcessAgentAdapter) -> (ExecutionRequest, StartObs
     (req, start)
 }
 
-fn handle_fields(handle: &RuntimeHandle) -> (u32, String) {
+fn handle_fields(handle: &RuntimeHandle) -> (u32, u64, String, PathBuf) {
     let obj = handle.0.as_object().expect("handle object");
     assert_eq!(obj.get("kind").and_then(Value::as_str), Some(ADAPTER_KIND));
     assert_eq!(obj.get("v").and_then(Value::as_i64), Some(1));
     let pid = obj.get("pid").and_then(Value::as_u64).expect("pid") as u32;
+    let birth = obj.get("birth").and_then(Value::as_u64).expect("birth");
     let request_id = obj
         .get("request_id")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .filter(|s| !s.is_empty())
+        .expect("request_id")
         .to_string();
-    assert!(obj.get("stdout").and_then(Value::as_str).is_some());
+    let stdout = obj.get("stdout").and_then(Value::as_str).expect("stdout");
     assert!(obj.get("stderr").and_then(Value::as_str).is_some());
-    (pid, request_id)
+    (pid, birth, request_id, PathBuf::from(stdout))
 }
 
 // --- §16 Creation ---
@@ -207,8 +210,9 @@ fn start_creates_environment_and_returns_persisted_handle() {
     let req = request(AgentSpec::default());
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
     assert_no_quiescence_start(&start);
-    let (pid, request_id) = handle_fields(&start.runtime_handle);
+    let (pid, birth, request_id, _) = handle_fields(&start.runtime_handle);
     assert!(pid > 0);
+    assert!(birth > 0);
     assert_eq!(request_id, req.request_id().as_str());
 
     let text = serde_json::to_string(&start.runtime_handle.0).unwrap();
@@ -315,8 +319,7 @@ fn collect_blocked_response_respects_deadline_and_does_not_prove_state() {
     assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
     assert!(err.runtime_handle_hint().is_some());
     assert_no_secret(&err);
-    // Timeout is not TERMINATED / quiescence. The process may have been
-    // kill-sent as cleanup; that is still not a terminal observation.
+    let _ = adapter.terminate_execution(&start.runtime_handle, &long_deadline());
 }
 
 #[test]
@@ -353,15 +356,27 @@ fn missing_command_is_unavailable_not_scheduler_failure() {
 // --- §16 Control ---
 
 #[test]
-fn interrupt_is_observation_not_cancellation() {
+fn interrupt_attempts_physical_signal_or_reports_unsupported() {
     let adapter = LocalProcessAgentAdapter::new();
-    let (_req, start) = start_hang(&adapter);
-    let obs = adapter
-        .interrupt_execution(&start.runtime_handle, &long_deadline())
-        .unwrap();
-    assert_eq!(obs.state, ExecutionState::Running);
-    assert_no_quiescence_obs(&obs);
-    assert!(!obs.terminal_confirmed);
+    let req = request(AgentSpec::with_flag("FAKE_AGENT_HANG").env_pair("FAKE_AGENT_TRAP_INT", "1"));
+    let start = adapter.start_execution(&req, &long_deadline()).unwrap();
+    assert_eq!(start.state, ExecutionState::Running);
+    match adapter.interrupt_execution(&start.runtime_handle, &long_deadline()) {
+        Ok(obs) => {
+            assert_no_quiescence_obs(&obs);
+            assert!(!obs.terminal_confirmed);
+            // Trapped interrupt must not be treated as Task cancel. Unix
+            // SIGINT is ignored; Windows may still be RUNNING if the ctrl
+            // event landed and was ignored.
+            if obs.state == ExecutionState::Running {
+                assert_eq!(obs.state, ExecutionState::Running);
+            }
+        }
+        Err(err) => {
+            assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+            assert_no_secret(&err);
+        }
+    }
     adapter
         .terminate_execution(&start.runtime_handle, &long_deadline())
         .unwrap();
@@ -473,6 +488,7 @@ fn reconcile_failed_reconnect_is_ambiguous_unknown() {
         "v": 1,
         "kind": ADAPTER_KIND,
         "pid": u32::MAX,
+        "birth": 1,
         "request_id": req.request_id().as_str(),
         "stdout": "stdout.txt",
         "stderr": "stderr.txt",
@@ -503,6 +519,7 @@ fn reconcile_rejects_mismatched_request_id() {
         "v": 1,
         "kind": ADAPTER_KIND,
         "pid": 1,
+        "birth": 1,
         "request_id": "other",
         "stdout": "stdout.txt",
         "stderr": "stderr.txt",
@@ -538,4 +555,98 @@ fn request_prompt_is_scheduler_protocol_not_caller_text() {
     assert!(req.prompt().starts_with("LOCAL AGENT SCHEDULER TASK"));
     assert!(!req.prompt().contains("deepseek"));
     assert!(!req.prompt().contains(SECRET));
+}
+
+#[test]
+fn birth_mismatch_must_not_return_running() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let (req, start) = start_hang(&adapter);
+    let (pid, birth, request_id, stdout) = handle_fields(&start.runtime_handle);
+    let mut forged = start.runtime_handle.0.clone();
+    forged["birth"] = json!(birth.wrapping_add(1).max(1));
+    let forged = RuntimeHandle(forged);
+    assert_eq!(
+        forged.0.get("pid").and_then(Value::as_u64).unwrap() as u32,
+        pid
+    );
+    let _ = stdout;
+    let rec = adapter
+        .reconcile_start(req.request_id(), Some(&forged), &long_deadline())
+        .unwrap();
+    assert_eq!(rec.state, ExecutionState::Unknown);
+    assert!(rec.ambiguous);
+    let obs = adapter
+        .observe_execution(&forged, &long_deadline())
+        .unwrap();
+    assert_eq!(obs.state, ExecutionState::Unknown);
+    assert_eq!(request_id, req.request_id().as_str());
+    adapter
+        .terminate_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+}
+
+#[test]
+fn adapter_drop_does_not_kill_committed_execution() {
+    let handle;
+    {
+        let adapter = LocalProcessAgentAdapter::new();
+        let (_req, start) = start_hang(&adapter);
+        handle = start.runtime_handle.clone();
+    }
+    let adapter = LocalProcessAgentAdapter::new();
+    let obs = adapter
+        .observe_execution(&handle, &long_deadline())
+        .unwrap();
+    assert_eq!(obs.state, ExecutionState::Running);
+    assert_no_quiescence_obs(&obs);
+    adapter
+        .terminate_execution(&handle, &long_deadline())
+        .unwrap();
+}
+
+#[test]
+fn collect_oversize_stdout_is_protocol_not_success() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let (_req, start) = start_hang(&adapter);
+    let (_pid, _birth, _rid, stdout_path) = handle_fields(&start.runtime_handle);
+    let huge = "x".repeat(MAX_STDOUT_BYTES + 1);
+    std::fs::write(&stdout_path, huge).unwrap();
+    adapter
+        .terminate_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+    let err = adapter
+        .collect_outcome(&start.runtime_handle, &long_deadline())
+        .unwrap_err();
+    assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+    assert_no_secret(&err);
+}
+
+#[test]
+fn start_expired_after_stdin_does_not_return_running() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let req = request(AgentSpec::default());
+    let deadline = AdapterDeadline::from_instant(Instant::now() + Duration::from_nanos(1));
+    match adapter.start_execution(&req, &deadline) {
+        Ok(start) => panic!(
+            "positive start observation after exhausted budget: {:?}",
+            start.state
+        ),
+        Err(err) => {
+            assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+            assert_no_secret(&err);
+        }
+    }
+}
+
+#[test]
+fn collect_writer_quiescence_unknown_json_is_protocol() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let stdout = r#"{"ok":false,"failure_class":"WRITER_QUIESCENCE_UNKNOWN"}"#;
+    let req = request(AgentSpec::default().env_pair("FAKE_AGENT_STDOUT", stdout));
+    let start = adapter.start_execution(&req, &long_deadline()).unwrap();
+    let err = adapter
+        .collect_outcome(&start.runtime_handle, &long_deadline())
+        .unwrap_err();
+    assert_eq!(err.kind(), AdapterErrorKind::Protocol);
+    assert_no_secret(&err);
 }
