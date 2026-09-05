@@ -62,25 +62,29 @@ executable is user configuration, not a Scheduler concern.
 Handle:
 
 ```json
-{"v": 1, "kind": "local_process", "pid": N, "request_id": "...", "stdout": "...", "stderr": "..."}
+{"v": 1, "kind": "local_process", "pid": N, "birth": T, "request_id": "...", "stdout": "...", "stderr": "..."}
 ```
 
-Start returns RUNNING after spawn + stdin write + one `try_wait`. It does
-not wait the remaining start budget for the agent to finish; that wait
-belongs to `collect_outcome` (its own deadline). A fast-exit during start is
-UNKNOWN + ambiguous, not SUCCEEDED.
+`birth` is the process-instance token (Linux starttime / Windows creation
+FILETIME). PID match without birth match is UNKNOWN, never RUNNING.
 
-`quiescent_confirmed` is always false on this adapter. Process death is
-UNKNOWN on observe, never SUCCEEDED. Kill-sent is not quiescence.
-`WRITER_QUIESCENCE_UNKNOWN` in agent JSON is ignored (mechanical
-`START_FAILURE`).
+Start returns RUNNING after spawn + same-thread stdin write + one
+`try_wait`, only if the start deadline still remains. It does not wait
+the remaining start budget for the agent to finish; that wait belongs to
+`collect_outcome`. A fast-exit during start is UNKNOWN + ambiguous, not
+SUCCEEDED.
 
-Windows: `CREATE_NO_WINDOW`; pid liveness via `OpenProcess` /
-`GetExitCodeProcess(STILL_ACTIVE)` behind `#[allow(unsafe_code)]` on that
-function only. `Drop` kill-reaps leftover live children.
+`quiescent_confirmed` is always false. Process death is UNKNOWN on
+observe, never SUCCEEDED. Kill-sent is not quiescence.
+`WRITER_QUIESCENCE_UNKNOWN` or unknown `failure_class` in agent JSON is
+`AdapterError::Protocol`, not laundered `START_FAILURE`.
 
-`FAKE_AGENT_*` is passed per child through `target_options.env`. Tests never
-call process-wide `set_var`.
+Stdin write is nonblocking/PIPE_NOWAIT on the calling thread. There is
+no helper-thread watchdog. Drop forgets live `Child` objects: it does
+not kill committed executions.
+
+`FAKE_AGENT_*` is passed per child through `target_options.env`. Tests
+never call process-wide `set_var`.
 
 ---
 
@@ -89,18 +93,18 @@ call process-wide `set_var`.
 | Obligation | Proof |
 | --- | --- |
 | blocked process/session initialization | start does not wait for agent-ready; missing executable → `Unavailable`; expired start deadline rejected before spawn |
-| blocked request write | `write_all_bounded(BlockingWrite)` unit test; live 2 MiB unread stdin + hang → `DeadlineExceeded` + handle hint |
-| blocked flush | `write_all_bounded(BlockingFlush)` unit test |
+| blocked request write | 2 MiB unread stdin + hang → `DeadlineExceeded` + handle hint; write is same-thread PIPE_NOWAIT / `O_NONBLOCK` (no helper thread) |
 | blocked response read | collect of `FAKE_AGENT_HANG` returns by the collect deadline |
-| deadline between start stages | spawn, stdin write, and one `try_wait` share the start endpoint; no per-stage refresh |
+| deadline between start stages | spawn, stdin write, and one `try_wait` share the start endpoint; recheck before RUNNING |
 | deadline after partial locator | stdin timeout returns `runtime_handle_hint` |
-| cleanup with remaining budget | stdin timeout kill + `try_wait` before return |
-| cleanup with depleted budget | collect timeout kill is best-effort; no fresh wait |
-| interrupt timeout | expired interrupt → `DeadlineExceeded`; live interrupt is observe-only |
+| cleanup with remaining budget | uncommitted start stdin timeout kill + `try_wait` before return |
+| cleanup with depleted budget | collect timeout is `DeadlineExceeded` without SUCCEEDED; no fresh wait |
+| interrupt timeout | expired interrupt → `DeadlineExceeded`; live interrupt attempts SIGINT/CTRL_BREAK |
 | terminate timeout | expired terminate → `DeadlineExceeded` and does **not** claim TERMINATED (process still RUNNING) |
 | reconcile timeout | expired reconcile → `DeadlineExceeded` |
 | collect timeout | hang collect → `DeadlineExceeded` with hint, not terminal proof |
-| diagnostic sanitization | `FAKE_AGENT_STDERR_SECRET` and `api_key` in options never appear in `AdapterError` / outcome |
+| bounded stdout | oversize file → Protocol, not SUCCEEDED |
+| diagnostic length | `AdapterDiagnostic` still caps 512 chars. This crate does not implement a secret scanner; unread stderr is not sanitization evidence. |
 
 All six operations reject an already-expired `AdapterDeadline` before I/O.
 
@@ -111,12 +115,12 @@ All six operations reject an already-expired `AdapterDeadline` before I/O.
 Creation: `start_creates_environment_and_returns_persisted_handle`
 Observation: `observe_running_and_exited_environments`, `observe_unknown_handle_is_protocol`
 Deadline: `expired_deadline_is_rejected_on_all_six_operations`, collect/start blocked-I/O tests
-Control: `interrupt_is_observation_not_cancellation`, `terminate_kill_is_not_quiescence_or_task_cancel`, `terminate_timeout_does_not_imply_termination`
-Collection: success / structured failure / malformed protocol
-Restart: reconnect live handle; failed reconnect UNKNOWN; no handle is not a new start; mismatched `request_id` is Protocol
+Control: `interrupt_attempts_physical_signal_or_reports_unsupported`, `terminate_kill_is_not_quiescence_or_task_cancel`, `terminate_timeout_does_not_imply_termination`
+Collection: success / structured failure / malformed protocol / oversize / `WRITER_QUIESCENCE_UNKNOWN` Protocol
+Restart: reconnect live handle; failed reconnect UNKNOWN; no handle is not a new start; mismatched `request_id` is Protocol; birth mismatch is UNKNOWN
+Lifecycle: `adapter_drop_does_not_kill_committed_execution`
 
-Boundary extras: model/api_key options are opaque; worker prompt is the
-V0.1 protocol, never caller text.
+Boundary extras: opaque `target_options` keys are not Core fields; worker prompt is the V0.1 protocol, never caller text.
 
 ---
 
@@ -161,6 +165,17 @@ column, RootBridge `last_error` sanitization.
     Core and runtime do not depend on this crate.
 
 ---
+
+## 8a. Audit closure (PR #13 REQUEST CHANGES)
+
+Closed in-milestone, not deferred to M5.8:
+
+- P1-1 detached stdin helper thread removed
+- P1-2 `pid+birth` instance identity; empty `request_id` is Protocol
+- P1-3 deadline recheck before positive evidence; bounded stdout
+- P1-4 illegal/nonmechanical `failure_class` → Protocol
+- P1-5 Drop forgets, does not kill; terminate by pid after Drop
+- interrupt attempts a physical signal or returns Unavailable
 
 ## 9. Future Codex strategy
 

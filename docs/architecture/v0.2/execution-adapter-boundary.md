@@ -102,16 +102,16 @@ request is already `ExecutionRequest`, assembled exclusively from:
 2. `ResolvedExecutionEnvironment` — authoritative `target_options` /
    `profile_options` / `profile_timeout_seconds`.
 
-The request MUST NOT carry:
+Scheduler Core MUST NOT define, interpret, route, or persist
+model/provider credential semantics. There is no Core field named
+`model`, `provider`, or `api_key`. Caller-supplied prompt text cannot
+be injected (`RenderedWorkerPrompt` is derived from the launch snapshot).
 
-```text
-model / provider / api_key / caller-supplied prompt text
-```
-
-Those belong to user-owned external environment configuration, which the
-adapter may see only as opaque `target_options` JSON (for example
-`command`, `args`, `cwd`, `env` for a local process). Extra keys such as
-`model` or `api_key` are ignored; they are not Scheduler fields.
+Adapter-specific opaque `target_options` JSON MAY exist (`command`,
+`args`, `cwd`, `env` for a local process). Extra keys are ignored by
+this adapter. Provider credentials SHOULD remain in the user-owned
+external environment (command / config_ref / inherited env), not
+plaintext `api_key` in Agentype configuration.
 
 `ExecutionProfile.timeout_seconds` remains execution/profile configuration.
 It MUST NOT become any Scheduler-facing operation deadline. Operation
@@ -125,9 +125,10 @@ latency bounds come exclusively from the installed `AdapterDeadlinePolicy`.
 compare it, and pass it back. Scheduler Core MUST NOT interpret vendor
 fields.
 
-Allowed contents (adapter-private): process id, session id, container id,
-stdout/stderr paths, adapter kind, a copy of `request_id` used only as
-reconcile identity check.
+Allowed contents (adapter-private): process id, process-instance birth
+token, session id, container id, stdout/stderr paths, adapter kind, a
+copy of `request_id` used only as reconcile identity check. Core MUST
+NOT learn `ProcessId` or start-time types.
 
 It is not Execution identity, LogicalAgent identity, or Task identity.
 A handle hint on `AdapterError` is locator history only: not RUNNING, not
@@ -140,11 +141,17 @@ Reference adapter (`local_process`) handle:
   "v": 1,
   "kind": "local_process",
   "pid": 1234,
+  "birth": 123456789,
   "request_id": "<RequestId>",
   "stdout": "<path>",
   "stderr": "<path>"
 }
 ```
+
+PID reuse is not identity. RUNNING after restart requires `pid` **and**
+`birth` (Linux `/proc/<pid>/stat` starttime, Windows `GetProcessTimes`
+creation FILETIME). Missing `birth` or `request_id` is Protocol, not a
+wildcard. Birth mismatch is UNKNOWN, never positive re-admission.
 
 `adapter_kind = local_process` uniquely identifies this host's process table
 as spawned by this runtime. Multi-host or multi-installation domains (future
@@ -189,9 +196,10 @@ Diagnostics are bounded (512 chars) and MUST be sanitized by the adapter
 (secrets, tokens, Authorization, env, worker payload, full provider bodies).
 The type enforces length only.
 
-`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. An adapter that surfaces it
-from external JSON is treated as protocol / mechanical `START_FAILURE`; it
-cannot mint writer-safety.
+`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. External JSON that names
+it, or any unknown `failure_class`, is `AdapterError::Protocol` — not
+silently rewritten to `START_FAILURE`. Omitted `failure_class` on
+`ok:false` defaults to mechanical `StartFailure` only.
 
 Timeout, kill-sent, and process-not-running prove nothing about Task
 cancellation, writer safety, or quiescence. Successful validated
@@ -216,12 +224,15 @@ Unchanged:
 The reference adapter:
 
 - rejects already-expired calls on all six methods before I/O;
-- writes stdin on a helper thread with `recv_timeout(remaining)`;
+- writes stdin on the calling thread with nonblocking/PIPE_NOWAIT poll
+  under the same deadline (no helper thread, no detached watchdog);
+- rechecks the deadline before every positive RUNNING / SUCCEEDED /
+  FAILED / TERMINATED observation;
+- collect reads stdout in chunks with a 256 KiB bound;
 - waits for child exit in `WAIT_SLICE` bounded by `remaining`;
 - on start stdin timeout, persists the partial handle as
   `runtime_handle_hint` then returns `DeadlineExceeded`;
-- on collect timeout, best-effort kill then `DeadlineExceeded` (not
-  TERMINATED);
+- on collect timeout, `DeadlineExceeded` (not SUCCEEDED, not TERMINATED);
 - on terminate wait exhaustion, `DeadlineExceeded` with hint
   ("kill sent is not quiescence").
 
@@ -240,15 +251,18 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 
 | Operation | Mechanics |
 | --- | --- |
-| start | spawn + bounded stdin write of the Scheduler worker protocol + one `try_wait`. RUNNING if still alive; UNKNOWN+ambiguous if it already exited. Does not wait the remaining budget for agent completion. |
-| observe | live `Child` or OS pid liveness. Alive → RUNNING; not alive → UNKNOWN. Never SUCCEEDED. |
-| interrupt | best-effort observe. Not Task cancellation. |
-| terminate | `kill` + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. No live `Child` → observe only; do not invent TERMINATED. |
-| collect | wait remaining for exit, parse stdout JSON `{ok, payload, summary, failure_class}`. Process death is not quiescence. |
-| reconcile | reconnect persisted handle + `request_id`. No handle → ambiguous UNKNOWN, not a new start. |
+| start | spawn + same-thread bounded stdin write of the Scheduler worker protocol + one `try_wait`. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. Does not wait the remaining budget for agent completion. Uncommitted start failure may kill that child. |
+| observe | live `Child` with matching `birth`, else `pid+birth` instance liveness. Alive → RUNNING; mismatch/dead → UNKNOWN. Never SUCCEEDED. |
+| interrupt | Unix `SIGINT` / Windows `CTRL_BREAK` attempt, then observe. Not Task cancellation. Delivery failure is `Unavailable`, not a silent observe. |
+| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. Birth mismatch does not kill a different instance. |
+| collect | wait remaining for exit, bounded stdout read, parse JSON `{ok, payload, summary, failure_class}`. Process death is not quiescence. |
+| reconcile | reconnect persisted handle + `request_id` + `birth`. No handle → ambiguous UNKNOWN, not a new start. |
 
-Windows pid liveness: `OpenProcess` + `GetExitCodeProcess(STILL_ACTIVE)`.
-Spawn uses `CREATE_NO_WINDOW`. Drop kills leftover live children.
+Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via
+`GetProcessTimes`. Linux birth via `/proc/<pid>/stat` starttime.
+Dropping the adapter **forgets** live `Child` objects (does not wait,
+does not kill). Committed executions outlive adapter ownership;
+only `terminate_execution` or daemon shutdown policy may kill them.
 
 ---
 
