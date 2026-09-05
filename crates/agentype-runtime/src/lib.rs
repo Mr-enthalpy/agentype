@@ -9,12 +9,14 @@
 
 pub use agentype_execution_config::*;
 
+pub mod deadlines;
 pub mod notifier;
 pub mod observation;
 pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
+pub use deadlines::{AdapterDeadlinePolicy, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
     NotifierRunner, NotifierService,
@@ -228,7 +230,7 @@ impl std::error::Error for AdapterUnavailable {}
 /// explicitly empty registry is authoritative — resolution fails closed.
 #[derive(Default)]
 pub struct AdapterRegistry {
-    adapters: HashMap<String, Arc<dyn ExecutionAdapter>>,
+    adapters: HashMap<String, ResolvedAdapterBinding>,
 }
 
 impl AdapterRegistry {
@@ -240,6 +242,7 @@ impl AdapterRegistry {
         &mut self,
         adapter_kind: impl Into<String>,
         adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
     ) -> Result<(), AdapterRegistryError> {
         let kind = adapter_kind.into();
         if kind.trim().is_empty() {
@@ -250,15 +253,19 @@ impl AdapterRegistry {
         if self.adapters.contains_key(&kind) {
             return Err(AdapterRegistryError::DuplicateKind(kind));
         }
-        self.adapters.insert(kind, adapter);
+        self.adapters.insert(
+            kind.clone(),
+            ResolvedAdapterBinding::new(kind, adapter, deadlines),
+        );
         Ok(())
     }
 
     /// Fail-closed lookup by the configured `adapter_kind`. No fallback.
+    /// Returns a binding that always constructs an operation deadline.
     pub fn resolve(
         &self,
         adapter_kind: &str,
-    ) -> Result<Arc<dyn ExecutionAdapter>, AdapterUnavailable> {
+    ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
         self.adapters
             .get(adapter_kind)
             .cloned()
@@ -352,7 +359,7 @@ fn classify_kernel_authority_error(err: Error) -> DispatchError {
 pub struct ResolvedPhysicalExecutionEnvironment {
     binding: AuthoritativeExecutionBinding,
     environment: ResolvedExecutionEnvironment,
-    adapter: Arc<dyn ExecutionAdapter>,
+    adapter_binding: ResolvedAdapterBinding,
 }
 
 impl ResolvedPhysicalExecutionEnvironment {
@@ -364,8 +371,10 @@ impl ResolvedPhysicalExecutionEnvironment {
         &self.environment
     }
 
-    pub fn adapter(&self) -> &Arc<dyn ExecutionAdapter> {
-        &self.adapter
+    /// Installed adapter plus its operation deadline policy. There is no
+    /// raw `ExecutionAdapter` getter on the production path.
+    pub fn adapter_binding(&self) -> &ResolvedAdapterBinding {
+        &self.adapter_binding
     }
 
     pub fn attempt_isolation(&self) -> bool {
@@ -414,13 +423,13 @@ pub fn resolve_physical_execution_environment(
         &binding,
     )
     .map_err(DispatchError::Configuration)?;
-    let adapter = adapters
+    let adapter_binding = adapters
         .resolve(environment.target().adapter_kind.as_str())
         .map_err(DispatchError::AdapterAvailability)?;
     Ok(ResolvedPhysicalExecutionEnvironment {
         binding,
         environment,
-        adapter,
+        adapter_binding,
     })
 }
 
@@ -721,19 +730,19 @@ impl<'a> Dispatcher<'a> {
 
         // Physical start — exactly once (task §16), outside any SQLite
         // transaction (task §26).
-        let observation = match physical.adapter().start_execution(&request) {
+        let observation = match physical.adapter_binding().start_execution(&request) {
             Ok(observation) => observation,
             Err(err) => {
                 // Invocation error ≠ absence of execution: the start may
-                // have had side effects. Nonterminal NACK (never quiescent)
-                // keeps writer ambiguity intact for WRITE tasks (task §28).
-                // No observation exists, so no handle can be preserved.
+                // have had side effects. Persist any locator already
+                // learned, then STARTING → UNKNOWN, then nonterminal NACK.
                 let failure_class = adapter_invocation_failure_class(&err);
+                let hint = err.runtime_handle_hint().map(|h| h.0.clone());
                 self.persist_unresolved_physical_then_nack(
                     claim,
                     &execution_id,
                     failure_class,
-                    None,
+                    hint.as_ref(),
                 )?;
                 return Ok(DispatchOneOutcome::StartIndeterminate {
                     execution_id,
@@ -745,7 +754,7 @@ impl<'a> Dispatcher<'a> {
 
         self.commit_start_observation(
             claim,
-            physical.adapter(),
+            physical.adapter_binding(),
             &execution_id,
             &request_id,
             observation,
@@ -758,7 +767,7 @@ impl<'a> Dispatcher<'a> {
     fn commit_start_observation(
         &self,
         claim: &Claim,
-        adapter: &Arc<dyn ExecutionAdapter>,
+        adapter: &ResolvedAdapterBinding,
         execution_id: &ExecutionId,
         request_id: &RequestId,
         observation: StartObservation,
@@ -984,19 +993,17 @@ impl<'a> Dispatcher<'a> {
         failure_class: FailureClass,
         observed_handle: Option<&Value>,
     ) -> Result<(), DispatchError> {
-        if let Some(handle) = observed_handle {
-            self.kernel
-                .record_physical_outcome(
-                    execution_id,
-                    ExecutionState::Unknown,
-                    Some(handle),
-                    None,
-                    Some(failure_class),
-                    false,
-                    false,
-                )
-                .map_err(DispatchError::Persistence)?;
-        }
+        self.kernel
+            .record_physical_outcome(
+                execution_id,
+                ExecutionState::Unknown,
+                observed_handle,
+                None,
+                Some(failure_class),
+                false,
+                false,
+            )
+            .map_err(DispatchError::Persistence)?;
         self.nack_start(
             claim,
             execution_id,
@@ -1922,7 +1929,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     fn fake_adapters(kind: &str) -> AdapterRegistry {
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(kind, Arc::new(FakeAdapter::new()))
+            .register(
+                kind,
+                Arc::new(FakeAdapter::new()),
+                crate::deadlines::test_deadlines(),
+            )
             .unwrap();
         adapters
     }
@@ -2010,16 +2021,28 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let mut adapters = AdapterRegistry::new();
         assert_eq!(
             adapters
-                .register("   ", Arc::new(FakeAdapter::new()))
+                .register(
+                    "   ",
+                    Arc::new(FakeAdapter::new()),
+                    crate::deadlines::test_deadlines()
+                )
                 .unwrap_err(),
             AdapterRegistryError::InvalidKind("adapter kind cannot be empty".into())
         );
         adapters
-            .register("process", Arc::new(FakeAdapter::new()))
+            .register(
+                "process",
+                Arc::new(FakeAdapter::new()),
+                crate::deadlines::test_deadlines(),
+            )
             .unwrap();
         assert_eq!(
             adapters
-                .register("process", Arc::new(FakeAdapter::new()))
+                .register(
+                    "process",
+                    Arc::new(FakeAdapter::new()),
+                    crate::deadlines::test_deadlines()
+                )
                 .unwrap_err(),
             AdapterRegistryError::DuplicateKind("process".into())
         );
@@ -2040,24 +2063,22 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             Some(FailureClass::ResourceUnavailable)
         );
         assert_eq!(
-            DispatchError::AdapterInvocation(AdapterError::Unavailable("u".into()))
+            DispatchError::AdapterInvocation(AdapterError::unavailable("u"))
                 .standard_failure_class(),
             Some(FailureClass::ResourceUnavailable)
         );
         assert_eq!(
-            DispatchError::AdapterInvocation(AdapterError::DeadlineExceeded("d".into()))
+            DispatchError::AdapterInvocation(AdapterError::deadline_exceeded("d"))
                 .standard_failure_class(),
             Some(FailureClass::Timeout)
         );
         assert_eq!(
-            DispatchError::AdapterInvocation(AdapterError::Protocol("p".into()))
-                .standard_failure_class(),
+            DispatchError::AdapterInvocation(AdapterError::protocol("p")).standard_failure_class(),
             Some(FailureClass::AdapterProtocolFailure)
         );
         assert_eq!(
-            DispatchError::AdapterInvocation(AdapterError::Other("o".into()))
-                .standard_failure_class(),
-            Some(FailureClass::StartFailure)
+            DispatchError::AdapterInvocation(AdapterError::other("o")).standard_failure_class(),
+            Some(FailureClass::Unknown)
         );
         // Authority and persistence are domain/storage errors, never Task
         // failure classes.
@@ -2112,7 +2133,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
 
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         (kernel, clock, registry, adapters, fake)
     }
 
@@ -2163,39 +2186,55 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     }
 
     impl ExecutionAdapter for ClockAdvancingAdapter {
-        fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+        fn start_execution(
+            &self,
+            request: &ExecutionRequest,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
             self.clock.advance(self.advance_seconds);
-            self.inner.start_execution(request)
+            self.inner.start_execution(request, deadline)
         }
 
-        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
-            self.inner.observe_execution(handle)
+        fn observe_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle, deadline)
         }
 
         fn interrupt_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.interrupt_execution(handle)
+            self.inner.interrupt_execution(handle, deadline)
         }
 
         fn terminate_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.terminate_execution(handle)
+            self.inner.terminate_execution(handle, deadline)
         }
 
-        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
-            self.inner.collect_outcome(handle)
+        fn collect_outcome(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionOutcome> {
+            self.inner.collect_outcome(handle, deadline)
         }
 
         fn reconcile_start(
             &self,
             request_id: &RequestId,
             persisted_handle: Option<&RuntimeHandle>,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
-            self.inner.reconcile_start(request_id, persisted_handle)
+            self.inner
+                .reconcile_start(request_id, persisted_handle, deadline)
         }
     }
 
@@ -2654,7 +2693,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
         let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", advancing).unwrap();
+        adapters
+            .register("process", advancing, crate::deadlines::test_deadlines())
+            .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, _ids) = kernel
             .submit_batch(&[TaskSpec::new("stale-running", Value::Null)])
@@ -2699,7 +2740,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             incarnation_reusable: false,
         });
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", advancing).unwrap();
+        adapters
+            .register("process", advancing, crate::deadlines::test_deadlines())
+            .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, _ids) = kernel
             .submit_batch(&[TaskSpec::new("stale-fail", Value::Null)])
@@ -3417,7 +3460,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             .unwrap();
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", Arc::new(FakeAdapter::new()))
+            .register(
+                "process",
+                Arc::new(FakeAdapter::new()),
+                crate::deadlines::test_deadlines(),
+            )
             .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
 
@@ -3505,42 +3552,58 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
     }
 
     impl ExecutionAdapter for CollectCorruptingAdapter {
-        fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
-            self.inner.start_execution(request)
+        fn start_execution(
+            &self,
+            request: &ExecutionRequest,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            self.inner.start_execution(request, deadline)
         }
 
-        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+        fn collect_outcome(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionOutcome> {
             let conn = rusqlite::Connection::open(&self.path).unwrap();
             conn.busy_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
             conn.execute(&self.corrupt_sql, []).unwrap();
-            self.inner.collect_outcome(handle)
+            self.inner.collect_outcome(handle, deadline)
         }
 
-        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
-            self.inner.observe_execution(handle)
+        fn observe_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle, deadline)
         }
 
         fn interrupt_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.interrupt_execution(handle)
+            self.inner.interrupt_execution(handle, deadline)
         }
 
         fn terminate_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.terminate_execution(handle)
+            self.inner.terminate_execution(handle, deadline)
         }
 
         fn reconcile_start(
             &self,
             request_id: &RequestId,
             persisted_handle: Option<&RuntimeHandle>,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
-            self.inner.reconcile_start(request_id, persisted_handle)
+            self.inner
+                .reconcile_start(request_id, persisted_handle, deadline)
         }
     }
 
@@ -3601,7 +3664,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             ),
         ));
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", wrapper.clone()).unwrap();
+        adapters
+            .register(
+                "process",
+                wrapper.clone(),
+                crate::deadlines::test_deadlines(),
+            )
+            .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
             .register_target(ExecutionTargetConfig::new("local", "process", false))
@@ -3655,7 +3724,13 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             ),
         ));
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", wrapper.clone()).unwrap();
+        adapters
+            .register(
+                "process",
+                wrapper.clone(),
+                crate::deadlines::test_deadlines(),
+            )
+            .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
             .register_target(ExecutionTargetConfig::new("local", "process", false))
@@ -3703,7 +3778,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (kernel, path, claim) = file_dispatch_env("freeze-kind");
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
             .register_target(ExecutionTargetConfig::new("local", "process", false))
@@ -3789,7 +3866,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (kernel, path, claim) = file_dispatch_env("continuity-warm");
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
             .register_target(ExecutionTargetConfig::new("local", "process", false))
@@ -3849,7 +3928,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (kernel, _path, claim1) = file_dispatch_env("continuity-next");
         let fake = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         let mut registry = ExecutionRegistry::new();
         registry
             .register_target(ExecutionTargetConfig::new("local", "process", false))
@@ -3935,7 +4016,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let (_batch, _ids) = kernel
             .submit_batch(&[TaskSpec::new("indeterminate", Value::Null)])
             .unwrap();
-        fake.set_next_start_error(AdapterError::Unavailable("worker gone mid-start".into()));
+        fake.set_next_start_error(AdapterError::unavailable("worker gone mid-start"));
 
         let outcome = d.dispatch_one().unwrap();
         let execution_id = match &outcome {
@@ -3950,6 +4031,334 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             kernel.execution(&execution_id).unwrap().state,
             ExecutionState::Unknown
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // M5.6 adapter deadline contract: bounded start, evidence-first errors
+    // ------------------------------------------------------------------
+
+    fn m56_policy() -> crate::deadlines::AdapterDeadlinePolicy {
+        crate::deadlines::AdapterDeadlinePolicy::new(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(7),
+        )
+        .unwrap()
+    }
+
+    /// M5.6 §45 #14: `start_execution` receives the deadline minted from the
+    /// registered start budget — not the profile timeout and not another
+    /// operation's slot.
+    #[test]
+    fn start_execution_receives_the_registered_start_budget() {
+        let (kernel, _clock, registry, _adapters, fake) = dispatch_env();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register("process", fake.clone(), m56_policy())
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[TaskSpec::new("start-budget", Value::Null)])
+            .unwrap();
+
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::RunningAdmitted { .. }
+        ));
+        let seen = fake
+            .deadline_for(agentype_adapter_api::AdapterOperation::StartExecution)
+            .expect("start deadline recorded");
+        let remaining = seen.remaining();
+        assert!(remaining > std::time::Duration::from_secs(1));
+        assert!(remaining <= std::time::Duration::from_secs(2));
+        // The profile timeout (30s) never became the operation deadline.
+        assert!(remaining <= std::time::Duration::from_secs(2));
+    }
+
+    /// M5.6 §47 #32/#35-37/#43: a start timeout before any locator is a
+    /// physical UNKNOWN with the TIMEOUT failure class, no supervision
+    /// admission, no blind re-start of the same Execution, and the declared
+    /// retry policy decides the task consequence (read-only: RETRY_WAIT).
+    #[test]
+    fn start_timeout_before_locator_is_physical_unknown() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("start-timeout", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start_error(AdapterError::deadline_exceeded(
+            "start exceeded operation budget before locator",
+        ));
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                execution_id,
+                failure_class: Some(FailureClass::Timeout),
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate(Timeout), got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        // No supervision admission exists (only RunningAdmitted mints one).
+        assert_eq!(fake.start_call_count(), 1);
+        // Read-only + retryable TIMEOUT: declared retry policy applies.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+        // No blind re-start of the same Execution: the retry wait is not yet
+        // claimable and nothing calls start_execution a second time.
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+        assert_eq!(fake.start_call_count(), 1);
+    }
+
+    /// M5.6 §20/§47 #33/#31: a start timeout after a partial locator keeps
+    /// the earned locator as durable physical history — the hint carries no
+    /// terminal proof, but it must not disappear.
+    #[test]
+    fn start_timeout_after_partial_locator_persists_the_locator() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        kernel
+            .submit_batch(&[
+                TaskSpec::new("partial-locator", Value::Null).retry(retryable_write_policy())
+            ])
+            .unwrap();
+        let hint = serde_json::json!({"thread_id": 7});
+        fake.set_next_start_error(
+            AdapterError::deadline_exceeded("turn/start exceeded budget after thread/start")
+                .with_handle_hint(RuntimeHandle(hint.clone())),
+        );
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                execution_id,
+                failure_class: Some(FailureClass::Timeout),
+                ..
+            } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate(Timeout), got {other:?}"),
+        };
+        assert_eq!(
+            kernel.execution(&execution_id).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            hint,
+            "partial locator must survive the failed operation"
+        );
+    }
+
+    /// M5.6 §24/§47 #27/#38-39: the start invocation error class matrix.
+    /// DeadlineExceeded → TIMEOUT, Protocol → ADAPTER_PROTOCOL_FAILURE,
+    /// Other → UNKNOWN (never START_FAILURE: a generic error does not prove
+    /// the start was rejected).
+    #[test]
+    fn start_invocation_error_class_matrix() {
+        for (err, expected) in [
+            (
+                AdapterError::deadline_exceeded("budget"),
+                FailureClass::Timeout,
+            ),
+            (
+                AdapterError::protocol("bad frame"),
+                FailureClass::AdapterProtocolFailure,
+            ),
+            (AdapterError::other("opaque"), FailureClass::Unknown),
+        ] {
+            let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+            let d = Dispatcher::new(&kernel, &registry, &adapters);
+            kernel
+                .submit_batch(&[TaskSpec::new("class-matrix", Value::Null)])
+                .unwrap();
+            fake.set_next_start_error(err);
+            match &d.dispatch_one().unwrap() {
+                DispatchOneOutcome::StartIndeterminate { failure_class, .. } => {
+                    assert_eq!(*failure_class.as_ref().unwrap(), expected);
+                }
+                other => panic!("expected StartIndeterminate, got {other:?}"),
+            }
+            assert_ne!(expected, FailureClass::StartFailure);
+        }
+    }
+
+    /// M5.6 §47 #34: a start timeout under stale authority preserves the
+    /// returned handle hint as physical history only — the Task is never
+    /// restored and no admission appears.
+    #[test]
+    fn stale_start_timeout_keeps_handle_as_physical_history_only() {
+        let (kernel, clock, registry, _adapters, _fake) = dispatch_env();
+        let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
+        let hint = serde_json::json!({"thread_id": 11});
+        advancing.inner.set_next_start_error(
+            AdapterError::deadline_exceeded("budget exhausted while authority expired")
+                .with_handle_hint(RuntimeHandle(hint.clone())),
+        );
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register("process", advancing, crate::deadlines::test_deadlines())
+            .unwrap();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, _ids) = kernel
+            .submit_batch(&[TaskSpec::new("stale-timeout", Value::Null)])
+            .unwrap();
+
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected StartIndeterminate, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(
+            kernel.execution_runtime_handle(&execution_id).unwrap(),
+            hint,
+            "locator evidence survives stale authority"
+        );
+        // Task authority was NOT restored.
+        assert_eq!(
+            kernel.task(&exec.task_id.clone()).unwrap().state,
+            TaskState::Leased
+        );
+    }
+
+    /// M5.6 §47 #41: an unisolated WRITE start timeout without quiescence
+    /// obeys writer safety — suspension, never a silent retry.
+    #[test]
+    fn unisolated_write_start_timeout_suspends_for_writer_safety() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("write-timeout", Value::Null).write().retry(
+                RetryPolicy {
+                    max_attempts: 3,
+                    // TIMEOUT deliberately NOT retryable for this writer.
+                    retry_classes: vec![FailureClass::ExecutionLost],
+                    base_backoff_seconds: 1.0,
+                    max_backoff_seconds: 8.0,
+                },
+            )])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start_error(AdapterError::deadline_exceeded(
+            "writer start budget exhausted",
+        ));
+
+        let outcome = d.dispatch_one().unwrap();
+        match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                failure_class: Some(FailureClass::Timeout),
+                ..
+            } => {}
+            other => panic!("expected StartIndeterminate(Timeout), got {other:?}"),
+        }
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
+    }
+
+    /// M5.6 §47 #42: an isolated WRITE start timeout follows the frozen
+    /// isolation fact — safe retry is permitted, so the declared retry
+    /// policy applies instead of writer suspension.
+    #[test]
+    fn isolated_write_start_timeout_uses_frozen_isolation_policy() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock.clone(), 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", true))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default").with_timeout(30.0))
+            .unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
+
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("iso-write-timeout", Value::Null)
+                .write()
+                .retry(retryable_write_policy())])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start_error(AdapterError::deadline_exceeded(
+            "isolated writer start budget exhausted",
+        ));
+
+        let outcome = d.dispatch_one().unwrap();
+        match &outcome {
+            DispatchOneOutcome::StartIndeterminate {
+                failure_class: Some(FailureClass::Timeout),
+                ..
+            } => {}
+            other => panic!("expected StartIndeterminate(Timeout), got {other:?}"),
+        }
+        // Isolation was frozen at Execution creation.
+        // retryable TIMEOUT on an isolated attempt: RETRY_WAIT, not SUSPENDED.
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::RetryWait);
+    }
+
+    /// M5.6 §45 #21 / §53: deadline policy is runtime composition, never
+    /// durable state. The executions schema carries no deadline/policy
+    /// columns; the deadline dies with the invocation.
+    #[test]
+    fn deadline_policy_is_not_persisted_to_execution_state() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agentype-m56-schema-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.db");
+        let clock: Arc<dyn agentype_core::Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, 16_384).unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(executions)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // Routing by persisted adapter_kind remains (M5.4)...
+        assert!(columns.iter().any(|c| c == "adapter_kind"));
+        // ...but no absolute deadline, deadline owner, remaining budget, or
+        // operation timeout ever becomes durable Scheduler semantics.
+        for c in &columns {
+            let lower = c.to_ascii_lowercase();
+            assert!(
+                !lower.contains("deadline")
+                    && !lower.contains("policy")
+                    && !lower.contains("remaining"),
+                "runtime mechanics leaked into executions column {c}"
+            );
+        }
+        drop(stmt);
+        drop(conn);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #60: an ambiguous observation is `StartIndeterminate` (also asserted
@@ -4240,7 +4649,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let kernel = Arc::new(kernel);
         let advancing = Arc::new(ClockAdvancingAdapter::new(clock.clone(), 25.0));
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", advancing).unwrap();
+        adapters
+            .register("process", advancing, crate::deadlines::test_deadlines())
+            .unwrap();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let service = SupervisionService::new(kernel.clone(), &supervision_timing()).unwrap();
         let (_batch, _ids) = kernel

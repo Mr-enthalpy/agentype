@@ -21,7 +21,7 @@ use crate::observation::{
 };
 use crate::supervision::{SupervisionError, SupervisionRunner, SupervisionService};
 use crate::timing::RuntimeTimingConfig;
-use crate::{AdapterRegistry, SupervisionAdmission};
+use crate::{AdapterRegistry, ResolvedAdapterBinding, SupervisionAdmission};
 
 /// Where a freshly minted admission is consumed. The live runner must be
 /// used when one is running (lifecycle gate + deadline wake-up); the
@@ -41,7 +41,7 @@ impl AdmissionSink for SupervisionRunner {
         SupervisionRunner::admit(self, admission)
     }
 }
-use agentype_adapter_api::{ExecutionAdapter, RuntimeHandle, StartObservation};
+use agentype_adapter_api::{RuntimeHandle, StartObservation};
 use agentype_core::{Error, ExecutionState, FailureClass, ResultId};
 use agentype_storage_sqlite::{ExecutionReconciliationSnapshot, Kernel};
 use serde_json::Value;
@@ -351,12 +351,9 @@ fn reconcile_active_physical(
         Ok(observation) => observation,
         Err(err) => {
             let failure_class = adapter_invocation_failure_class(&err);
-            return unresolved_or_history(
-                kernel,
-                snapshot,
-                failure_class,
-                Some(snapshot.runtime_handle()),
-            );
+            let hint = err.runtime_handle_hint().map(|h| h.0.clone());
+            let handle = hint.as_ref().or(Some(snapshot.runtime_handle()));
+            return unresolved_or_history(kernel, snapshot, failure_class, handle);
         }
     };
 
@@ -379,7 +376,7 @@ fn missing_adapter(
 
 fn apply_reconcile_observation(
     kernel: &Kernel,
-    adapter: Arc<dyn ExecutionAdapter>,
+    adapter: ResolvedAdapterBinding,
     snapshot: &ExecutionReconciliationSnapshot,
     observation: StartObservation,
     supervisor: &impl AdmissionSink,
@@ -439,7 +436,7 @@ fn admit_or_history(
 
 fn collect_and_apply(
     kernel: &Kernel,
-    adapter: Arc<dyn ExecutionAdapter>,
+    adapter: ResolvedAdapterBinding,
     snapshot: &ExecutionReconciliationSnapshot,
     observation: &StartObservation,
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
@@ -917,7 +914,9 @@ mod tests {
 
     fn adapters(fake: &Arc<FakeAdapter>) -> AdapterRegistry {
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", fake.clone()).unwrap();
+        adapters
+            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .unwrap();
         adapters
     }
 
@@ -1468,6 +1467,281 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // M5.6: bounded reconcile / collect under absolute deadlines
+    // ------------------------------------------------------------------
+
+    /// M5.6 §48 #44: reconcile_start receives a finite absolute deadline
+    /// minted from the registered reconcile budget.
+    #[test]
+    fn reconcile_receives_a_finite_deadline() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("rec-dl", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+
+        reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap();
+        let seen = fake
+            .deadline_for(agentype_adapter_api::AdapterOperation::ReconcileStart)
+            .expect("reconcile deadline recorded");
+        assert!(!seen.is_expired());
+        let remaining = seen.remaining();
+        let budget = crate::deadlines::test_deadlines()
+            .budget(agentype_adapter_api::AdapterOperation::ReconcileStart);
+        assert!(remaining > budget - std::time::Duration::from_secs(1));
+        assert!(remaining <= budget);
+        // No start_execution escape hatch was used.
+        assert_eq!(fake.start_call_count(), 0);
+    }
+
+    /// M5.6 §48 #45-47: a reconcile timeout is a per-Execution mechanical
+    /// failure — not a persistence-fatal recovery error, never a supervision
+    /// admission — and the returned handle hint is preserved.
+    #[test]
+    fn reconcile_timeout_is_unresolved_not_fatal_and_keeps_handle_hint() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        let hint = json!({"thread_id": 21});
+        fake.set_next_reconcile_error(
+            agentype_adapter_api::AdapterError::deadline_exceeded(
+                "reconcile exceeded operation budget",
+            )
+            .with_handle_hint(RuntimeHandle(hint.clone())),
+        );
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("rec-timeout", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Unresolved { failure_class } => {
+                assert_eq!(failure_class, FailureClass::Timeout);
+            }
+            other => panic!("expected Unresolved(Timeout), got {other:?}"),
+        }
+        assert_eq!(svc.active_count(), 0);
+        assert_eq!(
+            kernel.execution(launch.execution_id()).unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert_eq!(
+            kernel
+                .execution_runtime_handle(launch.execution_id())
+                .unwrap(),
+            hint,
+            "reconcile handle hint must be persisted"
+        );
+
+        // The whole recovery barrier still completes: an ordinary adapter
+        // timeout cannot leave startup RECOVERING forever (M5.4 P1 closure).
+        let recovered =
+            recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
+        assert_eq!(recovered.runner().active_count(), 0);
+    }
+
+    /// M5.6 §48 #48: a reconcile timeout under stale authority mutates
+    /// physical history only.
+    #[test]
+    fn stale_reconcile_timeout_is_physical_history_only() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let advancing = Arc::new(ClockAdvancingAdapter {
+            inner: FakeAdapter::new(),
+            clock: clock.clone(),
+            advance: 20.0,
+        });
+        let hint = json!({"thread_id": 22});
+        advancing.inner.set_next_reconcile_error(
+            agentype_adapter_api::AdapterError::deadline_exceeded(
+                "reconcile budget exhausted while authority expired",
+            )
+            .with_handle_hint(RuntimeHandle(hint.clone())),
+        );
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register("process", advancing, crate::deadlines::test_deadlines())
+            .unwrap();
+
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("stale-rec-to", json!({"o": 1})));
+        clock.advance(20.0);
+        kernel.expire_leases(true).unwrap();
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        assert!(!snap.current_authority_hint().structurally_current());
+
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::PhysicalHistoryOnly => {}
+            other => panic!("expected PhysicalHistoryOnly, got {other:?}"),
+        }
+        assert_eq!(svc.active_count(), 0);
+        assert_eq!(
+            kernel
+                .execution_runtime_handle(launch.execution_id())
+                .unwrap(),
+            hint,
+            "locator evidence survives stale authority"
+        );
+    }
+
+    /// M5.6 §48 #49: a reconcile timeout on a current unisolated writer
+    /// follows suspension safety — never a silent retry.
+    #[test]
+    fn unisolated_writer_reconcile_timeout_suspends() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile_error(agentype_adapter_api::AdapterError::deadline_exceeded(
+            "writer reconcile budget exhausted",
+        ));
+        let adapters = adapters(&fake);
+        let spec = TaskSpec::new("write-rec-to", json!({"o": 1}))
+            .write()
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                // TIMEOUT deliberately not retryable for this writer.
+                retry_classes: vec![FailureClass::ExecutionLost],
+                base_backoff_seconds: 1.0,
+                max_backoff_seconds: 8.0,
+            });
+        let (_claim, launch) = start_named(&kernel, spec);
+        let snap = snapshot_of(&kernel, launch.execution_id());
+
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Unresolved {
+                failure_class: FailureClass::Timeout,
+            } => {}
+            other => panic!("expected Unresolved(Timeout), got {other:?}"),
+        }
+        assert_eq!(
+            kernel.task(snap.task_id()).unwrap().state,
+            TaskState::Suspended
+        );
+    }
+
+    /// M5.6 §48 #50: after a terminal reconcile candidate, collect_outcome
+    /// receives its OWN new operation deadline — a distinct endpoint from
+    /// the reconcile call.
+    #[test]
+    fn terminal_candidate_collect_gets_its_own_deadline() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(json!({"done": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("term-dl", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::TaskCompleted { .. } => {}
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        }
+        let rec = fake
+            .deadline_for(agentype_adapter_api::AdapterOperation::ReconcileStart)
+            .expect("reconcile deadline");
+        let collect = fake
+            .deadline_for(agentype_adapter_api::AdapterOperation::CollectOutcome)
+            .expect("collect deadline");
+        assert_ne!(rec.expires_at(), collect.expires_at());
+        assert!(!collect.is_expired());
+    }
+
+    /// M5.6 §48 #51-53: a collect timeout produces no ACK, no Result, and
+    /// inherits neither the terminal nor the quiescence proof of the
+    /// terminal candidate that preceded it.
+    #[test]
+    fn collect_timeout_never_acks_or_inherits_terminal_proof() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(StartObservation {
+            state: ExecutionState::Succeeded,
+            runtime_handle: RuntimeHandle(json!({"claimed": true})),
+            ambiguous: false,
+            failure_class: None,
+            detail: None,
+            terminal_confirmed: true,
+            quiescent_confirmed: true,
+        });
+        fake.set_next_collect_error(agentype_adapter_api::AdapterError::deadline_exceeded(
+            "collect budget exhausted",
+        ));
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("collect-to", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Unresolved {
+                failure_class: FailureClass::Timeout,
+            } => {}
+            other => panic!("expected Unresolved(Timeout), got {other:?}"),
+        }
+        assert_ne!(
+            kernel.task(snap.task_id()).unwrap().state,
+            TaskState::Completed
+        );
+        assert!(kernel.result_for_task(snap.task_id()).is_err());
+        // The earlier terminal candidate's proof was NOT inherited.
+        let exec = kernel.execution(launch.execution_id()).unwrap();
+        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+    }
+
+    /// M5.6 §48 #54-55: recovery proceeds to later candidates after an
+    /// ordinary adapter timeout, and a conformant deadline failure cannot
+    /// leave the barrier permanently blocked.
+    #[test]
+    fn recovery_proceeds_after_adapter_timeouts() {
+        let (_clock, k) = env();
+        // A second partition so both leases can be held concurrently.
+        k.upsert_partition(&PartitionSpec::new(
+            "general-b",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+        k.reconcile_pool().unwrap();
+        let kernel = Arc::new(k);
+        let fake = Arc::new(FakeAdapter::new());
+        // Whichever execution reconciles first gets the timeout (one-shot);
+        // the later candidate still readmits with a RUNNING observation.
+        fake.set_next_reconcile_error(agentype_adapter_api::AdapterError::deadline_exceeded(
+            "first candidate reconcile budget exhausted",
+        ));
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let (_c1, l1) = start_named(&kernel, TaskSpec::new("cand-a", json!({"o": 1})));
+        let (_c2, l2) = start_named(
+            &kernel,
+            TaskSpec::new("cand-b", json!({"o": 1})).partition("general-b"),
+        );
+
+        let recovered = recover_runtime_without_notifier(kernel.clone(), &adapters, timing())
+            .expect("recovery completes despite adapter timeout");
+        // Exactly one candidate was readmitted (the non-timed-out one).
+        let readmitted = recovered.runner().contains(l1.execution_id()) as usize
+            + recovered.runner().contains(l2.execution_id()) as usize;
+        assert_eq!(readmitted, 1);
+        assert_eq!(fake.reconcile_call_count(), 2);
+    }
+
     /// #44/#45/#59: runner starts empty, successful readmission is supervised
     /// at READY, and `start_execution` is never called.
     #[test]
@@ -1717,7 +1991,13 @@ mod tests {
             advance: 20.0,
         });
         let mut adapters = AdapterRegistry::new();
-        adapters.register("process", advancing.clone()).unwrap();
+        adapters
+            .register(
+                "process",
+                advancing.clone(),
+                crate::deadlines::test_deadlines(),
+            )
+            .unwrap();
         let recovered =
             recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
         assert_eq!(recovered.runner().active_count(), 0);
@@ -1892,39 +2172,52 @@ mod tests {
         fn start_execution(
             &self,
             request: &agentype_adapter_api::ExecutionRequest,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
-            self.inner.start_execution(request)
+            self.inner.start_execution(request, deadline)
         }
 
-        fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
-            self.inner.observe_execution(handle)
+        fn observe_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.inner.observe_execution(handle, deadline)
         }
 
         fn interrupt_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.interrupt_execution(handle)
+            self.inner.interrupt_execution(handle, deadline)
         }
 
         fn terminate_execution(
             &self,
             handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<ExecutionObservation> {
-            self.inner.terminate_execution(handle)
+            self.inner.terminate_execution(handle, deadline)
         }
 
-        fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
-            self.inner.collect_outcome(handle)
+        fn collect_outcome(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> AdapterResult<ExecutionOutcome> {
+            self.inner.collect_outcome(handle, deadline)
         }
 
         fn reconcile_start(
             &self,
             request_id: &agentype_core::RequestId,
             persisted_handle: Option<&RuntimeHandle>,
+            deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
             self.clock.advance(self.advance);
-            self.inner.reconcile_start(request_id, persisted_handle)
+            self.inner
+                .reconcile_start(request_id, persisted_handle, deadline)
         }
     }
 }

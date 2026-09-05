@@ -13,11 +13,18 @@ use agentype_core::{ExecutionState, FailureClass};
 /// classification belongs inside adapter implementations; no provider strings
 /// are parsed at the runtime or core layer.
 pub fn adapter_invocation_failure_class(err: &AdapterError) -> FailureClass {
-    match err {
-        AdapterError::Unavailable(_) => FailureClass::ResourceUnavailable,
-        AdapterError::DeadlineExceeded(_) => FailureClass::Timeout,
-        AdapterError::Protocol(_) => FailureClass::AdapterProtocolFailure,
-        AdapterError::Other(_) => FailureClass::StartFailure,
+    match err.kind() {
+        agentype_adapter_api::AdapterErrorKind::Unavailable => FailureClass::ResourceUnavailable,
+        agentype_adapter_api::AdapterErrorKind::DeadlineExceeded => FailureClass::Timeout,
+        agentype_adapter_api::AdapterErrorKind::Protocol => FailureClass::AdapterProtocolFailure,
+        agentype_adapter_api::AdapterErrorKind::Other => FailureClass::Unknown,
+    }
+}
+
+fn mechanical_failure_class(class: Option<FailureClass>) -> Option<FailureClass> {
+    match class {
+        Some(c) if !c.is_mechanical() => Some(FailureClass::AdapterProtocolFailure),
+        other => other,
     }
 }
 
@@ -57,6 +64,16 @@ pub enum CollectedOutcomeKind {
 /// dispatcher (contradictory RUNNING, then exact RUNNING, then
 /// ambiguous/unresolved, then terminal-looking, then catch-all).
 pub fn normalize_start_observation(observation: &StartObservation) -> StartObservationKind {
+    if mechanical_failure_class(observation.failure_class)
+        == Some(FailureClass::AdapterProtocolFailure)
+        && observation
+            .failure_class
+            .is_some_and(|c| !c.is_mechanical())
+    {
+        return StartObservationKind::Unresolved {
+            failure_class: FailureClass::AdapterProtocolFailure,
+        };
+    }
     // An ACTIVE state carrying end-of-execution claims is internally
     // contradictory; fail closed as unresolved so no grant can be minted.
     if observation.state == ExecutionState::Running
@@ -95,6 +112,11 @@ pub fn normalize_start_observation(observation: &StartObservation) -> StartObser
 /// quiescence-without-terminality, then terminal success/failure, then
 /// nonterminal catch-all).
 pub fn normalize_collected_outcome(outcome: &ExecutionOutcome) -> CollectedOutcomeKind {
+    if outcome.failure_class.is_some_and(|c| !c.is_mechanical()) {
+        return CollectedOutcomeKind::Unresolved {
+            failure_class: FailureClass::AdapterProtocolFailure,
+        };
+    }
     if outcome.terminal_confirmed && outcome.state.is_active_physical() {
         return CollectedOutcomeKind::Unresolved {
             failure_class: FailureClass::AdapterProtocolFailure,
@@ -315,20 +337,65 @@ mod tests {
     #[test]
     fn adapter_error_taxonomy() {
         assert_eq!(
-            adapter_invocation_failure_class(&AdapterError::Unavailable("x".into())),
+            adapter_invocation_failure_class(&AdapterError::unavailable("x")),
             FailureClass::ResourceUnavailable
         );
         assert_eq!(
-            adapter_invocation_failure_class(&AdapterError::DeadlineExceeded("x".into())),
+            adapter_invocation_failure_class(&AdapterError::deadline_exceeded("x")),
             FailureClass::Timeout
         );
         assert_eq!(
-            adapter_invocation_failure_class(&AdapterError::Protocol("x".into())),
+            adapter_invocation_failure_class(&AdapterError::protocol("x")),
             FailureClass::AdapterProtocolFailure
         );
         assert_eq!(
-            adapter_invocation_failure_class(&AdapterError::Other("x".into())),
-            FailureClass::StartFailure
+            adapter_invocation_failure_class(&AdapterError::other("x")),
+            FailureClass::Unknown
+        );
+    }
+
+    /// M5.6 §27/#26-27: a generic invocation error is UNKNOWN, never
+    /// START_FAILURE; START_FAILURE remains reserved for positively
+    /// collected terminal failure without an explicit class.
+    #[test]
+    fn invocation_other_is_unknown_and_start_failure_needs_positive_proof() {
+        let class = adapter_invocation_failure_class(&AdapterError::other("opaque failure"));
+        assert_eq!(class, FailureClass::Unknown);
+        assert_ne!(class, FailureClass::StartFailure);
+        // A proven terminal collection without an explicit class may still
+        // produce START_FAILURE — only physical/protocol evidence earns it.
+        assert_eq!(
+            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true, None)),
+            CollectedOutcomeKind::TerminalFailure {
+                failure_class: FailureClass::StartFailure
+            }
+        );
+    }
+
+    /// M5.6 §25/#29: `WRITER_QUIESCENCE_UNKNOWN` is Scheduler-derived. An
+    /// adapter supplying it in a start observation or collected outcome is
+    /// rejected as an adapter protocol failure — writer-safety escalation
+    /// stays exclusively Scheduler policy.
+    #[test]
+    fn scheduler_derived_quiescence_class_is_rejected_as_protocol_failure() {
+        let mut obs = start(ExecutionState::Failed, false, true, true);
+        obs.failure_class = Some(FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            normalize_start_observation(&obs),
+            StartObservationKind::Unresolved {
+                failure_class: FailureClass::AdapterProtocolFailure
+            }
+        );
+        assert_eq!(
+            normalize_collected_outcome(&outcome(
+                ExecutionState::Failed,
+                true,
+                true,
+                Some(FailureClass::WriterQuiescenceUnknown)
+            )),
+            CollectedOutcomeKind::Unresolved {
+                failure_class: FailureClass::AdapterProtocolFailure
+            }
         );
     }
 }
