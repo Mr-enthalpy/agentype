@@ -21,7 +21,7 @@ use crate::observation::{
 };
 use crate::supervision::{SupervisionError, SupervisionRunner, SupervisionService};
 use crate::timing::RuntimeTimingConfig;
-use crate::{AdapterRegistry, ResolvedAdapterBinding, SupervisionAdmission};
+use crate::{AdapterBindingKey, AdapterRegistry, ResolvedAdapterBinding, SupervisionAdmission};
 
 /// Where a freshly minted admission is consumed. The live runner must be
 /// used when one is running (lifecycle gate + deadline wake-up); the
@@ -125,7 +125,6 @@ pub enum ReconcileExecutionOutcome {
         failure_class: FailureClass,
     },
 }
-
 /// Category A: replay a persisted terminal *authority* consequence.
 ///
 /// Physical terminal evidence (`SUCCEEDED`/`FAILED`/`TERMINATED` +
@@ -341,7 +340,11 @@ fn reconcile_active_physical(
     snapshot: &ExecutionReconciliationSnapshot,
     supervisor: &impl AdmissionSink,
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
-    let adapter = match adapters.resolve(snapshot.adapter_kind()) {
+    let key = match AdapterBindingKey::new(snapshot.adapter_binding_key()) {
+        Ok(key) => key,
+        Err(_) => return missing_adapter(kernel, snapshot),
+    };
+    let adapter = match adapters.resolve_exact(snapshot.adapter_kind(), &key) {
         Ok(adapter) => adapter,
         Err(_) => return missing_adapter(kernel, snapshot),
     };
@@ -809,7 +812,9 @@ mod tests {
     use crate::notifier::{NotifierBinding, NotifierConfig, NotifierRetryPolicy};
     use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
-    use crate::{AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
+    use crate::{
+        AdapterBindingKey, AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
+    };
     use agentype_adapter_api::{
         AdapterResult, ExecutionAdapter, ExecutionObservation, ExecutionOutcome, FakeAdapter,
         RuntimeHandle, StartObservation,
@@ -883,6 +888,7 @@ mod tests {
                 execution_profile: claim.execution_profile.clone(),
             }),
             "process",
+            AdapterBindingKey::for_tests(),
         )
         .unwrap()
     }
@@ -915,7 +921,7 @@ mod tests {
     fn adapters(fake: &Arc<FakeAdapter>) -> AdapterRegistry {
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         adapters
     }
@@ -925,13 +931,11 @@ mod tests {
             state: ExecutionState::Running,
             runtime_handle: RuntimeHandle(json!({"reconciled": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
         }
     }
-
     /// #38/#42: crash after physical SUCCEEDED is durable, before ACK,
     /// replays into exactly one Result while authority is current.
     #[test]
@@ -1437,7 +1441,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"done": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -1446,7 +1449,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             payload: Some(json!({"ok": true})),
             summary: Some("done".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -1564,7 +1566,7 @@ mod tests {
         );
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
 
         let (_claim, launch) = start_named(&kernel, TaskSpec::new("stale-rec-to", json!({"o": 1})));
@@ -1636,7 +1638,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"done": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -1672,7 +1673,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"claimed": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -1992,7 +1992,7 @@ mod tests {
         });
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 "process",
                 advancing.clone(),
                 crate::deadlines::test_deadlines(),

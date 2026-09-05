@@ -12,7 +12,9 @@ path = "src/bin/fake-agent.rs"
 [dependencies]
 agentype-adapter-api.workspace = true
 agentype-core.workspace = true
+agentype-execution-config.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-agentype-execution-config.workspace = true
+agentype-runtime.workspace = true
+agentype-storage-sqlite.workspace = true

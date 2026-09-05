@@ -18,6 +18,8 @@ dependencies = [
  "agentype-adapter-api",
  "agentype-core",
  "agentype-execution-config",
+ "agentype-runtime",
+ "agentype-storage-sqlite",
  "serde_json",
 ]
 

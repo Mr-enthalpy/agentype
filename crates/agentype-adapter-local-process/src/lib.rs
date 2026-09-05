@@ -12,14 +12,15 @@ use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterResult, ExecutionAdapter, ExecutionObservation,
     ExecutionOutcome, ExecutionRequest, RuntimeHandle, StartObservation,
 };
-use agentype_core::{ExecutionState, FailureClass, RequestId};
+use agentype_core::{ExecutionState, RequestId};
+use agentype_execution_config::AdapterBindingKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ struct LiveProcess {
 /// Spawn and control a user-configured local executable.
 pub struct LocalProcessAgentAdapter {
     live: Mutex<HashMap<u32, LiveProcess>>,
+    binding_key: AdapterBindingKey,
 }
 
 impl Default for LocalProcessAgentAdapter {
@@ -54,17 +56,64 @@ impl LocalProcessAgentAdapter {
     pub fn new() -> Self {
         Self {
             live: Mutex::new(HashMap::new()),
+            binding_key: capture_domain_key(),
         }
     }
+
+    pub fn binding_key(&self) -> &AdapterBindingKey {
+        &self.binding_key
+    }
+}
+
+fn capture_domain_key() -> AdapterBindingKey {
+    static DOMAIN: OnceLock<AdapterBindingKey> = OnceLock::new();
+    DOMAIN.get_or_init(compute_domain_key).clone()
+}
+
+fn compute_domain_key() -> AdapterBindingKey {
+    #[cfg(target_os = "linux")]
+    {
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+        let raw = format!("linux:{}", boot.trim());
+        AdapterBindingKey::new(raw)
+            .unwrap_or_else(|_| AdapterBindingKey::new("linux:unknown-boot").expect("static key"))
+    }
+    #[cfg(windows)]
+    {
+        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
+        let boot = windows_boot_token();
+        AdapterBindingKey::new(format!("win:{host}:{boot}"))
+            .unwrap_or_else(|_| AdapterBindingKey::new("win:unknown").expect("static key"))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        AdapterBindingKey::new("unsupported-os").expect("static key")
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_boot_token() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let uptime = unsafe { GetTickCount64() };
+    now_ms.saturating_sub(uptime)
 }
 
 impl Drop for LocalProcessAgentAdapter {
     fn drop(&mut self) {
-        // Dropping adapter ownership is not terminate_execution. Child::drop
-        // waits, so the live Child is forgotten: the OS process continues.
+        // Dropping adapter ownership is not terminate_execution.
+        // `Child` has no Drop (does not wait or kill). Reap already-dead
+        // children with WNOHANG; leave running processes alive.
         if let Ok(mut live) = self.live.lock() {
-            for (_, proc) in live.drain() {
-                std::mem::forget(proc.child);
+            for (_, mut proc) in live.drain() {
+                let _ = proc.child.try_wait();
             }
         }
     }
@@ -462,8 +511,11 @@ fn kill_pid(pid: u32) {
 fn interrupt_pid(pid: u32) -> AdapterResult<()> {
     #[cfg(unix)]
     {
-        let _ = signal_pid_unix(pid, 2);
-        Ok(())
+        match signal_pid_unix_result(pid, 2) {
+            Ok(()) => Ok(()),
+            Err(esrch) if esrch => Ok(()), // gone: observe will report UNKNOWN
+            Err(_) => Err(AdapterError::unavailable("interrupt SIGINT not delivered")),
+        }
     }
     #[cfg(windows)]
     {
@@ -527,33 +579,73 @@ fn interrupt_pid_windows(pid: u32) -> AdapterResult<()> {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn signal_pid_unix(pid: u32, sig: i32) -> bool {
+    signal_pid_unix_result(pid, sig).is_ok()
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn signal_pid_unix_result(pid: u32, sig: i32) -> Result<(), bool> {
+    const ESRCH: i32 = 3;
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     let Ok(raw) = i32::try_from(pid) else {
-        return false;
+        return Err(false);
     };
-    unsafe { kill(raw, sig) == 0 }
+    unsafe {
+        if kill(raw, sig) == 0 {
+            Ok(())
+        } else {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            Err(errno == ESRCH)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn reap_pid(pid: u32) {
+    const WNOHANG: i32 = 1;
+    extern "C" {
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    unsafe {
+        let _ = waitpid(raw, std::ptr::null_mut(), WNOHANG);
+    }
 }
 
 fn process_birth(pid: u32) -> Option<u64> {
+    process_stat(pid).map(|(_, birth)| birth)
+}
+
+fn instance_alive(pid: u32, birth: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        reap_pid(pid);
+    }
+    match process_stat(pid) {
+        Some((state, found)) => !matches!(state, 'Z' | 'X' | 'x') && found == birth,
+        None => false,
+    }
+}
+
+fn process_stat(pid: u32) -> Option<(char, u64)> {
     #[cfg(windows)]
     {
-        process_birth_windows(pid)
+        process_birth_windows(pid).map(|b| ('R', b))
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        process_birth_unix(pid)
+        process_stat_linux(pid)
     }
-    #[cfg(not(any(windows, unix)))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = pid;
         None
     }
-}
-
-fn instance_alive(pid: u32, birth: u64) -> bool {
-    process_birth(pid) == Some(birth)
 }
 
 #[cfg(windows)]
@@ -598,22 +690,41 @@ fn process_birth_windows(pid: u32) -> Option<u64> {
     }
 }
 
-#[cfg(unix)]
-fn process_birth_unix(pid: u32) -> Option<u64> {
+#[cfg(target_os = "linux")]
+fn process_stat_linux(pid: u32) -> Option<(char, u64)> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_starttime(&text)
+    parse_stat_identity(&text)
 }
 
-#[cfg(any(unix, test))]
-fn parse_stat_starttime(stat: &str) -> Option<u64> {
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_identity(stat: &str) -> Option<(char, u64)> {
     let close = stat.rfind(')')?;
-    let rest = stat.get(close + 1..)?;
-    rest.split_whitespace().nth(19)?.parse().ok()
+    let rest = stat.get(close + 1..)?.trim_start();
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let starttime = fields.nth(18)?.parse().ok()?;
+    Some((state, starttime))
 }
 
-fn spawn_child(spec: &ProcessSpec, stdout_path: &Path, stderr_path: &Path) -> AdapterResult<Child> {
+fn spawn_child(
+    spec: &ProcessSpec,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<Child> {
+    require_deadline(
+        deadline,
+        "start deadline exhausted before stdout file",
+        None,
+    )?;
     let stdout = File::create(stdout_path).map_err(|_| diagnostic("cannot create stdout file"))?;
+    require_deadline(
+        deadline,
+        "start deadline exhausted before stderr file",
+        None,
+    )?;
     let stderr = File::create(stderr_path).map_err(|_| diagnostic("cannot create stderr file"))?;
+    require_deadline(deadline, "start deadline exhausted before spawn", None)?;
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args)
         .stdin(Stdio::piped())
@@ -677,40 +788,26 @@ fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
         .get("summary")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if obj.contains_key("failure_class") {
+        return Err(AdapterError::protocol(
+            "adapter outcome must not include Scheduler failure_class",
+        ));
+    }
     if ok {
         let payload = obj.get("payload").cloned();
         return Ok(ExecutionOutcome {
             state: ExecutionState::Succeeded,
             payload,
             summary,
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: false,
             incarnation_reusable: false,
         });
     }
-    let failure_class = match obj.get("failure_class") {
-        None | Some(Value::Null) => FailureClass::StartFailure,
-        Some(Value::String(s)) => match FailureClass::parse_sql(s) {
-            Ok(c) if c.is_mechanical() => c,
-            Ok(_) => {
-                return Err(AdapterError::protocol(
-                    "scheduler-derived failure_class is not adapter-authored",
-                ));
-            }
-            Err(_) => {
-                return Err(AdapterError::protocol("unknown failure_class"));
-            }
-        },
-        Some(_) => {
-            return Err(AdapterError::protocol("failure_class must be a string"));
-        }
-    };
     Ok(ExecutionOutcome {
         state: ExecutionState::Failed,
         payload: None,
         summary,
-        failure_class: Some(failure_class),
         terminal_confirmed: true,
         quiescent_confirmed: false,
         incarnation_reusable: false,
@@ -759,7 +856,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let stdout_path = exec_dir.join("stdout.txt");
         let stderr_path = exec_dir.join("stderr.txt");
         require_deadline(deadline, "start deadline exhausted before spawn", None)?;
-        let mut child = spawn_child(&spec, &stdout_path, &stderr_path)?;
+        let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
         let birth = match process_birth(pid) {
             Some(b) => b,
@@ -790,8 +887,8 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 return Err(AdapterError::other("child stdin missing").with_handle_hint(handle));
             }
         };
-        let prompt = request.prompt().as_bytes().to_vec();
-        if let Err(err) = write_stdin_deadline(stdin, &prompt, deadline) {
+        let input = serde_json::to_vec(request.payload()).unwrap_or_else(|_| b"{}".to_vec());
+        if let Err(err) = write_stdin_deadline(stdin, &input, deadline) {
             kill_child(&mut child);
             let _ = child.try_wait();
             return Err(err.with_handle_hint(handle));
@@ -815,7 +912,6 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     state: ExecutionState::Unknown,
                     runtime_handle: handle,
                     ambiguous: true,
-                    failure_class: None,
                     detail: Some("process exited during start; collect for outcome".into()),
                     terminal_confirmed: false,
                     quiescent_confirmed: false,
@@ -835,7 +931,6 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     state: ExecutionState::Running,
                     runtime_handle: handle,
                     ambiguous: false,
-                    failure_class: None,
                     detail: None,
                     terminal_confirmed: false,
                     quiescent_confirmed: false,
@@ -935,7 +1030,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 )?;
                 return Ok(terminated_observation());
             }
-            std::mem::forget(proc.child);
+            let _ = proc.child.try_wait();
             return Err(deadline_exceeded_hint(
                 "terminate wait exhausted; kill sent is not quiescence",
                 handle.clone(),
@@ -1023,7 +1118,6 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 state: ExecutionState::Unknown,
                 runtime_handle: RuntimeHandle::default(),
                 ambiguous: true,
-                failure_class: None,
                 detail: Some("no persisted handle; identity is request_id only".into()),
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
@@ -1032,15 +1126,9 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let parsed = match parse_handle(handle) {
             Ok(p) => p,
             Err(err) => {
-                return Ok(StartObservation {
-                    state: ExecutionState::Unknown,
-                    runtime_handle: handle.clone(),
-                    ambiguous: true,
-                    failure_class: Some(FailureClass::AdapterProtocolFailure),
-                    detail: err.diagnostic().map(str::to_string),
-                    terminal_confirmed: false,
-                    quiescent_confirmed: false,
-                });
+                return Err(AdapterError::protocol(
+                    err.diagnostic().unwrap_or("invalid persisted handle"),
+                ));
             }
         };
         if parsed.request_id != request_id.as_str() {
@@ -1084,7 +1172,6 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             },
             runtime_handle: handle.clone(),
             ambiguous: !alive,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
@@ -1197,10 +1284,9 @@ mod tests {
     }
 
     #[test]
-    fn omitted_failure_class_defaults_to_start_failure() {
+    fn omitted_failure_class_is_failed_without_scheduler_class() {
         let out = parse_outcome_json(r#"{"ok":false,"summary":"nope"}"#).unwrap();
         assert_eq!(out.state, ExecutionState::Failed);
-        assert_eq!(out.failure_class, Some(FailureClass::StartFailure));
         assert!(!out.quiescent_confirmed);
     }
 
@@ -1225,6 +1311,13 @@ mod tests {
     #[test]
     fn proc_stat_starttime_is_field_22() {
         let line = "1234 (fake-agent) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99999 0";
-        assert_eq!(parse_stat_starttime(line), Some(99999));
+        assert_eq!(parse_stat_identity(line), Some(('S', 99999)));
+    }
+
+    #[test]
+    fn proc_stat_zombie_is_not_alive() {
+        let line = "1234 (fake-agent) Z 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99999 0";
+        assert_eq!(parse_stat_identity(line), Some(('Z', 99999)));
+        assert!(matches!(parse_stat_identity(line), Some(('Z', _))));
     }
 }

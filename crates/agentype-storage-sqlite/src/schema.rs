@@ -2,11 +2,11 @@
 //! an in-place Python V0.1 upgrade.
 
 /// Schema version 2 added `executions.adapter_kind`. Version 3 adds the
-/// lossless pending-terminal envelope (`summary`, `incarnation_reusable`)
-/// so crash-before-ACK/NACK can replay the same authority inputs as the
-/// live path (M5.4 P1). Older files are rejected at open (fail closed);
-/// D-DB-MIGRATE is still unresolved.
-pub const SCHEMA_VERSION: i64 = 3;
+/// lossless pending-terminal envelope (`summary`, `incarnation_reusable`).
+/// Version 4 adds `executions.adapter_binding_key` (opaque domain identity
+/// frozen at Execution creation). Older files are rejected at open (fail
+/// closed); D-DB-MIGRATE is still unresolved.
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS executions (
     execution_target TEXT NOT NULL,
     execution_profile TEXT NOT NULL,
     adapter_kind TEXT NOT NULL,
+    adapter_binding_key TEXT NOT NULL,
     attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',

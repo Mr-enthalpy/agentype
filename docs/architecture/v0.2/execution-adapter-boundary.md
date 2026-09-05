@@ -58,13 +58,11 @@ M5.7 MUST NOT implement, and an Execution Adapter MUST NOT own:
 - Memory / checkpoint compression
 - Transform, Move, Merge
 - Provider routing and credential management
-- Prompt orchestration (the worker protocol is derived by
-  `RenderedWorkerPrompt` from the launch snapshot; the adapter only
-  transports it)
+- Prompt orchestration as a generic adapter requirement
+  (`RenderedWorkerPrompt` is an optional V0.1 compatibility renderer)
 - Transcript database, dashboard, conversation UI
 - Codex CLI / OpenCode runtime integration
 - Steady-state observer loop, watchdog thread, process lock
-- Schema bump, `adapter_binding_key` column
 - RootBridge `last_error` sanitization
 
 Optional ergonomics (transcript viewer, terminal attach, debug) MAY exist
@@ -153,10 +151,10 @@ PID reuse is not identity. RUNNING after restart requires `pid` **and**
 creation FILETIME). Missing `birth` or `request_id` is Protocol, not a
 wildcard. Birth mismatch is UNKNOWN, never positive re-admission.
 
-`adapter_kind = local_process` uniquely identifies this host's process table
-as spawned by this runtime. Multi-host or multi-installation domains (future
-Codex) still need an opaque `adapter_binding_key` frozen at Execution
-creation (BLOCKS_REAL_ADAPTER_PARITY; not added in M5.7, no schema bump).
+`adapter_kind` is the driver family (`local_process`). The opaque
+`adapter_binding_key` (schema v4) is the concrete domain (host/boot/
+process-namespace fingerprint), frozen at Execution creation. Recovery
+resolves `(kind, key)` with no fallback. Core does not interpret the key.
 
 ---
 
@@ -236,6 +234,10 @@ The reference adapter:
 - on terminate wait exhaustion, `DeadlineExceeded` with hint
   ("kill sent is not quiescence").
 
+Absolute deadlines cover adapter-controlled user-space waits and staged
+syscalls. An uninterruptible kernel/filesystem/hardware call is outside
+the in-process software liveness guarantee. There is no watchdog thread.
+
 ---
 
 ## 9. Reference adapter design
@@ -251,18 +253,19 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 
 | Operation | Mechanics |
 | --- | --- |
-| start | spawn + same-thread bounded stdin write of the Scheduler worker protocol + one `try_wait`. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. Does not wait the remaining budget for agent completion. Uncommitted start failure may kill that child. |
-| observe | live `Child` with matching `birth`, else `pid+birth` instance liveness. Alive → RUNNING; mismatch/dead → UNKNOWN. Never SUCCEEDED. |
-| interrupt | Unix `SIGINT` / Windows `CTRL_BREAK` attempt, then observe. Not Task cancellation. Delivery failure is `Unavailable`, not a silent observe. |
-| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. Birth mismatch does not kill a different instance. |
-| collect | wait remaining for exit, bounded stdout read, parse JSON `{ok, payload, summary, failure_class}`. Process death is not quiescence. |
-| reconcile | reconnect persisted handle + `request_id` + `birth`. No handle → ambiguous UNKNOWN, not a new start. |
+| start | spawn (deadline-staged) + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. Uncommitted start failure may kill that child. |
+| observe | live `Child` with matching `birth`, else `pid+birth` and non-zombie state. Alive → RUNNING; mismatch/dead/zombie → UNKNOWN. Never SUCCEEDED. |
+| interrupt | Unix `SIGINT` (ESRCH → observe; other errno → Unavailable) / Windows `CTRL_BREAK`. Not Task cancellation. |
+| terminate | `kill` (live `Child` or pid-level) + wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false`. |
+| collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). |
+| reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. No handle → ambiguous UNKNOWN. |
 
 Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via
-`GetProcessTimes`. Linux birth via `/proc/<pid>/stat` starttime.
-Dropping the adapter **forgets** live `Child` objects (does not wait,
-does not kill). Committed executions outlive adapter ownership;
-only `terminate_execution` or daemon shutdown policy may kill them.
+`GetProcessTimes`. Linux: `/proc/<pid>/stat` starttime **and** state
+(`Z`/`X` are not alive); `waitpid(WNOHANG)` while still parent.
+Drop reaps already-dead children and leaves running processes alive
+(`Child` is dropped, not killed, not forgotten). Committed executions
+outlive adapter ownership.
 
 ---
 
@@ -283,5 +286,6 @@ It SHOULD NOT land until this local-process adapter remains replaceable
 without Core changes. If Codex integration forces Scheduler to learn
 session semantics, the boundary is wrong — fix the adapter, not Core.
 
-`adapter_binding_key` remains hung for the case where `adapter_kind`
-(`codex`) can name different hosts or installations.
+A future Codex installation is another `adapter_binding_key`, not a Core
+enum. `adapter_kind` stays `codex` (or similar); the key names the host
+and installation.

@@ -40,24 +40,26 @@ DeepSeek, not an ArchitectureAgent.
 | Slice | What |
 | --- | --- |
 | A | crate `agentype-adapter-local-process`, workspace member, `fake-agent` bin, `target_options.{command,args,cwd,env}` |
-| B | `start_execution`: spawn, bounded stdin write of `RenderedWorkerPrompt`, opaque handle, partial locator on stdin timeout |
-| C | `observe_execution` / `interrupt_execution` / `terminate_execution` |
-| D | `collect_outcome` (stdout JSON; never quiescence) |
-| E | `reconcile_start` by `request_id` + persisted handle; no handle → ambiguous UNKNOWN |
-| F/G | blocked I/O + sanitization tests (M5.6 §51) |
+| B | `start_execution`: staged spawn, same-thread stdin of opaque payload JSON, handle with pid+birth |
+| C | observe / interrupt (real SIGINT/CTRL_BREAK) / terminate (pid-level after Drop) |
+| D | `collect_outcome`: bounded stdout `{ok,payload,summary}` — no Scheduler `failure_class` |
+| E | `reconcile_start` by `request_id` + handle; protocol errors are `AdapterError` |
+| F | `adapter_binding_key` frozen at Execution creation (SCHEMA_VERSION 4) |
+| G | Dispatcher/Recovery integration through a real `fake-agent` process |
 | H | this report + architecture document |
 
-No Core type named `ExecutionSpec` was added. `ExecutionRequest` is already
-the physical creation request. No schema bump. No `adapter_binding_key`
-column. No runtime/composition-root wiring (M5.8). No observer, watchdog,
-Codex, or RootBridge change.
+No Core `ExecutionSpec`. `ExecutionRequest` no longer carries a generic
+prompt. `StartObservation` / `ExecutionOutcome` no longer carry
+`FailureClass` (Runtime classifies). No observer, watchdog, Codex, or
+RootBridge change. M5.8 composition root is still later.
 
 ---
 
 ## 3. Reference adapter
 
-`adapter_kind = local_process` names this host's process table. The
-executable is user configuration, not a Scheduler concern.
+`adapter_kind = local_process` is the driver family. The opaque
+`adapter_binding_key` (Linux boot_id / Windows host+boot, process-local
+`OnceLock`) is the concrete domain. The executable is user configuration.
 
 Handle:
 
@@ -76,12 +78,12 @@ SUCCEEDED.
 
 `quiescent_confirmed` is always false. Process death is UNKNOWN on
 observe, never SUCCEEDED. Kill-sent is not quiescence.
-`WRITER_QUIESCENCE_UNKNOWN` or unknown `failure_class` in agent JSON is
-`AdapterError::Protocol`, not laundered `START_FAILURE`.
+Any `failure_class` key in agent JSON is `AdapterError::Protocol`.
+Terminal `ok:false` is Failed; Runtime maps it to `StartFailure`.
 
-Stdin write is nonblocking/PIPE_NOWAIT on the calling thread. There is
-no helper-thread watchdog. Drop forgets live `Child` objects: it does
-not kill committed executions.
+Stdin is opaque payload JSON on the calling thread (PIPE_NOWAIT /
+O_NONBLOCK). Drop reaps zombies with `try_wait` and leaves running
+children alive. Linux treats `/proc` state `Z`/`X` as not alive.
 
 `FAKE_AGENT_*` is passed per child through `target_options.env`. Tests
 never call process-wide `set_var`.
@@ -128,18 +130,15 @@ Boundary extras: opaque `target_options` keys are not Core fields; worker prompt
 
 AgentType, SpawnSource, Memory, Transform, provider routing, credentials,
 prompt management, transcript DB, dashboard, Codex/OpenCode adapter,
-observer loop, watchdog, process lock, schema bump, `adapter_binding_key`
-column, RootBridge `last_error` sanitization.
+observer loop, watchdog, process lock, RootBridge `last_error`
+sanitization.
 
 ---
 
 ## 7. Hung P1s (must not be lost)
 
-- **adapter_binding_key** — BLOCKS_REAL_ADAPTER_PARITY. M5.7 documents that
-  `local_process` is unique for this host's process table, so the column is
-  not added. Multi-host / multi-install Codex still needs an opaque
-  provider-neutral key frozen at Execution creation. Core must not interpret
-  it.
+- **adapter_binding_key** — closed (schema v4). Core does not interpret it.
+  Future Codex installations are additional keys.
 - **last_error sanitization** — BLOCKS_REAL_ROOT_BRIDGE (M5.5). Not M5.7.
 - **M5.8** — composition root must mechanically run process lock →
   RECOVERING → `RecoveredRuntime` → enable Dispatcher → READY; one
@@ -170,12 +169,11 @@ column, RootBridge `last_error` sanitization.
 
 Closed in-milestone, not deferred to M5.8:
 
-- P1-1 detached stdin helper thread removed
-- P1-2 `pid+birth` instance identity; empty `request_id` is Protocol
-- P1-3 deadline recheck before positive evidence; bounded stdout
-- P1-4 illegal/nonmechanical `failure_class` → Protocol
-- P1-5 Drop forgets, does not kill; terminate by pid after Drop
-- interrupt attempts a physical signal or returns Unavailable
+- Linux zombie/reap: no `mem::forget`; `Z` is not RUNNING; `waitpid(WNOHANG)`
+- `adapter_binding_key` schema v4; `resolve_exact(kind, key)`
+- Generic prompt and adapter-authored `FailureClass` removed from DTOs
+- Staged spawn deadline; honest kernel-syscall caveat
+- Dispatcher/Recovery path through real `fake-agent`
 
 ## 9. Future Codex strategy
 

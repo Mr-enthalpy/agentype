@@ -10,8 +10,8 @@ use agentype_adapter_api::{
 use agentype_adapter_local_process::{LocalProcessAgentAdapter, ADAPTER_KIND, MAX_STDOUT_BYTES};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, BatchId, CommittedContinuitySnapshot, ExecutionId,
-    ExecutionState, FailureClass, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId,
-    TaskId, WorkspaceMode,
+    ExecutionState, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId,
+    WorkspaceMode,
 };
 use agentype_execution_config::{
     ExecutionLaunchSnapshot, ExecutionProfileConfig, ExecutionRegistry, ExecutionResolutionMode,
@@ -432,14 +432,13 @@ fn collect_successful_outcome() {
 #[test]
 fn collect_failed_outcome_from_structured_json() {
     let adapter = LocalProcessAgentAdapter::new();
-    let stdout = r#"{"ok":false,"summary":"agent failed","failure_class":"START_FAILURE"}"#;
+    let stdout = r#"{"ok":false,"summary":"agent failed"}"#;
     let req = request(AgentSpec::default().env_pair("FAKE_AGENT_STDOUT", stdout));
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
     assert_eq!(out.state, ExecutionState::Failed);
-    assert_eq!(out.failure_class, Some(FailureClass::StartFailure));
     assert_eq!(out.summary.as_deref(), Some("agent failed"));
     assert!(out.terminal_confirmed);
     assert!(!out.quiescent_confirmed);
@@ -550,11 +549,14 @@ fn model_and_api_key_options_are_opaque_and_not_leaked() {
 }
 
 #[test]
-fn request_prompt_is_scheduler_protocol_not_caller_text() {
+fn request_payload_is_opaque_not_scheduler_protocol() {
     let req = request(AgentSpec::default());
-    assert!(req.prompt().starts_with("LOCAL AGENT SCHEDULER TASK"));
-    assert!(!req.prompt().contains("deepseek"));
-    assert!(!req.prompt().contains(SECRET));
+    assert_eq!(req.payload(), &json!({"k": "v"}));
+    let dump = format!("{:?}", req);
+    assert!(
+        !dump.contains("LOCAL AGENT SCHEDULER TASK"),
+        "generic request must not carry the V0.1 worker protocol"
+    );
 }
 
 #[test]

@@ -21,6 +21,7 @@ agentype-execution-config = { path = "crates/agentype-execution-config" }
 agentype-adapter-api = { path = "crates/agentype-adapter-api" }
 agentype-adapter-local-process = { path = "crates/agentype-adapter-local-process" }
 agentype-root-bridge = { path = "crates/agentype-root-bridge" }
+agentype-runtime = { path = "crates/agentype-runtime" }
 agentype-storage-sqlite = { path = "crates/agentype-storage-sqlite" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"

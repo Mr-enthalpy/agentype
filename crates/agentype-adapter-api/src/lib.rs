@@ -11,9 +11,8 @@ mod deadline;
 pub use deadline::{AdapterDeadline, AdapterOperation, DeadlineConfigError};
 
 use agentype_core::{
-    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, FailureClass,
-    IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
-    WorkstreamId,
+    AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, IncarnationId,
+    LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode, WorkstreamId,
 };
 use agentype_execution_config::{ExecutionLaunchSnapshot, ResolvedExecutionEnvironment};
 use serde_json::Value;
@@ -293,7 +292,6 @@ pub struct ExecutionRequest {
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
-    prompt: String,
     payload: Value,
     acceptance: Value,
     workstream_id: Option<WorkstreamId>,
@@ -312,9 +310,9 @@ impl ExecutionRequest {
     /// snapshot; physical runtime configuration comes exclusively from the
     /// resolved environment (which can only be produced by authoritative
     /// configuration resolution — its fields are private, so callers cannot
-    /// inject fabricated options). The worker prompt is deterministically
-    /// derived from the snapshot as the provider-neutral V0.1 worker protocol
-    /// (see `RenderedWorkerPrompt`).
+    /// inject fabricated options). A V0.1 text protocol MAY be derived from
+    /// the snapshot via `RenderedWorkerPrompt` as an optional compatibility
+    /// renderer; it is not a field of this generic adapter request.
     ///
     /// Fail-closed pairing: the snapshot and the environment must describe
     /// the same attempt identity (attempt_id, lease_epoch, execution_target,
@@ -364,7 +362,6 @@ impl ExecutionRequest {
             execution_target: launch.execution_target().to_string(),
             execution_profile: launch.execution_profile().to_string(),
             workspace_mode: launch.workspace_mode(),
-            prompt: RenderedWorkerPrompt::from_launch(launch).protocol,
             payload: launch.payload().clone(),
             acceptance: launch.acceptance().clone(),
             workstream_id: launch.workstream_id().cloned(),
@@ -428,12 +425,6 @@ impl ExecutionRequest {
         self.workspace_mode
     }
 
-    /// Deterministically derived worker protocol (V0.1 task protocol), never
-    /// the Task name and never caller-supplied text.
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
-
     pub fn payload(&self) -> &Value {
         &self.payload
     }
@@ -485,7 +476,6 @@ pub struct StartObservation {
     pub state: ExecutionState,
     pub runtime_handle: RuntimeHandle,
     pub ambiguous: bool,
-    pub failure_class: Option<FailureClass>,
     pub detail: Option<String>,
     pub terminal_confirmed: bool,
     pub quiescent_confirmed: bool,
@@ -504,7 +494,6 @@ pub struct ExecutionOutcome {
     pub state: ExecutionState,
     pub payload: Option<Value>,
     pub summary: Option<String>,
-    pub failure_class: Option<FailureClass>,
     pub terminal_confirmed: bool,
     pub quiescent_confirmed: bool,
     pub incarnation_reusable: bool,
@@ -749,7 +738,6 @@ impl ExecutionAdapter for FakeAdapter {
             state: ExecutionState::Running,
             runtime_handle: handle,
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
@@ -853,7 +841,6 @@ impl ExecutionAdapter for FakeAdapter {
             state: ExecutionState::Succeeded,
             payload: Some(serde_json::json!({"ok": true})),
             summary: Some("fake".into()),
-            failure_class: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
             incarnation_reusable: false,
@@ -896,7 +883,6 @@ impl ExecutionAdapter for FakeAdapter {
             state: ExecutionState::Unknown,
             runtime_handle: handle,
             ambiguous: true,
-            failure_class: None,
             detail: Some("fake reconcile is identity-preserving by request".into()),
             terminal_confirmed: false,
             quiescent_confirmed: false,
@@ -1083,11 +1069,9 @@ mod tests {
         // The snapshot carries the durable Task label; the request prompt is
         // deterministically derived from the protocol — never the label.
         assert_eq!(launch.task_name(), "my-task");
-        assert_eq!(
-            req.prompt(),
-            RenderedWorkerPrompt::from_launch(&launch).as_str()
-        );
-        assert!(req.prompt().contains("OBJECTIVE\n{\"key\": \"val\"}"));
+        let protocol = RenderedWorkerPrompt::from_launch(&launch);
+        assert!(protocol.as_str().contains("OBJECTIVE\n{\"key\": \"val\"}"));
+        assert!(!req.payload().is_null());
         assert_eq!(req.payload(), &serde_json::json!({"key": "val"}));
         assert_eq!(req.acceptance(), &serde_json::json!({"criterion": "pass"}));
         assert_eq!(req.workstream_id(), Some(&ws));
@@ -1124,15 +1108,11 @@ mod tests {
         let first = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         let second = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
         assert_eq!(first, second);
-        assert_eq!(
-            first.prompt(),
-            RenderedWorkerPrompt::from_launch(&launch).as_str()
-        );
-        assert!(first
-            .prompt()
+        let protocol = RenderedWorkerPrompt::from_launch(&launch);
+        assert!(protocol
+            .as_str()
             .starts_with("LOCAL AGENT SCHEDULER TASK\n\nTASK_ID\n"));
-        // The mock snapshot is read-only: no writer instructions may appear.
-        assert!(!first.prompt().contains("WRITER RECOVERY RULES"));
+        assert!(!protocol.as_str().contains("WRITER RECOVERY RULES"));
     }
 
     /// §21 fixture hygiene regression: the synthetic snapshot and its
@@ -1345,7 +1325,6 @@ mod tests {
                 state: ExecutionState::Running,
                 runtime_handle: RuntimeHandle(serde_json::json!({"probe": true})),
                 ambiguous: false,
-                failure_class: None,
                 detail: None,
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
@@ -1392,7 +1371,6 @@ mod tests {
                 state: ExecutionState::Succeeded,
                 payload: None,
                 summary: None,
-                failure_class: None,
                 terminal_confirmed: true,
                 quiescent_confirmed: true,
                 incarnation_reusable: false,
@@ -1410,7 +1388,6 @@ mod tests {
                 state: ExecutionState::Unknown,
                 runtime_handle: RuntimeHandle::default(),
                 ambiguous: true,
-                failure_class: None,
                 detail: None,
                 terminal_confirmed: false,
                 quiescent_confirmed: false,

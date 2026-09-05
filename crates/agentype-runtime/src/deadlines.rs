@@ -10,6 +10,7 @@ use agentype_adapter_api::{
     StartObservation,
 };
 use agentype_core::RequestId;
+use agentype_execution_config::AdapterBindingKey;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +76,7 @@ impl AdapterDeadlinePolicy {
 #[derive(Clone)]
 pub struct ResolvedAdapterBinding {
     adapter_kind: String,
+    adapter_binding_key: AdapterBindingKey,
     adapter: Arc<dyn ExecutionAdapter>,
     deadlines: AdapterDeadlinePolicy,
 }
@@ -82,11 +84,13 @@ pub struct ResolvedAdapterBinding {
 impl ResolvedAdapterBinding {
     pub(crate) fn new(
         adapter_kind: String,
+        adapter_binding_key: AdapterBindingKey,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
     ) -> Self {
         Self {
             adapter_kind,
+            adapter_binding_key,
             adapter,
             deadlines,
         }
@@ -94,6 +98,10 @@ impl ResolvedAdapterBinding {
 
     pub fn adapter_kind(&self) -> &str {
         &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
+        &self.adapter_binding_key
     }
 
     pub fn policy(&self) -> AdapterDeadlinePolicy {
@@ -193,6 +201,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new());
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(9)).unwrap(),
         );
@@ -231,7 +240,12 @@ mod tests {
             Duration::from_secs(6),
         )
         .unwrap();
-        let binding = ResolvedAdapterBinding::new("process".into(), fake.clone(), policy);
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            fake.clone(),
+            policy,
+        );
         let handle = RuntimeHandle(serde_json::json!({"h": 1}));
 
         binding.reconcile_start(&RequestId::new(), None).unwrap();
@@ -276,10 +290,10 @@ mod tests {
         let fast = AdapterDeadlinePolicy::uniform(Duration::from_secs(2)).unwrap();
         let slow = AdapterDeadlinePolicy::uniform(Duration::from_secs(60)).unwrap();
         adapters
-            .register("fast", Arc::new(FakeAdapter::new()), fast)
+            .register_kind("fast", Arc::new(FakeAdapter::new()), fast)
             .unwrap();
         adapters
-            .register("slow", Arc::new(FakeAdapter::new()), slow)
+            .register_kind("slow", Arc::new(FakeAdapter::new()), slow)
             .unwrap();
         assert_eq!(
             adapters
@@ -299,6 +313,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_exact_rejects_binding_key_mismatch() {
+        let mut adapters = crate::AdapterRegistry::new();
+        adapters
+            .register_kind(
+                "process",
+                Arc::new(FakeAdapter::new()),
+                AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+        assert!(adapters
+            .resolve_exact("process", &AdapterBindingKey::for_tests())
+            .is_ok());
+        let other = AdapterBindingKey::new("other-domain").unwrap();
+        assert!(adapters.resolve_exact("process", &other).is_err());
+    }
+
     /// M5.6 §49 #56-58: an observe timeout is an invocation error, never an
     /// observation. No terminality, quiescence, or physical transition can
     /// be derived from it (the RUNNING→UNKNOWN transition does not exist in
@@ -312,6 +343,7 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
         );
@@ -342,6 +374,7 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
         );
@@ -369,6 +402,7 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
         );
