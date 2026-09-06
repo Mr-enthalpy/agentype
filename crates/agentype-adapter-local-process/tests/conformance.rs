@@ -210,6 +210,11 @@ fn start_creates_environment_and_returns_persisted_handle() {
     let req = request(AgentSpec::default());
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
     assert_no_quiescence_start(&start);
+    if start.state != ExecutionState::Running {
+        assert_eq!(start.state, ExecutionState::Terminated);
+        assert!(!start.ambiguous);
+        assert!(!start.terminal_confirmed);
+    }
     let (pid, birth, request_id, _) = handle_fields(&start.runtime_handle);
     assert!(pid > 0);
     assert!(birth > 0);
@@ -247,8 +252,9 @@ fn observe_running_and_exited_environments() {
     let after = adapter
         .observe_execution(&start.runtime_handle, &long_deadline())
         .unwrap();
-    // Process death is UNKNOWN, never SUCCEEDED and never quiescence.
-    assert_eq!(after.state, ExecutionState::Unknown);
+    // Identified handle whose process is gone is ENDED (Terminated), never
+    // SUCCEEDED and never quiescence. Collect proves the outcome.
+    assert_eq!(after.state, ExecutionState::Terminated);
     assert_no_quiescence_obs(&after);
     assert!(!after.terminal_confirmed);
 }
@@ -377,6 +383,23 @@ fn interrupt_attempts_physical_signal_or_reports_unsupported() {
             assert_no_secret(&err);
         }
     }
+    adapter
+        .terminate_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+}
+
+#[test]
+fn expired_deadline_after_identity_check_does_not_kill() {
+    let adapter = LocalProcessAgentAdapter::new();
+    let (_req, start) = start_hang(&adapter);
+    let err = adapter
+        .terminate_execution(&start.runtime_handle, &expired_deadline())
+        .unwrap_err();
+    assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+    let still = adapter
+        .observe_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
+    assert_eq!(still.state, ExecutionState::Running);
     adapter
         .terminate_execution(&start.runtime_handle, &long_deadline())
         .unwrap();
@@ -531,8 +554,9 @@ fn reconcile_failed_reconnect_is_ambiguous_unknown() {
     let rec = adapter
         .reconcile_start(req.request_id(), Some(&ghost), &long_deadline())
         .unwrap();
-    assert_eq!(rec.state, ExecutionState::Unknown);
-    assert!(rec.ambiguous);
+    assert_eq!(rec.state, ExecutionState::Terminated);
+    assert!(!rec.ambiguous);
+    assert!(!rec.terminal_confirmed);
     assert_no_quiescence_start(&rec);
 }
 

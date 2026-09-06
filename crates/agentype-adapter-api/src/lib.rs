@@ -14,7 +14,9 @@ use agentype_core::{
     AttemptId, BatchId, CommittedContinuitySnapshot, ExecutionId, ExecutionState, IncarnationId,
     LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode, WorkstreamId,
 };
-use agentype_execution_config::{ExecutionLaunchSnapshot, ResolvedExecutionEnvironment};
+use agentype_execution_config::{
+    AdapterBindingKey, ExecutionLaunchSnapshot, ResolvedExecutionEnvironment,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -536,6 +538,15 @@ pub trait ExecutionAdapter: Send + Sync {
         persisted_handle: Option<&RuntimeHandle>,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation>;
+}
+
+/// An adapter that can import itself as a physical execution source.
+/// Kind, domain key, and enforceable isolation come from the adapter, not
+/// the composition caller.
+pub trait ImportableAdapter: ExecutionAdapter {
+    fn import_kind(&self) -> &str;
+    fn import_binding_key(&self) -> AdapterBindingKey;
+    fn import_attempt_isolation(&self) -> bool;
 }
 
 /// In-memory fake used by M4 tests and M5.2 dispatch tests. No process, no

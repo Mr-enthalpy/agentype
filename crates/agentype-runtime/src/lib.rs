@@ -35,7 +35,9 @@ pub use supervision::{
 };
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 
-use agentype_adapter_api::{AdapterError, ExecutionAdapter, ExecutionRequest, StartObservation};
+use agentype_adapter_api::{
+    AdapterError, ExecutionAdapter, ExecutionRequest, ImportableAdapter, StartObservation,
+};
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
     ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
@@ -270,11 +272,84 @@ pub struct AdapterRegistry {
     adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
 }
 
+/// Kind, domain key, and enforceable safety produced together by an importer.
+/// Composition cannot assemble a mismatched key or isolation claim.
+pub struct ImportedExecutionBinding {
+    adapter_kind: String,
+    adapter_binding_key: AdapterBindingKey,
+    safety: AdapterSafetyEnvelope,
+    adapter: Arc<dyn ExecutionAdapter>,
+}
+
+impl ImportedExecutionBinding {
+    pub fn from_importable(adapter: Arc<dyn ImportableAdapter>) -> Self {
+        let adapter_kind = adapter.import_kind().to_string();
+        let adapter_binding_key = adapter.import_binding_key();
+        let safety = AdapterSafetyEnvelope::unenforceable()
+            .with_attempt_isolation(adapter.import_attempt_isolation());
+        let exec: Arc<dyn ExecutionAdapter> = adapter.clone();
+        Self {
+            adapter_kind,
+            adapter_binding_key,
+            safety,
+            adapter: exec,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(
+        adapter_kind: impl Into<String>,
+        adapter: Arc<dyn ExecutionAdapter>,
+        safety: AdapterSafetyEnvelope,
+    ) -> Self {
+        Self {
+            adapter_kind: adapter_kind.into(),
+            adapter_binding_key: AdapterBindingKey::for_tests(),
+            safety,
+            adapter,
+        }
+    }
+
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
+        &self.adapter_binding_key
+    }
+}
+
 impl AdapterRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn import(
+        &mut self,
+        binding: ImportedExecutionBinding,
+        deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.insert_binding(
+            binding.adapter_kind,
+            binding.adapter_binding_key,
+            binding.adapter,
+            deadlines,
+            binding.safety,
+        )
+    }
+
+    pub fn import_source(
+        &mut self,
+        adapter: Arc<dyn ImportableAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.import(
+            ImportedExecutionBinding::from_importable(adapter),
+            deadlines,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register(
         &mut self,
         adapter_kind: impl Into<String>,
@@ -291,7 +366,8 @@ impl AdapterRegistry {
         )
     }
 
-    /// Import an adapter together with the physical safety it can enforce.
+    /// Test helper: caller-assembled key/safety. Production uses `import`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register_with_safety(
         &mut self,
         adapter_kind: impl Into<String>,

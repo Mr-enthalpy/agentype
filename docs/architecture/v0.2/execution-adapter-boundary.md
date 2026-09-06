@@ -171,9 +171,23 @@ Recovery uses `resolve_exact(kind, key)` with no fallback. Launch without
 a SpawnSource uses `resolve_unique(kind)` and fails closed if two
 installations of that driver are present. Core does not interpret the key.
 
+Identified process end (`Terminated`, not ambiguous, not
+`terminal_confirmed`) is a collect candidate. Process death is not
+success or quiescence, but it is enough to call `collect_outcome`.
+`UNKNOWN` remains identity-not-confirmed.
+
+Production install is `AdapterRegistry::import` /
+`ImportedExecutionBinding::from_importable`. Kind, domain key, and
+enforceable isolation come from the adapter (`ImportableAdapter`), not
+the composition caller.
+
 Control (interrupt/terminate/reap) MUST target a pinned process instance
 (Linux `pidfd`, Windows one PROCESS handle used for both birth check and
-act). A stale handle with a reused PID MUST NOT affect the new occupant.
+act). After pin returns, interrupt/kill recheck the same deadline before
+signaling. A stale handle with a reused PID MUST NOT affect the new occupant.
+
+Observation errors (`try_wait` failure, `/proc` I/O other than not-found)
+are `AdapterError`, not physical absence.
 
 `attempt_isolation` on `ExecutionTargetConfig` is a requirement, not a
 proof. It intersects the installed binding's `AdapterSafetyEnvelope`.
@@ -286,12 +300,12 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 
 | Operation | Mechanics |
 | --- | --- |
-| start | spawn (deadline-staged) + immediate deadline check + birth probe under the same endpoint + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. If spawn returns after expiry, kill the uncommitted child — no birth I/O. RUNNING if still alive **and** deadline remains; UNKNOWN+ambiguous if it already exited. |
-| observe | live `Child` with matching `birth`, else `pid+birth` and non-zombie state. Alive → RUNNING; mismatch/dead/zombie → UNKNOWN. Never SUCCEEDED. |
+| start | spawn (deadline-staged) + immediate deadline check + birth probe under the same endpoint + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. If spawn returns after expiry, kill the uncommitted child — no birth I/O. RUNNING if still alive **and** deadline remains; identified process end → Terminated (ENDED, collect), not UNKNOWN. |
+| observe | live `Child` with matching `birth`, else pin `pid+birth`. Alive → RUNNING; identified instance gone → Terminated (ENDED, collect); birth mismatch → UNKNOWN. Never SUCCEEDED. |
 | interrupt | Pin the process instance (Linux pidfd / Windows PROCESS handle), verify birth, then signal through that pin. Stale pid+wrong birth MUST NOT interrupt another occupant. Unpinned control is Unavailable. Not Task cancellation. |
 | terminate | Pin, verify birth, kill through the same pin, wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
 | collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol, not Failed. |
-| reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. No handle → ambiguous UNKNOWN. |
+| reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. Identified process ended → Terminated (ENDED, collect). No handle / birth mismatch → ambiguous UNKNOWN. |
 
 Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via
 `GetProcessTimes`. Linux: `/proc/<pid>/stat` starttime **and** state

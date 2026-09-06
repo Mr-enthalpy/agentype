@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "M4 recovery orchestration and M5 runtime configuration boundary; daemon loops are M5.2"
 
+[features]
+test-support = ["agentype-execution-config/test-support"]
+
 [dependencies]
 agentype-core.workspace = true
 agentype-execution-config.workspace = true

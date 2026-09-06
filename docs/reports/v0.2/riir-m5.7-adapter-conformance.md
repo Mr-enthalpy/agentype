@@ -81,11 +81,12 @@ FILETIME). PID match without birth match is UNKNOWN, never RUNNING.
 Start returns RUNNING after spawn + same-thread stdin write + one
 `try_wait`, only if the start deadline still remains. It does not wait
 the remaining start budget for the agent to finish; that wait belongs to
-`collect_outcome`. A fast-exit during start is UNKNOWN + ambiguous, not
-SUCCEEDED.
+`collect_outcome`. An identified fast-exit during start is Terminated
+(ENDED, collect candidate), not UNKNOWN and not SUCCEEDED.
 
-`quiescent_confirmed` is always false. Process death is UNKNOWN on
-observe, never SUCCEEDED. Kill-sent is not quiescence.
+`quiescent_confirmed` is always false. Identified process death on
+observe is Terminated/ENDED (collect), never SUCCEEDED. Identity
+unconfirmed remains UNKNOWN. Kill-sent is not quiescence.
 Any `failure_class` key in agent JSON is `AdapterError::Protocol`.
 `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol.
 Terminal `ok:false` is Failed; Runtime maps it to `StartFailure`.
@@ -190,9 +191,14 @@ Closed in-milestone, not deferred to M5.8:
 - spawn returns → immediate deadline check before birth probe; liveness
   probes take the same `AdapterDeadline`
 - interrupt/terminate pin the process instance (pidfd / PROCESS handle)
-  before any signal; forged pid+wrong birth must not control a decoy
+  before any signal; forged pid+wrong birth must not control a decoy;
+  deadline is rechecked after pin before signal/kill
 - `attempt_isolation` ∩ installed `AdapterSafetyEnvelope`; local_process
   cannot enforce isolation
+- Identified process end is Terminated/ENDED → collect, not EXECUTION_LOST
+- Production install is `import` / `ImportableAdapter` (kind+key+safety
+  from the adapter)
+- `try_wait` / `/proc` errors are AdapterError, not process absence
 - Generic prompt and adapter-authored `FailureClass` removed from DTOs
 - Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
   aligned (host-kernel progress assumption; no watchdog)

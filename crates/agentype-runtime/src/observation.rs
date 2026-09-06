@@ -70,6 +70,11 @@ pub fn normalize_start_observation(observation: &StartObservation) -> StartObser
     if observation.state == ExecutionState::Running && !observation.ambiguous {
         return StartObservationKind::ExactRunning;
     }
+    // Identified process ended: collect. Death is not success or quiescence,
+    // but it is a terminal candidate. Unknown/ambiguous stay EXECUTION_LOST.
+    if observation.state == ExecutionState::Terminated && !observation.ambiguous {
+        return StartObservationKind::TerminalCandidate;
+    }
     if observation.ambiguous
         || matches!(
             observation.state,
@@ -229,6 +234,10 @@ mod tests {
         );
         assert_eq!(
             normalize_start_observation(&start(ExecutionState::Failed, false, true, false)),
+            StartObservationKind::TerminalCandidate
+        );
+        assert_eq!(
+            normalize_start_observation(&start(ExecutionState::Terminated, false, false, false)),
             StartObservationKind::TerminalCandidate
         );
     }

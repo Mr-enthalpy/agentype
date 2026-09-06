@@ -10,6 +10,7 @@ use super::process_stat;
 use super::{require_deadline, AdapterDeadline, AdapterError, AdapterResult};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub(crate) struct PinnedInstance {
     pid: u32,
     #[cfg(target_os = "linux")]
@@ -38,13 +39,21 @@ impl Drop for PinnedInstance {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum PinOutcome {
+    Pinned(PinnedInstance),
+    /// PID does not exist: the identified instance has ended (or never ran).
+    Gone,
+    /// A process exists at this PID but birth does not match.
+    Mismatch,
+}
+
 /// Open a pinned identity for `pid` and confirm `expected_birth`.
-/// `Ok(None)` means this is not that instance (gone or reused).
 pub(crate) fn pin_instance(
     pid: u32,
     expected_birth: u64,
     deadline: &AdapterDeadline,
-) -> AdapterResult<Option<PinnedInstance>> {
+) -> AdapterResult<PinOutcome> {
     require_deadline(deadline, "deadline exhausted before pinning process", None)?;
     #[cfg(target_os = "linux")]
     {
@@ -64,7 +73,8 @@ pub(crate) fn pin_instance(
 }
 
 impl PinnedInstance {
-    pub(crate) fn interrupt(&self) -> AdapterResult<()> {
+    pub(crate) fn interrupt(&self, deadline: &AdapterDeadline) -> AdapterResult<()> {
+        require_deadline(deadline, "deadline exhausted before interrupt", None)?;
         #[cfg(target_os = "linux")]
         {
             send_linux(self.pidfd, libc::SIGINT)
@@ -79,7 +89,8 @@ impl PinnedInstance {
         }
     }
 
-    pub(crate) fn kill(&self) -> AdapterResult<()> {
+    pub(crate) fn kill(&self, deadline: &AdapterDeadline) -> AdapterResult<()> {
+        require_deadline(deadline, "deadline exhausted before terminate", None)?;
         #[cfg(target_os = "linux")]
         {
             send_linux(self.pidfd, libc::SIGKILL)
@@ -98,7 +109,7 @@ impl PinnedInstance {
         require_deadline(deadline, "deadline exhausted before pinned liveness", None)?;
         #[cfg(target_os = "linux")]
         {
-            Ok(match super::process_stat_linux(self.pid) {
+            Ok(match super::process_stat_linux(self.pid)? {
                 Some((state, _)) => !matches!(state, 'Z' | 'X' | 'x'),
                 None => false,
             })
@@ -144,10 +155,10 @@ fn pin_linux(
     pid: u32,
     expected_birth: u64,
     deadline: &AdapterDeadline,
-) -> AdapterResult<Option<PinnedInstance>> {
+) -> AdapterResult<PinOutcome> {
     let raw = match i32::try_from(pid) {
         Ok(p) => p,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(PinOutcome::Gone),
     };
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0i32) as i32 };
     if pidfd < 0 {
@@ -158,14 +169,15 @@ fn pin_linux(
             ));
         }
         if errno == libc::ESRCH || errno == libc::ENOENT {
-            return Ok(None);
+            return Ok(PinOutcome::Gone);
         }
         return Err(AdapterError::unavailable("pidfd_open failed"));
     }
     let pinned = PinnedInstance { pid, pidfd };
     match process_stat(pid, deadline)? {
-        Some((_, birth)) if birth == expected_birth => Ok(Some(pinned)),
-        _ => Ok(None),
+        Some((_, birth)) if birth == expected_birth => Ok(PinOutcome::Pinned(pinned)),
+        Some(_) => Ok(PinOutcome::Mismatch),
+        None => Ok(PinOutcome::Gone),
     }
 }
 
@@ -206,7 +218,7 @@ fn pin_windows(
     pid: u32,
     expected_birth: u64,
     deadline: &AdapterDeadline,
-) -> AdapterResult<Option<PinnedInstance>> {
+) -> AdapterResult<PinOutcome> {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -222,17 +234,17 @@ fn pin_windows(
         )
     };
     if handle.is_null() {
-        return Ok(None);
+        return Ok(PinOutcome::Gone);
     }
     let pinned = PinnedInstance { pid, handle };
     let birth = match windows_creation(handle) {
         Some(b) => b,
-        None => return Ok(None),
+        None => return Ok(PinOutcome::Gone),
     };
     if birth != expected_birth {
-        return Ok(None);
+        return Ok(PinOutcome::Mismatch);
     }
-    Ok(Some(pinned))
+    Ok(PinOutcome::Pinned(pinned))
 }
 
 #[cfg(windows)]
@@ -325,4 +337,61 @@ fn wait_windows(handle: *mut core::ffi::c_void, slice: Duration) {
         let _ = WaitForSingleObject(handle, ms);
     }
     let _ = WAIT_OBJECT_0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_birth;
+    use agentype_adapter_api::AdapterErrorKind;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn spawn_hang() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("ping")
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sleep")
+        }
+    }
+
+    #[test]
+    fn expired_deadline_after_pin_does_not_kill() {
+        let mut child = spawn_hang();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(80));
+        let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
+        let birth = process_birth(pid, &long).expect("birth");
+        let pinned = match pin_instance(pid, birth, &long).unwrap() {
+            PinOutcome::Pinned(p) => p,
+            other => panic!("expected pin, got {other:?}"),
+        };
+        let expired = AdapterDeadline::from_instant(Instant::now() - Duration::from_secs(1));
+        let err = pinned.kill(&expired).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+        assert!(
+            matches!(
+                pin_instance(pid, birth, &long).unwrap(),
+                PinOutcome::Pinned(_)
+            ),
+            "expired kill must not terminate the pinned instance"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

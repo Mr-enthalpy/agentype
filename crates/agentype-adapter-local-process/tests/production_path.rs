@@ -71,16 +71,10 @@ fn only_execution_id(kernel: &Kernel) -> agentype_core::ExecutionId {
 #[test]
 fn dispatcher_starts_and_collects_real_fake_agent() {
     let (_clock, kernel) = kernel();
-    let adapter = Arc::new(LocalProcessAgentAdapter::new());
+    let kernel = Arc::new(kernel);
+    let adapter = Arc::new(LocalProcessAgentAdapter::try_new().unwrap());
     let mut adapters = AdapterRegistry::new();
-    adapters
-        .register(
-            ADAPTER_KIND,
-            adapter.binding_key().clone(),
-            adapter,
-            policy(),
-        )
-        .unwrap();
+    adapters.import_source(adapter.clone(), policy()).unwrap();
     let registry = registry_with(json!({}));
     kernel
         .submit_batch(&[TaskSpec::new("real-collect", json!({"goal": "echo"}))])
@@ -92,11 +86,24 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
             drop(admission);
             let execution_id = only_execution_id(&kernel);
             let handle = RuntimeHandle(kernel.execution_runtime_handle(&execution_id).unwrap());
-            let binding = adapters.resolve_unique(ADAPTER_KIND).unwrap();
-            let collected = binding.collect_outcome(&handle).unwrap();
-            assert_eq!(collected.state, agentype_core::ExecutionState::Succeeded);
+            let deadline = AdapterDeadline::after(Duration::from_secs(8)).unwrap();
+            for _ in 0..80 {
+                let obs = adapter.observe_execution(&handle, &deadline).unwrap();
+                if obs.state != agentype_core::ExecutionState::Running {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
+            let exec = kernel.execution(&execution_id).unwrap();
+            let task = kernel.task(&exec.task_id).unwrap();
+            assert_eq!(
+                task.state,
+                agentype_core::TaskState::Completed,
+                "identified process end must collect through Recovery, not EXECUTION_LOST"
+            );
         }
-        other => panic!("expected TaskCompleted or RunningAdmitted, got {other:?}"),
+        other => panic!("expected TaskCompleted or RunningAdmitted then collect, got {other:?}"),
     }
 }
 
@@ -104,12 +111,10 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
 fn recovery_readmits_same_binding_key_after_new_adapter_instance() {
     let (_clock, kernel) = kernel();
     let kernel = Arc::new(kernel);
-    let adapter = Arc::new(LocalProcessAgentAdapter::new());
+    let adapter = Arc::new(LocalProcessAgentAdapter::try_new().unwrap());
     let key = adapter.binding_key().clone();
     let mut adapters = AdapterRegistry::new();
-    adapters
-        .register(ADAPTER_KIND, key.clone(), adapter, policy())
-        .unwrap();
+    adapters.import_source(adapter, policy()).unwrap();
     let registry = registry_with(json!({"FAKE_AGENT_HANG": "1"}));
     kernel
         .submit_batch(&[TaskSpec::new("hang-recover", json!({}))])
@@ -124,17 +129,10 @@ fn recovery_readmits_same_binding_key_after_new_adapter_instance() {
 
     drop(adapters);
 
-    let adapter2 = Arc::new(LocalProcessAgentAdapter::new());
+    let adapter2 = Arc::new(LocalProcessAgentAdapter::try_new().unwrap());
     assert_eq!(adapter2.binding_key(), &key);
     let mut adapters2 = AdapterRegistry::new();
-    adapters2
-        .register(
-            ADAPTER_KIND,
-            adapter2.binding_key().clone(),
-            adapter2.clone(),
-            policy(),
-        )
-        .unwrap();
+    adapters2.import_source(adapter2.clone(), policy()).unwrap();
     let recovered = recover_runtime_without_notifier(kernel.clone(), &adapters2, timing()).unwrap();
     assert!(
         recovered.runner().contains(&execution_id),
@@ -208,16 +206,9 @@ fn recovery_does_not_readmit_foreign_binding_key() {
 #[test]
 fn isolated_target_cannot_use_local_process_adapter() {
     let (_clock, kernel) = kernel();
-    let adapter = Arc::new(LocalProcessAgentAdapter::new());
+    let adapter = Arc::new(LocalProcessAgentAdapter::try_new().unwrap());
     let mut adapters = AdapterRegistry::new();
-    adapters
-        .register(
-            ADAPTER_KIND,
-            adapter.binding_key().clone(),
-            adapter,
-            policy(),
-        )
-        .unwrap();
+    adapters.import_source(adapter, policy()).unwrap();
     let mut registry = ExecutionRegistry::new();
     registry
         .register_target(

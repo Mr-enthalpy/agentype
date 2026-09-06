@@ -10,7 +10,7 @@
 
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterResult, ExecutionAdapter, ExecutionObservation,
-    ExecutionOutcome, ExecutionRequest, RuntimeHandle, StartObservation,
+    ExecutionOutcome, ExecutionRequest, ImportableAdapter, RuntimeHandle, StartObservation,
 };
 use agentype_core::{ExecutionState, RequestId};
 use agentype_execution_config::AdapterBindingKey;
@@ -71,6 +71,20 @@ impl LocalProcessAgentAdapter {
 
     pub fn binding_key(&self) -> &AdapterBindingKey {
         &self.binding_key
+    }
+}
+
+impl ImportableAdapter for LocalProcessAgentAdapter {
+    fn import_kind(&self) -> &str {
+        ADAPTER_KIND
+    }
+
+    fn import_binding_key(&self) -> AdapterBindingKey {
+        self.binding_key.clone()
+    }
+
+    fn import_attempt_isolation(&self) -> bool {
+        false
     }
 }
 
@@ -412,8 +426,8 @@ fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResu
 
 fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
     match pin::pin_instance(pid, birth, deadline)? {
-        None => Ok(true),
-        Some(pinned) => pinned.wait_exit(deadline),
+        pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => Ok(true),
+        pin::PinOutcome::Pinned(pinned) => pinned.wait_exit(deadline),
     }
 }
 
@@ -580,7 +594,7 @@ fn kill_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
+pub(crate) fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
     require_deadline(
         deadline,
         "deadline exhausted before process birth probe",
@@ -591,10 +605,21 @@ fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
         .ok_or_else(|| AdapterError::unavailable("cannot read process birth identity"))
 }
 
-fn instance_alive(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
+fn instance_presence(
+    pid: u32,
+    birth: u64,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<InstancePresence> {
     match pin::pin_instance(pid, birth, deadline)? {
-        None => Ok(false),
-        Some(pinned) => pinned.is_alive(deadline),
+        pin::PinOutcome::Gone => Ok(InstancePresence::Ended),
+        pin::PinOutcome::Mismatch => Ok(InstancePresence::Absent),
+        pin::PinOutcome::Pinned(pinned) => {
+            if pinned.is_alive(deadline)? {
+                Ok(InstancePresence::Running)
+            } else {
+                Ok(InstancePresence::Ended)
+            }
+        }
     }
 }
 
@@ -610,7 +635,7 @@ fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(c
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(process_stat_linux(pid))
+        process_stat_linux(pid)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -662,9 +687,12 @@ fn process_birth_windows(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn process_stat_linux(pid: u32) -> Option<(char, u64)> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_identity(&text)
+pub(crate) fn process_stat_linux(pid: u32) -> AdapterResult<Option<(char, u64)>> {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => Ok(parse_stat_identity(&text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(AdapterError::other("process stat probe failed")),
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -792,21 +820,43 @@ fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
     })
 }
 
-fn liveness_observation(alive: bool) -> ExecutionObservation {
-    if alive {
-        ExecutionObservation {
+enum InstancePresence {
+    Running,
+    Ended,
+    Absent,
+}
+
+fn liveness_observation(presence: InstancePresence) -> ExecutionObservation {
+    match presence {
+        InstancePresence::Running => ExecutionObservation {
             state: ExecutionState::Running,
             terminal_confirmed: false,
             quiescent_confirmed: false,
             detail: None,
-        }
-    } else {
-        ExecutionObservation {
+        },
+        InstancePresence::Ended => ExecutionObservation {
+            state: ExecutionState::Terminated,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            detail: Some("identified process ended; collect for outcome".into()),
+        },
+        InstancePresence::Absent => ExecutionObservation {
             state: ExecutionState::Unknown,
             terminal_confirmed: false,
             quiescent_confirmed: false,
-            detail: Some("process not running".into()),
-        }
+            detail: Some("process instance not found".into()),
+        },
+    }
+}
+
+fn ended_start_observation(handle: RuntimeHandle) -> StartObservation {
+    StartObservation {
+        state: ExecutionState::Terminated,
+        runtime_handle: handle,
+        ambiguous: false,
+        detail: Some("identified process ended; collect for outcome".into()),
+        terminal_confirmed: false,
+        quiescent_confirmed: false,
     }
 }
 
@@ -891,14 +941,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     "start deadline exhausted before observation",
                     Some(&handle),
                 )?;
-                Ok(StartObservation {
-                    state: ExecutionState::Unknown,
-                    runtime_handle: handle,
-                    ambiguous: true,
-                    detail: Some("process exited during start; collect for outcome".into()),
-                    terminal_confirmed: false,
-                    quiescent_confirmed: false,
-                })
+                Ok(ended_start_observation(handle))
             }
             Ok(None) => {
                 require_deadline(
@@ -937,34 +980,34 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         if let Some(proc) = live.get_mut(&parsed.pid) {
             if proc.birth != parsed.birth {
                 drop(live);
-                let alive = instance_alive(parsed.pid, parsed.birth, deadline)?;
+                let presence = instance_presence(parsed.pid, parsed.birth, deadline)?;
                 require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-                return Ok(liveness_observation(alive));
+                return Ok(liveness_observation(presence));
             }
             match proc.child.try_wait() {
                 Ok(Some(_)) => {
                     live.remove(&parsed.pid);
                     require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-                    return Ok(liveness_observation(false));
+                    return Ok(liveness_observation(InstancePresence::Ended));
                 }
                 Ok(None) => {
                     require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-                    return Ok(liveness_observation(true));
+                    return Ok(liveness_observation(InstancePresence::Running));
                 }
                 Err(_) => return Err(AdapterError::other("observe wait failed")),
             }
         }
         drop(live);
-        let alive = instance_alive(parsed.pid, parsed.birth, deadline)?;
+        let presence = instance_presence(parsed.pid, parsed.birth, deadline)?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-        if alive {
+        if matches!(presence, InstancePresence::Running) {
             require_deadline(
                 deadline,
                 "observe deadline exhausted before RUNNING",
                 Some(handle),
             )?;
         }
-        Ok(liveness_observation(alive))
+        Ok(liveness_observation(presence))
     }
 
     fn interrupt_execution(
@@ -975,10 +1018,8 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
         match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
-            None => {}
-            Some(pinned) => {
-                pinned.interrupt()?;
-            }
+            pin::PinOutcome::Pinned(pinned) => pinned.interrupt(deadline)?,
+            pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => {}
         }
         require_deadline(
             deadline,
@@ -1008,10 +1049,14 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         };
         if let Some(mut proc) = proc {
             match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
-                Some(pinned) => pinned.kill()?,
-                None => {
+                pin::PinOutcome::Pinned(pinned) => pinned.kill(deadline)?,
+                pin::PinOutcome::Gone => {
                     let _ = proc.child.try_wait();
-                    return Ok(liveness_observation(false));
+                    return Ok(liveness_observation(InstancePresence::Ended));
+                }
+                pin::PinOutcome::Mismatch => {
+                    let _ = proc.child.try_wait();
+                    return Ok(liveness_observation(InstancePresence::Absent));
                 }
             }
             if wait_child_exit(&mut proc.child, deadline)? {
@@ -1028,23 +1073,31 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 handle.clone(),
             ));
         }
-        if let Some(pinned) = pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
-            pinned.kill()?;
-            if pinned.wait_exit(deadline)? {
-                require_deadline(
-                    deadline,
-                    "terminate deadline exhausted after wait",
-                    Some(handle),
-                )?;
-                return Ok(terminated_observation());
+        match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+            pin::PinOutcome::Pinned(pinned) => {
+                pinned.kill(deadline)?;
+                if pinned.wait_exit(deadline)? {
+                    require_deadline(
+                        deadline,
+                        "terminate deadline exhausted after wait",
+                        Some(handle),
+                    )?;
+                    return Ok(terminated_observation());
+                }
+                Err(deadline_exceeded_hint(
+                    "terminate wait exhausted; kill sent is not quiescence",
+                    handle.clone(),
+                ))
             }
-            return Err(deadline_exceeded_hint(
-                "terminate wait exhausted; kill sent is not quiescence",
-                handle.clone(),
-            ));
+            pin::PinOutcome::Gone => {
+                require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
+                Ok(liveness_observation(InstancePresence::Ended))
+            }
+            pin::PinOutcome::Mismatch => {
+                require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
+                Ok(liveness_observation(InstancePresence::Absent))
+            }
         }
-        require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
-        Ok(liveness_observation(false))
     }
 
     fn collect_outcome(
@@ -1128,45 +1181,54 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 "persisted handle request_id does not match reconcile identity",
             ));
         }
-        let alive = {
+        let presence = {
             let mut live = self.live.lock().expect("live map");
             if let Some(proc) = live.get_mut(&parsed.pid) {
                 if proc.birth != parsed.birth {
                     drop(live);
-                    instance_alive(parsed.pid, parsed.birth, deadline)?
+                    instance_presence(parsed.pid, parsed.birth, deadline)?
                 } else {
                     match proc.child.try_wait() {
                         Ok(Some(_)) => {
                             live.remove(&parsed.pid);
-                            false
+                            InstancePresence::Ended
                         }
-                        Ok(None) => true,
-                        Err(_) => false,
+                        Ok(None) => InstancePresence::Running,
+                        Err(_) => {
+                            return Err(AdapterError::other("reconcile wait failed"));
+                        }
                     }
                 }
             } else {
                 drop(live);
-                instance_alive(parsed.pid, parsed.birth, deadline)?
+                instance_presence(parsed.pid, parsed.birth, deadline)?
             }
         };
-        if alive {
+        if matches!(presence, InstancePresence::Running) {
             require_deadline(
                 deadline,
                 "reconcile deadline exhausted before RUNNING",
                 Some(handle),
             )?;
         }
-        Ok(StartObservation {
-            state: if alive {
-                ExecutionState::Running
-            } else {
-                ExecutionState::Unknown
+        Ok(match presence {
+            InstancePresence::Running => StartObservation {
+                state: ExecutionState::Running,
+                runtime_handle: handle.clone(),
+                ambiguous: false,
+                detail: None,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
             },
-            runtime_handle: handle.clone(),
-            ambiguous: !alive,
-            detail: None,
-            terminal_confirmed: false,
-            quiescent_confirmed: false,
+            InstancePresence::Ended => ended_start_observation(handle.clone()),
+            InstancePresence::Absent => StartObservation {
+                state: ExecutionState::Unknown,
+                runtime_handle: handle.clone(),
+                ambiguous: true,
+                detail: Some("process instance not found".into()),
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+            },
         })
     }
 }

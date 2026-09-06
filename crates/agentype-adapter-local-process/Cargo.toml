@@ -23,6 +23,6 @@ serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-agentype-runtime.workspace = true
+agentype-runtime = { workspace = true, features = ["test-support"] }
 agentype-storage-sqlite.workspace = true
 agentype-execution-config = { workspace = true, features = ["test-support"] }
