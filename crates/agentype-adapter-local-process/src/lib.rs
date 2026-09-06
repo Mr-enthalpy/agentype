@@ -26,6 +26,13 @@ use std::time::Duration;
 
 mod pin;
 
+/// Hidden helper for the Linux pidfd PID-recycle regression binary.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn pidfd_recycle_experiment() -> i32 {
+    pin::recycle_pid_experiment()
+}
+
 /// Frozen adapter_kind for this environment domain: this host's process
 /// table as spawned by this runtime. Not a vendor/model name.
 pub const ADAPTER_KIND: &str = "local_process";

@@ -158,6 +158,10 @@ sanitization.
   RECOVERING → `RecoveredRuntime` → enable Dispatcher → READY; one
   production `SupervisionRunner` owner per process; steady-state observer
   consuming these bounded adapter calls, separate from heartbeat.
+- **ContinuityBinding** — BLOCKS_CONTINUITY_CAPABLE_REAL_ADAPTER. LocalProcess
+  ignores `incarnation_runtime_handle`. First adapter that interprets a
+  native resume locator must qualify it with `adapter_kind` +
+  `adapter_binding_key`. Not this merge.
 
 ---
 
@@ -193,7 +197,8 @@ Closed in-milestone, not deferred to M5.8:
 - interrupt/terminate pin the process instance (pidfd / PROCESS handle)
   before any signal; forged pid+wrong birth must not control a decoy;
   deadline is rechecked after pin before signal/kill. Windows interrupt
-  is Unavailable (no PID `AttachConsole` / CTRL_BREAK)
+  is Unavailable (no PID `AttachConsole` / CTRL_BREAK). After pin, Linux
+  liveness/wait use pidfd poll, never numeric `/proc/<pid>`
 - `attempt_isolation` ∩ installed `AdapterSafetyEnvelope`; local_process
   cannot enforce isolation
 - Identified process end is Terminated/ENDED → collect, not EXECUTION_LOST

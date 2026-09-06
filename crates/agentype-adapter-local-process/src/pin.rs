@@ -12,6 +12,8 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct PinnedInstance {
+    /// Pin-time numeric PID. After pin, Linux must not re-resolve it.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pid: u32,
     #[cfg(target_os = "linux")]
     pidfd: i32,
@@ -183,10 +185,7 @@ impl PinnedInstance {
         require_deadline(deadline, "deadline exhausted before pinned liveness", None)?;
         #[cfg(target_os = "linux")]
         {
-            Ok(match super::process_stat_linux(self.pid)? {
-                Some((state, _)) => !matches!(state, 'Z' | 'X' | 'x'),
-                None => false,
-            })
+            Ok(!pidfd_task_exited(self.pidfd, Duration::ZERO)?)
         }
         #[cfg(windows)]
         {
@@ -199,19 +198,35 @@ impl PinnedInstance {
     }
 
     pub(crate) fn wait_exit(&self, deadline: &AdapterDeadline) -> AdapterResult<bool> {
+        require_deadline(deadline, "deadline exhausted before pinned wait", None)?;
         loop {
-            if !self.is_alive(deadline)? {
-                return Ok(true);
-            }
             match super::wait_slice(deadline) {
-                None => return Ok(false),
-                Some(slice) => {
+                None => {
                     #[cfg(target_os = "linux")]
                     {
-                        poll_pidfd(self.pidfd, slice);
+                        return pidfd_task_exited(self.pidfd, Duration::ZERO);
                     }
                     #[cfg(windows)]
                     {
+                        return Ok(!windows_still_active(self.handle)?);
+                    }
+                    #[cfg(not(any(windows, target_os = "linux")))]
+                    {
+                        return Ok(false);
+                    }
+                }
+                Some(slice) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if pidfd_task_exited(self.pidfd, slice)? {
+                            return Ok(true);
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        if !windows_still_active(self.handle)? {
+                            return Ok(true);
+                        }
                         wait_windows(self.handle, slice);
                     }
                     #[cfg(not(any(windows, target_os = "linux")))]
@@ -273,17 +288,80 @@ fn send_linux(pidfd: i32, sig: i32) -> AdapterResult<()> {
     Err(AdapterError::unavailable("pinned signal not delivered"))
 }
 
+/// PID 1 in a fresh pid namespace: pin A, reap A, reuse A's numeric PID
+/// as B, prove pidfd liveness still reports A dead. Exit 0 on success.
+/// Must run as the only thread (after exec into `pidfd-recycle`).
 #[cfg(target_os = "linux")]
-fn poll_pidfd(pidfd: i32, slice: Duration) {
-    let timeout_ms = i32::try_from(slice.as_millis()).unwrap_or(i32::MAX);
+pub(crate) fn recycle_pid_experiment() -> i32 {
+    unsafe {
+        let a = libc::fork();
+        if a < 0 {
+            return 5;
+        }
+        if a == 0 {
+            libc::pause();
+            libc::_exit(0);
+        }
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, a, 0i32) as i32;
+        if pidfd < 0 {
+            libc::kill(a, libc::SIGKILL);
+            libc::waitpid(a, std::ptr::null_mut(), 0);
+            return 6;
+        }
+        libc::kill(a, libc::SIGKILL);
+        libc::waitpid(a, std::ptr::null_mut(), 0);
+        let b = libc::fork();
+        if b < 0 {
+            libc::close(pidfd);
+            return 8;
+        }
+        if b == 0 {
+            libc::pause();
+            libc::_exit(0);
+        }
+        if b != a {
+            libc::kill(b, libc::SIGKILL);
+            libc::waitpid(b, std::ptr::null_mut(), 0);
+            libc::close(pidfd);
+            return 9;
+        }
+        let pinned = PinnedInstance {
+            pid: a as u32,
+            pidfd,
+        };
+        let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
+        let alive = pinned.is_alive(&long);
+        libc::kill(b, libc::SIGKILL);
+        libc::waitpid(b, std::ptr::null_mut(), 0);
+        match alive {
+            Ok(false) => 0,
+            Ok(true) => 10,
+            Err(_) => 11,
+        }
+    }
+}
+
+/// True if the pinned task has exited. Never re-resolves a numeric PID.
+#[cfg(target_os = "linux")]
+fn pidfd_task_exited(pidfd: i32, timeout: Duration) -> AdapterResult<bool> {
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let mut pfd = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,
         revents: 0,
     };
-    unsafe {
-        libc::poll(&mut pfd, 1, timeout_ms);
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EINTR {
+            return Ok(false);
+        }
+        return Err(AdapterError::other("pidfd poll failed"));
     }
+    if rc == 0 {
+        return Ok(false);
+    }
+    Ok((pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
 }
 
 #[cfg(windows)]
@@ -464,6 +542,26 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_reports_dead_after_reap() {
+        let mut child = spawn_hang();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(80));
+        let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
+        let birth = process_birth(pid, &long).expect("birth");
+        let pinned = match pin_instance(pid, birth, &long).unwrap() {
+            PinOutcome::Pinned(p) => p,
+            other => panic!("expected pin, got {other:?}"),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !pinned.is_alive(&long).unwrap(),
+            "pidfd must report the original process dead after reap"
+        );
     }
 
     #[test]

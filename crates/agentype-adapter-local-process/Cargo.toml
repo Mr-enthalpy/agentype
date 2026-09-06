@@ -13,6 +13,10 @@ path = "src/bin/fake-agent.rs"
 name = "print-binding-key"
 path = "src/bin/print-binding-key.rs"
 
+[[bin]]
+name = "pidfd-recycle"
+path = "src/bin/pidfd-recycle.rs"
+
 [dependencies]
 agentype-adapter-api.workspace = true
 agentype-core.workspace = true
