@@ -10,6 +10,7 @@ use agentype_adapter_api::{
     StartObservation,
 };
 use agentype_core::RequestId;
+use agentype_execution_config::AdapterBindingKey;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,31 +70,68 @@ impl AdapterDeadlinePolicy {
     }
 }
 
+/// Physical safety the installed execution source can actually enforce.
+/// Target configuration may *require* isolation; this envelope says whether
+/// the imported binding can back that claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterSafetyEnvelope {
+    attempt_isolation: bool,
+}
+
+impl AdapterSafetyEnvelope {
+    pub fn unenforceable() -> Self {
+        Self::default()
+    }
+
+    pub fn with_attempt_isolation(mut self, attempt_isolation: bool) -> Self {
+        self.attempt_isolation = attempt_isolation;
+        self
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+}
+
 /// Installed adapter plus its operation policy. Production code invokes
 /// through these methods so a deadline is always constructed. The raw
 /// `ExecutionAdapter` is not exposed.
 #[derive(Clone)]
 pub struct ResolvedAdapterBinding {
     adapter_kind: String,
+    adapter_binding_key: AdapterBindingKey,
     adapter: Arc<dyn ExecutionAdapter>,
     deadlines: AdapterDeadlinePolicy,
+    safety: AdapterSafetyEnvelope,
 }
 
 impl ResolvedAdapterBinding {
     pub(crate) fn new(
         adapter_kind: String,
+        adapter_binding_key: AdapterBindingKey,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
     ) -> Self {
         Self {
             adapter_kind,
+            adapter_binding_key,
             adapter,
             deadlines,
+            safety,
         }
+    }
+
+    pub fn enforces_attempt_isolation(&self) -> bool {
+        self.safety.attempt_isolation()
     }
 
     pub fn adapter_kind(&self) -> &str {
         &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
+        &self.adapter_binding_key
     }
 
     pub fn policy(&self) -> AdapterDeadlinePolicy {
@@ -193,8 +231,10 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new());
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(9)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         // No request: just mint via a dummy? start needs ExecutionRequest.
         // Endpoint inspection: call observe with empty handle after we have
@@ -231,7 +271,13 @@ mod tests {
             Duration::from_secs(6),
         )
         .unwrap();
-        let binding = ResolvedAdapterBinding::new("process".into(), fake.clone(), policy);
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            fake.clone(),
+            policy,
+            AdapterSafetyEnvelope::unenforceable(),
+        );
         let handle = RuntimeHandle(serde_json::json!({"h": 1}));
 
         binding.reconcile_start(&RequestId::new(), None).unwrap();
@@ -276,14 +322,14 @@ mod tests {
         let fast = AdapterDeadlinePolicy::uniform(Duration::from_secs(2)).unwrap();
         let slow = AdapterDeadlinePolicy::uniform(Duration::from_secs(60)).unwrap();
         adapters
-            .register("fast", Arc::new(FakeAdapter::new()), fast)
+            .register_kind("fast", Arc::new(FakeAdapter::new()), fast)
             .unwrap();
         adapters
-            .register("slow", Arc::new(FakeAdapter::new()), slow)
+            .register_kind("slow", Arc::new(FakeAdapter::new()), slow)
             .unwrap();
         assert_eq!(
             adapters
-                .resolve("fast")
+                .resolve_unique("fast")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::ReconcileStart),
@@ -291,12 +337,29 @@ mod tests {
         );
         assert_eq!(
             adapters
-                .resolve("slow")
+                .resolve_unique("slow")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::CollectOutcome),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn resolve_exact_rejects_binding_key_mismatch() {
+        let mut adapters = crate::AdapterRegistry::new();
+        adapters
+            .register_kind(
+                "process",
+                Arc::new(FakeAdapter::new()),
+                AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+        assert!(adapters
+            .resolve_exact("process", &AdapterBindingKey::for_tests())
+            .is_ok());
+        let other = AdapterBindingKey::new("other-domain").unwrap();
+        assert!(adapters.resolve_exact("process", &other).is_err());
     }
 
     /// M5.6 §49 #56-58: an observe timeout is an invocation error, never an
@@ -312,8 +375,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .observe_execution(&RuntimeHandle(serde_json::json!({})))
@@ -342,8 +407,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .interrupt_execution(&RuntimeHandle(serde_json::json!({})))
@@ -369,8 +436,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .terminate_execution(&RuntimeHandle(serde_json::json!({})))

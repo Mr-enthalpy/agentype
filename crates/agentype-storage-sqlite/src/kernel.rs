@@ -122,6 +122,7 @@ pub struct ExecutionReconciliationSnapshot {
     /// Adapter routing identity frozen at execution commitment (M5.2):
     /// recovery routes by THIS, never by current target/profile config.
     adapter_kind: String,
+    adapter_binding_key: String,
     persisted_state: ExecutionState,
     runtime_handle: Value,
     terminal_confirmed: bool,
@@ -191,6 +192,12 @@ impl ExecutionReconciliationSnapshot {
                 row.execution_id
             )));
         }
+        if row.adapter_binding_key.trim().is_empty() {
+            return Err(Error::invariant(format!(
+                "execution {} has a blank durable adapter binding key",
+                row.execution_id
+            )));
+        }
         Ok(Self {
             execution_id: ExecutionId::from_string(&row.execution_id),
             request_id: RequestId::from_string(&row.request_id),
@@ -199,6 +206,7 @@ impl ExecutionReconciliationSnapshot {
             lease_epoch: LeaseEpoch(row.lease_epoch as u64),
             incarnation_id: IncarnationId::from_string(&row.incarnation_id),
             adapter_kind: row.adapter_kind,
+            adapter_binding_key: row.adapter_binding_key,
             persisted_state: ExecutionState::parse_sql(&row.state)?,
             runtime_handle: json_load(&row.runtime_handle)?,
             terminal_confirmed: row.terminal_confirmed,
@@ -253,6 +261,11 @@ impl ExecutionReconciliationSnapshot {
     /// Frozen at execution commitment. Recovery MUST route by this value.
     pub fn adapter_kind(&self) -> &str {
         &self.adapter_kind
+    }
+
+    /// Opaque domain identity frozen at execution commitment.
+    pub fn adapter_binding_key(&self) -> &str {
+        &self.adapter_binding_key
     }
 
     pub fn persisted_state(&self) -> ExecutionState {
@@ -1381,6 +1394,16 @@ impl Kernel {
                 "execution commitment requires a non-blank adapter routing identity",
             ));
         }
+        if physical_binding
+            .adapter_binding_key()
+            .as_str()
+            .trim()
+            .is_empty()
+        {
+            return Err(Error::invalid_authority(
+                "execution commitment requires a non-blank adapter binding key",
+            ));
+        }
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
@@ -1486,8 +1509,8 @@ impl Kernel {
             let attempt_isolation = safety.attempt_isolation();
             tx.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,
-                 execution_profile,adapter_kind,attempt_isolation,state,started_at,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'STARTING',?10,?10)",
+                 execution_profile,adapter_kind,adapter_binding_key,attempt_isolation,state,started_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'STARTING',?11,?11)",
                 params![
                     execution_id.as_str(),
                     request_id.as_str(),
@@ -1497,6 +1520,7 @@ impl Kernel {
                     attempt.execution_target,
                     attempt.execution_profile,
                     physical_binding.adapter_kind(),
+                    physical_binding.adapter_binding_key().as_str(),
                     attempt_isolation as i64,
                     now
                 ],
@@ -2730,7 +2754,7 @@ impl Kernel {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.id,e.request_id,e.task_id,e.attempt_id,e.incarnation_id,
-                            e.adapter_kind,e.state,e.runtime_handle_json,
+                            e.adapter_kind,e.adapter_binding_key,e.state,e.runtime_handle_json,
                             e.terminal_confirmed,e.quiescent_confirmed,e.outcome_json,
                             e.summary,e.incarnation_reusable,e.failure_class,e.attempt_isolation,
                             a.lease_epoch,a.state,l.state,l.expires_at,t.state,t.current_attempt_id
@@ -2751,21 +2775,22 @@ impl Kernel {
                         attempt_id: r.get(3)?,
                         incarnation_id: r.get(4)?,
                         adapter_kind: r.get(5)?,
-                        state: r.get(6)?,
-                        runtime_handle: r.get(7)?,
-                        terminal_confirmed: r.get::<_, i64>(8)? != 0,
-                        quiescent_confirmed: r.get::<_, i64>(9)? != 0,
-                        outcome_json: r.get(10)?,
-                        summary: r.get(11)?,
-                        incarnation_reusable: r.get::<_, i64>(12)? != 0,
-                        failure_class: r.get(13)?,
-                        attempt_isolation: r.get::<_, i64>(14)? != 0,
-                        lease_epoch: r.get(15)?,
-                        attempt_state: r.get(16)?,
-                        lease_state: r.get(17)?,
-                        lease_expires_at: r.get(18)?,
-                        task_state: r.get(19)?,
-                        current_attempt_id: r.get(20)?,
+                        adapter_binding_key: r.get(6)?,
+                        state: r.get(7)?,
+                        runtime_handle: r.get(8)?,
+                        terminal_confirmed: r.get::<_, i64>(9)? != 0,
+                        quiescent_confirmed: r.get::<_, i64>(10)? != 0,
+                        outcome_json: r.get(11)?,
+                        summary: r.get(12)?,
+                        incarnation_reusable: r.get::<_, i64>(13)? != 0,
+                        failure_class: r.get(14)?,
+                        attempt_isolation: r.get::<_, i64>(15)? != 0,
+                        lease_epoch: r.get(16)?,
+                        attempt_state: r.get(17)?,
+                        lease_state: r.get(18)?,
+                        lease_expires_at: r.get(19)?,
+                        task_state: r.get(20)?,
+                        current_attempt_id: r.get(21)?,
                     })
                 })
                 .map_err(map_sqlite)?;
@@ -3430,6 +3455,7 @@ struct ReconciliationRow {
     attempt_id: String,
     incarnation_id: String,
     adapter_kind: String,
+    adapter_binding_key: String,
     state: String,
     runtime_handle: String,
     terminal_confirmed: bool,

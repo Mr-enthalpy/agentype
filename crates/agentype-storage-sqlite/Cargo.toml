@@ -15,3 +15,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 agentype-adapter-api.workspace = true
+agentype-execution-config = { workspace = true, features = ["test-support"] }

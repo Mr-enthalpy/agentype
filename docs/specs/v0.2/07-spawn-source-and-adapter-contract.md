@@ -38,9 +38,17 @@ Narrow interface, UNCHANGED from V0.1:
 - `collect_outcome`
 - `reconcile_start`
 
-Every call MUST return within a configured absolute deadline, including
-exception cleanup. Cleanup consumes remaining time; a depleted deadline MAY
-only kill or abandon without a fresh wait budget.
+All adapter-controlled waits, retries, protocol stages, cleanup waits and
+additional side-effect stages MUST obey the single absolute deadline.
+Under the host-kernel progress assumption, the Scheduler-facing operation
+MUST return within that deadline. An OS/kernel primitive that cannot be
+interrupted by the process is outside the in-process liveness guarantee;
+after such a primitive returns, an expired deadline MUST prohibit any new
+blocking/side-effect stage except immediate allowed cleanup. Cleanup
+consumes remaining time; a depleted deadline MAY only kill or abandon
+without a fresh wait budget. A helper thread, detached watchdog, or
+fresh per-stage timeout MUST NOT be used to paper over an uninterruptible
+kernel wait.
 
 `StartObservation` MUST carry `terminal_confirmed` and `quiescent_confirmed`
 (default false). Dispatcher MUST NOT derive those proofs from a
