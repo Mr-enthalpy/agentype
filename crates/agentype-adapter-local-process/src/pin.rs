@@ -148,7 +148,14 @@ impl PinnedInstance {
         }
         #[cfg(windows)]
         {
-            interrupt_windows_pinned(self.pid)
+            // CREATE_NO_WINDOW children have no console; AttachConsole(pid)
+            // plus GenerateConsoleCtrlEvent is numeric-PID TOCTOU, not an
+            // act on this PROCESS handle. Identity-bound graceful interrupt
+            // is an environment-owned channel, not local_process.
+            let _ = self.pid;
+            Err(AdapterError::unavailable(
+                "identity-bound interrupt unsupported for local_process on Windows",
+            ))
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -366,31 +373,6 @@ fn kill_windows_pinned(handle: *mut core::ffi::c_void) -> AdapterResult<()> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn interrupt_windows_pinned(pid: u32) -> AdapterResult<()> {
-    const CTRL_BREAK_EVENT: u32 = 1;
-    extern "system" {
-        fn AttachConsole(pid: u32) -> i32;
-        fn FreeConsole() -> i32;
-        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-    }
-    unsafe {
-        let attached = AttachConsole(pid) != 0;
-        let ok = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
-        if attached {
-            let _ = FreeConsole();
-        }
-        if ok {
-            Ok(())
-        } else {
-            Err(AdapterError::unavailable(
-                "interrupt not delivered (ctrl event failed)",
-            ))
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
 fn wait_windows(handle: *mut core::ffi::c_void, slice: Duration) {
     const WAIT_OBJECT_0: u32 = 0;
     extern "system" {
@@ -454,6 +436,31 @@ mod tests {
                 PinOutcome::Pinned(_)
             ),
             "expired kill must not terminate the pinned instance"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_interrupt_is_unavailable_and_does_not_kill() {
+        let mut child = spawn_hang();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(80));
+        let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
+        let birth = process_birth(pid, &long).expect("birth");
+        let pinned = match pin_instance(pid, birth, &long).unwrap() {
+            PinOutcome::Pinned(p) => p,
+            other => panic!("expected pin, got {other:?}"),
+        };
+        let err = pinned.interrupt(&long).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+        assert!(
+            matches!(
+                pin_instance(pid, birth, &long).unwrap(),
+                PinOutcome::Pinned(_)
+            ),
+            "Windows interrupt must not act on a numeric PID"
         );
         let _ = child.kill();
         let _ = child.wait();

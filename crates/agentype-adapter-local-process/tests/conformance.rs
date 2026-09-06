@@ -371,16 +371,22 @@ fn interrupt_attempts_physical_signal_or_reports_unsupported() {
         Ok(obs) => {
             assert_no_quiescence_obs(&obs);
             assert!(!obs.terminal_confirmed);
-            // Trapped interrupt must not be treated as Task cancel. Unix
-            // SIGINT is ignored; Windows may still be RUNNING if the ctrl
-            // event landed and was ignored.
-            if obs.state == ExecutionState::Running {
-                assert_eq!(obs.state, ExecutionState::Running);
-            }
+            #[cfg(windows)]
+            panic!("Windows interrupt must be Unavailable, not a PID console signal");
+            // Trapped SIGINT must not be treated as Task cancel.
+            #[cfg(not(windows))]
+            let _ = obs.state;
         }
         Err(err) => {
             assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
             assert_no_secret(&err);
+            #[cfg(windows)]
+            {
+                let still = adapter
+                    .observe_execution(&start.runtime_handle, &long_deadline())
+                    .unwrap();
+                assert_eq!(still.state, ExecutionState::Running);
+            }
         }
     }
     adapter

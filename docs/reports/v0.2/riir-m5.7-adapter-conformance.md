@@ -41,7 +41,7 @@ DeepSeek, not an ArchitectureAgent.
 | --- | --- |
 | A | crate `agentype-adapter-local-process`, workspace member, `fake-agent` bin, `target_options.{command,args,cwd,env}` |
 | B | `start_execution`: staged spawn, same-thread stdin of opaque payload JSON, handle with pid+birth |
-| C | observe / interrupt (real SIGINT/CTRL_BREAK) / terminate (pid-level after Drop) |
+| C | observe / interrupt (Linux SIGINT via pidfd; Windows Unavailable) / terminate (pinned PROCESS handle) |
 | D | `collect_outcome`: bounded stdout `{ok,payload,summary}` — no Scheduler `failure_class` |
 | E | `reconcile_start` by `request_id` + handle; protocol errors are `AdapterError` |
 | F | `adapter_binding_key` frozen at Execution creation (SCHEMA_VERSION 4) |
@@ -111,7 +111,7 @@ never call process-wide `set_var`.
 | deadline after partial locator | stdin timeout returns `runtime_handle_hint` |
 | cleanup with remaining budget | uncommitted start stdin timeout kill + `try_wait` before return |
 | cleanup with depleted budget | collect timeout is `DeadlineExceeded` without SUCCEEDED; no fresh wait |
-| interrupt timeout | expired interrupt → `DeadlineExceeded`; live interrupt attempts SIGINT/CTRL_BREAK |
+| interrupt timeout | expired interrupt → `DeadlineExceeded`; live Linux interrupt is pidfd SIGINT; Windows live interrupt is `Unavailable` |
 | terminate timeout | expired terminate → `DeadlineExceeded` and does **not** claim TERMINATED (process still RUNNING) |
 | reconcile timeout | expired reconcile → `DeadlineExceeded` |
 | collect timeout | hang collect → `DeadlineExceeded` with hint, not terminal proof |
@@ -192,7 +192,8 @@ Closed in-milestone, not deferred to M5.8:
   probes take the same `AdapterDeadline`
 - interrupt/terminate pin the process instance (pidfd / PROCESS handle)
   before any signal; forged pid+wrong birth must not control a decoy;
-  deadline is rechecked after pin before signal/kill
+  deadline is rechecked after pin before signal/kill. Windows interrupt
+  is Unavailable (no PID `AttachConsole` / CTRL_BREAK)
 - `attempt_isolation` ∩ installed `AdapterSafetyEnvelope`; local_process
   cannot enforce isolation
 - Identified process end is Terminated/ENDED → collect, not EXECUTION_LOST
