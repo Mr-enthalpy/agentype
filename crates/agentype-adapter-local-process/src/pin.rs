@@ -49,18 +49,24 @@ pub(crate) enum PinOutcome {
 }
 
 /// Result of classifying a Windows `OpenProcess` return + `GetLastError`.
+/// Compiled on Windows production and on every-OS tests.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowsOpen {
     Present,
     Gone,
 }
 
+#[cfg(any(windows, test))]
 const ERROR_ACCESS_DENIED: i32 = 5;
+#[cfg(any(windows, test))]
 const ERROR_INVALID_PARAMETER: i32 = 87;
+#[cfg(any(windows, test))]
 const STILL_ACTIVE: u32 = 259;
 
 /// Only `ERROR_INVALID_PARAMETER` is positive PID-absence. Access and
 /// unknown failures must not become `Gone`.
+#[cfg(any(windows, test))]
 pub(crate) fn classify_open_process(
     handle_is_null: bool,
     last_error: i32,
@@ -76,6 +82,7 @@ pub(crate) fn classify_open_process(
 }
 
 /// `GetProcessTimes` failure is an observation error, not process absence.
+#[cfg(any(windows, test))]
 pub(crate) fn classify_process_times(ok: bool, creation: u64) -> AdapterResult<u64> {
     if !ok {
         return Err(AdapterError::other("GetProcessTimes failed"));
@@ -84,6 +91,7 @@ pub(crate) fn classify_process_times(ok: bool, creation: u64) -> AdapterResult<u
 }
 
 /// `GetExitCodeProcess` failure is an observation error, not "not alive".
+#[cfg(any(windows, test))]
 pub(crate) fn classify_still_active(query_ok: bool, code: u32) -> AdapterResult<bool> {
     if !query_ok {
         return Err(AdapterError::other("GetExitCodeProcess failed"));
@@ -92,6 +100,7 @@ pub(crate) fn classify_still_active(query_ok: bool, code: u32) -> AdapterResult<
 }
 
 /// Terminate + query failure must not become terminate success.
+#[cfg(any(windows, test))]
 pub(crate) fn classify_terminate(
     terminate_ok: bool,
     still: AdapterResult<bool>,
