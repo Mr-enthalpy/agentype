@@ -10,7 +10,7 @@ fn pidfd_liveness_never_follows_recycled_numeric_pid() {
     // Hosted Ubuntu rejects unprivileged uid_map writes. PID namespace
     // recycle still requires CAP_SYS_ADMIN; passwordless sudo is the CI path.
     let status = Command::new("sudo")
-        .args(["unshare", "--pid", "--fork", "--kill-child"])
+        .args(["unshare", "--pid", "--fork", "--mount-proc", "--kill-child"])
         .arg(bin)
         .status()
         .expect("sudo unshare must exist on Linux CI");

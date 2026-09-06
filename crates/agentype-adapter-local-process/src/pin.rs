@@ -309,7 +309,14 @@ pub(crate) fn recycle_pid_experiment() -> i32 {
             return 6;
         }
         libc::kill(a, libc::SIGKILL);
-        libc::waitpid(a, std::ptr::null_mut(), 0);
+        while libc::waitpid(a, std::ptr::null_mut(), 0) < 0 {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                libc::close(pidfd);
+                return 7;
+            }
+        }
+        // The PID cursor advances; force the next fork to reuse A's number.
+        let _ = std::fs::write("/proc/sys/kernel/ns_last_pid", (a - 1).to_string());
         let b = libc::fork();
         if b < 0 {
             libc::close(pidfd);
