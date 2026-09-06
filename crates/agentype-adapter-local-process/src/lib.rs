@@ -631,7 +631,7 @@ fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(c
     )?;
     #[cfg(windows)]
     {
-        Ok(process_birth_windows(pid).map(|b| ('R', b)))
+        Ok(process_birth_windows(pid)?.map(|b| ('R', b)))
     }
     #[cfg(target_os = "linux")]
     {
@@ -646,9 +646,8 @@ fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(c
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn process_birth_windows(pid: u32) -> Option<u64> {
+fn process_birth_windows(pid: u32) -> AdapterResult<Option<u64>> {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
     #[repr(C)]
     struct FileTime {
         low: u32,
@@ -669,30 +668,53 @@ fn process_birth_windows(pid: u32) -> Option<u64> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return None;
+            let last = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return match pin::classify_open_process(true, last)? {
+                pin::WindowsOpen::Gone => Ok(None),
+                pin::WindowsOpen::Present => unreachable!("null OpenProcess is not Present"),
+            };
         }
         let mut code = 0u32;
-        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        let query_ok = GetExitCodeProcess(handle, &mut code) != 0;
+        let still = match pin::classify_still_active(query_ok, code) {
+            Ok(still) => still,
+            Err(err) => {
+                CloseHandle(handle);
+                return Err(err);
+            }
+        };
         let mut creation = FileTime { low: 0, high: 0 };
         let mut exit = FileTime { low: 0, high: 0 };
         let mut kernel = FileTime { low: 0, high: 0 };
         let mut user = FileTime { low: 0, high: 0 };
-        let times = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let times_ok =
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
         CloseHandle(handle);
-        if !alive || times == 0 {
-            return None;
+        let birth = pin::classify_process_times(
+            times_ok,
+            ((creation.high as u64) << 32) | creation.low as u64,
+        )?;
+        if !still {
+            return Ok(None);
         }
-        Some(((creation.high as u64) << 32) | creation.low as u64)
+        Ok(Some(birth))
     }
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn process_stat_linux(pid: u32) -> AdapterResult<Option<(char, u64)>> {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(text) => Ok(parse_stat_identity(&text)),
+        Ok(text) => stat_identity_from_text(&text).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(AdapterError::other("process stat probe failed")),
     }
+}
+
+/// Parse `/proc/<pid>/stat` identity. Malformed text is an observation
+/// error, not process absence.
+#[cfg(any(target_os = "linux", test))]
+fn stat_identity_from_text(text: &str) -> AdapterResult<(char, u64)> {
+    parse_stat_identity(text).ok_or_else(|| AdapterError::other("process stat parse failed"))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1390,6 +1412,19 @@ mod tests {
         let line = "1234 (fake-agent) Z 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99999 0";
         assert_eq!(parse_stat_identity(line), Some(('Z', 99999)));
         assert!(matches!(parse_stat_identity(line), Some(('Z', _))));
+    }
+
+    #[test]
+    fn malformed_proc_stat_is_adapter_error_not_gone() {
+        let err = stat_identity_from_text("not-a-stat-line").unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Other);
+        assert!(parse_stat_identity("1234 (no-fields)").is_none());
+        assert_eq!(
+            stat_identity_from_text("1234 (no-fields)")
+                .unwrap_err()
+                .kind(),
+            AdapterErrorKind::Other
+        );
     }
 
     #[test]

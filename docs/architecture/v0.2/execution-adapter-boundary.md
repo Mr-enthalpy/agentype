@@ -186,8 +186,11 @@ Control (interrupt/terminate/reap) MUST target a pinned process instance
 act). After pin returns, interrupt/kill recheck the same deadline before
 signaling. A stale handle with a reused PID MUST NOT affect the new occupant.
 
-Observation errors (`try_wait` failure, `/proc` I/O other than not-found)
-are `AdapterError`, not physical absence.
+Observation errors (`try_wait` failure, `/proc` I/O other than not-found,
+malformed `/proc` stat, Windows `OpenProcess` access/unknown failure,
+`GetProcessTimes` / `GetExitCodeProcess` failure) are `AdapterError`, not
+physical absence. Only ENOENT/`ERROR_INVALID_PARAMETER` is `Gone`.
+Terminate + query failure is not TERMINATED proof.
 
 `attempt_isolation` on `ExecutionTargetConfig` is a requirement, not a
 proof. It intersects the installed binding's `AdapterSafetyEnvelope`.

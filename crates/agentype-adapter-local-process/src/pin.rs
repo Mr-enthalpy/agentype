@@ -48,6 +48,64 @@ pub(crate) enum PinOutcome {
     Mismatch,
 }
 
+/// Result of classifying a Windows `OpenProcess` return + `GetLastError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsOpen {
+    Present,
+    Gone,
+}
+
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_INVALID_PARAMETER: i32 = 87;
+const STILL_ACTIVE: u32 = 259;
+
+/// Only `ERROR_INVALID_PARAMETER` is positive PID-absence. Access and
+/// unknown failures must not become `Gone`.
+pub(crate) fn classify_open_process(
+    handle_is_null: bool,
+    last_error: i32,
+) -> AdapterResult<WindowsOpen> {
+    if !handle_is_null {
+        return Ok(WindowsOpen::Present);
+    }
+    match last_error {
+        ERROR_INVALID_PARAMETER => Ok(WindowsOpen::Gone),
+        ERROR_ACCESS_DENIED => Err(AdapterError::unavailable("OpenProcess access denied")),
+        _ => Err(AdapterError::other("OpenProcess failed")),
+    }
+}
+
+/// `GetProcessTimes` failure is an observation error, not process absence.
+pub(crate) fn classify_process_times(ok: bool, creation: u64) -> AdapterResult<u64> {
+    if !ok {
+        return Err(AdapterError::other("GetProcessTimes failed"));
+    }
+    Ok(creation)
+}
+
+/// `GetExitCodeProcess` failure is an observation error, not "not alive".
+pub(crate) fn classify_still_active(query_ok: bool, code: u32) -> AdapterResult<bool> {
+    if !query_ok {
+        return Err(AdapterError::other("GetExitCodeProcess failed"));
+    }
+    Ok(code == STILL_ACTIVE)
+}
+
+/// Terminate + query failure must not become terminate success.
+pub(crate) fn classify_terminate(
+    terminate_ok: bool,
+    still: AdapterResult<bool>,
+) -> AdapterResult<()> {
+    if terminate_ok {
+        return Ok(());
+    }
+    match still {
+        Ok(true) => Err(AdapterError::unavailable("TerminateProcess failed")),
+        Ok(false) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Open a pinned identity for `pid` and confirm `expected_birth`.
 pub(crate) fn pin_instance(
     pid: u32,
@@ -116,7 +174,7 @@ impl PinnedInstance {
         }
         #[cfg(windows)]
         {
-            Ok(windows_still_active(self.handle))
+            windows_still_active(self.handle)
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -234,13 +292,14 @@ fn pin_windows(
         )
     };
     if handle.is_null() {
-        return Ok(PinOutcome::Gone);
+        let last = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return match classify_open_process(true, last)? {
+            WindowsOpen::Gone => Ok(PinOutcome::Gone),
+            WindowsOpen::Present => unreachable!("null OpenProcess is not Present"),
+        };
     }
     let pinned = PinnedInstance { pid, handle };
-    let birth = match windows_creation(handle) {
-        Some(b) => b,
-        None => return Ok(PinOutcome::Gone),
-    };
+    let birth = windows_creation(handle)?;
     if birth != expected_birth {
         return Ok(PinOutcome::Mismatch);
     }
@@ -249,7 +308,7 @@ fn pin_windows(
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn windows_creation(handle: *mut core::ffi::c_void) -> Option<u64> {
+fn windows_creation(handle: *mut core::ffi::c_void) -> AdapterResult<u64> {
     #[repr(C)]
     struct FileTime {
         low: u32,
@@ -269,21 +328,21 @@ fn windows_creation(handle: *mut core::ffi::c_void) -> Option<u64> {
     let mut kernel = FileTime { low: 0, high: 0 };
     let mut user = FileTime { low: 0, high: 0 };
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    if ok == 0 {
-        return None;
-    }
-    Some(((creation.high as u64) << 32) | creation.low as u64)
+    classify_process_times(
+        ok != 0,
+        ((creation.high as u64) << 32) | creation.low as u64,
+    )
 }
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn windows_still_active(handle: *mut core::ffi::c_void) -> bool {
-    const STILL_ACTIVE: u32 = 259;
+fn windows_still_active(handle: *mut core::ffi::c_void) -> AdapterResult<bool> {
     extern "system" {
         fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
     }
     let mut code = 0u32;
-    unsafe { GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE }
+    let query_ok = unsafe { GetExitCodeProcess(handle, &mut code) != 0 };
+    classify_still_active(query_ok, code)
 }
 
 #[cfg(windows)]
@@ -292,12 +351,8 @@ fn kill_windows_pinned(handle: *mut core::ffi::c_void) -> AdapterResult<()> {
     extern "system" {
         fn TerminateProcess(handle: *mut core::ffi::c_void, code: u32) -> i32;
     }
-    unsafe {
-        if TerminateProcess(handle, 1) == 0 && windows_still_active(handle) {
-            return Err(AdapterError::unavailable("TerminateProcess failed"));
-        }
-    }
-    Ok(())
+    let terminate_ok = unsafe { TerminateProcess(handle, 1) != 0 };
+    classify_terminate(terminate_ok, windows_still_active(handle))
 }
 
 #[cfg(windows)]
@@ -393,5 +448,55 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn open_process_invalid_parameter_is_gone() {
+        assert_eq!(
+            classify_open_process(false, 0).unwrap(),
+            WindowsOpen::Present
+        );
+        assert_eq!(
+            classify_open_process(true, ERROR_INVALID_PARAMETER).unwrap(),
+            WindowsOpen::Gone
+        );
+    }
+
+    #[test]
+    fn open_process_access_denied_is_unavailable_not_gone() {
+        let err = classify_open_process(true, ERROR_ACCESS_DENIED).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn open_process_unknown_failure_is_other_not_gone() {
+        let err = classify_open_process(true, 1234).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Other);
+    }
+
+    #[test]
+    fn get_process_times_failure_is_adapter_error_not_gone() {
+        let err = classify_process_times(false, 0).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Other);
+        assert_eq!(classify_process_times(true, 99).unwrap(), 99);
+    }
+
+    #[test]
+    fn get_exit_code_failure_is_adapter_error_not_dead() {
+        let err = classify_still_active(false, 0).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Other);
+        assert!(classify_still_active(true, STILL_ACTIVE).unwrap());
+        assert!(!classify_still_active(true, 1).unwrap());
+    }
+
+    #[test]
+    fn terminate_plus_query_failure_is_adapter_error_not_success() {
+        let err = classify_terminate(false, Err(AdapterError::other("GetExitCodeProcess failed")))
+            .unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::Other);
+        let live = classify_terminate(false, Ok(true)).unwrap_err();
+        assert_eq!(live.kind(), AdapterErrorKind::Unavailable);
+        classify_terminate(false, Ok(false)).unwrap();
+        classify_terminate(true, Err(AdapterError::other("ignored"))).unwrap();
     }
 }

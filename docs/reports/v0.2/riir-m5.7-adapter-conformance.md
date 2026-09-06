@@ -198,7 +198,11 @@ Closed in-milestone, not deferred to M5.8:
 - Identified process end is Terminated/ENDED → collect, not EXECUTION_LOST
 - Production install is `import` / `ImportableAdapter` (kind+key+safety
   from the adapter)
-- `try_wait` / `/proc` errors are AdapterError, not process absence
+- `try_wait` / `/proc` errors are AdapterError, not process absence;
+  malformed `/proc` stat is Other, not Gone; Windows OpenProcess only
+  `ERROR_INVALID_PARAMETER` is Gone; GetProcessTimes / GetExitCodeProcess
+  failure is AdapterError; TerminateProcess + query failure is not
+  TERMINATED proof
 - Generic prompt and adapter-authored `FailureClass` removed from DTOs
 - Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
   aligned (host-kernel progress assumption; no watchdog)
