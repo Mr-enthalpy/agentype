@@ -1205,10 +1205,20 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
-        match pin::pin_instance(
+        let trusted_live = {
+            let live = self.live.lock().expect("live map");
+            live.get(&parsed.pid)
+                .is_some_and(|p| p.birth == parsed.birth && p.inst == parsed.inst)
+        };
+        let token = if trusted_live {
+            None
+        } else {
+            Some(parsed.inst.as_str())
+        };
+        match pin::pin_instance_with_token_check(
             parsed.pid,
             parsed.birth,
-            &parsed.inst,
+            token,
             &parsed.stdout_path,
             deadline,
         )? {
@@ -1242,10 +1252,10 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         };
         if let Some(mut proc) = proc {
-            match pin::pin_instance(
+            match pin::pin_instance_with_token_check(
                 parsed.pid,
                 parsed.birth,
-                &parsed.inst,
+                None,
                 &parsed.stdout_path,
                 deadline,
             )? {

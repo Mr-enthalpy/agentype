@@ -127,6 +127,24 @@ pub(crate) fn pin_instance(
     stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<PinOutcome> {
+    pin_instance_with_token_check(
+        pid,
+        expected_birth,
+        Some(expected_token),
+        stdout_path,
+        deadline,
+    )
+}
+
+/// `None` token: caller already holds the Child (in-process live map).
+/// Restart paths must pass `Some(token)`.
+pub(crate) fn pin_instance_with_token_check(
+    pid: u32,
+    expected_birth: u64,
+    expected_token: Option<&str>,
+    stdout_path: &std::path::Path,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<PinOutcome> {
     require_deadline(deadline, "deadline exhausted before pinning process", None)?;
     #[cfg(target_os = "linux")]
     {
@@ -248,7 +266,7 @@ impl PinnedInstance {
 fn pin_linux(
     pid: u32,
     expected_birth: u64,
-    expected_token: &str,
+    expected_token: Option<&str>,
     stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<PinOutcome> {
@@ -274,8 +292,10 @@ fn pin_linux(
     require_deadline(deadline, "deadline exhausted after process stat", None)?;
     match stat {
         Some((_, birth)) if birth == expected_birth => {
-            if !instance_token_matches(pid, expected_token, stdout_path, deadline)? {
-                return Ok(PinOutcome::Mismatch);
+            if let Some(token) = expected_token {
+                if !instance_token_matches(pid, token, stdout_path, deadline)? {
+                    return Ok(PinOutcome::Mismatch);
+                }
             }
             require_deadline(deadline, "deadline exhausted after environ", None)?;
             Ok(PinOutcome::Pinned(pinned))
