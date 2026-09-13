@@ -479,77 +479,6 @@ fn collect_and_apply(
             FailureClass::Unknown,
             Some(&observation.runtime_handle.0),
         ),
-        CollectedOutcomeKind::TerminalSuccess => {
-            let payload = outcome.payload.clone().unwrap_or(Value::Null);
-            kernel
-                .record_pending_physical_terminal(
-                    snapshot.execution_id(),
-                    ExecutionState::Succeeded,
-                    Some(&observation.runtime_handle.0),
-                    outcome.payload.as_ref(),
-                    outcome.summary.as_deref(),
-                    None,
-                    outcome.quiescent_confirmed,
-                    outcome.incarnation_reusable,
-                )
-                .map_err(RecoveryError::from)?;
-            match kernel.ack_success(
-                snapshot.attempt_id(),
-                snapshot.lease_epoch(),
-                Some(snapshot.execution_id()),
-                &payload,
-                outcome.summary.as_deref(),
-                outcome.quiescent_confirmed,
-                outcome.incarnation_reusable,
-            ) {
-                Ok(Some(result_id)) => Ok(ReconcileExecutionOutcome::TaskCompleted { result_id }),
-                Ok(None) => Ok(ReconcileExecutionOutcome::WriterSafetySuspendedAfterSuccess),
-                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                    kernel
-                        .record_physical_outcome(
-                            snapshot.execution_id(),
-                            ExecutionState::Succeeded,
-                            Some(&observation.runtime_handle.0),
-                            outcome.payload.as_ref(),
-                            None,
-                            true,
-                            outcome.quiescent_confirmed,
-                        )
-                        .map_err(RecoveryError::from)?;
-                    Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
-                }
-                Err(err) => Err(RecoveryError::from(err)),
-            }
-        }
-        CollectedOutcomeKind::TerminalFailure { failure_class } => {
-            kernel
-                .record_pending_physical_terminal(
-                    snapshot.execution_id(),
-                    ExecutionState::Failed,
-                    Some(&observation.runtime_handle.0),
-                    None,
-                    outcome.summary.as_deref(),
-                    Some(failure_class),
-                    outcome.quiescent_confirmed,
-                    outcome.incarnation_reusable,
-                )
-                .map_err(RecoveryError::from)?;
-            match kernel.nack(
-                snapshot.attempt_id(),
-                snapshot.lease_epoch(),
-                failure_class,
-                Some(snapshot.execution_id()),
-                true,
-                outcome.quiescent_confirmed,
-                outcome.incarnation_reusable,
-            ) {
-                Ok(_) => Ok(ReconcileExecutionOutcome::TerminalFailure { failure_class }),
-                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                    Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
-                }
-                Err(err) => Err(RecoveryError::from(err)),
-            }
-        }
     }
 }
 
@@ -836,8 +765,8 @@ mod tests {
         AdapterBindingKey, AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
     };
     use agentype_adapter_api::{
-        AdapterResult, ExecutionAdapter, ExecutionObservation, ExecutionOutcome, FakeAdapter,
-        RuntimeHandle, StartObservation,
+        AdapterResult, ExecutionAdapter, ExecutionObservation, FakeAdapter,
+        PhysicalExecutionOutcome, RuntimeHandle, StartObservation,
     };
     use agentype_core::{
         AttemptState, AuthoritativeExecutionBinding, Claim, Clock, ExecutionState, FailureClass,
@@ -1497,25 +1426,18 @@ mod tests {
             terminal_confirmed: true,
             quiescent_confirmed: true,
         });
-        fake.set_next_outcome(agentype_adapter_api::ExecutionOutcome {
-            state: ExecutionState::Succeeded,
-            payload: Some(json!({"ok": true})),
-            summary: Some("done".into()),
-            terminal_confirmed: true,
-            quiescent_confirmed: true,
-            incarnation_reusable: false,
-        });
+        fake.set_next_outcome(PhysicalExecutionOutcome::exited());
         let adapters = adapters(&fake);
         let (_claim, launch) = start_named(&kernel, TaskSpec::new("term", json!({"o": 1})));
         let snap = snapshot_of(&kernel, launch.execution_id());
         match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
-            ReconcileExecutionOutcome::TaskCompleted { .. } => {}
-            other => panic!("expected TaskCompleted, got {other:?}"),
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
         }
         assert_eq!(fake.start_call_count(), 0);
         assert_eq!(fake.collect_call_count(), 1);
         assert_eq!(svc.active_count(), 0);
-        assert_eq!(
+        assert_ne!(
             kernel.task(snap.task_id()).unwrap().state,
             TaskState::Completed
         );
@@ -1699,8 +1621,8 @@ mod tests {
         let snap = snapshot_of(&kernel, launch.execution_id());
 
         match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
-            ReconcileExecutionOutcome::TaskCompleted { .. } => {}
-            other => panic!("expected TaskCompleted, got {other:?}"),
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
         }
         let rec = fake
             .deadline_for(agentype_adapter_api::AdapterOperation::ReconcileStart)
@@ -2223,7 +2145,7 @@ mod tests {
     impl ExecutionAdapter for ClockAdvancingAdapter {
         fn start_execution(
             &self,
-            request: &agentype_adapter_api::ExecutionRequest,
+            request: &agentype_adapter_api::EnvironmentStartRequest,
             deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
             self.inner.start_execution(request, deadline)
@@ -2257,7 +2179,7 @@ mod tests {
             &self,
             handle: &RuntimeHandle,
             deadline: &agentype_adapter_api::AdapterDeadline,
-        ) -> AdapterResult<ExecutionOutcome> {
+        ) -> AdapterResult<agentype_adapter_api::PhysicalExecutionOutcome> {
             self.inner.collect_outcome(handle, deadline)
         }
 

@@ -40,7 +40,7 @@ DeepSeek, not an ArchitectureAgent.
 | Slice | What |
 | --- | --- |
 | A | crate `agentype-adapter-local-process`, workspace member, `fake-agent` bin, `target_options.{command,args,cwd,env}` |
-| B | `start_execution`: staged spawn, same-thread stdin of opaque payload JSON, handle with pid+birth |
+| B | `start_execution`: staged spawn, empty stdin (not Task payload), handle with pid+birth+inst |
 | C | observe / interrupt (Linux SIGINT via pidfd; Windows Unavailable) / terminate (pinned PROCESS handle) |
 | D | `collect_outcome`: bounded stdout `{ok,payload,summary}` — no Scheduler `failure_class` |
 | E | `reconcile_start` by `request_id` + handle; protocol errors are `AdapterError` |
@@ -88,14 +88,12 @@ the remaining start budget for the agent to finish; that wait belongs to
 observe is Terminated/ENDED (physical collect), never Task SUCCEEDED.
 Identity unconfirmed remains UNKNOWN. Unverifiable identity is
 AdapterError, not Mismatch-as-ended. Kill-sent is not quiescence.
-Adapter stdin is not Task payload; collect is not Result JSON.
-Any `failure_class` key in agent JSON is `AdapterError::Protocol`.
-`ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol.
-Terminal `ok:false` is Failed; Runtime maps it to `StartFailure`.
+Adapter stdin is empty (not Task payload). Collect is
+`PhysicalExecutionOutcome`, not Result JSON. Agent stdout is an artifact
+path, not ACK proof.
 
-Stdin is opaque payload JSON on the calling thread (PIPE_NOWAIT /
-O_NONBLOCK). Drop reaps zombies with `try_wait` and leaves running
-children alive. Linux treats `/proc` state `Z`/`X` as not alive.
+Drop reaps zombies with `try_wait` and leaves running children alive.
+Linux treats `/proc` state `Z`/`X` as not alive.
 
 `FAKE_AGENT_*` is passed per child through `target_options.env`. Tests
 never call process-wide `set_var`.
@@ -107,7 +105,7 @@ never call process-wide `set_var`.
 | Obligation | Proof |
 | --- | --- |
 | blocked process/session initialization | start does not wait for agent-ready; missing executable → `Unavailable`; expired start deadline rejected before spawn |
-| blocked request write | 2 MiB unread stdin + hang → `DeadlineExceeded` + handle hint; write is same-thread PIPE_NOWAIT / `O_NONBLOCK` (no helper thread) |
+| blocked request write | Task payload is not written; large payload does not block start |
 | blocked response read | collect of `FAKE_AGENT_HANG` returns by the collect deadline |
 | deadline between start stages | spawn, stdin write, and one `try_wait` share the start endpoint; recheck before RUNNING |
 | deadline after partial locator | stdin timeout returns `runtime_handle_hint` |
@@ -117,7 +115,7 @@ never call process-wide `set_var`.
 | terminate timeout | expired terminate → `DeadlineExceeded` and does **not** claim TERMINATED (process still RUNNING) |
 | reconcile timeout | expired reconcile → `DeadlineExceeded` |
 | collect timeout | hang collect → `DeadlineExceeded` with hint, not terminal proof |
-| bounded stdout | oversize file → Protocol, not SUCCEEDED |
+| bounded stdout | collect does not slurp stdout as Result |
 | diagnostic length | `AdapterDiagnostic` still caps 512 chars. This crate does not implement a secret scanner; unread stderr is not sanitization evidence. |
 
 All six operations reject an already-expired `AdapterDeadline` before I/O.
@@ -130,13 +128,13 @@ Creation: `start_creates_environment_and_returns_persisted_handle`
 Observation: `observe_running_and_exited_environments`, `observe_unknown_handle_is_protocol`
 Deadline: `expired_deadline_is_rejected_on_all_six_operations`, collect/start blocked-I/O tests
 Control: `interrupt_attempts_physical_signal_or_reports_unsupported`, `terminate_kill_is_not_quiescence_or_task_cancel`, `terminate_timeout_does_not_imply_termination`
-Collection: success / structured failure / malformed protocol / oversize / `WRITER_QUIESCENCE_UNKNOWN` Protocol
+Collection: physical exit; agent JSON is ignored
 Restart: reconnect live handle; failed reconnect UNKNOWN; no handle is not a new start; mismatched `request_id` is Protocol; birth mismatch is UNKNOWN
 Lifecycle: `adapter_drop_does_not_kill_committed_execution`
 
-Boundary extras: opaque `target_options` keys are not Core fields; stdin is
-opaque payload JSON. `RenderedWorkerPrompt` remains an optional V0.1
-renderer, not an Adapter input.
+Boundary extras: opaque `target_options` keys are not Core fields. stdin is
+not Task payload. `RenderedWorkerPrompt` is V0.1 worker-plane, not an
+`ExecutionAdapter` input.
 
 ---
 

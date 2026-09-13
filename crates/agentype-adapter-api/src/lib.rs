@@ -152,6 +152,8 @@ pub type AdapterResult<T> = Result<T, AdapterError>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeHandle(pub Value);
 
+/// Deterministic V0.1 worker-plane protocol. Not part of `ExecutionAdapter`.
+///
 /// Deterministic, provider-neutral worker protocol derived from an
 /// authoritative launch snapshot.
 ///
@@ -473,6 +475,94 @@ impl ExecutionRequest {
     }
 }
 
+/// Physical-only start request for `ExecutionAdapter`. No Task payload,
+/// acceptance, workstream, or semantic continuity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentStartRequest {
+    request_id: RequestId,
+    execution_id: ExecutionId,
+    workspace_mode: WorkspaceMode,
+    incarnation_runtime_handle: RuntimeHandle,
+    target_options: Value,
+    profile_options: Value,
+    profile_timeout_seconds: Option<f64>,
+    attempt_isolation: bool,
+}
+
+impl EnvironmentStartRequest {
+    pub fn from_launch(
+        launch: &ExecutionLaunchSnapshot,
+        environment: &ResolvedExecutionEnvironment,
+    ) -> Result<Self, LaunchEnvironmentMismatch> {
+        let safety = environment.safety();
+        let mut mismatched: Vec<&'static str> = Vec::new();
+        if launch.safety().attempt_id().as_str() != safety.attempt_id().as_str() {
+            mismatched.push("attempt_id");
+        }
+        if launch.safety().lease_epoch() != safety.lease_epoch() {
+            mismatched.push("lease_epoch");
+        }
+        if launch.execution_target() != safety.execution_target() {
+            mismatched.push("execution_target");
+        }
+        if launch.execution_profile() != safety.execution_profile() {
+            mismatched.push("execution_profile");
+        }
+        if launch.safety().attempt_isolation() != safety.attempt_isolation() {
+            mismatched.push("attempt_isolation");
+        }
+        if !mismatched.is_empty() {
+            return Err(LaunchEnvironmentMismatch {
+                detail: format!(
+                    "launch snapshot and resolved environment describe different attempts: {mismatched:?}"
+                ),
+            });
+        }
+        Ok(Self {
+            request_id: launch.request_id().clone(),
+            execution_id: launch.execution_id().clone(),
+            workspace_mode: launch.workspace_mode(),
+            incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
+            target_options: environment.target().options.clone(),
+            profile_options: environment.profile().options.clone(),
+            profile_timeout_seconds: environment.profile().timeout_seconds,
+            attempt_isolation: safety.attempt_isolation(),
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+
+    pub fn workspace_mode(&self) -> WorkspaceMode {
+        self.workspace_mode
+    }
+
+    pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
+        &self.incarnation_runtime_handle
+    }
+
+    pub fn target_options(&self) -> &Value {
+        &self.target_options
+    }
+
+    pub fn profile_options(&self) -> &Value {
+        &self.profile_options
+    }
+
+    pub fn profile_timeout_seconds(&self) -> Option<f64> {
+        self.profile_timeout_seconds
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StartObservation {
     pub state: ExecutionState,
@@ -501,10 +591,55 @@ pub struct ExecutionOutcome {
     pub incarnation_reusable: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicalState {
+    Exited,
+    Terminated,
+    Unknown,
+}
+
+/// Physical environment collect result. Not a Task Result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicalExecutionOutcome {
+    pub physical_state: PhysicalState,
+    pub exit_status: Option<i32>,
+    pub artifact_refs: Option<Value>,
+    pub diagnostic: Option<String>,
+}
+
+impl PhysicalExecutionOutcome {
+    pub fn exited() -> Self {
+        Self {
+            physical_state: PhysicalState::Exited,
+            exit_status: Some(0),
+            artifact_refs: None,
+            diagnostic: None,
+        }
+    }
+
+    pub fn terminated() -> Self {
+        Self {
+            physical_state: PhysicalState::Terminated,
+            exit_status: None,
+            artifact_refs: None,
+            diagnostic: None,
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self {
+            physical_state: PhysicalState::Unknown,
+            exit_status: None,
+            artifact_refs: None,
+            diagnostic: None,
+        }
+    }
+}
+
 pub trait ExecutionAdapter: Send + Sync {
     fn start_execution(
         &self,
-        request: &ExecutionRequest,
+        request: &EnvironmentStartRequest,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation>;
     fn observe_execution(
@@ -526,7 +661,7 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
-    ) -> AdapterResult<ExecutionOutcome>;
+    ) -> AdapterResult<PhysicalExecutionOutcome>;
     /// Spec 07: narrow interface UNCHANGED from V0.1. Reconciliation is keyed
     /// by the stable start request identity because an ambiguous start may
     /// leave the scheduler without a complete runtime handle; the persisted
@@ -566,7 +701,7 @@ struct FakeState {
     next_observe_error: Option<AdapterError>,
     next_interrupt_error: Option<AdapterError>,
     next_terminate_error: Option<AdapterError>,
-    next_outcome: Option<ExecutionOutcome>,
+    next_outcome: Option<PhysicalExecutionOutcome>,
     next_collect_error: Option<AdapterError>,
     next_reconcile: Option<StartObservation>,
     next_reconcile_error: Option<AdapterError>,
@@ -580,7 +715,7 @@ struct FakeState {
     terminate_call_count: usize,
     reconcile_call_count: usize,
     collect_call_count: usize,
-    last_request: Option<ExecutionRequest>,
+    last_request: Option<EnvironmentStartRequest>,
     last_reconcile_request_id: Option<RequestId>,
 }
 
@@ -603,7 +738,7 @@ impl FakeAdapter {
         self.inner.lock().expect("fake adapter").next_start_error = Some(err);
     }
 
-    pub fn set_next_outcome(&self, outcome: ExecutionOutcome) {
+    pub fn set_next_outcome(&self, outcome: PhysicalExecutionOutcome) {
         self.inner.lock().expect("fake adapter").next_outcome = Some(outcome);
     }
 
@@ -613,7 +748,7 @@ impl FakeAdapter {
     }
 
     /// The request received by the most recent `start_execution` call.
-    pub fn last_request(&self) -> Option<ExecutionRequest> {
+    pub fn last_request(&self) -> Option<EnvironmentStartRequest> {
         self.inner
             .lock()
             .expect("fake adapter")
@@ -720,7 +855,7 @@ impl FakeAdapter {
 impl ExecutionAdapter for FakeAdapter {
     fn start_execution(
         &self,
-        request: &ExecutionRequest,
+        request: &EnvironmentStartRequest,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         let mut g = self.inner.lock().expect("fake adapter");
@@ -731,10 +866,9 @@ impl ExecutionAdapter for FakeAdapter {
         g.deadline_by_operation
             .insert(AdapterOperation::StartExecution, *deadline);
         if g.unavailable {
-            return Err(AdapterError::unavailable(format!(
-                "target {} unavailable",
-                request.execution_target()
-            )));
+            return Err(AdapterError::unavailable(
+                "execution environment unavailable",
+            ));
         }
         if let Some(err) = g.next_start_error.take() {
             return Err(err);
@@ -835,7 +969,7 @@ impl ExecutionAdapter for FakeAdapter {
         &self,
         _handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
-    ) -> AdapterResult<ExecutionOutcome> {
+    ) -> AdapterResult<PhysicalExecutionOutcome> {
         let mut g = self.inner.lock().expect("fake adapter");
         g.collect_call_count += 1;
         g.last_deadline = Some(*deadline);
@@ -848,14 +982,9 @@ impl ExecutionAdapter for FakeAdapter {
         if let Some(err) = g.next_collect_error.take() {
             return Err(err);
         }
-        Ok(g.next_outcome.take().unwrap_or(ExecutionOutcome {
-            state: ExecutionState::Succeeded,
-            payload: Some(serde_json::json!({"ok": true})),
-            summary: Some("fake".into()),
-            terminal_confirmed: true,
-            quiescent_confirmed: true,
-            incarnation_reusable: false,
-        }))
+        Ok(g.next_outcome
+            .take()
+            .unwrap_or(PhysicalExecutionOutcome::exited()))
     }
 
     fn reconcile_start(
@@ -972,7 +1101,7 @@ mod tests {
         let fake = FakeAdapter::new();
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req, &dl()).unwrap();
         assert!(!start.terminal_confirmed);
         assert!(!start.quiescent_confirmed);
@@ -988,7 +1117,7 @@ mod tests {
         let fake = FakeAdapter::new();
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&launch, &mock.environment).unwrap();
         let start = fake.start_execution(&req, &dl()).unwrap();
 
         // Ambiguous start: scheduler lost the handle, but the start request
@@ -1116,8 +1245,8 @@ mod tests {
     fn worker_prompt_is_deterministic_and_cannot_be_injected() {
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let first = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
-        let second = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let first = EnvironmentStartRequest::from_launch(&launch, &mock.environment).unwrap();
+        let second = EnvironmentStartRequest::from_launch(&launch, &mock.environment).unwrap();
         assert_eq!(first, second);
         let protocol = RenderedWorkerPrompt::from_launch(&launch);
         assert!(protocol
@@ -1149,7 +1278,7 @@ mod tests {
         assert_eq!(fake.start_call_count(), 0);
         let mock = mock_launch();
         let launch = mock.snapshot;
-        let req = ExecutionRequest::from_launch(&launch, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&launch, &mock.environment).unwrap();
         let _ = fake.start_execution(&req, &dl()).unwrap();
         let _ = fake.start_execution(&req, &dl()).unwrap();
         assert_eq!(fake.start_call_count(), 2);
@@ -1187,7 +1316,7 @@ mod tests {
             &foreign_binding,
         )
         .unwrap();
-        let err = ExecutionRequest::from_launch(&mock.snapshot, &foreign_env).unwrap_err();
+        let err = EnvironmentStartRequest::from_launch(&mock.snapshot, &foreign_env).unwrap_err();
         assert!(err.detail.contains("attempt_id"), "got: {err:?}");
 
         // The same attempt, but a different configured target.
@@ -1202,7 +1331,8 @@ mod tests {
             &wrong_target_binding,
         )
         .unwrap();
-        let err = ExecutionRequest::from_launch(&mock.snapshot, &wrong_target_env).unwrap_err();
+        let err =
+            EnvironmentStartRequest::from_launch(&mock.snapshot, &wrong_target_env).unwrap_err();
         assert!(err.detail.contains("execution_target"), "got: {err:?}");
 
         // The same attempt identity and target/profile names, but a
@@ -1225,7 +1355,7 @@ mod tests {
         )
         .unwrap();
         assert!(isolated_env.attempt_isolation());
-        let err = ExecutionRequest::from_launch(&mock.snapshot, &isolated_env).unwrap_err();
+        let err = EnvironmentStartRequest::from_launch(&mock.snapshot, &isolated_env).unwrap_err();
         assert!(err.detail.contains("attempt_isolation"), "got: {err:?}");
     }
 
@@ -1309,7 +1439,7 @@ mod tests {
     impl ExecutionAdapter for DeadlineProbe {
         fn start_execution(
             &self,
-            request: &ExecutionRequest,
+            request: &EnvironmentStartRequest,
             deadline: &AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
             let _ = request;
@@ -1376,16 +1506,9 @@ mod tests {
             &self,
             _handle: &RuntimeHandle,
             deadline: &AdapterDeadline,
-        ) -> AdapterResult<ExecutionOutcome> {
+        ) -> AdapterResult<PhysicalExecutionOutcome> {
             self.stage("collect", deadline);
-            Ok(ExecutionOutcome {
-                state: ExecutionState::Succeeded,
-                payload: None,
-                summary: None,
-                terminal_confirmed: true,
-                quiescent_confirmed: true,
-                incarnation_reusable: false,
-            })
+            Ok(PhysicalExecutionOutcome::exited())
         }
 
         fn reconcile_start(
@@ -1415,7 +1538,7 @@ mod tests {
         let base = Instant::now() + std::time::Duration::from_secs(10);
         let deadline = AdapterDeadline::from_instant(base);
         let mock = mock_launch();
-        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
         assert!(probe.start_execution(&req, &deadline).is_err());
         let endpoints = probe.endpoints();
         assert_eq!(endpoints.len(), 3);
@@ -1479,7 +1602,7 @@ mod tests {
         let base = Instant::now() + std::time::Duration::from_secs(10);
         let deadline = AdapterDeadline::from_instant(base);
         let mock = mock_launch();
-        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
         let err = probe.start_execution(&req, &deadline).unwrap_err();
         assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
         assert!(probe.endpoints().iter().any(|(s, _)| *s == "cleanup"));
@@ -1493,7 +1616,7 @@ mod tests {
         let base = Instant::now() + std::time::Duration::from_secs(10);
         let deadline = AdapterDeadline::from_instant(base);
         let mock = mock_launch();
-        let req = ExecutionRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
+        let req = EnvironmentStartRequest::from_launch(&mock.snapshot, &mock.environment).unwrap();
         let err = probe.start_execution(&req, &deadline).unwrap_err();
         assert_eq!(err.kind(), AdapterErrorKind::Protocol);
         assert!(probe.endpoints().iter().any(|(s, _)| *s == "cleanup"));

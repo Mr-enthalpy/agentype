@@ -268,16 +268,15 @@ physical `Failed`; Runtime maps a collected Failed to mechanical
 `StartFailure`. The adapter does not author Scheduler failure classes.
 
 Timeout, kill-sent, and process-not-running prove nothing about Task
-cancellation, writer safety, or quiescence. Successful validated
-`collect_outcome` may produce execution completion evidence
-(`terminal_confirmed`); this reference adapter never sets
-`quiescent_confirmed`.
+cancellation, writer safety, or quiescence. `collect_outcome` is physical
+environment end, not Task completion.
 
 ---
 
 ## 8. Deadline inheritance from M5.6
 
-Unchanged:
+See `m5.6-deadline-amendment.md`. Host-kernel progress is an explicit
+assumption. Still true:
 
 - one absolute monotonic `AdapterDeadline` per Scheduler-facing call;
 - `now == expires_at` is expired; `remaining` saturates at zero; no
@@ -330,11 +329,11 @@ environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
 
 | Operation | Mechanics |
 | --- | --- |
-| start | spawn (deadline-staged) + immediate deadline check + birth probe under the same endpoint + same-thread bounded stdin of **opaque payload JSON** + one `try_wait`. If spawn returns after expiry, kill the uncommitted child — no birth I/O. RUNNING if still alive **and** deadline remains; identified process end → Terminated (ENDED, collect), not UNKNOWN. |
+| start | spawn (deadline-staged) + birth probe + empty stdin (not Task payload) + one `try_wait`. RUNNING if still alive **and** deadline remains; identified process end → Terminated (ENDED, physical collect). |
 | observe | live `Child` with matching `birth`, else pin `pid+birth`. Alive → RUNNING; identified instance gone → Terminated (ENDED, collect); birth mismatch → UNKNOWN. Never SUCCEEDED. |
 | interrupt | Linux: pin pidfd, then `SIGINT` through that pin. Windows: `Unavailable` (no numeric-PID console event). Stale pid+wrong birth MUST NOT interrupt another occupant. Unpinned control is Unavailable. Not Task cancellation. |
 | terminate | Pin, verify birth, kill through the same pin, wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
-| collect | wait remaining for exit, bounded stdout read, parse `{ok, payload, summary}` (**no Scheduler `failure_class`**). `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol, not Failed. |
+| collect | wait remaining for process exit; return `PhysicalExecutionOutcome` (Exited/Terminated/Unknown + artifact paths). Not Task Result. |
 | reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. Identified process ended → Terminated (ENDED, collect). No handle / birth mismatch → ambiguous UNKNOWN. |
 
 Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via

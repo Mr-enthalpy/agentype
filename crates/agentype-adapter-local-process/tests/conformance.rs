@@ -4,8 +4,8 @@
 #![allow(unsafe_code)]
 
 use agentype_adapter_api::{
-    AdapterDeadline, AdapterError, AdapterErrorKind, ExecutionAdapter, ExecutionObservation,
-    ExecutionRequest, RuntimeHandle, StartObservation,
+    AdapterDeadline, AdapterError, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter,
+    ExecutionObservation, RuntimeHandle, StartObservation,
 };
 use agentype_adapter_local_process::{LocalProcessAgentAdapter, ADAPTER_KIND, MAX_STDOUT_BYTES};
 use agentype_core::{
@@ -104,7 +104,7 @@ impl AgentSpec {
     }
 }
 
-fn request(spec: AgentSpec) -> ExecutionRequest {
+fn request(spec: AgentSpec) -> EnvironmentStartRequest {
     let mut env_map = serde_json::Map::new();
     for (k, v) in spec.env {
         env_map.insert(k, Value::String(v));
@@ -174,10 +174,10 @@ fn request(spec: AgentSpec) -> ExecutionRequest {
             environment.safety().clone(),
         )
     };
-    ExecutionRequest::from_launch(&snapshot, &environment).unwrap()
+    EnvironmentStartRequest::from_launch(&snapshot, &environment).unwrap()
 }
 
-fn start_hang(adapter: &LocalProcessAgentAdapter) -> (ExecutionRequest, StartObservation) {
+fn start_hang(adapter: &LocalProcessAgentAdapter) -> (EnvironmentStartRequest, StartObservation) {
     let req = request(AgentSpec::with_flag("FAKE_AGENT_HANG"));
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
     assert_eq!(start.state, ExecutionState::Running);
@@ -235,10 +235,11 @@ fn start_creates_environment_and_returns_persisted_handle() {
     let outcome = adapter
         .collect_outcome(&restored, &long_deadline())
         .unwrap();
-    assert_eq!(outcome.state, ExecutionState::Terminated);
-    assert!(!outcome.terminal_confirmed);
-    assert!(!outcome.quiescent_confirmed);
-    assert_ne!(outcome.summary.as_deref(), Some("fake-agent"));
+    assert_eq!(
+        outcome.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert_ne!(outcome.diagnostic.as_deref(), Some("fake-agent"));
 }
 
 // --- §16 Observation ---
@@ -502,10 +503,13 @@ fn collect_reports_physical_exit_not_task_result() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
-    assert!(!out.terminal_confirmed);
-    assert!(!out.quiescent_confirmed);
-    assert_ne!(out.payload, Some(json!({"echo": true})));
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert!(out.diagnostic.is_some());
+
+    assert_ne!(out.artifact_refs, Some(json!({"echo": true})));
 }
 
 #[test]
@@ -517,9 +521,12 @@ fn collect_ignores_agent_stdout_json() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
-    assert!(!out.terminal_confirmed);
-    assert_ne!(out.summary.as_deref(), Some("agent failed"));
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert!(out.diagnostic.is_some());
+    assert_ne!(out.diagnostic.as_deref(), Some("agent failed"));
 }
 
 #[test]
@@ -530,8 +537,11 @@ fn collect_malformed_agent_stdout_is_still_physical_exit() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
-    assert!(!out.terminal_confirmed);
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert!(out.diagnostic.is_some());
 }
 
 // --- §16 Restart ---
@@ -624,7 +634,10 @@ fn model_and_api_key_options_are_opaque_and_not_leaked() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
     let dump = format!("{out:?}");
     assert!(!dump.contains(SECRET), "outcome leaked api_key: {dump}");
 }
@@ -632,7 +645,6 @@ fn model_and_api_key_options_are_opaque_and_not_leaked() {
 #[test]
 fn request_payload_is_opaque_not_scheduler_protocol() {
     let req = request(AgentSpec::default());
-    assert_eq!(req.payload(), &json!({"k": "v"}));
     let dump = format!("{:?}", req);
     assert!(
         !dump.contains("LOCAL AGENT SCHEDULER TASK"),
@@ -717,8 +729,11 @@ fn collect_does_not_slurp_stdout_as_task_result() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
-    assert!(!out.terminal_confirmed);
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert!(out.diagnostic.is_some());
 }
 
 #[test]
@@ -747,6 +762,9 @@ fn collect_does_not_interpret_failure_class_in_agent_json() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Terminated);
-    assert!(!out.terminal_confirmed);
+    assert_eq!(
+        out.physical_state,
+        agentype_adapter_api::PhysicalState::Terminated
+    );
+    assert!(out.diagnostic.is_some());
 }

@@ -6,8 +6,8 @@
 
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterOperation, AdapterResult, DeadlineConfigError,
-    ExecutionAdapter, ExecutionObservation, ExecutionOutcome, ExecutionRequest, RuntimeHandle,
-    StartObservation,
+    EnvironmentStartRequest, ExecutionAdapter, ExecutionObservation, PhysicalExecutionOutcome,
+    RuntimeHandle, StartObservation,
 };
 use agentype_core::RequestId;
 use agentype_execution_config::AdapterBindingKey;
@@ -143,7 +143,10 @@ impl ResolvedAdapterBinding {
             .map_err(|e| AdapterError::other(e.to_string()))
     }
 
-    pub fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+    pub fn start_execution(
+        &self,
+        request: &EnvironmentStartRequest,
+    ) -> AdapterResult<StartObservation> {
         let deadline = self.deadline(AdapterOperation::StartExecution)?;
         admit_start(&deadline, self.adapter.start_execution(request, &deadline))
     }
@@ -170,7 +173,10 @@ impl ResolvedAdapterBinding {
         )
     }
 
-    pub fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+    pub fn collect_outcome(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> AdapterResult<PhysicalExecutionOutcome> {
         let deadline = self.deadline(AdapterOperation::CollectOutcome)?;
         admit_with_handle(
             &deadline,
@@ -206,7 +212,7 @@ impl ResolvedAdapterBinding {
 
 fn late_deadline_error(
     deadline: &AdapterDeadline,
-    hint: Option<&RuntimeHandle>,
+    input_handle: Option<&RuntimeHandle>,
     prior: Option<AdapterError>,
 ) -> AdapterError {
     if !deadline.is_expired() {
@@ -215,17 +221,17 @@ fn late_deadline_error(
     let err = AdapterError::deadline_exceeded(
         "runtime rejected adapter evidence after deadline endpoint",
     );
-    let hinted = match hint {
-        Some(h) => err.with_handle_hint(h.clone()),
-        None => prior
-            .as_ref()
-            .and_then(AdapterError::runtime_handle_hint)
-            .cloned()
-            .map(|h| err.clone().with_handle_hint(h))
-            .unwrap_or(err),
-    };
-    let _ = prior;
-    hinted
+    if let Some(h) = prior
+        .as_ref()
+        .and_then(AdapterError::runtime_handle_hint)
+        .cloned()
+    {
+        return err.with_handle_hint(h);
+    }
+    if let Some(h) = input_handle {
+        return err.with_handle_hint(h.clone());
+    }
+    err
 }
 
 fn admit_start(
@@ -359,7 +365,7 @@ mod tests {
     impl ExecutionAdapter for LateOkAdapter {
         fn start_execution(
             &self,
-            _request: &ExecutionRequest,
+            _request: &EnvironmentStartRequest,
             _deadline: &AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
             unreachable!("not used")
@@ -395,16 +401,9 @@ mod tests {
             &self,
             _handle: &RuntimeHandle,
             _deadline: &AdapterDeadline,
-        ) -> AdapterResult<ExecutionOutcome> {
+        ) -> AdapterResult<PhysicalExecutionOutcome> {
             std::thread::sleep(Duration::from_millis(30));
-            Ok(ExecutionOutcome {
-                state: agentype_core::ExecutionState::Succeeded,
-                payload: Some(serde_json::json!({"stolen": true})),
-                summary: Some("late".into()),
-                terminal_confirmed: true,
-                quiescent_confirmed: false,
-                incarnation_reusable: false,
-            })
+            Ok(PhysicalExecutionOutcome::exited())
         }
         fn reconcile_start(
             &self,
@@ -414,6 +413,77 @@ mod tests {
         ) -> AdapterResult<StartObservation> {
             unreachable!("not used")
         }
+    }
+
+    struct LateHintAdapter;
+
+    impl ExecutionAdapter for LateHintAdapter {
+        fn start_execution(
+            &self,
+            _request: &EnvironmentStartRequest,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+        fn observe_execution(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            unreachable!("not used")
+        }
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn collect_outcome(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<PhysicalExecutionOutcome> {
+            std::thread::sleep(Duration::from_millis(30));
+            Err(AdapterError::other("learned better locator")
+                .with_handle_hint(RuntimeHandle(serde_json::json!({"locator": "H2"}))))
+        }
+        fn reconcile_start(
+            &self,
+            _request_id: &RequestId,
+            _persisted_handle: Option<&RuntimeHandle>,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+    }
+
+    #[test]
+    fn late_error_preserves_adapter_learned_locator_over_input_handle() {
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            Arc::new(LateHintAdapter),
+            AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        let h1 = RuntimeHandle(serde_json::json!({"locator": "H1"}));
+        let err = binding.collect_outcome(&h1).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
+        assert_eq!(
+            err.runtime_handle_hint().map(|h| &h.0),
+            Some(&serde_json::json!({"locator": "H2"}))
+        );
     }
 
     #[test]

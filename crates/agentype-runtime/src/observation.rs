@@ -5,7 +5,9 @@
 //! Kernel state and they never ACK/NACK. Callers persist and apply
 //! authority consequences through the existing fenced primitives.
 
-use agentype_adapter_api::{AdapterError, ExecutionOutcome, StartObservation};
+use agentype_adapter_api::{
+    AdapterError, PhysicalExecutionOutcome, PhysicalState, StartObservation,
+};
 use agentype_core::{ExecutionState, FailureClass};
 
 /// Mechanical normalization of adapter invocation errors into the existing
@@ -39,15 +41,10 @@ pub enum StartObservationKind {
     Unresolved { failure_class: FailureClass },
 }
 
-/// What a collected `ExecutionOutcome` means. `collect_outcome` is the
-/// ACK/NACK proof authority (spec 07); this classifier does not mutate.
+/// What a collected physical outcome means. Collect is not Task Result
+/// authority; this classifier does not mutate and never ACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectedOutcomeKind {
-    /// `SUCCEEDED` with terminal proof. The caller MAY ACK; writer safety
-    /// still decides whether a Result is created.
-    TerminalSuccess,
-    /// Terminal non-success. The caller MAY NACK with terminal proof bits.
-    TerminalFailure { failure_class: FailureClass },
     /// Process/environment ended without Task Result authority.
     PhysicalEnded,
     /// Contradictory or nonterminal collection. Zero inherited
@@ -99,42 +96,12 @@ pub fn normalize_start_observation(observation: &StartObservation) -> StartObser
 /// (active+terminal, LOST+proof, success-without-terminal,
 /// quiescence-without-terminality, then terminal success/failure, then
 /// nonterminal catch-all).
-pub fn normalize_collected_outcome(outcome: &ExecutionOutcome) -> CollectedOutcomeKind {
-    if outcome.terminal_confirmed && outcome.state.is_active_physical() {
-        return CollectedOutcomeKind::Unresolved {
-            failure_class: FailureClass::AdapterProtocolFailure,
-        };
-    }
-    if outcome.state == ExecutionState::Lost
-        && (outcome.terminal_confirmed || outcome.quiescent_confirmed)
-    {
-        return CollectedOutcomeKind::Unresolved {
-            failure_class: FailureClass::AdapterProtocolFailure,
-        };
-    }
-    if outcome.state == ExecutionState::Succeeded && !outcome.terminal_confirmed {
-        return CollectedOutcomeKind::Unresolved {
-            failure_class: FailureClass::InvalidResult,
-        };
-    }
-    if outcome.quiescent_confirmed && !outcome.terminal_confirmed {
-        return CollectedOutcomeKind::Unresolved {
-            failure_class: FailureClass::AdapterProtocolFailure,
-        };
-    }
-    if outcome.state == ExecutionState::Terminated && !outcome.terminal_confirmed {
-        return CollectedOutcomeKind::PhysicalEnded;
-    }
-    if outcome.terminal_confirmed {
-        if outcome.state == ExecutionState::Succeeded {
-            return CollectedOutcomeKind::TerminalSuccess;
-        }
-        return CollectedOutcomeKind::TerminalFailure {
-            failure_class: FailureClass::StartFailure,
-        };
-    }
-    CollectedOutcomeKind::Unresolved {
-        failure_class: FailureClass::ExecutionLost,
+pub fn normalize_collected_outcome(outcome: &PhysicalExecutionOutcome) -> CollectedOutcomeKind {
+    match outcome.physical_state {
+        PhysicalState::Exited | PhysicalState::Terminated => CollectedOutcomeKind::PhysicalEnded,
+        PhysicalState::Unknown => CollectedOutcomeKind::Unresolved {
+            failure_class: FailureClass::ExecutionLost,
+        },
     }
 }
 
@@ -160,14 +127,12 @@ mod tests {
         }
     }
 
-    fn outcome(state: ExecutionState, terminal: bool, quiescent: bool) -> ExecutionOutcome {
-        ExecutionOutcome {
-            state,
-            payload: None,
-            summary: None,
-            terminal_confirmed: terminal,
-            quiescent_confirmed: quiescent,
-            incarnation_reusable: false,
+    fn physical(state: PhysicalState) -> PhysicalExecutionOutcome {
+        PhysicalExecutionOutcome {
+            physical_state: state,
+            exit_status: None,
+            artifact_refs: None,
+            diagnostic: None,
         }
     }
 
@@ -248,53 +213,19 @@ mod tests {
     }
 
     #[test]
-    fn collected_success_and_failure() {
+    fn collected_physical_exit_is_not_task_result() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, true, true)),
-            CollectedOutcomeKind::TerminalSuccess
-        );
-        assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
-            CollectedOutcomeKind::TerminalFailure {
-                failure_class: FailureClass::StartFailure
-            }
-        );
-        assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Terminated, true, true)),
-            CollectedOutcomeKind::TerminalFailure {
-                failure_class: FailureClass::StartFailure
-            }
-        );
-        assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Terminated, false, false)),
+            normalize_collected_outcome(&physical(PhysicalState::Exited)),
             CollectedOutcomeKind::PhysicalEnded
         );
-    }
-
-    #[test]
-    fn collected_contradictions_are_unresolved() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Running, true, true)),
-            CollectedOutcomeKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
-            }
+            normalize_collected_outcome(&physical(PhysicalState::Terminated)),
+            CollectedOutcomeKind::PhysicalEnded
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Lost, true, true)),
+            normalize_collected_outcome(&physical(PhysicalState::Unknown)),
             CollectedOutcomeKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
-            }
-        );
-        assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Succeeded, false, false)),
-            CollectedOutcomeKind::Unresolved {
-                failure_class: FailureClass::InvalidResult
-            }
-        );
-        assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, true)),
-            CollectedOutcomeKind::Unresolved {
-                failure_class: FailureClass::AdapterProtocolFailure
+                failure_class: FailureClass::ExecutionLost
             }
         );
     }
@@ -302,7 +233,7 @@ mod tests {
     #[test]
     fn nonterminal_collect_cannot_inherit_reconcile_proof() {
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Unknown, false, false)),
+            normalize_collected_outcome(&physical(PhysicalState::Unknown)),
             CollectedOutcomeKind::Unresolved {
                 failure_class: FailureClass::ExecutionLost
             }
@@ -337,12 +268,10 @@ mod tests {
         let class = adapter_invocation_failure_class(&AdapterError::other("opaque failure"));
         assert_eq!(class, FailureClass::Unknown);
         assert_ne!(class, FailureClass::StartFailure);
-        // A proven terminal collection without an explicit class may still
-        // produce START_FAILURE — only physical/protocol evidence earns it.
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
-            CollectedOutcomeKind::TerminalFailure {
-                failure_class: FailureClass::StartFailure
+            normalize_collected_outcome(&physical(PhysicalState::Unknown)),
+            CollectedOutcomeKind::Unresolved {
+                failure_class: FailureClass::ExecutionLost
             }
         );
     }
@@ -363,10 +292,8 @@ mod tests {
             FailureClass::AdapterProtocolFailure
         );
         assert_eq!(
-            normalize_collected_outcome(&outcome(ExecutionState::Failed, true, true)),
-            CollectedOutcomeKind::TerminalFailure {
-                failure_class: FailureClass::StartFailure
-            }
+            normalize_collected_outcome(&physical(PhysicalState::Exited)),
+            CollectedOutcomeKind::PhysicalEnded
         );
     }
 }

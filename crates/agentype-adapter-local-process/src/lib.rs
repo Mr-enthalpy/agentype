@@ -8,9 +8,12 @@
 //! Platform FFI is confined to pid liveness, process birth, cancellable
 //! stdin, interrupt, and pid-level terminate. No helper threads.
 
+#[cfg(test)]
+use agentype_adapter_api::ExecutionOutcome;
 use agentype_adapter_api::{
-    AdapterDeadline, AdapterError, AdapterResult, ExecutionAdapter, ExecutionObservation,
-    ExecutionOutcome, ExecutionRequest, ImportableAdapter, RuntimeHandle, StartObservation,
+    AdapterDeadline, AdapterError, AdapterResult, EnvironmentStartRequest, ExecutionAdapter,
+    ExecutionObservation, ImportableAdapter, PhysicalExecutionOutcome, RuntimeHandle,
+    StartObservation,
 };
 use agentype_core::{ExecutionState, RequestId};
 use agentype_execution_config::AdapterBindingKey;
@@ -993,7 +996,7 @@ fn terminated_observation() -> ExecutionObservation {
 impl ExecutionAdapter for LocalProcessAgentAdapter {
     fn start_execution(
         &self,
-        request: &ExecutionRequest,
+        request: &EnvironmentStartRequest,
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         require_deadline(deadline, "start deadline already expired", None)?;
@@ -1297,7 +1300,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         &self,
         handle: &RuntimeHandle,
         deadline: &AdapterDeadline,
-    ) -> AdapterResult<ExecutionOutcome> {
+    ) -> AdapterResult<PhysicalExecutionOutcome> {
         require_deadline(deadline, "collect deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
         let proc = {
@@ -1336,16 +1339,14 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             "collect deadline exhausted after process exit",
             Some(handle),
         )?;
-        Ok(ExecutionOutcome {
-            state: ExecutionState::Terminated,
-            payload: Some(json!({
+        Ok(PhysicalExecutionOutcome {
+            physical_state: agentype_adapter_api::PhysicalState::Terminated,
+            exit_status: None,
+            artifact_refs: Some(json!({
                 "stdout": parsed.stdout_path.to_string_lossy(),
                 "stderr": parsed.stderr_path.to_string_lossy(),
             })),
-            summary: Some("physical process exited".into()),
-            terminal_confirmed: false,
-            quiescent_confirmed: false,
-            incarnation_reusable: false,
+            diagnostic: Some("physical process exited".into()),
         })
     }
 
