@@ -7,7 +7,7 @@
 
 use agentype_core::*;
 use agentype_execution_config::{
-    resolve_execution_environment, ExecutionProfileConfig, ExecutionRegistry,
+    resolve_execution_environment, AdapterBindingKey, ExecutionProfileConfig, ExecutionRegistry,
     ExecutionResolutionMode, ExecutionTargetConfig, FrozenExecutionSafety,
     FrozenPhysicalExecutionBinding,
 };
@@ -136,7 +136,12 @@ pub fn unisolated_safety(claim: &Claim) -> FrozenExecutionSafety {
 /// frozen safety facts plus the test adapter_kind, ready for
 /// `Kernel::create_execution`.
 pub fn unisolated_launch_binding(claim: &Claim) -> FrozenPhysicalExecutionBinding {
-    FrozenPhysicalExecutionBinding::new(unisolated_safety(claim), "test").unwrap()
+    FrozenPhysicalExecutionBinding::new(
+        unisolated_safety(claim),
+        "test",
+        AdapterBindingKey::for_tests(),
+    )
+    .unwrap()
 }
 
 pub fn run_claim(
@@ -163,7 +168,8 @@ pub fn run_claim(
             &binding_for(&claim),
         )
         .unwrap();
-        env.physical_binding().unwrap()
+        env.physical_binding(AdapterBindingKey::for_tests())
+            .unwrap()
     } else {
         unisolated_launch_binding(&claim)
     };

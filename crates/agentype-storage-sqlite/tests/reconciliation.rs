@@ -34,7 +34,12 @@ fn launch_with_kind(
 ) -> agentype_execution_config::ExecutionLaunchSnapshot {
     k.create_execution(
         claim,
-        FrozenPhysicalExecutionBinding::new(unisolated_safety(claim), kind).unwrap(),
+        FrozenPhysicalExecutionBinding::new(
+            unisolated_safety(claim),
+            kind,
+            agentype_execution_config::AdapterBindingKey::for_tests(),
+        )
+        .unwrap(),
     )
     .unwrap()
 }
