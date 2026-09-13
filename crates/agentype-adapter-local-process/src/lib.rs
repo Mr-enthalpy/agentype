@@ -49,6 +49,7 @@ const INSTANCE_ENV: &str = "AGENTYPE_INSTANCE";
 struct LiveProcess {
     child: Child,
     birth: u64,
+    inst: String,
 }
 
 /// Spawn and control a user-configured local executable.
@@ -506,9 +507,10 @@ fn wait_instance_exit(
     pid: u32,
     birth: u64,
     inst: &str,
+    stdout_path: &Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<bool> {
-    match pin::pin_instance(pid, birth, inst, deadline)? {
+    match pin::pin_instance(pid, birth, inst, stdout_path, deadline)? {
         pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => Ok(true),
         pin::PinOutcome::Pinned(pinned) => pinned.wait_exit(deadline),
     }
@@ -721,9 +723,10 @@ fn instance_presence(
     pid: u32,
     birth: u64,
     inst: &str,
+    stdout_path: &Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<InstancePresence> {
-    match pin::pin_instance(pid, birth, inst, deadline)? {
+    match pin::pin_instance(pid, birth, inst, stdout_path, deadline)? {
         pin::PinOutcome::Gone => Ok(InstancePresence::Ended),
         pin::PinOutcome::Mismatch => Ok(InstancePresence::Absent),
         pin::PinOutcome::Pinned(pinned) => {
@@ -841,10 +844,12 @@ fn parse_stat_identity(stat: &str) -> Option<(char, u64)> {
     Some((state, starttime))
 }
 
+#[allow(unsafe_code)]
 fn spawn_child(
     spec: &ProcessSpec,
     stdout_path: &Path,
     stderr_path: &Path,
+    instance_path: &Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<Child> {
     require_deadline(
@@ -877,6 +882,19 @@ fn spawn_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        let _ = instance_path;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let instance_path = instance_path.to_path_buf();
+        unsafe {
+            cmd.pre_exec(move || {
+                let held = std::fs::File::open(&instance_path)?;
+                std::mem::forget(held);
+                Ok(())
+            });
+        }
     }
     cmd.spawn()
         .map_err(|_| AdapterError::unavailable("failed to spawn local process"))
@@ -1023,7 +1041,10 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let token = instance_token();
         spec.env.retain(|(k, _)| k != INSTANCE_ENV);
         spec.env.push((INSTANCE_ENV.to_string(), token.clone()));
-        let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
+        let instance_path = exec_dir.join("instance");
+        fs::write(&instance_path, token.as_bytes())
+            .map_err(|_| diagnostic("cannot write instance token"))?;
+        let mut child = spawn_child(&spec, &stdout_path, &stderr_path, &instance_path, deadline)?;
         let pid = child.id();
         let hint = encode_locator_hint(
             pid,
@@ -1100,10 +1121,14 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     "start deadline exhausted before RUNNING",
                     Some(&handle),
                 )?;
-                self.live
-                    .lock()
-                    .expect("live map")
-                    .insert(pid, LiveProcess { child, birth });
+                self.live.lock().expect("live map").insert(
+                    pid,
+                    LiveProcess {
+                        child,
+                        birth,
+                        inst: parsed.inst.clone(),
+                    },
+                );
                 Ok(StartObservation {
                     state: ExecutionState::Running,
                     runtime_handle: handle,
@@ -1129,9 +1154,15 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let parsed = parse_handle(handle)?;
         let mut live = self.live.lock().expect("live map");
         if let Some(proc) = live.get_mut(&parsed.pid) {
-            if proc.birth != parsed.birth {
+            if proc.birth != parsed.birth || proc.inst != parsed.inst {
                 drop(live);
-                let presence = instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?;
+                let presence = instance_presence(
+                    parsed.pid,
+                    parsed.birth,
+                    &parsed.inst,
+                    &parsed.stdout_path,
+                    deadline,
+                )?;
                 require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
                 return Ok(liveness_observation(presence));
             }
@@ -1149,7 +1180,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         }
         drop(live);
-        let presence = instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?;
+        let presence = instance_presence(
+            parsed.pid,
+            parsed.birth,
+            &parsed.inst,
+            &parsed.stdout_path,
+            deadline,
+        )?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
         if matches!(presence, InstancePresence::Running) {
             require_deadline(
@@ -1168,7 +1205,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
-        match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
+        match pin::pin_instance(
+            parsed.pid,
+            parsed.birth,
+            &parsed.inst,
+            &parsed.stdout_path,
+            deadline,
+        )? {
             pin::PinOutcome::Pinned(pinned) => pinned.interrupt(deadline)?,
             pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => {}
         }
@@ -1190,7 +1233,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let proc = {
             let mut live = self.live.lock().expect("live map");
             match live.remove(&parsed.pid) {
-                Some(proc) if proc.birth == parsed.birth => Some(proc),
+                Some(proc) if proc.birth == parsed.birth && proc.inst == parsed.inst => Some(proc),
                 Some(proc) => {
                     live.insert(parsed.pid, proc);
                     None
@@ -1199,7 +1242,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         };
         if let Some(mut proc) = proc {
-            match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
+            match pin::pin_instance(
+                parsed.pid,
+                parsed.birth,
+                &parsed.inst,
+                &parsed.stdout_path,
+                deadline,
+            )? {
                 pin::PinOutcome::Pinned(pinned) => pinned.kill(deadline)?,
                 pin::PinOutcome::Gone => {
                     let _ = proc.child.try_wait();
@@ -1234,7 +1283,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 handle.clone(),
             ));
         }
-        match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
+        match pin::pin_instance(
+            parsed.pid,
+            parsed.birth,
+            &parsed.inst,
+            &parsed.stdout_path,
+            deadline,
+        )? {
             pin::PinOutcome::Pinned(pinned) => {
                 pinned.kill(deadline)?;
                 if pinned.wait_exit(deadline)? {
@@ -1275,7 +1330,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let proc = {
             let mut live = self.live.lock().expect("live map");
             match live.remove(&parsed.pid) {
-                Some(proc) if proc.birth == parsed.birth => Some(proc),
+                Some(proc) if proc.birth == parsed.birth && proc.inst == parsed.inst => Some(proc),
                 Some(proc) => {
                     live.insert(parsed.pid, proc);
                     None
@@ -1291,7 +1346,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     handle.clone(),
                 ));
             }
-        } else if !wait_instance_exit(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
+        } else if !wait_instance_exit(
+            parsed.pid,
+            parsed.birth,
+            &parsed.inst,
+            &parsed.stdout_path,
+            deadline,
+        )? {
             return Err(deadline_exceeded_hint(
                 "collect deadline exhausted before process exit",
                 handle.clone(),
@@ -1349,9 +1410,15 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let presence = {
             let mut live = self.live.lock().expect("live map");
             if let Some(proc) = live.get_mut(&parsed.pid) {
-                if proc.birth != parsed.birth {
+                if proc.birth != parsed.birth || proc.inst != parsed.inst {
                     drop(live);
-                    instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?
+                    instance_presence(
+                        parsed.pid,
+                        parsed.birth,
+                        &parsed.inst,
+                        &parsed.stdout_path,
+                        deadline,
+                    )?
                 } else {
                     match proc.child.try_wait() {
                         Ok(Some(_)) => {
@@ -1366,7 +1433,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 }
             } else {
                 drop(live);
-                instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?
+                instance_presence(
+                    parsed.pid,
+                    parsed.birth,
+                    &parsed.inst,
+                    &parsed.stdout_path,
+                    deadline,
+                )?
             }
         };
         let observation = match presence {

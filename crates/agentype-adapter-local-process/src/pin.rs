@@ -124,21 +124,22 @@ pub(crate) fn pin_instance(
     pid: u32,
     expected_birth: u64,
     expected_token: &str,
+    stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<PinOutcome> {
     require_deadline(deadline, "deadline exhausted before pinning process", None)?;
     #[cfg(target_os = "linux")]
     {
-        pin_linux(pid, expected_birth, expected_token, deadline)
+        pin_linux(pid, expected_birth, expected_token, stdout_path, deadline)
     }
     #[cfg(windows)]
     {
-        let _ = expected_token;
+        let _ = (expected_token, stdout_path);
         pin_windows(pid, expected_birth, deadline)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = (pid, expected_birth, expected_token);
+        let _ = (pid, expected_birth, expected_token, stdout_path);
         Err(AdapterError::unavailable(
             "cannot pin process instance on this OS",
         ))
@@ -248,6 +249,7 @@ fn pin_linux(
     pid: u32,
     expected_birth: u64,
     expected_token: &str,
+    stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<PinOutcome> {
     let raw = match i32::try_from(pid) {
@@ -272,7 +274,7 @@ fn pin_linux(
     require_deadline(deadline, "deadline exhausted after process stat", None)?;
     match stat {
         Some((_, birth)) if birth == expected_birth => {
-            if !environ_has_instance(pid, expected_token, deadline)? {
+            if !instance_token_matches(pid, expected_token, stdout_path, deadline)? {
                 return Ok(PinOutcome::Mismatch);
             }
             require_deadline(deadline, "deadline exhausted after environ", None)?;
@@ -284,24 +286,61 @@ fn pin_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn environ_has_instance(
+fn instance_token_matches(
     pid: u32,
     expected_token: &str,
+    stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<bool> {
-    require_deadline(deadline, "deadline exhausted before environ", None)?;
+    require_deadline(deadline, "deadline exhausted before instance token", None)?;
     if expected_token.is_empty() {
         return Ok(false);
     }
-    let bytes = match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AdapterError::other("cannot read process environ"));
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
+        let needle = format!("AGENTYPE_INSTANCE={expected_token}");
+        if bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
+            return Ok(true);
         }
-        Err(_) => return Err(AdapterError::other("cannot read process environ")),
+    }
+    held_instance_file_matches(pid, expected_token, stdout_path, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn held_instance_file_matches(
+    pid: u32,
+    expected_token: &str,
+    stdout_path: &std::path::Path,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<bool> {
+    require_deadline(deadline, "deadline exhausted before instance fd", None)?;
+    let Some(dir) = stdout_path.parent() else {
+        return Ok(false);
     };
-    let needle = format!("AGENTYPE_INSTANCE={expected_token}");
-    Ok(bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()))
+    let instance_path = dir.join("instance");
+    match std::fs::read_to_string(&instance_path) {
+        Ok(text) if text == expected_token => proc_holds_path(pid, &instance_path),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AdapterError::other("cannot read instance token file")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_holds_path(pid: u32, path: &std::path::Path) -> AdapterResult<bool> {
+    let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let fd_dir = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(AdapterError::other("cannot read process fds")),
+    };
+    for ent in fd_dir.flatten() {
+        if let Ok(link) = std::fs::read_link(ent.path()) {
+            if link == want || link == path {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -377,7 +416,13 @@ pub(crate) fn recycle_pid_experiment() -> i32 {
             }
         };
         if matches!(
-            pin_instance(b as u32, occupant_birth, "dead-A-token", &long),
+            pin_instance(
+                b as u32,
+                occupant_birth,
+                "dead-A-token",
+                std::path::Path::new("stdout.txt"),
+                &long,
+            ),
             Ok(PinOutcome::Pinned(_))
         ) {
             libc::kill(b, libc::SIGKILL);
@@ -569,7 +614,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
         let birth = process_birth(pid, &long).expect("birth");
-        let pinned = match pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap() {
+        let pinned = match pin_instance(
+            pid,
+            birth,
+            PIN_TEST_TOKEN,
+            std::path::Path::new("stdout.txt"),
+            &long,
+        )
+        .unwrap()
+        {
             PinOutcome::Pinned(p) => p,
             other => panic!("expected pin, got {other:?}"),
         };
@@ -578,7 +631,14 @@ mod tests {
         assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
         assert!(
             matches!(
-                pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap(),
+                pin_instance(
+                    pid,
+                    birth,
+                    PIN_TEST_TOKEN,
+                    std::path::Path::new("stdout.txt"),
+                    &long
+                )
+                .unwrap(),
                 PinOutcome::Pinned(_)
             ),
             "expired kill must not terminate the pinned instance"
@@ -595,7 +655,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
         let birth = process_birth(pid, &long).expect("birth");
-        let pinned = match pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap() {
+        let pinned = match pin_instance(
+            pid,
+            birth,
+            PIN_TEST_TOKEN,
+            std::path::Path::new("stdout.txt"),
+            &long,
+        )
+        .unwrap()
+        {
             PinOutcome::Pinned(p) => p,
             other => panic!("expected pin, got {other:?}"),
         };
@@ -603,7 +671,14 @@ mod tests {
         assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
         assert!(
             matches!(
-                pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap(),
+                pin_instance(
+                    pid,
+                    birth,
+                    PIN_TEST_TOKEN,
+                    std::path::Path::new("stdout.txt"),
+                    &long
+                )
+                .unwrap(),
                 PinOutcome::Pinned(_)
             ),
             "Windows interrupt must not act on a numeric PID"
@@ -620,7 +695,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         let long = AdapterDeadline::after(Duration::from_secs(2)).unwrap();
         let birth = process_birth(pid, &long).expect("birth");
-        let pinned = match pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap() {
+        let pinned = match pin_instance(
+            pid,
+            birth,
+            PIN_TEST_TOKEN,
+            std::path::Path::new("stdout.txt"),
+            &long,
+        )
+        .unwrap()
+        {
             PinOutcome::Pinned(p) => p,
             other => panic!("expected pin, got {other:?}"),
         };
@@ -636,7 +719,8 @@ mod tests {
     #[test]
     fn expired_deadline_does_not_start_environ_stage() {
         let expired = AdapterDeadline::from_instant(Instant::now() - Duration::from_secs(1));
-        let err = environ_has_instance(1, "tok", &expired).unwrap_err();
+        let err = instance_token_matches(1, "tok", std::path::Path::new("stdout.txt"), &expired)
+            .unwrap_err();
         assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
     }
 
@@ -650,14 +734,28 @@ mod tests {
         let birth = process_birth(pid, &long).expect("birth");
         assert!(
             matches!(
-                pin_instance(pid, birth, PIN_TEST_TOKEN, &long).unwrap(),
+                pin_instance(
+                    pid,
+                    birth,
+                    PIN_TEST_TOKEN,
+                    std::path::Path::new("stdout.txt"),
+                    &long
+                )
+                .unwrap(),
                 PinOutcome::Pinned(_)
             ),
             "matching token must pin"
         );
         assert!(
             matches!(
-                pin_instance(pid, birth, "other-instance-token", &long).unwrap(),
+                pin_instance(
+                    pid,
+                    birth,
+                    "other-instance-token",
+                    std::path::Path::new("stdout.txt"),
+                    &long,
+                )
+                .unwrap(),
                 PinOutcome::Mismatch
             ),
             "wrong token must not pin the occupant"
