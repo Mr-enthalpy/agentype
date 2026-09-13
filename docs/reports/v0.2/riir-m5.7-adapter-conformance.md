@@ -203,7 +203,11 @@ Closed in-milestone, not deferred to M5.8:
   cannot enforce isolation
 - Identified process end is Terminated/ENDED → collect, not EXECUTION_LOST
 - Production install is `import` / `ImportableAdapter` (kind+key+safety
-  from the adapter)
+  from the adapter). `prepare_execution_launch` is test-support only
+- Linux restart identity is pidfd + `AGENTYPE_INSTANCE` token, not
+  starttime ticks alone; Windows start birth comes from the owned Child
+  handle
+- Spec 07 freezes kind/key/import/exact-recovery/safety intersection
 - `try_wait` / `/proc` errors are AdapterError, not process absence;
   malformed `/proc` stat is Other, not Gone; Windows OpenProcess only
   `ERROR_INVALID_PARAMETER` is Gone; GetProcessTimes / GetExitCodeProcess

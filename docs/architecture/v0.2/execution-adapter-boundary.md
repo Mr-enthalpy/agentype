@@ -186,7 +186,11 @@ instance (Linux `pidfd`, Windows one PROCESS handle used for both birth
 check and `TerminateProcess`). After pin, every later observe/wait/signal
 for that invocation MUST act on the pinned identity and MUST NOT
 re-resolve the numeric PID (Linux liveness is `poll(pidfd)`, not
-`/proc/<pid>`). After pin returns, kill rechecks the same deadline before
+`/proc/<pid>`). Restart identity is pidfd plus an adapter-owned instance
+token in the child environment (`AGENTYPE_INSTANCE`); matching
+`/proc` starttime ticks alone is not enough. Windows start captures
+creation time from the owned `Child` PROCESS handle so a fast-exit still
+yields ENDED→collect. After pin returns, kill rechecks the same deadline before
 signaling. A stale handle with a reused PID MUST NOT affect the new
 occupant. Windows graceful interrupt is `Unavailable`:
 `AttachConsole`/`GenerateConsoleCtrlEvent` would act on a numeric PID

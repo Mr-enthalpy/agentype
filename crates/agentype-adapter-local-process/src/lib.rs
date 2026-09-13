@@ -20,9 +20,10 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod pin;
 
@@ -43,6 +44,7 @@ pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 const HANDLE_VERSION: i64 = 1;
 const WAIT_SLICE: Duration = Duration::from_millis(10);
 const READ_CHUNK: usize = 8 * 1024;
+const INSTANCE_ENV: &str = "AGENTYPE_INSTANCE";
 
 struct LiveProcess {
     child: Child,
@@ -244,6 +246,7 @@ struct ProcessSpec {
 struct ParsedHandle {
     pid: u32,
     birth: u64,
+    inst: String,
     request_id: String,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -319,6 +322,7 @@ fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
         "kind": ADAPTER_KIND,
         "pid": parsed.pid,
         "birth": parsed.birth,
+        "inst": parsed.inst,
         "request_id": parsed.request_id,
         "stdout": parsed.stdout_path.to_string_lossy(),
         "stderr": parsed.stderr_path.to_string_lossy(),
@@ -351,6 +355,13 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
         .get("birth")
         .and_then(Value::as_u64)
         .ok_or_else(|| AdapterError::protocol("handle.birth missing"))?;
+    let inst = obj
+        .get("inst")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AdapterError::protocol("handle.inst missing"))?
+        .to_string();
     let request_id = obj
         .get("request_id")
         .and_then(Value::as_str)
@@ -369,6 +380,7 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
     Ok(ParsedHandle {
         pid,
         birth,
+        inst,
         request_id,
         stdout_path: PathBuf::from(stdout),
         stderr_path: PathBuf::from(stderr),
@@ -431,8 +443,13 @@ fn wait_child_exit(child: &mut Child, deadline: &AdapterDeadline) -> AdapterResu
     }
 }
 
-fn wait_instance_exit(pid: u32, birth: u64, deadline: &AdapterDeadline) -> AdapterResult<bool> {
-    match pin::pin_instance(pid, birth, deadline)? {
+fn wait_instance_exit(
+    pid: u32,
+    birth: u64,
+    inst: &str,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<bool> {
+    match pin::pin_instance(pid, birth, inst, deadline)? {
         pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => Ok(true),
         pin::PinOutcome::Pinned(pinned) => pinned.wait_exit(deadline),
     }
@@ -601,6 +618,7 @@ fn kill_child(child: &mut Child) {
     let _ = child.kill();
 }
 
+#[cfg(any(test, not(windows)))]
 pub(crate) fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<u64> {
     require_deadline(
         deadline,
@@ -612,12 +630,41 @@ pub(crate) fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResu
         .ok_or_else(|| AdapterError::unavailable("cannot read process birth identity"))
 }
 
+fn instance_token() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    format!("{seq:016x}{t:016x}{pid:08x}")
+}
+
+fn process_birth_from_child(child: &Child, deadline: &AdapterDeadline) -> AdapterResult<u64> {
+    require_deadline(
+        deadline,
+        "deadline exhausted before process birth probe",
+        None,
+    )?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        pin::creation_from_handle(child.as_raw_handle())
+    }
+    #[cfg(not(windows))]
+    {
+        process_birth(child.id(), deadline)
+    }
+}
+
 fn instance_presence(
     pid: u32,
     birth: u64,
+    inst: &str,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<InstancePresence> {
-    match pin::pin_instance(pid, birth, deadline)? {
+    match pin::pin_instance(pid, birth, inst, deadline)? {
         pin::PinOutcome::Gone => Ok(InstancePresence::Ended),
         pin::PinOutcome::Mismatch => Ok(InstancePresence::Absent),
         pin::PinOutcome::Pinned(pinned) => {
@@ -630,6 +677,7 @@ fn instance_presence(
     }
 }
 
+#[cfg(any(test, not(windows)))]
 fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(char, u64)>> {
     require_deadline(
         deadline,
@@ -651,7 +699,7 @@ fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(c
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 #[allow(unsafe_code)]
 fn process_birth_windows(pid: u32) -> AdapterResult<Option<u64>> {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -905,7 +953,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         require_deadline(deadline, "start deadline already expired", None)?;
-        let spec = spec_from_options(request.target_options())?;
+        let mut spec = spec_from_options(request.target_options())?;
         require_deadline(deadline, "start deadline exhausted before spawn", None)?;
         let exec_dir =
             std::env::temp_dir().join(format!("agentype-exec-{}", request.request_id().as_str()));
@@ -913,6 +961,9 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let stdout_path = exec_dir.join("stdout.txt");
         let stderr_path = exec_dir.join("stderr.txt");
         require_deadline(deadline, "start deadline exhausted before spawn", None)?;
+        let token = instance_token();
+        spec.env.retain(|(k, _)| k != INSTANCE_ENV);
+        spec.env.push((INSTANCE_ENV.to_string(), token.clone()));
         let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
         if let Err(err) = require_deadline(deadline, "start deadline exhausted after spawn", None) {
@@ -920,7 +971,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             let _ = child.try_wait();
             return Err(err);
         }
-        let birth = match process_birth(pid, deadline) {
+        let birth = match process_birth_from_child(&child, deadline) {
             Ok(b) => b,
             Err(err) => {
                 kill_child(&mut child);
@@ -931,6 +982,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let parsed = ParsedHandle {
             pid,
             birth,
+            inst: token,
             request_id: request.request_id().as_str().to_string(),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
@@ -1009,7 +1061,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         if let Some(proc) = live.get_mut(&parsed.pid) {
             if proc.birth != parsed.birth {
                 drop(live);
-                let presence = instance_presence(parsed.pid, parsed.birth, deadline)?;
+                let presence = instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?;
                 require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
                 return Ok(liveness_observation(presence));
             }
@@ -1027,7 +1079,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         }
         drop(live);
-        let presence = instance_presence(parsed.pid, parsed.birth, deadline)?;
+        let presence = instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
         if matches!(presence, InstancePresence::Running) {
             require_deadline(
@@ -1046,7 +1098,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
         let parsed = parse_handle(handle)?;
-        match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+        match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
             pin::PinOutcome::Pinned(pinned) => pinned.interrupt(deadline)?,
             pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => {}
         }
@@ -1077,7 +1129,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             }
         };
         if let Some(mut proc) = proc {
-            match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+            match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
                 pin::PinOutcome::Pinned(pinned) => pinned.kill(deadline)?,
                 pin::PinOutcome::Gone => {
                     let _ = proc.child.try_wait();
@@ -1102,7 +1154,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 handle.clone(),
             ));
         }
-        match pin::pin_instance(parsed.pid, parsed.birth, deadline)? {
+        match pin::pin_instance(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
             pin::PinOutcome::Pinned(pinned) => {
                 pinned.kill(deadline)?;
                 if pinned.wait_exit(deadline)? {
@@ -1155,7 +1207,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     handle.clone(),
                 ));
             }
-        } else if !wait_instance_exit(parsed.pid, parsed.birth, deadline)? {
+        } else if !wait_instance_exit(parsed.pid, parsed.birth, &parsed.inst, deadline)? {
             return Err(deadline_exceeded_hint(
                 "collect deadline exhausted before process exit",
                 handle.clone(),
@@ -1215,7 +1267,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             if let Some(proc) = live.get_mut(&parsed.pid) {
                 if proc.birth != parsed.birth {
                     drop(live);
-                    instance_presence(parsed.pid, parsed.birth, deadline)?
+                    instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?
                 } else {
                     match proc.child.try_wait() {
                         Ok(Some(_)) => {
@@ -1230,7 +1282,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 }
             } else {
                 drop(live);
-                instance_presence(parsed.pid, parsed.birth, deadline)?
+                instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?
             }
         };
         if matches!(presence, InstancePresence::Running) {
@@ -1301,6 +1353,7 @@ mod tests {
             "kind": ADAPTER_KIND,
             "pid": 1,
             "birth": 9,
+            "inst": "t",
             "stdout": "a",
             "stderr": "b"
         }));
@@ -1320,11 +1373,25 @@ mod tests {
             parse_handle(&no_birth).unwrap_err().kind(),
             AdapterErrorKind::Protocol
         );
+        let no_inst = RuntimeHandle(json!({
+            "v": 1,
+            "kind": ADAPTER_KIND,
+            "pid": 1,
+            "birth": 9,
+            "request_id": "r",
+            "stdout": "a",
+            "stderr": "b"
+        }));
+        assert_eq!(
+            parse_handle(&no_inst).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
         let empty_req = RuntimeHandle(json!({
             "v": 1,
             "kind": ADAPTER_KIND,
             "pid": 1,
             "birth": 9,
+            "inst": "t",
             "request_id": "",
             "stdout": "a",
             "stderr": "b"
@@ -1395,6 +1462,7 @@ mod tests {
         let parsed = ParsedHandle {
             pid: 4242,
             birth: 99,
+            inst: "abc".into(),
             request_id: "req-1".into(),
             stdout_path: PathBuf::from("stdout.txt"),
             stderr_path: PathBuf::from("stderr.txt"),
@@ -1405,6 +1473,7 @@ mod tests {
         let again = parse_handle(&restored).unwrap();
         assert_eq!(again.pid, 4242);
         assert_eq!(again.birth, 99);
+        assert_eq!(again.inst, "abc");
         assert_eq!(again.request_id, "req-1");
     }
 

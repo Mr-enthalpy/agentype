@@ -153,6 +153,11 @@ impl PreparedExecutionLaunch {
 ///
 /// `adapter_binding_key` is the concrete imported domain. This façade does
 /// not consult `AdapterRegistry` and MUST NOT invent a `"test"` key.
+///
+/// Production launch must go through `resolve_physical_execution_environment`
+/// so imported `AdapterSafetyEnvelope` intersects target isolation. This
+/// standalone constructor is test-support only.
+#[cfg(any(test, feature = "test-support"))]
 pub fn prepare_execution_launch(
     kernel: &Kernel,
     claim: &Claim,

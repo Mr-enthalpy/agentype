@@ -199,6 +199,14 @@ fn handle_fields(handle: &RuntimeHandle) -> (u32, u64, String, PathBuf) {
         .to_string();
     let stdout = obj.get("stdout").and_then(Value::as_str).expect("stdout");
     assert!(obj.get("stderr").and_then(Value::as_str).is_some());
+    assert!(
+        obj.get("inst")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some(),
+        "handle.inst is the restart identity token"
+    );
     (pid, birth, request_id, PathBuf::from(stdout))
 }
 
@@ -432,6 +440,21 @@ fn forged_handle_must_not_control_another_process() {
         "forged interrupt must not affect the real instance"
     );
 
+    #[cfg(target_os = "linux")]
+    {
+        let mut wrong_inst = start.runtime_handle.0.clone();
+        wrong_inst["inst"] = json!("not-the-instance");
+        let wrong_inst = RuntimeHandle(wrong_inst);
+        let stolen = adapter
+            .observe_execution(&wrong_inst, &long_deadline())
+            .unwrap();
+        assert_ne!(
+            stolen.state,
+            ExecutionState::Running,
+            "wrong instance token must not observe RUNNING"
+        );
+    }
+
     let _ = adapter.terminate_execution(&forged, &long_deadline());
     let still = adapter
         .observe_execution(&start.runtime_handle, &long_deadline())
@@ -553,6 +576,7 @@ fn reconcile_failed_reconnect_is_ambiguous_unknown() {
         "kind": ADAPTER_KIND,
         "pid": u32::MAX,
         "birth": 1,
+        "inst": "ghost",
         "request_id": req.request_id().as_str(),
         "stdout": "stdout.txt",
         "stderr": "stderr.txt",
@@ -585,6 +609,7 @@ fn reconcile_rejects_mismatched_request_id() {
         "kind": ADAPTER_KIND,
         "pid": 1,
         "birth": 1,
+        "inst": "t",
         "request_id": "other",
         "stdout": "stdout.txt",
         "stderr": "stderr.txt",

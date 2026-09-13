@@ -65,6 +65,26 @@ Process death is not quiescence proof.
 Adapter absolute deadlines are **M5** runtime conformance (the interface
 itself is required for M4 observation vocabulary).
 
+## Physical adapter identity and imported source (**M5.7**)
+
+`AdapterKind` is the driver family (for example `local_process`). It is
+not a vendor, model, or installation name.
+
+`AdapterBindingKey` is an opaque concrete physical execution domain
+(host/boot/namespace fingerprint). Core MUST NOT interpret it.
+
+An Execution MUST atomically freeze `adapter_kind` and
+`adapter_binding_key` at creation. Recovery MUST `resolve_exact(kind, key)`
+and MUST NOT fall back to another source of the same kind.
+
+Until M6 SpawnSource exists, launch MUST `resolve_unique(kind)`. Ambiguous
+installations of the same kind MUST fail closed.
+
+An imported source owns its kind, binding key, and enforceable physical
+capabilities. Effective safety is the intersection of the ExecutionTarget
+requirement and the imported source's enforceability. A composition caller
+MUST NOT mint durable isolation or a binding key without that intersection.
+
 ## ExecutionProfile registry (**M5**)
 
 An Execution profile registry supplied by the composition root is
