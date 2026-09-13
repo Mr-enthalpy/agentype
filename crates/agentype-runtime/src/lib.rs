@@ -1090,6 +1090,19 @@ impl<'a> Dispatcher<'a> {
                     failure_class: Some(failure_class),
                 })
             }
+            CollectedOutcomeKind::PhysicalEnded => {
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    execution_id,
+                    FailureClass::Unknown,
+                    Some(observed_handle),
+                )?;
+                Ok(DispatchOneOutcome::StartIndeterminate {
+                    execution_id: execution_id.clone(),
+                    request_id: request_id.clone(),
+                    failure_class: Some(FailureClass::Unknown),
+                })
+            }
             CollectedOutcomeKind::TerminalSuccess => {
                 // Authoritative success: persist the physical terminal fact
                 // BEFORE the ACK consequence (M5.4 P1-1). The two machines

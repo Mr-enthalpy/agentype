@@ -57,8 +57,15 @@ kernel wait.
 (default false). Dispatcher MUST NOT derive those proofs from a
 terminal-looking enum state.
 
-`collect_outcome` is authoritative for ACK/NACK proof. A nonterminal collect
-MUST NOT inherit terminal/quiescence proof from earlier `reconcile_start`.
+`collect_outcome` reports **physical** environment end. It is not Task
+Result authority and MUST NOT carry agent `{ok,payload,summary}` as a
+Scheduler Result. ACK/NACK of Task Result is a separate Worker data
+plane. A nonterminal collect MUST NOT inherit terminal/quiescence proof
+from earlier `reconcile_start`.
+
+After an adapter call returns, Runtime MUST re-qualify the same deadline
+before admitting the evidence. Evidence obtained after the endpoint MUST
+NOT become a successful observation; the error is `DeadlineExceeded`.
 
 Runtime locators (thread id, session id, turn id) MUST be opaque handles on
 Incarnation/Execution. Core MUST NOT interpret vendor enums.

@@ -31,6 +31,16 @@ External Agent Environment
           network, prompt/system context, internal memory
 ```
 
+`ExecutionAdapter` MUST NOT consume Task payload or acceptance, MUST NOT
+define an agent result JSON (`ok`/`payload`/`summary` as Result), and
+MUST NOT create an authoritative Result. Task/Result travel on a separate
+Worker data plane (not this milestone). `collect_outcome` reports
+physical environment end (exited / terminated / unknown + artifact
+paths), not Task success.
+
+Runtime `ResolvedAdapterBinding` admits returned evidence only if the
+**same** deadline has not expired.
+
 The frozen contract is `ExecutionAdapter` in `agentype-adapter-api`:
 
 - `start_execution`

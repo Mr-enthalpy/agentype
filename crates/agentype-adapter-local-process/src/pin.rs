@@ -312,55 +312,20 @@ fn instance_token_matches(
     stdout_path: &std::path::Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<bool> {
+    let _ = stdout_path;
     require_deadline(deadline, "deadline exhausted before instance token", None)?;
     if expected_token.is_empty() {
         return Ok(false);
     }
-    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
-        let needle = format!("AGENTYPE_INSTANCE={expected_token}");
-        if bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
-            return Ok(true);
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(bytes) => {
+            let needle = format!("AGENTYPE_INSTANCE={expected_token}");
+            Ok(bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()))
         }
+        Err(_) => Err(AdapterError::other(
+            "instance identity unverifiable; environ unreadable",
+        )),
     }
-    held_instance_file_matches(pid, expected_token, stdout_path, deadline)
-}
-
-#[cfg(target_os = "linux")]
-fn held_instance_file_matches(
-    pid: u32,
-    expected_token: &str,
-    stdout_path: &std::path::Path,
-    deadline: &AdapterDeadline,
-) -> AdapterResult<bool> {
-    require_deadline(deadline, "deadline exhausted before instance fd", None)?;
-    let Some(dir) = stdout_path.parent() else {
-        return Ok(false);
-    };
-    let instance_path = dir.join("instance");
-    match std::fs::read_to_string(&instance_path) {
-        Ok(text) if text == expected_token => proc_holds_path(pid, &instance_path),
-        Ok(_) => Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(AdapterError::other("cannot read instance token file")),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn proc_holds_path(pid: u32, path: &std::path::Path) -> AdapterResult<bool> {
-    let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let fd_dir = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        Ok(dir) => dir,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(AdapterError::other("cannot read process fds")),
-    };
-    for ent in fd_dir.flatten() {
-        if let Ok(link) = std::fs::read_link(ent.path()) {
-            if link == want || link == path {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(target_os = "linux")]

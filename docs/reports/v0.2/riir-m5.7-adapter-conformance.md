@@ -85,8 +85,10 @@ the remaining start budget for the agent to finish; that wait belongs to
 (ENDED, collect candidate), not UNKNOWN and not SUCCEEDED.
 
 `quiescent_confirmed` is always false. Identified process death on
-observe is Terminated/ENDED (collect), never SUCCEEDED. Identity
-unconfirmed remains UNKNOWN. Kill-sent is not quiescence.
+observe is Terminated/ENDED (physical collect), never Task SUCCEEDED.
+Identity unconfirmed remains UNKNOWN. Unverifiable identity is
+AdapterError, not Mismatch-as-ended. Kill-sent is not quiescence.
+Adapter stdin is not Task payload; collect is not Result JSON.
 Any `failure_class` key in agent JSON is `AdapterError::Protocol`.
 `ok` MUST be an explicit JSON boolean; missing or non-bool is Protocol.
 Terminal `ok:false` is Failed; Runtime maps it to `StartFailure`.
@@ -172,7 +174,8 @@ sanitization.
 2. Observe — yes.
 3. Control (interrupt/terminate) — yes.
 4. Collect outcome — yes.
-5. All operations obey M5.6 deadlines — yes.
+5. All operations obey M5.6 deadlines — Runtime façade re-qualifies the
+   same endpoint after the adapter returns; late Succeeded is DeadlineExceeded.
 6. Scheduler does not know model/provider — `ExecutionRequest` has no such
    fields; extra option keys are opaque.
 7. Scheduler does not manage harness — the executable is user-owned.

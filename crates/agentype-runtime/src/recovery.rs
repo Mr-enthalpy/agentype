@@ -473,6 +473,12 @@ fn collect_and_apply(
             failure_class,
             Some(&observation.runtime_handle.0),
         ),
+        CollectedOutcomeKind::PhysicalEnded => unresolved_or_history(
+            kernel,
+            snapshot,
+            FailureClass::Unknown,
+            Some(&observation.runtime_handle.0),
+        ),
         CollectedOutcomeKind::TerminalSuccess => {
             let payload = outcome.payload.clone().unwrap_or(Value::Null);
             kernel

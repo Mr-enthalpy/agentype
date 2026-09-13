@@ -239,10 +239,11 @@ writer safety
 
 The same rule applies in recovery: `reconcile_start` errors prefer
 `err.runtime_handle_hint()` over the persisted handle
-(`recovery.rs` `reconcile_active_physical`). A partial external start
-remains recoverable: the locator is durably preserved and the same
-Execution is later reconciled by stable `RequestId` — never blindly
-started again (tests:
+(`recovery.rs` `reconcile_active_physical`). A partial locator is
+**durably preserved** as evidence (`reconnectable: false`). It is not
+necessarily reconnectable: Scheduler must not blindly re-start, and must
+not treat the hint as a control handle. Reconcile by stable `RequestId`
+only when the handle is reconnectable (tests:
 `start_timeout_after_partial_locator_persists_the_locator`,
 `stale_start_timeout_keeps_handle_as_physical_history_only`,
 `reconcile_timeout_is_unresolved_not_fatal_and_keeps_handle_hint`).

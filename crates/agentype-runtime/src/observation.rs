@@ -48,6 +48,8 @@ pub enum CollectedOutcomeKind {
     TerminalSuccess,
     /// Terminal non-success. The caller MAY NACK with terminal proof bits.
     TerminalFailure { failure_class: FailureClass },
+    /// Process/environment ended without Task Result authority.
+    PhysicalEnded,
     /// Contradictory or nonterminal collection. Zero inherited
     /// terminal/quiescence proof.
     Unresolved { failure_class: FailureClass },
@@ -119,6 +121,9 @@ pub fn normalize_collected_outcome(outcome: &ExecutionOutcome) -> CollectedOutco
         return CollectedOutcomeKind::Unresolved {
             failure_class: FailureClass::AdapterProtocolFailure,
         };
+    }
+    if outcome.state == ExecutionState::Terminated && !outcome.terminal_confirmed {
+        return CollectedOutcomeKind::PhysicalEnded;
     }
     if outcome.terminal_confirmed {
         if outcome.state == ExecutionState::Succeeded {
@@ -259,6 +264,10 @@ mod tests {
             CollectedOutcomeKind::TerminalFailure {
                 failure_class: FailureClass::StartFailure
             }
+        );
+        assert_eq!(
+            normalize_collected_outcome(&outcome(ExecutionState::Terminated, false, false)),
+            CollectedOutcomeKind::PhysicalEnded
         );
     }
 

@@ -17,7 +17,6 @@ use agentype_execution_config::AdapterBindingKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +42,7 @@ pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 
 const HANDLE_VERSION: i64 = 1;
 const WAIT_SLICE: Duration = Duration::from_millis(10);
-const READ_CHUNK: usize = 8 * 1024;
+
 const INSTANCE_ENV: &str = "AGENTYPE_INSTANCE";
 
 struct LiveProcess {
@@ -371,6 +370,7 @@ fn encode_locator_hint(
         "stdout": stdout.to_string_lossy(),
         "stderr": stderr.to_string_lossy(),
         "identity_complete": false,
+        "reconnectable": false,
     }))
 }
 
@@ -391,8 +391,10 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
             "handle kind is not local_process; no adapter fallback",
         ));
     }
-    if obj.get("identity_complete").and_then(Value::as_bool) == Some(false) {
-        return Err(AdapterError::protocol("incomplete locator cannot control"));
+    if obj.get("identity_complete").and_then(Value::as_bool) == Some(false)
+        || obj.get("reconnectable").and_then(Value::as_bool) == Some(false)
+    {
+        return Err(AdapterError::protocol("locator hint is not reconnectable"));
     }
     let pid = obj
         .get("pid")
@@ -511,7 +513,10 @@ fn wait_instance_exit(
     deadline: &AdapterDeadline,
 ) -> AdapterResult<bool> {
     match pin::pin_instance(pid, birth, inst, stdout_path, deadline)? {
-        pin::PinOutcome::Gone | pin::PinOutcome::Mismatch => Ok(true),
+        pin::PinOutcome::Gone => Ok(true),
+        pin::PinOutcome::Mismatch => Err(AdapterError::other(
+            "process identity proven different; not collect-as-ended",
+        )),
         pin::PinOutcome::Pinned(pinned) => pinned.wait_exit(deadline),
     }
 }
@@ -844,12 +849,10 @@ fn parse_stat_identity(stat: &str) -> Option<(char, u64)> {
     Some((state, starttime))
 }
 
-#[allow(unsafe_code)]
 fn spawn_child(
     spec: &ProcessSpec,
     stdout_path: &Path,
     stderr_path: &Path,
-    instance_path: &Path,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<Child> {
     require_deadline(
@@ -882,48 +885,12 @@ fn spawn_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-        let _ = instance_path;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let instance_path = instance_path.to_path_buf();
-        unsafe {
-            cmd.pre_exec(move || {
-                let held = std::fs::File::open(&instance_path)?;
-                std::mem::forget(held);
-                Ok(())
-            });
-        }
     }
     cmd.spawn()
         .map_err(|_| AdapterError::unavailable("failed to spawn local process"))
 }
 
-fn read_stdout_bounded(path: &Path, deadline: &AdapterDeadline) -> AdapterResult<String> {
-    require_deadline(deadline, "collect stdout read: deadline exhausted", None)?;
-    let mut f = File::open(path).map_err(|_| AdapterError::protocol("cannot open stdout file"))?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; READ_CHUNK];
-    loop {
-        require_deadline(deadline, "collect stdout read: deadline exhausted", None)?;
-        match f.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len().saturating_add(n) > MAX_STDOUT_BYTES {
-                    return Err(AdapterError::protocol(
-                        "process stdout exceeds collect size bound",
-                    ));
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(AdapterError::other("stdout read failed")),
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
+#[cfg(test)]
 fn parse_outcome_json(stdout: &str) -> AdapterResult<ExecutionOutcome> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -1041,10 +1008,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let token = instance_token();
         spec.env.retain(|(k, _)| k != INSTANCE_ENV);
         spec.env.push((INSTANCE_ENV.to_string(), token.clone()));
-        let instance_path = exec_dir.join("instance");
-        fs::write(&instance_path, token.as_bytes())
-            .map_err(|_| diagnostic("cannot write instance token"))?;
-        let mut child = spawn_child(&spec, &stdout_path, &stderr_path, &instance_path, deadline)?;
+        let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
         let hint = encode_locator_hint(
             pid,
@@ -1092,8 +1056,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 return Err(AdapterError::other("child stdin missing").with_handle_hint(handle));
             }
         };
-        let input = serde_json::to_vec(request.payload()).unwrap_or_else(|_| b"{}".to_vec());
-        if let Err(err) = write_stdin_deadline(stdin, &input, deadline) {
+        if let Err(err) = write_stdin_deadline(stdin, b"", deadline) {
             kill_child(&mut child);
             let _ = child.try_wait();
             return Err(err.with_handle_hint(handle));
@@ -1370,21 +1333,20 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         }
         require_deadline(
             deadline,
-            "collect deadline exhausted before stdout read",
+            "collect deadline exhausted after process exit",
             Some(handle),
         )?;
-        let stdout = read_stdout_bounded(&parsed.stdout_path, deadline).map_err(|err| match err
-            .runtime_handle_hint()
-        {
-            Some(_) => err,
-            None => err.with_handle_hint(handle.clone()),
-        })?;
-        require_deadline(
-            deadline,
-            "collect deadline exhausted before outcome parse",
-            Some(handle),
-        )?;
-        parse_outcome_json(&stdout)
+        Ok(ExecutionOutcome {
+            state: ExecutionState::Terminated,
+            payload: Some(json!({
+                "stdout": parsed.stdout_path.to_string_lossy(),
+                "stderr": parsed.stderr_path.to_string_lossy(),
+            })),
+            summary: Some("physical process exited".into()),
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            incarnation_reusable: false,
+        })
     }
 
     fn reconcile_start(
@@ -1718,6 +1680,10 @@ mod tests {
         assert!(obj.get("birth").is_none());
         assert_eq!(
             obj.get("identity_complete").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            obj.get("reconnectable").and_then(Value::as_bool),
             Some(false)
         );
         assert_eq!(

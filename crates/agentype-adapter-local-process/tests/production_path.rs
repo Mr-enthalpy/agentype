@@ -81,7 +81,10 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
         .unwrap();
     let d = Dispatcher::new(&kernel, &registry, &adapters);
     match d.dispatch_one().unwrap() {
-        DispatchOneOutcome::TaskCompleted { .. } => {}
+        DispatchOneOutcome::TaskCompleted { .. } => {
+            panic!("ExecutionAdapter must not ACK a Task Result from process stdout")
+        }
+        DispatchOneOutcome::StartIndeterminate { .. } => {}
         DispatchOneOutcome::RunningAdmitted { admission } => {
             drop(admission);
             let execution_id = only_execution_id(&kernel);
@@ -97,13 +100,13 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
             recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
             let exec = kernel.execution(&execution_id).unwrap();
             let task = kernel.task(&exec.task_id).unwrap();
-            assert_eq!(
+            assert_ne!(
                 task.state,
                 agentype_core::TaskState::Completed,
-                "identified process end must collect through Recovery, not EXECUTION_LOST"
+                "physical collect must not mint a Task Result"
             );
         }
-        other => panic!("expected TaskCompleted or RunningAdmitted then collect, got {other:?}"),
+        other => panic!("expected physical collect without TaskCompleted, got {other:?}"),
     }
 }
 

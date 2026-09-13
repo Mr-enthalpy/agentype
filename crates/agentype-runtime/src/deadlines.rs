@@ -145,7 +145,7 @@ impl ResolvedAdapterBinding {
 
     pub fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
         let deadline = self.deadline(AdapterOperation::StartExecution)?;
-        self.adapter.start_execution(request, &deadline)
+        admit_start(&deadline, self.adapter.start_execution(request, &deadline))
     }
 
     pub fn reconcile_start(
@@ -154,18 +154,29 @@ impl ResolvedAdapterBinding {
         persisted_handle: Option<&RuntimeHandle>,
     ) -> AdapterResult<StartObservation> {
         let deadline = self.deadline(AdapterOperation::ReconcileStart)?;
-        self.adapter
-            .reconcile_start(request_id, persisted_handle, &deadline)
+        admit_start(
+            &deadline,
+            self.adapter
+                .reconcile_start(request_id, persisted_handle, &deadline),
+        )
     }
 
     pub fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::ObserveExecution)?;
-        self.adapter.observe_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.observe_execution(handle, &deadline),
+        )
     }
 
     pub fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
         let deadline = self.deadline(AdapterOperation::CollectOutcome)?;
-        self.adapter.collect_outcome(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.collect_outcome(handle, &deadline),
+        )
     }
 
     pub fn interrupt_execution(
@@ -173,7 +184,11 @@ impl ResolvedAdapterBinding {
         handle: &RuntimeHandle,
     ) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::InterruptExecution)?;
-        self.adapter.interrupt_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.interrupt_execution(handle, &deadline),
+        )
     }
 
     pub fn terminate_execution(
@@ -181,7 +196,90 @@ impl ResolvedAdapterBinding {
         handle: &RuntimeHandle,
     ) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::TerminateExecution)?;
-        self.adapter.terminate_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.terminate_execution(handle, &deadline),
+        )
+    }
+}
+
+fn late_deadline_error(
+    deadline: &AdapterDeadline,
+    hint: Option<&RuntimeHandle>,
+    prior: Option<AdapterError>,
+) -> AdapterError {
+    if !deadline.is_expired() {
+        return prior.unwrap_or_else(|| AdapterError::deadline_exceeded("deadline exhausted"));
+    }
+    let err = AdapterError::deadline_exceeded(
+        "runtime rejected adapter evidence after deadline endpoint",
+    );
+    let hinted = match hint {
+        Some(h) => err.with_handle_hint(h.clone()),
+        None => prior
+            .as_ref()
+            .and_then(AdapterError::runtime_handle_hint)
+            .cloned()
+            .map(|h| err.clone().with_handle_hint(h))
+            .unwrap_or(err),
+    };
+    let _ = prior;
+    hinted
+}
+
+fn admit_start(
+    deadline: &AdapterDeadline,
+    result: AdapterResult<StartObservation>,
+) -> AdapterResult<StartObservation> {
+    match result {
+        Ok(obs) => {
+            if deadline.is_expired() {
+                Err(AdapterError::deadline_exceeded(
+                    "runtime rejected adapter evidence after deadline endpoint",
+                )
+                .with_handle_hint(obs.runtime_handle))
+            } else {
+                Ok(obs)
+            }
+        }
+        Err(err) => {
+            if deadline.is_expired() {
+                let hint = err.runtime_handle_hint().cloned();
+                let out = AdapterError::deadline_exceeded(
+                    "runtime rejected adapter evidence after deadline endpoint",
+                );
+                Err(match hint {
+                    Some(h) => out.with_handle_hint(h),
+                    None => out,
+                })
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn admit_with_handle<T>(
+    deadline: &AdapterDeadline,
+    handle: Option<&RuntimeHandle>,
+    result: AdapterResult<T>,
+) -> AdapterResult<T> {
+    match result {
+        Ok(value) => {
+            if deadline.is_expired() {
+                Err(late_deadline_error(deadline, handle, None))
+            } else {
+                Ok(value)
+            }
+        }
+        Err(err) => {
+            if deadline.is_expired() {
+                Err(late_deadline_error(deadline, handle, Some(err)))
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -254,6 +352,86 @@ mod tests {
         let _ = seen.remaining();
         assert_eq!(seen.expires_at(), endpoint);
         assert!(endpoint > Instant::now());
+    }
+
+    struct LateOkAdapter;
+
+    impl ExecutionAdapter for LateOkAdapter {
+        fn start_execution(
+            &self,
+            _request: &ExecutionRequest,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+        fn observe_execution(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(ExecutionObservation {
+                state: agentype_core::ExecutionState::Running,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+                detail: None,
+            })
+        }
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn collect_outcome(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionOutcome> {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(ExecutionOutcome {
+                state: agentype_core::ExecutionState::Succeeded,
+                payload: Some(serde_json::json!({"stolen": true})),
+                summary: Some("late".into()),
+                terminal_confirmed: true,
+                quiescent_confirmed: false,
+                incarnation_reusable: false,
+            })
+        }
+        fn reconcile_start(
+            &self,
+            _request_id: &RequestId,
+            _persisted_handle: Option<&RuntimeHandle>,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+    }
+
+    #[test]
+    fn facade_rejects_late_succeeded_collect_as_deadline_exceeded() {
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            Arc::new(LateOkAdapter),
+            AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        let err = binding
+            .collect_outcome(&RuntimeHandle(serde_json::json!({"h": 1})))
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
     }
 
     /// M5.6 §45 #15-19: each Scheduler-facing operation receives the budget

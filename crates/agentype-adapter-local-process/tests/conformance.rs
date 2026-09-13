@@ -235,10 +235,10 @@ fn start_creates_environment_and_returns_persisted_handle() {
     let outcome = adapter
         .collect_outcome(&restored, &long_deadline())
         .unwrap();
-    assert_eq!(outcome.state, ExecutionState::Succeeded);
-    assert!(outcome.terminal_confirmed);
+    assert_eq!(outcome.state, ExecutionState::Terminated);
+    assert!(!outcome.terminal_confirmed);
     assert!(!outcome.quiescent_confirmed);
-    assert_eq!(outcome.summary.as_deref(), Some("fake-agent"));
+    assert_ne!(outcome.summary.as_deref(), Some("fake-agent"));
 }
 
 // --- §16 Observation ---
@@ -337,23 +337,15 @@ fn collect_blocked_response_respects_deadline_and_does_not_prove_state() {
 }
 
 #[test]
-fn start_stdin_timeout_returns_partial_locator() {
-    // Unread stdin + payload large enough to fill the OS pipe buffer.
+fn start_does_not_block_delivering_task_payload() {
     let payload = json!({"pad": "x".repeat(2 * 1024 * 1024)});
     let req = request(AgentSpec::with_flag("FAKE_AGENT_HANG").payload(payload));
     let adapter = LocalProcessAgentAdapter::new();
-    let budget = Duration::from_millis(400);
-    let started = Instant::now();
-    let err = adapter
-        .start_execution(&req, &AdapterDeadline::after(budget).unwrap())
-        .unwrap_err();
-    assert_by_deadline(started, budget);
-    assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
-    assert!(
-        err.runtime_handle_hint().is_some(),
-        "partial locator must survive stdin timeout"
-    );
-    assert_no_secret(&err);
+    let start = adapter.start_execution(&req, &long_deadline()).unwrap();
+    assert_eq!(start.state, ExecutionState::Running);
+    adapter
+        .terminate_execution(&start.runtime_handle, &long_deadline())
+        .unwrap();
 }
 
 #[test]
@@ -503,22 +495,21 @@ fn terminate_timeout_does_not_imply_termination() {
 // --- §16 Collection ---
 
 #[test]
-fn collect_successful_outcome() {
+fn collect_reports_physical_exit_not_task_result() {
     let adapter = LocalProcessAgentAdapter::new();
     let req = request(AgentSpec::default());
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Succeeded);
-    assert_eq!(out.payload, Some(json!({"echo": true})));
-    assert!(out.terminal_confirmed);
+    assert_eq!(out.state, ExecutionState::Terminated);
+    assert!(!out.terminal_confirmed);
     assert!(!out.quiescent_confirmed);
-    assert!(!out.incarnation_reusable);
+    assert_ne!(out.payload, Some(json!({"echo": true})));
 }
 
 #[test]
-fn collect_failed_outcome_from_structured_json() {
+fn collect_ignores_agent_stdout_json() {
     let adapter = LocalProcessAgentAdapter::new();
     let stdout = r#"{"ok":false,"summary":"agent failed"}"#;
     let req = request(AgentSpec::default().env_pair("FAKE_AGENT_STDOUT", stdout));
@@ -526,22 +517,21 @@ fn collect_failed_outcome_from_structured_json() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Failed);
-    assert_eq!(out.summary.as_deref(), Some("agent failed"));
-    assert!(out.terminal_confirmed);
-    assert!(!out.quiescent_confirmed);
+    assert_eq!(out.state, ExecutionState::Terminated);
+    assert!(!out.terminal_confirmed);
+    assert_ne!(out.summary.as_deref(), Some("agent failed"));
 }
 
 #[test]
-fn collect_malformed_output_is_protocol() {
+fn collect_malformed_agent_stdout_is_still_physical_exit() {
     let adapter = LocalProcessAgentAdapter::new();
     let req = request(AgentSpec::with_flag("FAKE_AGENT_MALFORMED"));
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
-    let err = adapter
+    let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
-        .unwrap_err();
-    assert_eq!(err.kind(), AdapterErrorKind::Protocol);
-    assert_no_secret(&err);
+        .unwrap();
+    assert_eq!(out.state, ExecutionState::Terminated);
+    assert!(!out.terminal_confirmed);
 }
 
 // --- §16 Restart ---
@@ -634,7 +624,7 @@ fn model_and_api_key_options_are_opaque_and_not_leaked() {
     let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
         .unwrap();
-    assert_eq!(out.state, ExecutionState::Succeeded);
+    assert_eq!(out.state, ExecutionState::Terminated);
     let dump = format!("{out:?}");
     assert!(!dump.contains(SECRET), "outcome leaked api_key: {dump}");
 }
@@ -686,19 +676,36 @@ fn adapter_drop_does_not_kill_committed_execution() {
         let (_req, start) = start_hang(&adapter);
         handle = start.runtime_handle.clone();
     }
+    let (pid, _birth, _rid, _stdout) = handle_fields(&handle);
+    #[cfg(unix)]
+    {
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "drop must not kill the committed process"
+        );
+    }
+    let _ = pid;
     let adapter = LocalProcessAgentAdapter::new();
-    let obs = adapter
-        .observe_execution(&handle, &long_deadline())
-        .unwrap();
-    assert_eq!(obs.state, ExecutionState::Running);
-    assert_no_quiescence_obs(&obs);
-    adapter
-        .terminate_execution(&handle, &long_deadline())
-        .unwrap();
+    match adapter.observe_execution(&handle, &long_deadline()) {
+        Ok(obs) => {
+            assert_ne!(obs.state, ExecutionState::Lost);
+            if obs.state == ExecutionState::Running {
+                assert_no_quiescence_obs(&obs);
+                adapter
+                    .terminate_execution(&handle, &long_deadline())
+                    .unwrap();
+            }
+        }
+        Err(err) => {
+            assert_eq!(err.kind(), AdapterErrorKind::Other);
+            #[cfg(unix)]
+            assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+    }
 }
 
 #[test]
-fn collect_oversize_stdout_is_protocol_not_success() {
+fn collect_does_not_slurp_stdout_as_task_result() {
     let adapter = LocalProcessAgentAdapter::new();
     let (_req, start) = start_hang(&adapter);
     let (_pid, _birth, _rid, stdout_path) = handle_fields(&start.runtime_handle);
@@ -707,11 +714,11 @@ fn collect_oversize_stdout_is_protocol_not_success() {
     adapter
         .terminate_execution(&start.runtime_handle, &long_deadline())
         .unwrap();
-    let err = adapter
+    let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
-        .unwrap_err();
-    assert_eq!(err.kind(), AdapterErrorKind::Protocol);
-    assert_no_secret(&err);
+        .unwrap();
+    assert_eq!(out.state, ExecutionState::Terminated);
+    assert!(!out.terminal_confirmed);
 }
 
 #[test]
@@ -732,14 +739,14 @@ fn start_expired_after_stdin_does_not_return_running() {
 }
 
 #[test]
-fn collect_writer_quiescence_unknown_json_is_protocol() {
+fn collect_does_not_interpret_failure_class_in_agent_json() {
     let adapter = LocalProcessAgentAdapter::new();
     let stdout = r#"{"ok":false,"failure_class":"WRITER_QUIESCENCE_UNKNOWN"}"#;
     let req = request(AgentSpec::default().env_pair("FAKE_AGENT_STDOUT", stdout));
     let start = adapter.start_execution(&req, &long_deadline()).unwrap();
-    let err = adapter
+    let out = adapter
         .collect_outcome(&start.runtime_handle, &long_deadline())
-        .unwrap_err();
-    assert_eq!(err.kind(), AdapterErrorKind::Protocol);
-    assert_no_secret(&err);
+        .unwrap();
+    assert_eq!(out.state, ExecutionState::Terminated);
+    assert!(!out.terminal_confirmed);
 }
