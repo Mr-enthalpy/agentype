@@ -140,25 +140,31 @@ Reference adapter (`local_process`) handle:
   "kind": "local_process",
   "pid": 1234,
   "birth": 123456789,
+  "inst": "<opaque instance token>",
   "request_id": "<RequestId>",
   "stdout": "<path>",
   "stderr": "<path>"
 }
 ```
 
-PID reuse is not identity. RUNNING after restart requires `pid` **and**
-`birth` (Linux `/proc/<pid>/stat` starttime, Windows `GetProcessTimes`
-creation FILETIME). Missing `birth` or `request_id` is Protocol, not a
-wildcard. Birth mismatch is UNKNOWN, never positive re-admission.
+PID reuse is not identity. RUNNING after restart requires `pid`, `birth`,
+and `inst` (Linux `/proc/<pid>/stat` starttime plus `AGENTYPE_INSTANCE`
+environ token; Windows `GetProcessTimes` creation FILETIME). Missing
+`birth`, `inst`, or `request_id` is Protocol, not a wildcard. Birth or
+token mismatch is UNKNOWN, never positive re-admission. A post-spawn
+locator hint may omit `birth` (`identity_complete: false`) and MUST NOT
+be used to pin or re-admit.
 
 `adapter_kind` is the driver family (`local_process`). The opaque
 `adapter_binding_key` (schema v4) is the concrete domain, frozen at
 Execution creation. It MUST cover every RuntimeHandle locator this adapter
 will re-interpret after restart:
 
-- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>` (`/proc/sys/kernel/random/boot_id`,
-  `/proc/self/ns/pid`, `/proc/self/ns/mnt`). stdout/stderr paths are
-  filesystem locators, so mount namespace is part of the domain.
+- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>:<root_dev>:<root_ino>`
+  (`/proc/sys/kernel/random/boot_id`, `/proc/self/ns/pid`,
+  `/proc/self/ns/mnt`, `stat(/proc/self/root)`). stdout/stderr paths are
+  filesystem locators; mount namespace plus root inode distinguish chroot
+  views that share a mount ns.
 - Windows: `win:<COMPUTERNAME>:<BootIdentifier>` from
   `NtQuerySystemInformation(SystemBootEnvironmentInformation)`. Not
   wall-clock minus `GetTickCount64`.

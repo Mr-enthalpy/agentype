@@ -61,7 +61,7 @@ RootBridge change. M5.8 composition root is still later.
 `adapter_binding_key` is the concrete domain, fail-closed at
 `LocalProcessAgentAdapter::try_new()`:
 
-- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>`
+- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>:<root_dev>:<root_ino>`
 - Windows: `win:<COMPUTERNAME>:<BootIdentifier GUID>`
 
 Missing identity is `Unavailable`. There is no `unknown-*` key.
@@ -208,6 +208,11 @@ Closed in-milestone, not deferred to M5.8:
   starttime ticks alone; Windows start birth comes from the owned Child
   handle
 - Spec 07 freezes kind/key/import/exact-recovery/safety intersection
+- Successful adapter returns qualify the deadline after the last evidence
+  stage; expired evidence is DeadlineExceeded, not Terminated/Unknown
+- Linux binding key includes root `dev:ino` so chroot is not the same domain
+- Spawn-after deadline/birth failure keeps a partial locator hint
+  (`identity_complete: false`)
 - `try_wait` / `/proc` errors are AdapterError, not process absence;
   malformed `/proc` stat is Other, not Gone; Windows OpenProcess only
   `ERROR_INVALID_PARAMETER` is Gone; GetProcessTimes / GetExitCodeProcess

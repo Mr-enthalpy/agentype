@@ -268,11 +268,14 @@ fn pin_linux(
         return Err(AdapterError::unavailable("pidfd_open failed"));
     }
     let pinned = PinnedInstance { pid, pidfd };
-    match process_stat(pid, deadline)? {
+    let stat = process_stat(pid, deadline)?;
+    require_deadline(deadline, "deadline exhausted after process stat", None)?;
+    match stat {
         Some((_, birth)) if birth == expected_birth => {
-            if !environ_has_instance(pid, expected_token)? {
+            if !environ_has_instance(pid, expected_token, deadline)? {
                 return Ok(PinOutcome::Mismatch);
             }
+            require_deadline(deadline, "deadline exhausted after environ", None)?;
             Ok(PinOutcome::Pinned(pinned))
         }
         Some(_) => Ok(PinOutcome::Mismatch),
@@ -281,7 +284,12 @@ fn pin_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn environ_has_instance(pid: u32, expected_token: &str) -> AdapterResult<bool> {
+fn environ_has_instance(
+    pid: u32,
+    expected_token: &str,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<bool> {
+    require_deadline(deadline, "deadline exhausted before environ", None)?;
     if expected_token.is_empty() {
         return Ok(false);
     }
@@ -622,6 +630,14 @@ mod tests {
             !pinned.is_alive(&long).unwrap(),
             "pidfd must report the original process dead after reap"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_deadline_does_not_start_environ_stage() {
+        let expired = AdapterDeadline::from_instant(Instant::now() - Duration::from_secs(1));
+        let err = environ_has_instance(1, "tok", &expired).unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
     }
 
     #[cfg(target_os = "linux")]

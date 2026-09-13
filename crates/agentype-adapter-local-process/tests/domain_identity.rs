@@ -44,6 +44,13 @@ fn linux_domain_key_includes_pid_and_mount_namespaces() {
         key.contains(mnt_ns),
         "linux key {key} must include mount namespace {mnt_ns}"
     );
+    let meta = std::fs::metadata("/proc/self/root").expect("root meta");
+    use std::os::unix::fs::MetadataExt;
+    let root = format!("{}:{}", meta.dev(), meta.ino());
+    assert!(
+        key.contains(&root),
+        "linux key {key} must include root identity {root}"
+    );
     assert!(!key.contains("unknown"));
 }
 

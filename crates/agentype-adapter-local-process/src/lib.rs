@@ -109,7 +109,14 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
             .ok_or_else(|| AdapterError::unavailable("linux boot_id unavailable"))?;
         let pid_ns = read_ns("pid")?;
         let mnt_ns = read_ns("mnt")?;
-        linux_domain_key(&boot, &pid_ns, &mnt_ns)
+        let (root_dev, root_ino) = linux_root_identity()?;
+        linux_domain_key(
+            &boot,
+            &pid_ns,
+            &mnt_ns,
+            &root_dev.to_string(),
+            &root_ino.to_string(),
+        )
     }
     #[cfg(windows)]
     {
@@ -132,19 +139,36 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn linux_domain_key(boot: &str, pid_ns: &str, mnt_ns: &str) -> AdapterResult<AdapterBindingKey> {
-    if boot.trim().is_empty() || pid_ns.trim().is_empty() || mnt_ns.trim().is_empty() {
+fn linux_domain_key(
+    boot: &str,
+    pid_ns: &str,
+    mnt_ns: &str,
+    root_dev: &str,
+    root_ino: &str,
+) -> AdapterResult<AdapterBindingKey> {
+    let parts = [boot, pid_ns, mnt_ns, root_dev, root_ino];
+    if parts.iter().any(|p| p.trim().is_empty()) {
         return Err(AdapterError::unavailable(
             "linux domain identity components cannot be empty",
         ));
     }
-    if boot.contains("unknown") || pid_ns.contains("unknown") || mnt_ns.contains("unknown") {
+    if parts.iter().any(|p| p.contains("unknown")) {
         return Err(AdapterError::unavailable(
             "linux domain identity cannot use unknown placeholders",
         ));
     }
-    AdapterBindingKey::new(format!("linux:{boot}:{pid_ns}:{mnt_ns}"))
-        .map_err(|_| AdapterError::unavailable("linux domain key invalid"))
+    AdapterBindingKey::new(format!(
+        "linux:{boot}:{pid_ns}:{mnt_ns}:{root_dev}:{root_ino}"
+    ))
+    .map_err(|_| AdapterError::unavailable("linux domain key invalid"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_root_identity() -> AdapterResult<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata("/proc/self/root")
+        .map_err(|_| AdapterError::unavailable("linux root identity unavailable"))?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 #[cfg(target_os = "linux")]
@@ -329,6 +353,26 @@ fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
     }))
 }
 
+/// Locator evidence after spawn, before birth is known. Not pin authority.
+fn encode_locator_hint(
+    pid: u32,
+    inst: &str,
+    request_id: &str,
+    stdout: &Path,
+    stderr: &Path,
+) -> RuntimeHandle {
+    RuntimeHandle(json!({
+        "v": HANDLE_VERSION,
+        "kind": ADAPTER_KIND,
+        "pid": pid,
+        "inst": inst,
+        "request_id": request_id,
+        "stdout": stdout.to_string_lossy(),
+        "stderr": stderr.to_string_lossy(),
+        "identity_complete": false,
+    }))
+}
+
 fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
     let obj = handle
         .0
@@ -345,6 +389,9 @@ fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
         return Err(AdapterError::protocol(
             "handle kind is not local_process; no adapter fallback",
         ));
+    }
+    if obj.get("identity_complete").and_then(Value::as_bool) == Some(false) {
+        return Err(AdapterError::protocol("incomplete locator cannot control"));
     }
     let pid = obj
         .get("pid")
@@ -408,6 +455,18 @@ fn require_deadline(
         });
     }
     Ok(())
+}
+
+/// Successful Scheduler-facing returns must qualify after the last
+/// evidence-producing operation. Expired evidence is not an observation.
+fn qualify_ok<T>(
+    deadline: &AdapterDeadline,
+    msg: &'static str,
+    hint: Option<&RuntimeHandle>,
+    value: T,
+) -> AdapterResult<T> {
+    require_deadline(deadline, msg, hint)?;
+    Ok(value)
 }
 
 fn wait_slice(deadline: &AdapterDeadline) -> Option<Duration> {
@@ -966,7 +1025,18 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         spec.env.push((INSTANCE_ENV.to_string(), token.clone()));
         let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
-        if let Err(err) = require_deadline(deadline, "start deadline exhausted after spawn", None) {
+        let hint = encode_locator_hint(
+            pid,
+            &token,
+            request.request_id().as_str(),
+            &stdout_path,
+            &stderr_path,
+        );
+        if let Err(err) = require_deadline(
+            deadline,
+            "start deadline exhausted after spawn",
+            Some(&hint),
+        ) {
             kill_child(&mut child);
             let _ = child.try_wait();
             return Err(err);
@@ -976,7 +1046,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             Err(err) => {
                 kill_child(&mut child);
                 let _ = child.try_wait();
-                return Err(err);
+                return Err(err.with_handle_hint(hint));
             }
         };
         let parsed = ParsedHandle {
@@ -1133,11 +1203,21 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 pin::PinOutcome::Pinned(pinned) => pinned.kill(deadline)?,
                 pin::PinOutcome::Gone => {
                     let _ = proc.child.try_wait();
-                    return Ok(liveness_observation(InstancePresence::Ended));
+                    return qualify_ok(
+                        deadline,
+                        "terminate deadline exhausted",
+                        Some(handle),
+                        liveness_observation(InstancePresence::Ended),
+                    );
                 }
                 pin::PinOutcome::Mismatch => {
                     let _ = proc.child.try_wait();
-                    return Ok(liveness_observation(InstancePresence::Absent));
+                    return qualify_ok(
+                        deadline,
+                        "terminate deadline exhausted",
+                        Some(handle),
+                        liveness_observation(InstancePresence::Absent),
+                    );
                 }
             }
             if wait_child_exit(&mut proc.child, deadline)? {
@@ -1170,14 +1250,18 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     handle.clone(),
                 ))
             }
-            pin::PinOutcome::Gone => {
-                require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
-                Ok(liveness_observation(InstancePresence::Ended))
-            }
-            pin::PinOutcome::Mismatch => {
-                require_deadline(deadline, "terminate deadline exhausted", Some(handle))?;
-                Ok(liveness_observation(InstancePresence::Absent))
-            }
+            pin::PinOutcome::Gone => qualify_ok(
+                deadline,
+                "terminate deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            ),
+            pin::PinOutcome::Mismatch => qualify_ok(
+                deadline,
+                "terminate deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            ),
         }
     }
 
@@ -1285,14 +1369,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 instance_presence(parsed.pid, parsed.birth, &parsed.inst, deadline)?
             }
         };
-        if matches!(presence, InstancePresence::Running) {
-            require_deadline(
-                deadline,
-                "reconcile deadline exhausted before RUNNING",
-                Some(handle),
-            )?;
-        }
-        Ok(match presence {
+        let observation = match presence {
             InstancePresence::Running => StartObservation {
                 state: ExecutionState::Running,
                 runtime_handle: handle.clone(),
@@ -1310,7 +1387,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
             },
-        })
+        };
+        qualify_ok(
+            deadline,
+            "reconcile deadline exhausted after observation",
+            Some(handle),
+            observation,
+        )
     }
 }
 
@@ -1505,18 +1588,58 @@ mod tests {
 
     #[test]
     fn domain_key_rejects_empty_or_unknown_placeholders() {
-        for (boot, pid, mnt) in [
-            ("", "pid:[1]", "mnt:[1]"),
-            ("boot", "", "mnt:[1]"),
-            ("boot", "pid:[1]", ""),
-            ("unknown-boot", "pid:[1]", "mnt:[1]"),
-            ("boot", "unknown-ns", "mnt:[1]"),
+        for (boot, pid, mnt, root_dev, root_ino) in [
+            ("", "pid:[1]", "mnt:[1]", "1", "2"),
+            ("boot", "", "mnt:[1]", "1", "2"),
+            ("boot", "pid:[1]", "", "1", "2"),
+            ("boot", "pid:[1]", "mnt:[1]", "", "2"),
+            ("boot", "pid:[1]", "mnt:[1]", "1", ""),
+            ("unknown-boot", "pid:[1]", "mnt:[1]", "1", "2"),
+            ("boot", "unknown-ns", "mnt:[1]", "1", "2"),
         ] {
-            let err = linux_domain_key(boot, pid, mnt).unwrap_err();
+            let err = linux_domain_key(boot, pid, mnt, root_dev, root_ino).unwrap_err();
             assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
         }
-        let key = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]").unwrap();
-        assert_eq!(key.as_str(), "linux:boot-id:pid:[1]:mnt:[2]");
+        let key = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "1").unwrap();
+        assert_eq!(key.as_str(), "linux:boot-id:pid:[1]:mnt:[2]:8:1");
         assert!(!key.as_str().contains("unknown"));
+        let other = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "99").unwrap();
+        assert_ne!(
+            key.as_str(),
+            other.as_str(),
+            "same ns with different root must not share a binding key"
+        );
+    }
+
+    #[test]
+    fn qualify_ok_rejects_expired_evidence() {
+        let expired = AdapterDeadline::from_instant(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let err = qualify_ok(&expired, "evidence after deadline", None, "obs").unwrap_err();
+        assert_eq!(err.kind(), AdapterErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn incomplete_locator_hint_is_protocol_not_control() {
+        let hint = encode_locator_hint(
+            9,
+            "tok",
+            "req-1",
+            Path::new("stdout.txt"),
+            Path::new("stderr.txt"),
+        );
+        let obj = hint.0.as_object().unwrap();
+        assert_eq!(obj.get("pid").and_then(Value::as_u64), Some(9));
+        assert_eq!(obj.get("inst").and_then(Value::as_str), Some("tok"));
+        assert!(obj.get("birth").is_none());
+        assert_eq!(
+            obj.get("identity_complete").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            parse_handle(&hint).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
     }
 }

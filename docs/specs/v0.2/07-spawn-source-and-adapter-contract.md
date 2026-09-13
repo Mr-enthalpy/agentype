@@ -44,7 +44,10 @@ Under the host-kernel progress assumption, the Scheduler-facing operation
 MUST return within that deadline. An OS/kernel primitive that cannot be
 interrupted by the process is outside the in-process liveness guarantee;
 after such a primitive returns, an expired deadline MUST prohibit any new
-blocking/side-effect stage except immediate allowed cleanup. Cleanup
+blocking/side-effect stage except immediate allowed cleanup. A successful
+Scheduler-facing return MUST qualify the same deadline after the last
+evidence-producing operation; evidence obtained after the endpoint MUST
+NOT become a successful observation. Cleanup
 consumes remaining time; a depleted deadline MAY only kill or abandon
 without a fresh wait budget. A helper thread, detached watchdog, or
 fresh per-stage timeout MUST NOT be used to paper over an uninterruptible
@@ -71,7 +74,10 @@ itself is required for M4 observation vocabulary).
 not a vendor, model, or installation name.
 
 `AdapterBindingKey` is an opaque concrete physical execution domain
-(host/boot/namespace fingerprint). Core MUST NOT interpret it.
+(host/boot/namespace/root fingerprint). Core MUST NOT interpret it.
+The key MUST distinguish every RuntimeHandle locator the adapter will
+re-interpret after restart, including filesystem-root identity when
+handles carry path locators.
 
 An Execution MUST atomically freeze `adapter_kind` and
 `adapter_binding_key` at creation. Recovery MUST `resolve_exact(kind, key)`
