@@ -262,10 +262,8 @@ Diagnostics are bounded (512 chars) and MUST be sanitized by the adapter
 (secrets, tokens, Authorization, env, worker payload, full provider bodies).
 The type enforces length only.
 
-`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. Any `failure_class` key in
-external JSON is `AdapterError::Protocol`. `ok:false` without that key is
-physical `Failed`; Runtime maps a collected Failed to mechanical
-`StartFailure`. The adapter does not author Scheduler failure classes.
+`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. The adapter does not
+author Scheduler failure classes and does not parse agent result JSON.
 
 Timeout, kill-sent, and process-not-running prove nothing about Task
 cancellation, writer safety, or quiescence. `collect_outcome` is physical
@@ -289,15 +287,17 @@ assumption. Still true:
 The reference adapter:
 
 - rejects already-expired calls on all six methods before I/O;
-- writes stdin on the calling thread with nonblocking/PIPE_NOWAIT poll
-  under the same deadline (no helper thread, no detached watchdog);
-- rechecks the deadline before every positive RUNNING / SUCCEEDED /
-  FAILED / TERMINATED observation;
-- collect reads stdout in chunks with a 256 KiB bound;
-- waits for child exit in `WAIT_SLICE` bounded by `remaining`;
-- on start stdin timeout, persists the partial handle as
+- start creates the environment and closes empty stdin (not Task
+  delivery); no helper thread, no detached watchdog;
+- rechecks the same deadline before returning RUNNING or a physical-end
+  observation; collect is not Task SUCCEEDED/FAILED;
+- collect waits for child exit in `WAIT_SLICE` bounded by `remaining` and
+  returns `PhysicalExecutionOutcome` (end + artifact path refs), not a
+  parsed Result;
+- a start-stage timeout after spawn persists the partial handle as
   `runtime_handle_hint` then returns `DeadlineExceeded`;
-- on collect timeout, `DeadlineExceeded` (not SUCCEEDED, not TERMINATED);
+- on collect timeout, `DeadlineExceeded` (not Task success, not
+  TERMINATED proof);
 - on terminate wait exhaustion, `DeadlineExceeded` with hint
   ("kill sent is not quiescence").
 

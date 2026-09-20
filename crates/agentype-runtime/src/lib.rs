@@ -404,7 +404,7 @@ impl AdapterRegistry {
         safety: AdapterSafetyEnvelope,
     ) -> Result<(), AdapterRegistryError> {
         if kind.trim().is_empty() {
-            return Err(AdapterRegistryError::InvalidBindingKey(
+            return Err(AdapterRegistryError::InvalidKind(
                 "adapter kind cannot be empty".into(),
             ));
         }
@@ -836,6 +836,43 @@ pub enum DispatchOneOutcome {
     },
 }
 
+/// Persist identified physical process end, then NACK without Result or
+/// quiescence. Kernel will not overwrite TERMINATED on the subsequent NACK.
+///
+/// `TERMINATED` here is physical history only: not Task success, not
+/// writer quiescence, not Result authority.
+pub(crate) fn persist_physical_end_then_nack(
+    kernel: &Kernel,
+    attempt_id: &AttemptId,
+    lease_epoch: LeaseEpoch,
+    execution_id: &ExecutionId,
+    observed_handle: Option<&Value>,
+    artifact_refs: Option<&Value>,
+) -> Result<(), Error> {
+    kernel.record_physical_outcome(
+        execution_id,
+        ExecutionState::Terminated,
+        observed_handle,
+        artifact_refs,
+        Some(FailureClass::Unknown),
+        false,
+        false,
+    )?;
+    match kernel.nack(
+        attempt_id,
+        lease_epoch,
+        FailureClass::Unknown,
+        Some(execution_id),
+        false,
+        false,
+        false,
+    ) {
+        Ok(_) => Ok(()),
+        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Minimal dispatch service (task §9): take one eligible Scheduler claim and
 /// either fail closed before physical execution, or make exactly one
 /// authoritative physical start attempt whose request, adapter binding,
@@ -1070,9 +1107,8 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// Authoritative classification of the collected outcome (spec 07:
-    /// `collect_outcome` is authoritative for ACK/NACK proof). Dispatch and
-    /// recovery share `normalize_collected_outcome`.
+    /// Classify collected physical evidence. Collect is not Task Result
+    /// authority. Dispatch and recovery share `normalize_collected_outcome`.
     fn commit_collected_outcome(
         &self,
         claim: &Claim,
@@ -1096,12 +1132,15 @@ impl<'a> Dispatcher<'a> {
                 })
             }
             CollectedOutcomeKind::PhysicalEnded => {
-                self.persist_unresolved_physical_then_nack(
-                    claim,
+                persist_physical_end_then_nack(
+                    self.kernel,
+                    &claim.attempt_id,
+                    claim.lease_epoch,
                     execution_id,
-                    FailureClass::Unknown,
                     Some(observed_handle),
-                )?;
+                    outcome.artifact_refs.as_ref(),
+                )
+                .map_err(DispatchError::Persistence)?;
                 Ok(DispatchOneOutcome::StartIndeterminate {
                     execution_id: execution_id.clone(),
                     request_id: request_id.clone(),
@@ -2829,7 +2868,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected physical collect without Task Result, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
         assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
     }
 
@@ -2860,6 +2901,51 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
         assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
         assert!(kernel.result_for_task(&task_id).is_err());
+    }
+
+    #[test]
+    fn physical_ended_persists_terminated_artifacts_without_result() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let d = Dispatcher::new(&kernel, &registry, &adapters);
+        let (_batch, ids) = kernel
+            .submit_batch(&[TaskSpec::new("physical-end", Value::Null)])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        fake.set_next_start(StartObservation {
+            state: ExecutionState::Terminated,
+            runtime_handle: RuntimeHandle(serde_json::json!({"env": 1})),
+            ambiguous: false,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(PhysicalExecutionOutcome {
+            physical_state: agentype_adapter_api::PhysicalState::Terminated,
+            exit_status: Some(0),
+            artifact_refs: Some(serde_json::json!({"stdout": "out.txt"})),
+            diagnostic: Some("physical process exited".into()),
+        });
+        let outcome = d.dispatch_one().unwrap();
+        let execution_id = match &outcome {
+            DispatchOneOutcome::StartIndeterminate { execution_id, .. } => execution_id.clone(),
+            other => panic!("expected physical collect, got {other:?}"),
+        };
+        let exec = kernel.execution(&execution_id).unwrap();
+        assert_eq!(exec.state, ExecutionState::Terminated);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(kernel.result_for_task(&task_id).is_err());
+        let persisted = kernel
+            .reconciliation_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.execution_id() == &execution_id)
+            .expect("persisted execution");
+        assert_eq!(
+            persisted.outcome_json(),
+            Some(&serde_json::json!({"stdout": "out.txt"}))
+        );
     }
 
     /// Audit P1: the authoritative runtime configuration (target options,
@@ -2953,7 +3039,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
-            ExecutionState::Unknown
+            ExecutionState::Terminated
         );
         let task_id = kernel.execution(&execution_id).unwrap().task_id.clone();
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Leased);
@@ -3017,7 +3103,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         };
         assert_eq!(
             kernel.execution(&execution_id).unwrap().state,
-            ExecutionState::Unknown
+            ExecutionState::Terminated
         );
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_ne!(kernel.task(&task_id).unwrap().state, TaskState::Completed);
@@ -3052,7 +3138,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
         assert!(kernel.result_for_task(&task_id).is_err());
@@ -3088,7 +3174,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected physical collect, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
         assert!(kernel.result_for_task(&task_id).is_err());
@@ -3158,7 +3244,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected StartIndeterminate, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
         // The observed handle survives the unresolved path (M5.4 needs it).
@@ -3385,7 +3471,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected physical collect without Task Result, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.quiescent_confirmed);
         assert_eq!(
             kernel.execution_runtime_handle(&execution_id).unwrap(),
@@ -3430,7 +3516,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected physical collect, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
         assert_eq!(
@@ -3584,7 +3670,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Writer-unsafe success produces no durable Result.
         assert!(kernel.result_for_task(&task_id).is_err());
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         assert!(!exec.terminal_confirmed);
         assert!(!exec.quiescent_confirmed);
         assert_eq!(
@@ -3764,7 +3850,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // Crash-window state: physical terminal + locator durable,
         // authority consequence unapplied.
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "TERMINATED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 1})
@@ -3815,7 +3901,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         let err = d.dispatch_claim(&claim).unwrap_err();
         assert!(matches!(err, DispatchError::Persistence(_)));
         let (state, handle) = durable_execution_state_and_handle(&path, &claim.attempt_id);
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "TERMINATED");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&handle).unwrap(),
             serde_json::json!({"crash": 2})
@@ -3941,7 +4027,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             other => panic!("expected physical collect without Task Result, got {other:?}"),
         };
         let exec = kernel.execution(&execution_id).unwrap();
-        assert_eq!(exec.state, ExecutionState::Unknown);
+        assert_eq!(exec.state, ExecutionState::Terminated);
         let incarnation_id = exec.incarnation_id.clone();
 
         let conn = rusqlite::Connection::open(&path).unwrap();

@@ -473,12 +473,20 @@ fn collect_and_apply(
             failure_class,
             Some(&observation.runtime_handle.0),
         ),
-        CollectedOutcomeKind::PhysicalEnded => unresolved_or_history(
-            kernel,
-            snapshot,
-            FailureClass::Unknown,
-            Some(&observation.runtime_handle.0),
-        ),
+        CollectedOutcomeKind::PhysicalEnded => {
+            crate::persist_physical_end_then_nack(
+                kernel,
+                snapshot.attempt_id(),
+                snapshot.lease_epoch(),
+                snapshot.execution_id(),
+                Some(&observation.runtime_handle.0),
+                outcome.artifact_refs.as_ref(),
+            )
+            .map_err(RecoveryError::from)?;
+            Ok(ReconcileExecutionOutcome::Unresolved {
+                failure_class: FailureClass::Unknown,
+            })
+        }
     }
 }
 
@@ -1440,6 +1448,54 @@ mod tests {
         assert_ne!(
             kernel.task(snap.task_id()).unwrap().state,
             TaskState::Completed
+        );
+    }
+
+    #[test]
+    fn physical_ended_recover_persists_terminated_artifacts_without_result() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(StartObservation {
+            state: ExecutionState::Terminated,
+            runtime_handle: RuntimeHandle(json!({"env": 1})),
+            ambiguous: false,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(PhysicalExecutionOutcome {
+            physical_state: agentype_adapter_api::PhysicalState::Terminated,
+            exit_status: Some(0),
+            artifact_refs: Some(json!({"stdout": "out.txt"})),
+            diagnostic: Some("physical process exited".into()),
+        });
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("phys-end", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
+        }
+        let exec = kernel.execution(launch.execution_id()).unwrap();
+        assert_eq!(exec.state, ExecutionState::Terminated);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_ne!(
+            kernel.task(snap.task_id()).unwrap().state,
+            TaskState::Completed
+        );
+        assert!(kernel.result_for_task(snap.task_id()).is_err());
+        let persisted = kernel
+            .reconciliation_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.execution_id() == launch.execution_id())
+            .expect("persisted execution");
+        assert_eq!(
+            persisted.outcome_json(),
+            Some(&json!({"stdout": "out.txt"}))
         );
     }
 

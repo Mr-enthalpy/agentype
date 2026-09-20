@@ -42,7 +42,7 @@ DeepSeek, not an ArchitectureAgent.
 | A | crate `agentype-adapter-local-process`, workspace member, `fake-agent` bin, `target_options.{command,args,cwd,env}` |
 | B | `start_execution`: staged spawn, empty stdin (not Task payload), handle with pid+birth+inst |
 | C | observe / interrupt (Linux SIGINT via pidfd; Windows Unavailable) / terminate (pinned PROCESS handle) |
-| D | `collect_outcome`: bounded stdout `{ok,payload,summary}` — no Scheduler `failure_class` |
+| D | `collect_outcome`: `PhysicalExecutionOutcome` (end + artifact paths), not Task Result |
 | E | `reconcile_start` by `request_id` + handle; protocol errors are `AdapterError` |
 | F | `adapter_binding_key` frozen at Execution creation (SCHEMA_VERSION 4) |
 | G | Dispatcher/Recovery integration through a real `fake-agent` process |
@@ -78,11 +78,11 @@ Handle:
 `birth` is the process-instance token (Linux starttime / Windows creation
 FILETIME). PID match without birth match is UNKNOWN, never RUNNING.
 
-Start returns RUNNING after spawn + same-thread stdin write + one
-`try_wait`, only if the start deadline still remains. It does not wait
-the remaining start budget for the agent to finish; that wait belongs to
+Start returns RUNNING after spawn + empty stdin close + one `try_wait`,
+only if the start deadline still remains. It does not wait the remaining
+start budget for the agent to finish; that wait belongs to
 `collect_outcome`. An identified fast-exit during start is Terminated
-(ENDED, collect candidate), not UNKNOWN and not SUCCEEDED.
+(ENDED, collect candidate), not UNKNOWN and not Task success.
 
 `quiescent_confirmed` is always false. Identified process death on
 observe is Terminated/ENDED (physical collect), never Task SUCCEEDED.
@@ -107,10 +107,10 @@ never call process-wide `set_var`.
 | blocked process/session initialization | start does not wait for agent-ready; missing executable → `Unavailable`; expired start deadline rejected before spawn |
 | blocked request write | Task payload is not written; large payload does not block start |
 | blocked response read | collect of `FAKE_AGENT_HANG` returns by the collect deadline |
-| deadline between start stages | spawn, stdin write, and one `try_wait` share the start endpoint; recheck before RUNNING |
-| deadline after partial locator | stdin timeout returns `runtime_handle_hint` |
-| cleanup with remaining budget | uncommitted start stdin timeout kill + `try_wait` before return |
-| cleanup with depleted budget | collect timeout is `DeadlineExceeded` without SUCCEEDED; no fresh wait |
+| deadline between start stages | spawn, empty stdin close, and one `try_wait` share the start endpoint; recheck before RUNNING |
+| deadline after partial locator | start-stage timeout returns `runtime_handle_hint` |
+| cleanup with remaining budget | uncommitted start-stage timeout kill + `try_wait` before return |
+| cleanup with depleted budget | collect timeout is `DeadlineExceeded` without Task success; no fresh wait |
 | interrupt timeout | expired interrupt → `DeadlineExceeded`; live Linux interrupt is pidfd SIGINT; Windows live interrupt is `Unavailable` |
 | terminate timeout | expired terminate → `DeadlineExceeded` and does **not** claim TERMINATED (process still RUNNING) |
 | reconcile timeout | expired reconcile → `DeadlineExceeded` |
@@ -223,7 +223,7 @@ Closed in-milestone, not deferred to M5.8:
 - Staged spawn deadline; spec 07 / M5.6 / architecture deadline wording
   aligned (host-kernel progress assumption; no watchdog)
 - Dispatcher/Recovery path through real `fake-agent`
-- Collect `ok` must be an explicit JSON boolean (else Protocol)
+- Collect is `PhysicalExecutionOutcome` (end + artifact refs), not Result JSON
 
 ## 9. Future Codex strategy
 
