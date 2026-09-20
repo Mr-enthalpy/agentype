@@ -21,7 +21,7 @@ use crate::observation::{
 };
 use crate::supervision::{SupervisionError, SupervisionRunner, SupervisionService};
 use crate::timing::RuntimeTimingConfig;
-use crate::{AdapterRegistry, ResolvedAdapterBinding, SupervisionAdmission};
+use crate::{AdapterBindingKey, AdapterRegistry, ResolvedAdapterBinding, SupervisionAdmission};
 
 /// Where a freshly minted admission is consumed. The live runner must be
 /// used when one is running (lifecycle gate + deadline wake-up); the
@@ -125,7 +125,6 @@ pub enum ReconcileExecutionOutcome {
         failure_class: FailureClass,
     },
 }
-
 /// Category A: replay a persisted terminal *authority* consequence.
 ///
 /// Physical terminal evidence (`SUCCEEDED`/`FAILED`/`TERMINATED` +
@@ -159,12 +158,20 @@ pub fn replay_persisted_terminal_consequence(
             }
             replay_success_consequence(kernel, snapshot)
         }
-        ExecutionState::Failed | ExecutionState::Terminated => {
+        ExecutionState::Terminated => {
+            // Physical process exit without collect proof is history, not
+            // Category A authority. Dispatcher must not mint ACK/NACK from a
+            // terminal-looking enum; Recovery obeys the same rule.
+            if !snapshot.terminal_confirmed() {
+                return Ok(TerminalReplayOutcome::NotApplicable);
+            }
+            replay_failure_consequence(kernel, snapshot)
+        }
+        ExecutionState::Failed => {
             if !snapshot.terminal_confirmed() {
                 return Err(RecoveryError::invariant(format!(
-                    "execution {} is {} without terminal_confirmed",
+                    "execution {} is FAILED without terminal_confirmed",
                     snapshot.execution_id(),
-                    snapshot.persisted_state().as_sql()
                 )));
             }
             replay_failure_consequence(kernel, snapshot)
@@ -297,8 +304,11 @@ pub fn reconcile_one_execution(
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
     match snapshot.persisted_state() {
         ExecutionState::Lost => close_lost(kernel, snapshot),
+        ExecutionState::Terminated if !snapshot.terminal_confirmed() => {
+            reconcile_active_physical(kernel, adapters, snapshot, supervisor)
+        }
         ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Terminated => {
-            // Category A owns these. Reaching here is a coordinator bug.
+            // Category A owns proven terminals. Reaching here is a coordinator bug.
             Err(RecoveryError::invariant(format!(
                 "reconcile_one_execution called for terminal execution {}",
                 snapshot.execution_id()
@@ -341,7 +351,11 @@ fn reconcile_active_physical(
     snapshot: &ExecutionReconciliationSnapshot,
     supervisor: &impl AdmissionSink,
 ) -> Result<ReconcileExecutionOutcome, RecoveryError> {
-    let adapter = match adapters.resolve(snapshot.adapter_kind()) {
+    let key = match AdapterBindingKey::new(snapshot.adapter_binding_key()) {
+        Ok(key) => key,
+        Err(_) => return missing_adapter(kernel, snapshot),
+    };
+    let adapter = match adapters.resolve_exact(snapshot.adapter_kind(), &key) {
         Ok(adapter) => adapter,
         Err(_) => return missing_adapter(kernel, snapshot),
     };
@@ -459,76 +473,19 @@ fn collect_and_apply(
             failure_class,
             Some(&observation.runtime_handle.0),
         ),
-        CollectedOutcomeKind::TerminalSuccess => {
-            let payload = outcome.payload.clone().unwrap_or(Value::Null);
-            kernel
-                .record_pending_physical_terminal(
-                    snapshot.execution_id(),
-                    ExecutionState::Succeeded,
-                    Some(&observation.runtime_handle.0),
-                    outcome.payload.as_ref(),
-                    outcome.summary.as_deref(),
-                    None,
-                    outcome.quiescent_confirmed,
-                    outcome.incarnation_reusable,
-                )
-                .map_err(RecoveryError::from)?;
-            match kernel.ack_success(
+        CollectedOutcomeKind::PhysicalEnded => {
+            crate::persist_physical_end_then_nack(
+                kernel,
                 snapshot.attempt_id(),
                 snapshot.lease_epoch(),
-                Some(snapshot.execution_id()),
-                &payload,
-                outcome.summary.as_deref(),
-                outcome.quiescent_confirmed,
-                outcome.incarnation_reusable,
-            ) {
-                Ok(Some(result_id)) => Ok(ReconcileExecutionOutcome::TaskCompleted { result_id }),
-                Ok(None) => Ok(ReconcileExecutionOutcome::WriterSafetySuspendedAfterSuccess),
-                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                    kernel
-                        .record_physical_outcome(
-                            snapshot.execution_id(),
-                            ExecutionState::Succeeded,
-                            Some(&observation.runtime_handle.0),
-                            outcome.payload.as_ref(),
-                            None,
-                            true,
-                            outcome.quiescent_confirmed,
-                        )
-                        .map_err(RecoveryError::from)?;
-                    Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
-                }
-                Err(err) => Err(RecoveryError::from(err)),
-            }
-        }
-        CollectedOutcomeKind::TerminalFailure { failure_class } => {
-            kernel
-                .record_pending_physical_terminal(
-                    snapshot.execution_id(),
-                    ExecutionState::Failed,
-                    Some(&observation.runtime_handle.0),
-                    None,
-                    outcome.summary.as_deref(),
-                    Some(failure_class),
-                    outcome.quiescent_confirmed,
-                    outcome.incarnation_reusable,
-                )
-                .map_err(RecoveryError::from)?;
-            match kernel.nack(
-                snapshot.attempt_id(),
-                snapshot.lease_epoch(),
-                failure_class,
-                Some(snapshot.execution_id()),
-                true,
-                outcome.quiescent_confirmed,
-                outcome.incarnation_reusable,
-            ) {
-                Ok(_) => Ok(ReconcileExecutionOutcome::TerminalFailure { failure_class }),
-                Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                    Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
-                }
-                Err(err) => Err(RecoveryError::from(err)),
-            }
+                snapshot.execution_id(),
+                Some(&observation.runtime_handle.0),
+                outcome.artifact_refs.as_ref(),
+            )
+            .map_err(RecoveryError::from)?;
+            Ok(ReconcileExecutionOutcome::Unresolved {
+                failure_class: FailureClass::Unknown,
+            })
         }
     }
 }
@@ -719,6 +676,9 @@ fn recover_runtime_inner(
                     }
                 }
             }
+            ExecutionState::Terminated if !snap.terminal_confirmed() => {
+                reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
+            }
             ExecutionState::Lost => {
                 reconcile_one_execution(&kernel, adapters, snap, guard.runner())?;
             }
@@ -809,10 +769,12 @@ mod tests {
     use crate::notifier::{NotifierBinding, NotifierConfig, NotifierRetryPolicy};
     use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
-    use crate::{AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
+    use crate::{
+        AdapterBindingKey, AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
+    };
     use agentype_adapter_api::{
-        AdapterResult, ExecutionAdapter, ExecutionObservation, ExecutionOutcome, FakeAdapter,
-        RuntimeHandle, StartObservation,
+        AdapterResult, ExecutionAdapter, ExecutionObservation, FakeAdapter,
+        PhysicalExecutionOutcome, RuntimeHandle, StartObservation,
     };
     use agentype_core::{
         AttemptState, AuthoritativeExecutionBinding, Claim, Clock, ExecutionState, FailureClass,
@@ -883,6 +845,7 @@ mod tests {
                 execution_profile: claim.execution_profile.clone(),
             }),
             "process",
+            AdapterBindingKey::for_tests(),
         )
         .unwrap()
     }
@@ -915,7 +878,7 @@ mod tests {
     fn adapters(fake: &Arc<FakeAdapter>) -> AdapterRegistry {
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", fake.clone(), crate::deadlines::test_deadlines())
+            .register_kind("process", fake.clone(), crate::deadlines::test_deadlines())
             .unwrap();
         adapters
     }
@@ -925,13 +888,11 @@ mod tests {
             state: ExecutionState::Running,
             runtime_handle: RuntimeHandle(json!({"reconciled": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: false,
             quiescent_confirmed: false,
         }
     }
-
     /// #38/#42: crash after physical SUCCEEDED is durable, before ACK,
     /// replays into exactly one Result while authority is current.
     #[test]
@@ -966,6 +927,38 @@ mod tests {
             TerminalReplayOutcome::AlreadyApplied { .. } => {}
             other => panic!("expected AlreadyApplied, got {other:?}"),
         }
+    }
+
+    /// TERMINATED without terminal_confirmed is physical history, not
+    /// Category A authority. Recovery must not treat it as durable corruption.
+    #[test]
+    fn terminated_without_terminal_confirmed_is_physical_history() {
+        let (_clock, k) = env();
+        let (_claim, launch) = start_named(&k, TaskSpec::new("term-hist", json!({"o": 1})));
+        k.record_physical_outcome(
+            launch.execution_id(),
+            ExecutionState::Terminated,
+            Some(&json!({"h": 1})),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let snap = snapshot_of(&k, launch.execution_id());
+        match replay_persisted_terminal_consequence(&k, &snap).unwrap() {
+            TerminalReplayOutcome::NotApplicable => {}
+            other => panic!("expected NotApplicable, got {other:?}"),
+        }
+        assert!(k.result_for_task(launch.task_id()).is_err());
+        assert_ne!(k.task(snap.task_id()).unwrap().state, TaskState::Completed);
+
+        let fake = Arc::new(FakeAdapter::new());
+        let adapters = adapters(&fake);
+        let kernel = Arc::new(k);
+        recover_runtime_without_notifier(kernel.clone(), &adapters, timing()).unwrap();
+        assert!(kernel.result_for_task(launch.task_id()).is_err());
     }
 
     /// #39: crash after physical FAILED is durable, before NACK, replays
@@ -1437,33 +1430,72 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"done": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
         });
-        fake.set_next_outcome(agentype_adapter_api::ExecutionOutcome {
-            state: ExecutionState::Succeeded,
-            payload: Some(json!({"ok": true})),
-            summary: Some("done".into()),
-            failure_class: None,
-            terminal_confirmed: true,
-            quiescent_confirmed: true,
-            incarnation_reusable: false,
-        });
+        fake.set_next_outcome(PhysicalExecutionOutcome::exited());
         let adapters = adapters(&fake);
         let (_claim, launch) = start_named(&kernel, TaskSpec::new("term", json!({"o": 1})));
         let snap = snapshot_of(&kernel, launch.execution_id());
         match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
-            ReconcileExecutionOutcome::TaskCompleted { .. } => {}
-            other => panic!("expected TaskCompleted, got {other:?}"),
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
         }
         assert_eq!(fake.start_call_count(), 0);
         assert_eq!(fake.collect_call_count(), 1);
         assert_eq!(svc.active_count(), 0);
-        assert_eq!(
+        assert_ne!(
             kernel.task(snap.task_id()).unwrap().state,
             TaskState::Completed
+        );
+    }
+
+    #[test]
+    fn physical_ended_recover_persists_terminated_artifacts_without_result() {
+        let (_clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(StartObservation {
+            state: ExecutionState::Terminated,
+            runtime_handle: RuntimeHandle(json!({"env": 1})),
+            ambiguous: false,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(PhysicalExecutionOutcome {
+            physical_state: agentype_adapter_api::PhysicalState::Terminated,
+            exit_status: Some(0),
+            artifact_refs: Some(json!({"stdout": "out.txt"})),
+            diagnostic: Some("physical process exited".into()),
+        });
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("phys-end", json!({"o": 1})));
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
+        }
+        let exec = kernel.execution(launch.execution_id()).unwrap();
+        assert_eq!(exec.state, ExecutionState::Terminated);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert_ne!(
+            kernel.task(snap.task_id()).unwrap().state,
+            TaskState::Completed
+        );
+        assert!(kernel.result_for_task(snap.task_id()).is_err());
+        let persisted = kernel
+            .reconciliation_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.execution_id() == launch.execution_id())
+            .expect("persisted execution");
+        assert_eq!(
+            persisted.outcome_json(),
+            Some(&json!({"stdout": "out.txt"}))
         );
     }
 
@@ -1564,7 +1596,7 @@ mod tests {
         );
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register("process", advancing, crate::deadlines::test_deadlines())
+            .register_kind("process", advancing, crate::deadlines::test_deadlines())
             .unwrap();
 
         let (_claim, launch) = start_named(&kernel, TaskSpec::new("stale-rec-to", json!({"o": 1})));
@@ -1636,7 +1668,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"done": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -1646,8 +1677,8 @@ mod tests {
         let snap = snapshot_of(&kernel, launch.execution_id());
 
         match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
-            ReconcileExecutionOutcome::TaskCompleted { .. } => {}
-            other => panic!("expected TaskCompleted, got {other:?}"),
+            ReconcileExecutionOutcome::Unresolved { .. } => {}
+            other => panic!("expected physical collect without Task Result, got {other:?}"),
         }
         let rec = fake
             .deadline_for(agentype_adapter_api::AdapterOperation::ReconcileStart)
@@ -1672,7 +1703,6 @@ mod tests {
             state: ExecutionState::Succeeded,
             runtime_handle: RuntimeHandle(json!({"claimed": true})),
             ambiguous: false,
-            failure_class: None,
             detail: None,
             terminal_confirmed: true,
             quiescent_confirmed: true,
@@ -1992,7 +2022,7 @@ mod tests {
         });
         let mut adapters = AdapterRegistry::new();
         adapters
-            .register(
+            .register_kind(
                 "process",
                 advancing.clone(),
                 crate::deadlines::test_deadlines(),
@@ -2171,7 +2201,7 @@ mod tests {
     impl ExecutionAdapter for ClockAdvancingAdapter {
         fn start_execution(
             &self,
-            request: &agentype_adapter_api::ExecutionRequest,
+            request: &agentype_adapter_api::EnvironmentStartRequest,
             deadline: &agentype_adapter_api::AdapterDeadline,
         ) -> AdapterResult<StartObservation> {
             self.inner.start_execution(request, deadline)
@@ -2205,7 +2235,7 @@ mod tests {
             &self,
             handle: &RuntimeHandle,
             deadline: &agentype_adapter_api::AdapterDeadline,
-        ) -> AdapterResult<ExecutionOutcome> {
+        ) -> AdapterResult<agentype_adapter_api::PhysicalExecutionOutcome> {
             self.inner.collect_outcome(handle, deadline)
         }
 

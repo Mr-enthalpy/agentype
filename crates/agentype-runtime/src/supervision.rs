@@ -850,7 +850,9 @@ mod tests {
         AuthoritativeExecutionBinding, Claim, Clock, ExecutionState, LeaseState, ManualClock,
         PartitionSpec, Retention, RetryPolicy, SystemClock, TaskSpec, TaskState,
     };
-    use agentype_execution_config::{FrozenExecutionSafety, FrozenPhysicalExecutionBinding};
+    use agentype_execution_config::{
+        AdapterBindingKey, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
+    };
     use serde_json::json;
     use std::sync::Arc;
 
@@ -891,6 +893,7 @@ mod tests {
                 execution_profile: claim.execution_profile.clone(),
             }),
             "test",
+            AdapterBindingKey::for_tests(),
         )
         .unwrap()
     }

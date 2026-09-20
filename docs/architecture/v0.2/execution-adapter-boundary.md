@@ -1,0 +1,367 @@
+# Execution Adapter Boundary
+
+Status: Architecture
+Applies to: V0.2 / M5.7
+Canonical path: `docs/architecture/v0.2/execution-adapter-boundary.md`
+Not a specification. Normative adapter interface remains
+[spec 07](../../specs/v0.2/07-spawn-source-and-adapter-contract.md).
+Deadline algebra remains
+[M5.6](../../reports/v0.2/riir-m5.6-adapter-deadline-contract.md).
+
+---
+
+## 1. Adapter definition
+
+An Execution Adapter is the Scheduler-facing owner of **one physical
+execution environment**. It is not a model client, not a provider router,
+and not an agent.
+
+```text
+Scheduler
+    owns: Task, LogicalAgent, Execution lifecycle, Lease, Retry,
+          Recovery, Authority
+        |
+        v
+Execution Adapter
+    owns: create, reconnect, observe, interrupt, terminate, collect
+        |
+        v
+External Agent Environment
+    owns: agent runtime, harness, tools, model/provider, credentials,
+          network, prompt/system context, internal memory
+```
+
+`ExecutionAdapter` MUST NOT consume Task payload or acceptance, MUST NOT
+define an agent result JSON (`ok`/`payload`/`summary` as Result), and
+MUST NOT create an authoritative Result. Task/Result travel on a separate
+Worker data plane (not this milestone). `collect_outcome` reports
+physical environment end (exited / terminated / unknown + artifact
+paths), not Task success.
+
+Runtime `ResolvedAdapterBinding` admits returned evidence only if the
+**same** deadline has not expired.
+
+The frozen contract is `ExecutionAdapter` in `agentype-adapter-api`:
+
+- `start_execution`
+- `reconcile_start`
+- `observe_execution`
+- `collect_outcome`
+- `interrupt_execution`
+- `terminate_execution`
+
+Every method receives one `AdapterDeadline`. No method may block
+indefinitely, spawn hidden background work, bypass the deadline, or mutate
+Scheduler state.
+
+If adding a new model or provider requires changing Scheduler Core, this
+boundary has failed.
+
+---
+
+## 2. Non-goals
+
+M5.7 MUST NOT implement, and an Execution Adapter MUST NOT own:
+
+- AgentType hierarchy
+- SpawnSource registry
+- Memory / checkpoint compression
+- Transform, Move, Merge
+- Provider routing and credential management
+- Prompt orchestration as a generic adapter requirement
+  (`RenderedWorkerPrompt` is an optional V0.1 compatibility renderer)
+- Transcript database, dashboard, conversation UI
+- Codex CLI / OpenCode runtime integration
+- Steady-state observer loop, watchdog thread, process lock
+- RootBridge `last_error` sanitization
+
+Optional ergonomics (transcript viewer, terminal attach, debug) MAY exist
+beside an adapter. They MUST NOT be required for Scheduler correctness. A
+minimal adapter without UI remains fully valid.
+
+---
+
+## 3. Runtime boundary
+
+| Layer | Owns | Must not own |
+| --- | --- | --- |
+| Scheduler Core | execution semantics, authority, retry, recovery | process/session protocol, model, credentials |
+| Execution Adapter | physical create/connect/observe/control/collect | Task/Lease/Result authority, logical lifecycle |
+| External environment | agent implementation, harness, tools, model | Scheduler state |
+
+`LogicalAgent` has many `Execution`s. Each Execution is created by some
+adapter. The adapter does not know that two Executions are the same logical
+agent. Crash and replacement mint a new physical instance; identity
+preservation across restart is `reconcile_start(request_id, persisted_handle)`,
+never a second `start_execution`.
+
+Process death is not quiescence. Heartbeat failure is not process death.
+Adapter timeout is not TERMINATED, LOST, or writer-safety proof.
+
+---
+
+## 4. ExecutionSpec
+
+There is no new Core type named `ExecutionSpec`. The Scheduler semantic
+request is already `ExecutionRequest`, assembled exclusively from:
+
+1. `ExecutionLaunchSnapshot` — durable Scheduler identities, workspace,
+   payload, acceptance, continuity;
+2. `ResolvedExecutionEnvironment` — authoritative `target_options` /
+   `profile_options` / `profile_timeout_seconds`.
+
+Scheduler Core MUST NOT define, interpret, route, or persist
+model/provider credential semantics. There is no Core field named
+`model`, `provider`, or `api_key`. Caller-supplied prompt text cannot
+be injected (`RenderedWorkerPrompt` is derived from the launch snapshot).
+
+Adapter-specific opaque `target_options` JSON MAY exist (`command`,
+`args`, `cwd`, `env` for a local process). Extra keys are ignored by
+this adapter. Provider credentials SHOULD remain in the user-owned
+external environment (command / config_ref / inherited env), not
+plaintext `api_key` in Agentype configuration.
+
+`ExecutionProfile.timeout_seconds` remains execution/profile configuration.
+It MUST NOT become any Scheduler-facing operation deadline. Operation
+latency bounds come exclusively from the installed `AdapterDeadlinePolicy`.
+
+---
+
+## 5. RuntimeHandle semantics
+
+`RuntimeHandle` is opaque JSON physical evidence. Scheduler may persist it,
+compare it, and pass it back. Scheduler Core MUST NOT interpret vendor
+fields.
+
+Allowed contents (adapter-private): process id, process-instance birth
+token, session id, container id, stdout/stderr paths, adapter kind, a
+copy of `request_id` used only as reconcile identity check. Core MUST
+NOT learn `ProcessId` or start-time types.
+
+It is not Execution identity, LogicalAgent identity, or Task identity.
+A handle hint on `AdapterError` is locator history only: not RUNNING, not
+terminal, not quiescent, not Task authority.
+
+Reference adapter (`local_process`) handle:
+
+```json
+{
+  "v": 1,
+  "kind": "local_process",
+  "pid": 1234,
+  "birth": 123456789,
+  "inst": "<opaque instance token>",
+  "request_id": "<RequestId>",
+  "stdout": "<path>",
+  "stderr": "<path>"
+}
+```
+
+PID reuse is not identity. RUNNING after restart requires `pid`, `birth`,
+and `inst` (Linux `/proc/<pid>/stat` starttime plus `AGENTYPE_INSTANCE`
+environ token; Windows `GetProcessTimes` creation FILETIME). Missing
+`birth`, `inst`, or `request_id` is Protocol, not a wildcard. Birth or
+token mismatch is UNKNOWN, never positive re-admission. A post-spawn
+locator hint may omit `birth` (`identity_complete: false`) and MUST NOT
+be used to pin or re-admit.
+
+`adapter_kind` is the driver family (`local_process`). The opaque
+`adapter_binding_key` (schema v4) is the concrete domain, frozen at
+Execution creation. It MUST cover every RuntimeHandle locator this adapter
+will re-interpret after restart:
+
+- Linux: `linux:<boot_id>:<pid_ns>:<mnt_ns>:<root_dev>:<root_ino>`
+  (`/proc/sys/kernel/random/boot_id`, `/proc/self/ns/pid`,
+  `/proc/self/ns/mnt`, `stat(/proc/self/root)`). stdout/stderr paths are
+  filesystem locators; mount namespace plus root inode distinguish chroot
+  views that share a mount ns.
+- Windows: `win:<COMPUTERNAME>:<BootIdentifier>` from
+  `NtQuerySystemInformation(SystemBootEnvironmentInformation)`. Not
+  wall-clock minus `GetTickCount64`.
+
+Missing boot, namespace, or boot-GUID identity is `Unavailable`. The
+adapter MUST NOT mint `unknown-*` keys. Installation is
+`LocalProcessAgentAdapter::try_new()`.
+
+Recovery uses `resolve_exact(kind, key)` with no fallback. Launch without
+a SpawnSource uses `resolve_unique(kind)` and fails closed if two
+installations of that driver are present. Core does not interpret the key.
+
+Identified process end (`Terminated`, not ambiguous, not
+`terminal_confirmed`) is a collect candidate. Process death is not
+success or quiescence, but it is enough to call `collect_outcome`.
+`UNKNOWN` remains identity-not-confirmed.
+
+Production install is `AdapterRegistry::import` /
+`ImportedExecutionBinding::from_importable`. Kind, domain key, and
+enforceable isolation come from the adapter (`ImportableAdapter`), not
+the composition caller.
+
+Control (Linux interrupt, terminate/reap) MUST target a pinned process
+instance (Linux `pidfd`, Windows one PROCESS handle used for both birth
+check and `TerminateProcess`). After pin, every later observe/wait/signal
+for that invocation MUST act on the pinned identity and MUST NOT
+re-resolve the numeric PID (Linux liveness is `poll(pidfd)`, not
+`/proc/<pid>`). Restart identity is pidfd plus an adapter-owned instance
+token in the child environment (`AGENTYPE_INSTANCE`); matching
+`/proc` starttime ticks alone is not enough. Windows start captures
+creation time from the owned `Child` PROCESS handle so a fast-exit still
+yields ENDED→collect. After pin returns, kill rechecks the same deadline before
+signaling. A stale handle with a reused PID MUST NOT affect the new
+occupant. Windows graceful interrupt is `Unavailable`:
+`AttachConsole`/`GenerateConsoleCtrlEvent` would act on a numeric PID
+after pin, which is TOCTOU, and `CREATE_NO_WINDOW` children have no
+console. Cooperative interrupt belongs to the external environment.
+
+Observation errors (`try_wait` failure, `/proc` I/O other than not-found,
+malformed `/proc` stat, Windows `OpenProcess` access/unknown failure,
+`GetProcessTimes` / `GetExitCodeProcess` failure) are `AdapterError`, not
+physical absence. Only ENOENT/`ERROR_INVALID_PARAMETER` is `Gone`.
+Terminate + query failure is not TERMINATED proof.
+
+`attempt_isolation` on `ExecutionTargetConfig` is a requirement, not a
+proof. It intersects the installed binding's `AdapterSafetyEnvelope`.
+`LocalProcessAgentAdapter` cannot enforce isolation; a target that requires
+it is `RESOURCE_UNAVAILABLE` before Execution creation.
+
+---
+
+## 6. Capability model
+
+Required:
+
+```text
+ExecutionControlCapability  = the six ExecutionAdapter methods
+```
+
+Optional, non-correctness:
+
+```text
+SessionInspectionCapability
+TerminalAttachmentCapability
+TranscriptCapability
+DebugCapability
+```
+
+The reference adapter implements only the required lifecycle contract.
+
+---
+
+## 7. Failure model
+
+Adapter failure is not Scheduler failure.
+
+| `AdapterErrorKind` | Scheduler mechanical class |
+| --- | --- |
+| `DeadlineExceeded` | `TIMEOUT` |
+| `Unavailable` | `RESOURCE_UNAVAILABLE` |
+| `Protocol` | `ADAPTER_PROTOCOL_FAILURE` |
+| `Other` | `UNKNOWN` (not `START_FAILURE`) |
+
+Diagnostics are bounded (512 chars) and MUST be sanitized by the adapter
+(secrets, tokens, Authorization, env, worker payload, full provider bodies).
+The type enforces length only.
+
+`WRITER_QUIESCENCE_UNKNOWN` is Scheduler-owned. The adapter does not
+author Scheduler failure classes and does not parse agent result JSON.
+
+Timeout, kill-sent, and process-not-running prove nothing about Task
+cancellation, writer safety, or quiescence. `collect_outcome` is physical
+environment end, not Task completion.
+
+---
+
+## 8. Deadline inheritance from M5.6
+
+See `m5.6-deadline-amendment.md`. Host-kernel progress is an explicit
+assumption. Still true:
+
+- one absolute monotonic `AdapterDeadline` per Scheduler-facing call;
+- `now == expires_at` is expired; `remaining` saturates at zero; no
+  extend/reset;
+- every internal stage and exception cleanup derives from the same endpoint;
+- depleted deadline may only kill or abandon, never open a fresh wait;
+- production invocation is `ResolvedAdapterBinding` (M5.6 façade);
+- this crate does not depend on runtime; composition is M5.8.
+
+The reference adapter:
+
+- rejects already-expired calls on all six methods before I/O;
+- start creates the environment and closes empty stdin (not Task
+  delivery); no helper thread, no detached watchdog;
+- rechecks the same deadline before returning RUNNING or a physical-end
+  observation; collect is not Task SUCCEEDED/FAILED;
+- collect waits for child exit in `WAIT_SLICE` bounded by `remaining` and
+  returns `PhysicalExecutionOutcome` (end + artifact path refs), not a
+  parsed Result;
+- a start-stage timeout after spawn persists the partial handle as
+  `runtime_handle_hint` then returns `DeadlineExceeded`;
+- on collect timeout, `DeadlineExceeded` (not Task success, not
+  TERMINATED proof);
+- on terminate wait exhaustion, `DeadlineExceeded` with hint
+  ("kill sent is not quiescence").
+
+Normative contract (spec 07, aligned here; this file is not itself a spec):
+
+All adapter-controlled waits, retries, protocol stages, cleanup waits and
+additional side-effect stages MUST obey the single absolute deadline.
+Under the host-kernel progress assumption, the Scheduler-facing operation
+MUST return within that deadline. An OS/kernel primitive that cannot be
+interrupted by the process is outside the in-process liveness guarantee;
+after such a primitive returns, an expired deadline MUST prohibit any new
+blocking/side-effect stage except immediate allowed cleanup.
+
+There is no watchdog thread. A helper thread, detached watchdog, or fresh
+per-stage timeout MUST NOT paper over an uninterruptible kernel wait.
+
+---
+
+## 9. Reference adapter design
+
+Crate: `agentype-adapter-local-process`.
+Type: `LocalProcessAgentAdapter`.
+Kind: `local_process`.
+
+User-owned executable from `target_options.command` / `args` / `cwd` /
+`env`. The crate ships `fake-agent` only as a scriptable external
+environment for conformance (behavior selected by `FAKE_AGENT_*` env passed
+**per child**, never process-wide `set_var`).
+
+| Operation | Mechanics |
+| --- | --- |
+| start | spawn (deadline-staged) + birth probe + empty stdin (not Task payload) + one `try_wait`. RUNNING if still alive **and** deadline remains; identified process end → Terminated (ENDED, physical collect). |
+| observe | live `Child` with matching `birth`, else pin `pid+birth`. Alive → RUNNING; identified instance gone → Terminated (ENDED, collect); birth mismatch → UNKNOWN. Never SUCCEEDED. |
+| interrupt | Linux: pin pidfd, then `SIGINT` through that pin. Windows: `Unavailable` (no numeric-PID console event). Stale pid+wrong birth MUST NOT interrupt another occupant. Unpinned control is Unavailable. Not Task cancellation. |
+| terminate | Pin, verify birth, kill through the same pin, wait remaining. Confirmed exit → TERMINATED with `terminal_confirmed=false`, `quiescent_confirmed=false` (physical history, not ACK/NACK proof). |
+| collect | wait remaining for process exit; return `PhysicalExecutionOutcome` (Exited/Terminated/Unknown + artifact paths). Not Task Result. |
+| reconcile | reconnect persisted handle + `request_id` + `birth` under the frozen `(adapter_kind, adapter_binding_key)`. Identified process ended → Terminated (ENDED, collect). No handle / birth mismatch → ambiguous UNKNOWN. |
+
+Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`; birth via
+`GetProcessTimes`. Linux: `/proc/<pid>/stat` starttime **and** state
+(`Z`/`X` are not alive); `waitpid(WNOHANG)` while still parent.
+Drop reaps already-dead children and leaves running processes alive
+(`Child` is dropped, not killed, not forgotten). Committed executions
+outlive adapter ownership.
+
+---
+
+## 10. Future Codex / OpenCode integration
+
+Codex CLI Adapter and OpenCode Runtime Adapter are the same **kind** of
+object as `LocalProcessAgentAdapter`: they create and control an externally
+owned environment. They are not model adapters.
+
+A future Codex adapter SHOULD:
+
+- speak the same six methods and `AdapterDeadline`;
+- store an opaque session/thread locator as `RuntimeHandle`;
+- treat CLI/auth/sandbox/transcript as environment concerns;
+- not teach Scheduler about providers, models, or conversation UI.
+
+It SHOULD NOT land until this local-process adapter remains replaceable
+without Core changes. If Codex integration forces Scheduler to learn
+session semantics, the boundary is wrong — fix the adapter, not Core.
+
+A future Codex installation is another `adapter_binding_key`, not a Core
+enum. `adapter_kind` stays `codex` (or similar); the key names the host
+and installation.

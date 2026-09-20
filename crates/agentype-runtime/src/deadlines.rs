@@ -6,10 +6,11 @@
 
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterOperation, AdapterResult, DeadlineConfigError,
-    ExecutionAdapter, ExecutionObservation, ExecutionOutcome, ExecutionRequest, RuntimeHandle,
-    StartObservation,
+    EnvironmentStartRequest, ExecutionAdapter, ExecutionObservation, PhysicalExecutionOutcome,
+    RuntimeHandle, StartObservation,
 };
 use agentype_core::RequestId;
+use agentype_execution_config::AdapterBindingKey;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,31 +70,68 @@ impl AdapterDeadlinePolicy {
     }
 }
 
+/// Physical safety the installed execution source can actually enforce.
+/// Target configuration may *require* isolation; this envelope says whether
+/// the imported binding can back that claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterSafetyEnvelope {
+    attempt_isolation: bool,
+}
+
+impl AdapterSafetyEnvelope {
+    pub fn unenforceable() -> Self {
+        Self::default()
+    }
+
+    pub fn with_attempt_isolation(mut self, attempt_isolation: bool) -> Self {
+        self.attempt_isolation = attempt_isolation;
+        self
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+}
+
 /// Installed adapter plus its operation policy. Production code invokes
 /// through these methods so a deadline is always constructed. The raw
 /// `ExecutionAdapter` is not exposed.
 #[derive(Clone)]
 pub struct ResolvedAdapterBinding {
     adapter_kind: String,
+    adapter_binding_key: AdapterBindingKey,
     adapter: Arc<dyn ExecutionAdapter>,
     deadlines: AdapterDeadlinePolicy,
+    safety: AdapterSafetyEnvelope,
 }
 
 impl ResolvedAdapterBinding {
     pub(crate) fn new(
         adapter_kind: String,
+        adapter_binding_key: AdapterBindingKey,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
     ) -> Self {
         Self {
             adapter_kind,
+            adapter_binding_key,
             adapter,
             deadlines,
+            safety,
         }
+    }
+
+    pub fn enforces_attempt_isolation(&self) -> bool {
+        self.safety.attempt_isolation()
     }
 
     pub fn adapter_kind(&self) -> &str {
         &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
+        &self.adapter_binding_key
     }
 
     pub fn policy(&self) -> AdapterDeadlinePolicy {
@@ -105,9 +143,12 @@ impl ResolvedAdapterBinding {
             .map_err(|e| AdapterError::other(e.to_string()))
     }
 
-    pub fn start_execution(&self, request: &ExecutionRequest) -> AdapterResult<StartObservation> {
+    pub fn start_execution(
+        &self,
+        request: &EnvironmentStartRequest,
+    ) -> AdapterResult<StartObservation> {
         let deadline = self.deadline(AdapterOperation::StartExecution)?;
-        self.adapter.start_execution(request, &deadline)
+        admit_start(&deadline, self.adapter.start_execution(request, &deadline))
     }
 
     pub fn reconcile_start(
@@ -116,18 +157,32 @@ impl ResolvedAdapterBinding {
         persisted_handle: Option<&RuntimeHandle>,
     ) -> AdapterResult<StartObservation> {
         let deadline = self.deadline(AdapterOperation::ReconcileStart)?;
-        self.adapter
-            .reconcile_start(request_id, persisted_handle, &deadline)
+        admit_start(
+            &deadline,
+            self.adapter
+                .reconcile_start(request_id, persisted_handle, &deadline),
+        )
     }
 
     pub fn observe_execution(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::ObserveExecution)?;
-        self.adapter.observe_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.observe_execution(handle, &deadline),
+        )
     }
 
-    pub fn collect_outcome(&self, handle: &RuntimeHandle) -> AdapterResult<ExecutionOutcome> {
+    pub fn collect_outcome(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> AdapterResult<PhysicalExecutionOutcome> {
         let deadline = self.deadline(AdapterOperation::CollectOutcome)?;
-        self.adapter.collect_outcome(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.collect_outcome(handle, &deadline),
+        )
     }
 
     pub fn interrupt_execution(
@@ -135,7 +190,11 @@ impl ResolvedAdapterBinding {
         handle: &RuntimeHandle,
     ) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::InterruptExecution)?;
-        self.adapter.interrupt_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.interrupt_execution(handle, &deadline),
+        )
     }
 
     pub fn terminate_execution(
@@ -143,7 +202,90 @@ impl ResolvedAdapterBinding {
         handle: &RuntimeHandle,
     ) -> AdapterResult<ExecutionObservation> {
         let deadline = self.deadline(AdapterOperation::TerminateExecution)?;
-        self.adapter.terminate_execution(handle, &deadline)
+        admit_with_handle(
+            &deadline,
+            Some(handle),
+            self.adapter.terminate_execution(handle, &deadline),
+        )
+    }
+}
+
+fn late_deadline_error(
+    deadline: &AdapterDeadline,
+    input_handle: Option<&RuntimeHandle>,
+    prior: Option<AdapterError>,
+) -> AdapterError {
+    if !deadline.is_expired() {
+        return prior.unwrap_or_else(|| AdapterError::deadline_exceeded("deadline exhausted"));
+    }
+    let err = AdapterError::deadline_exceeded(
+        "runtime rejected adapter evidence after deadline endpoint",
+    );
+    if let Some(h) = prior
+        .as_ref()
+        .and_then(AdapterError::runtime_handle_hint)
+        .cloned()
+    {
+        return err.with_handle_hint(h);
+    }
+    if let Some(h) = input_handle {
+        return err.with_handle_hint(h.clone());
+    }
+    err
+}
+
+fn admit_start(
+    deadline: &AdapterDeadline,
+    result: AdapterResult<StartObservation>,
+) -> AdapterResult<StartObservation> {
+    match result {
+        Ok(obs) => {
+            if deadline.is_expired() {
+                Err(AdapterError::deadline_exceeded(
+                    "runtime rejected adapter evidence after deadline endpoint",
+                )
+                .with_handle_hint(obs.runtime_handle))
+            } else {
+                Ok(obs)
+            }
+        }
+        Err(err) => {
+            if deadline.is_expired() {
+                let hint = err.runtime_handle_hint().cloned();
+                let out = AdapterError::deadline_exceeded(
+                    "runtime rejected adapter evidence after deadline endpoint",
+                );
+                Err(match hint {
+                    Some(h) => out.with_handle_hint(h),
+                    None => out,
+                })
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn admit_with_handle<T>(
+    deadline: &AdapterDeadline,
+    handle: Option<&RuntimeHandle>,
+    result: AdapterResult<T>,
+) -> AdapterResult<T> {
+    match result {
+        Ok(value) => {
+            if deadline.is_expired() {
+                Err(late_deadline_error(deadline, handle, None))
+            } else {
+                Ok(value)
+            }
+        }
+        Err(err) => {
+            if deadline.is_expired() {
+                Err(late_deadline_error(deadline, handle, Some(err)))
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -193,8 +335,10 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new());
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(9)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         // No request: just mint via a dummy? start needs ExecutionRequest.
         // Endpoint inspection: call observe with empty handle after we have
@@ -216,6 +360,150 @@ mod tests {
         assert!(endpoint > Instant::now());
     }
 
+    struct LateOkAdapter;
+
+    impl ExecutionAdapter for LateOkAdapter {
+        fn start_execution(
+            &self,
+            _request: &EnvironmentStartRequest,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+        fn observe_execution(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(ExecutionObservation {
+                state: agentype_core::ExecutionState::Running,
+                terminal_confirmed: false,
+                quiescent_confirmed: false,
+                detail: None,
+            })
+        }
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn collect_outcome(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<PhysicalExecutionOutcome> {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(PhysicalExecutionOutcome::exited())
+        }
+        fn reconcile_start(
+            &self,
+            _request_id: &RequestId,
+            _persisted_handle: Option<&RuntimeHandle>,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+    }
+
+    struct LateHintAdapter;
+
+    impl ExecutionAdapter for LateHintAdapter {
+        fn start_execution(
+            &self,
+            _request: &EnvironmentStartRequest,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+        fn observe_execution(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            unreachable!("not used")
+        }
+        fn interrupt_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn terminate_execution(
+            &self,
+            handle: &RuntimeHandle,
+            deadline: &AdapterDeadline,
+        ) -> AdapterResult<ExecutionObservation> {
+            self.observe_execution(handle, deadline)
+        }
+        fn collect_outcome(
+            &self,
+            _handle: &RuntimeHandle,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<PhysicalExecutionOutcome> {
+            std::thread::sleep(Duration::from_millis(30));
+            Err(AdapterError::other("learned better locator")
+                .with_handle_hint(RuntimeHandle(serde_json::json!({"locator": "H2"}))))
+        }
+        fn reconcile_start(
+            &self,
+            _request_id: &RequestId,
+            _persisted_handle: Option<&RuntimeHandle>,
+            _deadline: &AdapterDeadline,
+        ) -> AdapterResult<StartObservation> {
+            unreachable!("not used")
+        }
+    }
+
+    #[test]
+    fn late_error_preserves_adapter_learned_locator_over_input_handle() {
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            Arc::new(LateHintAdapter),
+            AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        let h1 = RuntimeHandle(serde_json::json!({"locator": "H1"}));
+        let err = binding.collect_outcome(&h1).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
+        assert_eq!(
+            err.runtime_handle_hint().map(|h| &h.0),
+            Some(&serde_json::json!({"locator": "H2"}))
+        );
+    }
+
+    #[test]
+    fn facade_rejects_late_succeeded_collect_as_deadline_exceeded() {
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            Arc::new(LateOkAdapter),
+            AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        let err = binding
+            .collect_outcome(&RuntimeHandle(serde_json::json!({"h": 1})))
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
+    }
+
     /// M5.6 §45 #15-19: each Scheduler-facing operation receives the budget
     /// its policy slot defines — no operation inherits another's timeout and
     /// no call opens a fresh deadline inside another call.
@@ -231,7 +519,13 @@ mod tests {
             Duration::from_secs(6),
         )
         .unwrap();
-        let binding = ResolvedAdapterBinding::new("process".into(), fake.clone(), policy);
+        let binding = ResolvedAdapterBinding::new(
+            "process".into(),
+            AdapterBindingKey::for_tests(),
+            fake.clone(),
+            policy,
+            AdapterSafetyEnvelope::unenforceable(),
+        );
         let handle = RuntimeHandle(serde_json::json!({"h": 1}));
 
         binding.reconcile_start(&RequestId::new(), None).unwrap();
@@ -276,14 +570,14 @@ mod tests {
         let fast = AdapterDeadlinePolicy::uniform(Duration::from_secs(2)).unwrap();
         let slow = AdapterDeadlinePolicy::uniform(Duration::from_secs(60)).unwrap();
         adapters
-            .register("fast", Arc::new(FakeAdapter::new()), fast)
+            .register_kind("fast", Arc::new(FakeAdapter::new()), fast)
             .unwrap();
         adapters
-            .register("slow", Arc::new(FakeAdapter::new()), slow)
+            .register_kind("slow", Arc::new(FakeAdapter::new()), slow)
             .unwrap();
         assert_eq!(
             adapters
-                .resolve("fast")
+                .resolve_unique("fast")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::ReconcileStart),
@@ -291,12 +585,29 @@ mod tests {
         );
         assert_eq!(
             adapters
-                .resolve("slow")
+                .resolve_unique("slow")
                 .unwrap()
                 .policy()
                 .budget(AdapterOperation::CollectOutcome),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn resolve_exact_rejects_binding_key_mismatch() {
+        let mut adapters = crate::AdapterRegistry::new();
+        adapters
+            .register_kind(
+                "process",
+                Arc::new(FakeAdapter::new()),
+                AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+        assert!(adapters
+            .resolve_exact("process", &AdapterBindingKey::for_tests())
+            .is_ok());
+        let other = AdapterBindingKey::new("other-domain").unwrap();
+        assert!(adapters.resolve_exact("process", &other).is_err());
     }
 
     /// M5.6 §49 #56-58: an observe timeout is an invocation error, never an
@@ -312,8 +623,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .observe_execution(&RuntimeHandle(serde_json::json!({})))
@@ -342,8 +655,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .interrupt_execution(&RuntimeHandle(serde_json::json!({})))
@@ -369,8 +684,10 @@ mod tests {
         ));
         let binding = ResolvedAdapterBinding::new(
             "process".into(),
+            AdapterBindingKey::for_tests(),
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
+            AdapterSafetyEnvelope::unenforceable(),
         );
         let err = binding
             .terminate_execution(&RuntimeHandle(serde_json::json!({})))
