@@ -621,6 +621,17 @@ pub fn recover_runtime(
     recover_runtime_inner(kernel, adapters, timing, notifier, None)
 }
 
+/// Test-support recovery that does not acquire `RuntimeProcessLock`.
+/// Production composition must go through `SchedulerDaemon`.
+pub fn recover_runtime_without_process_lock(
+    kernel: Arc<Kernel>,
+    adapters: &AdapterRegistry,
+    timing: RuntimeTimingConfig,
+    notifier: NotifierBinding,
+) -> Result<RecoveredRuntime, RecoveryError> {
+    recover_runtime(kernel, adapters, timing, notifier)
+}
+
 /// Explicit test-only recovery without a notifier. Does NOT mark outbox
 /// events DELIVERED and is not a production "no RootBridge" success path.
 pub fn recover_runtime_without_notifier(

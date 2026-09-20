@@ -1,0 +1,70 @@
+//! Cross-process RuntimeProcessLock tests. Two threads are not evidence.
+
+use agentype_runtime::{ProcessLockError, RuntimeProcessGuard, SqliteRuntimeConfig};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn temp_store() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("agentype-xproc-{nanos}.sqlite"))
+}
+
+fn helper() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_hold-process-lock"))
+}
+
+#[test]
+fn second_os_process_fails_before_recovery() {
+    let path = temp_store();
+    let mut child = helper()
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn lock helper");
+    let stdout = child.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let first = lines.next().and_then(Result::ok);
+    assert_eq!(first.as_deref(), Some("LOCKED"));
+
+    let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+    match RuntimeProcessGuard::acquire(&cfg) {
+        Err(ProcessLockError::AlreadyRunning) => {}
+        other => panic!("second process must not acquire, got {other:?}"),
+    }
+
+    drop(child.stdin.take());
+    let status = child.wait().expect("helper exit");
+    assert!(status.success(), "helper failed: {status}");
+
+    let _released = RuntimeProcessGuard::acquire(&cfg).expect("lock released after helper exit");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn clean_shutdown_releases_lock_for_next_process() {
+    let path = temp_store();
+    let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+    {
+        let _guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+    }
+    let mut child = helper()
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn lock helper");
+    let stdout = child.stdout.take().expect("helper stdout");
+    let first = BufReader::new(stdout).lines().next().and_then(Result::ok);
+    assert_eq!(first.as_deref(), Some("LOCKED"));
+    let mut stdin = child.stdin.take().expect("helper stdin");
+    let _ = stdin.write_all(b"done\n");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_file(path);
+}

@@ -12,6 +12,7 @@ pub use agentype_execution_config::*;
 pub mod deadlines;
 pub mod notifier;
 pub mod observation;
+pub mod process_lock;
 pub mod recovery;
 pub mod supervision;
 pub mod timing;
@@ -25,10 +26,14 @@ pub use observation::{
     adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
     CollectedOutcomeKind, StartObservationKind,
 };
+pub use process_lock::{
+    hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,
+    RuntimeProcessLock, SqliteRuntimeConfig,
+};
 pub use recovery::{
     reconcile_one_execution, recover_runtime, recover_runtime_without_notifier,
-    replay_persisted_terminal_consequence, AdmissionSink, ReconcileExecutionOutcome,
-    RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
+    recover_runtime_without_process_lock, replay_persisted_terminal_consequence, AdmissionSink,
+    ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 pub use supervision::{
     RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
