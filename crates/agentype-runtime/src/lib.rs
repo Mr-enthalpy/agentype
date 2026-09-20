@@ -40,7 +40,7 @@ use agentype_adapter_api::{
 };
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskState, UnixTime,
 };
 use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
@@ -765,15 +765,11 @@ impl SupervisionAdmission {
 
 /// Immediate outcome of one dispatch attempt (task §25 vocabulary).
 ///
-/// The vocabulary separates physical certainty from Scheduler/task
-/// consequences (M5.3 outcome-vocabulary closure): `StartIndeterminate`
-/// means the physical start MAY have happened and the durable Execution is
-/// unresolved — it must never be read as "the start definitely failed";
-/// `TerminalFailure` means an authoritative collected terminal failure was
-/// established and the NACK consequence already applied; `TaskCompleted`
-/// means the Task completed with a durable Result; and a physical success
-/// that writer safety refused to complete is its own variant, never
-/// `TaskCompleted`.
+/// Adapter collect cannot create Task Results. `StartIndeterminate` means
+/// the physical start MAY have happened and the durable Execution is
+/// unresolved — it must never be read as "the start definitely failed".
+/// Worker ACK / Result authority is a separate data plane
+/// (`TerminalReplayOutcome` for durable crash replay).
 ///
 /// Deliberately NOT `Clone`: `RunningAdmitted` carries the move-only
 /// `SupervisionAdmission` capability, and copying the outcome would copy a
@@ -809,31 +805,14 @@ pub enum DispatchOneOutcome {
         request_id: RequestId,
         failure_class: Option<FailureClass>,
     },
-    /// An authoritative collected terminal failure was established
-    /// (`collect_outcome` proved terminality); the NACK rules already
-    /// applied (failure row, physical history, retry policy, writer
-    /// safety). No supervision is required.
-    TerminalFailure {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-        failure_class: FailureClass,
-    },
-    /// The adapter completed synchronously, the authoritative ACK path ran,
-    /// and the Task completed with exactly one durable Result.
-    TaskCompleted {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-        result_id: ResultId,
-    },
-    /// The physical execution reported success, but the Task could not
-    /// safely complete because the writer quiescence condition was not
-    /// satisfied (WRITER_SUCCESS_NOT_QUIESCENT suspension): no Result was
-    /// committed and the Task is suspended/escalated. Deliberately NOT
-    /// `TaskCompleted`.
-    WriterSafetySuspendedAfterSuccess {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-    },
+}
+
+/// Fenced authority consequence. Stale authority is visible to the caller
+/// and must not be reported as applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityConsequence {
+    Applied { task_state: TaskState },
+    AuthorityAlreadyStale,
 }
 
 /// Persist identified physical process end, then NACK without Result or
@@ -848,7 +827,7 @@ pub(crate) fn persist_physical_end_then_nack(
     execution_id: &ExecutionId,
     observed_handle: Option<&Value>,
     artifact_refs: Option<&Value>,
-) -> Result<(), Error> {
+) -> Result<AuthorityConsequence, Error> {
     kernel.record_physical_outcome(
         execution_id,
         ExecutionState::Terminated,
@@ -867,8 +846,10 @@ pub(crate) fn persist_physical_end_then_nack(
         false,
         false,
     ) {
-        Ok(_) => Ok(()),
-        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => Ok(()),
+        Ok(task_state) => Ok(AuthorityConsequence::Applied { task_state }),
+        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+            Ok(AuthorityConsequence::AuthorityAlreadyStale)
+        }
         Err(err) => Err(err),
     }
 }
@@ -1670,7 +1651,9 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
             prepared.snapshot().attempt_id().as_str(),
             prepared.snapshot().lease_epoch(),
         );
-        let protocol = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot());
+        let protocol = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        );
         assert_eq!(protocol.as_str(), expected);
         assert!(
             !protocol.as_str().contains("WRITER RECOVERY RULES"),
@@ -1692,9 +1675,11 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
         .workstream(ws.clone());
         let prepared = launch_spec(&kernel, &registry, spec);
 
-        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
-            .as_str()
-            .to_string();
+        let prompt = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        )
+        .as_str()
+        .to_string();
         assert!(
             prompt.contains(
                 "WRITER RECOVERY RULES\n\
@@ -1729,9 +1714,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
 
         assert_eq!(prepared.snapshot().task_name(), "implement-foo");
-        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
-            .as_str()
-            .to_string();
+        let prompt = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        )
+        .as_str()
+        .to_string();
         assert!(
             prompt.contains("OBJECTIVE\n{\"objective\": \"build feature foo\"}"),
             "the objective is the task payload, not the task name"
@@ -4501,12 +4488,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         ));
     }
 
-    /// #62 + #64: a successful synchronous ACK returns `TaskCompleted` with
-    /// a concrete (non-optional) `ResultId`, and `RunningAdmitted` is the
-    /// only outcome that carries a `SupervisionAdmission` — structurally
-    /// guaranteed by the enum shape and asserted here on the admitted path.
+    /// Adapter collect cannot mint a Result. `RunningAdmitted` is the only
+    /// outcome that carries a `SupervisionAdmission`.
     #[test]
-    fn task_completed_carries_concrete_result_and_only_running_admitted_carries_admission() {
+    fn adapter_collect_cannot_complete_task_and_only_running_admitted_carries_admission() {
         let (kernel, _clock, registry, adapters, fake) = dispatch_env();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, ids) = kernel
@@ -4530,9 +4515,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
     }
 
-    /// #63: a physical success that writer safety refuses to complete is
-    /// `WriterSafetySuspendedAfterSuccess` — a distinct outcome, never
-    /// `TaskCompleted`.
+    /// Physical collect of an unisolated WRITE still suspends without Result.
     #[test]
     fn writer_safety_suspension_is_distinct_from_task_completed() {
         let (kernel, _clock, registry, adapters, fake) = dispatch_env();

@@ -106,24 +106,18 @@ pub enum TerminalReplayOutcome {
 }
 
 /// Mechanical outcome of Category B/C (one Execution reconcile).
+///
+/// Adapter collect cannot create Task Results. Durable Worker/authority
+/// crash replay remains `TerminalReplayOutcome`.
 #[derive(Debug)]
 pub enum ReconcileExecutionOutcome {
     /// Fresh grant minted and admitted into `supervisor`.
     Readmitted,
     /// Observed RUNNING (or other history) persisted; no grant, no admission.
     PhysicalHistoryOnly,
-    TaskCompleted {
-        result_id: ResultId,
-    },
-    WriterSafetySuspendedAfterSuccess,
-    TerminalFailure {
-        failure_class: FailureClass,
-    },
     /// Nonterminal / unresolved: mechanical NACK applied when authority was
     /// current; writer safety / retry policy decided the Task state.
-    Unresolved {
-        failure_class: FailureClass,
-    },
+    Unresolved { failure_class: FailureClass },
 }
 /// Category A: replay a persisted terminal *authority* consequence.
 ///
@@ -474,7 +468,7 @@ fn collect_and_apply(
             Some(&observation.runtime_handle.0),
         ),
         CollectedOutcomeKind::PhysicalEnded => {
-            crate::persist_physical_end_then_nack(
+            match crate::persist_physical_end_then_nack(
                 kernel,
                 snapshot.attempt_id(),
                 snapshot.lease_epoch(),
@@ -482,10 +476,17 @@ fn collect_and_apply(
                 Some(&observation.runtime_handle.0),
                 outcome.artifact_refs.as_ref(),
             )
-            .map_err(RecoveryError::from)?;
-            Ok(ReconcileExecutionOutcome::Unresolved {
-                failure_class: FailureClass::Unknown,
-            })
+            .map_err(RecoveryError::from)?
+            {
+                crate::AuthorityConsequence::Applied { .. } => {
+                    Ok(ReconcileExecutionOutcome::Unresolved {
+                        failure_class: FailureClass::Unknown,
+                    })
+                }
+                crate::AuthorityConsequence::AuthorityAlreadyStale => {
+                    Ok(ReconcileExecutionOutcome::PhysicalHistoryOnly)
+                }
+            }
         }
     }
 }
@@ -577,7 +578,8 @@ impl Drop for StartupGuard {
     }
 }
 
-/// A Runtime that has passed the restart barrier and may dispatch.
+/// Restart reconciliation completed. This is **not** production dispatch
+/// eligibility (`ReadyRuntime` / `ReadyPermit` are M5.8).
 ///
 /// Production recovery with `NotifierBinding::Enabled` owns both runners.
 /// There is no API that consumes supervision while dropping notifier
@@ -598,7 +600,9 @@ impl RecoveredRuntime {
     }
 }
 
-/// Full recovery barrier. Dispatch MUST NOT run until this returns.
+/// Restart reconciliation barrier. Dispatch MUST NOT run until M5.8
+/// activation mints a `ReadyPermit`. This function only yields
+/// `RecoveredRuntime`.
 ///
 /// Order: expire → empty SupervisionRunner → NotifierRunner (same
 /// uncommitted cleanup scope) → terminal replay → reconcile
@@ -1496,6 +1500,46 @@ mod tests {
         assert_eq!(
             persisted.outcome_json(),
             Some(&json!({"stdout": "out.txt"}))
+        );
+    }
+
+    #[test]
+    fn stale_physical_end_is_history_only() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let svc = supervisor(kernel.clone());
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(StartObservation {
+            state: ExecutionState::Terminated,
+            runtime_handle: RuntimeHandle(json!({"env": 1})),
+            ambiguous: false,
+            detail: None,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+        });
+        fake.set_next_outcome(PhysicalExecutionOutcome {
+            physical_state: agentype_adapter_api::PhysicalState::Terminated,
+            exit_status: Some(0),
+            artifact_refs: Some(json!({"stdout": "out.txt"})),
+            diagnostic: Some("physical process exited".into()),
+        });
+        let adapters = adapters(&fake);
+        let (_claim, launch) = start_named(&kernel, TaskSpec::new("stale-end", json!({"o": 1})));
+        clock.advance(20.0);
+        kernel.expire_leases(true).unwrap();
+        let snap = snapshot_of(&kernel, launch.execution_id());
+        match reconcile_one_execution(&kernel, &adapters, &snap, &svc).unwrap() {
+            ReconcileExecutionOutcome::PhysicalHistoryOnly => {}
+            other => panic!("expected PhysicalHistoryOnly, got {other:?}"),
+        }
+        let exec = kernel.execution(launch.execution_id()).unwrap();
+        assert_eq!(exec.state, ExecutionState::Terminated);
+        assert!(!exec.terminal_confirmed);
+        assert!(!exec.quiescent_confirmed);
+        assert!(kernel.result_for_task(snap.task_id()).is_err());
+        assert_ne!(
+            kernel.task(snap.task_id()).unwrap().state,
+            TaskState::Completed
         );
     }
 

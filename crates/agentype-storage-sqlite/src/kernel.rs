@@ -1706,6 +1706,30 @@ impl Kernel {
         })
     }
 
+    /// Persist a better opaque locator without inventing physical state,
+    /// Task/Lease mutation, or terminal/quiescence proof.
+    pub fn record_runtime_handle_hint(
+        &self,
+        execution_id: &ExecutionId,
+        handle: &Value,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            let execution = required_execution(tx, execution_id.as_str())?;
+            let handle_json = json_dump(handle);
+            tx.execute(
+                "UPDATE executions SET runtime_handle_json=?1, updated_at=?2 WHERE id=?3",
+                params![handle_json, now, execution.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
+                params![handle_json, execution.incarnation_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        })
+    }
+
     /// Persist a collected terminal physical fact without applying
     /// incarnation presence or Task authority (M5.4 P1-1). Physical history
     /// and Scheduler consequence are different machines: a crash after this
@@ -1998,6 +2022,84 @@ impl Kernel {
             if retry_allowed && writer_safe {
                 let delay =
                     retry_backoff_seconds(&policy, attempt.attempt_number as u32);
+                tx.execute(
+                    "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
+                    params![now, attempt.id],
+                )
+                .map_err(map_sqlite)?;
+                tx.execute(
+                    "UPDATE leases SET state='RELEASED',ended_at=?1 WHERE id=?2",
+                    params![now, lease.id],
+                )
+                .map_err(map_sqlite)?;
+                tx.execute(
+                    "UPDATE tasks SET state='RETRY_WAIT',current_attempt_id=NULL,next_eligible_at=?1,updated_at=?2 WHERE id=?3",
+                    params![now + delay, now, task.id],
+                )
+                .map_err(map_sqlite)?;
+                release_agent(tx, &attempt.logical_agent_id, now)?;
+                return Ok(TaskState::RetryWait);
+            }
+            let suspension = suspension_failure_class(writer_safe, failure_class);
+            suspend_current(tx, &attempt, &lease, &task, suspension, None, None, now)?;
+            Ok(TaskState::Suspended)
+        })
+    }
+
+    /// Close current Attempt/Lease authority without inventing a physical
+    /// Execution state. Mechanical failure, retry, and writer-safety still
+    /// apply. Terminal/quiescence proof and Result are not created.
+    pub fn nack_preserving_physical_history(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        failure_class: FailureClass,
+        execution_id: Option<&ExecutionId>,
+    ) -> Result<TaskState, Error> {
+        self.tx(|tx, now| {
+            let (attempt, lease, task) =
+                validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            let execution = execution_for_attempt(
+                tx,
+                &attempt.id,
+                execution_id.map(|e| e.as_str()),
+            )?;
+            let resolved_id = execution.as_ref().map(|e| e.id.clone());
+            record_failure(
+                tx,
+                &task.id,
+                Some(&attempt.id),
+                resolved_id.as_deref(),
+                failure_class,
+                None,
+                None,
+                None,
+                now,
+            )?;
+            let presence = if failure_class == FailureClass::ExecutionLost {
+                ExecutionState::Lost
+            } else {
+                ExecutionState::Failed
+            };
+            record_incarnation_presence(
+                tx,
+                attempt.incarnation_id.as_deref(),
+                presence,
+                false,
+                false,
+                false,
+                now,
+            )?;
+            let policy = task_retry_policy(&task)?;
+            let retry_allowed = retry_allowed(&policy, failure_class, attempt.attempt_number as u32);
+            let writer_safe = writer_is_safe_to_replace(
+                task.workspace_mode == "write",
+                execution.is_some(),
+                false,
+                execution.as_ref().map(|e| e.attempt_isolation).unwrap_or(false),
+            );
+            if retry_allowed && writer_safe {
+                let delay = retry_backoff_seconds(&policy, attempt.attempt_number as u32);
                 tx.execute(
                     "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
                     params![now, attempt.id],

@@ -81,9 +81,6 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
         .unwrap();
     let d = Dispatcher::new(&kernel, &registry, &adapters);
     match d.dispatch_one().unwrap() {
-        DispatchOneOutcome::TaskCompleted { .. } => {
-            panic!("ExecutionAdapter must not ACK a Task Result from process stdout")
-        }
         DispatchOneOutcome::StartIndeterminate { .. } => {}
         DispatchOneOutcome::RunningAdmitted { admission } => {
             drop(admission);
@@ -106,7 +103,7 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
                 "physical collect must not mint a Task Result"
             );
         }
-        other => panic!("expected physical collect without TaskCompleted, got {other:?}"),
+        other => panic!("expected physical collect without Task Result, got {other:?}"),
     }
 }
 
