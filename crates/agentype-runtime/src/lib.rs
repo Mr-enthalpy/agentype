@@ -9,6 +9,7 @@
 
 pub use agentype_execution_config::*;
 
+pub mod control;
 pub mod deadlines;
 pub mod notifier;
 pub mod observation;
@@ -18,6 +19,9 @@ pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
+pub use control::{
+    ControlCycleReport, ControlDispatch, ControlError, ControlLoopRunner, ControlLoopService,
+};
 pub use deadlines::{AdapterDeadlinePolicy, AdapterSafetyEnvelope, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
@@ -282,7 +286,7 @@ impl std::error::Error for AdapterUnavailable {}
 /// imported execution domain. This is NOT SpawnSource and carries no
 /// semantic scheduling authority. An explicitly empty registry is
 /// authoritative — resolution fails closed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AdapterRegistry {
     adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
 }
@@ -873,6 +877,10 @@ pub(crate) fn persist_physical_end_then_nack(
 /// The Dispatcher accepts only authoritative composition objects — an
 /// `ExecutionRegistry` and an `AdapterRegistry` — and therefore cannot use
 /// `DirectUnconfigured` (task §8).
+///
+/// Production dispatch is `ControlLoopService` behind a `ReadyPermit`.
+/// Direct `dispatch_one` remains for M5.2 unit tests and crate-external
+/// adapter conformance tests; it is not the daemon composition path.
 pub struct Dispatcher<'a> {
     kernel: &'a Kernel,
     execution_registry: &'a ExecutionRegistry,
