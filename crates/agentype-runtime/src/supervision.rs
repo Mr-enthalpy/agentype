@@ -903,6 +903,23 @@ impl SupervisionRunner {
         self.service.contains(execution_id)
     }
 
+    /// Shared process-local registry handle for the physical observer.
+    pub fn service(&self) -> SupervisionService {
+        self.service.clone()
+    }
+
+    /// Cloneable admit path that still honors the runner lifecycle gate.
+    pub fn admit_sink(&self) -> SupervisionAdmitSink {
+        SupervisionAdmitSink {
+            service: self.service.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.shared.state.lock().expect("runner state lock").phase == RunnerPhase::Failed
+    }
+
     pub fn active_count(&self) -> usize {
         self.service.active_count()
     }
@@ -958,6 +975,30 @@ impl SupervisionRunner {
     /// recorded fatal fault, if any (M5.3 §33/§34).
     pub fn shutdown(mut self) -> Result<(), SupervisionError> {
         self.stop_and_join().map_or(Ok(()), Err)
+    }
+}
+
+/// Cloneable admit path that rejects admits after the runner stops.
+#[derive(Clone)]
+pub struct SupervisionAdmitSink {
+    service: SupervisionService,
+    shared: Arc<RunnerShared>,
+}
+
+impl SupervisionAdmitSink {
+    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+        let state = self.shared.state.lock().expect("runner state lock");
+        if state.phase != RunnerPhase::Running {
+            return Err(SupervisionError::RunnerStopped(
+                "admission is only accepted while the heartbeat loop is running",
+            ));
+        }
+        let result = self.service.admit(admission);
+        if result.is_ok() {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
+        result
     }
 }
 

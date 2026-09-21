@@ -41,6 +41,12 @@ impl AdmissionSink for SupervisionRunner {
         SupervisionRunner::admit(self, admission)
     }
 }
+
+impl AdmissionSink for crate::SupervisionAdmitSink {
+    fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+        crate::SupervisionAdmitSink::admit(self, admission)
+    }
+}
 use agentype_adapter_api::{RuntimeHandle, StartObservation};
 use agentype_core::{Error, ExecutionState, FailureClass, ResultId};
 use agentype_storage_sqlite::{ExecutionReconciliationSnapshot, Kernel};
@@ -597,6 +603,11 @@ impl RecoveredRuntime {
 
     pub fn notifier(&self) -> Option<&NotifierRunner> {
         self.notifier.as_ref()
+    }
+
+    /// Production daemon takes ownership of both runners.
+    pub fn into_parts(self) -> (SupervisionRunner, Option<NotifierRunner>) {
+        (self.runner, self.notifier)
     }
 }
 

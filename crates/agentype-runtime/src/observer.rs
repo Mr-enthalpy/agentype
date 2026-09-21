@@ -13,7 +13,8 @@ use agentype_adapter_api::{AdapterError, ExecutionObservation};
 use agentype_core::{Error, ExecutionState, FailureClass, UnixTime};
 use agentype_storage_sqlite::Kernel;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// Observer timing. Distinct from AdapterDeadlinePolicy and lease duration.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -200,6 +201,10 @@ impl PhysicalObserverService {
 
     pub fn config(&self) -> PhysicalObserverConfig {
         self.config
+    }
+
+    pub fn observe_due_now(&self) -> Result<Vec<ObserveApply>, ObserverError> {
+        self.observe_due(self.kernel.now())
     }
 
     pub fn observe_due(&self, now: UnixTime) -> Result<Vec<ObserveApply>, ObserverError> {
@@ -415,6 +420,111 @@ fn generation_current(supervision: &SupervisionService, identity: &SupervisionId
         .observation_snapshots()
         .iter()
         .any(|snap| snap.identity.generation() == identity.generation())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ObserverRunnerPhase {
+    Running,
+    ShuttingDown,
+    Failed,
+}
+
+struct ObserverRunnerState {
+    phase: ObserverRunnerPhase,
+    fatal: Option<ObserverError>,
+}
+
+/// Independent observer thread. Never shares Adapter I/O with heartbeat.
+pub struct PhysicalObserverRunner {
+    shared: Arc<(Mutex<ObserverRunnerState>, Condvar)>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PhysicalObserverRunner {
+    pub fn start(service: PhysicalObserverService) -> Result<Self, ObserverError> {
+        let poll = Duration::from_secs_f64(service.config().poll_interval());
+        let shared = Arc::new((
+            Mutex::new(ObserverRunnerState {
+                phase: ObserverRunnerPhase::Running,
+                fatal: None,
+            }),
+            Condvar::new(),
+        ));
+        let thread_shared = shared.clone();
+        let join = std::thread::Builder::new()
+            .name("physical-observer".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    {
+                        let state = thread_shared.0.lock().expect("observer runner state");
+                        if state.phase != ObserverRunnerPhase::Running {
+                            break;
+                        }
+                    }
+                    if let Err(err) = service.observe_due_now() {
+                        let mut state = thread_shared.0.lock().expect("observer runner state");
+                        state.phase = ObserverRunnerPhase::Failed;
+                        state.fatal = Some(err);
+                        break;
+                    }
+                    let state = thread_shared.0.lock().expect("observer runner state");
+                    if state.phase != ObserverRunnerPhase::Running {
+                        break;
+                    }
+                    let (_guard, _) = thread_shared
+                        .1
+                        .wait_timeout(state, poll)
+                        .expect("observer runner wait");
+                }));
+                if result.is_err() {
+                    let mut state = thread_shared.0.lock().expect("observer runner state");
+                    state.phase = ObserverRunnerPhase::Failed;
+                    state.fatal = Some(ObserverError::Fatal(Error::invariant(
+                        "physical-observer thread panicked",
+                    )));
+                }
+            })
+            .map_err(|err| {
+                ObserverError::Fatal(Error::invariant(format!(
+                    "failed to spawn physical-observer thread: {err}"
+                )))
+            })?;
+        Ok(Self {
+            shared,
+            join: Some(join),
+        })
+    }
+
+    pub fn request_stop(&self) {
+        let mut state = self.shared.0.lock().expect("observer runner state");
+        if state.phase == ObserverRunnerPhase::Running {
+            state.phase = ObserverRunnerPhase::ShuttingDown;
+        }
+        self.shared.1.notify_all();
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.shared.0.lock().expect("observer runner state").phase == ObserverRunnerPhase::Failed
+    }
+
+    pub fn take_fatal(&self) -> Option<String> {
+        self.shared
+            .0
+            .lock()
+            .expect("observer runner state")
+            .fatal
+            .as_ref()
+            .map(ToString::to_string)
+    }
+}
+
+impl Drop for PhysicalObserverRunner {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 #[cfg(test)]

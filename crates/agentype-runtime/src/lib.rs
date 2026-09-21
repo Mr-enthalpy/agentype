@@ -10,6 +10,7 @@
 pub use agentype_execution_config::*;
 
 pub mod control;
+pub mod daemon;
 pub mod deadlines;
 pub mod notifier;
 pub mod observation;
@@ -22,6 +23,9 @@ pub mod timing;
 pub use control::{
     ControlCycleReport, ControlDispatch, ControlError, ControlLoopRunner, ControlLoopService,
 };
+pub use daemon::{
+    DaemonError, DaemonExit, DaemonPhase, RunningSchedulerDaemon, SchedulerDaemonBuilder,
+};
 pub use deadlines::{AdapterDeadlinePolicy, AdapterSafetyEnvelope, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
@@ -33,7 +37,8 @@ pub use observation::{
 };
 pub use observer::{
     classify_execution_observation, ObserveApply, ObserverConfigError, ObserverError,
-    PhysicalObservationKind, PhysicalObserverConfig, PhysicalObserverService,
+    PhysicalObservationKind, PhysicalObserverConfig, PhysicalObserverRunner,
+    PhysicalObserverService,
 };
 pub use process_lock::{
     hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,
@@ -45,7 +50,8 @@ pub use recovery::{
     ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 pub use supervision::{
-    RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
+    RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
+    SupervisionService,
 };
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 

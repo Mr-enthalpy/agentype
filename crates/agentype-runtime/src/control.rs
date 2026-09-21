@@ -248,6 +248,15 @@ impl ControlLoopRunner {
             .as_ref()
             .map(ToString::to_string)
     }
+
+    pub fn is_failed(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("control runner state")
+            .phase
+            == RunnerPhase::Failed
+    }
 }
 
 impl Drop for ControlLoopRunner {
