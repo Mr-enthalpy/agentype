@@ -23,6 +23,10 @@ use std::path::Path;
 pub enum SupervisedRenewal {
     Renewed(UnixTime),
     NotRunning,
+    /// Process-local physical freshness expired at the renewal
+    /// serialization point. Not authority loss and not a durable
+    /// physical-state change.
+    FreshnessExpired,
 }
 
 /// The authoritative output of the fenced RUNNING-confirmation-and-renewal
@@ -2831,8 +2835,23 @@ impl Kernel {
         lease_epoch: LeaseEpoch,
         execution_id: &ExecutionId,
     ) -> Result<SupervisedRenewal, Error> {
+        self.renew_supervised_execution_guarded(attempt_id, lease_epoch, execution_id, None)
+    }
+
+    /// Same fenced renewal, with a process-local freshness deadline checked
+    /// at the transaction serialization point (`now` after BEGIN IMMEDIATE).
+    pub fn renew_supervised_execution_guarded(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        execution_id: &ExecutionId,
+        fresh_until: Option<UnixTime>,
+    ) -> Result<SupervisedRenewal, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
+            if fresh_until.is_some_and(|until| now >= until) {
+                return Ok(SupervisedRenewal::FreshnessExpired);
+            }
             let (attempt, lease, _) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
             let execution = required_execution(tx, execution_id.as_str())?;

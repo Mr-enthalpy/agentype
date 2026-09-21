@@ -236,13 +236,28 @@ impl SchedulerDaemonBuilder {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
-            })
-            .ok();
+            });
+        let watchdog = match watchdog {
+            Ok(handle) => handle,
+            Err(err) => {
+                inner.stop.store(true, Ordering::SeqCst);
+                inner.gate.revoke();
+                inner.control.request_stop();
+                inner.observer.request_stop();
+                inner.supervision.request_stop();
+                if let Some(n) = &inner.notifier {
+                    n.request_stop();
+                }
+                return Err(DaemonError::Config(format!(
+                    "required health watchdog failed to start: {err}"
+                )));
+            }
+        };
         Ok(RunningSchedulerDaemon {
-            _lock: lock,
             kernel,
             inner: Some(inner),
-            watchdog,
+            watchdog: Some(watchdog),
+            _lock: lock,
         })
     }
 }
@@ -259,10 +274,10 @@ struct DaemonInner {
 
 /// Running production daemon. Drop / `join` releases the process lock last.
 pub struct RunningSchedulerDaemon {
-    _lock: RuntimeProcessGuard,
     kernel: Arc<Kernel>,
     inner: Option<Arc<DaemonInner>>,
     watchdog: Option<std::thread::JoinHandle<()>>,
+    _lock: RuntimeProcessGuard,
 }
 
 impl RunningSchedulerDaemon {
@@ -334,13 +349,17 @@ impl RunningSchedulerDaemon {
             phase,
             ..
         } = inner;
-        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed
-            || control.join_fatal().is_some()
-            || observer.join_fatal().is_some()
-            || supervision.is_failed()
-            || notifier.as_ref().is_some_and(|n| n.is_failed());
+        let control_fatal = control.join_fatal();
+        let observer_fatal = observer.join_fatal();
+        let supervision_failed = supervision.is_failed();
+        let notifier_failed = notifier.as_ref().is_some_and(|n| n.is_failed());
         drop(supervision);
         drop(notifier);
+        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed
+            || control_fatal.is_some()
+            || observer_fatal.is_some()
+            || supervision_failed
+            || notifier_failed;
         if failed {
             DaemonExit::Failed("runtime worker failed".into())
         } else {
@@ -363,6 +382,14 @@ impl Drop for RunningSchedulerDaemon {
         }
         if let Some(watchdog) = self.watchdog.take() {
             let _ = watchdog.join();
+        }
+        if let Some(arc) = self.inner.take() {
+            if let Ok(inner) = Arc::try_unwrap(arc) {
+                drop(inner.control.join_fatal());
+                drop(inner.observer.join_fatal());
+                drop(inner.supervision);
+                drop(inner.notifier);
+            }
         }
     }
 }

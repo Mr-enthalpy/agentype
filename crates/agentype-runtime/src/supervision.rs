@@ -532,7 +532,9 @@ impl SupervisionService {
         self.registry
             .lock()
             .expect("supervision registry lock")
-            .contains(execution_id)
+            .entries
+            .get(execution_id)
+            .is_some_and(|e| e.renewal_eligible)
     }
 
     pub fn active_count(&self) -> usize {
@@ -617,16 +619,29 @@ impl SupervisionService {
         // lease under the §A2 gate) — a healthy supervisor can never
         // schedule itself past the durable expiry.
         let anchor = self.kernel.now();
-        let outcome = match self.kernel.renew_supervised_execution(
+        let fresh_until = {
+            let registry = self.registry.lock().expect("supervision registry lock");
+            registry.freshness_limit.and_then(|limit| {
+                registry
+                    .entries
+                    .get(&execution_id)
+                    .map(|entry| entry.last_positive_observed_at + limit)
+            })
+        };
+        let outcome = match self.kernel.renew_supervised_execution_guarded(
             identity.attempt_id(),
             identity.lease_epoch(),
             &execution_id,
+            fresh_until,
         ) {
             Ok(SupervisedRenewal::Renewed(new_expires_at)) => RenewalOutcome::Renewed {
                 execution_id,
                 new_expires_at,
             },
             Ok(SupervisedRenewal::NotRunning) => RenewalOutcome::NoLongerRunning { execution_id },
+            Ok(SupervisedRenewal::FreshnessExpired) => {
+                RenewalOutcome::FreshnessStale { execution_id }
+            }
             Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                 RenewalOutcome::AuthorityLost { execution_id }
             }
@@ -644,9 +659,13 @@ impl SupervisionService {
         let mut registry = self.registry.lock().expect("supervision registry lock");
         match &outcome {
             RenewalOutcome::Renewed { .. } => registry.record_renewal(&identity, next_due_at),
-            RenewalOutcome::FreshnessStale { .. } => {}
+            RenewalOutcome::FreshnessStale { .. } => {
+                registry.record_renewal(&identity, next_due_at);
+                registry.stop_renewal_if_current(&identity);
+            }
             RenewalOutcome::AuthorityLost { .. } | RenewalOutcome::NoLongerRunning { .. } => {
-                registry.remove_if_current(&identity);
+                registry.stop_renewal_if_current(&identity);
+                registry.record_renewal(&identity, next_due_at);
             }
         }
         Ok(outcome)

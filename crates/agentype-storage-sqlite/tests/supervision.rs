@@ -437,6 +437,40 @@ fn renewal_timestamp_is_sampled_after_transaction_serialization() {
     assert_authority_loss(result.unwrap_err());
 }
 
+#[test]
+fn freshness_deadline_is_checked_after_transaction_serialization() {
+    let db = FixtureDb::new("fresh-clock");
+    let env = file_env(&db);
+    let (_batch, _task, claim, exec) = run_claim(&env.k, read_task("fresh-clock"), false);
+    env.clock.advance(2.0);
+    let fresh_until = env.clock.now() + 2.0;
+    let background_clock = env.clock.clone();
+    let background_kernel =
+        Kernel::open(&db.path, background_clock as Arc<dyn Clock>, 10.0, 16_384).unwrap();
+    let blocker = rusqlite::Connection::open(&db.path).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let handle = std::thread::spawn(move || {
+        background_kernel.renew_supervised_execution_guarded(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            &exec,
+            Some(fresh_until),
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    env.clock.advance(3.0);
+    assert!(env.clock.now() >= fresh_until);
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    let result = handle.join().unwrap().unwrap();
+    assert_eq!(
+        result,
+        agentype_storage_sqlite::SupervisedRenewal::FreshnessExpired
+    );
+}
+
 fn kernel_task_completed(k: &Kernel, task: &TaskId) -> bool {
     k.task(task).unwrap().state == TaskState::Completed
 }

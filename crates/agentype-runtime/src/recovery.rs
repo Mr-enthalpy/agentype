@@ -606,7 +606,7 @@ impl RecoveredRuntime {
     }
 
     /// Production daemon takes ownership of both runners.
-    pub fn into_parts(self) -> (SupervisionRunner, Option<NotifierRunner>) {
+    pub(crate) fn into_parts(self) -> (SupervisionRunner, Option<NotifierRunner>) {
         (self.runner, self.notifier)
     }
 }
@@ -634,6 +634,7 @@ pub fn recover_runtime(
 
 /// Test-support recovery that does not acquire `RuntimeProcessLock`.
 /// Production composition must go through `SchedulerDaemon`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn recover_runtime_without_process_lock(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
@@ -645,6 +646,7 @@ pub fn recover_runtime_without_process_lock(
 
 /// Explicit test-only recovery without a notifier. Does NOT mark outbox
 /// events DELIVERED and is not a production "no RootBridge" success path.
+#[cfg(any(test, feature = "test-support"))]
 pub fn recover_runtime_without_notifier(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,

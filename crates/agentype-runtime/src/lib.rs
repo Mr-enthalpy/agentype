@@ -45,10 +45,11 @@ pub use process_lock::{
     RuntimeProcessLock, SqliteRuntimeConfig,
 };
 pub use recovery::{
-    reconcile_one_execution, recover_runtime, recover_runtime_without_notifier,
-    recover_runtime_without_process_lock, replay_persisted_terminal_consequence, AdmissionSink,
+    reconcile_one_execution, recover_runtime, replay_persisted_terminal_consequence, AdmissionSink,
     ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use recovery::{recover_runtime_without_notifier, recover_runtime_without_process_lock};
 pub use supervision::{
     RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
     SupervisionService,
@@ -891,6 +892,7 @@ pub struct Dispatcher<'a> {
     kernel: &'a Kernel,
     execution_registry: &'a ExecutionRegistry,
     adapters: &'a AdapterRegistry,
+    gate: Option<&'a crate::control::DispatchGate>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -903,7 +905,13 @@ impl<'a> Dispatcher<'a> {
             kernel,
             execution_registry,
             adapters,
+            gate: None,
         }
+    }
+
+    pub(crate) fn with_gate(mut self, gate: &'a crate::control::DispatchGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Obtain one eligible claim and dispatch it.
@@ -974,6 +982,19 @@ impl<'a> Dispatcher<'a> {
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
+        if self.gate.is_some_and(|g| !g.is_open()) {
+            self.persist_unresolved_physical_then_nack(
+                claim,
+                &execution_id,
+                FailureClass::Unknown,
+                None,
+            )?;
+            return Ok(DispatchOneOutcome::StartIndeterminate {
+                execution_id,
+                request_id,
+                failure_class: Some(FailureClass::Unknown),
+            });
+        }
         let request = EnvironmentStartRequest::from_launch(&snapshot, physical.environment())
             .map_err(|m| DispatchError::Authority(Error::invalid_authority(m.detail)))?;
 

@@ -106,21 +106,24 @@ struct StoreIdentity {
 }
 
 impl StoreIdentity {
-    fn lock_file_names(&self) -> Vec<String> {
-        vec![
-            hashed_lock_name("id", &self.file_id),
-            hashed_lock_name("path", &self.canonical),
-        ]
+    fn adjacent_lock_path(&self) -> Result<PathBuf, ProcessLockError> {
+        let canonical = PathBuf::from(&self.canonical);
+        let parent = canonical.parent().ok_or_else(|| {
+            ProcessLockError::IdentityUnresolvable(
+                "canonical store path has no parent directory".into(),
+            )
+        })?;
+        Ok(parent.join(format!(".agentype-runtime-lock-{}", fnv64(&self.file_id))))
     }
 }
 
-fn hashed_lock_name(kind: &str, value: &str) -> String {
+fn fnv64(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for b in value.bytes() {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("{kind}-{hash:016x}.lock")
+    hash
 }
 
 /// Exclusive, nonblocking, crash-released ownership of one Scheduler store.
@@ -154,27 +157,20 @@ impl RuntimeProcessLock {
         let identity = store_identity(&store, store_path)?;
         drop(store);
         let reservation = IdentityReservation::claim(&identity)?;
-
-        let lock_dir = lock_directory()?;
-        fs::create_dir_all(&lock_dir)?;
-        let mut files = Vec::new();
-        for name in identity.lock_file_names() {
-            let lock_path = lock_dir.join(name);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)?;
-            match file.try_lock_exclusive() {
-                Ok(true) => {}
-                Ok(false) => return Err(ProcessLockError::AlreadyRunning),
-                Err(err) => return Err(err.into()),
-            }
-            files.push(file);
+        let lock_path = store_lock_path(&identity)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(true) => {}
+            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+            Err(err) => return Err(err.into()),
         }
         Ok(Self {
-            _files: files,
+            _files: vec![file],
             _reservation: reservation,
             identity,
             store_path: store_path.to_path_buf(),
@@ -264,36 +260,8 @@ impl RuntimeProcessGuard {
     }
 }
 
-fn lock_directory() -> Result<PathBuf, ProcessLockError> {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                ProcessLockError::IdentityUnresolvable(
-                    "LOCALAPPDATA is unset; cannot place store lock".into(),
-                )
-            })?;
-        Ok(base.join("agentype").join("runtime-locks"))
-    }
-    #[cfg(unix)]
-    {
-        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            if !runtime.is_empty() {
-                return Ok(PathBuf::from(runtime).join("agentype-runtime-locks"));
-            }
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            ProcessLockError::IdentityUnresolvable("HOME is unset; cannot place store lock".into())
-        })?;
-        Ok(PathBuf::from(home).join(".agentype").join("runtime-locks"))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Err(ProcessLockError::IdentityUnresolvable(
-            "store lock directory is only implemented on unix and windows".into(),
-        ))
-    }
+fn store_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
+    identity.adjacent_lock_path()
 }
 
 fn store_identity(_file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {

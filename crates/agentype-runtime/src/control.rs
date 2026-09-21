@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Shared eligibility to start new physical executions. Revoked on
 /// graceful shutdown and on the first structural runner failure.
 #[derive(Clone, Debug)]
-pub(crate) struct DispatchGate {
+pub struct DispatchGate {
     allowed: Arc<AtomicBool>,
 }
 
@@ -143,7 +143,8 @@ impl<S: AdmissionSink> ControlLoopService<S> {
                 wait: self.poll,
             });
         }
-        let dispatcher = Dispatcher::new(&self.kernel, &self.execution_registry, &self.adapters);
+        let dispatcher = Dispatcher::new(&self.kernel, &self.execution_registry, &self.adapters)
+            .with_gate(&self.gate);
         let dispatch = match dispatcher.dispatch_one()? {
             DispatchOneOutcome::NoWork => ControlDispatch::NoWork,
             DispatchOneOutcome::AuthorityRejected => ControlDispatch::AuthorityRejected,

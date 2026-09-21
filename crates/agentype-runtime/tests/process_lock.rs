@@ -87,6 +87,9 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
         .env("TMPDIR", &alien_tmp)
         .env("TMP", &alien_tmp)
         .env("TEMP", &alien_tmp)
+        .env("XDG_RUNTIME_DIR", &alien_tmp)
+        .env("HOME", &alien_tmp)
+        .env("LOCALAPPDATA", &alien_tmp)
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -98,7 +101,7 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
     assert_ne!(
         first.as_deref(),
         Some("LOCKED"),
-        "helper with a different TMPDIR/TEMP must not lock the same store"
+        "helper with a different XDG_RUNTIME_DIR/HOME/LOCALAPPDATA/TMPDIR must not lock the same store"
     );
     drop(child.stdin.take());
     let status = child.wait().expect("helper exit");

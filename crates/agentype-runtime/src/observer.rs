@@ -106,6 +106,11 @@ impl ObservationTicket {
     }
 }
 
+struct WatchState {
+    ticket: ObservationTicket,
+    next_observation_at: UnixTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalObservationKind {
     ExactRunning,
@@ -182,7 +187,7 @@ pub struct PhysicalObserverService {
     adapters: AdapterRegistry,
     supervision: SupervisionService,
     config: PhysicalObserverConfig,
-    watch: Mutex<HashMap<ExecutionId, ObservationTicket>>,
+    watch: Mutex<HashMap<ExecutionId, WatchState>>,
 }
 
 impl PhysicalObserverService {
@@ -211,39 +216,66 @@ impl PhysicalObserverService {
     }
 
     pub fn observe_due(&self, now: UnixTime) -> Result<Vec<ObserveApply>, ObserverError> {
-        let mut tickets: Vec<ObservationTicket> = self
+        let poll = self.config.poll_interval;
+        let mut due: Vec<(UnixTime, ObservationTicket)> = self
             .supervision
             .observation_snapshots()
             .into_iter()
-            .filter(|snap| {
-                let _ = snap.renewal_eligible;
-                now >= snap.last_positive_observed_at + self.config.poll_interval
-            })
-            .map(|snap| ObservationTicket {
-                execution_id: snap.identity.execution_id().clone(),
-                request_id: snap.identity.request_id().clone(),
-                identity: snap.identity,
+            .filter_map(|snap| {
+                let due_at = snap.last_positive_observed_at + poll;
+                if now >= due_at {
+                    Some((
+                        due_at,
+                        ObservationTicket {
+                            execution_id: snap.identity.execution_id().clone(),
+                            request_id: snap.identity.request_id().clone(),
+                            identity: snap.identity,
+                        },
+                    ))
+                } else {
+                    None
+                }
             })
             .collect();
         {
             let watch = self.watch.lock().expect("physical watch lock");
-            for ticket in watch.values() {
-                if tickets
+            for state in watch.values() {
+                if now < state.next_observation_at {
+                    continue;
+                }
+                if due
                     .iter()
-                    .any(|t| t.execution_id == ticket.execution_id)
+                    .any(|(_, t)| t.execution_id == state.ticket.execution_id)
                 {
                     continue;
                 }
-                tickets.push(ticket.clone());
+                due.push((state.next_observation_at, state.ticket.clone()));
             }
         }
-        tickets.sort_by(|a, b| a.execution_id.as_str().cmp(b.execution_id.as_str()));
-        tickets.truncate(self.config.batch_limit);
-        let mut out = Vec::with_capacity(tickets.len());
-        for ticket in tickets {
-            out.push(self.observe_ticket(&ticket, false)?);
+        due.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.execution_id.as_str().cmp(b.1.execution_id.as_str()))
+        });
+        due.truncate(self.config.batch_limit);
+        let mut out = Vec::with_capacity(due.len());
+        for (_, ticket) in due {
+            let applied = self.observe_ticket(&ticket, false)?;
+            self.schedule_next(&ticket, now + poll);
+            out.push(applied);
         }
         Ok(out)
+    }
+
+    fn schedule_next(&self, ticket: &ObservationTicket, next_at: UnixTime) {
+        let mut watch = self.watch.lock().expect("physical watch lock");
+        watch
+            .entry(ticket.execution_id.clone())
+            .and_modify(|state| state.next_observation_at = next_at)
+            .or_insert(WatchState {
+                ticket: ticket.clone(),
+                next_observation_at: next_at,
+            });
     }
 
     /// One bounded observation for every currently supervised Execution.
@@ -296,7 +328,14 @@ impl PhysicalObserverService {
                 let artifacts = if kind == PhysicalObservationKind::PhysicalEnded {
                     match adapter.collect_outcome(&handle) {
                         Ok(outcome) => outcome.artifact_refs,
-                        Err(_) => None,
+                        Err(err) => {
+                            if let Some(hint) = err.runtime_handle_hint() {
+                                let _ = self
+                                    .kernel
+                                    .record_runtime_handle_hint(&ticket.execution_id, &hint.0);
+                            }
+                            None
+                        }
                     }
                 } else {
                     None
@@ -327,7 +366,9 @@ impl PhysicalObserverService {
         if !current
             && !matches!(
                 kind,
-                PhysicalObservationKind::PhysicalEnded | PhysicalObservationKind::IdentityLost
+                PhysicalObservationKind::PhysicalEnded
+                    | PhysicalObservationKind::IdentityLost
+                    | PhysicalObservationKind::InvocationError
             )
         {
             return Ok(ObserveApply::Dropped);
@@ -336,10 +377,7 @@ impl PhysicalObserverService {
             PhysicalObservationKind::ExactRunning => {
                 self.supervision
                     .refresh_freshness(&ticket.identity, self.kernel.now());
-                self.watch
-                    .lock()
-                    .expect("physical watch lock")
-                    .insert(ticket.execution_id.clone(), ticket.clone());
+                self.schedule_next(ticket, self.kernel.now() + self.config.poll_interval);
                 Ok(ObserveApply::Refreshed)
             }
             PhysicalObservationKind::InvocationError => {
