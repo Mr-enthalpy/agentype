@@ -128,6 +128,7 @@ fn hashed_lock_name(kind: &str, value: &str) -> String {
 /// Non-Clone. Dropping the lock (or process death) releases the OS lock.
 pub struct RuntimeProcessLock {
     _files: Vec<File>,
+    _reservation: IdentityReservation,
     identity: StoreIdentity,
     store_path: PathBuf,
 }
@@ -152,41 +153,33 @@ impl RuntimeProcessLock {
             .open(store_path)?;
         let identity = store_identity(&store, store_path)?;
         drop(store);
-        claim_identity(&identity)?;
+        let reservation = IdentityReservation::claim(&identity)?;
 
         let lock_dir = lock_directory()?;
         fs::create_dir_all(&lock_dir)?;
         let mut files = Vec::new();
         for name in identity.lock_file_names() {
             let lock_path = lock_dir.join(name);
-            let file = OpenOptions::new()
+            let file = match OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&lock_path);
-            let file = match file {
+                .open(&lock_path)
+            {
                 Ok(file) => file,
-                Err(err) => {
-                    release_identity(&identity);
-                    return Err(err.into());
-                }
+                Err(err) => return Err(err.into()),
             };
             match file.try_lock_exclusive() {
                 Ok(true) => {}
-                Ok(false) => {
-                    release_identity(&identity);
-                    return Err(ProcessLockError::AlreadyRunning);
-                }
-                Err(err) => {
-                    release_identity(&identity);
-                    return Err(err.into());
-                }
+                Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+                Err(err) => return Err(err.into()),
             }
             files.push(file);
         }
         Ok(Self {
             _files: files,
+            _reservation: reservation,
             identity,
             store_path: store_path.to_path_buf(),
         })
@@ -202,9 +195,37 @@ impl RuntimeProcessLock {
     }
 }
 
-impl Drop for RuntimeProcessLock {
+struct IdentityReservation {
+    keys: Vec<String>,
+}
+
+impl IdentityReservation {
+    fn claim(identity: &StoreIdentity) -> Result<Self, ProcessLockError> {
+        let mut held = held_identities()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut keys = Vec::new();
+        for key in [identity.file_id.clone(), identity.canonical.clone()] {
+            if !held.insert(key.clone()) {
+                for added in &keys {
+                    held.remove(added);
+                }
+                return Err(ProcessLockError::AlreadyRunning);
+            }
+            keys.push(key);
+        }
+        Ok(Self { keys })
+    }
+}
+
+impl Drop for IdentityReservation {
     fn drop(&mut self) {
-        release_identity(&self.identity);
+        let mut held = held_identities()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            held.remove(key);
+        }
     }
 }
 
@@ -213,24 +234,12 @@ fn held_identities() -> &'static Mutex<HashSet<String>> {
     HELD.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn claim_identity(identity: &StoreIdentity) -> Result<(), ProcessLockError> {
-    let mut held = held_identities()
+#[cfg(test)]
+fn identity_keys_held(identity: &StoreIdentity) -> bool {
+    let held = held_identities()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !held.insert(identity.file_id.clone()) || !held.insert(identity.canonical.clone()) {
-        held.remove(&identity.file_id);
-        held.remove(&identity.canonical);
-        return Err(ProcessLockError::AlreadyRunning);
-    }
-    Ok(())
-}
-
-fn release_identity(identity: &StoreIdentity) {
-    let mut held = held_identities()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    held.remove(&identity.file_id);
-    held.remove(&identity.canonical);
+    held.contains(&identity.file_id) && held.contains(&identity.canonical)
 }
 
 /// Holds the process lock until Runtime workers have stopped.
@@ -260,7 +269,35 @@ impl RuntimeProcessGuard {
 }
 
 fn lock_directory() -> Result<PathBuf, ProcessLockError> {
-    Ok(std::env::temp_dir().join("agentype-runtime-locks"))
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                ProcessLockError::IdentityUnresolvable(
+                    "LOCALAPPDATA is unset; cannot place store lock".into(),
+                )
+            })?;
+        Ok(base.join("agentype").join("runtime-locks"))
+    }
+    #[cfg(unix)]
+    {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            if !runtime.is_empty() {
+                return Ok(PathBuf::from(runtime).join("agentype-runtime-locks"));
+            }
+        }
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            ProcessLockError::IdentityUnresolvable("HOME is unset; cannot place store lock".into())
+        })?;
+        Ok(PathBuf::from(home).join(".agentype").join("runtime-locks"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(ProcessLockError::IdentityUnresolvable(
+            "store lock directory is only implemented on unix and windows".into(),
+        ))
+    }
 }
 
 fn store_identity(_file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
@@ -353,6 +390,30 @@ mod tests {
             Err(ProcessLockError::AlreadyRunning) => {}
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
+        let file = File::open(&path).unwrap();
+        let id = store_identity(&file, &path).unwrap();
+        assert!(
+            identity_keys_held(&id),
+            "failed second claim must not drop the holder's reservation"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_second_claim_does_not_drop_first_reservation() {
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        let file = File::open(&path).unwrap();
+        let id = store_identity(&file, &path).unwrap();
+        assert!(identity_keys_held(&id));
+        assert!(matches!(
+            RuntimeProcessGuard::acquire(&cfg),
+            Err(ProcessLockError::AlreadyRunning)
+        ));
+        assert!(identity_keys_held(&id));
+        drop(guard);
+        assert!(!identity_keys_held(&id));
         let _ = fs::remove_file(path);
     }
 

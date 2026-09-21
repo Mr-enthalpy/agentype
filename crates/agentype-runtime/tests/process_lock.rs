@@ -68,3 +68,45 @@ fn clean_shutdown_releases_lock_for_next_process() {
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn different_process_temp_dir_cannot_split_store_ownership() {
+    let path = temp_store();
+    let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+    let _guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+
+    let alien_tmp = std::env::temp_dir().join(format!(
+        "agentype-alien-tmp-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&alien_tmp).unwrap();
+    let mut child = helper()
+        .env("TMPDIR", &alien_tmp)
+        .env("TMP", &alien_tmp)
+        .env("TEMP", &alien_tmp)
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lock helper with alien temp dir");
+    let stdout = child.stdout.take().expect("helper stdout");
+    let first = BufReader::new(stdout).lines().next().and_then(Result::ok);
+    assert_ne!(
+        first.as_deref(),
+        Some("LOCKED"),
+        "helper with a different TMPDIR/TEMP must not lock the same store"
+    );
+    drop(child.stdin.take());
+    let status = child.wait().expect("helper exit");
+    assert!(
+        !status.success(),
+        "helper must fail closed, got {status}"
+    );
+    drop(_guard);
+    let _ = std::fs::remove_dir_all(alien_tmp);
+    let _ = std::fs::remove_file(path);
+}
