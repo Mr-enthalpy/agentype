@@ -440,6 +440,11 @@ impl FakeAdapter {
         self.inner.lock().expect("fake adapter").next_collect_error = Some(err);
     }
 
+    /// Inject the next `observe_execution` observation (consumed once).
+    pub fn set_next_observe(&self, obs: ExecutionObservation) {
+        self.inner.lock().expect("fake adapter").next_observe = Some(obs);
+    }
+
     /// Inject an error for the next `observe_execution` call (consumed once).
     pub fn set_next_observe_error(&self, err: AdapterError) {
         self.inner.lock().expect("fake adapter").next_observe_error = Some(err);

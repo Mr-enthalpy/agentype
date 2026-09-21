@@ -12,6 +12,7 @@ pub use agentype_execution_config::*;
 pub mod deadlines;
 pub mod notifier;
 pub mod observation;
+pub mod observer;
 pub mod process_lock;
 pub mod recovery;
 pub mod supervision;
@@ -25,6 +26,10 @@ pub use notifier::{
 pub use observation::{
     adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
     CollectedOutcomeKind, StartObservationKind,
+};
+pub use observer::{
+    classify_execution_observation, ObserveApply, ObserverConfigError, ObserverError,
+    PhysicalObservationKind, PhysicalObserverConfig, PhysicalObserverService,
 };
 pub use process_lock::{
     hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,

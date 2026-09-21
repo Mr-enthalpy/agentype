@@ -468,6 +468,15 @@ fn commit_outbox_delivery_locked(
 
 use std::sync::Arc;
 
+/// Frozen adapter routing plus locator for one Execution.
+#[derive(Debug, Clone)]
+pub struct ExecutionRoutingFacts {
+    pub adapter_kind: String,
+    pub adapter_binding_key: String,
+    pub request_id: RequestId,
+    pub runtime_handle: Value,
+}
+
 pub struct Kernel {
     store: Store,
     clock: Arc<dyn Clock>,
@@ -3446,6 +3455,42 @@ impl Kernel {
                 )
                 .map_err(map_sqlite)?;
             json_load(&handle)
+        })
+    }
+
+    /// Frozen adapter routing plus locator for one Execution. Observer
+    /// candidates come from process-local supervision; this reader only
+    /// loads facts for those tickets.
+    pub fn execution_routing_facts(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<ExecutionRoutingFacts, Error> {
+        self.store.query(|conn| {
+            conn.query_row(
+                "SELECT adapter_kind,adapter_binding_key,request_id,runtime_handle_json
+                 FROM executions WHERE id=?1",
+                params![id.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(map_sqlite)
+            .and_then(|(kind, key, request_id, handle)| {
+                Ok(ExecutionRoutingFacts {
+                    adapter_kind: kind,
+                    adapter_binding_key: key,
+                    request_id: RequestId::from_string(&request_id),
+                    runtime_handle: match handle {
+                        Some(raw) => json_load(&raw)?,
+                        None => Value::Null,
+                    },
+                })
+            })
         })
     }
 
