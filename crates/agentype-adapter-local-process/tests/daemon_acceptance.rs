@@ -11,9 +11,11 @@ use agentype_runtime::{
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn fake_bin() -> String {
     env!("CARGO_BIN_EXE_fake-agent").to_string()
@@ -119,6 +121,7 @@ fn only_snap(kernel: &Kernel) -> agentype_storage_sqlite::ExecutionReconciliatio
 /// Acceptance A: physical end is not a Task Result.
 #[test]
 fn acceptance_a_physical_end_does_not_mint_result() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let path = temp_store();
     let daemon = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "200"}));
     assert_eq!(daemon.phase(), DaemonPhase::Ready);
@@ -150,6 +153,7 @@ fn acceptance_a_physical_end_does_not_mint_result() {
 /// Acceptance B: Worker ACK fixture wins; later physical end is history.
 #[test]
 fn acceptance_b_worker_ack_then_physical_history_only() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let path = temp_store();
     let daemon = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "1500"}));
     seed_pool(daemon.kernel());
@@ -207,6 +211,7 @@ fn acceptance_b_worker_ack_then_physical_history_only() {
 /// Acceptance C: second owner of the same store is AlreadyRunning.
 #[test]
 fn acceptance_c_second_daemon_is_already_running() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let path = temp_store();
     let first = start_daemon(&path, json!({}));
     let store = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
@@ -230,6 +235,7 @@ fn acceptance_c_second_daemon_is_already_running() {
 /// Acceptance D: shutdown releases the lock; next daemon recovers then dispatches.
 #[test]
 fn acceptance_d_restart_acquires_lock_and_recovers_before_dispatch() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let path = temp_store();
     let first = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "50"}));
     seed_pool(first.kernel());
