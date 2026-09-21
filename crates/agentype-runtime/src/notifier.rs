@@ -293,7 +293,7 @@ fn classify_commit(event_id: &OutboxEventId, state: OutboxState, success: bool) 
 }
 
 fn bridge_diagnostic(err: &RootBridgeError) -> String {
-    format!("{err}")
+    format!("{}: {}", err.kind().as_str(), err.diagnostic().as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -662,6 +662,29 @@ mod tests {
             k.result_for_task(&task_id).unwrap().state,
             ResultState::Available
         );
+    }
+
+    #[test]
+    fn last_error_is_kind_plus_bounded_diagnostic_not_display() {
+        let (clock, k) = env();
+        let (_batch, _task, event) = complete_one(&k, "diag", json!({"o": 1}));
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let secret = format!(
+            "Authorization: Bearer super-secret-token\n{}",
+            "x".repeat(600)
+        );
+        bridge.script_err(RootBridgeError::Unavailable(secret.into()));
+        let svc = service(k.clone(), bridge);
+        svc.deliver_due(clock.now(), 8).unwrap();
+        let err = k
+            .outbox_delivery(&event)
+            .unwrap()
+            .last_error
+            .expect("last_error");
+        assert!(err.starts_with("UNAVAILABLE: "));
+        assert!(!err.contains("super-secret-token"));
+        assert!(!err.contains("root bridge unavailable"));
+        assert!(err.chars().count() <= 512);
     }
 
     #[test]

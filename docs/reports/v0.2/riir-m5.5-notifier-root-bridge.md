@@ -5,6 +5,10 @@ Applies to: branch `rust/m5.5-notifier` (base: main @ M5.4 merge `a9d4d00`)
 Canonical path: `docs/reports/v0.2/riir-m5.5-notifier-root-bridge.md`
 Not a specification.
 
+**M5.8 amendment:** `last_error` is now `RootBridgeErrorKind` plus a bounded
+`RootBridgeDiagnostic` (see `riir-m5.8-runtime-daemon.md`). The P1 below
+describes the M5.5 snapshot, not the current production path.
+
 Despite the historical `riir-` directory naming, this milestone is **native Rust
 runtime implementation**. It consumes the frozen M4 kernel and M5.1–M5.4
 runtime boundaries and implements spec 03 / 12 / 14 notifier isolation.

@@ -172,37 +172,112 @@ impl DeliveryReceipt {
     }
 }
 
+const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 512;
+
+/// Mechanical class of a failed Root wakeup delivery. Not a Scheduler
+/// `FailureClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootBridgeErrorKind {
+    Unavailable,
+    DeadlineExceeded,
+    Protocol,
+    Rejected,
+    Other,
+}
+
+impl RootBridgeErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "UNAVAILABLE",
+            Self::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            Self::Protocol => "PROTOCOL",
+            Self::Rejected => "REJECTED",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+/// Bounded, length-capped Root diagnostic. Callers MUST sanitize secrets;
+/// the type enforces length and strips `Authorization:` lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootBridgeDiagnostic(String);
+
+impl RootBridgeDiagnostic {
+    pub fn new(raw: impl Into<String>) -> Self {
+        let mut out = String::new();
+        for line in raw.into().lines() {
+            let trimmed = line.trim();
+            let redacted =
+                if trimmed.len() >= 14 && trimmed[..14].eq_ignore_ascii_case("authorization:") {
+                    "Authorization: [redacted]"
+                } else {
+                    line
+                };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(redacted);
+        }
+        Self(out.chars().take(ROOT_DIAGNOSTIC_MAX_CHARS).collect())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RootBridgeDiagnostic {
+    fn from(raw: String) -> Self {
+        Self::new(raw)
+    }
+}
+
+impl From<&str> for RootBridgeDiagnostic {
+    fn from(raw: &str) -> Self {
+        Self::new(raw)
+    }
+}
+
 /// Mechanical delivery failure. Not a Scheduler `FailureClass`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootBridgeError {
-    Unavailable(String),
-    DeadlineExceeded(String),
-    Protocol(String),
-    Rejected(String),
-    Other(String),
+    Unavailable(RootBridgeDiagnostic),
+    DeadlineExceeded(RootBridgeDiagnostic),
+    Protocol(RootBridgeDiagnostic),
+    Rejected(RootBridgeDiagnostic),
+    Other(RootBridgeDiagnostic),
 }
 
 impl RootBridgeError {
-    pub fn diagnostic(&self) -> &str {
+    pub fn kind(&self) -> RootBridgeErrorKind {
         match self {
-            Self::Unavailable(m)
-            | Self::DeadlineExceeded(m)
-            | Self::Protocol(m)
-            | Self::Rejected(m)
-            | Self::Other(m) => m,
+            Self::Unavailable(_) => RootBridgeErrorKind::Unavailable,
+            Self::DeadlineExceeded(_) => RootBridgeErrorKind::DeadlineExceeded,
+            Self::Protocol(_) => RootBridgeErrorKind::Protocol,
+            Self::Rejected(_) => RootBridgeErrorKind::Rejected,
+            Self::Other(_) => RootBridgeErrorKind::Other,
+        }
+    }
+
+    pub fn diagnostic(&self) -> &RootBridgeDiagnostic {
+        match self {
+            Self::Unavailable(d)
+            | Self::DeadlineExceeded(d)
+            | Self::Protocol(d)
+            | Self::Rejected(d)
+            | Self::Other(d) => d,
         }
     }
 }
 
 impl std::fmt::Display for RootBridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable(m) => write!(f, "root bridge unavailable: {m}"),
-            Self::DeadlineExceeded(m) => write!(f, "root bridge deadline exceeded: {m}"),
-            Self::Protocol(m) => write!(f, "root bridge protocol: {m}"),
-            Self::Rejected(m) => write!(f, "root bridge rejected: {m}"),
-            Self::Other(m) => write!(f, "root bridge error: {m}"),
-        }
+        write!(
+            f,
+            "root bridge {}: {}",
+            self.kind().as_str(),
+            self.diagnostic().as_str()
+        )
     }
 }
 
@@ -458,6 +533,16 @@ mod tests {
         assert!(bridge.deliver(&wakeup).is_ok());
         assert_eq!(bridge.deliver_count(), 1);
         assert_eq!(bridge.deliveries()[0].event_id().as_str(), "event_1");
+    }
+
+    #[test]
+    fn diagnostic_is_bounded_and_redacts_authorization() {
+        let long = "x".repeat(800);
+        let d = RootBridgeDiagnostic::new(long);
+        assert_eq!(d.as_str().chars().count(), 512);
+        let secret = RootBridgeDiagnostic::new("Authorization: Bearer super-secret-token\nok");
+        assert!(!secret.as_str().contains("super-secret-token"));
+        assert!(secret.as_str().contains("Authorization: [redacted]"));
     }
 
     #[test]
