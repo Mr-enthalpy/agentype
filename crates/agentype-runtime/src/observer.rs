@@ -12,6 +12,7 @@ use crate::{
 use agentype_adapter_api::{AdapterError, ExecutionObservation};
 use agentype_core::{Error, ExecutionState, FailureClass, UnixTime};
 use agentype_storage_sqlite::Kernel;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -181,6 +182,7 @@ pub struct PhysicalObserverService {
     adapters: AdapterRegistry,
     supervision: SupervisionService,
     config: PhysicalObserverConfig,
+    watch: Mutex<HashMap<ExecutionId, ObservationTicket>>,
 }
 
 impl PhysicalObserverService {
@@ -196,6 +198,7 @@ impl PhysicalObserverService {
             adapters,
             supervision,
             config,
+            watch: Mutex::new(HashMap::new()),
         }
     }
 
@@ -222,6 +225,19 @@ impl PhysicalObserverService {
                 identity: snap.identity,
             })
             .collect();
+        {
+            let watch = self.watch.lock().expect("physical watch lock");
+            for ticket in watch.values() {
+                if tickets
+                    .iter()
+                    .any(|t| t.execution_id == ticket.execution_id)
+                {
+                    continue;
+                }
+                tickets.push(ticket.clone());
+            }
+        }
+        tickets.sort_by(|a, b| a.execution_id.as_str().cmp(b.execution_id.as_str()));
         tickets.truncate(self.config.batch_limit);
         let mut out = Vec::with_capacity(tickets.len());
         for ticket in tickets {
@@ -271,6 +287,12 @@ impl PhysicalObserverService {
         match adapter.observe_execution(&handle) {
             Ok(observation) => {
                 let kind = classify_execution_observation(&observation);
+                if matches!(
+                    kind,
+                    PhysicalObservationKind::PhysicalEnded | PhysicalObservationKind::IdentityLost
+                ) {
+                    self.supervision.stop_renewal_eligibility(&ticket.identity);
+                }
                 let artifacts = if kind == PhysicalObservationKind::PhysicalEnded {
                     match adapter.collect_outcome(&handle) {
                         Ok(outcome) => outcome.artifact_refs,
@@ -301,13 +323,23 @@ impl PhysicalObserverService {
         invoke_err: Option<AdapterError>,
         artifacts: Option<serde_json::Value>,
     ) -> Result<ObserveApply, ObserverError> {
-        if !generation_current(&self.supervision, &ticket.identity) {
+        let current = generation_current(&self.supervision, &ticket.identity);
+        if !current
+            && !matches!(
+                kind,
+                PhysicalObservationKind::PhysicalEnded | PhysicalObservationKind::IdentityLost
+            )
+        {
             return Ok(ObserveApply::Dropped);
         }
         match kind {
             PhysicalObservationKind::ExactRunning => {
                 self.supervision
                     .refresh_freshness(&ticket.identity, self.kernel.now());
+                self.watch
+                    .lock()
+                    .expect("physical watch lock")
+                    .insert(ticket.execution_id.clone(), ticket.clone());
                 Ok(ObserveApply::Refreshed)
             }
             PhysicalObservationKind::InvocationError => {
@@ -335,17 +367,26 @@ impl PhysicalObserverService {
             }
             PhysicalObservationKind::IdentityLost => {
                 self.supervision.stop_renewal_eligibility(&ticket.identity);
-                self.kernel
-                    .record_physical_outcome(
-                        &ticket.execution_id,
-                        ExecutionState::Lost,
-                        Some(&handle.0),
-                        None,
-                        Some(FailureClass::ExecutionLost),
-                        false,
-                        false,
-                    )
-                    .map_err(ObserverError::from)?;
+                match self.kernel.record_physical_outcome(
+                    &ticket.execution_id,
+                    ExecutionState::Lost,
+                    Some(&handle.0),
+                    None,
+                    Some(FailureClass::ExecutionLost),
+                    false,
+                    false,
+                ) {
+                    Ok(()) => {}
+                    Err(Error::InvalidTransition(_)) => {
+                        self.supervision.drop_if_current(&ticket.identity);
+                        self.watch
+                            .lock()
+                            .expect("physical watch lock")
+                            .remove(&ticket.execution_id);
+                        return Ok(ObserveApply::Dropped);
+                    }
+                    Err(err) => return Err(ObserverError::from(err)),
+                }
                 self.nack_current(ticket, FailureClass::ExecutionLost)?;
                 self.supervision.drop_if_current(&ticket.identity);
                 Ok(ObserveApply::IdentityLost)
@@ -364,10 +405,18 @@ impl PhysicalObserverService {
                 {
                     AuthorityConsequence::Applied { .. } => {
                         self.supervision.drop_if_current(&ticket.identity);
+                        self.watch
+                            .lock()
+                            .expect("physical watch lock")
+                            .remove(&ticket.execution_id);
                         Ok(ObserveApply::PhysicalEnded)
                     }
                     AuthorityConsequence::AuthorityAlreadyStale => {
                         self.supervision.drop_if_current(&ticket.identity);
+                        self.watch
+                            .lock()
+                            .expect("physical watch lock")
+                            .remove(&ticket.execution_id);
                         Ok(ObserveApply::AuthorityAlreadyStale)
                     }
                 }
@@ -515,6 +564,14 @@ impl PhysicalObserverRunner {
             .fatal
             .as_ref()
             .map(ToString::to_string)
+    }
+
+    pub(crate) fn join_fatal(mut self) -> Option<String> {
+        self.request_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        self.take_fatal()
     }
 }
 

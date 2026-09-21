@@ -591,19 +591,25 @@ impl SupervisionService {
         identity: SupervisionIdentity,
     ) -> Result<RenewalOutcome, SupervisionError> {
         let execution_id = identity.execution_id().clone();
-        let stale = {
-            let now = self.kernel.now();
-            let registry = self.registry.lock().expect("supervision registry lock");
-            registry.freshness_limit.is_some_and(|limit| {
-                registry.entries.get(&execution_id).is_some_and(|entry| {
-                    entry.identity.generation() == identity.generation()
-                        && (!entry.renewal_eligible
-                            || now >= entry.last_positive_observed_at + limit)
-                })
-            })
-        };
-        if stale {
-            return Ok(RenewalOutcome::FreshnessStale { execution_id });
+        let now = self.kernel.now();
+        {
+            let mut registry = self.registry.lock().expect("supervision registry lock");
+            match registry.entries.get(&execution_id) {
+                None => return Err(SupervisionError::NoSuchEntry),
+                Some(entry) if entry.identity.generation() != identity.generation() => {
+                    return Err(SupervisionError::NoSuchEntry);
+                }
+                Some(entry) => {
+                    let stale = registry.freshness_limit.is_some_and(|limit| {
+                        !entry.renewal_eligible || now >= entry.last_positive_observed_at + limit
+                    });
+                    if stale {
+                        let next_due_at = now + self.heartbeat_interval.as_secs_f64();
+                        registry.record_renewal(&identity, next_due_at);
+                        return Ok(RenewalOutcome::FreshnessStale { execution_id });
+                    }
+                }
+            }
         }
         // Anchor BEFORE the renewal (M5.3 audit P1-1): the next deadline is
         // then anchor + interval, which is strictly earlier than the

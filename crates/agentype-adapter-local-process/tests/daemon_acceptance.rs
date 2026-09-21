@@ -121,7 +121,7 @@ fn only_snap(kernel: &Kernel) -> agentype_storage_sqlite::ExecutionReconciliatio
 /// Acceptance A: physical end is not a Task Result.
 #[test]
 fn acceptance_a_physical_end_does_not_mint_result() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = temp_store();
     let daemon = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "200"}));
     assert_eq!(daemon.phase(), DaemonPhase::Ready);
@@ -153,7 +153,7 @@ fn acceptance_a_physical_end_does_not_mint_result() {
 /// Acceptance B: Worker ACK fixture wins; later physical end is history.
 #[test]
 fn acceptance_b_worker_ack_then_physical_history_only() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = temp_store();
     let daemon = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "1500"}));
     seed_pool(daemon.kernel());
@@ -194,9 +194,8 @@ fn acceptance_b_worker_ack_then_physical_history_only() {
         TaskState::Completed
     );
     let first = daemon.kernel().result_for_task(&task_id).unwrap();
-    wait_until(Duration::from_secs(6), || {
+    wait_until(Duration::from_secs(8), || {
         daemon.kernel().execution(&exec_id).unwrap().state == ExecutionState::Terminated
-            || daemon.kernel().execution(&exec_id).unwrap().state == ExecutionState::Succeeded
     });
     assert_eq!(
         daemon.kernel().task(&task_id).unwrap().state,
@@ -211,7 +210,7 @@ fn acceptance_b_worker_ack_then_physical_history_only() {
 /// Acceptance C: second owner of the same store is AlreadyRunning.
 #[test]
 fn acceptance_c_second_daemon_is_already_running() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = temp_store();
     let first = start_daemon(&path, json!({}));
     let store = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
@@ -235,7 +234,7 @@ fn acceptance_c_second_daemon_is_already_running() {
 /// Acceptance D: shutdown releases the lock; next daemon recovers then dispatches.
 #[test]
 fn acceptance_d_restart_acquires_lock_and_recovers_before_dispatch() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = temp_store();
     let first = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "50"}));
     seed_pool(first.kernel());
@@ -244,9 +243,10 @@ fn acceptance_d_restart_acquires_lock_and_recovers_before_dispatch() {
         .submit_batch(&[TaskSpec::new("m58-d", json!({"goal": "echo"}))])
         .unwrap();
     thread::sleep(Duration::from_millis(400));
-    match first.join() {
-        agentype_runtime::DaemonExit::Stopped | agentype_runtime::DaemonExit::Failed(_) => {}
-    }
+    assert!(matches!(
+        first.join(),
+        agentype_runtime::DaemonExit::Stopped
+    ));
     let second = start_daemon(&path, json!({"FAKE_AGENT_SLEEP_MS": "50"}));
     assert_eq!(second.phase(), DaemonPhase::Ready);
     second.join();

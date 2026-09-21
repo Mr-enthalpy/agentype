@@ -3,7 +3,7 @@
 //! Recovery grants this Runtime the right to begin activation; it does not
 //! by itself grant production dispatch capability.
 
-use crate::control::{ControlError, ControlLoopRunner, ControlLoopService};
+use crate::control::{ControlError, ControlLoopRunner, ControlLoopService, DispatchGate};
 use crate::notifier::{NotifierBinding, NotifierRunner};
 use crate::observer::{
     ObserverError, PhysicalObserverConfig, PhysicalObserverRunner, PhysicalObserverService,
@@ -20,6 +20,7 @@ use agentype_storage_sqlite::Kernel;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonPhase {
@@ -162,16 +163,30 @@ impl SchedulerDaemonBuilder {
         kernel
             .revive_eligible_agents()
             .map_err(DaemonError::Persistence)?;
-        if supervision.is_failed() {
+        if supervision.is_failed() || notifier.as_ref().is_some_and(|n| n.is_failed()) {
             drop(observer_service);
             drop(notifier);
             drop(supervision);
             drop(lock);
             return Err(DaemonError::Recovery(RecoveryError::Invariant(
-                "supervision failed during activation".into(),
+                "a required runner failed during activation".into(),
             )));
         }
+        let now = kernel.now();
+        let freshness = self.observer.freshness_limit();
+        for snap in supervision.service().observation_snapshots() {
+            if snap.renewal_eligible && now >= snap.last_positive_observed_at + freshness {
+                drop(observer_service);
+                drop(notifier);
+                drop(supervision);
+                drop(lock);
+                return Err(DaemonError::Recovery(RecoveryError::Invariant(
+                    "activation left a current execution with stale physical freshness".into(),
+                )));
+            }
+        }
         let permit = ReadyPermit::mint();
+        let gate = DispatchGate::open();
         let control_service = ControlLoopService::new(
             kernel.clone(),
             self.execution_registry,
@@ -179,38 +194,86 @@ impl SchedulerDaemonBuilder {
             supervision.admit_sink(),
             &self.timing,
             permit,
+            gate.clone(),
         );
         let observer =
             PhysicalObserverRunner::start(observer_service).map_err(DaemonError::Observer)?;
         let control = ControlLoopRunner::start(control_service).map_err(DaemonError::Control)?;
+        let inner = Arc::new(DaemonInner {
+            control,
+            observer,
+            supervision,
+            notifier,
+            gate,
+            stop: AtomicBool::new(false),
+            phase: Mutex::new(DaemonPhase::Ready),
+        });
+        let watchdog_inner = inner.clone();
+        let watchdog = std::thread::Builder::new()
+            .name("daemon-health".into())
+            .spawn(move || loop {
+                if watchdog_inner.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let failed = watchdog_inner.control.is_failed()
+                    || watchdog_inner.observer.is_failed()
+                    || watchdog_inner.supervision.is_failed()
+                    || watchdog_inner
+                        .notifier
+                        .as_ref()
+                        .is_some_and(|n| n.is_failed());
+                if failed {
+                    watchdog_inner.gate.revoke();
+                    let mut phase = watchdog_inner.phase.lock().expect("daemon phase");
+                    *phase = DaemonPhase::Failed;
+                    drop(phase);
+                    watchdog_inner.control.request_stop();
+                    watchdog_inner.observer.request_stop();
+                    watchdog_inner.supervision.request_stop();
+                    if let Some(n) = &watchdog_inner.notifier {
+                        n.request_stop();
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            })
+            .ok();
         Ok(RunningSchedulerDaemon {
             _lock: lock,
             kernel,
-            control: Some(control),
-            observer: Some(observer),
-            supervision: Some(supervision),
-            notifier,
-            stop: Arc::new(AtomicBool::new(false)),
-            phase: Arc::new(Mutex::new(DaemonPhase::Ready)),
+            inner: Some(inner),
+            watchdog,
         })
     }
+}
+
+struct DaemonInner {
+    control: ControlLoopRunner,
+    observer: PhysicalObserverRunner,
+    supervision: SupervisionRunner,
+    notifier: Option<NotifierRunner>,
+    gate: DispatchGate,
+    stop: AtomicBool,
+    phase: Mutex<DaemonPhase>,
 }
 
 /// Running production daemon. Drop / `join` releases the process lock last.
 pub struct RunningSchedulerDaemon {
     _lock: RuntimeProcessGuard,
     kernel: Arc<Kernel>,
-    control: Option<ControlLoopRunner>,
-    observer: Option<PhysicalObserverRunner>,
-    supervision: Option<SupervisionRunner>,
-    notifier: Option<NotifierRunner>,
-    stop: Arc<AtomicBool>,
-    phase: Arc<Mutex<DaemonPhase>>,
+    inner: Option<Arc<DaemonInner>>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RunningSchedulerDaemon {
     pub fn phase(&self) -> DaemonPhase {
-        *self.phase.lock().expect("daemon phase")
+        *self
+            .inner
+            .as_ref()
+            .expect("daemon inner")
+            .phase
+            .lock()
+            .expect("daemon phase")
     }
 
     pub fn kernel(&self) -> &Kernel {
@@ -218,83 +281,89 @@ impl RunningSchedulerDaemon {
     }
 
     pub fn poll_health(&self) {
-        let failed = self.control.as_ref().is_some_and(|c| c.is_failed())
-            || self.observer.as_ref().is_some_and(|o| o.is_failed())
-            || self.supervision.as_ref().is_some_and(|s| s.is_failed())
-            || self.notifier.as_ref().is_some_and(|n| n.is_failed());
+        let inner = self.inner.as_ref().expect("daemon inner");
+        let failed = inner.control.is_failed()
+            || inner.observer.is_failed()
+            || inner.supervision.is_failed()
+            || inner.notifier.as_ref().is_some_and(|n| n.is_failed());
         if failed {
-            let mut phase = self.phase.lock().expect("daemon phase");
-            *phase = DaemonPhase::Failed;
-            drop(phase);
+            *inner.phase.lock().expect("daemon phase") = DaemonPhase::Failed;
             self.request_shutdown();
         }
     }
 
     pub fn request_shutdown(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let mut phase = self.phase.lock().expect("daemon phase");
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        inner.gate.revoke();
+        inner.stop.store(true, Ordering::SeqCst);
+        let mut phase = inner.phase.lock().expect("daemon phase");
         if *phase == DaemonPhase::Ready {
             *phase = DaemonPhase::Stopping;
         }
-        if let Some(control) = &self.control {
-            control.request_stop();
-        }
-        if let Some(observer) = &self.observer {
-            observer.request_stop();
-        }
-        if let Some(supervision) = &self.supervision {
-            supervision.request_stop();
-        }
-        if let Some(notifier) = &self.notifier {
+        drop(phase);
+        inner.control.request_stop();
+        inner.observer.request_stop();
+        inner.supervision.request_stop();
+        if let Some(notifier) = &inner.notifier {
             notifier.request_stop();
         }
     }
 
     pub fn join(mut self) -> DaemonExit {
-        self.poll_health();
         self.request_shutdown();
-        let failed = *self.phase.lock().expect("daemon phase") == DaemonPhase::Failed
-            || self.control.as_ref().is_some_and(|c| c.is_failed())
-            || self.observer.as_ref().is_some_and(|o| o.is_failed())
-            || self.supervision.as_ref().is_some_and(|s| s.is_failed())
-            || self.notifier.as_ref().is_some_and(|n| n.is_failed());
-        drop(self.control.take());
-        drop(self.observer.take());
-        drop(self.supervision.take());
-        drop(self.notifier.take());
-        let mut phase = self.phase.lock().expect("daemon phase");
-        let exit = if failed {
-            *phase = DaemonPhase::Failed;
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+        let inner = match Arc::try_unwrap(self.inner.take().expect("daemon inner")) {
+            Ok(inner) => inner,
+            Err(shared) => {
+                return if *shared.phase.lock().expect("daemon phase") == DaemonPhase::Failed {
+                    DaemonExit::Failed("runtime worker failed".into())
+                } else {
+                    DaemonExit::Stopped
+                };
+            }
+        };
+        let DaemonInner {
+            control,
+            observer,
+            supervision,
+            notifier,
+            phase,
+            ..
+        } = inner;
+        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed
+            || control.join_fatal().is_some()
+            || observer.join_fatal().is_some()
+            || supervision.is_failed()
+            || notifier.as_ref().is_some_and(|n| n.is_failed());
+        drop(supervision);
+        drop(notifier);
+        if failed {
             DaemonExit::Failed("runtime worker failed".into())
         } else {
-            *phase = DaemonPhase::Stopped;
             DaemonExit::Stopped
-        };
-        drop(phase);
-        exit
-        // `_lock` drops after runners.
+        }
     }
 }
 
 impl Drop for RunningSchedulerDaemon {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(control) = &self.control {
-            control.request_stop();
+        if let Some(inner) = &self.inner {
+            inner.gate.revoke();
+            inner.stop.store(true, Ordering::SeqCst);
+            inner.control.request_stop();
+            inner.observer.request_stop();
+            inner.supervision.request_stop();
+            if let Some(notifier) = &inner.notifier {
+                notifier.request_stop();
+            }
         }
-        if let Some(observer) = &self.observer {
-            observer.request_stop();
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
         }
-        if let Some(supervision) = &self.supervision {
-            supervision.request_stop();
-        }
-        if let Some(notifier) = &self.notifier {
-            notifier.request_stop();
-        }
-        self.control.take();
-        self.observer.take();
-        self.supervision.take();
-        self.notifier.take();
     }
 }
 
@@ -390,9 +459,7 @@ mod tests {
             tasks.iter().all(|s| *s != TaskState::Completed),
             "shutdown must not mint Results; got {tasks:?}"
         );
-        match daemon.join() {
-            DaemonExit::Stopped | DaemonExit::Failed(_) => {}
-        }
+        assert!(matches!(daemon.join(), DaemonExit::Stopped));
         let again = builder_for(&path).start().unwrap();
         assert_eq!(again.phase(), DaemonPhase::Ready);
         again.join();

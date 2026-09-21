@@ -160,16 +160,12 @@ impl RuntimeProcessLock {
         let mut files = Vec::new();
         for name in identity.lock_file_names() {
             let lock_path = lock_dir.join(name);
-            let file = match OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&lock_path)
-            {
-                Ok(file) => file,
-                Err(err) => return Err(err.into()),
-            };
+                .open(&lock_path)?;
             match file.try_lock_exclusive() {
                 Ok(true) => {}
                 Ok(false) => return Err(ProcessLockError::AlreadyRunning),

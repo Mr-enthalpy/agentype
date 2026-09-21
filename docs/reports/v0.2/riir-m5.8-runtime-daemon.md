@@ -29,6 +29,32 @@ manufacturing Task, Result, or quiescence semantics.
 
 SCHEMA_VERSION remains 4.
 
+## Ownership graph
+
+```text
+SchedulerDaemon
+  RuntimeProcessGuard          (stable lock dir, not temp_dir)
+  Arc<Kernel>
+  DispatchGate                 (revoked on shutdown and first runner fatal)
+  SupervisionRunner            (lease renewal only)
+  PhysicalObserverRunner       (freshness + physical watch)
+  ControlLoopRunner            (maintenance + gated dispatch)
+  NotifierRunner?              (optional)
+  daemon-health watchdog       (auto-stop; poll_health is diagnostic only)
+```
+
+READY is minted only after activation, a freshness re-check of remaining
+current executions, and required runner health.
+
+Shutdown revokes DispatchGate before claim/start, then joins workers and
+summarizes fatal after those joins.
+
+## Diagnostic contract
+
+`RootBridgeDiagnostic` enforces max length and redacts `Authorization:`
+lines. It does not claim full secret sanitization. Prefix matching uses
+`str::get`, so ordinary UTF-8 messages must not panic.
+
 ---
 
 ## RootBridge diagnostics

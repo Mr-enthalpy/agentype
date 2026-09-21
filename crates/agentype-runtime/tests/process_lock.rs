@@ -102,10 +102,7 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
     );
     drop(child.stdin.take());
     let status = child.wait().expect("helper exit");
-    assert!(
-        !status.success(),
-        "helper must fail closed, got {status}"
-    );
+    assert!(!status.success(), "helper must fail closed, got {status}");
     drop(_guard);
     let _ = std::fs::remove_dir_all(alien_tmp);
     let _ = std::fs::remove_file(path);

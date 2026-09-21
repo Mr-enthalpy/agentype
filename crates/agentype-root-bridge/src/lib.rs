@@ -207,12 +207,14 @@ impl RootBridgeDiagnostic {
         let mut out = String::new();
         for line in raw.into().lines() {
             let trimmed = line.trim();
-            let redacted =
-                if trimmed.len() >= 14 && trimmed[..14].eq_ignore_ascii_case("authorization:") {
-                    "Authorization: [redacted]"
-                } else {
-                    line
-                };
+            let redacted = if trimmed
+                .get(..14)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("authorization:"))
+            {
+                "Authorization: [redacted]"
+            } else {
+                line
+            };
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -543,6 +545,11 @@ mod tests {
         let secret = RootBridgeDiagnostic::new("Authorization: Bearer super-secret-token\nok");
         assert!(!secret.as_str().contains("super-secret-token"));
         assert!(secret.as_str().contains("Authorization: [redacted]"));
+        let zh = RootBridgeDiagnostic::new("连接服务失败请重试");
+        assert!(zh.as_str().contains("连接服务失败请重试"));
+        let mix = RootBridgeDiagnostic::new("失败 🚨 retry");
+        assert!(mix.as_str().contains("失败"));
+        assert!(mix.as_str().contains("retry"));
     }
 
     #[test]

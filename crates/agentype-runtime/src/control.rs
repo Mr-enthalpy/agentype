@@ -12,8 +12,32 @@ use agentype_core::Error;
 use agentype_core::FailureClass;
 use agentype_storage_sqlite::Kernel;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// Shared eligibility to start new physical executions. Revoked on
+/// graceful shutdown and on the first structural runner failure.
+#[derive(Clone, Debug)]
+pub(crate) struct DispatchGate {
+    allowed: Arc<AtomicBool>,
+}
+
+impl DispatchGate {
+    pub(crate) fn open() -> Self {
+        Self {
+            allowed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.allowed.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.allowed.load(Ordering::SeqCst)
+    }
+}
 
 /// Dispatch result after ControlLoop has consumed a `RunningAdmitted`
 /// admission into supervision.
@@ -78,16 +102,18 @@ pub struct ControlLoopService<S> {
     supervision: S,
     poll: Duration,
     _permit: ReadyPermit,
+    gate: DispatchGate,
 }
 
 impl<S: AdmissionSink> ControlLoopService<S> {
-    pub fn new(
+    pub(crate) fn new(
         kernel: Arc<Kernel>,
         execution_registry: ExecutionRegistry,
         adapters: AdapterRegistry,
         supervision: S,
         timing: &RuntimeTimingConfig,
         permit: ReadyPermit,
+        gate: DispatchGate,
     ) -> Self {
         Self {
             kernel,
@@ -96,6 +122,7 @@ impl<S: AdmissionSink> ControlLoopService<S> {
             supervision,
             poll: timing.dispatcher_poll_interval(),
             _permit: permit,
+            gate,
         }
     }
 
@@ -110,6 +137,12 @@ impl<S: AdmissionSink> ControlLoopService<S> {
         self.kernel.promote_retry_wait()?;
         self.kernel.reconcile_pool()?;
         self.kernel.revive_eligible_agents()?;
+        if !self.gate.is_open() {
+            return Ok(ControlCycleReport {
+                dispatch: ControlDispatch::NoWork,
+                wait: self.poll,
+            });
+        }
         let dispatcher = Dispatcher::new(&self.kernel, &self.execution_registry, &self.adapters);
         let dispatch = match dispatcher.dispatch_one()? {
             DispatchOneOutcome::NoWork => ControlDispatch::NoWork,
@@ -127,10 +160,13 @@ impl<S: AdmissionSink> ControlLoopService<S> {
             },
             DispatchOneOutcome::RunningAdmitted { admission } => {
                 let execution_id = admission.execution_id().clone();
-                self.supervision
-                    .admit(admission)
-                    .map_err(ControlError::Fatal)?;
-                ControlDispatch::RunningAdmitted { execution_id }
+                match self.supervision.admit(admission) {
+                    Ok(()) => ControlDispatch::RunningAdmitted { execution_id },
+                    Err(SupervisionError::RunnerStopped(_)) if !self.gate.is_open() => {
+                        ControlDispatch::NoWork
+                    }
+                    Err(err) => return Err(ControlError::Fatal(err)),
+                }
             }
         };
         Ok(ControlCycleReport {
@@ -257,6 +293,14 @@ impl ControlLoopRunner {
             .phase
             == RunnerPhase::Failed
     }
+
+    pub(crate) fn join_fatal(mut self) -> Option<String> {
+        self.request_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        self.fatal()
+    }
 }
 
 impl Drop for ControlLoopRunner {
@@ -353,6 +397,7 @@ mod tests {
             supervision,
             &timing(),
             ReadyPermit::mint(),
+            DispatchGate::open(),
         )
     }
 
@@ -480,6 +525,7 @@ mod tests {
             runner,
             &timing(),
             ReadyPermit::mint(),
+            DispatchGate::open(),
         );
         match control.cycle() {
             Err(ControlError::Fatal(SupervisionError::RunnerStopped(_))) => {}
