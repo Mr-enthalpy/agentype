@@ -24,57 +24,95 @@ enum GatePhase {
     Failed,
 }
 
+#[derive(Debug)]
+struct GateInner {
+    phase: GatePhase,
+    in_flight_starts: u32,
+}
+
 /// Shared eligibility to start new physical executions.
+/// Fatal publication and start-permit issuance share this mutex.
 #[derive(Clone, Debug)]
 pub struct DispatchGate {
-    phase: Arc<Mutex<GatePhase>>,
+    inner: Arc<Mutex<GateInner>>,
+}
+
+/// Held across one physical `start_execution`. Drop does not abort the call;
+/// it only releases the in-flight count.
+pub struct DispatchStartPermit {
+    gate: DispatchGate,
+}
+
+impl Drop for DispatchStartPermit {
+    fn drop(&mut self) {
+        let mut inner = self.gate.inner.lock().expect("dispatch gate");
+        inner.in_flight_starts = inner.in_flight_starts.saturating_sub(1);
+    }
 }
 
 impl DispatchGate {
     #[cfg(test)]
     pub(crate) fn open() -> Self {
         Self {
-            phase: Arc::new(Mutex::new(GatePhase::Ready)),
+            inner: Arc::new(Mutex::new(GateInner {
+                phase: GatePhase::Ready,
+                in_flight_starts: 0,
+            })),
         }
     }
 
     pub(crate) fn closed() -> Self {
         Self {
-            phase: Arc::new(Mutex::new(GatePhase::Closed)),
+            inner: Arc::new(Mutex::new(GateInner {
+                phase: GatePhase::Closed,
+                in_flight_starts: 0,
+            })),
         }
     }
 
     /// Closed → Ready. Returns false if a fatal or shutdown already won.
     pub(crate) fn try_commit_ready(&self) -> bool {
-        let mut phase = self.phase.lock().expect("dispatch gate");
-        if *phase == GatePhase::Closed {
-            *phase = GatePhase::Ready;
+        let mut inner = self.inner.lock().expect("dispatch gate");
+        if inner.phase == GatePhase::Closed {
+            inner.phase = GatePhase::Ready;
             true
         } else {
             false
         }
     }
 
+    /// Synchronous fatal publication. Dispatch eligibility ends in this call.
     pub(crate) fn fail(&self) {
-        let mut phase = self.phase.lock().expect("dispatch gate");
-        if *phase == GatePhase::Closed || *phase == GatePhase::Ready {
-            *phase = GatePhase::Failed;
+        let mut inner = self.inner.lock().expect("dispatch gate");
+        if inner.phase == GatePhase::Closed || inner.phase == GatePhase::Ready {
+            inner.phase = GatePhase::Failed;
         }
     }
 
     pub(crate) fn begin_shutdown(&self) {
-        let mut phase = self.phase.lock().expect("dispatch gate");
-        if *phase != GatePhase::Failed {
-            *phase = GatePhase::Stopping;
+        let mut inner = self.inner.lock().expect("dispatch gate");
+        if inner.phase != GatePhase::Failed {
+            inner.phase = GatePhase::Stopping;
         }
     }
 
+    /// Linearization point for a new external start. Shutdown or fatal that
+    /// wins this lock prevents the permit.
+    pub(crate) fn try_begin_physical_start(&self) -> Option<DispatchStartPermit> {
+        let mut inner = self.inner.lock().expect("dispatch gate");
+        if inner.phase != GatePhase::Ready {
+            return None;
+        }
+        inner.in_flight_starts = inner.in_flight_starts.saturating_add(1);
+        Some(DispatchStartPermit { gate: self.clone() })
+    }
+
     pub(crate) fn is_open(&self) -> bool {
-        *self.phase.lock().expect("dispatch gate") == GatePhase::Ready
+        self.inner.lock().expect("dispatch gate").phase == GatePhase::Ready
     }
 
     pub(crate) fn published_phase(&self) -> crate::DaemonPhase {
-        match *self.phase.lock().expect("dispatch gate") {
+        match self.inner.lock().expect("dispatch gate").phase {
             GatePhase::Closed | GatePhase::Stopping => crate::DaemonPhase::Stopping,
             GatePhase::Ready => crate::DaemonPhase::Ready,
             GatePhase::Failed => crate::DaemonPhase::Failed,
@@ -179,6 +217,7 @@ impl<S: AdmissionSink> ControlLoopService<S> {
         self.kernel.expire_leases(false)?;
         self.kernel.promote_retry_wait()?;
         self.kernel.reconcile_pool()?;
+        self.kernel.ensure_task_consumers()?;
         self.kernel.revive_eligible_agents()?;
         if !self.gate.is_open() {
             return Ok(ControlCycleReport {
@@ -257,6 +296,7 @@ impl ControlLoopRunner {
             signal: Condvar::new(),
         });
         let thread_shared = shared.clone();
+        let fatal_gate = service.gate.clone();
         let join = std::thread::Builder::new()
             .name("control-loop".into())
             .spawn(move || {
@@ -284,6 +324,8 @@ impl ControlLoopRunner {
                                 thread_shared.state.lock().expect("control runner state");
                             state.phase = RunnerPhase::Failed;
                             state.fatal = Some(err);
+                            drop(state);
+                            fatal_gate.fail();
                             break;
                         }
                     }
@@ -294,6 +336,8 @@ impl ControlLoopRunner {
                     state.fatal = Some(ControlError::Fatal(SupervisionError::Fatal(
                         Error::invariant("control-loop thread panicked"),
                     )));
+                    drop(state);
+                    fatal_gate.fail();
                 }
                 let mut state = thread_shared.state.lock().expect("control runner state");
                 if state.phase == RunnerPhase::Running {

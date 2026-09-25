@@ -1228,6 +1228,84 @@ impl Kernel {
         })
     }
 
+    /// Birth a temporary consumer when a QUEUED task has no compatible READY
+    /// identity. May exceed desired capacity; later reconciliation retires excess.
+    pub fn ensure_task_consumers(&self) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,partition_name,workstream_id,continuity,affinity_tags_json
+                     FROM tasks WHERE state='QUEUED'",
+                )
+                .map_err(map_sqlite)?;
+            let tasks = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(map_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite)?;
+            drop(stmt);
+            for (_id, partition, workstream, continuity, tags_json) in tasks {
+                let required = parse_str_list(&tags_json)?;
+                let continuity = ContinuityPreference::parse_sql(&continuity)?;
+                let mut agent_stmt = tx
+                    .prepare(
+                        "SELECT id,state,workstream_id,tags_json,current_task_id,available_since,created_at
+                         FROM logical_agents WHERE partition_name=?1 AND state='READY'",
+                    )
+                    .map_err(map_sqlite)?;
+                let agents = agent_stmt
+                    .query_map(params![partition], |r| {
+                        Ok(ClaimAgentSnapshot {
+                            id: r.get(0)?,
+                            state: LogicalAgentState::Ready,
+                            assigned_to_task: r.get::<_, Option<String>>(4)?.is_some(),
+                            partition: partition.clone(),
+                            workstream_id: r.get(2)?,
+                            tags: parse_str_list(&r.get::<_, String>(3)?)
+                                .unwrap_or_default(),
+                            available_since: r.get(5)?,
+                            created_at: r.get(6)?,
+                        })
+                    })
+                    .map_err(map_sqlite)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_sqlite)?;
+                drop(agent_stmt);
+                let intent = ClaimIntent {
+                    partition: &partition,
+                    required_tags: &required,
+                    workstream_id: workstream.as_deref(),
+                    continuity,
+                };
+                if select_claim_agent(&agents, &intent).is_none() {
+                    let partition_tags: String = tx
+                        .query_row(
+                            "SELECT tags_json FROM partitions WHERE name=?1",
+                            params![partition],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| "[]".to_string());
+                    let mut tags = parse_str_list(&partition_tags).unwrap_or_default();
+                    for tag in required {
+                        if !tags.iter().any(|t| t == &tag) {
+                            tags.push(tag);
+                        }
+                    }
+                    birth_agent(tx, &partition, workstream.as_deref(), Some(&tags), now)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn claim_next_available(&self) -> Result<Option<Claim>, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {

@@ -345,6 +345,15 @@ impl NotifierRunner {
         bridge: Arc<dyn RootBridge>,
         config: NotifierConfig,
     ) -> Result<Self, NotifierError> {
+        Self::start_with_fatal_gate(kernel, bridge, config, None)
+    }
+
+    pub(crate) fn start_with_fatal_gate(
+        kernel: Arc<Kernel>,
+        bridge: Arc<dyn RootBridge>,
+        config: NotifierConfig,
+        fatal_gate: Option<crate::DispatchGate>,
+    ) -> Result<Self, NotifierError> {
         let service = NotifierService::new(kernel, bridge, config.retry_policy());
         let shared = Arc::new(RunnerShared {
             state: Mutex::new(RunnerState::default()),
@@ -364,7 +373,7 @@ impl NotifierRunner {
                     let candidates = match service.due(now, batch_limit) {
                         Ok(c) => c,
                         Err(e) => {
-                            fail_runner(&thread_shared, e);
+                            fail_runner(&thread_shared, e, &fatal_gate);
                             break;
                         }
                     };
@@ -373,7 +382,7 @@ impl NotifierRunner {
                             break;
                         }
                         if let Err(e) = service.deliver_one(&candidate) {
-                            fail_runner(&thread_shared, e);
+                            fail_runner(&thread_shared, e, &fatal_gate);
                             return;
                         }
                     }
@@ -394,6 +403,10 @@ impl NotifierRunner {
                         state.fatal = Some(NotifierError::Invariant(
                             "the notifier worker thread panicked".into(),
                         ));
+                    }
+                    drop(state);
+                    if let Some(gate) = &fatal_gate {
+                        gate.fail();
                     }
                 }
             })
@@ -457,12 +470,16 @@ impl NotifierRunner {
     }
 }
 
-fn fail_runner(shared: &RunnerShared, err: NotifierError) {
+fn fail_runner(shared: &RunnerShared, err: NotifierError, gate: &Option<crate::DispatchGate>) {
     let mut state = shared.state.lock().expect("notifier runner state");
     if state.fatal.is_none() {
         state.fatal = Some(err);
     }
     state.phase = RunnerPhase::Failed;
+    drop(state);
+    if let Some(gate) = gate {
+        gate.fail();
+    }
 }
 
 impl Drop for NotifierRunner {

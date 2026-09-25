@@ -22,6 +22,7 @@ pub mod timing;
 
 pub use control::{
     ControlCycleReport, ControlDispatch, ControlError, ControlLoopRunner, ControlLoopService,
+    DispatchGate,
 };
 pub use daemon::{
     DaemonError, DaemonExit, DaemonPhase, RunningSchedulerDaemon, SchedulerDaemonBuilder,
@@ -1001,12 +1002,23 @@ impl<'a> Dispatcher<'a> {
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
-        if self.gate.is_some_and(|g| !g.is_open()) {
-            self.kernel
-                .abort_before_physical_start(&claim.attempt_id, claim.lease_epoch, &execution_id)
-                .map_err(DispatchError::Persistence)?;
-            return Ok(DispatchOneOutcome::NoWork);
-        }
+        let _start_permit = if let Some(gate) = self.gate {
+            match gate.try_begin_physical_start() {
+                Some(permit) => Some(permit),
+                None => {
+                    self.kernel
+                        .abort_before_physical_start(
+                            &claim.attempt_id,
+                            claim.lease_epoch,
+                            &execution_id,
+                        )
+                        .map_err(DispatchError::Persistence)?;
+                    return Ok(DispatchOneOutcome::NoWork);
+                }
+            }
+        } else {
+            None
+        };
         let request = EnvironmentStartRequest::from_launch(&snapshot, physical.environment())
             .map_err(|m| DispatchError::Authority(Error::invalid_authority(m.detail)))?;
 

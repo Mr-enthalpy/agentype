@@ -11,7 +11,7 @@ use crate::observer::{
 use crate::process_lock::{
     ProcessLockError, ReadyPermit, RuntimeProcessGuard, SqliteRuntimeConfig,
 };
-use crate::recovery::{recover_runtime, RecoveryError};
+use crate::recovery::{recover_runtime_with_gate, RecoveryError};
 use crate::supervision::SupervisionRunner;
 use crate::timing::RuntimeTimingConfig;
 use crate::{AdapterRegistry, ExecutionRegistry};
@@ -154,8 +154,15 @@ impl SchedulerDaemonBuilder {
             )
             .map_err(DaemonError::Persistence)?,
         );
-        let recovered = recover_runtime(kernel.clone(), &self.adapters, self.timing, self.notifier)
-            .map_err(DaemonError::Recovery)?;
+        let gate = DispatchGate::closed();
+        let recovered = recover_runtime_with_gate(
+            kernel.clone(),
+            &self.adapters,
+            self.timing,
+            self.notifier,
+            gate.clone(),
+        )
+        .map_err(DaemonError::Recovery)?;
         if recovered.runner().is_failed() {
             return Err(DaemonError::Recovery(RecoveryError::Invariant(
                 "supervision failed before activation".into(),
@@ -231,7 +238,6 @@ impl SchedulerDaemonBuilder {
             }
         }
         let permit = ReadyPermit::mint();
-        let gate = DispatchGate::closed();
         let control_service = ControlLoopService::new(
             kernel.clone(),
             self.execution_registry,
@@ -245,8 +251,8 @@ impl SchedulerDaemonBuilder {
             permit,
             gate.clone(),
         );
-        let observer =
-            PhysicalObserverRunner::start(observer_service).map_err(DaemonError::Observer)?;
+        let observer = PhysicalObserverRunner::start(observer_service, gate.clone())
+            .map_err(DaemonError::Observer)?;
         let control = ControlLoopRunner::start(control_service).map_err(DaemonError::Control)?;
         let supervision = startup.supervision.take().expect("supervision");
         let notifier = startup.notifier.take();

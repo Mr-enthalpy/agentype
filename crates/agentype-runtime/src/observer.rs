@@ -600,7 +600,10 @@ pub struct PhysicalObserverRunner {
 }
 
 impl PhysicalObserverRunner {
-    pub fn start(service: PhysicalObserverService) -> Result<Self, ObserverError> {
+    pub fn start(
+        service: PhysicalObserverService,
+        fatal_gate: crate::DispatchGate,
+    ) -> Result<Self, ObserverError> {
         let wake = service.supervision_wake_target().observer_wake();
         let shared = Arc::new((
             Mutex::new(ObserverRunnerState {
@@ -624,6 +627,8 @@ impl PhysicalObserverRunner {
                         let mut state = thread_shared.0.lock().expect("observer runner state");
                         state.phase = ObserverRunnerPhase::Failed;
                         state.fatal = Some(err);
+                        drop(state);
+                        fatal_gate.fail();
                         break;
                     }
                     let wait = service.wait_for_next_due();
@@ -643,6 +648,8 @@ impl PhysicalObserverRunner {
                     state.fatal = Some(ObserverError::Fatal(Error::invariant(
                         "physical-observer thread panicked",
                     )));
+                    drop(state);
+                    fatal_gate.fail();
                 }
             })
             .map_err(|err| {

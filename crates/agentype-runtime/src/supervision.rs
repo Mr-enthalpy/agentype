@@ -862,9 +862,18 @@ impl SupervisionRunner {
     /// spawns, so a timing/lease mismatch fails fast. Admissions enter
     /// through the runner's handles (`admit`), always AFTER the dispatcher's
     /// fenced first renewal committed (M5.3 §21).
+    #[cfg(test)]
     pub(crate) fn start(
         kernel: Arc<Kernel>,
         timing: RuntimeTimingConfig,
+    ) -> Result<Self, SupervisionError> {
+        Self::start_with_fatal_gate(kernel, timing, None)
+    }
+
+    pub(crate) fn start_with_fatal_gate(
+        kernel: Arc<Kernel>,
+        timing: RuntimeTimingConfig,
+        fatal_gate: Option<crate::DispatchGate>,
     ) -> Result<Self, SupervisionError> {
         let service = SupervisionService::new(kernel.clone(), &timing)?;
         let shared = Arc::new(RunnerShared::default());
@@ -891,6 +900,9 @@ impl SupervisionRunner {
                             }
                             state.phase = RunnerPhase::Failed;
                             drop(state);
+                            if let Some(gate) = &fatal_gate {
+                                gate.fail();
+                            }
                             break 'supervision;
                         }
                         // Deadline wait (M5.3 audit P1-1): sleep until the
@@ -936,6 +948,10 @@ impl SupervisionRunner {
                         state.fatal = Some(SupervisionError::Fatal(Error::invariant(
                             "the supervision heartbeat thread panicked",
                         )));
+                    }
+                    drop(state);
+                    if let Some(gate) = &fatal_gate {
+                        gate.fail();
                     }
                 }
                 // Local shutdown: drop ownership. No revocation, no

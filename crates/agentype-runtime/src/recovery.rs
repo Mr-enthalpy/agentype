@@ -629,7 +629,17 @@ pub(crate) fn recover_runtime(
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, notifier, None)
+    recover_runtime_inner(kernel, adapters, timing, notifier, None, None)
+}
+
+pub(crate) fn recover_runtime_with_gate(
+    kernel: Arc<Kernel>,
+    adapters: &AdapterRegistry,
+    timing: RuntimeTimingConfig,
+    notifier: NotifierBinding,
+    gate: crate::DispatchGate,
+) -> Result<RecoveredRuntime, RecoveryError> {
+    recover_runtime_inner(kernel, adapters, timing, notifier, None, Some(gate))
 }
 
 /// Test-support recovery that does not acquire `RuntimeProcessLock`.
@@ -661,15 +671,22 @@ fn recover_runtime_inner(
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
     fail_after_readmits: Option<usize>,
+    fatal_gate: Option<crate::DispatchGate>,
 ) -> Result<RecoveredRuntime, RecoveryError> {
     kernel.expire_leases(true).map_err(RecoveryError::from)?;
 
     let runner =
-        SupervisionRunner::start(kernel.clone(), timing).map_err(RecoveryError::Supervision)?;
+        SupervisionRunner::start_with_fatal_gate(kernel.clone(), timing, fatal_gate.clone())
+            .map_err(RecoveryError::Supervision)?;
     let notifier_runner = match notifier {
         NotifierBinding::Enabled { config, bridge } => Some(
-            NotifierRunner::start(kernel.clone(), bridge, config)
-                .map_err(RecoveryError::Notifier)?,
+            NotifierRunner::start_with_fatal_gate(
+                kernel.clone(),
+                bridge,
+                config,
+                fatal_gate.clone(),
+            )
+            .map_err(RecoveryError::Notifier)?,
         ),
         #[cfg(any(test, feature = "test-support"))]
         NotifierBinding::DisabledForTests => None,
@@ -739,6 +756,7 @@ fn recover_runtime_failing_after_readmits(
         timing,
         NotifierBinding::DisabledForTests,
         Some(after),
+        None,
     )
 }
 
@@ -2186,6 +2204,7 @@ mod tests {
                 bridge: bridge.clone(),
             },
             Some(1),
+            None,
         ) {
             Err(err) => err,
             Ok(_) => panic!("expected injected startup fatal"),
