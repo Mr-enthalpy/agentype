@@ -86,6 +86,16 @@ impl From<ProcessLockError> for DaemonError {
 ///     let _ = agentype_runtime::Dispatcher::new;
 /// }
 /// ```
+/// ```compile_fail
+/// fn _no_public_supervision_start() {
+///     let _ = agentype_runtime::SupervisionRunner::start;
+/// }
+/// ```
+/// ```compile_fail
+/// fn _no_public_reconcile() {
+///     let _ = agentype_runtime::reconcile_one_execution;
+/// }
+/// ```
 pub struct SchedulerDaemonBuilder {
     store: SqliteRuntimeConfig,
     timing: RuntimeTimingConfig,
@@ -222,14 +232,15 @@ impl SchedulerDaemonBuilder {
         }
         let permit = ReadyPermit::mint();
         let gate = DispatchGate::closed();
-        let supervision = startup.supervision.take().expect("supervision");
-        let notifier = startup.notifier.take();
-        let lock = startup.lock.take().expect("process lock");
         let control_service = ControlLoopService::new(
             kernel.clone(),
             self.execution_registry,
             self.adapters,
-            supervision.admit_sink(),
+            startup
+                .supervision
+                .as_ref()
+                .expect("supervision")
+                .admit_sink(),
             &self.timing,
             permit,
             gate.clone(),
@@ -237,6 +248,9 @@ impl SchedulerDaemonBuilder {
         let observer =
             PhysicalObserverRunner::start(observer_service).map_err(DaemonError::Observer)?;
         let control = ControlLoopRunner::start(control_service).map_err(DaemonError::Control)?;
+        let supervision = startup.supervision.take().expect("supervision");
+        let notifier = startup.notifier.take();
+        let lock = startup.lock.take().expect("process lock");
         let inner = Arc::new(DaemonInner {
             control,
             observer,
@@ -261,7 +275,7 @@ impl SchedulerDaemonBuilder {
                         .as_ref()
                         .is_some_and(|n| n.is_failed());
                 if failed {
-                    watchdog_inner.gate.revoke();
+                    watchdog_inner.gate.fail();
                     let mut phase = watchdog_inner.phase.lock().expect("daemon phase");
                     *phase = DaemonPhase::Failed;
                     drop(phase);
@@ -288,7 +302,7 @@ impl SchedulerDaemonBuilder {
                 } = Arc::try_unwrap(inner).unwrap_or_else(|_| {
                     panic!("health watchdog was not spawned, so the daemon arc is unique")
                 });
-                gate.revoke();
+                gate.fail();
                 control.request_stop();
                 observer.request_stop();
                 supervision.request_stop();
@@ -306,7 +320,33 @@ impl SchedulerDaemonBuilder {
                 )));
             }
         };
-        inner.gate.allow();
+        if !inner.gate.try_commit_ready() {
+            let DaemonInner {
+                control,
+                observer,
+                supervision,
+                notifier,
+                gate: _,
+                ..
+            } = Arc::try_unwrap(inner).unwrap_or_else(|_| {
+                panic!("ready commit lost, daemon arc must still be unique")
+            });
+            control.request_stop();
+            observer.request_stop();
+            supervision.request_stop();
+            if let Some(n) = &notifier {
+                n.request_stop();
+            }
+            let _ = supervision.shutdown();
+            drop(control);
+            drop(observer);
+            if let Some(n) = notifier {
+                let _ = n.shutdown();
+            }
+            return Err(DaemonError::Recovery(RecoveryError::Invariant(
+                "a runner failed before READY could be committed".into(),
+            )));
+        }
         *inner.phase.lock().expect("daemon phase") = DaemonPhase::Ready;
         Ok(RunningSchedulerDaemon {
             kernel,
@@ -390,7 +430,7 @@ impl RunningSchedulerDaemon {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
-        inner.gate.revoke();
+        inner.gate.begin_shutdown();
         inner.stop.store(true, Ordering::SeqCst);
         let mut phase = inner.phase.lock().expect("daemon phase");
         if *phase == DaemonPhase::Ready {
@@ -451,7 +491,7 @@ impl RunningSchedulerDaemon {
 impl Drop for RunningSchedulerDaemon {
     fn drop(&mut self) {
         if let Some(inner) = &self.inner {
-            inner.gate.revoke();
+            inner.gate.begin_shutdown();
             inner.stop.store(true, Ordering::SeqCst);
             inner.control.request_stop();
             inner.observer.request_stop();

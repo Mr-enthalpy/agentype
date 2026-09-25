@@ -207,6 +207,9 @@ struct SupervisedExecution {
     identity: SupervisionIdentity,
     next_due_at: UnixTime,
     last_positive_observed_at: UnixTime,
+    /// Bumps on every positive observation. A stale renewal result may
+    /// only revoke the epoch it actually checked.
+    freshness_epoch: u64,
     renewal_eligible: bool,
 }
 
@@ -263,6 +266,7 @@ impl SupervisionRegistry {
                         identity,
                         next_due_at,
                         last_positive_observed_at,
+                        freshness_epoch: 0,
                         renewal_eligible: true,
                     },
                 );
@@ -380,6 +384,7 @@ impl SupervisionRegistry {
         if current {
             if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
                 entry.last_positive_observed_at = observed_at;
+                entry.freshness_epoch = entry.freshness_epoch.saturating_add(1);
                 entry.renewal_eligible = true;
             }
         }
@@ -422,11 +427,41 @@ pub(crate) struct SupervisedSnapshot {
 /// [`SupervisionRunner`], which stops its loop and clears ownership on
 /// Fatal. A service that has produced a Fatal must not be reused for
 /// renewal; the Runner enforces this mechanically.
+/// Wakeups are counted under the same mutex the observer waits on, so a
+/// notification cannot be lost between computing the deadline and sleeping.
+pub(crate) struct ObserverWake {
+    generation: Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl ObserverWake {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn poke(&self) {
+        let mut generation = self.generation.lock().expect("observer wake");
+        *generation = generation.saturating_add(1);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn wait(&self, timeout: Duration) {
+        let generation = self.generation.lock().expect("observer wake");
+        let seen = *generation;
+        let _ = self
+            .cv
+            .wait_timeout_while(generation, timeout, |generation| *generation == seen);
+    }
+}
+
 pub struct SupervisionService {
     kernel: Arc<Kernel>,
     registry: Arc<Mutex<SupervisionRegistry>>,
     heartbeat_interval: Duration,
-    observer_wake: Arc<Mutex<Option<Arc<std::sync::Condvar>>>>,
+    observer_wake: Arc<ObserverWake>,
 }
 
 impl Clone for SupervisionService {
@@ -464,19 +499,16 @@ impl SupervisionService {
             kernel,
             registry: Arc::new(Mutex::new(SupervisionRegistry::new())),
             heartbeat_interval: timing.heartbeat_interval(),
-            observer_wake: Arc::new(Mutex::new(None)),
+            observer_wake: Arc::new(ObserverWake::new()),
         })
     }
 
-    /// Observer runner registers so a new admission interrupts its sleep.
-    pub(crate) fn bind_observer_wake(&self, wake: Arc<std::sync::Condvar>) {
-        *self.observer_wake.lock().expect("observer wake") = Some(wake);
+    pub(crate) fn observer_wake(&self) -> Arc<ObserverWake> {
+        self.observer_wake.clone()
     }
 
     fn poke_observer(&self) {
-        if let Some(wake) = self.observer_wake.lock().expect("observer wake").as_ref() {
-            wake.notify_all();
-        }
+        self.observer_wake.poke();
     }
 
     /// Enable the M5.8 physical-freshness gate. Default is off so M5.3
@@ -640,14 +672,17 @@ impl SupervisionService {
         // lease under the §A2 gate) — a healthy supervisor can never
         // schedule itself past the durable expiry.
         let anchor = self.kernel.now();
-        let fresh_until = {
+        let (fresh_until, checked_epoch) = {
             let registry = self.registry.lock().expect("supervision registry lock");
-            registry.freshness_limit.and_then(|limit| {
-                registry
-                    .entries
-                    .get(&execution_id)
-                    .map(|entry| entry.last_positive_observed_at + limit)
-            })
+            match registry.entries.get(&execution_id) {
+                Some(entry) => (
+                    registry
+                        .freshness_limit
+                        .map(|limit| entry.last_positive_observed_at + limit),
+                    entry.freshness_epoch,
+                ),
+                None => (None, 0),
+            }
         };
         let outcome = match self.kernel.renew_supervised_execution_guarded(
             identity.attempt_id(),
@@ -681,8 +716,16 @@ impl SupervisionService {
         match &outcome {
             RenewalOutcome::Renewed { .. } => registry.record_renewal(&identity, next_due_at),
             RenewalOutcome::FreshnessStale { .. } => {
-                registry.record_renewal(&identity, next_due_at);
-                registry.stop_renewal_if_current(&identity);
+                let still_same = registry.entries.get(identity.execution_id()).is_some_and(|entry| {
+                    entry.identity.generation() == identity.generation()
+                        && entry.freshness_epoch == checked_epoch
+                });
+                if still_same {
+                    registry.record_renewal(&identity, next_due_at);
+                    registry.stop_renewal_if_current(&identity);
+                } else {
+                    registry.record_renewal(&identity, self.kernel.now());
+                }
             }
             RenewalOutcome::AuthorityLost { .. } | RenewalOutcome::NoLongerRunning { .. } => {
                 registry.stop_renewal_if_current(&identity);
@@ -814,7 +857,7 @@ impl SupervisionRunner {
     /// spawns, so a timing/lease mismatch fails fast. Admissions enter
     /// through the runner's handles (`admit`), always AFTER the dispatcher's
     /// fenced first renewal committed (M5.3 §21).
-    pub fn start(
+    pub(crate) fn start(
         kernel: Arc<Kernel>,
         timing: RuntimeTimingConfig,
     ) -> Result<Self, SupervisionError> {

@@ -45,7 +45,7 @@ pub use process_lock::{
     RuntimeProcessLock, SqliteRuntimeConfig,
 };
 pub use recovery::{
-    reconcile_one_execution, replay_persisted_terminal_consequence, AdmissionSink,
+    replay_persisted_terminal_consequence, AdmissionSink,
     ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1002,16 +1002,13 @@ impl<'a> Dispatcher<'a> {
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
         if self.gate.is_some_and(|g| !g.is_open()) {
-            self.persist_unresolved_physical_then_nack(
-                claim,
-                &execution_id,
-                FailureClass::Unknown,
-                None,
-            )?;
+            self.kernel
+                .abort_before_physical_start(&claim.attempt_id, claim.lease_epoch, &execution_id)
+                .map_err(DispatchError::Persistence)?;
             return Ok(DispatchOneOutcome::StartIndeterminate {
                 execution_id,
                 request_id,
-                failure_class: Some(FailureClass::Unknown),
+                failure_class: Some(FailureClass::ResourceUnavailable),
             });
         }
         let request = EnvironmentStartRequest::from_launch(&snapshot, physical.environment())

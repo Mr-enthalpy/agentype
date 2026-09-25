@@ -14,7 +14,7 @@ use agentype_core::{Error, ExecutionState, FailureClass, UnixTime};
 use agentype_storage_sqlite::Kernel;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Observer timing. Distinct from AdapterDeadlinePolicy and lease duration.
@@ -577,13 +577,13 @@ struct ObserverRunnerState {
 
 /// Independent observer thread. Never shares Adapter I/O with heartbeat.
 pub struct PhysicalObserverRunner {
-    shared: Arc<(Mutex<ObserverRunnerState>, Arc<Condvar>)>,
+    shared: Arc<(Mutex<ObserverRunnerState>, Arc<crate::supervision::ObserverWake>)>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PhysicalObserverRunner {
     pub fn start(service: PhysicalObserverService) -> Result<Self, ObserverError> {
-        let wake = Arc::new(Condvar::new());
+        let wake = service.supervision_wake_target().observer_wake();
         let shared = Arc::new((
             Mutex::new(ObserverRunnerState {
                 phase: ObserverRunnerPhase::Running,
@@ -595,7 +595,6 @@ impl PhysicalObserverRunner {
         let join = std::thread::Builder::new()
             .name("physical-observer".into())
             .spawn(move || {
-                service.supervision_wake_target().bind_observer_wake(wake);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     {
                         let state = thread_shared.0.lock().expect("observer runner state");
@@ -617,10 +616,8 @@ impl PhysicalObserverRunner {
                     if wait.is_zero() {
                         continue;
                     }
-                    let (_guard, _) = thread_shared
-                        .1
-                        .wait_timeout(state, wait)
-                        .expect("observer runner wait");
+                    drop(state);
+                    thread_shared.1.wait(wait);
                 }));
                 if result.is_err() {
                     let mut state = thread_shared.0.lock().expect("observer runner state");
@@ -646,7 +643,7 @@ impl PhysicalObserverRunner {
         if state.phase == ObserverRunnerPhase::Running {
             state.phase = ObserverRunnerPhase::ShuttingDown;
         }
-        self.shared.1.notify_all();
+        self.shared.1.poke();
     }
 
     pub fn is_failed(&self) -> bool {

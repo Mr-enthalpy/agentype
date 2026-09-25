@@ -136,6 +136,7 @@ pub enum NotifierBinding {
         config: NotifierConfig,
         bridge: Arc<dyn RootBridge>,
     },
+    #[cfg(any(test, feature = "test-support"))]
     DisabledForTests,
 }
 

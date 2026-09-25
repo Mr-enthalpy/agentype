@@ -12,41 +12,65 @@ use agentype_core::Error;
 use agentype_core::FailureClass;
 use agentype_storage_sqlite::Kernel;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Shared eligibility to start new physical executions. Revoked on
-/// graceful shutdown and on the first structural runner failure.
+/// Monotonic dispatch eligibility. Failed and Stopping cannot return to Ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatePhase {
+    Closed,
+    Ready,
+    Stopping,
+    Failed,
+}
+
+/// Shared eligibility to start new physical executions.
 #[derive(Clone, Debug)]
 pub struct DispatchGate {
-    allowed: Arc<AtomicBool>,
+    phase: Arc<Mutex<GatePhase>>,
 }
 
 impl DispatchGate {
     #[cfg(test)]
     pub(crate) fn open() -> Self {
         Self {
-            allowed: Arc::new(AtomicBool::new(true)),
+            phase: Arc::new(Mutex::new(GatePhase::Ready)),
         }
     }
 
     pub(crate) fn closed() -> Self {
         Self {
-            allowed: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(Mutex::new(GatePhase::Closed)),
         }
     }
 
-    pub(crate) fn allow(&self) {
-        self.allowed.store(true, Ordering::SeqCst);
+    /// Closed → Ready. Returns false if a fatal or shutdown already won.
+    pub(crate) fn try_commit_ready(&self) -> bool {
+        let mut phase = self.phase.lock().expect("dispatch gate");
+        if *phase == GatePhase::Closed {
+            *phase = GatePhase::Ready;
+            true
+        } else {
+            false
+        }
     }
 
-    pub(crate) fn revoke(&self) {
-        self.allowed.store(false, Ordering::SeqCst);
+    pub(crate) fn fail(&self) {
+        let mut phase = self.phase.lock().expect("dispatch gate");
+        if *phase == GatePhase::Closed || *phase == GatePhase::Ready {
+            *phase = GatePhase::Failed;
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        let mut phase = self.phase.lock().expect("dispatch gate");
+        if *phase != GatePhase::Failed {
+            *phase = GatePhase::Stopping;
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.allowed.load(Ordering::SeqCst)
+        *self.phase.lock().expect("dispatch gate") == GatePhase::Ready
     }
 }
 

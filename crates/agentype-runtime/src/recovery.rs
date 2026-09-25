@@ -296,7 +296,7 @@ fn apply_nack(
 ///
 /// A successful grant is admitted immediately so heartbeat can begin
 /// during recovery (M5.4 plan §8).
-pub fn reconcile_one_execution(
+pub(crate) fn reconcile_one_execution(
     kernel: &Kernel,
     adapters: &AdapterRegistry,
     snapshot: &ExecutionReconciliationSnapshot,
@@ -671,6 +671,7 @@ fn recover_runtime_inner(
             NotifierRunner::start(kernel.clone(), bridge, config)
                 .map_err(RecoveryError::Notifier)?,
         ),
+        #[cfg(any(test, feature = "test-support"))]
         NotifierBinding::DisabledForTests => None,
     };
     let guard = StartupGuard::new(runner, notifier_runner);

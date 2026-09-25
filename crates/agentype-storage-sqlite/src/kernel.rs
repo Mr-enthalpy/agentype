@@ -2143,6 +2143,45 @@ impl Kernel {
         })
     }
 
+    /// The adapter was never called. Remove the STARTING row, then close
+    /// authority as if no execution existed, so an unisolated writer is not
+    /// given a quiescence obligation.
+    pub fn abort_before_physical_start(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        execution_id: &ExecutionId,
+    ) -> Result<TaskState, Error> {
+        self.tx(|tx, now| {
+            let (_attempt, _lease, _task) =
+                validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            let execution = required_execution(tx, execution_id.as_str())?;
+            if execution.attempt_id != attempt_id.as_str() {
+                return Err(Error::stale("execution does not belong to current attempt"));
+            }
+            if execution.state != "STARTING" {
+                return Err(Error::invalid_transition(
+                    "only an unstarted STARTING execution can be aborted before the adapter",
+                ));
+            }
+            tx.execute(
+                "DELETE FROM executions WHERE id=?1 AND state='STARTING'",
+                params![execution.id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        })?;
+        self.nack(
+            attempt_id,
+            lease_epoch,
+            FailureClass::ResourceUnavailable,
+            None,
+            false,
+            false,
+            false,
+        )
+    }
+
     pub fn cancel_task(&self, task_id: &TaskId, quiescence_confirmed: bool) -> Result<(), Error> {
         self.tx(|tx, now| {
             let task = required_task(tx, task_id.as_str())?;
