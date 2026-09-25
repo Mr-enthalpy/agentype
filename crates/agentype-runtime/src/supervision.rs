@@ -716,10 +716,14 @@ impl SupervisionService {
         match &outcome {
             RenewalOutcome::Renewed { .. } => registry.record_renewal(&identity, next_due_at),
             RenewalOutcome::FreshnessStale { .. } => {
-                let still_same = registry.entries.get(identity.execution_id()).is_some_and(|entry| {
-                    entry.identity.generation() == identity.generation()
-                        && entry.freshness_epoch == checked_epoch
-                });
+                let still_same =
+                    registry
+                        .entries
+                        .get(identity.execution_id())
+                        .is_some_and(|entry| {
+                            entry.identity.generation() == identity.generation()
+                                && entry.freshness_epoch == checked_epoch
+                        });
                 if still_same {
                     registry.record_renewal(&identity, next_due_at);
                     registry.stop_renewal_if_current(&identity);

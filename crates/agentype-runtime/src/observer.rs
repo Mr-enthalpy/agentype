@@ -577,7 +577,10 @@ struct ObserverRunnerState {
 
 /// Independent observer thread. Never shares Adapter I/O with heartbeat.
 pub struct PhysicalObserverRunner {
-    shared: Arc<(Mutex<ObserverRunnerState>, Arc<crate::supervision::ObserverWake>)>,
+    shared: Arc<(
+        Mutex<ObserverRunnerState>,
+        Arc<crate::supervision::ObserverWake>,
+    )>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 

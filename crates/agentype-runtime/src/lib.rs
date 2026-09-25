@@ -44,12 +44,12 @@ pub use process_lock::{
     hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,
     RuntimeProcessLock, SqliteRuntimeConfig,
 };
-pub use recovery::{
-    replay_persisted_terminal_consequence, AdmissionSink,
-    ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
-};
 #[cfg(any(test, feature = "test-support"))]
 pub use recovery::{recover_runtime_without_notifier, recover_runtime_without_process_lock};
+pub use recovery::{
+    replay_persisted_terminal_consequence, AdmissionSink, ReconcileExecutionOutcome,
+    RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
+};
 pub use supervision::{
     RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
     SupervisionService,
