@@ -1,8 +1,12 @@
-//! Hard-link count. Unix uses stable metadata; Windows uses one OS call
-//! so `agentype-runtime` can keep `forbid(unsafe_code)`.
+//! Handle-derived file identity and hard-link count.
+//!
+//! Unix uses stable metadata. Windows uses OS calls so `agentype-runtime`
+//! can keep `forbid(unsafe_code)`. Identity is never resolved by re-opening
+//! a path.
 
 use std::fs::File;
 use std::io;
+use std::path::PathBuf;
 
 pub fn link_count(file: &File) -> io::Result<u64> {
     #[cfg(unix)]
@@ -36,65 +40,67 @@ fn link_count_windows(file: &File) -> io::Result<u64> {
     Ok(u64::from(info.nNumberOfLinks))
 }
 
-/// Crash-released exclusive ownership of one file identity.
-///
-/// Windows `LockFile` on the Scheduler database collides with SQLite, and a
-/// lock file next to the current path splits after a same-volume rename.
-/// The mutex name is the file id, so the contention follows the file.
-#[cfg(windows)]
-pub struct IdentityMutex {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-#[cfg(windows)]
-unsafe impl Send for IdentityMutex {}
-
-#[cfg(windows)]
-impl Drop for IdentityMutex {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::System::Threading::ReleaseMutex(self.handle);
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
+/// Identity of the file this handle already refers to. Stable across rename.
+pub fn file_identity(file: &File) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        file_identity_windows(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is unavailable on this platform",
+        ))
     }
 }
 
-/// `Some` owns the mutex. `None` means another process already owns this file id.
 #[cfg(windows)]
-pub fn try_acquire_identity_mutex(file_id: &str) -> io::Result<Option<IdentityMutex>> {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, WAIT_ABANDONED, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+fn file_identity_windows(file: &File) -> io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
-    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
-    let wide = mutex_name(file_id);
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, wide.as_ptr()) };
-    if handle.is_null() {
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let created = unsafe { GetLastError() } != ERROR_ALREADY_EXISTS;
-    if created {
-        return Ok(Some(IdentityMutex { handle }));
-    }
-    let wait = unsafe { WaitForSingleObject(handle, 0) };
-    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-        return Ok(Some(IdentityMutex { handle }));
-    }
-    unsafe { CloseHandle(handle) };
-    if wait == WAIT_TIMEOUT {
-        return Ok(None);
-    }
-    Err(io::Error::last_os_error())
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok(format!("{}:{index}", info.dwVolumeSerialNumber))
 }
 
+/// Machine-wide directory for file-identity locks. Not `Local\`, and not
+/// any path derived from the database's current parent or from environment
+/// variables such as `PROGRAMDATA`.
 #[cfg(windows)]
-fn mutex_name(file_id: &str) -> Vec<u16> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::from("Local\\agentype-file-");
-    for byte in file_id.as_bytes() {
-        name.push(HEX[(byte >> 4) as usize] as char);
-        name.push(HEX[(byte & 0xf) as usize] as char);
+pub fn machine_lock_dir() -> io::Result<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+
+    let mut raw = std::ptr::null_mut();
+    let hr =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return Err(io::Error::other(format!(
+            "ProgramData known folder is unavailable ({hr})"
+        )));
     }
-    name.encode_utf16().chain(std::iter::once(0)).collect()
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let path = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Ok(PathBuf::from(path).join("agentype").join("locks"))
 }

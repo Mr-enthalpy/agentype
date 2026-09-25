@@ -90,6 +90,7 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
         .env("XDG_RUNTIME_DIR", &alien_tmp)
         .env("HOME", &alien_tmp)
         .env("LOCALAPPDATA", &alien_tmp)
+        .env("PROGRAMDATA", &alien_tmp)
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -111,8 +112,7 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Same inode, new directory. The identity lock must not follow the old parent.
-#[cfg(unix)]
+/// Same file, new directory. The identity lock must not follow the old parent.
 #[test]
 fn cross_directory_rename_cannot_split_store_ownership() {
     let nanos = SystemTime::now()

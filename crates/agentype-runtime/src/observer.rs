@@ -28,6 +28,7 @@ pub struct PhysicalObserverConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserverConfigError {
     NonPositive { field: &'static str },
+    Unrepresentable { field: &'static str },
     Relation,
 }
 
@@ -36,6 +37,9 @@ impl fmt::Display for ObserverConfigError {
         match self {
             Self::NonPositive { field } => {
                 write!(f, "observer {field} must be finite and positive")
+            }
+            Self::Unrepresentable { field } => {
+                write!(f, "observer {field} is not a representable duration")
             }
             Self::Relation => write!(
                 f,
@@ -61,6 +65,9 @@ impl PhysicalObserverConfig {
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(ObserverConfigError::NonPositive { field });
+            }
+            if std::time::Duration::try_from_secs_f64(value).is_err() {
+                return Err(ObserverConfigError::Unrepresentable { field });
             }
         }
         if batch_limit == 0 {
@@ -719,6 +726,12 @@ mod tests {
     use std::sync::Arc;
 
     const LEASE: f64 = 10.0;
+
+    #[test]
+    fn unrepresentable_duration_is_rejected() {
+        let err = PhysicalObserverConfig::new(f64::MAX, f64::MAX, 1, f64::MAX).unwrap_err();
+        assert!(matches!(err, ObserverConfigError::Unrepresentable { .. }));
+    }
 
     fn env() -> (Arc<ManualClock>, Arc<Kernel>) {
         let clock = Arc::new(ManualClock::new(1_000.0));

@@ -16,7 +16,6 @@ agentype-root-bridge.workspace = true
 agentype-storage-sqlite.workspace = true
 serde_json.workspace = true
 fs4.workspace = true
-file-id.workspace = true
 agentype-nlink.workspace = true
 
 [dev-dependencies]

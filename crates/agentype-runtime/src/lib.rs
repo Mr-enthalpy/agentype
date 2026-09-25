@@ -932,7 +932,19 @@ impl<'a> Dispatcher<'a> {
     }
 
     /// Obtain one eligible claim and dispatch it.
+    ///
+    /// When a gate is installed, the physical-start permit is taken before
+    /// any claim. Shutdown or fatal that already won the gate must not
+    /// create an Attempt.
     pub(crate) fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
+        let _start_permit = if let Some(gate) = self.gate {
+            match gate.try_begin_physical_start() {
+                Some(permit) => Some(permit),
+                None => return Ok(DispatchOneOutcome::NoWork),
+            }
+        } else {
+            None
+        };
         let claim = match self
             .kernel
             .claim_next_available()
@@ -1002,23 +1014,6 @@ impl<'a> Dispatcher<'a> {
             .map_err(classify_kernel_authority_error)?;
         let execution_id = snapshot.execution_id().clone();
         let request_id = snapshot.request_id().clone();
-        let _start_permit = if let Some(gate) = self.gate {
-            match gate.try_begin_physical_start() {
-                Some(permit) => Some(permit),
-                None => {
-                    self.kernel
-                        .abort_before_physical_start(
-                            &claim.attempt_id,
-                            claim.lease_epoch,
-                            &execution_id,
-                        )
-                        .map_err(DispatchError::Persistence)?;
-                    return Ok(DispatchOneOutcome::NoWork);
-                }
-            }
-        } else {
-            None
-        };
         let request = EnvironmentStartRequest::from_launch(&snapshot, physical.environment())
             .map_err(|m| DispatchError::Authority(Error::invalid_authority(m.detail)))?;
 
@@ -2567,6 +2562,31 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             self.inner
                 .reconcile_start(request_id, persisted_handle, deadline)
         }
+    }
+
+    #[test]
+    fn closed_gate_does_not_consume_an_attempt() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let gate = DispatchGate::open();
+        gate.begin_shutdown();
+        let d = Dispatcher::new(&kernel, &registry, &adapters).with_gate(&gate);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("no-budget", serde_json::json!({"o": 1})).retry(RetryPolicy {
+                    max_attempts: 2,
+                    ..RetryPolicy::default()
+                }),
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+        assert_eq!(fake.start_call_count(), 0);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Queued);
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        assert_eq!(claim.attempt_number, 1);
     }
 
     #[test]

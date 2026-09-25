@@ -21,7 +21,7 @@ manufacturing Task, Result, or quiescence semantics.
 | Slice | What landed |
 | --- | --- |
 | A | `AuthorityConsequence`; preserving-nack; worker DTOs in `worker_protocol_v01` |
-| B | `RuntimeProcessLock` + `ReadyPermit` + file-store identity |
+| B | `RuntimeProcessLock` + `ReadyPermit` + handle file identity |
 | C | `PhysicalObserverService` freshness gate + activation sweep |
 | D | `ControlLoopService` / `ControlLoopRunner` behind `ReadyPermit` |
 | E | `SchedulerDaemonBuilder` lifecycle, observer runner, shutdown |
@@ -29,11 +29,17 @@ manufacturing Task, Result, or quiescence semantics.
 
 SCHEMA_VERSION remains 4.
 
+File identity is read from the open handle. Unix flocks that inode.
+Windows locks `.agentype-runtime-lock-<file id>` under the ProgramData
+known folder, so a cross-session rename cannot split the singleton.
+The dispatch permit is taken before `claim_next_available`; a gate that
+is already stopping or failed does not create an Attempt.
+
 ## Ownership graph
 
 ```text
 SchedulerDaemon
-  RuntimeProcessGuard          (stable lock dir, not temp_dir)
+  RuntimeProcessGuard          (handle identity; Windows ProgramData lock, not Local\)
   Arc<Kernel>
   DispatchGate                 (revoked on shutdown and first runner fatal)
   SupervisionRunner            (lease renewal only)

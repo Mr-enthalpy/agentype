@@ -2,12 +2,14 @@
 //!
 //! Ownership is an OS Runtime property, not a Scheduler Lease, PID file, or
 //! SQLite row. The same file identity is exclusive even if the path is
-//! renamed to another directory: Unix flocks the store inode (`flock` does
-//! not share SQLite's `fcntl` locks), and Windows holds a named mutex keyed
-//! by the file id (a byte-range lock on the database would collide with
-//! SQLite). A canonical-path sidecar still stops two processes that open
-//! the same path. Hard links fail closed. The lock directory is never
-//! `temp_dir`, `XDG_RUNTIME_DIR`, `HOME`, or `LOCALAPPDATA`.
+//! renamed to another directory. Identity is read from the open handle,
+//! never by resolving the path again. Unix flocks that inode (`flock` does
+//! not share SQLite's `fcntl` locks). Windows locks a file under the
+//! machine ProgramData known folder, keyed only by that handle identity —
+//! not `Local\`, and not the database directory. A canonical-path sidecar
+//! still stops two processes that open the same path. Hard links fail
+//! closed. Lock files are never placed in `temp_dir`, `XDG_RUNTIME_DIR`,
+//! `HOME`, or `LOCALAPPDATA`.
 
 use fs4::fs_std::FileExt;
 use std::collections::HashSet;
@@ -123,8 +125,6 @@ fn fnv64(value: &str) -> u64 {
 /// Non-Clone. Dropping the lock (or process death) releases the OS lock.
 pub struct RuntimeProcessLock {
     _files: Vec<File>,
-    #[cfg(windows)]
-    _identity_mutex: agentype_nlink::IdentityMutex,
     _reservation: IdentityReservation,
     identity: StoreIdentity,
     store_path: PathBuf,
@@ -142,28 +142,21 @@ impl RuntimeProcessLock {
                 fs::create_dir_all(parent)?;
             }
         }
-        let store = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(store_path)?;
+        let store = open_store(store_path)?;
         let identity = store_identity(&store, store_path)?;
         let reservation = IdentityReservation::claim(&identity)?;
-        // Identity exclusion follows the file, not its current parent.
-        // Unix: flock on this fd. Windows: named mutex. Never LockFile the db.
+        // Unix: flock the inode we already opened. Windows: a machine-wide
+        // lock file named only from that handle's identity. Never LockFile
+        // the database, and never use the `Local\` namespace.
         #[cfg(unix)]
         match store.try_lock_exclusive() {
             Ok(true) => {}
             Ok(false) => return Err(ProcessLockError::AlreadyRunning),
             Err(err) => return Err(err.into()),
         }
-        #[cfg(windows)]
-        let identity_mutex = match agentype_nlink::try_acquire_identity_mutex(&identity.file_id)? {
-            Some(mutex) => mutex,
-            None => return Err(ProcessLockError::AlreadyRunning),
-        };
         let mut files = vec![store];
+        #[cfg(windows)]
+        files.push(lock_windows_identity(&identity.file_id)?);
         let lock_path = canonical_lock_path(&identity)?;
         let file = OpenOptions::new()
             .read(true)
@@ -176,16 +169,23 @@ impl RuntimeProcessLock {
             Ok(false) => return Err(ProcessLockError::AlreadyRunning),
             Err(err) => return Err(err.into()),
         }
-        let again = store_identity(files.first().expect("store fd"), store_path)?;
-        if again.file_id != identity.file_id || again.canonical != identity.canonical {
+        // The path may have been replaced. Compare a fresh handle, not
+        // another path lookup of the file id.
+        let reopened = open_store(store_path)?;
+        let again = agentype_nlink::file_identity(&reopened)?;
+        if again != identity.file_id {
             return Err(ProcessLockError::IdentityUnresolvable(
                 "scheduler store identity changed while the lock was acquired".into(),
             ));
         }
+        let links = agentype_nlink::link_count(files.first().expect("store fd"))?;
+        if links > 1 {
+            return Err(ProcessLockError::IdentityUnresolvable(format!(
+                "scheduler store has {links} hard links; production refuses multi-name databases"
+            )));
+        }
         Ok(Self {
             _files: files,
-            #[cfg(windows)]
-            _identity_mutex: identity_mutex,
             _reservation: reservation,
             identity,
             store_path: store_path.to_path_buf(),
@@ -195,9 +195,9 @@ impl RuntimeProcessLock {
     /// Fail closed when `path` is no longer the file this lock owns.
     /// Startup calls this after `Kernel::open` re-resolves the path.
     pub fn confirm_store_identity(&self, path: &Path) -> Result<(), ProcessLockError> {
-        let file = File::open(path)?;
-        let again = store_identity(&file, path)?;
-        if again.file_id != self.identity.file_id {
+        let file = open_store(path)?;
+        let again = agentype_nlink::file_identity(&file)?;
+        if again != self.identity.file_id {
             return Err(ProcessLockError::IdentityUnresolvable(
                 "scheduler store identity changed before the kernel opened it".into(),
             ));
@@ -301,8 +301,39 @@ fn canonical_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockE
     )))
 }
 
+fn open_store(path: &Path) -> Result<File, ProcessLockError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    // Share delete so a rename of the open store is possible. The identity
+    // lock, not the sharing mode, is what keeps a second daemon out.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0x1 | 0x2 | 0x4);
+    }
+    Ok(opts.open(path)?)
+}
+
+#[cfg(windows)]
+fn lock_windows_identity(file_id: &str) -> Result<File, ProcessLockError> {
+    let dir = agentype_nlink::machine_lock_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(".agentype-runtime-lock-{}", fnv64(file_id)));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(ProcessLockError::AlreadyRunning),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn store_identity(file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
-    let _canonical = fs::canonicalize(path).map_err(|err| {
+    let canonical = fs::canonicalize(path).map_err(|err| {
         ProcessLockError::IdentityUnresolvable(format!(
             "cannot canonicalize {}: {err}",
             path.display()
@@ -314,15 +345,15 @@ fn store_identity(file: &File, path: &Path) -> Result<StoreIdentity, ProcessLock
             "scheduler store has {links} hard links; production refuses multi-name databases"
         )));
     }
-    let id = file_id::get_file_id(path).map_err(|err| {
+    let file_id = agentype_nlink::file_identity(file).map_err(|err| {
         ProcessLockError::IdentityUnresolvable(format!(
             "cannot read file identity for {}: {err}",
             path.display()
         ))
     })?;
     Ok(StoreIdentity {
-        file_id: format!("{id:?}"),
-        canonical: _canonical.to_string_lossy().into_owned(),
+        file_id,
+        canonical: canonical.to_string_lossy().into_owned(),
     })
 }
 
@@ -421,6 +452,26 @@ mod tests {
         assert!(identity_keys_held(&id));
         drop(guard);
         assert!(!identity_keys_held(&id));
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_lock_is_not_session_local_or_beside_the_store() {
+        let dir = agentype_nlink::machine_lock_dir().unwrap();
+        let rendered = dir.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            !rendered.contains("local\\agentype"),
+            "identity lock must not use the Local namespace: {rendered}"
+        );
+        assert!(dir.ends_with(std::path::Path::new("agentype").join("locks")));
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let _guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        assert!(
+            !dir.starts_with(path.parent().unwrap()),
+            "identity lock must not live next to the store"
+        );
         let _ = fs::remove_file(path);
     }
 

@@ -138,6 +138,8 @@ impl SchedulerDaemonBuilder {
         })
     }
 
+    /// Test clock injection. Production startup uses [`SystemClock`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -408,6 +410,8 @@ impl RunningSchedulerDaemon {
             .published_phase()
     }
 
+    /// Direct Scheduler authority. Not part of the production daemon API.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn kernel(&self) -> &Kernel {
         &self.kernel
     }
