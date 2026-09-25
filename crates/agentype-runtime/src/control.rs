@@ -24,10 +24,21 @@ pub struct DispatchGate {
 }
 
 impl DispatchGate {
+    #[cfg(test)]
     pub(crate) fn open() -> Self {
         Self {
             allowed: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub(crate) fn closed() -> Self {
+        Self {
+            allowed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn allow(&self) {
+        self.allowed.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn revoke(&self) {

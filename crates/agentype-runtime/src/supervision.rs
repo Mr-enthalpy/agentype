@@ -267,6 +267,7 @@ impl SupervisionRegistry {
                     },
                 );
                 Ok(())
+                // poke happens after the registry lock is released by the caller
             }
         }
     }
@@ -425,6 +426,7 @@ pub struct SupervisionService {
     kernel: Arc<Kernel>,
     registry: Arc<Mutex<SupervisionRegistry>>,
     heartbeat_interval: Duration,
+    observer_wake: Arc<Mutex<Option<Arc<std::sync::Condvar>>>>,
 }
 
 impl Clone for SupervisionService {
@@ -433,6 +435,7 @@ impl Clone for SupervisionService {
             kernel: self.kernel.clone(),
             registry: self.registry.clone(),
             heartbeat_interval: self.heartbeat_interval,
+            observer_wake: self.observer_wake.clone(),
         }
     }
 }
@@ -461,7 +464,19 @@ impl SupervisionService {
             kernel,
             registry: Arc::new(Mutex::new(SupervisionRegistry::new())),
             heartbeat_interval: timing.heartbeat_interval(),
+            observer_wake: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Observer runner registers so a new admission interrupts its sleep.
+    pub(crate) fn bind_observer_wake(&self, wake: Arc<std::sync::Condvar>) {
+        *self.observer_wake.lock().expect("observer wake") = Some(wake);
+    }
+
+    fn poke_observer(&self) {
+        if let Some(wake) = self.observer_wake.lock().expect("observer wake").as_ref() {
+            wake.notify_all();
+        }
     }
 
     /// Enable the M5.8 physical-freshness gate. Default is off so M5.3
@@ -517,8 +532,14 @@ impl SupervisionService {
         // `heartbeat_interval < lease_seconds` (the §A2 gate), this due
         // point is always strictly before the durable expiry.
         let next_due_at = admission.first_renewed_at() + self.heartbeat_interval.as_secs_f64();
-        let mut registry = self.registry.lock().expect("supervision registry lock");
-        registry.admit(admission, next_due_at)
+        let admitted = {
+            let mut registry = self.registry.lock().expect("supervision registry lock");
+            registry.admit(admission, next_due_at)
+        };
+        if admitted.is_ok() {
+            self.poke_observer();
+        }
+        admitted
     }
 
     /// Explicitly drop supervision ownership (terminal handling, invariant

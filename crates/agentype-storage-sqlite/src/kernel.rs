@@ -1678,6 +1678,8 @@ impl Kernel {
             require_physical_transition(from, state)?;
             let handle_json = runtime_handle.map(json_dump);
             let outcome_json = payload.map(json_dump);
+            let attached =
+                execution_still_attached(tx, &execution.id, &execution.incarnation_id)?;
             tx.execute(
                 "UPDATE executions SET state=?1,runtime_handle_json=COALESCE(?2,runtime_handle_json),
                  outcome_json=COALESCE(?3,outcome_json),
@@ -1699,22 +1701,24 @@ impl Kernel {
                 ],
             )
             .map_err(map_sqlite)?;
-            if let Some(h) = &handle_json {
-                tx.execute(
-                    "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
-                    params![h, execution.incarnation_id],
-                )
-                .map_err(map_sqlite)?;
+            if attached {
+                if let Some(h) = &handle_json {
+                    tx.execute(
+                        "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
+                        params![h, execution.incarnation_id],
+                    )
+                    .map_err(map_sqlite)?;
+                }
+                record_incarnation_presence(
+                    tx,
+                    Some(&execution.incarnation_id),
+                    state,
+                    terminal_confirmed,
+                    quiescent_confirmed,
+                    false,
+                    now,
+                )?;
             }
-            record_incarnation_presence(
-                tx,
-                Some(&execution.incarnation_id),
-                state,
-                terminal_confirmed,
-                quiescent_confirmed,
-                false,
-                now,
-            )?;
             Ok(())
         })
     }
@@ -1734,11 +1738,13 @@ impl Kernel {
                 params![handle_json, now, execution.id],
             )
             .map_err(map_sqlite)?;
-            tx.execute(
-                "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
-                params![handle_json, execution.incarnation_id],
-            )
-            .map_err(map_sqlite)?;
+            if execution_still_attached(tx, &execution.id, &execution.incarnation_id)? {
+                tx.execute(
+                    "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
+                    params![handle_json, execution.incarnation_id],
+                )
+                .map_err(map_sqlite)?;
+            }
             Ok(())
         })
     }
@@ -3850,4 +3856,34 @@ impl PartitionRow {
             topology_revision: r.get(8)?,
         })
     }
+}
+
+/// True only while this Execution is still the incarnation's live attachment.
+/// A later Execution in STARTING/RUNNING/UNKNOWN owns the incarnation; late
+/// evidence from an older Execution must not rewrite it.
+fn execution_still_attached(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    incarnation_id: &str,
+) -> Result<bool, Error> {
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM executions WHERE id=?1",
+            params![execution_id],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite)?;
+    if !matches!(state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
+        return Ok(false);
+    }
+    let other: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM executions WHERE incarnation_id=?1 AND id!=?2
+             AND state IN ('STARTING','RUNNING','UNKNOWN') LIMIT 1",
+            params![incarnation_id, execution_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?;
+    Ok(other.is_none())
 }

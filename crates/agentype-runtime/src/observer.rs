@@ -234,6 +234,29 @@ impl PhysicalObserverService {
         self.observe_due(self.kernel.now())
     }
 
+    fn supervision_wake_target(&self) -> &SupervisionService {
+        &self.supervision
+    }
+
+    /// Wall time until the earliest scheduled observation. Zero means due now.
+    fn wait_for_next_due(&self) -> Duration {
+        let now = self.kernel.now();
+        let earliest = self
+            .watch
+            .lock()
+            .expect("physical watch lock")
+            .values()
+            .map(|state| state.next_observation_at)
+            .fold(None, |best: Option<UnixTime>, due| {
+                Some(best.map_or(due, |prev| prev.min(due)))
+            });
+        match earliest {
+            Some(due) if due <= now => Duration::ZERO,
+            Some(due) => Duration::from_secs_f64(due - now),
+            None => Duration::from_secs_f64(self.config.poll_interval),
+        }
+    }
+
     pub fn observe_due(&self, now: UnixTime) -> Result<Vec<ObserveApply>, ObserverError> {
         let poll = self.config.poll_interval;
         {
@@ -247,7 +270,7 @@ impl PhysicalObserverService {
                             request_id: snap.identity.request_id().clone(),
                             identity: snap.identity.clone(),
                         },
-                        next_observation_at: snap.last_positive_observed_at + poll,
+                        next_observation_at: now,
                     });
             }
         }
@@ -284,7 +307,8 @@ impl PhysicalObserverService {
                     .expect("physical watch lock")
                     .remove(&ticket.execution_id);
             } else {
-                self.schedule_next(&ticket, now + poll);
+                let completed = self.kernel.now();
+                self.schedule_next(&ticket, completed + poll);
             }
             out.push(applied);
         }
@@ -404,16 +428,19 @@ impl PhysicalObserverService {
                 Ok(ObserveApply::Refreshed)
             }
             PhysicalObservationKind::InvocationError => {
+                let class = invoke_err
+                    .as_ref()
+                    .map(adapter_invocation_failure_class)
+                    .unwrap_or(FailureClass::Unknown);
                 if let Some(err) = invoke_err.as_ref() {
                     if let Some(hint) = err.runtime_handle_hint() {
                         self.kernel
                             .record_runtime_handle_hint(&ticket.execution_id, &hint.0)
                             .map_err(ObserverError::from)?;
                     }
-                    let _ = adapter_invocation_failure_class(err);
                 }
                 if activation {
-                    self.close_preserving(ticket)
+                    self.close_preserving(ticket, class)
                 } else {
                     Ok(ObserveApply::InvocationIgnored)
                 }
@@ -421,7 +448,7 @@ impl PhysicalObserverService {
             PhysicalObservationKind::ProtocolInvalid => {
                 self.supervision.stop_renewal_eligibility(&ticket.identity);
                 if activation {
-                    self.close_preserving(ticket)
+                    self.close_preserving(ticket, FailureClass::AdapterProtocolFailure)
                 } else {
                     Ok(ObserveApply::ProtocolInvalidated)
                 }
@@ -485,11 +512,15 @@ impl PhysicalObserverService {
         }
     }
 
-    fn close_preserving(&self, ticket: &ObservationTicket) -> Result<ObserveApply, ObserverError> {
+    fn close_preserving(
+        &self,
+        ticket: &ObservationTicket,
+        failure_class: FailureClass,
+    ) -> Result<ObserveApply, ObserverError> {
         match self.kernel.nack_preserving_physical_history(
             ticket.identity.attempt_id(),
             ticket.identity.lease_epoch(),
-            FailureClass::Unknown,
+            failure_class,
             Some(&ticket.execution_id),
         ) {
             Ok(_) => {
@@ -546,24 +577,25 @@ struct ObserverRunnerState {
 
 /// Independent observer thread. Never shares Adapter I/O with heartbeat.
 pub struct PhysicalObserverRunner {
-    shared: Arc<(Mutex<ObserverRunnerState>, Condvar)>,
+    shared: Arc<(Mutex<ObserverRunnerState>, Arc<Condvar>)>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PhysicalObserverRunner {
     pub fn start(service: PhysicalObserverService) -> Result<Self, ObserverError> {
-        let poll = Duration::from_secs_f64(service.config().poll_interval());
+        let wake = Arc::new(Condvar::new());
         let shared = Arc::new((
             Mutex::new(ObserverRunnerState {
                 phase: ObserverRunnerPhase::Running,
                 fatal: None,
             }),
-            Condvar::new(),
+            wake.clone(),
         ));
         let thread_shared = shared.clone();
         let join = std::thread::Builder::new()
             .name("physical-observer".into())
             .spawn(move || {
+                service.supervision_wake_target().bind_observer_wake(wake);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     {
                         let state = thread_shared.0.lock().expect("observer runner state");
@@ -577,13 +609,17 @@ impl PhysicalObserverRunner {
                         state.fatal = Some(err);
                         break;
                     }
+                    let wait = service.wait_for_next_due();
                     let state = thread_shared.0.lock().expect("observer runner state");
                     if state.phase != ObserverRunnerPhase::Running {
                         break;
                     }
+                    if wait.is_zero() {
+                        continue;
+                    }
                     let (_guard, _) = thread_shared
                         .1
-                        .wait_timeout(state, poll)
+                        .wait_timeout(state, wait)
                         .expect("observer runner wait");
                 }));
                 if result.is_err() {
@@ -896,6 +932,45 @@ mod tests {
         assert_ne!(
             kernel.task(&claim.task_id).unwrap().state,
             TaskState::Leased
+        );
+    }
+
+    #[test]
+    fn activation_timeout_keeps_timeout_class_for_retry() {
+        let (_clock, kernel) = env();
+        let fake = Arc::new(FakeAdapter::new());
+        let svc = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_kind("process", fake.clone(), test_deadlines())
+            .unwrap();
+        let observer =
+            PhysicalObserverService::new(kernel.clone(), adapters, svc.clone(), observer_cfg());
+        kernel
+            .submit_batch(&[TaskSpec::new("act-to", json!({"o": 1})).retry(
+                agentype_core::RetryPolicy {
+                    max_attempts: 3,
+                    retry_classes: vec![agentype_core::FailureClass::Timeout],
+                    base_backoff_seconds: 1.0,
+                    max_backoff_seconds: 4.0,
+                },
+            )])
+            .unwrap();
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        let exec = kernel
+            .create_execution(&claim, binding(&claim))
+            .unwrap()
+            .execution_id()
+            .clone();
+        kernel
+            .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec, &json!({}))
+            .unwrap();
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+        fake.set_next_observe_error(AdapterError::deadline_exceeded("activation observe"));
+        observer.activation_sweep().unwrap();
+        assert_eq!(
+            kernel.task(&claim.task_id).unwrap().state,
+            TaskState::RetryWait
         );
     }
 

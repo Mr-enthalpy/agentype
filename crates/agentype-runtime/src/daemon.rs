@@ -157,6 +157,12 @@ impl SchedulerDaemonBuilder {
             )));
         }
         let (supervision, notifier) = recovered.into_parts();
+        let mut startup = StartupGuard {
+            supervision: Some(supervision),
+            notifier,
+            lock: Some(lock),
+        };
+        let supervision = startup.supervision.as_ref().expect("supervision");
         let observer_service = PhysicalObserverService::new(
             kernel.clone(),
             self.adapters.clone(),
@@ -176,18 +182,21 @@ impl SchedulerDaemonBuilder {
         kernel
             .revive_eligible_agents()
             .map_err(DaemonError::Persistence)?;
-        if supervision.is_failed() || notifier.as_ref().is_some_and(|n| n.is_failed()) {
-            drop(observer_service);
-            drop(notifier);
-            drop(supervision);
-            drop(lock);
+        if startup.supervision.as_ref().is_some_and(|s| s.is_failed())
+            || startup.notifier.as_ref().is_some_and(|n| n.is_failed())
+        {
             return Err(DaemonError::Recovery(RecoveryError::Invariant(
                 "a required runner failed during activation".into(),
             )));
         }
         let now = kernel.now();
         let freshness = self.observer.freshness_limit();
-        let local = supervision.service().observation_snapshots();
+        let local = startup
+            .supervision
+            .as_ref()
+            .expect("supervision")
+            .service()
+            .observation_snapshots();
         for cand in kernel
             .reconciliation_candidates()
             .map_err(DaemonError::Persistence)?
@@ -196,10 +205,6 @@ impl SchedulerDaemonBuilder {
                 continue;
             }
             if cand.persisted_state() != agentype_core::ExecutionState::Running {
-                drop(observer_service);
-                drop(notifier);
-                drop(supervision);
-                drop(lock);
                 return Err(DaemonError::Recovery(RecoveryError::Invariant(
                     "current authority is not a fresh RUNNING supervision".into(),
                 )));
@@ -210,17 +215,16 @@ impl SchedulerDaemonBuilder {
                     && now < snap.last_positive_observed_at + freshness
             });
             if !fresh {
-                drop(observer_service);
-                drop(notifier);
-                drop(supervision);
-                drop(lock);
                 return Err(DaemonError::Recovery(RecoveryError::Invariant(
                     "current authority lacks fresh renewable supervision".into(),
                 )));
             }
         }
         let permit = ReadyPermit::mint();
-        let gate = DispatchGate::open();
+        let gate = DispatchGate::closed();
+        let supervision = startup.supervision.take().expect("supervision");
+        let notifier = startup.notifier.take();
+        let lock = startup.lock.take().expect("process lock");
         let control_service = ControlLoopService::new(
             kernel.clone(),
             self.execution_registry,
@@ -240,7 +244,7 @@ impl SchedulerDaemonBuilder {
             notifier,
             gate,
             stop: AtomicBool::new(false),
-            phase: Mutex::new(DaemonPhase::Ready),
+            phase: Mutex::new(DaemonPhase::Stopping),
         });
         let watchdog_inner = inner.clone();
         let watchdog = std::thread::Builder::new()
@@ -274,25 +278,66 @@ impl SchedulerDaemonBuilder {
         let watchdog = match watchdog {
             Ok(handle) => handle,
             Err(err) => {
-                inner.stop.store(true, Ordering::SeqCst);
-                inner.gate.revoke();
-                inner.control.request_stop();
-                inner.observer.request_stop();
-                inner.supervision.request_stop();
-                if let Some(n) = &inner.notifier {
+                let DaemonInner {
+                    control,
+                    observer,
+                    supervision,
+                    notifier,
+                    gate,
+                    ..
+                } = Arc::try_unwrap(inner).unwrap_or_else(|_| {
+                    panic!("health watchdog was not spawned, so the daemon arc is unique")
+                });
+                gate.revoke();
+                control.request_stop();
+                observer.request_stop();
+                supervision.request_stop();
+                if let Some(n) = &notifier {
                     n.request_stop();
+                }
+                let _ = supervision.shutdown();
+                drop(control);
+                drop(observer);
+                if let Some(n) = notifier {
+                    let _ = n.shutdown();
                 }
                 return Err(DaemonError::Config(format!(
                     "required health watchdog failed to start: {err}"
                 )));
             }
         };
+        inner.gate.allow();
+        *inner.phase.lock().expect("daemon phase") = DaemonPhase::Ready;
         Ok(RunningSchedulerDaemon {
             kernel,
             inner: Some(inner),
             watchdog: Some(watchdog),
             _lock: lock,
         })
+    }
+}
+
+struct StartupGuard {
+    supervision: Option<SupervisionRunner>,
+    notifier: Option<NotifierRunner>,
+    lock: Option<RuntimeProcessGuard>,
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(supervision) = &self.supervision {
+            supervision.request_stop();
+        }
+        if let Some(notifier) = &self.notifier {
+            notifier.request_stop();
+        }
+        if let Some(supervision) = self.supervision.take() {
+            let _ = supervision.shutdown();
+        }
+        if let Some(notifier) = self.notifier.take() {
+            let _ = notifier.shutdown();
+        }
+        drop(self.lock.take());
     }
 }
 
