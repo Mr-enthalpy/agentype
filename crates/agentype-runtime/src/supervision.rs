@@ -304,6 +304,11 @@ impl SupervisionRegistry {
         self.entries.contains_key(execution_id)
     }
 
+    /// This runtime still has the entry. Distinct from renewal eligibility.
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.contains(execution_id)
+    }
+
     pub fn active_count(&self) -> usize {
         self.entries.len()
     }
@@ -581,6 +586,7 @@ impl SupervisionService {
         registry.remove(execution_id)
     }
 
+    /// Renewal eligibility, not ownership. A stale entry stays owned.
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.registry
             .lock()
@@ -588,6 +594,14 @@ impl SupervisionService {
             .entries
             .get(execution_id)
             .is_some_and(|e| e.renewal_eligible)
+    }
+
+    /// This runtime's registry still has the entry, even if renewal is stopped.
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .owns(execution_id)
     }
 
     pub fn active_count(&self) -> usize {
@@ -661,6 +675,9 @@ impl SupervisionService {
                     if stale {
                         let next_due_at = now + self.heartbeat_interval.as_secs_f64();
                         registry.record_renewal(&identity, next_due_at);
+                        // Keep the entry. Stop renewal only. Recovery still
+                        // owns this execution until activation refreshes it.
+                        registry.stop_renewal_if_current(&identity);
                         return Ok(RenewalOutcome::FreshnessStale { execution_id });
                     }
                 }
@@ -1011,6 +1028,11 @@ impl SupervisionRunner {
 
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.service.contains(execution_id)
+    }
+
+    /// Owned supervision entry, whether or not it may currently renew.
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.service.owns(execution_id)
     }
 
     /// Shared process-local registry handle for the physical observer.

@@ -629,7 +629,13 @@ pub(crate) fn recover_runtime(
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, notifier, None, None, None)
+    recover_runtime_inner(
+        kernel,
+        adapters,
+        timing,
+        notifier,
+        RecoveryRun::production(),
+    )
 }
 
 pub(crate) fn recover_runtime_with_gate(
@@ -645,9 +651,11 @@ pub(crate) fn recover_runtime_with_gate(
         adapters,
         timing,
         notifier,
-        None,
-        Some(gate),
-        Some(freshness_limit),
+        RecoveryRun {
+            fatal_gate: Some(gate),
+            freshness_limit: Some(freshness_limit),
+            ..RecoveryRun::production()
+        },
     )
 }
 
@@ -674,19 +682,35 @@ pub fn recover_runtime_without_notifier(
     recover_runtime(kernel, adapters, timing, NotifierBinding::DisabledForTests)
 }
 
+struct RecoveryRun<'a> {
+    fail_after_readmits: Option<usize>,
+    fatal_gate: Option<crate::DispatchGate>,
+    freshness_limit: Option<f64>,
+    between_candidates: Option<&'a dyn Fn(&SupervisionRunner)>,
+}
+
+impl RecoveryRun<'static> {
+    fn production() -> Self {
+        Self {
+            fail_after_readmits: None,
+            fatal_gate: None,
+            freshness_limit: None,
+            between_candidates: None,
+        }
+    }
+}
+
 fn recover_runtime_inner(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
-    fail_after_readmits: Option<usize>,
-    fatal_gate: Option<crate::DispatchGate>,
-    freshness_limit: Option<f64>,
+    run: RecoveryRun<'_>,
 ) -> Result<RecoveredRuntime, RecoveryError> {
     kernel.expire_leases(true).map_err(RecoveryError::from)?;
 
     let runner =
-        SupervisionRunner::start_with_fatal_gate(kernel.clone(), timing, fatal_gate.clone())
+        SupervisionRunner::start_with_fatal_gate(kernel.clone(), timing, run.fatal_gate.clone())
             .map_err(RecoveryError::Supervision)?;
     let notifier_runner = match notifier {
         NotifierBinding::Enabled { config, bridge } => Some(
@@ -694,7 +718,7 @@ fn recover_runtime_inner(
                 kernel.clone(),
                 bridge,
                 config,
-                fatal_gate.clone(),
+                run.fatal_gate.clone(),
             )
             .map_err(RecoveryError::Notifier)?,
         ),
@@ -702,7 +726,7 @@ fn recover_runtime_inner(
         NotifierBinding::DisabledForTests => None,
     };
     let guard = StartupGuard::new(runner, notifier_runner);
-    if let Some(limit) = freshness_limit {
+    if let Some(limit) = run.freshness_limit {
         guard.runner().service().enable_freshness_gate(limit);
     }
     guard.check_healthy()?;
@@ -728,7 +752,7 @@ fn recover_runtime_inner(
                     ReconcileExecutionOutcome::Readmitted
                 ) {
                     readmits += 1;
-                    if fail_after_readmits == Some(readmits) {
+                    if run.fail_after_readmits == Some(readmits) {
                         return Err(RecoveryError::invariant(
                             "injected startup fatal after successful readmission",
                         ));
@@ -744,6 +768,9 @@ fn recover_runtime_inner(
             ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Terminated => {}
         }
         guard.check_healthy()?;
+        if let Some(hook) = run.between_candidates {
+            hook(guard.runner());
+        }
     }
 
     kernel.expire_leases(false).map_err(RecoveryError::from)?;
@@ -768,9 +795,10 @@ fn recover_runtime_failing_after_readmits(
         adapters,
         timing,
         NotifierBinding::DisabledForTests,
-        Some(after),
-        None,
-        None,
+        RecoveryRun {
+            fail_after_readmits: Some(after),
+            ..RecoveryRun::production()
+        },
     )
 }
 
@@ -789,7 +817,8 @@ fn assert_ready_invariant(
         }
         match snap.persisted_state() {
             ExecutionState::Running => {
-                if !runner.contains(snap.execution_id()) {
+                // Ownership, not freshness. Activation requalifies renewal.
+                if !runner.owns(snap.execution_id()) {
                     return Err(RecoveryError::invariant(format!(
                         "READY with unsupervised current RUNNING execution {}",
                         snap.execution_id()
@@ -827,9 +856,12 @@ fn persisted_handle_hint(value: &Value) -> Option<RuntimeHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::require_fresh_running_authority;
     use crate::notifier::{NotifierBinding, NotifierConfig, NotifierRetryPolicy};
+    use crate::observer::{ObserveApply, PhysicalObserverConfig, PhysicalObserverService};
     use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
+    use crate::DispatchGate;
     use crate::{
         AdapterBindingKey, AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
     };
@@ -845,6 +877,7 @@ mod tests {
     use agentype_root_bridge::{RecordingRootBridge, RootBridgeError};
     use agentype_storage_sqlite::Kernel;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -2217,9 +2250,10 @@ mod tests {
                 config: notifier_cfg(),
                 bridge: bridge.clone(),
             },
-            Some(1),
-            None,
-            None,
+            RecoveryRun {
+                fail_after_readmits: Some(1),
+                ..RecoveryRun::production()
+            },
         ) {
             Err(err) => err,
             Ok(_) => panic!("expected injected startup fatal"),
@@ -2292,6 +2326,134 @@ mod tests {
             OutboxState::Pending
         );
         assert!(kernel.outbox_delivery(&event).unwrap().next_delivery_at > clock.now());
+        drop(recovered);
+    }
+
+    fn recover_with_between(
+        kernel: Arc<Kernel>,
+        adapters: &AdapterRegistry,
+        freshness_limit: f64,
+        between: &dyn Fn(&SupervisionRunner),
+    ) -> Result<RecoveredRuntime, RecoveryError> {
+        recover_runtime_inner(
+            kernel,
+            adapters,
+            timing(),
+            NotifierBinding::DisabledForTests,
+            RecoveryRun {
+                fatal_gate: Some(DispatchGate::closed()),
+                freshness_limit: Some(freshness_limit),
+                between_candidates: Some(between),
+                ..RecoveryRun::production()
+            },
+        )
+    }
+
+    /// Freshness can lapse during a long recovery. Ownership still completes,
+    /// and a later positive observation is what restores ReadyPermit.
+    #[test]
+    fn stale_freshness_during_recovery_still_reaches_activation() {
+        let (clock, k) = env();
+        k.upsert_partition(&PartitionSpec::new(
+            "general-b",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+        k.reconcile_pool().unwrap();
+        let kernel = Arc::new(k);
+        let (_c1, early) = start_named(&kernel, TaskSpec::new("early", json!({"o": 1})));
+        let (_c2, later) = start_named(
+            &kernel,
+            TaskSpec::new("later", json!({"o": 1})).partition("general-b"),
+        );
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        let adapters = adapters(&fake);
+        let calls = AtomicUsize::new(0);
+        let clock_hook = clock.clone();
+        let fake_hook = fake.clone();
+        let recovered = recover_with_between(kernel.clone(), &adapters, 4.0, &|runner| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                clock_hook.advance(5.0);
+                runner.service().renew_due_now().unwrap();
+                fake_hook.set_next_reconcile(running_obs());
+            }
+        })
+        .expect("recovery owns executions after freshness lapses");
+        assert!(recovered.runner().owns(early.execution_id()));
+        assert!(recovered.runner().owns(later.execution_id()));
+        let ineligible = [early.execution_id(), later.execution_id()]
+            .into_iter()
+            .filter(|id| !recovered.runner().contains(id))
+            .count();
+        assert_eq!(ineligible, 1);
+        let snaps = recovered.runner().service().observation_snapshots();
+        assert!(require_fresh_running_authority(&kernel, &snaps, 4.0).is_err());
+        let observer = PhysicalObserverService::new(
+            kernel.clone(),
+            adapters.clone(),
+            recovered.runner().service(),
+            PhysicalObserverConfig::new(1.0, 4.0, 8, 10.0).unwrap(),
+        );
+        let applied = observer.activation_sweep().unwrap();
+        assert!(applied.iter().all(|item| *item == ObserveApply::Refreshed));
+        assert!(recovered.runner().contains(early.execution_id()));
+        assert!(recovered.runner().contains(later.execution_id()));
+        let snaps = recovered.runner().service().observation_snapshots();
+        require_fresh_running_authority(&kernel, &snaps, 4.0)
+            .expect("positive observation restores fresh renewal");
+        drop(recovered);
+    }
+
+    /// Activation that cannot re-observe the stale execution closes authority.
+    /// READY is then allowed only because that execution is no longer current.
+    #[test]
+    fn activation_failure_closes_stale_authority_before_ready() {
+        let (clock, k) = env();
+        let kernel = Arc::new(k);
+        let (claim, launch) = start_named(&kernel, TaskSpec::new("stale-close", json!({"o": 1})));
+        let fake = Arc::new(FakeAdapter::new());
+        fake.set_next_reconcile(running_obs());
+        fake.set_next_observe_error(agentype_adapter_api::AdapterError::deadline_exceeded(
+            "activation observe",
+        ));
+        let adapters = adapters(&fake);
+        let clock_hook = clock.clone();
+        let recovered = recover_with_between(kernel.clone(), &adapters, 4.0, &|runner| {
+            clock_hook.advance(5.0);
+            runner.service().renew_due_now().unwrap();
+        })
+        .expect("ownership recovery completes while renewal is stopped");
+        assert!(recovered.runner().owns(launch.execution_id()));
+        assert!(!recovered.runner().contains(launch.execution_id()));
+        let snaps = recovered.runner().service().observation_snapshots();
+        assert!(require_fresh_running_authority(&kernel, &snaps, 4.0).is_err());
+        let observer = PhysicalObserverService::new(
+            kernel.clone(),
+            adapters,
+            recovered.runner().service(),
+            PhysicalObserverConfig::new(1.0, 4.0, 8, 10.0).unwrap(),
+        );
+        assert_eq!(
+            observer.activation_sweep().unwrap(),
+            vec![ObserveApply::ProtocolInvalidated]
+        );
+        assert_ne!(
+            kernel.execution(launch.execution_id()).unwrap().state,
+            ExecutionState::Lost
+        );
+        assert!(kernel.result_for_task(&claim.task_id).is_err());
+        assert_ne!(
+            kernel.task(&claim.task_id).unwrap().state,
+            TaskState::Completed
+        );
+        assert!(!recovered.runner().owns(launch.execution_id()));
+        let snaps = recovered.runner().service().observation_snapshots();
+        require_fresh_running_authority(&kernel, &snaps, 4.0)
+            .expect("READY only after the stale execution loses current authority");
         drop(recovered);
     }
 

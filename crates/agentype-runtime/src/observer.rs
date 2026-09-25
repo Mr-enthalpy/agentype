@@ -871,7 +871,9 @@ mod tests {
             kernel.execution(&exec).unwrap().state,
             ExecutionState::Running
         );
-        assert!(svc.contains(&exec));
+        assert!(svc.owns(&exec));
+        assert_eq!(svc.renewal_eligible(&exec), Some(false));
+        assert!(!svc.contains(&exec));
         assert_ne!(
             kernel.task(&claim.task_id).unwrap().state,
             TaskState::Completed

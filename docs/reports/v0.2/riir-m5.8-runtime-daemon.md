@@ -59,8 +59,10 @@ lines. It does not claim full secret sanitization. Prefix matching uses
 
 ## RootBridge diagnostics
 
-`last_error` is `KIND: bounded-diagnostic`. Notifier does not persist
-`format!("{RootBridgeError}")`. `Authorization:` lines are redacted.
+Durable `last_error` stores only the safe RootBridge kind:
+`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `PROTOCOL`, `REJECTED`, or `OTHER`.
+M5.8 does not persist a bounded diagnostic. `Authorization:` redaction
+still applies to non-durable `RootBridgeDiagnostic` text.
 
 ---
 

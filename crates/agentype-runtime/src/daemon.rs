@@ -154,6 +154,9 @@ impl SchedulerDaemonBuilder {
             )
             .map_err(DaemonError::Persistence)?,
         );
+        lock.lock()
+            .confirm_store_identity(self.store.path())
+            .map_err(DaemonError::from)?;
         let gate = DispatchGate::closed();
         let recovered = recover_runtime_with_gate(
             kernel.clone(),
@@ -207,7 +210,6 @@ impl SchedulerDaemonBuilder {
                 "a required runner failed during activation".into(),
             )));
         }
-        let now = kernel.now();
         let freshness = self.observer.freshness_limit();
         let local = startup
             .supervision
@@ -215,29 +217,8 @@ impl SchedulerDaemonBuilder {
             .expect("supervision")
             .service()
             .observation_snapshots();
-        for cand in kernel
-            .reconciliation_candidates()
-            .map_err(DaemonError::Persistence)?
-        {
-            if !cand.current_authority_hint().looks_current_at(now) {
-                continue;
-            }
-            if cand.persisted_state() != agentype_core::ExecutionState::Running {
-                return Err(DaemonError::Recovery(RecoveryError::Invariant(
-                    "current authority is not a fresh RUNNING supervision".into(),
-                )));
-            }
-            let fresh = local.iter().any(|snap| {
-                snap.identity.execution_id() == cand.execution_id()
-                    && snap.renewal_eligible
-                    && now < snap.last_positive_observed_at + freshness
-            });
-            if !fresh {
-                return Err(DaemonError::Recovery(RecoveryError::Invariant(
-                    "current authority lacks fresh renewable supervision".into(),
-                )));
-            }
-        }
+        require_fresh_running_authority(&kernel, &local, freshness)
+            .map_err(DaemonError::Recovery)?;
         let permit = ReadyPermit::mint();
         let control_service = ControlLoopService::new(
             kernel.clone(),
@@ -470,8 +451,11 @@ impl RunningSchedulerDaemon {
         let inner = match Arc::try_unwrap(self.inner.take().expect("daemon inner")) {
             Ok(inner) => inner,
             Err(shared) => {
-                return if *shared.phase.lock().expect("daemon phase") == DaemonPhase::Failed {
-                    DaemonExit::Failed("runtime worker failed".into())
+                let cause = first_worker_fatal(&shared);
+                return if *shared.phase.lock().expect("daemon phase") == DaemonPhase::Failed
+                    || cause.is_some()
+                {
+                    DaemonExit::Failed(cause.unwrap_or_else(|| "runtime worker failed".into()))
                 } else {
                     DaemonExit::Stopped
                 };
@@ -492,17 +476,65 @@ impl RunningSchedulerDaemon {
             Some(runner) => runner.shutdown().err(),
             None => None,
         };
-        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed
-            || control_fatal.is_some()
-            || observer_fatal.is_some()
-            || supervision_fatal.is_some()
-            || notifier_fatal.is_some();
+        let cause = control_fatal
+            .or(observer_fatal)
+            .or(supervision_fatal.map(|err| err.to_string()))
+            .or(notifier_fatal.map(|err| err.to_string()));
+        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed || cause.is_some();
         if failed {
-            DaemonExit::Failed("runtime worker failed".into())
+            DaemonExit::Failed(cause.unwrap_or_else(|| "runtime worker failed".into()))
         } else {
             DaemonExit::Stopped
         }
     }
+}
+
+fn first_worker_fatal(inner: &DaemonInner) -> Option<String> {
+    inner
+        .control
+        .fatal()
+        .or_else(|| inner.observer.take_fatal())
+        .or_else(|| inner.supervision.take_fatal().map(|err| err.to_string()))
+        .or_else(|| {
+            inner
+                .notifier
+                .as_ref()
+                .and_then(|runner| runner.take_fatal().map(|err| err.to_string()))
+        })
+}
+
+/// Post-activation READY gate. Recovery only required ownership.
+/// This requires a fresh, renewal-eligible RUNNING supervision.
+pub(crate) fn require_fresh_running_authority(
+    kernel: &Kernel,
+    snapshots: &[crate::supervision::SupervisedSnapshot],
+    freshness_limit: f64,
+) -> Result<(), RecoveryError> {
+    let now = kernel.now();
+    for cand in kernel
+        .reconciliation_candidates()
+        .map_err(RecoveryError::from)?
+    {
+        if !cand.current_authority_hint().looks_current_at(now) {
+            continue;
+        }
+        if cand.persisted_state() != agentype_core::ExecutionState::Running {
+            return Err(RecoveryError::Invariant(
+                "current authority is not a fresh RUNNING supervision".into(),
+            ));
+        }
+        let fresh = snapshots.iter().any(|snap| {
+            snap.identity.execution_id() == cand.execution_id()
+                && snap.renewal_eligible
+                && now < snap.last_positive_observed_at + freshness_limit
+        });
+        if !fresh {
+            return Err(RecoveryError::Invariant(
+                "current authority lacks fresh renewable supervision".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for RunningSchedulerDaemon {

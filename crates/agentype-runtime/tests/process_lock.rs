@@ -110,3 +110,43 @@ fn different_process_temp_dir_cannot_split_store_ownership() {
     let _ = std::fs::remove_dir_all(alien_tmp);
     let _ = std::fs::remove_file(path);
 }
+
+/// Same inode, new directory. The identity lock must not follow the old parent.
+#[cfg(unix)]
+#[test]
+fn cross_directory_rename_cannot_split_store_ownership() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("agentype-rename-{nanos}"));
+    let source = root.join("a").join("scheduler.sqlite");
+    let dest = root.join("b").join("scheduler.sqlite");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    let mut child = helper()
+        .arg(&source)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn lock helper");
+    let stdout = child.stdout.take().expect("helper stdout");
+    let first = BufReader::new(stdout).lines().next().and_then(Result::ok);
+    assert_eq!(first.as_deref(), Some("LOCKED"));
+
+    std::fs::rename(&source, &dest).expect("rename open store");
+    // Re-open and close in this process. That must not drop the child's flock.
+    drop(std::fs::File::open(&dest).unwrap());
+    let cfg = SqliteRuntimeConfig::new(&dest, 10.0, 16_384).unwrap();
+    match RuntimeProcessGuard::acquire(&cfg) {
+        Err(ProcessLockError::AlreadyRunning) => {}
+        other => panic!("renamed store must stay owned, got {other:?}"),
+    }
+
+    drop(child.stdin.take());
+    let status = child.wait().expect("helper exit");
+    assert!(status.success(), "helper failed: {status}");
+    let _released = RuntimeProcessGuard::acquire(&cfg).expect("lock released after helper exit");
+    let _ = std::fs::remove_dir_all(root);
+}

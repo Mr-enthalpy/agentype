@@ -1,9 +1,13 @@
 //! OS-owned exclusive lock for one Scheduler store.
 //!
 //! Ownership is an OS Runtime property, not a Scheduler Lease, PID file, or
-//! SQLite row. The lock identifies the store by canonical file identity
-//! (Unix `dev:ino`, Windows volume+index), so path aliases and hard links
-//! cannot mint a second daemon.
+//! SQLite row. The same file identity is exclusive even if the path is
+//! renamed to another directory: Unix flocks the store inode (`flock` does
+//! not share SQLite's `fcntl` locks), and Windows holds a named mutex keyed
+//! by the file id (a byte-range lock on the database would collide with
+//! SQLite). A canonical-path sidecar still stops two processes that open
+//! the same path. Hard links fail closed. The lock directory is never
+//! `temp_dir`, `XDG_RUNTIME_DIR`, `HOME`, or `LOCALAPPDATA`.
 
 use fs4::fs_std::FileExt;
 use std::collections::HashSet;
@@ -105,18 +109,6 @@ struct StoreIdentity {
     canonical: String,
 }
 
-impl StoreIdentity {
-    fn adjacent_lock_path(&self) -> Result<PathBuf, ProcessLockError> {
-        let canonical = PathBuf::from(&self.canonical);
-        let parent = canonical.parent().ok_or_else(|| {
-            ProcessLockError::IdentityUnresolvable(
-                "canonical store path has no parent directory".into(),
-            )
-        })?;
-        Ok(parent.join(format!(".agentype-runtime-lock-{}", fnv64(&self.file_id))))
-    }
-}
-
 fn fnv64(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for b in value.bytes() {
@@ -131,6 +123,8 @@ fn fnv64(value: &str) -> u64 {
 /// Non-Clone. Dropping the lock (or process death) releases the OS lock.
 pub struct RuntimeProcessLock {
     _files: Vec<File>,
+    #[cfg(windows)]
+    _identity_mutex: agentype_nlink::IdentityMutex,
     _reservation: IdentityReservation,
     identity: StoreIdentity,
     store_path: PathBuf,
@@ -156,19 +150,31 @@ impl RuntimeProcessLock {
             .open(store_path)?;
         let identity = store_identity(&store, store_path)?;
         let reservation = IdentityReservation::claim(&identity)?;
+        // Identity exclusion follows the file, not its current parent.
+        // Unix: flock on this fd. Windows: named mutex. Never LockFile the db.
+        #[cfg(unix)]
+        match store.try_lock_exclusive() {
+            Ok(true) => {}
+            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+            Err(err) => return Err(err.into()),
+        }
+        #[cfg(windows)]
+        let identity_mutex = match agentype_nlink::try_acquire_identity_mutex(&identity.file_id)? {
+            Some(mutex) => mutex,
+            None => return Err(ProcessLockError::AlreadyRunning),
+        };
         let mut files = vec![store];
-        for lock_path in [store_lock_path(&identity)?, canonical_lock_path(&identity)?] {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)?;
-            match file.try_lock_exclusive() {
-                Ok(true) => files.push(file),
-                Ok(false) => return Err(ProcessLockError::AlreadyRunning),
-                Err(err) => return Err(err.into()),
-            }
+        let lock_path = canonical_lock_path(&identity)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(true) => files.push(file),
+            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+            Err(err) => return Err(err.into()),
         }
         let again = store_identity(files.first().expect("store fd"), store_path)?;
         if again.file_id != identity.file_id || again.canonical != identity.canonical {
@@ -178,10 +184,25 @@ impl RuntimeProcessLock {
         }
         Ok(Self {
             _files: files,
+            #[cfg(windows)]
+            _identity_mutex: identity_mutex,
             _reservation: reservation,
             identity,
             store_path: store_path.to_path_buf(),
         })
+    }
+
+    /// Fail closed when `path` is no longer the file this lock owns.
+    /// Startup calls this after `Kernel::open` re-resolves the path.
+    pub fn confirm_store_identity(&self, path: &Path) -> Result<(), ProcessLockError> {
+        let file = File::open(path)?;
+        let again = store_identity(&file, path)?;
+        if again.file_id != self.identity.file_id {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "scheduler store identity changed before the kernel opened it".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Canonical store identity string. Diagnostic only — not ownership.
@@ -265,10 +286,6 @@ impl RuntimeProcessGuard {
     pub fn lock(&self) -> &RuntimeProcessLock {
         &self.lock
     }
-}
-
-fn store_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
-    identity.adjacent_lock_path()
 }
 
 fn canonical_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
