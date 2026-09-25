@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "SQLite WAL authority for the Agentype M4 kernel"
 
+[features]
+test-support = []
+
 [dependencies]
 agentype-core.workspace = true
 agentype-execution-config.workspace = true

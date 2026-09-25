@@ -678,10 +678,11 @@ impl SupervisionService {
                 Some(entry) => (
                     registry
                         .freshness_limit
-                        .map(|limit| entry.last_positive_observed_at + limit),
+                        .map(|limit| entry.last_positive_observed_at + limit)
+                        .unwrap_or(f64::MAX),
                     entry.freshness_epoch,
                 ),
-                None => (None, 0),
+                None => (f64::MAX, 0),
             }
         };
         let outcome = match self.kernel.renew_supervised_execution_guarded(

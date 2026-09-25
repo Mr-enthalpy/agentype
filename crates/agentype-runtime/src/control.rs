@@ -72,6 +72,14 @@ impl DispatchGate {
     pub(crate) fn is_open(&self) -> bool {
         *self.phase.lock().expect("dispatch gate") == GatePhase::Ready
     }
+
+    pub(crate) fn published_phase(&self) -> crate::DaemonPhase {
+        match *self.phase.lock().expect("dispatch gate") {
+            GatePhase::Closed | GatePhase::Stopping => crate::DaemonPhase::Stopping,
+            GatePhase::Ready => crate::DaemonPhase::Ready,
+            GatePhase::Failed => crate::DaemonPhase::Failed,
+        }
+    }
 }
 
 /// Dispatch result after ControlLoop has consumed a `RunningAdmitted`

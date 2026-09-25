@@ -457,7 +457,7 @@ fn freshness_deadline_is_checked_after_transaction_serialization() {
             &claim.attempt_id,
             claim.lease_epoch,
             &exec,
-            Some(fresh_until),
+            fresh_until,
         )
     });
     std::thread::sleep(std::time::Duration::from_millis(200));

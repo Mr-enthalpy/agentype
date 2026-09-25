@@ -137,6 +137,8 @@ pub enum PhysicalObservationKind {
     IdentityLost,
     ProtocolInvalid,
     InvocationError,
+    /// Unresolved physical uncertainty. Not identity loss.
+    Unresolved,
 }
 
 pub fn classify_execution_observation(
@@ -153,13 +155,19 @@ pub fn classify_execution_observation(
     if observation.state == ExecutionState::Terminated && !observation.terminal_confirmed {
         return PhysicalObservationKind::PhysicalEnded;
     }
+    if observation.state == ExecutionState::Lost {
+        return PhysicalObservationKind::IdentityLost;
+    }
+    if observation.state == ExecutionState::Unknown {
+        return PhysicalObservationKind::Unresolved;
+    }
     if matches!(
         observation.state,
         ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Starting
     ) {
         return PhysicalObservationKind::ProtocolInvalid;
     }
-    PhysicalObservationKind::IdentityLost
+    PhysicalObservationKind::Unresolved
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +449,13 @@ impl PhysicalObserverService {
                 }
                 if activation {
                     self.close_preserving(ticket, class)
+                } else {
+                    Ok(ObserveApply::InvocationIgnored)
+                }
+            }
+            PhysicalObservationKind::Unresolved => {
+                if activation {
+                    self.close_preserving(ticket, FailureClass::Unknown)
                 } else {
                     Ok(ObserveApply::InvocationIgnored)
                 }
@@ -899,7 +914,7 @@ mod tests {
         let (claim, exec) = running(&kernel, "obs-lost");
         svc.admit(mint(&claim, &exec, &kernel)).unwrap();
         fake.set_next_observe(ExecutionObservation {
-            state: ExecutionState::Unknown,
+            state: ExecutionState::Lost,
             terminal_confirmed: false,
             quiescent_confirmed: false,
             detail: None,

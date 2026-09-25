@@ -1005,11 +1005,7 @@ impl<'a> Dispatcher<'a> {
             self.kernel
                 .abort_before_physical_start(&claim.attempt_id, claim.lease_epoch, &execution_id)
                 .map_err(DispatchError::Persistence)?;
-            return Ok(DispatchOneOutcome::StartIndeterminate {
-                execution_id,
-                request_id,
-                failure_class: Some(FailureClass::ResourceUnavailable),
-            });
+            return Ok(DispatchOneOutcome::NoWork);
         }
         let request = EnvironmentStartRequest::from_launch(&snapshot, physical.environment())
             .map_err(|m| DispatchError::Authority(Error::invalid_authority(m.detail)))?;

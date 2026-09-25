@@ -294,7 +294,7 @@ fn classify_commit(event_id: &OutboxEventId, state: OutboxState, success: bool) 
 }
 
 fn bridge_diagnostic(err: &RootBridgeError) -> String {
-    format!("{}: {}", err.kind().as_str(), err.diagnostic().as_str())
+    err.kind().as_str().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -682,10 +682,9 @@ mod tests {
             .unwrap()
             .last_error
             .expect("last_error");
-        assert!(err.starts_with("UNAVAILABLE: "));
+        assert_eq!(err, "UNAVAILABLE");
         assert!(!err.contains("super-secret-token"));
-        assert!(!err.contains("root bridge unavailable"));
-        assert!(err.chars().count() <= 512);
+        assert!(!err.contains("Authorization"));
     }
 
     #[test]

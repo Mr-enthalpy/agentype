@@ -2169,17 +2169,24 @@ impl Kernel {
                 params![execution.id],
             )
             .map_err(map_sqlite)?;
-            Ok(())
-        })?;
-        self.nack(
-            attempt_id,
-            lease_epoch,
-            FailureClass::ResourceUnavailable,
-            None,
-            false,
-            false,
-            false,
-        )
+            tx.execute(
+                "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
+                params![now, _attempt.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE leases SET state='RELEASED',ended_at=?1 WHERE id=?2",
+                params![now, _lease.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE tasks SET state='QUEUED',current_attempt_id=NULL,updated_at=?1 WHERE id=?2",
+                params![now, _task.id],
+            )
+            .map_err(map_sqlite)?;
+            release_agent(tx, &_attempt.logical_agent_id, now)?;
+            Ok(TaskState::Queued)
+        })
     }
 
     pub fn cancel_task(&self, task_id: &TaskId, quiescence_confirmed: bool) -> Result<(), Error> {
@@ -2833,6 +2840,7 @@ impl Kernel {
     /// periodic renewal MUST use `renew_supervised_execution`, which is
     /// fenced by the positively admitted execution identity. Visibility
     /// reduction is scheduled for the M5.8 composition freeze.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn heartbeat(
         &self,
         attempt_id: &AttemptId,
@@ -2874,27 +2882,29 @@ impl Kernel {
     /// `attempt_id` + `lease_epoch` + `execution_id` — never by TaskId or
     /// LogicalAgentId alone. An already-expired lease fails stale; a renewal
     /// can never revive expired authority.
+    /// Test/oracle renewal with no physical-freshness constraint.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn renew_supervised_execution(
         &self,
         attempt_id: &AttemptId,
         lease_epoch: LeaseEpoch,
         execution_id: &ExecutionId,
     ) -> Result<SupervisedRenewal, Error> {
-        self.renew_supervised_execution_guarded(attempt_id, lease_epoch, execution_id, None)
+        self.renew_supervised_execution_guarded(attempt_id, lease_epoch, execution_id, f64::MAX)
     }
 
-    /// Same fenced renewal, with a process-local freshness deadline checked
-    /// at the transaction serialization point (`now` after BEGIN IMMEDIATE).
+    /// Fenced renewal. `fresh_until` is required: there is no production
+    /// call that renews without a physical-freshness endpoint.
     pub fn renew_supervised_execution_guarded(
         &self,
         attempt_id: &AttemptId,
         lease_epoch: LeaseEpoch,
         execution_id: &ExecutionId,
-        fresh_until: Option<UnixTime>,
+        fresh_until: UnixTime,
     ) -> Result<SupervisedRenewal, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
-            if fresh_until.is_some_and(|until| now >= until) {
+            if now >= fresh_until {
                 return Ok(SupervisedRenewal::FreshnessExpired);
             }
             let (attempt, lease, _) =

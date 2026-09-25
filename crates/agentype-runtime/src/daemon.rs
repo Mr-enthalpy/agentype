@@ -321,14 +321,29 @@ impl SchedulerDaemonBuilder {
             }
         };
         if !inner.gate.try_commit_ready() {
+            inner.stop.store(true, Ordering::SeqCst);
+            inner.control.request_stop();
+            inner.observer.request_stop();
+            inner.supervision.request_stop();
+            if let Some(n) = &inner.notifier {
+                n.request_stop();
+            }
+            let _ = watchdog.join();
             let DaemonInner {
                 control,
                 observer,
                 supervision,
                 notifier,
                 ..
-            } = Arc::try_unwrap(inner)
-                .unwrap_or_else(|_| panic!("ready commit lost, daemon arc must still be unique"));
+            } = match Arc::try_unwrap(inner) {
+                Ok(inner) => inner,
+                Err(shared) => {
+                    drop(shared);
+                    return Err(DaemonError::Recovery(RecoveryError::Invariant(
+                        "runner failed before READY; cleanup could not join every worker".into(),
+                    )));
+                }
+            };
             control.request_stop();
             observer.request_stop();
             supervision.request_stop();
@@ -345,7 +360,6 @@ impl SchedulerDaemonBuilder {
                 "a runner failed before READY could be committed".into(),
             )));
         }
-        *inner.phase.lock().expect("daemon phase") = DaemonPhase::Ready;
         Ok(RunningSchedulerDaemon {
             kernel,
             inner: Some(inner),
@@ -399,13 +413,11 @@ pub struct RunningSchedulerDaemon {
 
 impl RunningSchedulerDaemon {
     pub fn phase(&self) -> DaemonPhase {
-        *self
-            .inner
+        self.inner
             .as_ref()
             .expect("daemon inner")
-            .phase
-            .lock()
-            .expect("daemon phase")
+            .gate
+            .published_phase()
     }
 
     pub fn kernel(&self) -> &Kernel {
