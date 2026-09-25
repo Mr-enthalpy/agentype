@@ -73,6 +73,19 @@ impl From<ProcessLockError> for DaemonError {
 }
 
 /// Single-run builder. `start` consumes the builder.
+///
+/// Unlocked recovery and ungated dispatch are not public production APIs.
+///
+/// ```compile_fail
+/// fn _no_unlocked_recovery() {
+///     let _ = agentype_runtime::recover_runtime;
+/// }
+/// ```
+/// ```compile_fail
+/// fn _no_ungated_dispatch() {
+///     let _ = agentype_runtime::Dispatcher::new;
+/// }
+/// ```
 pub struct SchedulerDaemonBuilder {
     store: SqliteRuntimeConfig,
     timing: RuntimeTimingConfig,
@@ -174,14 +187,35 @@ impl SchedulerDaemonBuilder {
         }
         let now = kernel.now();
         let freshness = self.observer.freshness_limit();
-        for snap in supervision.service().observation_snapshots() {
-            if snap.renewal_eligible && now >= snap.last_positive_observed_at + freshness {
+        let local = supervision.service().observation_snapshots();
+        for cand in kernel
+            .reconciliation_candidates()
+            .map_err(DaemonError::Persistence)?
+        {
+            if !cand.current_authority_hint().looks_current_at(now) {
+                continue;
+            }
+            if cand.persisted_state() != agentype_core::ExecutionState::Running {
                 drop(observer_service);
                 drop(notifier);
                 drop(supervision);
                 drop(lock);
                 return Err(DaemonError::Recovery(RecoveryError::Invariant(
-                    "activation left a current execution with stale physical freshness".into(),
+                    "current authority is not a fresh RUNNING supervision".into(),
+                )));
+            }
+            let fresh = local.iter().any(|snap| {
+                snap.identity.execution_id() == cand.execution_id()
+                    && snap.renewal_eligible
+                    && now < snap.last_positive_observed_at + freshness
+            });
+            if !fresh {
+                drop(observer_service);
+                drop(notifier);
+                drop(supervision);
+                drop(lock);
+                return Err(DaemonError::Recovery(RecoveryError::Invariant(
+                    "current authority lacks fresh renewable supervision".into(),
                 )));
             }
         }
@@ -351,15 +385,16 @@ impl RunningSchedulerDaemon {
         } = inner;
         let control_fatal = control.join_fatal();
         let observer_fatal = observer.join_fatal();
-        let supervision_failed = supervision.is_failed();
-        let notifier_failed = notifier.as_ref().is_some_and(|n| n.is_failed());
-        drop(supervision);
-        drop(notifier);
+        let supervision_fatal = supervision.shutdown().err();
+        let notifier_fatal = match notifier {
+            Some(runner) => runner.shutdown().err(),
+            None => None,
+        };
         let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed
             || control_fatal.is_some()
             || observer_fatal.is_some()
-            || supervision_failed
-            || notifier_failed;
+            || supervision_fatal.is_some()
+            || notifier_fatal.is_some();
         if failed {
             DaemonExit::Failed("runtime worker failed".into())
         } else {

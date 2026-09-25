@@ -45,7 +45,7 @@ pub use process_lock::{
     RuntimeProcessLock, SqliteRuntimeConfig,
 };
 pub use recovery::{
-    reconcile_one_execution, recover_runtime, replay_persisted_terminal_consequence, AdmissionSink,
+    reconcile_one_execution, replay_persisted_terminal_consequence, AdmissionSink,
     ReconcileExecutionOutcome, RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -896,7 +896,7 @@ pub struct Dispatcher<'a> {
 }
 
 impl<'a> Dispatcher<'a> {
-    pub fn new(
+    pub(crate) fn new(
         kernel: &'a Kernel,
         execution_registry: &'a ExecutionRegistry,
         adapters: &'a AdapterRegistry,
@@ -914,8 +914,24 @@ impl<'a> Dispatcher<'a> {
         self
     }
 
+    /// Test-support entry. Production dispatch goes through `SchedulerDaemon`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(
+        kernel: &'a Kernel,
+        execution_registry: &'a ExecutionRegistry,
+        adapters: &'a AdapterRegistry,
+    ) -> Self {
+        Self::new(kernel, execution_registry, adapters)
+    }
+
+    /// Test-support dispatch. Not a production entry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dispatch_one_for_tests(&self) -> Result<DispatchOneOutcome, DispatchError> {
+        self.dispatch_one()
+    }
+
     /// Obtain one eligible claim and dispatch it.
-    pub fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
+    pub(crate) fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
         let claim = match self
             .kernel
             .claim_next_available()
@@ -932,7 +948,10 @@ impl<'a> Dispatcher<'a> {
     /// physical request field is derived from the durable launch snapshot,
     /// never from the claim's semantic copies, and identity mismatches are
     /// rejected by the Kernel's authority validation.
-    pub fn dispatch_claim(&self, claim: &Claim) -> Result<DispatchOneOutcome, DispatchError> {
+    pub(crate) fn dispatch_claim(
+        &self,
+        claim: &Claim,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
         // Composition (task §4): authority, then target/profile
         // configuration, then installed adapter. Nothing exists and no
         // adapter is consulted until all three resolve.

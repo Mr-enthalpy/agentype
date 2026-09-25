@@ -79,8 +79,8 @@ fn dispatcher_starts_and_collects_real_fake_agent() {
     kernel
         .submit_batch(&[TaskSpec::new("real-collect", json!({"goal": "echo"}))])
         .unwrap();
-    let d = Dispatcher::new(&kernel, &registry, &adapters);
-    match d.dispatch_one().unwrap() {
+    let d = Dispatcher::for_tests(&kernel, &registry, &adapters);
+    match d.dispatch_one_for_tests().unwrap() {
         DispatchOneOutcome::StartIndeterminate { .. } => {}
         DispatchOneOutcome::RunningAdmitted { admission } => {
             drop(admission);
@@ -119,8 +119,8 @@ fn recovery_readmits_same_binding_key_after_new_adapter_instance() {
     kernel
         .submit_batch(&[TaskSpec::new("hang-recover", json!({}))])
         .unwrap();
-    let d = Dispatcher::new(&kernel, &registry, &adapters);
-    match d.dispatch_one().unwrap() {
+    let d = Dispatcher::for_tests(&kernel, &registry, &adapters);
+    match d.dispatch_one_for_tests().unwrap() {
         DispatchOneOutcome::RunningAdmitted { admission } => drop(admission),
         other => panic!("expected RunningAdmitted, got {other:?}"),
     }
@@ -165,8 +165,8 @@ fn recovery_does_not_readmit_foreign_binding_key() {
     kernel
         .submit_batch(&[TaskSpec::new("hang-foreign", json!({}))])
         .unwrap();
-    let d = Dispatcher::new(&kernel, &registry, &adapters);
-    match d.dispatch_one().unwrap() {
+    let d = Dispatcher::for_tests(&kernel, &registry, &adapters);
+    match d.dispatch_one_for_tests().unwrap() {
         DispatchOneOutcome::RunningAdmitted { admission } => drop(admission),
         other => panic!("expected RunningAdmitted, got {other:?}"),
     }
@@ -225,8 +225,8 @@ fn isolated_target_cannot_use_local_process_adapter() {
     kernel
         .submit_batch(&[TaskSpec::new("isolated-local", json!({}))])
         .unwrap();
-    let d = Dispatcher::new(&kernel, &registry, &adapters);
-    match d.dispatch_one().unwrap() {
+    let d = Dispatcher::for_tests(&kernel, &registry, &adapters);
+    match d.dispatch_one_for_tests().unwrap() {
         DispatchOneOutcome::ConfigurationUnavailable { .. } => {}
         other => panic!("expected ConfigurationUnavailable, got {other:?}"),
     }

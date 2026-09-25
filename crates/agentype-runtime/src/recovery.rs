@@ -623,7 +623,7 @@ impl RecoveredRuntime {
 /// Delivery during RECOVERY is legal: a wakeup asserts a durable event
 /// exists, not that the daemon is READY. Ordinary RootBridge unavailability
 /// does not prevent READY. Durable notifier corruption does.
-pub fn recover_runtime(
+pub(crate) fn recover_runtime(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,

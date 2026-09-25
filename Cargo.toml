@@ -8,6 +8,7 @@ members = [
     "crates/agentype-adapter-local-process",
     "crates/agentype-root-bridge",
     "crates/agentype-runtime",
+    "crates/agentype-nlink",
 ]
 
 [workspace.package]
@@ -30,3 +31,4 @@ serde_json = "1"
 libc = "0.2"
 fs4 = "0.13"
 file-id = "0.2"
+agentype-nlink = { path = "crates/agentype-nlink" }

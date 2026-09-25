@@ -106,9 +106,28 @@ impl ObservationTicket {
     }
 }
 
+#[derive(Clone)]
 struct WatchState {
     ticket: ObservationTicket,
     next_observation_at: UnixTime,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchDisposition {
+    Keep,
+    Forget,
+}
+
+fn watch_disposition(applied: &ObserveApply) -> WatchDisposition {
+    match applied {
+        ObserveApply::PhysicalEnded
+        | ObserveApply::IdentityLost
+        | ObserveApply::AuthorityAlreadyStale
+        | ObserveApply::Dropped => WatchDisposition::Forget,
+        ObserveApply::Refreshed
+        | ObserveApply::ProtocolInvalidated
+        | ObserveApply::InvocationIgnored => WatchDisposition::Keep,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,51 +236,56 @@ impl PhysicalObserverService {
 
     pub fn observe_due(&self, now: UnixTime) -> Result<Vec<ObserveApply>, ObserverError> {
         let poll = self.config.poll_interval;
-        let mut due: Vec<(UnixTime, ObservationTicket)> = self
-            .supervision
-            .observation_snapshots()
-            .into_iter()
-            .filter_map(|snap| {
-                let due_at = snap.last_positive_observed_at + poll;
-                if now >= due_at {
-                    Some((
-                        due_at,
-                        ObservationTicket {
+        {
+            let mut watch = self.watch.lock().expect("physical watch lock");
+            for snap in self.supervision.observation_snapshots() {
+                watch
+                    .entry(snap.identity.execution_id().clone())
+                    .or_insert_with(|| WatchState {
+                        ticket: ObservationTicket {
                             execution_id: snap.identity.execution_id().clone(),
                             request_id: snap.identity.request_id().clone(),
-                            identity: snap.identity,
+                            identity: snap.identity.clone(),
                         },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        {
-            let watch = self.watch.lock().expect("physical watch lock");
-            for state in watch.values() {
-                if now < state.next_observation_at {
-                    continue;
-                }
-                if due
-                    .iter()
-                    .any(|(_, t)| t.execution_id == state.ticket.execution_id)
-                {
-                    continue;
-                }
-                due.push((state.next_observation_at, state.ticket.clone()));
+                        next_observation_at: snap.last_positive_observed_at + poll,
+                    });
             }
         }
-        due.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.execution_id.as_str().cmp(b.1.execution_id.as_str()))
-        });
-        due.truncate(self.config.batch_limit);
+        let mut due: Vec<ObservationTicket> = {
+            let watch = self.watch.lock().expect("physical watch lock");
+            let mut items: Vec<WatchState> = watch
+                .values()
+                .filter(|state| now >= state.next_observation_at)
+                .cloned()
+                .collect();
+            items.sort_by(|a, b| {
+                a.next_observation_at
+                    .partial_cmp(&b.next_observation_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        a.ticket
+                            .execution_id
+                            .as_str()
+                            .cmp(b.ticket.execution_id.as_str())
+                    })
+            });
+            items
+                .into_iter()
+                .take(self.config.batch_limit)
+                .map(|state| state.ticket)
+                .collect()
+        };
         let mut out = Vec::with_capacity(due.len());
-        for (_, ticket) in due {
+        for ticket in due.drain(..) {
             let applied = self.observe_ticket(&ticket, false)?;
-            self.schedule_next(&ticket, now + poll);
+            if watch_disposition(&applied) == WatchDisposition::Forget {
+                self.watch
+                    .lock()
+                    .expect("physical watch lock")
+                    .remove(&ticket.execution_id);
+            } else {
+                self.schedule_next(&ticket, now + poll);
+            }
             out.push(applied);
         }
         Ok(out)
@@ -325,14 +349,13 @@ impl PhysicalObserverService {
                 ) {
                     self.supervision.stop_renewal_eligibility(&ticket.identity);
                 }
+                let mut effective = handle.clone();
                 let artifacts = if kind == PhysicalObservationKind::PhysicalEnded {
                     match adapter.collect_outcome(&handle) {
                         Ok(outcome) => outcome.artifact_refs,
                         Err(err) => {
                             if let Some(hint) = err.runtime_handle_hint() {
-                                let _ = self
-                                    .kernel
-                                    .record_runtime_handle_hint(&ticket.execution_id, &hint.0);
+                                effective = hint.clone();
                             }
                             None
                         }
@@ -340,7 +363,7 @@ impl PhysicalObserverService {
                 } else {
                     None
                 };
-                self.apply_kind(ticket, kind, &handle, activation, None, artifacts)
+                self.apply_kind(ticket, kind, &effective, activation, None, artifacts)
             }
             Err(err) => self.apply_kind(
                 ticket,
@@ -874,5 +897,74 @@ mod tests {
             kernel.task(&claim.task_id).unwrap().state,
             TaskState::Leased
         );
+    }
+
+    #[test]
+    fn failed_observation_does_not_starve_a_healthy_peer() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Arc::new(Kernel::open_memory(clock.clone(), LEASE, 16_384).unwrap());
+        kernel
+            .upsert_partition(&agentype_core::PartitionSpec::new(
+                "general",
+                2,
+                agentype_core::Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let fake = Arc::new(FakeAdapter::new());
+        let svc = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_kind("process", fake.clone(), test_deadlines())
+            .unwrap();
+        let observer = PhysicalObserverService::new(
+            kernel.clone(),
+            adapters,
+            svc.clone(),
+            PhysicalObserverConfig::new(1.0, 4.0, 1, LEASE).unwrap(),
+        );
+        let (c1, e1) = running(&kernel, "starve-a");
+        let (c2, _e2) = running(&kernel, "starve-b");
+        svc.admit(mint(&c1, &e1, &kernel)).unwrap();
+        svc.admit(mint(&c2, &_e2, &kernel)).unwrap();
+        clock.advance(1.0);
+        fake.set_next_observe_error(AdapterError::deadline_exceeded("a blocked"));
+        let first = observer.observe_due(kernel.now()).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = observer.observe_due(kernel.now()).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0], second[0]);
+        assert_eq!(fake.observe_call_count(), 2);
+    }
+
+    #[test]
+    fn physical_end_via_observe_due_is_not_requeued() {
+        let (clock, kernel) = env();
+        let fake = Arc::new(FakeAdapter::new());
+        let (svc, observer) = harness(kernel.clone(), fake.clone());
+        let (claim, exec) = running(&kernel, "obs-forget");
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+        clock.advance(1.0);
+        fake.set_next_observe(ExecutionObservation {
+            state: ExecutionState::Terminated,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            detail: None,
+        });
+        let first = observer.observe_due(kernel.now()).unwrap();
+        assert!(matches!(
+            first.as_slice(),
+            [ObserveApply::PhysicalEnded] | [ObserveApply::AuthorityAlreadyStale]
+        ));
+        let calls = fake.observe_call_count();
+        clock.advance(5.0);
+        let again = observer.observe_due(kernel.now()).unwrap();
+        assert!(
+            again.is_empty(),
+            "ended watch must not be requeued: {again:?}"
+        );
+        assert_eq!(fake.observe_call_count(), calls);
     }
 }

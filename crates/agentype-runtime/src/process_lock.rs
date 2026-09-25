@@ -264,13 +264,19 @@ fn store_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError
     identity.adjacent_lock_path()
 }
 
-fn store_identity(_file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
+fn store_identity(file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
     let _canonical = fs::canonicalize(path).map_err(|err| {
         ProcessLockError::IdentityUnresolvable(format!(
             "cannot canonicalize {}: {err}",
             path.display()
         ))
     })?;
+    let links = agentype_nlink::link_count(file)?;
+    if links > 1 {
+        return Err(ProcessLockError::IdentityUnresolvable(format!(
+            "scheduler store has {links} hard links; production refuses multi-name databases"
+        )));
+    }
     let id = file_id::get_file_id(path).map_err(|err| {
         ProcessLockError::IdentityUnresolvable(format!(
             "cannot read file identity for {}: {err}",
@@ -402,8 +408,16 @@ mod tests {
                 if alias_id.as_deref() == Some(original_id.as_str()) {
                     let alias_cfg = SqliteRuntimeConfig::new(&alias, 10.0, 16_384).unwrap();
                     match RuntimeProcessGuard::acquire(&alias_cfg) {
-                        Err(ProcessLockError::AlreadyRunning) => {}
-                        other => panic!("hardlink must share lock, got {other:?}"),
+                        Err(ProcessLockError::IdentityUnresolvable(_)) => {}
+                        other => panic!("multi-link store must fail closed, got {other:?}"),
+                    }
+                    match RuntimeProcessGuard::acquire(&cfg) {
+                        Err(ProcessLockError::IdentityUnresolvable(_)) => {}
+                        other => {
+                            panic!(
+                                "original path must also refuse a multi-link store, got {other:?}"
+                            )
+                        }
                     }
                 }
                 let _ = fs::remove_file(&alias);
