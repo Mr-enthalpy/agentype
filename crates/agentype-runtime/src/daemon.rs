@@ -326,7 +326,6 @@ impl SchedulerDaemonBuilder {
                 observer,
                 supervision,
                 notifier,
-                gate: _,
                 ..
             } = Arc::try_unwrap(inner)
                 .unwrap_or_else(|_| panic!("ready commit lost, daemon arc must still be unique"));
