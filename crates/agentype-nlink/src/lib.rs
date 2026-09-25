@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(windows)]
 use std::path::PathBuf;
 
 pub fn link_count(file: &File) -> io::Result<u64> {
