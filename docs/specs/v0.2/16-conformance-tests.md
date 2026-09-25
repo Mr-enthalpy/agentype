@@ -45,7 +45,10 @@ authoritative (`RESOURCE_UNAVAILABLE`, no adapter default); configuration
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`; daemon
 single-run; adapter absolute deadlines including cleanup; first-adapter
 runtime/live parity for **one named** reference adapter (opaque handles
-only; which adapter is IMPLEMENTATION-DEFINED). M5 MUST NOT require both
+only; which adapter is IMPLEMENTATION-DEFINED). **M5.8:** OS process
+singleton for one Scheduler store; physical freshness gates heartbeat
+renewal; `collect_outcome` / physical end MUST NOT mint a Task Result;
+second process MUST fail before recovery mutation. M5 MUST NOT require both
 V0.1.3 transports.
 
 ## B. V0.2 semantic tests (M6)

@@ -136,6 +136,7 @@ pub enum NotifierBinding {
         config: NotifierConfig,
         bridge: Arc<dyn RootBridge>,
     },
+    #[cfg(any(test, feature = "test-support"))]
     DisabledForTests,
 }
 
@@ -293,7 +294,7 @@ fn classify_commit(event_id: &OutboxEventId, state: OutboxState, success: bool) 
 }
 
 fn bridge_diagnostic(err: &RootBridgeError) -> String {
-    format!("{err}")
+    err.kind().as_str().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -344,6 +345,15 @@ impl NotifierRunner {
         bridge: Arc<dyn RootBridge>,
         config: NotifierConfig,
     ) -> Result<Self, NotifierError> {
+        Self::start_with_fatal_gate(kernel, bridge, config, None)
+    }
+
+    pub(crate) fn start_with_fatal_gate(
+        kernel: Arc<Kernel>,
+        bridge: Arc<dyn RootBridge>,
+        config: NotifierConfig,
+        fatal_gate: Option<crate::DispatchGate>,
+    ) -> Result<Self, NotifierError> {
         let service = NotifierService::new(kernel, bridge, config.retry_policy());
         let shared = Arc::new(RunnerShared {
             state: Mutex::new(RunnerState::default()),
@@ -363,7 +373,7 @@ impl NotifierRunner {
                     let candidates = match service.due(now, batch_limit) {
                         Ok(c) => c,
                         Err(e) => {
-                            fail_runner(&thread_shared, e);
+                            fail_runner(&thread_shared, e, &fatal_gate);
                             break;
                         }
                     };
@@ -372,7 +382,7 @@ impl NotifierRunner {
                             break;
                         }
                         if let Err(e) = service.deliver_one(&candidate) {
-                            fail_runner(&thread_shared, e);
+                            fail_runner(&thread_shared, e, &fatal_gate);
                             return;
                         }
                     }
@@ -393,6 +403,10 @@ impl NotifierRunner {
                         state.fatal = Some(NotifierError::Invariant(
                             "the notifier worker thread panicked".into(),
                         ));
+                    }
+                    drop(state);
+                    if let Some(gate) = &fatal_gate {
+                        gate.fail();
                     }
                 }
             })
@@ -456,12 +470,16 @@ impl NotifierRunner {
     }
 }
 
-fn fail_runner(shared: &RunnerShared, err: NotifierError) {
+fn fail_runner(shared: &RunnerShared, err: NotifierError, gate: &Option<crate::DispatchGate>) {
     let mut state = shared.state.lock().expect("notifier runner state");
     if state.fatal.is_none() {
         state.fatal = Some(err);
     }
     state.phase = RunnerPhase::Failed;
+    drop(state);
+    if let Some(gate) = gate {
+        gate.fail();
+    }
 }
 
 impl Drop for NotifierRunner {
@@ -662,6 +680,28 @@ mod tests {
             k.result_for_task(&task_id).unwrap().state,
             ResultState::Available
         );
+    }
+
+    #[test]
+    fn last_error_is_kind_plus_bounded_diagnostic_not_display() {
+        let (clock, k) = env();
+        let (_batch, _task, event) = complete_one(&k, "diag", json!({"o": 1}));
+        let bridge = Arc::new(RecordingRootBridge::new());
+        let secret = format!(
+            "Authorization: Bearer super-secret-token\n{}",
+            "x".repeat(600)
+        );
+        bridge.script_err(RootBridgeError::Unavailable(secret.into()));
+        let svc = service(k.clone(), bridge);
+        svc.deliver_due(clock.now(), 8).unwrap();
+        let err = k
+            .outbox_delivery(&event)
+            .unwrap()
+            .last_error
+            .expect("last_error");
+        assert_eq!(err, "UNAVAILABLE");
+        assert!(!err.contains("super-secret-token"));
+        assert!(!err.contains("Authorization"));
     }
 
     #[test]

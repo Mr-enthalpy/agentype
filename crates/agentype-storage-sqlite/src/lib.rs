@@ -12,8 +12,9 @@ mod store;
 pub mod txutil;
 
 pub use kernel::{
-    CurrentAuthorityHint, ExecutionReconciliationSnapshot, Kernel, LeaseSupervisionView,
-    OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant, SupervisedRenewal,
+    CurrentAuthorityHint, ExecutionReconciliationSnapshot, ExecutionRoutingFacts, Kernel,
+    LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,
+    SupervisedRenewal,
 };
 pub use schema::SCHEMA_VERSION;
 pub use store::IMPLEMENTATION_LINE;

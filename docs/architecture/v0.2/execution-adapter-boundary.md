@@ -103,7 +103,10 @@ Adapter timeout is not TERMINATED, LOST, or writer-safety proof.
 ## 4. ExecutionSpec
 
 There is no new Core type named `ExecutionSpec`. The Scheduler semantic
-request is already `ExecutionRequest`, assembled exclusively from:
+worker-plane request may be derived as `worker_protocol_v01::ExecutionRequest`.
+The Adapter production path receives `EnvironmentStartRequest` (physical
+create only: no payload, acceptance, or Result JSON), assembled exclusively
+from the same two sources:
 
 1. `ExecutionLaunchSnapshot` — durable Scheduler identities, workspace,
    payload, acceptance, continuity;

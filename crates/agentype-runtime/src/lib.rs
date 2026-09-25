@@ -9,13 +9,24 @@
 
 pub use agentype_execution_config::*;
 
+pub mod control;
+pub mod daemon;
 pub mod deadlines;
 pub mod notifier;
 pub mod observation;
+pub mod observer;
+pub mod process_lock;
 pub mod recovery;
 pub mod supervision;
 pub mod timing;
 
+pub use control::{
+    ControlCycleReport, ControlDispatch, ControlError, ControlLoopRunner, ControlLoopService,
+    DispatchGate,
+};
+pub use daemon::{
+    DaemonError, DaemonExit, DaemonPhase, RunningSchedulerDaemon, SchedulerDaemonBuilder,
+};
 pub use deadlines::{AdapterDeadlinePolicy, AdapterSafetyEnvelope, ResolvedAdapterBinding};
 pub use notifier::{
     DeliveryOutcome, NotifierBinding, NotifierConfig, NotifierError, NotifierRetryPolicy,
@@ -25,13 +36,24 @@ pub use observation::{
     adapter_invocation_failure_class, normalize_collected_outcome, normalize_start_observation,
     CollectedOutcomeKind, StartObservationKind,
 };
+pub use observer::{
+    classify_execution_observation, ObserveApply, ObserverConfigError, ObserverError,
+    PhysicalObservationKind, PhysicalObserverConfig, PhysicalObserverRunner,
+    PhysicalObserverService,
+};
+pub use process_lock::{
+    hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,
+    RuntimeProcessLock, SqliteRuntimeConfig,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use recovery::{recover_runtime_without_notifier, recover_runtime_without_process_lock};
 pub use recovery::{
-    reconcile_one_execution, recover_runtime, recover_runtime_without_notifier,
     replay_persisted_terminal_consequence, AdmissionSink, ReconcileExecutionOutcome,
     RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
 pub use supervision::{
-    RenewalOutcome, SupervisionError, SupervisionRegistry, SupervisionRunner, SupervisionService,
+    RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
+    SupervisionService,
 };
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 
@@ -40,7 +62,7 @@ use agentype_adapter_api::{
 };
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, ResultId, UnixTime,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskState, UnixTime,
 };
 use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
@@ -272,7 +294,7 @@ impl std::error::Error for AdapterUnavailable {}
 /// imported execution domain. This is NOT SpawnSource and carries no
 /// semantic scheduling authority. An explicitly empty registry is
 /// authoritative — resolution fails closed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AdapterRegistry {
     adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
 }
@@ -765,15 +787,11 @@ impl SupervisionAdmission {
 
 /// Immediate outcome of one dispatch attempt (task §25 vocabulary).
 ///
-/// The vocabulary separates physical certainty from Scheduler/task
-/// consequences (M5.3 outcome-vocabulary closure): `StartIndeterminate`
-/// means the physical start MAY have happened and the durable Execution is
-/// unresolved — it must never be read as "the start definitely failed";
-/// `TerminalFailure` means an authoritative collected terminal failure was
-/// established and the NACK consequence already applied; `TaskCompleted`
-/// means the Task completed with a durable Result; and a physical success
-/// that writer safety refused to complete is its own variant, never
-/// `TaskCompleted`.
+/// Adapter collect cannot create Task Results. `StartIndeterminate` means
+/// the physical start MAY have happened and the durable Execution is
+/// unresolved — it must never be read as "the start definitely failed".
+/// Worker ACK / Result authority is a separate data plane
+/// (`TerminalReplayOutcome` for durable crash replay).
 ///
 /// Deliberately NOT `Clone`: `RunningAdmitted` carries the move-only
 /// `SupervisionAdmission` capability, and copying the outcome would copy a
@@ -809,31 +827,14 @@ pub enum DispatchOneOutcome {
         request_id: RequestId,
         failure_class: Option<FailureClass>,
     },
-    /// An authoritative collected terminal failure was established
-    /// (`collect_outcome` proved terminality); the NACK rules already
-    /// applied (failure row, physical history, retry policy, writer
-    /// safety). No supervision is required.
-    TerminalFailure {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-        failure_class: FailureClass,
-    },
-    /// The adapter completed synchronously, the authoritative ACK path ran,
-    /// and the Task completed with exactly one durable Result.
-    TaskCompleted {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-        result_id: ResultId,
-    },
-    /// The physical execution reported success, but the Task could not
-    /// safely complete because the writer quiescence condition was not
-    /// satisfied (WRITER_SUCCESS_NOT_QUIESCENT suspension): no Result was
-    /// committed and the Task is suspended/escalated. Deliberately NOT
-    /// `TaskCompleted`.
-    WriterSafetySuspendedAfterSuccess {
-        execution_id: ExecutionId,
-        request_id: RequestId,
-    },
+}
+
+/// Fenced authority consequence. Stale authority is visible to the caller
+/// and must not be reported as applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityConsequence {
+    Applied { task_state: TaskState },
+    AuthorityAlreadyStale,
 }
 
 /// Persist identified physical process end, then NACK without Result or
@@ -848,7 +849,7 @@ pub(crate) fn persist_physical_end_then_nack(
     execution_id: &ExecutionId,
     observed_handle: Option<&Value>,
     artifact_refs: Option<&Value>,
-) -> Result<(), Error> {
+) -> Result<AuthorityConsequence, Error> {
     kernel.record_physical_outcome(
         execution_id,
         ExecutionState::Terminated,
@@ -867,8 +868,10 @@ pub(crate) fn persist_physical_end_then_nack(
         false,
         false,
     ) {
-        Ok(_) => Ok(()),
-        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => Ok(()),
+        Ok(task_state) => Ok(AuthorityConsequence::Applied { task_state }),
+        Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+            Ok(AuthorityConsequence::AuthorityAlreadyStale)
+        }
         Err(err) => Err(err),
     }
 }
@@ -882,14 +885,19 @@ pub(crate) fn persist_physical_end_then_nack(
 /// The Dispatcher accepts only authoritative composition objects — an
 /// `ExecutionRegistry` and an `AdapterRegistry` — and therefore cannot use
 /// `DirectUnconfigured` (task §8).
+///
+/// Production dispatch is `ControlLoopService` behind a `ReadyPermit`.
+/// Direct `dispatch_one` remains for M5.2 unit tests and crate-external
+/// adapter conformance tests; it is not the daemon composition path.
 pub struct Dispatcher<'a> {
     kernel: &'a Kernel,
     execution_registry: &'a ExecutionRegistry,
     adapters: &'a AdapterRegistry,
+    gate: Option<&'a crate::control::DispatchGate>,
 }
 
 impl<'a> Dispatcher<'a> {
-    pub fn new(
+    pub(crate) fn new(
         kernel: &'a Kernel,
         execution_registry: &'a ExecutionRegistry,
         adapters: &'a AdapterRegistry,
@@ -898,11 +906,45 @@ impl<'a> Dispatcher<'a> {
             kernel,
             execution_registry,
             adapters,
+            gate: None,
         }
     }
 
+    pub(crate) fn with_gate(mut self, gate: &'a crate::control::DispatchGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Test-support entry. Production dispatch goes through `SchedulerDaemon`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(
+        kernel: &'a Kernel,
+        execution_registry: &'a ExecutionRegistry,
+        adapters: &'a AdapterRegistry,
+    ) -> Self {
+        Self::new(kernel, execution_registry, adapters)
+    }
+
+    /// Test-support dispatch. Not a production entry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dispatch_one_for_tests(&self) -> Result<DispatchOneOutcome, DispatchError> {
+        self.dispatch_one()
+    }
+
     /// Obtain one eligible claim and dispatch it.
-    pub fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
+    ///
+    /// When a gate is installed, the physical-start permit is taken before
+    /// any claim. Shutdown or fatal that already won the gate must not
+    /// create an Attempt.
+    pub(crate) fn dispatch_one(&self) -> Result<DispatchOneOutcome, DispatchError> {
+        let _start_permit = if let Some(gate) = self.gate {
+            match gate.try_begin_physical_start() {
+                Some(permit) => Some(permit),
+                None => return Ok(DispatchOneOutcome::NoWork),
+            }
+        } else {
+            None
+        };
         let claim = match self
             .kernel
             .claim_next_available()
@@ -919,7 +961,10 @@ impl<'a> Dispatcher<'a> {
     /// physical request field is derived from the durable launch snapshot,
     /// never from the claim's semantic copies, and identity mismatches are
     /// rejected by the Kernel's authority validation.
-    pub fn dispatch_claim(&self, claim: &Claim) -> Result<DispatchOneOutcome, DispatchError> {
+    pub(crate) fn dispatch_claim(
+        &self,
+        claim: &Claim,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
         // Composition (task §4): authority, then target/profile
         // configuration, then installed adapter. Nothing exists and no
         // adapter is consulted until all three resolve.
@@ -1670,7 +1715,9 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
             prepared.snapshot().attempt_id().as_str(),
             prepared.snapshot().lease_epoch(),
         );
-        let protocol = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot());
+        let protocol = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        );
         assert_eq!(protocol.as_str(), expected);
         assert!(
             !protocol.as_str().contains("WRITER RECOVERY RULES"),
@@ -1692,9 +1739,11 @@ Do not claim Scheduler ACK; the Scheduler validates the current lease separately
         .workstream(ws.clone());
         let prepared = launch_spec(&kernel, &registry, spec);
 
-        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
-            .as_str()
-            .to_string();
+        let prompt = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        )
+        .as_str()
+        .to_string();
         assert!(
             prompt.contains(
                 "WRITER RECOVERY RULES\n\
@@ -1729,9 +1778,11 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         );
 
         assert_eq!(prepared.snapshot().task_name(), "implement-foo");
-        let prompt = agentype_adapter_api::RenderedWorkerPrompt::from_launch(prepared.snapshot())
-            .as_str()
-            .to_string();
+        let prompt = agentype_adapter_api::worker_protocol_v01::RenderedWorkerPrompt::from_launch(
+            prepared.snapshot(),
+        )
+        .as_str()
+        .to_string();
         assert!(
             prompt.contains("OBJECTIVE\n{\"objective\": \"build feature foo\"}"),
             "the objective is the task payload, not the task name"
@@ -2511,6 +2562,31 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             self.inner
                 .reconcile_start(request_id, persisted_handle, deadline)
         }
+    }
+
+    #[test]
+    fn closed_gate_does_not_consume_an_attempt() {
+        let (kernel, _clock, registry, adapters, fake) = dispatch_env();
+        let gate = DispatchGate::open();
+        gate.begin_shutdown();
+        let d = Dispatcher::new(&kernel, &registry, &adapters).with_gate(&gate);
+        let (_batch, ids) = kernel
+            .submit_batch(&[
+                TaskSpec::new("no-budget", serde_json::json!({"o": 1})).retry(RetryPolicy {
+                    max_attempts: 2,
+                    ..RetryPolicy::default()
+                }),
+            ])
+            .unwrap();
+        let task_id = ids.values().next().unwrap().clone();
+        assert!(matches!(
+            d.dispatch_one().unwrap(),
+            DispatchOneOutcome::NoWork
+        ));
+        assert_eq!(fake.start_call_count(), 0);
+        assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Queued);
+        let claim = kernel.claim_next_available().unwrap().unwrap();
+        assert_eq!(claim.attempt_number, 1);
     }
 
     #[test]
@@ -4501,12 +4577,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         ));
     }
 
-    /// #62 + #64: a successful synchronous ACK returns `TaskCompleted` with
-    /// a concrete (non-optional) `ResultId`, and `RunningAdmitted` is the
-    /// only outcome that carries a `SupervisionAdmission` — structurally
-    /// guaranteed by the enum shape and asserted here on the admitted path.
+    /// Adapter collect cannot mint a Result. `RunningAdmitted` is the only
+    /// outcome that carries a `SupervisionAdmission`.
     #[test]
-    fn task_completed_carries_concrete_result_and_only_running_admitted_carries_admission() {
+    fn adapter_collect_cannot_complete_task_and_only_running_admitted_carries_admission() {
         let (kernel, _clock, registry, adapters, fake) = dispatch_env();
         let d = Dispatcher::new(&kernel, &registry, &adapters);
         let (_batch, ids) = kernel
@@ -4530,9 +4604,7 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         }
     }
 
-    /// #63: a physical success that writer safety refuses to complete is
-    /// `WriterSafetySuspendedAfterSuccess` — a distinct outcome, never
-    /// `TaskCompleted`.
+    /// Physical collect of an unisolated WRITE still suspends without Result.
     #[test]
     fn writer_safety_suspension_is_distinct_from_task_completed() {
         let (kernel, _clock, registry, adapters, fake) = dispatch_env();

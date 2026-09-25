@@ -69,3 +69,15 @@ Backoff clock: [03](03-task-attempt-lease-result.md) (completion, not start).
 
 A SchedulerDaemon object MUST be single-run. A second `run` while notifier
 shutdown is in progress MUST be rejected.
+
+**M5.8:** one Scheduler store has exactly one production daemon, identified
+by OS process lock on store file identity (not a Scheduler Lease). Startup
+MUST acquire that lock before Kernel recovery mutation or Adapter I/O.
+`recover_runtime` grants activation, not dispatch. READY requires a
+runtime-local `ReadyPermit` minted only after physical-observation
+activation and runner health. Physical observation does not renew
+authority; stale freshness stops renewal eligibility without inventing
+death, termination, or quiescence. Shutdown stops Scheduler mechanics; it
+MUST NOT cancel semantic work or terminate external agents. The only safe
+recovery from a failed Runtime component is a new Runtime lifecycle through
+the full restart barrier.
