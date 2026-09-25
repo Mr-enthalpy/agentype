@@ -1234,8 +1234,13 @@ impl Kernel {
         self.tx(|tx, now| {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id,partition_name,workstream_id,continuity,affinity_tags_json
-                     FROM tasks WHERE state='QUEUED'",
+                    "SELECT t.id,t.partition_name,t.workstream_id,t.continuity,t.affinity_tags_json,
+                            p.tags_json
+                     FROM tasks t
+                     JOIN batches b ON b.id=t.batch_id
+                     JOIN pool_partitions p ON p.name=t.partition_name
+                     WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1
+                     ORDER BY t.priority DESC,t.created_at,t.id",
                 )
                 .map_err(map_sqlite)?;
             let tasks = stmt
@@ -1246,13 +1251,14 @@ impl Kernel {
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 })
                 .map_err(map_sqlite)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_sqlite)?;
             drop(stmt);
-            for (_id, partition, workstream, continuity, tags_json) in tasks {
+            for (_id, partition, workstream, continuity, tags_json, partition_tags_json) in tasks {
                 let required = parse_str_list(&tags_json)?;
                 let continuity = ContinuityPreference::parse_sql(&continuity)?;
                 let mut agent_stmt = tx
@@ -1261,24 +1267,36 @@ impl Kernel {
                          FROM logical_agents WHERE partition_name=?1 AND state='READY'",
                     )
                     .map_err(map_sqlite)?;
-                let agents = agent_stmt
+                let raw_agents = agent_stmt
                     .query_map(params![partition], |r| {
-                        Ok(ClaimAgentSnapshot {
-                            id: r.get(0)?,
-                            state: LogicalAgentState::Ready,
-                            assigned_to_task: r.get::<_, Option<String>>(4)?.is_some(),
-                            partition: partition.clone(),
-                            workstream_id: r.get(2)?,
-                            tags: parse_str_list(&r.get::<_, String>(3)?)
-                                .unwrap_or_default(),
-                            available_since: r.get(5)?,
-                            created_at: r.get(6)?,
-                        })
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<f64>>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
                     })
                     .map_err(map_sqlite)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(map_sqlite)?;
                 drop(agent_stmt);
+                let mut agents = Vec::with_capacity(raw_agents.len());
+                for (id, workstream_id, tags_json, current_task, available_since, created_at) in
+                    raw_agents
+                {
+                    agents.push(ClaimAgentSnapshot {
+                        id,
+                        state: LogicalAgentState::Ready,
+                        assigned_to_task: current_task.is_some(),
+                        partition: partition.clone(),
+                        workstream_id,
+                        tags: parse_str_list(&tags_json)?,
+                        available_since,
+                        created_at,
+                    });
+                }
                 let intent = ClaimIntent {
                     partition: &partition,
                     required_tags: &required,
@@ -1286,16 +1304,9 @@ impl Kernel {
                     continuity,
                 };
                 if select_claim_agent(&agents, &intent).is_none() {
-                    let partition_tags: String = tx
-                        .query_row(
-                            "SELECT tags_json FROM partitions WHERE name=?1",
-                            params![partition],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or_else(|_| "[]".to_string());
-                    let mut tags = parse_str_list(&partition_tags).unwrap_or_default();
+                    let mut tags = parse_str_list(&partition_tags_json)?;
                     for tag in required {
-                        if !tags.iter().any(|t| t == &tag) {
+                        if !tags.iter().any(|existing| existing == &tag) {
                             tags.push(tag);
                         }
                     }

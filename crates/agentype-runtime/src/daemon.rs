@@ -161,6 +161,7 @@ impl SchedulerDaemonBuilder {
             self.timing,
             self.notifier,
             gate.clone(),
+            self.observer.freshness_limit(),
         )
         .map_err(DaemonError::Recovery)?;
         if recovered.runner().is_failed() {

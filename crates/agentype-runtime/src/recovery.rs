@@ -629,7 +629,7 @@ pub(crate) fn recover_runtime(
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, notifier, None, None)
+    recover_runtime_inner(kernel, adapters, timing, notifier, None, None, None)
 }
 
 pub(crate) fn recover_runtime_with_gate(
@@ -638,8 +638,17 @@ pub(crate) fn recover_runtime_with_gate(
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
     gate: crate::DispatchGate,
+    freshness_limit: f64,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    recover_runtime_inner(kernel, adapters, timing, notifier, None, Some(gate))
+    recover_runtime_inner(
+        kernel,
+        adapters,
+        timing,
+        notifier,
+        None,
+        Some(gate),
+        Some(freshness_limit),
+    )
 }
 
 /// Test-support recovery that does not acquire `RuntimeProcessLock`.
@@ -672,6 +681,7 @@ fn recover_runtime_inner(
     notifier: NotifierBinding,
     fail_after_readmits: Option<usize>,
     fatal_gate: Option<crate::DispatchGate>,
+    freshness_limit: Option<f64>,
 ) -> Result<RecoveredRuntime, RecoveryError> {
     kernel.expire_leases(true).map_err(RecoveryError::from)?;
 
@@ -692,6 +702,9 @@ fn recover_runtime_inner(
         NotifierBinding::DisabledForTests => None,
     };
     let guard = StartupGuard::new(runner, notifier_runner);
+    if let Some(limit) = freshness_limit {
+        guard.runner().service().enable_freshness_gate(limit);
+    }
     guard.check_healthy()?;
 
     let candidates = kernel
@@ -756,6 +769,7 @@ fn recover_runtime_failing_after_readmits(
         timing,
         NotifierBinding::DisabledForTests,
         Some(after),
+        None,
         None,
     )
 }
@@ -2204,6 +2218,7 @@ mod tests {
                 bridge: bridge.clone(),
             },
             Some(1),
+            None,
             None,
         ) {
             Err(err) => err,

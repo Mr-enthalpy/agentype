@@ -217,8 +217,8 @@ impl<S: AdmissionSink> ControlLoopService<S> {
         self.kernel.expire_leases(false)?;
         self.kernel.promote_retry_wait()?;
         self.kernel.reconcile_pool()?;
-        self.kernel.ensure_task_consumers()?;
         self.kernel.revive_eligible_agents()?;
+        self.kernel.ensure_task_consumers()?;
         if !self.gate.is_open() {
             return Ok(ControlCycleReport {
                 dispatch: ControlDispatch::NoWork,

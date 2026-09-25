@@ -155,22 +155,29 @@ impl RuntimeProcessLock {
             .truncate(false)
             .open(store_path)?;
         let identity = store_identity(&store, store_path)?;
-        drop(store);
         let reservation = IdentityReservation::claim(&identity)?;
-        let lock_path = store_lock_path(&identity)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        match file.try_lock_exclusive() {
-            Ok(true) => {}
-            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
-            Err(err) => return Err(err.into()),
+        let mut files = vec![store];
+        for lock_path in [store_lock_path(&identity)?, canonical_lock_path(&identity)?] {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            match file.try_lock_exclusive() {
+                Ok(true) => files.push(file),
+                Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let again = store_identity(files.first().expect("store fd"), store_path)?;
+        if again.file_id != identity.file_id || again.canonical != identity.canonical {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "scheduler store identity changed while the lock was acquired".into(),
+            ));
         }
         Ok(Self {
-            _files: vec![file],
+            _files: files,
             _reservation: reservation,
             identity,
             store_path: store_path.to_path_buf(),
@@ -262,6 +269,19 @@ impl RuntimeProcessGuard {
 
 fn store_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
     identity.adjacent_lock_path()
+}
+
+fn canonical_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
+    let canonical = PathBuf::from(&identity.canonical);
+    let parent = canonical.parent().ok_or_else(|| {
+        ProcessLockError::IdentityUnresolvable(
+            "canonical store path has no parent directory".into(),
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".agentype-runtime-path-{}",
+        fnv64(&identity.canonical)
+    )))
 }
 
 fn store_identity(file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
