@@ -21,3 +21,7 @@ agentype-nlink.workspace = true
 [dev-dependencies]
 rusqlite.workspace = true
 agentype-execution-config = { workspace = true, features = ["test-support"] }
+# `Kernel::attempt_count_for_task` is a test-support read, so this crate's own
+# tests need storage's test surface. It stays out of the production feature
+# set: only dev-dependency builds unify this feature in.
+agentype-storage-sqlite = { workspace = true, features = ["test-support"] }

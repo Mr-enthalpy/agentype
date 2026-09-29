@@ -416,6 +416,16 @@ impl RunningSchedulerDaemon {
         &self.kernel
     }
 
+    /// Narrow production control and diagnostics surface.
+    ///
+    /// This is the only production path that mutates Scheduler authority from
+    /// outside the Runtime. Worker acknowledgement, Runtime-owned mechanics,
+    /// and writer-quiescence overrides are not reachable through it.
+    pub fn control(&self) -> crate::SchedulerControl<'_> {
+        let lock = self._lock.lock();
+        crate::SchedulerControl::new(&self.kernel, lock.identity_debug(), lock.store_path())
+    }
+
     pub fn poll_health(&self) {
         let inner = self.inner.as_ref().expect("daemon inner");
         let failed = inner.control.is_failed()

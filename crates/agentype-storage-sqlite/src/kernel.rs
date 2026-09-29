@@ -2923,6 +2923,27 @@ impl Kernel {
         })
     }
 
+    /// Test-support only: how many Attempts a Task has ever created.
+    ///
+    /// A claim derives its `attempt_number` from exactly this count, so this
+    /// read makes "no Attempt was created" directly assertable instead of
+    /// inferable from the next claim's number. It exists so a regression that
+    /// spends retry budget without a physical start is visible before any
+    /// Execution exists.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attempt_count_for_task(&self, task_id: &TaskId) -> Result<u32, Error> {
+        self.store.query(|conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)?;
+            Ok(count as u32)
+        })
+    }
+
     /// LEGACY M4 primitive (frozen test surface only). This renewal is
     /// fenced by attempt_id + lease_epoch alone: it takes no execution
     /// identity and is NOT wired to supervision admission. Production

@@ -8,6 +8,19 @@ description = "SQLite WAL authority for the Agentype M4 kernel"
 [features]
 test-support = []
 
+# These two targets exercise the LEGACY M4 primitives `heartbeat` and
+# `renew_supervised_execution`, which exist only under `test-support`.
+# Declaring that requirement keeps a default-feature `cargo test` buildable
+# instead of failing to compile these targets, while the CI `--all-features`
+# run still executes them.
+[[test]]
+name = "m4_kernel"
+required-features = ["test-support"]
+
+[[test]]
+name = "supervision"
+required-features = ["test-support"]
+
 [dependencies]
 agentype-core.workspace = true
 agentype-execution-config.workspace = true

@@ -26,6 +26,7 @@ manufacturing Task, Result, or quiescence semantics.
 | D | `ControlLoopService` / `ControlLoopRunner` behind `ReadyPermit` |
 | E | `SchedulerDaemonBuilder` lifecycle, observer runner, shutdown |
 | F | RootBridge bounded diagnostics; LocalProcess live acceptance; architecture |
+| G | Narrow host control surface (`SchedulerControl`); composition closure |
 
 SCHEMA_VERSION remains 4.
 
@@ -54,6 +55,42 @@ current executions, and required runner health.
 
 Shutdown revokes DispatchGate before claim/start, then joins workers and
 summarizes fatal after those joins.
+
+## Host control surface
+
+`RunningSchedulerDaemon::control` lends a `SchedulerControl`, borrowed from
+the daemon so it cannot outlive the process lock and carrying no public
+constructor so it cannot be forged. It replaces the raw `Kernel` getter as
+the production path into Scheduler authority; `daemon.kernel()` is
+test-support only.
+
+Reachable: submit Batch, cancel Task/Batch, pool topology, Result ACK, Outbox
+ACK, diagnostics.
+
+Unreachable by construction: Worker acknowledgement (`ack_success`, `nack`,
+`nack_preserving_physical_history`), Runtime-owned mechanics (claim,
+execution commit, physical outcome, lease expiry, retry promotion, recovery,
+revival, renewal, outbox delivery pipeline), and the `cancel_task`
+`quiescence_confirmed` override.
+
+`resolve_escalation` is left out deliberately and is not claimed as closed:
+it selects a recovery primitive, so it belongs to the Escalation milestone.
+
+Four `compile_fail` doctests pin the absences, and one of them is backed by a
+probe run confirming the referenced externs resolve, so each failure is
+about the missing API rather than a missing crate.
+
+## Composition closure follow-ups
+
+`Kernel::attempt_count_for_task` is a test-support read that makes "no
+Attempt was created" directly assertable; the gate regression now asserts
+`attempt_count == 0` instead of inferring it from the next claim's number.
+
+`m4_kernel` and `supervision` declare `required-features = ["test-support"]`,
+because they exercise the legacy `heartbeat` / `renew_supervised_execution`
+primitives that only exist under that feature. A default-feature
+`cargo test --workspace` now compiles; the CI `--all-features` run still
+executes both targets.
 
 ## Diagnostic contract
 

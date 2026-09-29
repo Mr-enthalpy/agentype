@@ -17,6 +17,7 @@ pub mod observation;
 pub mod observer;
 pub mod process_lock;
 pub mod recovery;
+pub mod scheduler_control;
 pub mod supervision;
 pub mod timing;
 
@@ -51,6 +52,7 @@ pub use recovery::{
     replay_persisted_terminal_consequence, AdmissionSink, ReconcileExecutionOutcome,
     RecoveredRuntime, RecoveryError, TerminalReplayOutcome,
 };
+pub use scheduler_control::{BatchSubmission, SchedulerControl};
 pub use supervision::{
     RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
     SupervisionService,
@@ -2585,6 +2587,9 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         ));
         assert_eq!(fake.start_call_count(), 0);
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Queued);
+        // Directly assertable now: a gate that lost the permit created no
+        // Attempt at all, so no retry budget was spent.
+        assert_eq!(kernel.attempt_count_for_task(&task_id).unwrap(), 0);
         let claim = kernel.claim_next_available().unwrap().unwrap();
         assert_eq!(claim.attempt_number, 1);
     }
