@@ -2364,7 +2364,7 @@ mod tests {
         .unwrap();
         k.reconcile_pool().unwrap();
         let kernel = Arc::new(k);
-        let (claim_early, early) = start_named(&kernel, TaskSpec::new("early", json!({"o": 1})));
+        let (_c1, early) = start_named(&kernel, TaskSpec::new("early", json!({"o": 1})));
         let (_c2, later) = start_named(
             &kernel,
             TaskSpec::new("later", json!({"o": 1})).partition("general-b"),
@@ -2405,34 +2405,6 @@ mod tests {
         let snaps = recovered.runner().service().observation_snapshots();
         require_fresh_running_authority(&kernel, &snaps, 4.0)
             .expect("positive observation restores fresh renewal");
-
-        // M5.8 audit round 2, P1 (activation): reaching READY is not enough.
-        // A refreshed entry must be DEADLINE-SAFE again — its next renewal
-        // scheduled before its durable expiry — otherwise the daemon
-        // publishes READY and the healthy Execution expires moments later.
-        // The heartbeat step must therefore renew it rather than skip it as
-        // not-yet-due.
-        let before = kernel
-            .lease_supervision_view(&claim_early.attempt_id)
-            .unwrap()
-            .expires_at;
-        let outcomes = recovered.runner().service().renew_due_now().unwrap();
-        let renewed = outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, RenewalOutcome::Renewed { .. }))
-            .count();
-        assert!(
-            renewed > 0,
-            "a refreshed entry must be renewable again, got {outcomes:?}"
-        );
-        let after = kernel
-            .lease_supervision_view(&claim_early.attempt_id)
-            .unwrap()
-            .expires_at;
-        assert!(
-            after > before,
-            "the refreshed entry must renew before its durable expiry: {before} -> {after}"
-        );
         drop(recovered);
     }
 

@@ -776,6 +776,26 @@ impl SupervisionService {
             .snapshots()
     }
 
+    /// Run `decide` as the supervision readiness barrier.
+    ///
+    /// The registry lock is held for the whole call, so no observation-driven
+    /// or heartbeat-driven change to renewal eligibility or to the renewal
+    /// schedule can interleave with the decision. The composition root
+    /// validates READY and flips the DispatchGate inside this barrier, which
+    /// is what gives READY publication a linearization point: at the instant
+    /// of the flip, the invariant was decided against a state that nothing
+    /// else could be mutating.
+    ///
+    /// The registry lock is a leaf: holders release it before any Kernel
+    /// transaction, so holding it across a short validation is safe.
+    pub(crate) fn with_readiness_barrier<T>(
+        &self,
+        decide: impl FnOnce(&[SupervisedSnapshot]) -> T,
+    ) -> T {
+        let registry = self.registry.lock().expect("supervision registry lock");
+        decide(&registry.snapshots())
+    }
+
     /// Re-establish physical freshness for an owned entry. Returns whether a
     /// current entry was refreshed.
     pub(crate) fn refresh_freshness(
@@ -2020,6 +2040,66 @@ mod tests {
         }
 
         runner.shutdown().unwrap();
+    }
+
+    /// M5.8 audit round 3, P1-1: the readiness barrier must exclude every
+    /// freshness mutation, which is what lets the composition root decide
+    /// READY against a state nothing else can be changing.
+    #[test]
+    fn readiness_barrier_excludes_freshness_mutation() {
+        let (_clock, kernel) = env();
+        let svc = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        let (claim, exec) = running_execution(&kernel, "ready-barrier");
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+        svc.enable_freshness_gate(4.0);
+        svc.stop_renewal_eligibility(
+            &svc.observation_snapshots()
+                .into_iter()
+                .find(|snap| snap.identity.execution_id() == &exec)
+                .expect("admitted snapshot")
+                .identity,
+        );
+        assert_eq!(svc.renewal_eligible(&exec), Some(false));
+
+        let sink = SupervisionFreshnessSink::standalone(svc.clone());
+        let identity = svc
+            .observation_snapshots()
+            .into_iter()
+            .find(|snap| snap.identity.execution_id() == &exec)
+            .expect("admitted snapshot")
+            .identity;
+
+        // The refresher needs the registry lock the barrier holds, so it must
+        // not be joined from inside the barrier.
+        let mut refresher = None;
+        let mut applied_inside = true;
+        svc.with_readiness_barrier(|snapshots| {
+            refresher = Some({
+                let sink = sink.clone();
+                let identity = identity.clone();
+                std::thread::spawn(move || sink.refresh_positive(&identity, 1_010.0))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            applied_inside = snapshots
+                .iter()
+                .find(|snap| snap.identity.execution_id() == &exec)
+                .expect("snapshot inside barrier")
+                .renewal_eligible;
+        });
+        refresher
+            .expect("refresher spawned")
+            .join()
+            .expect("refresher thread");
+
+        assert!(
+            !applied_inside,
+            "a refresh must not land inside the readiness barrier"
+        );
+        assert_eq!(
+            svc.renewal_eligible(&exec),
+            Some(true),
+            "the refresh applies once the barrier is released"
+        );
     }
 
     /// Fatal smoke: a corrupted durable lease row stops the loop and

@@ -213,14 +213,6 @@ impl SchedulerDaemonBuilder {
             )));
         }
         let freshness = self.observer.freshness_limit();
-        let local = startup
-            .supervision
-            .as_ref()
-            .expect("supervision")
-            .service()
-            .observation_snapshots();
-        require_fresh_running_authority(&kernel, &local, freshness)
-            .map_err(DaemonError::Recovery)?;
         let permit = ReadyPermit::mint();
         let control_service = ControlLoopService::new(
             kernel.clone(),
@@ -235,9 +227,15 @@ impl SchedulerDaemonBuilder {
             permit,
             gate.clone(),
         );
-        let observer = PhysicalObserverRunner::start(observer_service, gate.clone())
+        // Workers start PAUSED behind the READY publication boundary
+        // (M5.8 audit round 3, P1-1). Neither observation nor maintenance may
+        // run between the readiness validation and the gate flip, because
+        // both can invalidate the READY invariant.
+        let ready = crate::control::ReadyRelease::new();
+        let observer = PhysicalObserverRunner::start(observer_service, gate.clone(), ready.clone())
             .map_err(DaemonError::Observer)?;
-        let control = ControlLoopRunner::start(control_service).map_err(DaemonError::Control)?;
+        let control = ControlLoopRunner::start(control_service, ready.clone())
+            .map_err(DaemonError::Control)?;
         let supervision = startup.supervision.take().expect("supervision");
         let notifier = startup.notifier.take();
         let lock = startup.lock.take().expect("process lock");
@@ -310,7 +308,51 @@ impl SchedulerDaemonBuilder {
                 )));
             }
         };
-        if !inner.gate.try_commit_ready() {
+        // READY publication: validation and the gate flip share one
+        // supervision readiness barrier, so no worker can change renewal
+        // eligibility or freshness between them. The workers are released
+        // inside the barrier, strictly after the flip.
+        //
+        // Runner health is checked BEFORE the barrier, not inside it: reading
+        // a runner's state lock while holding the supervision registry lock
+        // would invert the state -> registry order that `refresh_positive`
+        // establishes. It is also redundant inside, because every runner
+        // fatal publishes to the same dispatch gate synchronously, so
+        // `try_commit_ready` is the authoritative interlock.
+        let already_failed = inner.control.is_failed()
+            || inner.observer.is_failed()
+            || inner.supervision.is_failed()
+            || inner
+                .notifier
+                .as_ref()
+                .is_some_and(|notifier| notifier.is_failed());
+        let mut refusal: Option<DaemonError> = if already_failed {
+            Some(DaemonError::Recovery(RecoveryError::Invariant(
+                "a runner failed before READY could be committed".into(),
+            )))
+        } else {
+            None
+        };
+        let committed = refusal.is_none()
+            && inner
+                .supervision
+                .service()
+                .with_readiness_barrier(|snapshots| {
+                    if let Err(err) = require_fresh_running_authority(&kernel, snapshots, freshness)
+                    {
+                        refusal = Some(DaemonError::Recovery(err));
+                        return false;
+                    }
+                    if !inner.gate.try_commit_ready() {
+                        refusal = Some(DaemonError::Recovery(RecoveryError::Invariant(
+                            "the dispatch gate was already failed or stopping before READY".into(),
+                        )));
+                        return false;
+                    }
+                    ready.release();
+                    true
+                });
+        if !committed {
             inner.stop.store(true, Ordering::SeqCst);
             inner.control.request_stop();
             inner.observer.request_stop();
@@ -346,9 +388,11 @@ impl SchedulerDaemonBuilder {
             if let Some(n) = notifier {
                 let _ = n.shutdown();
             }
-            return Err(DaemonError::Recovery(RecoveryError::Invariant(
-                "a runner failed before READY could be committed".into(),
-            )));
+            return Err(refusal.unwrap_or_else(|| {
+                DaemonError::Recovery(RecoveryError::Invariant(
+                    "READY could not be published".into(),
+                ))
+            }));
         }
         Ok(RunningSchedulerDaemon {
             kernel,
@@ -583,7 +627,7 @@ mod tests {
     use crate::deadlines::test_deadlines;
     use crate::process_lock::RuntimeProcessGuard;
     use agentype_adapter_api::FakeAdapter;
-    use agentype_core::{PartitionSpec, Retention, TaskSpec, TaskState};
+    use agentype_core::{ExecutionState, PartitionSpec, Retention, TaskSpec, TaskState};
     use agentype_execution_config::{ExecutionProfileConfig, ExecutionTargetConfig};
     use serde_json::json;
     use std::path::PathBuf;
@@ -635,6 +679,230 @@ mod tests {
             NotifierBinding::DisabledForTests,
         )
         .unwrap()
+    }
+
+    /// Process adapter that panics on observation once armed, so the
+    /// observer thread's panic path is exercised through the real daemon
+    /// composition rather than a synthetic fault-injection framework.
+    struct PanickingObserverAdapter {
+        inner: FakeAdapter,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl PanickingObserverAdapter {
+        fn new() -> Self {
+            Self {
+                inner: FakeAdapter::new(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl agentype_adapter_api::ExecutionAdapter for PanickingObserverAdapter {
+        fn start_execution(
+            &self,
+            request: &agentype_adapter_api::EnvironmentStartRequest,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::StartObservation> {
+            self.inner.start_execution(request, deadline)
+        }
+
+        fn observe_execution(
+            &self,
+            handle: &agentype_adapter_api::RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::ExecutionObservation>
+        {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "armed observer fault for the daemon fatal chain"
+            );
+            self.inner.observe_execution(handle, deadline)
+        }
+
+        fn interrupt_execution(
+            &self,
+            handle: &agentype_adapter_api::RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::ExecutionObservation>
+        {
+            self.inner.interrupt_execution(handle, deadline)
+        }
+
+        fn terminate_execution(
+            &self,
+            handle: &agentype_adapter_api::RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::ExecutionObservation>
+        {
+            self.inner.terminate_execution(handle, deadline)
+        }
+
+        fn collect_outcome(
+            &self,
+            handle: &agentype_adapter_api::RuntimeHandle,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::PhysicalExecutionOutcome>
+        {
+            self.inner.collect_outcome(handle, deadline)
+        }
+
+        fn reconcile_start(
+            &self,
+            request_id: &agentype_core::RequestId,
+            persisted_handle: Option<&agentype_adapter_api::RuntimeHandle>,
+            deadline: &agentype_adapter_api::AdapterDeadline,
+        ) -> agentype_adapter_api::AdapterResult<agentype_adapter_api::StartObservation> {
+            self.inner
+                .reconcile_start(request_id, persisted_handle, deadline)
+        }
+    }
+
+    fn adapter_composition(
+        adapter: Arc<dyn agentype_adapter_api::ExecutionAdapter>,
+    ) -> (ExecutionRegistry, AdapterRegistry) {
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "process", false))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_kind("process", adapter, test_deadlines())
+            .unwrap();
+        (registry, adapters)
+    }
+
+    fn builder_with(
+        path: &std::path::Path,
+        adapters: AdapterRegistry,
+        registry: ExecutionRegistry,
+    ) -> SchedulerDaemonBuilder {
+        let store = SqliteRuntimeConfig::new(path, LEASE, 16_384).unwrap();
+        SchedulerDaemonBuilder::new(
+            store,
+            timing(),
+            observer(),
+            registry,
+            adapters,
+            NotifierBinding::DisabledForTests,
+        )
+        .unwrap()
+    }
+
+    /// M5.8 audit round 3, P1-2: the global fatal chain, end to end.
+    ///
+    /// M5.8 is the milestone that *composes* the runners, so component-level
+    /// fatal tests are not composition closure. This drives a real observer
+    /// fatal through a running daemon and checks what the whole runtime does:
+    /// stop new dispatch, stop renewals, join every worker, release the lock,
+    /// and let the next daemon recover.
+    #[test]
+    fn observer_fatal_stops_dispatch_renewal_and_releases_the_lock() {
+        let path = temp_store();
+        let adapter = Arc::new(PanickingObserverAdapter::new());
+        let (registry, adapters) = adapter_composition(adapter.clone());
+        let daemon = builder_with(&path, adapters, registry).start().unwrap();
+        assert_eq!(daemon.phase(), DaemonPhase::Ready);
+
+        // Bring up capacity and one long-running execution, and wait until it
+        // is actually supervised and being renewed.
+        let control = daemon.control();
+        control
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        control.reconcile_pool().unwrap();
+        let submission = control
+            .submit_batch(&[TaskSpec::new("fatal-run", json!({"o": 1}))])
+            .unwrap();
+        let task_id = submission.task_ids["fatal-run"].clone();
+        let kernel = daemon.kernel();
+        wait_until(Duration::from_secs(8), || {
+            kernel.reconciliation_candidates().unwrap().iter().any(|c| {
+                kernel.execution(c.execution_id()).unwrap().state == ExecutionState::Running
+            })
+        });
+        let candidate = kernel
+            .reconciliation_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| kernel.execution(c.execution_id()).unwrap().state == ExecutionState::Running)
+            .expect("a supervised execution");
+        let attempt_id = candidate.attempt_id().clone();
+
+        // Arm the fault: the observer thread panics on its next observation.
+        adapter.arm();
+        wait_until(Duration::from_secs(8), || {
+            daemon.phase() == DaemonPhase::Failed
+        });
+        assert_eq!(
+            daemon.phase(),
+            DaemonPhase::Failed,
+            "an observer fatal must fail the daemon"
+        );
+
+        // The durable lease stops being renewed.
+        let expired_at = kernel
+            .lease_supervision_view(&attempt_id)
+            .unwrap()
+            .expires_at;
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            kernel
+                .lease_supervision_view(&attempt_id)
+                .unwrap()
+                .expires_at,
+            expired_at,
+            "renewal must stop once the runtime has failed"
+        );
+
+        // No new Claim, Attempt, or physical start after the fatal.
+        let before_attempts = kernel.attempt_count_for_task(&task_id).unwrap();
+        let late = control
+            .submit_batch(&[TaskSpec::new("after-fatal", json!({"o": 2}))])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            kernel
+                .attempt_count_for_task(&late.task_ids["after-fatal"])
+                .unwrap(),
+            0,
+            "a failed runtime must not create an Attempt"
+        );
+        assert_eq!(
+            kernel.attempt_count_for_task(&task_id).unwrap(),
+            before_attempts
+        );
+
+        // Every worker joins, the lock is released, and the next daemon can
+        // take the store and recover.
+        assert!(matches!(daemon.join(), DaemonExit::Failed(_)));
+        let recovered = builder_for(&path).start().unwrap();
+        assert_eq!(recovered.phase(), DaemonPhase::Ready);
+        recovered.join();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

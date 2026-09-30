@@ -120,6 +120,63 @@ impl DispatchGate {
     }
 }
 
+/// Publication boundary for READY.
+///
+/// Runtime workers that act on their own schedule (physical observation and
+/// the control loop) wait here until the composition root has validated and
+/// published readiness. Without it a worker could change renewal eligibility
+/// between the final readiness validation and the gate flip, so the READY
+/// invariant would hold at validation time but not at publication time.
+///
+/// `release` is called by the composition root **inside** the readiness
+/// barrier, immediately after the gate flips, so a worker's first action is
+/// strictly after READY and can no longer invalidate it.
+#[derive(Clone)]
+pub struct ReadyRelease {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl ReadyRelease {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    /// Already published. Test composition that starts a worker directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn released() -> Self {
+        let release = Self::new();
+        release.release();
+        release
+    }
+
+    pub(crate) fn release(&self) {
+        let (lock, cv) = &*self.inner;
+        *lock.lock().expect("ready release") = true;
+        cv.notify_all();
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        *self.inner.0.lock().expect("ready release")
+    }
+
+    /// Wait for publication. Returns whether READY has been published; a
+    /// timeout simply means "not yet", so a caller can re-check its own
+    /// stop/fail state.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let (lock, cv) = &*self.inner;
+        let released = lock.lock().expect("ready release");
+        if *released {
+            return true;
+        }
+        let (guard, _) = cv
+            .wait_timeout_while(released, timeout, |released| !*released)
+            .expect("ready release");
+        *guard
+    }
+}
+
 /// Dispatch result after ControlLoop has consumed a `RunningAdmitted`
 /// admission into supervision.
 #[derive(Debug, Clone, PartialEq)]
@@ -284,7 +341,10 @@ pub struct ControlLoopRunner {
 }
 
 impl ControlLoopRunner {
-    pub fn start<S>(service: ControlLoopService<S>) -> Result<Self, ControlError>
+    pub fn start<S>(
+        service: ControlLoopService<S>,
+        ready: ReadyRelease,
+    ) -> Result<Self, ControlError>
     where
         S: AdmissionSink + Send + 'static,
     {
@@ -300,6 +360,18 @@ impl ControlLoopRunner {
         let join = std::thread::Builder::new()
             .name("control-loop".into())
             .spawn(move || {
+                // READY publication barrier (M5.8 audit round 3, P1-1):
+                // maintenance mutates durable authority, so the loop must not
+                // run between the readiness validation and the gate flip.
+                while !ready.is_released() {
+                    {
+                        let state = thread_shared.state.lock().expect("control runner state");
+                        if state.phase != RunnerPhase::Running {
+                            return;
+                        }
+                    }
+                    let _ = ready.wait(std::time::Duration::from_millis(20));
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     {
                         let state = thread_shared.state.lock().expect("control runner state");
@@ -627,7 +699,7 @@ mod tests {
         let svc = SupervisionService::new(kernel.clone(), &timing()).unwrap();
         let control = loop_svc(kernel, registry, adapters, svc);
         let started = Instant::now();
-        drop(ControlLoopRunner::start(control).unwrap());
+        drop(ControlLoopRunner::start(control, ReadyRelease::released()).unwrap());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

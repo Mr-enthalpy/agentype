@@ -613,6 +613,7 @@ impl PhysicalObserverRunner {
     pub fn start(
         service: PhysicalObserverService,
         fatal_gate: crate::DispatchGate,
+        ready: crate::control::ReadyRelease,
     ) -> Result<Self, ObserverError> {
         let wake = service.supervision_wake_target().observer_wake();
         let shared = Arc::new((
@@ -626,6 +627,19 @@ impl PhysicalObserverRunner {
         let join = std::thread::Builder::new()
             .name("physical-observer".into())
             .spawn(move || {
+                // READY publication barrier (M5.8 audit round 3, P1-1): a
+                // steady-state observation may stop renewal eligibility, so
+                // it must not run between the readiness validation and the
+                // gate flip. Wait for publication, or for stop/fail.
+                while !ready.is_released() {
+                    {
+                        let state = thread_shared.0.lock().expect("observer runner state");
+                        if state.phase != ObserverRunnerPhase::Running {
+                            return;
+                        }
+                    }
+                    let _ = ready.wait(std::time::Duration::from_millis(20));
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     {
                         let state = thread_shared.0.lock().expect("observer runner state");
@@ -980,6 +994,15 @@ mod tests {
             "recovered freshness must re-arm the deadline, got {:?}",
             svc.earliest_next_due()
         );
+        // Deadline safety is the property READY depends on: the refreshed
+        // entry's next renewal is scheduled strictly before its durable
+        // expiry, so a healthy Execution cannot lose authority to the
+        // Scheduler's own schedule. This sink has no heartbeat loop behind
+        // it, so the reading is not racing a live renewal.
+        assert!(
+            svc.earliest_next_due().unwrap() < lease_expiry(&kernel, &claim),
+            "the refreshed entry must be scheduled before its durable expiry"
+        );
 
         // The heartbeat step must therefore renew before the old expiry.
         match svc.renew_due(kernel.now()).unwrap().as_slice() {
@@ -989,6 +1012,41 @@ mod tests {
             other => panic!("expected exactly one renewal, got {other:?}"),
         }
         assert_eq!(lease_expiry(&kernel, &claim), t0 + 17.0);
+    }
+
+    /// M5.8 audit round 3, P1-1: a steady-state observation can stop renewal
+    /// eligibility, so the observer must not run between the readiness
+    /// validation and the gate flip. It starts paused behind `ReadyRelease`.
+    #[test]
+    fn observer_does_not_observe_before_ready_is_published() {
+        let (_clock, kernel) = env();
+        let fake = Arc::new(FakeAdapter::new());
+        let (svc, observer) = harness(kernel.clone(), fake.clone());
+        let (claim, exec) = running(&kernel, "obs-gate");
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+
+        let ready = crate::control::ReadyRelease::new();
+        let runner =
+            PhysicalObserverRunner::start(observer, crate::DispatchGate::open(), ready.clone())
+                .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            fake.observe_call_count(),
+            0,
+            "the observer must not observe before READY is published"
+        );
+
+        ready.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while fake.observe_call_count() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fake.observe_call_count() > 0,
+            "the observer must begin steady state once READY is published"
+        );
+        drop(runner);
     }
 
     #[test]

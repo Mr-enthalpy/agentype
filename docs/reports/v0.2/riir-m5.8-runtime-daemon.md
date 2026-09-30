@@ -80,6 +80,60 @@ Four `compile_fail` doctests pin the absences, and one of them is backed by a
 probe run confirming the referenced externs resolve, so each failure is
 about the missing API rather than a missing crate.
 
+## READY publication barrier
+
+`ReadyPermit` gates *construction* of the control loop; it does not gate
+*action*. M5.8 audit round 3 found that the observer runner started before
+`try_commit_ready`, so a steady-state observation could stop renewal
+eligibility between the final freshness check and the gate flip — READY would
+be published with the invariant already false.
+
+Two additions close it:
+
+- `ReadyRelease` — a publication boundary. The observer and control runners
+  start paused behind it and do no work until READY is published.
+- `SupervisionService::with_readiness_barrier` — holds the registry lock
+  across the readiness decision, so no observation-driven or heartbeat-driven
+  change to eligibility or the renewal schedule can interleave with it.
+
+The composition root now validates and flips the gate inside that barrier and
+releases the workers there, strictly after the flip. Runner health is read
+before the barrier because reading a runner's state lock under the registry
+lock would invert the state → registry order that `refresh_positive`
+establishes; it is also redundant inside, since every runner fatal publishes
+to the gate synchronously.
+
+Regressions: `observer_does_not_observe_before_ready_is_published` and
+`readiness_barrier_excludes_freshness_mutation`.
+
+## Global fatal closure
+
+The composition-closure gap is closed rather than deferred. Component fatal
+tests are not composition closure, so `observer_fatal_stops_dispatch_renewal_and_releases_the_lock`
+drives a real observer fatal through a running daemon — a panicking test
+adapter, no fault-injection framework — and checks the whole chain:
+
+```text
+observer fatal → daemon phase Failed
+               → the supervised Lease stops being renewed
+               → no new Attempt and no physical start for later work
+               → join() == DaemonExit::Failed
+               → the process lock is released
+               → a fresh daemon takes the store and reaches READY
+```
+
+That last step is the restart barrier the M5.8 frozen phrases require: the
+only safe recovery from a failed Runtime component is a new Runtime lifecycle.
+
+### Verification boundary
+
+The daemon and process-lock tests need a machine-writable ProgramData lock
+and writable temporary directories. In the environment where this change was
+written, confined child processes may write only inside the workspace, so
+those targets could not be executed there; every test that does not need
+those paths was run and passes. CI executes the full set on Ubuntu and
+Windows.
+
 ## Freshness recovery closure
 
 A stale freshness tick stops renewal and re-schedules the entry one heartbeat
@@ -121,17 +175,11 @@ The wake test was confirmed to fail with the notification removed, so it
 detects the second "deadline changed but the condvar never fired" bug rather
 than passing for another reason.
 
-## Deferred: daemon end-to-end fatal test
-
-M5.8's own end-to-end fatal evidence remains thin: each runner has fatal and
-gate tests, but `daemon.rs` has only lifecycle tests. A test asserting
-observer fatal → `DispatchGate::Failed` → no new Claim → supervision stopped →
-`DaemonExit::Failed` → lock released after workers is **not** in this change.
-Inducing a real observer fatal requires a fatal-injection point in the
-daemon's private composition, and the daemon tests need a machine-writable
-ProgramData lock, so the test could not be executed in the environment where
-it was written. Adding an unverifiable test to the freeze candidate was the
-worse risk; this stays an explicit open item.
+The activation regression lives in the recovery suite and asserts only that a
+positive observation restores **fresh renewable** supervision; it does not
+drive a renewal step, because `RecoveredRuntime` already has a live heartbeat
+loop that owns renewal, and a test that competed with it would be reading a
+racing registry.
 
 ## Composition closure follow-ups
 
