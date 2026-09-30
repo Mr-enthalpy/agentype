@@ -617,6 +617,97 @@ impl Kernel {
         })
     }
 
+    // =========================================================================
+    // M6-A Semantic Frontier Kernel Primitives
+    // =========================================================================
+
+    pub fn create_generation(
+        &self,
+        seed_payload: serde_json::Value,
+    ) -> Result<agentype_core::GenerationRecord, Error> {
+        self.tx(|tx, now| crate::frontier::create_generation(tx, now, seed_payload))
+    }
+
+    pub fn compile_intent(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+        intent: agentype_core::RawWorkIntent,
+        source_kind: &str,
+        source_ref: &str,
+        compiler_version: u32,
+    ) -> Result<agentype_core::ProposalRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::compile_intent(
+                tx,
+                now,
+                generation_id,
+                intent,
+                source_kind,
+                source_ref,
+                compiler_version,
+            )
+        })
+    }
+
+    pub fn admit_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<agentype_core::TaskSpec>,
+    ) -> Result<agentype_core::TaskId, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::admit_proposal(
+                tx,
+                now,
+                proposal_id,
+                expected_generation_revision,
+                override_task_spec,
+            )
+        })
+    }
+
+    pub fn freeze_generation(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+        expected_revision: u64,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            crate::frontier::freeze_generation(tx, now, generation_id, expected_revision)
+        })
+    }
+
+    pub fn close_generation(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+        expected_revision: u64,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            crate::frontier::close_generation(tx, now, generation_id, expected_revision)
+        })
+    }
+
+    pub fn reject_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        reason: &str,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::frontier::reject_proposal(tx, now, proposal_id, reason))
+    }
+
+    pub fn get_generation_view(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+    ) -> Result<agentype_core::GenerationView, Error> {
+        self.tx(|tx, _| crate::frontier::get_generation_view(tx, generation_id))
+    }
+
+    pub fn get_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+    ) -> Result<agentype_core::ProposalRecord, Error> {
+        self.tx(|tx, _| crate::frontier::get_proposal(tx, proposal_id))
+    }
+
     // ------------------------------------------------------------------ topology
 
     pub fn upsert_partition(&self, spec: &PartitionSpec) -> Result<i64, Error> {

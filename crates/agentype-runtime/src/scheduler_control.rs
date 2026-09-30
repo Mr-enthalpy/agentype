@@ -128,6 +128,11 @@ impl<'a> SchedulerControl<'a> {
         }
     }
 
+    /// Borrow the Root semantic control surface for this running daemon.
+    pub fn semantic_control(&self) -> crate::RootSemanticControl<'_> {
+        crate::RootSemanticControl::new(self.kernel)
+    }
+
     // ------------------------------------------------------------ submit
 
     /// Accept a Batch of Tasks for durable execution.

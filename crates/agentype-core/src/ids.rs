@@ -62,6 +62,8 @@ typed_id!(FailureId, "failure");
 typed_id!(OutboxEventId, "event");
 typed_id!(WorkstreamId, "workstream");
 typed_id!(RequestId, "request");
+typed_id!(GenerationId, "gen");
+typed_id!(ProposalId, "prop");
 
 /// Partition identity is the human-declared name (V0.1 topology).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

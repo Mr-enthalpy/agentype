@@ -5,7 +5,7 @@ use crate::states::*;
 use crate::UnixTime;
 use serde_json::Value;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub retry_classes: Vec<FailureClass>,
@@ -40,7 +40,7 @@ impl RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TaskSpec {
     pub name: String,
     pub payload: Value,
@@ -109,6 +109,116 @@ impl TaskSpec {
     pub fn continuity(mut self, c: ContinuityPreference) -> Self {
         self.continuity = c;
         self
+    }
+
+    /// Deterministic canonical JSON representation of all authority-bearing fields.
+    pub fn canonical_json(&self) -> Result<Value, crate::Error> {
+        if !self.retry_policy.base_backoff_seconds.is_finite()
+            || self.retry_policy.base_backoff_seconds <= 0.0
+        {
+            return Err(crate::Error::invariant(
+                "base_backoff_seconds must be a finite positive number",
+            ));
+        }
+        if !self.retry_policy.max_backoff_seconds.is_finite()
+            || self.retry_policy.max_backoff_seconds < self.retry_policy.base_backoff_seconds
+        {
+            return Err(crate::Error::invariant(
+                "max_backoff_seconds must be a finite number >= base_backoff_seconds",
+            ));
+        }
+        if self.retry_policy.max_attempts == 0 {
+            return Err(crate::Error::invariant("max_attempts must be >= 1"));
+        }
+
+        let base_backoff_num = serde_json::Number::from_f64(self.retry_policy.base_backoff_seconds)
+            .ok_or_else(|| {
+                crate::Error::invariant("base_backoff_seconds is not valid JSON number")
+            })?;
+        let max_backoff_num = serde_json::Number::from_f64(self.retry_policy.max_backoff_seconds)
+            .ok_or_else(|| {
+            crate::Error::invariant("max_backoff_seconds is not valid JSON number")
+        })?;
+
+        let mut sorted_tags = self.affinity_tags.clone();
+        sorted_tags.sort();
+
+        let mut sorted_deps = self.dependencies.clone();
+        sorted_deps.sort();
+
+        let mut sorted_retry_classes: Vec<String> = self
+            .retry_policy
+            .retry_classes
+            .iter()
+            .map(|c| c.as_sql().to_string())
+            .collect();
+        sorted_retry_classes.sort();
+
+        let mut map = serde_json::Map::new();
+        map.insert("name".into(), Value::String(self.name.clone()));
+        map.insert("payload".into(), self.payload.clone());
+        map.insert("acceptance".into(), self.acceptance.clone());
+        map.insert(
+            "partition".into(),
+            Value::String(self.partition.as_str().to_string()),
+        );
+        map.insert(
+            "workstream_id".into(),
+            self.workstream_id
+                .as_ref()
+                .map(|w| Value::String(w.as_str().to_string()))
+                .unwrap_or(Value::Null),
+        );
+        map.insert(
+            "continuity".into(),
+            Value::String(self.continuity.as_sql().to_string()),
+        );
+        map.insert(
+            "affinity_tags".into(),
+            Value::Array(sorted_tags.into_iter().map(Value::String).collect()),
+        );
+        map.insert(
+            "workspace_mode".into(),
+            Value::String(self.workspace_mode.as_sql().to_string()),
+        );
+        map.insert(
+            "dependencies".into(),
+            Value::Array(sorted_deps.into_iter().map(Value::String).collect()),
+        );
+        map.insert("priority".into(), Value::Number(self.priority.into()));
+        map.insert(
+            "max_attempts".into(),
+            Value::Number(self.retry_policy.max_attempts.into()),
+        );
+        map.insert(
+            "retry_classes".into(),
+            Value::Array(
+                sorted_retry_classes
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "base_backoff_seconds".into(),
+            Value::Number(base_backoff_num),
+        );
+        map.insert("max_backoff_seconds".into(), Value::Number(max_backoff_num));
+        map.insert(
+            "supersedes_task_id".into(),
+            self.supersedes_task_id
+                .as_ref()
+                .map(|s| Value::String(s.as_str().to_string()))
+                .unwrap_or(Value::Null),
+        );
+        map.insert(
+            "task_id".into(),
+            self.task_id
+                .as_ref()
+                .map(|t| Value::String(t.as_str().to_string()))
+                .unwrap_or(Value::Null),
+        );
+        Ok(Value::Object(map))
     }
 }
 

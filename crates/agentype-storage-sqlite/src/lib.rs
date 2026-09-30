@@ -19,6 +19,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod frontier;
 mod kernel;
 mod schema;
 mod store;
@@ -29,7 +30,7 @@ pub use kernel::{
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,
     SupervisedRenewal,
 };
-pub use schema::SCHEMA_VERSION;
+pub use schema::{SCHEMA_SQL, SCHEMA_VERSION};
 // Shared with `agentype-runtime`: the process lock resolves store identity
 // from a filesystem handle while SQLite resolves the same string with its own
 // special-filename rules, so both crates classify store paths with one table.
