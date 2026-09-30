@@ -14,11 +14,40 @@ use std::collections::HashMap;
 pub const GENERATION_FROZEN: &str = "GENERATION_FROZEN";
 pub const GENERATION_CLOSED: &str = "GENERATION_CLOSED";
 
+/// Immutable content-addressed artifact reference.
+///
+/// Requires an immutable content digest (e.g. `sha256:...`) in addition to
+/// an opaque storage locator so that the evidence snapshot identity cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactRef {
+    pub locator: String,
+    pub digest: String,
+}
+
+impl ArtifactRef {
+    pub fn new(
+        locator: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Result<Self, crate::Error> {
+        let locator = locator.into();
+        let digest = digest.into();
+        if locator.trim().is_empty() {
+            return Err(crate::Error::invariant("artifact locator cannot be empty"));
+        }
+        if digest.trim().is_empty() {
+            return Err(crate::Error::invariant(
+                "artifact digest cannot be empty (provenance requires immutable content digest)",
+            ));
+        }
+        Ok(Self { locator, digest })
+    }
+}
+
 /// Immutable set of semantic evidence/seed inputs captured at admission time.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SemanticInputSet {
     pub result_ids: Vec<ResultId>,
-    pub artifact_refs: Vec<String>,
+    pub artifact_refs: Vec<ArtifactRef>,
     pub seed_refs: Vec<String>,
 }
 
@@ -32,8 +61,8 @@ impl SemanticInputSet {
         self
     }
 
-    pub fn with_artifact(mut self, artifact_ref: impl Into<String>) -> Self {
-        self.artifact_refs.push(artifact_ref.into());
+    pub fn with_artifact(mut self, artifact: ArtifactRef) -> Self {
+        self.artifact_refs.push(artifact);
         self
     }
 
@@ -56,7 +85,7 @@ pub struct RawWorkIntent {
 
 impl RawWorkIntent {
     /// Deterministic canonical fingerprint of this intent's semantic content.
-    pub fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> Result<String, crate::Error> {
         let mut sorted_res = self
             .semantic_input_set
             .result_ids
@@ -64,10 +93,21 @@ impl RawWorkIntent {
             .map(|r| r.as_str().to_string())
             .collect::<Vec<_>>();
         sorted_res.sort();
+
         let mut sorted_art = self.semantic_input_set.artifact_refs.clone();
         sorted_art.sort();
+        let sorted_art_json = sorted_art
+            .iter()
+            .map(|a| serde_json::json!({ "locator": &a.locator, "digest": &a.digest }))
+            .collect::<Vec<_>>();
+
         let mut sorted_seed = self.semantic_input_set.seed_refs.clone();
         sorted_seed.sort();
+
+        let spec_val = match self.suggested_task_spec.as_ref() {
+            Some(s) => Some(s.canonical_json()?),
+            None => None,
+        };
 
         let val = serde_json::json!({
             "key": self.raw_intent_key,
@@ -76,12 +116,12 @@ impl RawWorkIntent {
             "rat": self.rationale,
             "inputs": {
                 "results": sorted_res,
-                "artifacts": sorted_art,
+                "artifacts": sorted_art_json,
                 "seeds": sorted_seed,
             },
-            "spec": self.suggested_task_spec.as_ref().map(|s| s.canonical_json()),
+            "spec": spec_val,
         });
-        val.to_string()
+        Ok(val.to_string())
     }
 }
 
@@ -94,6 +134,8 @@ pub struct ProposalRecord {
     pub source_ref: String,
     pub raw_intent_key: String,
     pub intent_fingerprint: String,
+    pub objective: String,
+    pub rationale: Option<String>,
     pub information_function: InformationFunction,
     pub normalized_task_spec: Option<TaskSpec>,
     pub semantic_input_set: SemanticInputSet,

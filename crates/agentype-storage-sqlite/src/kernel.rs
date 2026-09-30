@@ -701,6 +701,13 @@ impl Kernel {
         self.tx(|tx, _| crate::frontier::get_generation_view(tx, generation_id))
     }
 
+    pub fn get_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+    ) -> Result<agentype_core::ProposalRecord, Error> {
+        self.tx(|tx, _| crate::frontier::get_proposal(tx, proposal_id))
+    }
+
     // ------------------------------------------------------------------ topology
 
     pub fn upsert_partition(&self, spec: &PartitionSpec) -> Result<i64, Error> {

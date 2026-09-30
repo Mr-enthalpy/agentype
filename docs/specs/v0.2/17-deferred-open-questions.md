@@ -14,7 +14,7 @@ Classification:
 
 | ID | Question | Why unresolved | Blocks | Resolve by |
 |---|---|---|---|---|
-| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | **RESOLVED in M6-A**: Explicit Root admission is the sole frontier expansion authority; workers/compilers never auto-expand; automated policy DSL deferred | None (Resolved) | M6-A |
+| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | **DEFERRED (Does not block M6-A)**: M6-A freezes explicit Root admission as the sole expansion authority; automated policy DSL and machine-governed admission deferred | BLOCKS_SEMANTIC_LAYER | post-M6-A |
 | D-GEN-INTRA | May Root add Tasks after a Generation is already OPEN/ACTIVE? | **RESOLVED in M6-A**: Root may add Tasks dynamically; in OPEN all functions allowed, in FROZEN only compression allowed | None (Resolved) | M6-A |
 | D-GEN-TOPOLOGY | Generation provenance chain vs DAG | **RESOLVED in M6-A**: DAG tracked via immutable `SemanticInputSet` on each task binding and generation seed | None (Resolved) | M6-A |
 | D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | **RESOLVED in M6-A**: Ingress `RawWorkIntent` structure compiles deterministically to `CompiledWorkProposal` | None (Resolved) | M6-A |
@@ -32,7 +32,7 @@ Classification:
 | D-ADAPTER2 | Minimal second-adapter conformance extras | M7 demonstration | DOES_NOT_BLOCK_RIIR_KERNEL | M7 |
 | D-DB-MIGRATE | In-place V0.1 SQLite migrate vs import vs new DB | decide before upgrade claims | DOES_NOT_BLOCK_RIIR_KERNEL | before storage upgrade; M3 MAY use new DB |
 | D-OBJECTIVE | Objective/problem-scope schema | **RESOLVED in M6-A**: `RawWorkIntent.objective` string + optional rationale + `SemanticInputSet` provenance references | None (Resolved) | M6-A |
-| D-COMPILATION-CLOSURE | How model-backed compilation Tasks participate in Generation drain/REVIEWABLE (same-generation closure phase vs dedicated non-frontier system work vs other bounded form) | **RESOLVED in M6-A**: Compilation produces inert proposals; tasks only materialize upon explicit Root admission; compilation tasks do not occupy frontier membership | None (Resolved) | M6-A |
+| D-COMPILATION-CLOSURE | How model-backed compilation Tasks participate in Generation drain/REVIEWABLE (same-generation closure phase vs dedicated non-frontier system work vs other bounded form) | **DEFERRED (Does not block M6-A)**: M6-A ingress uses synchronous deterministic compiler yielding inert candidate proposals; asynchronous model-backed compilation tasks and their lifecycle closure deferred | BLOCKS_SEMANTIC_LAYER | post-M6-A |
 | D-GEN-RESUME | Align Generation resume with Task/Batch/Escalation: mechanical vs semantic discriminator, recovery edges, atomicity. Scheduler-owned Generation SUSPENDED→ACTIVE is **not** frozen | **RESOLVED in M6-A**: Strictly monotonic state machine `OPEN -> FROZEN -> CLOSED`; no intermediate SUSPENDED state or resume machine | None (Resolved) | M6-A |
 
 The first landing of this spec omitted V0.1.2 physical Execution transitions,

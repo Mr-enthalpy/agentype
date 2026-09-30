@@ -14,7 +14,7 @@ mod common;
 use common::*;
 
 use agentype_core::{
-    BatchId, BatchState, Clock, GenerationState, InformationFunction, ManualClock, PartitionId,
+    ArtifactRef, BatchState, Clock, GenerationState, InformationFunction, ManualClock, PartitionId,
     PartitionSpec, ProposalStateKind, RawWorkIntent, ResultId, Retention, SemanticInputSet,
     TaskSpec, TaskState,
 };
@@ -84,7 +84,9 @@ fn test_generation_lifecycle_and_admit_contract() {
     assert_eq!(gen.admission_seq, 0);
 
     // 2. Compile an EXPAND intent
-    let input_set = SemanticInputSet::new().with_artifact("heap_dump.bin");
+    let input_set = SemanticInputSet::new().with_artifact(
+        ArtifactRef::new("heap_dump.bin", "sha256:durable_heap_dump_digest").unwrap(),
+    );
     let intent = RawWorkIntent {
         raw_intent_key: "inspect_heap".into(),
         objective: "Inspect heap dump for allocations".into(),
@@ -130,12 +132,15 @@ fn test_generation_lifecycle_and_admit_contract() {
     assert_eq!(view.admitted_task_ids, vec![task_id.clone()]);
     assert!(!view.is_settled);
 
-    // INV-A6: duplicate admission is rejected
-    let dup_admit_res = kernel.admit_proposal(&proposal.proposal_id, 0, None);
-    assert!(
-        dup_admit_res.is_err(),
-        "cannot admit already admitted proposal"
-    );
+    // INV-A6 & P1-3: crash-retry idempotent admission returns the exact same TaskId
+    let dup_admit_res = kernel
+        .admit_proposal(&proposal.proposal_id, 0, None)
+        .expect("idempotent re-admission on crash retry");
+    assert_eq!(dup_admit_res, task_id);
+    let view_after_retry = kernel
+        .get_generation_view(&gen.generation_id)
+        .expect("generation view");
+    assert_eq!(view_after_retry.admitted_task_ids.len(), 1);
 
     // 4. Freeze generation (INV-A7 barrier)
     // First compile another EXPAND intent that remains PENDING
@@ -313,29 +318,37 @@ fn test_race_b_concurrent_admissions_same_proposal_single_winner() {
     }
 
     let mut successes = 0;
-    let mut conflicts = 0;
-    let mut admitted_tid = None;
+    let mut admitted_tid: Option<agentype_core::TaskId> = None;
 
     for h in handles {
         match h.join().unwrap() {
             Ok(tid) => {
                 successes += 1;
+                if let Some(ref prev_tid) = admitted_tid {
+                    assert_eq!(prev_tid, &tid, "All threads must observe the same TaskId");
+                }
                 admitted_tid = Some(tid);
             }
-            Err(_) => {
-                conflicts += 1;
+            Err(e) => {
+                panic!("Admission race must resolve idempotently, got: {e:?}");
             }
         }
     }
 
-    // Exactly one winner!
-    assert_eq!(successes, 1, "Exactly one thread must admit the proposal");
-    assert_eq!(conflicts, 7, "All other threads must fail admission");
+    // All threads resolve successfully to the exact same TaskId, and exactly one task was created
+    assert_eq!(
+        successes, 8,
+        "All threads must idempotently receive the admitted TaskId"
+    );
 
     let view = kernel
         .get_generation_view(&gen.generation_id)
         .expect("view");
-    assert_eq!(view.admitted_task_ids.len(), 1);
+    assert_eq!(
+        view.admitted_task_ids.len(),
+        1,
+        "Only one task must be created in the generation"
+    );
     assert_eq!(view.admitted_task_ids[0], admitted_tid.unwrap());
 }
 
@@ -518,9 +531,8 @@ fn test_p0_2_generation_open_dynamic_admissions_with_completed_batches() {
         .expect("result for T1");
 
     // Verify T1's batch is completed
-    let b1 = kernel
-        .batch(&BatchId::from_string(format!("batch_{t1}")))
-        .unwrap();
+    let t1_row = kernel.task(&t1).unwrap();
+    let b1 = kernel.batch(&t1_row.batch_id).unwrap();
     assert_eq!(b1.state, BatchState::Completed);
 
     // 3. Generation is STILL Open! Now Root admits T2 dynamically into the same Generation
@@ -541,9 +553,12 @@ fn test_p0_2_generation_open_dynamic_admissions_with_completed_batches() {
     let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
 
     // 4. Assert T2 has its own ACTIVE batch and is immediately claimable/executable!
-    let b2 = kernel
-        .batch(&BatchId::from_string(format!("batch_{t2}")))
-        .unwrap();
+    let t2_row = kernel.task(&t2).unwrap();
+    assert_ne!(
+        t1_row.batch_id, t2_row.batch_id,
+        "T1 and T2 must have distinct dedicated batches"
+    );
+    let b2 = kernel.batch(&t2_row.batch_id).unwrap();
     assert_eq!(b2.state, BatchState::Active);
 
     let claim2 = kernel.claim_next_available().unwrap().expect("claim T2");
@@ -863,7 +878,7 @@ fn test_p1_4_durable_task_spec_fail_closed() {
     use agentype_storage_sqlite::frontier::task_spec_from_json;
 
     let valid_spec = TaskSpec::new("task1", json!({"k": "v"}));
-    let valid_json = valid_spec.canonical_json();
+    let valid_json = valid_spec.canonical_json().expect("canonical_json");
     assert!(task_spec_from_json(&valid_json).is_ok());
 
     // 1. Missing name
@@ -1024,8 +1039,8 @@ fn test_p2_3_generation_task_bindings_proposal_unique_constraint() {
     // Insert proposal
     conn.execute(
         "INSERT INTO compiled_work_proposals(proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
-                                             intent_fingerprint, information_function, compiler_version, state, created_at, updated_at)
-         VALUES('prop_1', 'gen_1', 'root', 'sess', 'k', 'fp', 'EXPAND', 1, 'ADMITTED', ?1, ?1)",
+                                             intent_fingerprint, objective, rationale, information_function, compiler_version, state, created_at, updated_at)
+         VALUES('prop_1', 'gen_1', 'root', 'sess', 'k', 'fp', 'test objective', NULL, 'EXPAND', 1, 'ADMITTED', ?1, ?1)",
         rusqlite::params![now],
     ).unwrap();
 
@@ -1090,4 +1105,307 @@ fn test_p2_4_frozen_generation_rejects_expand_compilation() {
         InformationFunction::CompressPositive
     );
     assert_eq!(prop.state, ProposalStateKind::Pending);
+}
+
+#[test]
+fn test_p1_1_proposal_retains_objective_and_reopen_read() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "audit_leak".into(),
+        objective: "Audit cache leak on buffer pool".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: Some("Found 50MB spike during sustained writes".into()),
+        suggested_task_spec: None,
+    };
+
+    let proposal = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session_1", 1)
+        .unwrap();
+
+    assert_eq!(proposal.objective, "Audit cache leak on buffer pool");
+    assert_eq!(
+        proposal.rationale.as_deref(),
+        Some("Found 50MB spike during sustained writes")
+    );
+    assert_eq!(proposal.normalized_task_spec, None);
+
+    // Root / runtime restarts: read proposal back by proposal_id
+    let reloaded = kernel.get_proposal(&proposal.proposal_id).unwrap();
+    assert_eq!(reloaded.proposal_id, proposal.proposal_id);
+    assert_eq!(reloaded.objective, "Audit cache leak on buffer pool");
+    assert_eq!(
+        reloaded.rationale.as_deref(),
+        Some("Found 50MB spike during sustained writes")
+    );
+    assert_eq!(reloaded.normalized_task_spec, None);
+
+    // Root reconstructs the missing task spec and admits
+    let override_spec = TaskSpec::new("audit_cache_task", json!({"target": "buffer_pool"}));
+    let task_id = kernel
+        .admit_proposal(&proposal.proposal_id, 0, Some(override_spec))
+        .unwrap();
+
+    let task_row = kernel.task(&task_id).unwrap();
+    assert_eq!(task_row.name, "audit_cache_task");
+}
+
+#[test]
+fn test_p1_2_dedicated_batch_never_aliases_existing_active_batch() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let custom_task_id = "target_task_99";
+    let legacy_batch_name = format!("batch_{custom_task_id}");
+    let (legacy_batch, _) = kernel
+        .submit_batch(&[TaskSpec::new("legacy_task", json!({}))])
+        .unwrap();
+
+    // Now admit a proposal with task_id set to custom_task_id
+    let mut spec = TaskSpec::new("spec_with_custom_id", json!({}));
+    spec.task_id = Some(agentype_core::TaskId::from_string(custom_task_id));
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "custom_id_intent".into(),
+        objective: "Test dedicated batch allocation".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec),
+    };
+
+    let prop = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    let admitted_task_id = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
+    assert_eq!(admitted_task_id.as_str(), custom_task_id);
+
+    let task_row = kernel.task(&admitted_task_id).unwrap();
+    // The admitted task's batch MUST NOT be the legacy batch name or alias any existing batch!
+    assert_ne!(task_row.batch_id.as_str(), legacy_batch_name.as_str());
+    assert_ne!(task_row.batch_id, legacy_batch);
+
+    let batch_row = kernel.batch(&task_row.batch_id).unwrap();
+    assert_eq!(batch_row.state, BatchState::Active);
+}
+
+#[test]
+fn test_p1_2_dedicated_batch_never_strands_task_in_completed_batch() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Pre-populate a COMPLETED batch with a task
+    let (completed_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("completed_worker", json!({}))])
+        .unwrap();
+    let _tid = ids.values().next().unwrap();
+    let claim = kernel.claim_next_available().unwrap().unwrap();
+    let safety = unisolated_launch_binding(&claim);
+    let launch = kernel.create_execution(&claim, safety).unwrap();
+    let exec_id = launch.execution_id().clone();
+    kernel
+        .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
+        .unwrap();
+    kernel
+        .ack_success(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            Some(&exec_id),
+            &json!({"ok": true}),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    let b_status = kernel.batch(&completed_batch).unwrap();
+    assert_eq!(b_status.state, BatchState::Completed);
+
+    // Admit new M6 proposal
+    let intent = RawWorkIntent {
+        raw_intent_key: "task_after_completed_batch".into(),
+        objective: "Must not strand in completed batch".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("fresh_task", json!({}))),
+    };
+    let prop = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    let tid = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
+
+    let task_row = kernel.task(&tid).unwrap();
+    assert_ne!(task_row.batch_id, completed_batch);
+
+    let batch_row = kernel.batch(&task_row.batch_id).unwrap();
+    assert_eq!(batch_row.state, BatchState::Active);
+
+    // Task is immediately claimable because its batch is ACTIVE!
+    let claim = kernel
+        .claim_next_available()
+        .unwrap()
+        .expect("claim fresh task");
+    assert_eq!(claim.task_id, tid);
+}
+
+#[test]
+fn test_p1_3_admission_retry_returns_same_task_id() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "crash_retry_intent".into(),
+        objective: "Test admission idempotent retry".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("retry_worker", json!({}))),
+    };
+
+    let prop = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+
+    let t1 = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
+
+    // Retry call on the exact same proposal returns Ok(t1)
+    let t2 = kernel
+        .admit_proposal(&prop.proposal_id, 0, None)
+        .expect("retry must succeed idempotently");
+    assert_eq!(t1, t2);
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.admitted_task_ids, vec![t1.clone()]);
+
+    // Retry call with conflicting override spec returns Conflict
+    let conflict_spec = TaskSpec::new("conflicting_name", json!({}));
+    let err = kernel
+        .admit_proposal(&prop.proposal_id, 0, Some(conflict_spec))
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+}
+
+#[test]
+fn test_p1_4_artifact_ref_requires_immutable_digest() {
+    // Empty locator rejected
+    assert!(ArtifactRef::new("", "sha256:1234").is_err());
+    assert!(ArtifactRef::new("   ", "sha256:1234").is_err());
+
+    // Empty digest rejected (provenance requires immutable content digest)
+    assert!(ArtifactRef::new("file.bin", "").is_err());
+    assert!(ArtifactRef::new("file.bin", "   ").is_err());
+
+    // Valid locator and digest
+    let art = ArtifactRef::new("s3://bucket/heap.bin", "sha256:abcdef").unwrap();
+    assert_eq!(art.locator, "s3://bucket/heap.bin");
+    assert_eq!(art.digest, "sha256:abcdef");
+}
+
+#[test]
+fn test_p1_4_seed_ref_validated_against_generation_seed() {
+    let kernel = test_kernel();
+    let gen = kernel
+        .create_generation(json!({
+            "approved_corpus": "s3://corpus/v1",
+            "benchmark_id": 42
+        }))
+        .unwrap();
+
+    // Intent referencing an approved seed in seed_payload -> succeeds
+    let valid_set = SemanticInputSet::new().with_seed("approved_corpus");
+    let valid_intent = RawWorkIntent {
+        raw_intent_key: "valid_seed_intent".into(),
+        objective: "Process approved corpus".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: valid_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("worker", json!({}))),
+    };
+    let prop = kernel
+        .compile_intent(&gen.generation_id, valid_intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(prop.raw_intent_key, "valid_seed_intent");
+
+    // Intent referencing an unknown seed -> rejected with NotFound
+    let invalid_set = SemanticInputSet::new().with_seed("unknown_external_data");
+    let invalid_intent = RawWorkIntent {
+        raw_intent_key: "invalid_seed_intent".into(),
+        objective: "Process unapproved corpus".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: invalid_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("worker", json!({}))),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, invalid_intent, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::NotFound(_)));
+}
+
+#[test]
+fn test_p2_1_canonical_json_rejects_nan_and_inf_backoff() {
+    let mut spec = TaskSpec::new("test_backoff", json!({}));
+
+    // 1. base_backoff is NaN
+    spec.retry_policy.base_backoff_seconds = f64::NAN;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 2. base_backoff is INFINITY
+    spec.retry_policy.base_backoff_seconds = f64::INFINITY;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 3. base_backoff is 0.0
+    spec.retry_policy.base_backoff_seconds = 0.0;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 4. base_backoff is negative
+    spec.retry_policy.base_backoff_seconds = -1.0;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 5. max_backoff < base_backoff
+    spec.retry_policy.base_backoff_seconds = 10.0;
+    spec.retry_policy.max_backoff_seconds = 5.0;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 6. max_attempts == 0
+    spec.retry_policy.base_backoff_seconds = 1.0;
+    spec.retry_policy.max_backoff_seconds = 60.0;
+    spec.retry_policy.max_attempts = 0;
+    assert!(matches!(
+        spec.canonical_json(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
+
+    // 7. Invalid spec bubbles through RawWorkIntent::fingerprint
+    spec.retry_policy.base_backoff_seconds = f64::NAN;
+    spec.retry_policy.max_attempts = 1;
+    let intent = RawWorkIntent {
+        raw_intent_key: "key".into(),
+        objective: "obj".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec),
+    };
+    assert!(matches!(
+        intent.fingerprint(),
+        Err(agentype_core::Error::InvariantViolation(_))
+    ));
 }

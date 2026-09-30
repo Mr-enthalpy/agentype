@@ -12,11 +12,11 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt};
 use crate::txutil::required_partition;
 use agentype_core::{
-    generation_allows_admit, is_generation_settled, ContinuityPreference, Error, FailureClass,
-    GenerationId, GenerationRecord, GenerationState, GenerationView, InformationFunction,
-    OutboxEventId, PartitionId, ProposalExpirationReason, ProposalId, ProposalRecord,
-    ProposalStateKind, RawWorkIntent, ResultId, RetryPolicy, SemanticInputSet, TaskId,
-    TaskSettledSnapshot, TaskSpec, TaskState, UnixTime, WorkstreamId, GENERATION_CLOSED,
+    generation_allows_admit, is_generation_settled, ArtifactRef, BatchId, ContinuityPreference,
+    Error, FailureClass, GenerationId, GenerationRecord, GenerationState, GenerationView,
+    InformationFunction, OutboxEventId, PartitionId, ProposalExpirationReason, ProposalId,
+    ProposalRecord, ProposalStateKind, RawWorkIntent, ResultId, RetryPolicy, SemanticInputSet,
+    TaskId, TaskSettledSnapshot, TaskSpec, TaskState, UnixTime, WorkstreamId, GENERATION_CLOSED,
     GENERATION_FROZEN,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
@@ -32,7 +32,12 @@ pub fn semantic_input_set_to_json(set: &SemanticInputSet) -> Value {
     let artifacts: Vec<Value> = set
         .artifact_refs
         .iter()
-        .map(|a| Value::String(a.clone()))
+        .map(|a| {
+            let mut m = serde_json::Map::new();
+            m.insert("locator".into(), Value::String(a.locator.clone()));
+            m.insert("digest".into(), Value::String(a.digest.clone()));
+            Value::Object(m)
+        })
         .collect();
     let seeds: Vec<Value> = set
         .seed_refs
@@ -73,12 +78,20 @@ pub fn semantic_input_set_from_json(val: &Value) -> Result<SemanticInputSet, Err
     if let Some(arr_val) = obj.get("artifact_refs") {
         let arr = arr_val
             .as_array()
-            .ok_or_else(|| Error::invariant("artifact_refs must be an array of strings"))?;
+            .ok_or_else(|| Error::invariant("artifact_refs must be an array of objects"))?;
         for v in arr {
-            let s = v
-                .as_str()
-                .ok_or_else(|| Error::invariant("artifact_refs element must be a string"))?;
-            set.artifact_refs.push(s.to_string());
+            let art_obj = v
+                .as_object()
+                .ok_or_else(|| Error::invariant("artifact_refs element must be an object"))?;
+            let locator = art_obj
+                .get("locator")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::invariant("artifact_ref missing locator"))?;
+            let digest = art_obj
+                .get("digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::invariant("artifact_ref missing digest"))?;
+            set.artifact_refs.push(ArtifactRef::new(locator, digest)?);
         }
     }
     if let Some(arr_val) = obj.get("seed_refs") {
@@ -97,6 +110,7 @@ pub fn semantic_input_set_from_json(val: &Value) -> Result<SemanticInputSet, Err
 
 pub fn validate_semantic_input_set(
     tx: &Transaction<'_>,
+    generation_id: &GenerationId,
     set: &SemanticInputSet,
 ) -> Result<(), Error> {
     for rid in &set.result_ids {
@@ -116,10 +130,46 @@ pub fn validate_semantic_input_set(
             )));
         }
     }
+    for art in &set.artifact_refs {
+        if art.locator.trim().is_empty() {
+            return Err(Error::invariant("artifact locator cannot be empty"));
+        }
+        if art.digest.trim().is_empty() {
+            return Err(Error::invariant(
+                "artifact digest cannot be empty (provenance requires immutable content digest)",
+            ));
+        }
+    }
+    if !set.seed_refs.is_empty() {
+        let seed_payload_str: String = tx
+            .query_row(
+                "SELECT seed_payload_json FROM generations WHERE generation_id = ?1",
+                params![generation_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite)?
+            .ok_or_else(|| Error::not_found(format!("generation {:?}", generation_id.as_str())))?;
+        let seed_payload_val: Value = json_load(&seed_payload_str)?;
+        let obj = seed_payload_val.as_object().ok_or_else(|| {
+            Error::invalid_authority(
+                "generation seed_payload must be a JSON object to resolve seed_refs",
+            )
+        })?;
+        for sref in &set.seed_refs {
+            if !obj.contains_key(sref) {
+                return Err(Error::not_found(format!(
+                    "seed_ref {:?} not found in generation {:?} seed_payload",
+                    sref,
+                    generation_id.as_str()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
-pub fn task_spec_to_json(spec: &TaskSpec) -> Value {
+pub fn task_spec_to_json(spec: &TaskSpec) -> Result<Value, Error> {
     spec.canonical_json()
 }
 
@@ -347,7 +397,7 @@ pub fn compile_intent(
     }
 
     // 2. Validate semantic input set provenance
-    validate_semantic_input_set(tx, &intent.semantic_input_set)?;
+    validate_semantic_input_set(tx, generation_id, &intent.semantic_input_set)?;
 
     // 3. TaskSpec dependencies must be empty in M6-A
     if let Some(ref spec) = intent.suggested_task_spec {
@@ -358,14 +408,15 @@ pub fn compile_intent(
         }
     }
 
-    let fingerprint = intent.fingerprint();
+    let fingerprint = intent.fingerprint()?;
 
     // 4. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
     if let Some(existing) = query_opt(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
-                intent_fingerprint, information_function, normalized_task_spec_json, semantic_input_set_json,
-                compiler_version, state, admitted_task_id, expiration_reason, rejection_reason, created_at, updated_at
+                intent_fingerprint, objective, rationale, information_function, normalized_task_spec_json,
+                semantic_input_set_json, compiler_version, state, admitted_task_id, expiration_reason,
+                rejection_reason, created_at, updated_at
          FROM compiled_work_proposals
          WHERE generation_id=?1 AND source_kind=?2 AND source_ref=?3 AND raw_intent_key=?4 AND compiler_version=?5",
         params![
@@ -382,19 +433,21 @@ pub fn compile_intent(
             let sr: String = r.get(3)?;
             let rik: String = r.get(4)?;
             let ifp: String = r.get(5)?;
-            let if_str: String = r.get(6)?;
-            let spec_str: Option<String> = r.get(7)?;
-            let set_str: String = r.get(8)?;
-            let cv: u32 = r.get(9)?;
-            let st_str: String = r.get(10)?;
-            let at_str: Option<String> = r.get(11)?;
-            let er_str: Option<String> = r.get(12)?;
-            let rej_str: Option<String> = r.get(13)?;
-            let cat: f64 = r.get(14)?;
-            let uat: f64 = r.get(15)?;
+            let obj: String = r.get(6)?;
+            let rat: Option<String> = r.get(7)?;
+            let if_str: String = r.get(8)?;
+            let spec_str: Option<String> = r.get(9)?;
+            let set_str: String = r.get(10)?;
+            let cv: u32 = r.get(11)?;
+            let st_str: String = r.get(12)?;
+            let at_str: Option<String> = r.get(13)?;
+            let er_str: Option<String> = r.get(14)?;
+            let rej_str: Option<String> = r.get(15)?;
+            let cat: f64 = r.get(16)?;
+            let uat: f64 = r.get(17)?;
 
             Ok((
-                pid, gid, sk, sr, rik, ifp, if_str, spec_str, set_str, cv, st_str, at_str, er_str,
+                pid, gid, sk, sr, rik, ifp, obj, rat, if_str, spec_str, set_str, cv, st_str, at_str, er_str,
                 rej_str, cat, uat,
             ))
         },
@@ -406,6 +459,8 @@ pub fn compile_intent(
             sr,
             rik,
             ifp,
+            obj,
+            rat,
             if_str,
             spec_str,
             set_str,
@@ -448,6 +503,8 @@ pub fn compile_intent(
             source_ref: sr,
             raw_intent_key: rik,
             intent_fingerprint: ifp,
+            objective: obj,
+            rationale: rat,
             information_function: info_fn,
             normalized_task_spec: norm_spec,
             semantic_input_set: input_set,
@@ -463,17 +520,20 @@ pub fn compile_intent(
 
     // 5. Build proposal record and insert
     let norm_spec = intent.suggested_task_spec;
-    let spec_json_opt = norm_spec.as_ref().map(|s| json_dump(&task_spec_to_json(s)));
+    let spec_json_opt = match norm_spec.as_ref() {
+        Some(s) => Some(json_dump(&task_spec_to_json(s)?)),
+        None => None,
+    };
     let proposal_id = ProposalId::new();
     let set_json = json_dump(&semantic_input_set_to_json(&intent.semantic_input_set));
 
     tx.execute(
         "INSERT INTO compiled_work_proposals(
             proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
-            intent_fingerprint, information_function, normalized_task_spec_json, semantic_input_set_json,
+            intent_fingerprint, objective, rationale, information_function, normalized_task_spec_json, semantic_input_set_json,
             compiler_version, state, created_at, updated_at
          )
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'PENDING', ?11, ?11)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'PENDING', ?13, ?13)",
         params![
             proposal_id.as_str(),
             generation_id.as_str(),
@@ -481,6 +541,8 @@ pub fn compile_intent(
             source_ref,
             intent.raw_intent_key,
             fingerprint,
+            intent.objective,
+            intent.rationale,
             intent.information_function.as_sql(),
             spec_json_opt,
             set_json,
@@ -527,6 +589,8 @@ pub fn compile_intent(
         source_ref: source_ref.to_string(),
         raw_intent_key: intent.raw_intent_key,
         intent_fingerprint: fingerprint,
+        objective: intent.objective,
+        rationale: intent.rationale,
         information_function: intent.information_function,
         normalized_task_spec: norm_spec,
         semantic_input_set: intent.semantic_input_set,
@@ -537,6 +601,107 @@ pub fn compile_intent(
         rejection_reason: None,
         created_at: now,
         updated_at: now,
+    })
+}
+
+/// Read a ProposalRecord by proposal_id.
+pub fn get_proposal(
+    tx: &Transaction<'_>,
+    proposal_id: &ProposalId,
+) -> Result<ProposalRecord, Error> {
+    let existing = query_opt(
+        tx,
+        "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
+                intent_fingerprint, objective, rationale, information_function, normalized_task_spec_json,
+                semantic_input_set_json, compiler_version, state, admitted_task_id, expiration_reason,
+                rejection_reason, created_at, updated_at
+         FROM compiled_work_proposals
+         WHERE proposal_id=?1",
+        params![proposal_id.as_str()],
+        |r| {
+            let pid: String = r.get(0)?;
+            let gid: String = r.get(1)?;
+            let sk: String = r.get(2)?;
+            let sr: String = r.get(3)?;
+            let rik: String = r.get(4)?;
+            let ifp: String = r.get(5)?;
+            let obj: String = r.get(6)?;
+            let rat: Option<String> = r.get(7)?;
+            let if_str: String = r.get(8)?;
+            let spec_str: Option<String> = r.get(9)?;
+            let set_str: String = r.get(10)?;
+            let cv: u32 = r.get(11)?;
+            let st_str: String = r.get(12)?;
+            let at_str: Option<String> = r.get(13)?;
+            let er_str: Option<String> = r.get(14)?;
+            let rej_str: Option<String> = r.get(15)?;
+            let cat: f64 = r.get(16)?;
+            let uat: f64 = r.get(17)?;
+
+            Ok((
+                pid, gid, sk, sr, rik, ifp, obj, rat, if_str, spec_str, set_str, cv, st_str, at_str, er_str,
+                rej_str, cat, uat,
+            ))
+        },
+    )?
+    .ok_or_else(|| Error::not_found(format!("proposal {:?}", proposal_id.as_str())))?;
+
+    let (
+        pid,
+        gid,
+        sk,
+        sr,
+        rik,
+        ifp,
+        obj,
+        rat,
+        if_str,
+        spec_str,
+        set_str,
+        cv,
+        st_str,
+        at_str,
+        er_str,
+        rej_str,
+        cat,
+        uat,
+    ) = existing;
+
+    let info_fn = InformationFunction::parse_sql(&if_str)?;
+    let norm_spec = match spec_str {
+        Some(s) => {
+            let spec_val = json_load(&s)?;
+            Some(task_spec_from_json(&spec_val)?)
+        }
+        None => None,
+    };
+    let set_val = json_load(&set_str)?;
+    let input_set = semantic_input_set_from_json(&set_val)?;
+    let state = ProposalStateKind::parse_sql(&st_str)?;
+    let exp_reason = er_str
+        .as_deref()
+        .map(ProposalExpirationReason::parse_sql)
+        .transpose()?;
+
+    Ok(ProposalRecord {
+        proposal_id: ProposalId::from_string(pid),
+        generation_id: GenerationId::from_string(gid),
+        source_kind: sk,
+        source_ref: sr,
+        raw_intent_key: rik,
+        intent_fingerprint: ifp,
+        objective: obj,
+        rationale: rat,
+        information_function: info_fn,
+        normalized_task_spec: norm_spec,
+        semantic_input_set: input_set,
+        compiler_version: cv,
+        state,
+        admitted_task_id: at_str.map(TaskId::from_string),
+        expiration_reason: exp_reason,
+        rejection_reason: rej_str,
+        created_at: cat,
+        updated_at: uat,
     })
 }
 
@@ -573,12 +738,28 @@ pub fn admit_proposal(
     let prop_state = ProposalStateKind::parse_sql(&st_str)?;
     let info_fn = InformationFunction::parse_sql(&if_str)?;
 
+    // Crash-retry idempotency (P1-3): if already ADMITTED, return existing admitted TaskId.
     if prop_state == ProposalStateKind::Admitted {
         if let Some(existing_tid) = admitted_tid {
-            return Err(Error::conflict(format!(
-                "proposal {:?} already admitted as task {existing_tid}",
-                proposal_id.as_str()
-            )));
+            if let Some(override_spec) = override_task_spec {
+                let admitted_spec_json: Option<String> = tx
+                    .query_row(
+                        "SELECT admitted_task_spec_json FROM generation_task_bindings WHERE proposal_id=?1",
+                        params![proposal_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_sqlite)?;
+                if let Some(spec_str) = admitted_spec_json {
+                    let admitted_spec = task_spec_from_json(&json_load(&spec_str)?)?;
+                    if admitted_spec != override_spec {
+                        return Err(Error::conflict(
+                            "override_task_spec conflicts with previously admitted task_spec",
+                        ));
+                    }
+                }
+            }
+            return Ok(TaskId::from_string(existing_tid));
         }
     }
     if prop_state != ProposalStateKind::Pending {
@@ -618,8 +799,9 @@ pub fn admit_proposal(
     }
 
     // 3. Validate semantic input set provenance
+    let gen_id_obj = GenerationId::from_string(gid.clone());
     let semantic_input_set = semantic_input_set_from_json(&json_load(&set_str)?)?;
-    validate_semantic_input_set(tx, &semantic_input_set)?;
+    validate_semantic_input_set(tx, &gen_id_obj, &semantic_input_set)?;
 
     // 4. Resolve TaskSpec
     let norm_spec_opt: Option<TaskSpec> = match spec_str_opt {
@@ -658,14 +840,13 @@ pub fn admit_proposal(
     // Verify target partition exists and is active
     required_partition(tx, task_spec.partition.as_str(), true)?;
 
-    // 5. Ensure independent mechanical execution batch for this Task exists
+    // 5. Ensure independent mechanical execution batch for this Task exists (P1-2)
     let task_id = task_spec.task_id.clone().unwrap_or_else(TaskId::new);
-    let batch_id = format!("batch_{task_id}");
+    let batch_id = BatchId::new();
     tx.execute(
         "INSERT INTO batches(id, state, metadata_json, created_at, updated_at)
-         VALUES(?1, 'ACTIVE', '{}', ?2, ?2)
-         ON CONFLICT(id) DO NOTHING",
-        params![batch_id, now],
+         VALUES(?1, 'ACTIVE', '{}', ?2, ?2)",
+        params![batch_id.as_str(), now],
     )
     .map_err(map_sqlite)?;
 
@@ -689,7 +870,7 @@ pub fn admit_proposal(
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 'QUEUED', ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
         params![
             task_id.as_str(),
-            batch_id,
+            batch_id.as_str(),
             task_spec.name,
             json_dump(&task_spec.payload),
             json_dump(&task_spec.acceptance),
@@ -713,7 +894,7 @@ pub fn admit_proposal(
 
     // 7. Create GenerationTaskBinding
     let new_seq = gen_seq + 1;
-    let admitted_spec_json = json_dump(&task_spec_to_json(&task_spec));
+    let admitted_spec_json = json_dump(&task_spec_to_json(&task_spec)?);
     tx.execute(
         "INSERT INTO generation_task_bindings(
             generation_id, task_id, proposal_id, information_function,
@@ -744,8 +925,22 @@ pub fn admit_proposal(
         .map_err(map_sqlite)?;
 
     if updated == 0 {
+        // Concurrent race: check if proposal was already admitted by another transaction
+        let winner_row: Option<Option<String>> = tx
+            .query_row(
+                "SELECT admitted_task_id FROM compiled_work_proposals WHERE proposal_id=?1 AND state='ADMITTED'",
+                params![proposal_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+
+        if let Some(Some(winner_tid)) = winner_row {
+            return Ok(TaskId::from_string(winner_tid));
+        }
+
         return Err(Error::conflict(format!(
-            "proposal {:?} was admitted concurrently",
+            "proposal {:?} was admitted or state modified concurrently",
             proposal_id.as_str()
         )));
     }

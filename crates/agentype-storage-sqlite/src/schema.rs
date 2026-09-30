@@ -311,6 +311,8 @@ CREATE TABLE IF NOT EXISTS compiled_work_proposals (
     source_ref TEXT NOT NULL,
     raw_intent_key TEXT NOT NULL,
     intent_fingerprint TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    rationale TEXT,
     information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
     normalized_task_spec_json TEXT,
     semantic_input_set_json TEXT NOT NULL DEFAULT '{}',

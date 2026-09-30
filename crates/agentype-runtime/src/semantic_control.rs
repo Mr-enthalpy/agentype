@@ -85,4 +85,8 @@ impl<'a> RootSemanticControl<'a> {
     ) -> Result<GenerationView, Error> {
         self.kernel.get_generation_view(generation_id)
     }
+
+    pub fn read_proposal(&self, proposal_id: &ProposalId) -> Result<ProposalRecord, Error> {
+        self.kernel.get_proposal(proposal_id)
+    }
 }

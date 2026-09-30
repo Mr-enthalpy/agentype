@@ -112,7 +112,34 @@ impl TaskSpec {
     }
 
     /// Deterministic canonical JSON representation of all authority-bearing fields.
-    pub fn canonical_json(&self) -> Value {
+    pub fn canonical_json(&self) -> Result<Value, crate::Error> {
+        if !self.retry_policy.base_backoff_seconds.is_finite()
+            || self.retry_policy.base_backoff_seconds <= 0.0
+        {
+            return Err(crate::Error::invariant(
+                "base_backoff_seconds must be a finite positive number",
+            ));
+        }
+        if !self.retry_policy.max_backoff_seconds.is_finite()
+            || self.retry_policy.max_backoff_seconds < self.retry_policy.base_backoff_seconds
+        {
+            return Err(crate::Error::invariant(
+                "max_backoff_seconds must be a finite number >= base_backoff_seconds",
+            ));
+        }
+        if self.retry_policy.max_attempts == 0 {
+            return Err(crate::Error::invariant("max_attempts must be >= 1"));
+        }
+
+        let base_backoff_num = serde_json::Number::from_f64(self.retry_policy.base_backoff_seconds)
+            .ok_or_else(|| {
+                crate::Error::invariant("base_backoff_seconds is not valid JSON number")
+            })?;
+        let max_backoff_num = serde_json::Number::from_f64(self.retry_policy.max_backoff_seconds)
+            .ok_or_else(|| {
+            crate::Error::invariant("max_backoff_seconds is not valid JSON number")
+        })?;
+
         let mut sorted_tags = self.affinity_tags.clone();
         sorted_tags.sort();
 
@@ -174,16 +201,9 @@ impl TaskSpec {
         );
         map.insert(
             "base_backoff_seconds".into(),
-            serde_json::Number::from_f64(self.retry_policy.base_backoff_seconds)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::Number(1.into())),
+            Value::Number(base_backoff_num),
         );
-        map.insert(
-            "max_backoff_seconds".into(),
-            serde_json::Number::from_f64(self.retry_policy.max_backoff_seconds)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::Number(60.into())),
-        );
+        map.insert("max_backoff_seconds".into(), Value::Number(max_backoff_num));
         map.insert(
             "supersedes_task_id".into(),
             self.supersedes_task_id
@@ -198,7 +218,7 @@ impl TaskSpec {
                 .map(|t| Value::String(t.as_str().to_string()))
                 .unwrap_or(Value::Null),
         );
-        Value::Object(map)
+        Ok(Value::Object(map))
     }
 }
 
