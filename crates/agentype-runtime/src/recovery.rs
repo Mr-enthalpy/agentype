@@ -26,7 +26,7 @@ use crate::{AdapterBindingKey, AdapterRegistry, ResolvedAdapterBinding, Supervis
 /// Where a freshly minted admission is consumed. The live runner must be
 /// used when one is running (lifecycle gate + deadline wake-up); the
 /// deterministic `SupervisionService` is enough for single-execution tests.
-pub trait AdmissionSink {
+pub(crate) trait AdmissionSink {
     fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError>;
 }
 
@@ -42,9 +42,9 @@ impl AdmissionSink for SupervisionRunner {
     }
 }
 
-impl AdmissionSink for crate::SupervisionAdmitSink {
+impl AdmissionSink for crate::supervision::SupervisionAdmitSink {
     fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
-        crate::SupervisionAdmitSink::admit(self, admission)
+        crate::supervision::SupervisionAdmitSink::admit(self, admission)
     }
 }
 use agentype_adapter_api::{RuntimeHandle, StartObservation};
@@ -131,7 +131,7 @@ pub enum ReconcileExecutionOutcome {
 /// `terminal_confirmed`) is a different machine from ACK/NACK. The legal
 /// crash window is physical terminal durable, Attempt/Lease still ACTIVE,
 /// Result none — never inferred from `outcome_json` on an UNKNOWN row.
-pub fn replay_persisted_terminal_consequence(
+pub(crate) fn replay_persisted_terminal_consequence(
     kernel: &Kernel,
     snapshot: &ExecutionReconciliationSnapshot,
 ) -> Result<TerminalReplayOutcome, RecoveryError> {
@@ -623,6 +623,7 @@ impl RecoveredRuntime {
 /// Delivery during RECOVERY is legal: a wakeup asserts a durable event
 /// exists, not that the daemon is READY. Ordinary RootBridge unavailability
 /// does not prevent READY. Durable notifier corruption does.
+#[allow(dead_code)] // reachable only from this crate's tests and from the test-support entry points below
 pub(crate) fn recover_runtime(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
@@ -643,7 +644,7 @@ pub(crate) fn recover_runtime_with_gate(
     adapters: &AdapterRegistry,
     timing: RuntimeTimingConfig,
     notifier: NotifierBinding,
-    gate: crate::DispatchGate,
+    gate: crate::control::DispatchGate,
     freshness_limit: f64,
 ) -> Result<RecoveredRuntime, RecoveryError> {
     recover_runtime_inner(
@@ -660,8 +661,10 @@ pub(crate) fn recover_runtime_with_gate(
 }
 
 /// Test-support recovery that does not acquire `RuntimeProcessLock`.
-/// Production composition must go through `SchedulerDaemon`.
+/// Production composition must go through `SchedulerDaemon`. Not part of the
+/// supported production API: the gate is a test-only crate-internal entry.
 #[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)] // reachable only from this crate's tests and from the test-support entry points below
 pub fn recover_runtime_without_process_lock(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
@@ -674,6 +677,7 @@ pub fn recover_runtime_without_process_lock(
 /// Explicit test-only recovery without a notifier. Does NOT mark outbox
 /// events DELIVERED and is not a production "no RootBridge" success path.
 #[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)] // reachable only from this crate's tests and from the test-support entry points below
 pub fn recover_runtime_without_notifier(
     kernel: Arc<Kernel>,
     adapters: &AdapterRegistry,
@@ -684,7 +688,7 @@ pub fn recover_runtime_without_notifier(
 
 struct RecoveryRun<'a> {
     fail_after_readmits: Option<usize>,
-    fatal_gate: Option<crate::DispatchGate>,
+    fatal_gate: Option<crate::control::DispatchGate>,
     freshness_limit: Option<f64>,
     between_candidates: Option<&'a dyn Fn(&SupervisionRunner)>,
 }
@@ -856,12 +860,12 @@ fn persisted_handle_hint(value: &Value) -> Option<RuntimeHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::DispatchGate;
     use crate::daemon::require_fresh_running_authority;
     use crate::notifier::{NotifierBinding, NotifierConfig, NotifierRetryPolicy};
     use crate::observer::{ObserveApply, PhysicalObserverConfig, PhysicalObserverService};
     use crate::supervision::RenewalOutcome;
     use crate::timing::RuntimeTimingConfig;
-    use crate::DispatchGate;
     use crate::{
         AdapterBindingKey, AdapterRegistry, FrozenExecutionSafety, FrozenPhysicalExecutionBinding,
     };

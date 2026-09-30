@@ -1,0 +1,28 @@
+[package]
+name = "agentype-public-api-boundary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: this is a repository fixture that continuously proves the
+# supported production API shape. It exists to fail the build, not to ship.
+publish = false
+description = "External-consumer boundary fixture: only agentype-runtime is a supported production dependency"
+
+# Every boundary claim below is a rustdoc probe, so `cargo test -p
+# agentype-public-api-boundary` builds this package against the DEFAULT feature
+# set -- no `test-support`, and no `--all-features` unification with the rest of
+# the workspace. That is the only configuration in which "not exposed through
+# the supported production API" is testable at all, which is why CI runs this
+# package as its own cargo invocation instead of inside the workspace run.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The supported production dependencies, default features only. These are the
+# crates a real host embedding the daemon would depend on: `agentype-runtime`
+# for the daemon, `agentype-core` for the Scheduler data types, and
+# `agentype-root-bridge` to implement the wakeup side channel.
+agentype-runtime = { path = "../../crates/agentype-runtime" }
+agentype-core = { path = "../../crates/agentype-core" }
+agentype-root-bridge = { path = "../../crates/agentype-root-bridge" }
+serde_json = { workspace = true }

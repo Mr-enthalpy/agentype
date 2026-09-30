@@ -11,18 +11,41 @@ publish = false
 
 [features]
 test-support = []
+# Runtime-mechanical Kernel surface. Claim, execution commitment, lease
+# renewal, physical-history recording, worker ACK/NACK, recovery, and outbox
+# delivery commits belong to the Runtime's mechanical path, not to the
+# supported production API. They are compiled in only for this crate's own
+# tests, for the `agentype-runtime` dependency that owns the daemon, and for
+# repository test targets that deliberately drive the Kernel directly.
+runtime-internal = []
 
-# These two targets exercise the LEGACY M4 primitives `heartbeat` and
-# `renew_supervised_execution`, which exist only under `test-support`.
-# Declaring that requirement keeps a default-feature `cargo test` buildable
-# instead of failing to compile these targets, while the CI `--all-features`
-# run still executes them.
+# Every integration target below drives the Kernel's mechanical primitive
+# surface directly (claim, execution commitment, renewal, ACK/NACK, physical
+# history, recovery). Declaring the requirement keeps a default-feature
+# `cargo test` buildable instead of failing to compile these targets, while
+# the CI `--all-features` run still executes them.
 [[test]]
 name = "m4_kernel"
 required-features = ["test-support"]
 
 [[test]]
 name = "supervision"
+required-features = ["test-support"]
+
+[[test]]
+name = "outbox_delivery"
+required-features = ["test-support"]
+
+[[test]]
+name = "reconciliation"
+required-features = ["test-support"]
+
+[[test]]
+name = "recovery"
+required-features = ["test-support"]
+
+[[test]]
+name = "topology"
 required-features = ["test-support"]
 
 [dependencies]
@@ -36,3 +59,7 @@ serde_json.workspace = true
 [dev-dependencies]
 agentype-adapter-api.workspace = true
 agentype-execution-config = { workspace = true, features = ["test-support"] }
+# Self dev-dependency: this crate's own integration targets are a separate
+# crate, so they need the mechanical Kernel surface explicitly. Feature
+# unification makes the flag apply to the library under test too.
+agentype-storage-sqlite = { path = ".", features = ["runtime-internal"] }

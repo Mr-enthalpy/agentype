@@ -365,7 +365,7 @@ fn store_identity_for_tests(path: &Path) -> Option<String> {
 
 /// Production dispatch eligibility. Runtime-local, non-serializable, no
 /// public constructor. Minted only after lock + recovery + activation.
-pub struct ReadyPermit {
+pub(crate) struct ReadyPermit {
     _private: (),
 }
 

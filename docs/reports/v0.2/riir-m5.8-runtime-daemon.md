@@ -203,13 +203,49 @@ now lives entirely in `src/bin/hold-process-lock.rs`, and
 ownership of a store, so nothing a production consumer should be able to
 call.
 
-### Open: production API boundary
+### Production API boundary: closed
 
-`agentype-storage-sqlite::Kernel` remains a public API, so a consumer can
-still build a second claim/renew control plane without the process lock,
-recovery, `ReadyPermit`, or the dispatch gate, and `SupervisionService`'s
-renewal surface is still re-exported. Those are the M5.8 audit round 4 P1-1
-findings and are **not** closed by this change.
+`agentype-storage-sqlite` is declared an internal implementation crate
+(`publish = false`), and the mechanical half is now mechanical rather than
+declarative. Every runtime-mechanical Kernel method — claim, execution
+commitment, `confirm_running_and_renew`, physical-history recording, worker
+ACK/NACK, `expire_leases`, `promote_retry_wait`, `recover_authority`,
+revival, consumer birth, checkpoint promotion, and the outbox delivery
+commits — is compiled only under
+`#[cfg(any(test, feature = "runtime-internal"))]`. `agentype-runtime` is the
+only crate that requests `runtime-internal`; the storage crate's own
+integration targets request it explicitly through a self dev-dependency, and
+the adapter acceptance tests that deliberately drive the Kernel request it as
+well.
+
+`agentype-runtime`'s default production surface was narrowed in the same
+pass. `ControlLoopService`, `ControlLoopRunner`, `PhysicalObserverService`,
+`PhysicalObserverRunner`, `DispatchGate`, `ReadyRelease`, `ReadyPermit`,
+`SupervisionRegistry`, `SupervisionAdmitSink`, `RecoveredRuntime`, and
+recovery's reconciliation entry points are `pub(crate)`;
+`SupervisionRunner`, `SupervisionRegistry`, and the unlocked /
+notifier-less recovery entry points are re-exported only under the
+`test-support` gate. `ControlError` stays public because `DaemonError::Control`
+carries it, and the storage crate is not re-exported at all, so a consumer
+cannot name the mechanical Kernel handle through `agentype-runtime`.
+
+`tests/public-api` is the compile-time witness: an external-consumer fixture
+depending on `agentype-runtime` with default features, holding twelve
+`compile_fail` rustdoc probes (one per boundary item) plus a `no_run` positive
+probe for the supported
+`SchedulerDaemonBuilder → RunningSchedulerDaemon → SchedulerControl`
+composition. CI runs it as its own `cargo test -p
+agentype-public-api-boundary` invocation and excludes it from the workspace
+`--all-features` run, because `test-support` would defeat the probes.
+
+The frozen statement is deliberately narrower than "unforgeable capability":
+`SchedulerDaemon` is the sole supported production composition root, and
+runtime-mechanical Kernel and supervision APIs belong to non-published internal
+implementation surfaces that the supported production API does not expose. A
+repository consumer that deliberately depends on the internal crate and
+requests its feature can still bypass this — it is a package trust boundary,
+not a capability sandbox. The capability-token alternative was considered and
+rejected for M5.8.
 
 ## Composition closure follow-ups
 
@@ -217,11 +253,11 @@ findings and are **not** closed by this change.
 Attempt was created" directly assertable; the gate regression now asserts
 `attempt_count == 0` instead of inferring it from the next claim's number.
 
-`m4_kernel` and `supervision` declare `required-features = ["test-support"]`,
-because they exercise the legacy `heartbeat` / `renew_supervised_execution`
-primitives that only exist under that feature. A default-feature
-`cargo test --workspace` now compiles; the CI `--all-features` run still
-executes both targets.
+All six storage integration targets (`m4_kernel`, `supervision`,
+`outbox_delivery`, `reconciliation`, `recovery`, `topology`) declare
+`required-features = ["test-support"]`, because they drive the mechanical
+Kernel surface directly. A default-feature `cargo test --workspace` now
+compiles; the CI `--all-features` run still executes every target.
 
 ## Diagnostic contract
 

@@ -2,11 +2,12 @@
 //!
 //! This loop does not renew Leases and does not observe adapters.
 
+use crate::process_lock::ReadyPermit;
 use crate::recovery::AdmissionSink;
+use crate::supervision::SupervisionError;
 use crate::timing::RuntimeTimingConfig;
 use crate::{
     AdapterRegistry, DispatchError, DispatchOneOutcome, Dispatcher, ExecutionId, ExecutionRegistry,
-    ReadyPermit, SupervisionError,
 };
 use agentype_core::Error;
 use agentype_core::FailureClass;
@@ -33,13 +34,13 @@ struct GateInner {
 /// Shared eligibility to start new physical executions.
 /// Fatal publication and start-permit issuance share this mutex.
 #[derive(Clone, Debug)]
-pub struct DispatchGate {
+pub(crate) struct DispatchGate {
     inner: Arc<Mutex<GateInner>>,
 }
 
 /// Held across one physical `start_execution`. Drop does not abort the call;
 /// it only releases the in-flight count.
-pub struct DispatchStartPermit {
+pub(crate) struct DispatchStartPermit {
     gate: DispatchGate,
 }
 
@@ -132,7 +133,7 @@ impl DispatchGate {
 /// barrier, immediately after the gate flips, so a worker's first action is
 /// strictly after READY and can no longer invalidate it.
 #[derive(Clone)]
-pub struct ReadyRelease {
+pub(crate) struct ReadyRelease {
     inner: Arc<(Mutex<bool>, Condvar)>,
 }
 
@@ -145,7 +146,8 @@ impl ReadyRelease {
 
     /// Already published. Test composition that starts a worker directly.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn released() -> Self {
+    #[allow(dead_code)] // test-only composition helper
+    pub(crate) fn released() -> Self {
         let release = Self::new();
         release.release();
         release
@@ -180,7 +182,7 @@ impl ReadyRelease {
 /// Dispatch result after ControlLoop has consumed a `RunningAdmitted`
 /// admission into supervision.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ControlDispatch {
+pub(crate) enum ControlDispatch {
     NoWork,
     RunningAdmitted {
         execution_id: ExecutionId,
@@ -195,12 +197,18 @@ pub enum ControlDispatch {
     },
 }
 
+/// One control cycle's outcome. The daemon does not read `dispatch` (it acts
+/// through the supervision sink), but the cycle tests assert on it.
 #[derive(Debug)]
-pub struct ControlCycleReport {
+pub(crate) struct ControlCycleReport {
+    #[allow(dead_code)]
     pub dispatch: ControlDispatch,
     pub wait: Duration,
 }
 
+/// Failure of one control cycle. Public because `DaemonError::Control`
+/// carries it: a production host must be able to inspect why the daemon's
+/// control worker failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlError {
     Persistence(Error),
@@ -233,7 +241,7 @@ impl From<DispatchError> for ControlError {
 }
 
 /// Deterministic control loop. Construction requires `ReadyPermit`.
-pub struct ControlLoopService<S> {
+pub(crate) struct ControlLoopService<S> {
     kernel: Arc<Kernel>,
     execution_registry: ExecutionRegistry,
     adapters: AdapterRegistry,
@@ -264,13 +272,14 @@ impl<S: AdmissionSink> ControlLoopService<S> {
         }
     }
 
-    pub fn poll_interval(&self) -> Duration {
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
+    pub(crate) fn poll_interval(&self) -> Duration {
         self.poll
     }
 
     /// Expire / promote / pool / revive, then at most one dispatch.
     /// `RunningAdmitted` is handed to supervision before this returns.
-    pub fn cycle(&self) -> Result<ControlCycleReport, ControlError> {
+    pub(crate) fn cycle(&self) -> Result<ControlCycleReport, ControlError> {
         self.kernel.expire_leases(false)?;
         self.kernel.promote_retry_wait()?;
         self.kernel.reconcile_pool()?;
@@ -335,13 +344,13 @@ struct RunnerShared {
 }
 
 /// Background control loop. Stopped on drop. Does not busy-spin on NoWork.
-pub struct ControlLoopRunner {
+pub(crate) struct ControlLoopRunner {
     shared: Arc<RunnerShared>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ControlLoopRunner {
-    pub fn start<S>(
+    pub(crate) fn start<S>(
         service: ControlLoopService<S>,
         ready: ReadyRelease,
     ) -> Result<Self, ControlError>
@@ -481,8 +490,8 @@ mod tests {
     use super::*;
     use crate::deadlines::test_deadlines;
     use crate::process_lock::ReadyPermit;
-    use crate::supervision::SupervisionService;
-    use crate::{AdapterRegistry, SupervisionRunner};
+    use crate::supervision::{SupervisionRunner, SupervisionService};
+    use crate::AdapterRegistry;
     use agentype_adapter_api::FakeAdapter;
     use agentype_core::{
         FailureClass, LeaseState, ManualClock, PartitionSpec, Retention, RetryPolicy, TaskSpec,

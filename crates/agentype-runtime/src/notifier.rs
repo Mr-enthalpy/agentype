@@ -352,7 +352,7 @@ impl NotifierRunner {
         kernel: Arc<Kernel>,
         bridge: Arc<dyn RootBridge>,
         config: NotifierConfig,
-        fatal_gate: Option<crate::DispatchGate>,
+        fatal_gate: Option<crate::control::DispatchGate>,
     ) -> Result<Self, NotifierError> {
         let service = NotifierService::new(kernel, bridge, config.retry_policy());
         let shared = Arc::new(RunnerShared {
@@ -470,7 +470,11 @@ impl NotifierRunner {
     }
 }
 
-fn fail_runner(shared: &RunnerShared, err: NotifierError, gate: &Option<crate::DispatchGate>) {
+fn fail_runner(
+    shared: &RunnerShared,
+    err: NotifierError,
+    gate: &Option<crate::control::DispatchGate>,
+) {
     let mut state = shared.state.lock().expect("notifier runner state");
     if state.fatal.is_none() {
         state.fatal = Some(err);

@@ -233,7 +233,7 @@ pub struct SupervisionRegistry {
 }
 
 impl SupervisionRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -280,6 +280,7 @@ impl SupervisionRegistry {
     /// longer owns lease-renewal responsibility" — it never mutates
     /// Execution state, never claims quiescence, and never revokes or
     /// completes Task authority by itself.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&mut self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let entry = self
             .entries
@@ -300,19 +301,23 @@ impl SupervisionRegistry {
         }
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.entries.contains_key(execution_id)
     }
 
     /// This runtime still has the entry. Distinct from renewal eligibility.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn owns(&self, execution_id: &ExecutionId) -> bool {
         self.contains(execution_id)
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.entries.len()
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -596,12 +601,14 @@ impl SupervisionService {
 
     /// Explicitly drop supervision ownership (terminal handling, invariant
     /// mismatch). Never touches durable state.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let mut registry = self.registry.lock().expect("supervision registry lock");
         registry.remove(execution_id)
     }
 
     /// Renewal eligibility, not ownership. A stale entry stays owned.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.registry
             .lock()
@@ -612,6 +619,7 @@ impl SupervisionService {
     }
 
     /// This runtime's registry still has the entry, even if renewal is stopped.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn owns(&self, execution_id: &ExecutionId) -> bool {
         self.registry
             .lock()
@@ -619,6 +627,7 @@ impl SupervisionService {
             .owns(execution_id)
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.registry
             .lock()
@@ -936,7 +945,7 @@ impl SupervisionRunner {
     pub(crate) fn start_with_fatal_gate(
         kernel: Arc<Kernel>,
         timing: RuntimeTimingConfig,
-        fatal_gate: Option<crate::DispatchGate>,
+        fatal_gate: Option<crate::control::DispatchGate>,
     ) -> Result<Self, SupervisionError> {
         let service = SupervisionService::new(kernel.clone(), &timing)?;
         let shared = Arc::new(RunnerShared::default());
@@ -1062,6 +1071,7 @@ impl SupervisionRunner {
 
     /// Drop supervision ownership for one execution. Never touches durable
     /// state.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let state = self.shared.state.lock().expect("runner state lock");
         let result = self.service.remove(execution_id);
@@ -1072,11 +1082,13 @@ impl SupervisionRunner {
         result
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.service.contains(execution_id)
     }
 
     /// Owned supervision entry, whether or not it may currently renew.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn owns(&self, execution_id: &ExecutionId) -> bool {
         self.service.owns(execution_id)
     }
@@ -1104,6 +1116,7 @@ impl SupervisionRunner {
         self.shared.state.lock().expect("runner state lock").phase == RunnerPhase::Failed
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.service.active_count()
     }

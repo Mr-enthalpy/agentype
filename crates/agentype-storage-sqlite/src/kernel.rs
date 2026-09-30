@@ -1230,6 +1230,7 @@ impl Kernel {
 
     /// Birth a temporary consumer when a QUEUED task has no compatible READY
     /// identity. May exceed desired capacity; later reconciliation retires excess.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn ensure_task_consumers(&self) -> Result<(), Error> {
         self.tx(|tx, now| {
             let mut stmt = tx
@@ -1317,6 +1318,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn claim_next_available(&self) -> Result<Option<Claim>, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
@@ -1446,6 +1448,7 @@ impl Kernel {
     /// durable Attempt is rejected (InvalidAuthority) — both BEFORE any
     /// configuration resolution, so a forged claim cannot turn a fully
     /// configured Task into a RESOURCE_UNAVAILABLE preparation failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn resolve_execution_binding(
         &self,
         claim: &Claim,
@@ -1482,6 +1485,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn create_execution(
         &self,
         claim: &Claim,
@@ -1673,6 +1677,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn confirm_running_and_renew(
         &self,
         attempt_id: &AttemptId,
@@ -1741,6 +1746,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn record_physical_outcome(
         &self,
         execution_id: &ExecutionId,
@@ -1814,6 +1820,7 @@ impl Kernel {
 
     /// Persist a better opaque locator without inventing physical state,
     /// Task/Lease mutation, or terminal/quiescence proof.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn record_runtime_handle_hint(
         &self,
         execution_id: &ExecutionId,
@@ -1844,6 +1851,7 @@ impl Kernel {
     /// commit leaves `SUCCEEDED`/`FAILED` + `terminal_confirmed` with
     /// Attempt/Lease still ACTIVE. Incarnation WARM/TERMINATED is decided
     /// by the subsequent ACK/NACK (`incarnation_reusable`).
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn record_pending_physical_terminal(
         &self,
         execution_id: &ExecutionId,
@@ -1900,6 +1908,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn ack_success(
         &self,
         attempt_id: &AttemptId,
@@ -2039,6 +2048,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn nack(
         &self,
         attempt_id: &AttemptId,
@@ -2157,6 +2167,7 @@ impl Kernel {
     /// Close current Attempt/Lease authority without inventing a physical
     /// Execution state. Mechanical failure, retry, and writer-safety still
     /// apply. Terminal/quiescence proof and Result are not created.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn nack_preserving_physical_history(
         &self,
         attempt_id: &AttemptId,
@@ -2235,6 +2246,7 @@ impl Kernel {
     /// The adapter was never called. Remove the STARTING row, then close
     /// authority as if no execution existed, so an unisolated writer is not
     /// given a quiescence obligation.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn abort_before_physical_start(
         &self,
         attempt_id: &AttemptId,
@@ -2502,6 +2514,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn expire_leases(&self, recover_unstarted: bool) -> Result<ExpireReport, Error> {
         self.tx(|tx, now| {
             let mut report = ExpireReport::default();
@@ -2657,6 +2670,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn promote_retry_wait(&self) -> Result<u32, Error> {
         self.tx(|tx, now| {
             let n = tx
@@ -2886,6 +2900,7 @@ impl Kernel {
     /// PENDING → DELIVERED (attempts++, delivered_at, last_error NULL).
     /// DELIVERED / ACKED → no-op (do not regress ACKED to DELIVERED).
     /// Missing identity is an invariant failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn commit_outbox_delivery_success(
         &self,
         event_id: &OutboxEventId,
@@ -2899,6 +2914,7 @@ impl Kernel {
     /// PENDING → PENDING (attempts++, next_delivery_at = now+delay, last_error).
     /// DELIVERED / ACKED → no-op (do not restore PENDING, do not schedule retry).
     /// Missing identity is an invariant failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn commit_outbox_delivery_failure(
         &self,
         event_id: &OutboxEventId,
@@ -2951,6 +2967,7 @@ impl Kernel {
     /// fenced by the positively admitted execution identity. Visibility
     /// reduction is scheduled for the M5.8 composition freeze.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn heartbeat(
         &self,
         attempt_id: &AttemptId,
@@ -2994,6 +3011,7 @@ impl Kernel {
     /// can never revive expired authority.
     /// Test/oracle renewal with no physical-freshness constraint.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn renew_supervised_execution(
         &self,
         attempt_id: &AttemptId,
@@ -3005,6 +3023,7 @@ impl Kernel {
 
     /// Fenced renewal. `fresh_until` is required: there is no production
     /// call that renews without a physical-freshness endpoint.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn renew_supervised_execution_guarded(
         &self,
         attempt_id: &AttemptId,
@@ -3126,6 +3145,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn promote_checkpoint(
         &self,
         attempt_id: &AttemptId,
@@ -3298,6 +3318,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn report_configuration_unavailable(
         &self,
         attempt_id: &AttemptId,
@@ -3319,6 +3340,7 @@ impl Kernel {
         )
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn revive_agent(
         &self,
         logical_agent_id: &LogicalAgentId,
@@ -3373,6 +3395,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn revive_eligible_agents(&self) -> Result<u32, Error> {
         let candidates: Vec<(String, String)> = self.store.query(|conn| {
             let mut stmt = conn
@@ -3396,6 +3419,7 @@ impl Kernel {
         Ok(n)
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn recover_authority(&self) -> Result<ExpireReport, Error> {
         let expired = self.expire_leases(true)?;
         self.promote_retry_wait()?;

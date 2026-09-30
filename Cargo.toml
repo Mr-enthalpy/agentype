@@ -9,6 +9,11 @@ members = [
     "crates/agentype-root-bridge",
     "crates/agentype-runtime",
     "crates/agentype-nlink",
+    # External-consumer boundary fixture. It is a member so it must keep
+    # compiling, but CI runs it as its own `cargo test -p` invocation: its
+    # compile-fail probes are only meaningful under the DEFAULT feature set,
+    # and the workspace `--all-features` run would switch `test-support` on.
+    "tests/public-api",
 ]
 
 [workspace.package]

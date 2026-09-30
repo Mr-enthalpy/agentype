@@ -49,6 +49,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentype-public-api-boundary"
+version = "0.2.0"
+dependencies = [
+ "agentype-core",
+ "agentype-root-bridge",
+ "agentype-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "agentype-root-bridge"
 version = "0.2.0"
 dependencies = [
@@ -78,6 +88,7 @@ dependencies = [
  "agentype-adapter-api",
  "agentype-core",
  "agentype-execution-config",
+ "agentype-storage-sqlite",
  "rusqlite",
  "serde_json",
  "thiserror",

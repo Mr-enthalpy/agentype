@@ -216,7 +216,7 @@ pub enum ObserveApply {
 
 /// Deterministic physical observer. Adapter I/O never runs on the heartbeat
 /// thread. Candidates come only from the process-local supervision registry.
-pub struct PhysicalObserverService {
+pub(crate) struct PhysicalObserverService {
     kernel: Arc<Kernel>,
     adapters: AdapterRegistry,
     supervision: SupervisionFreshnessSink,
@@ -225,7 +225,7 @@ pub struct PhysicalObserverService {
 }
 
 impl PhysicalObserverService {
-    pub fn new(
+    pub(crate) fn new(
         kernel: Arc<Kernel>,
         adapters: AdapterRegistry,
         supervision: SupervisionFreshnessSink,
@@ -241,11 +241,12 @@ impl PhysicalObserverService {
         }
     }
 
-    pub fn config(&self) -> PhysicalObserverConfig {
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
+    pub(crate) fn config(&self) -> PhysicalObserverConfig {
         self.config
     }
 
-    pub fn observe_due_now(&self) -> Result<Vec<ObserveApply>, ObserverError> {
+    pub(crate) fn observe_due_now(&self) -> Result<Vec<ObserveApply>, ObserverError> {
         self.observe_due(self.kernel.now())
     }
 
@@ -601,7 +602,7 @@ struct ObserverRunnerState {
 }
 
 /// Independent observer thread. Never shares Adapter I/O with heartbeat.
-pub struct PhysicalObserverRunner {
+pub(crate) struct PhysicalObserverRunner {
     shared: Arc<(
         Mutex<ObserverRunnerState>,
         Arc<crate::supervision::ObserverWake>,
@@ -610,9 +611,9 @@ pub struct PhysicalObserverRunner {
 }
 
 impl PhysicalObserverRunner {
-    pub fn start(
+    pub(crate) fn start(
         service: PhysicalObserverService,
-        fatal_gate: crate::DispatchGate,
+        fatal_gate: crate::control::DispatchGate,
         ready: crate::control::ReadyRelease,
     ) -> Result<Self, ObserverError> {
         let wake = service.supervision_wake_target().observer_wake();
@@ -1026,9 +1027,12 @@ mod tests {
         svc.admit(mint(&claim, &exec, &kernel)).unwrap();
 
         let ready = crate::control::ReadyRelease::new();
-        let runner =
-            PhysicalObserverRunner::start(observer, crate::DispatchGate::open(), ready.clone())
-                .unwrap();
+        let runner = PhysicalObserverRunner::start(
+            observer,
+            crate::control::DispatchGate::open(),
+            ready.clone(),
+        )
+        .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert_eq!(
