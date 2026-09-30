@@ -114,10 +114,10 @@ impl TaskSpec {
     /// Deterministic canonical JSON representation of all authority-bearing fields.
     pub fn canonical_json(&self) -> Result<Value, crate::Error> {
         if !self.retry_policy.base_backoff_seconds.is_finite()
-            || self.retry_policy.base_backoff_seconds <= 0.0
+            || self.retry_policy.base_backoff_seconds < 0.0
         {
             return Err(crate::Error::invariant(
-                "base_backoff_seconds must be a finite positive number",
+                "base_backoff_seconds must be a finite non-negative number",
             ));
         }
         if !self.retry_policy.max_backoff_seconds.is_finite()
@@ -219,6 +219,18 @@ impl TaskSpec {
                 .unwrap_or(Value::Null),
         );
         Ok(Value::Object(map))
+    }
+
+    /// Deterministic equivalence under canonicalization.
+    ///
+    /// Order-insensitive vector fields (`affinity_tags`, `dependencies`,
+    /// `retry_classes`) and any other representation detail that canonical
+    /// serialization normalizes MUST NOT make two otherwise-identical specs
+    /// compare unequal. This is the correct predicate for admission replay and
+    /// override consistency, where Rust struct `PartialEq` would reject a
+    /// committed spec replayed with its original, differently-ordered vectors.
+    pub fn equivalent(&self, other: &TaskSpec) -> Result<bool, crate::Error> {
+        Ok(self.canonical_json()? == other.canonical_json()?)
     }
 }
 

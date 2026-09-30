@@ -32,6 +32,12 @@ Domain-semantic, architecture-light. Typical content: objective, rationale,
 question or change, expected outcome, evidence refs, dependency refs,
 observed constraints, affected domain, blocking indicator.
 
+It is an ingress value, not a durable aggregate (see
+[01](01-domain-model.md)). In M6-A a worker-originated intent is durable only
+through the source `Result` that carried it, and Root-originated intent is
+command input; the compiler turns it into a durable `CompiledWorkProposal`,
+which is the first Scheduler-owned review object.
+
 Ordinary workers MUST NOT need AgentType registries, Generation mechanics,
 Pool topology, SpawnSource, Transform, or Lease/Attempt/Incarnation knowledge.
 
@@ -71,15 +77,26 @@ active Leases, heartbeat, current Incarnation IDs, or physical processes.
 
 ## Outcomes
 
-Normative names:
+These outcome names are compiler **vocabulary**, not a persistent state machine
+an M6-A implementation must materialize.
+
+The concrete M6-A compiler surface is narrower: a deterministic compile either
+produces exactly one durable `CompiledWorkProposal` carrying the intent's
+content, or fails deterministically without creating any semantic commitment.
+Mapping onto the vocabulary:
 
 | Outcome | Meaning |
 |---|---|
-| COMPILED | one proposal produced |
-| REDUNDANCY_CANDIDATE | possible duplicate; intent remains Root-visible |
-| NEEDS_ROOT_DECISION | architectural/semantic ambiguity |
-| NEEDS_DECOMPOSITION | cannot compile without split; MUST NOT recurse |
-| INVALID | malformed or disallowed by schema/policy |
+| COMPILED | one durable proposal produced |
+| REDUNDANCY_CANDIDATE | stable-identity replay returns the existing durable proposal; it stays Root-visible/auditable through that proposal |
+| NEEDS_ROOT_DECISION | proposal produced without a normalized TaskSpec; Root decides at admission |
+| NEEDS_DECOMPOSITION | cannot compile without split; MUST NOT recurse; no commitment produced |
+| INVALID | malformed or disallowed by schema/policy; no commitment produced |
+
+Root-visibility for a rejected or ambiguous intent is preserved through the
+durable proposal when one exists. A compile that produces no commitment leaves
+no Scheduler object, because the intent itself is not a durable Scheduler record
+([01](01-domain-model.md)).
 
 `REJECTED_AS_REDUNDANT` is **not** a V0.2 disposition that may drop an
 intent from Root's frontier view. Compiler MAY detect redundancy;
@@ -104,7 +121,7 @@ Whether limited one-to-many normalization is ever justified is DEFERRED
 
 End-of-generation flow:
 
-`Generation drains → Results durable → intents collected → compilation pass → proposals → REVIEWABLE → Root reject/defer/admit`.
+`Generation drains → Results durable → intents read (from source Results / Root input) → compilation pass → durable proposals → Root-reviewable → Root reject/defer/admit`.
 
 If compilation requires agent/model execution, that work is ordinary
 Task/Attempt/Lease/Result. **Which Generation (if any) that compiler Task
