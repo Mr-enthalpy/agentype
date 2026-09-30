@@ -107,6 +107,10 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
          AND
          every Task admitted into G has reached an M5 terminal disposition (Completed, Cancelled; Suspended tasks require Root disposition)
      ```
+     `is_generation_settled` is the close gate and is false once the generation is
+     `CLOSED`. The derived `GenerationView.is_settled` field is a separate terminal
+     projection (`state == CLOSED || is_generation_settled`), so a closed generation
+     reads `is_settled = true`.
    - Atomically updates state to `CLOSED` and increments `revision`.
    - Atomically marks any remaining unadmitted `PENDING` proposals as `EXPIRED` (`reason: GENERATION_CLOSED`).
    - Emits an outbox event `GENERATION_CLOSED` in the same transaction.
@@ -117,13 +121,13 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
 
 - **Deterministic Compilation**: `compile_intent` maps a `RawWorkIntent` into a unique `CompiledWorkProposal`. It is idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)` with canonical payload fingerprinting (content changes for the same identity are rejected with Conflict).
 - **TaskSpec Dependencies**: In M6-A, `TaskSpec.dependencies` must be empty. Cross-admission dependency is expressed by `SemanticInputSet` provenance and Root admission order.
-- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, not an aggregate execution barrier. Each admitted task is materialized into its own independent mechanical Batch (`batch_{task_id}`), ensuring completion or cancellation of prior tasks never blocks dynamic admissions into an `OPEN` Generation.
+- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, not an aggregate execution barrier. Each admitted task is materialized into its own fresh dedicated mechanical Batch, ensuring completion or cancellation of prior tasks never blocks dynamic admissions into an `OPEN` Generation.
 - **Atomic Admission**: `admit_proposal` executes in a single SQLite transaction:
   1. Checks generation admission rules (`generation_allows_admit`).
   2. Transitions proposal state from `PENDING` to `ADMITTED`. Concurrent duplicate admissions result in exactly one winner (Race B).
   3. Validates that provenance `result_ids` exist in durable storage.
   4. Resolves `TaskSpec` (enforcing explicit Root decision if unspecified in proposal, and detecting conflicts).
-  5. Creates an M5 `TaskRecord` in state `Queued` inside its dedicated mechanical execution batch (`batch_{task_id}`).
+  5. Creates an M5 `TaskRecord` in state `Queued` inside a fresh dedicated mechanical execution batch (a new batch identity minted per admission, independent of the task id).
   6. Creates a `GenerationTaskBindingRecord` linking the task, generation, information function, admitted `TaskSpec`, and frozen `SemanticInputSet`.
 
 ---

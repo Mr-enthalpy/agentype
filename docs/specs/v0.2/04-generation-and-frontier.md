@@ -67,6 +67,13 @@ GenerationSettled(G) :=
     every Task admitted into G has reached an M5 terminal disposition (Completed or Cancelled; Suspended tasks require Root disposition)
 ```
 
+`GenerationSettled(G)` is the `close_generation` gate, so it is deliberately false
+once `G` has advanced to `CLOSED`. The derived `GenerationView.is_settled` field is
+a distinct terminal projection: it is true for a settled `FROZEN` generation and
+remains true for its terminal `CLOSED` successor
+(`state == CLOSED || GenerationSettled(G)`). A `CLOSED` generation therefore
+MUST NOT read `is_settled = false`.
+
 Mechanical work (retries, recovery, adapter reconciliation, lease renewals) remains inside the originating semantic Task and Generation. It MUST NOT create a new Generation.
 
 ## Task Materialization and Admission
@@ -78,7 +85,7 @@ Every semantic Task MUST belong to exactly one Generation via an explicit `Gener
 - Workers and compilers MUST NOT materialize executable Tasks directly.
 - **D-GEN-INTRA Resolution**: Root MAY add Tasks to an already `OPEN` or `FROZEN` generation dynamically (subject to information function admission rules). In `FROZEN`, only `COMPRESS_POSITIVE` and `COMPRESS_NEGATIVE` proposals may be admitted.
 - **Task Dependencies**: In M6-A, `TaskSpec.dependencies` MUST be empty. Semantic order is expressed by `SemanticInputSet` provenance and Root admission timing.
-- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, whereas Batch is an aggregate execution barrier. To preserve orthogonality and prevent deadlocks on dynamic admissions, each admitted semantic task is materialized into its own internal mechanical execution batch (`batch_{task_id}`). Prior task completions or cancellations never compromise the eligibility of subsequently admitted tasks in an `OPEN` Generation.
+- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, whereas Batch is an aggregate execution barrier. To preserve orthogonality and prevent deadlocks on dynamic admissions, each admitted semantic task is materialized into its own fresh dedicated internal mechanical execution batch (a new batch identity minted per admission, independent of the task id). Prior task completions or cancellations never compromise the eligibility of subsequently admitted tasks in an `OPEN` Generation.
 
 ## Information Functions
 

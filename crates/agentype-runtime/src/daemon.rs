@@ -472,12 +472,14 @@ impl RunningSchedulerDaemon {
         &self.kernel
     }
 
-    /// Narrow production control and diagnostics surface.
+    /// Narrow mechanical and host control/diagnostics surface.
     ///
-    /// This is the only *supported* production path that mutates Scheduler
-    /// authority from outside the Runtime. Worker acknowledgement,
-    /// Runtime-owned mechanics, and writer-quiescence overrides are not
-    /// reachable through it.
+    /// `SchedulerControl` is the supported surface for mechanical host actions
+    /// (submit/cancel, pool topology, Result/Outbox ACK, diagnostics);
+    /// [`semantic_control`](Self::semantic_control) is the supported surface for
+    /// semantic frontier authority. Both are reached only through this
+    /// composition root. Worker acknowledgement, Runtime-owned mechanics, and
+    /// writer-quiescence overrides are not reachable through either.
     pub fn control(&self) -> crate::SchedulerControl<'_> {
         let lock = self._lock.lock();
         crate::SchedulerControl::new(&self.kernel, lock.identity_debug(), lock.store_path())

@@ -26,7 +26,7 @@ Classification:
 | D-MEM-PROMOTE | Who promotes Result delta to canonical MemoryCapsule | Root vs integration Task vs other | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-NEG-GC | Negative entry scope/assumptions/applicability/supersession/hot-cold GC | without it prohibitions rot | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-CONTINUITY-BIND | ContinuityBinding storage, security, expiry | opaque handle only | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-ROOT-API | Exact Generation review / admit / defer API | **RESOLVED in M6-A**: Narrow `RootSemanticControl` surface (`compile_intent`, `admit_proposal`, `reject_proposal`, `freeze_generation`, `close_generation`, `get_generation_view`) | None (Resolved) | M6-A |
+| D-ROOT-API | Exact Generation review / admit / defer API | **RESOLVED in M6-A**: Narrow `RootSemanticControl` surface (`create_generation`, `compile_intent`, `admit_proposal`, `reject_proposal`, `freeze_generation`, `close_generation`, `read_generation_view`, `read_proposal`) | None (Resolved) | M6-A |
 | D-TRANSFORM-FAIL | Transform suspend/cancel/partial/rollback | saga happy path frozen | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-TOPOLOGY | Remaining type-refinement vs capacity vs MOVE vs MERGE vs TRANSFORM split | V0.1 MOVE/MERGE kernel is enough for M4 | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-ADAPTER2 | Minimal second-adapter conformance extras | M7 demonstration | DOES_NOT_BLOCK_RIIR_KERNEL | M7 |
