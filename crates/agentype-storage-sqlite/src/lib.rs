@@ -19,6 +19,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod frontier;
 mod kernel;
 mod schema;
 mod store;

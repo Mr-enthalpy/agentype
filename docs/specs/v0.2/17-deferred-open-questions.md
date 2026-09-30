@@ -15,9 +15,9 @@ Classification:
 | ID | Question | Why unresolved | Blocks | Resolve by |
 |---|---|---|---|---|
 | D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | design forbids guessing a workflow DSL | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-GEN-INTRA | May Root add Tasks after a Generation is already OPEN/ACTIVE? | not frozen in design | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-GEN-TOPOLOGY | Generation provenance chain vs DAG | only `parent_generation_id` sketched | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | trade-off compiler vs architecture leak | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-GEN-INTRA | May Root add Tasks after a Generation is already OPEN/ACTIVE? | **RESOLVED in M6-A**: Root may add Tasks dynamically; in OPEN all functions allowed, in FROZEN only compression allowed | None (Resolved) | M6-A |
+| D-GEN-TOPOLOGY | Generation provenance chain vs DAG | **RESOLVED in M6-A**: DAG tracked via immutable `SemanticInputSet` on each task binding and generation seed | None (Resolved) | M6-A |
+| D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | **RESOLVED in M6-A**: Ingress `RawWorkIntent` structure compiles deterministically to `CompiledWorkProposal` | None (Resolved) | M6-A |
 | D-INTENT-FANOUT | Whether 1-to-many compile is ever allowed | design prefers 0..1 | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-TYPE-REL | Concrete `can_execute` / `can_provision` / `more_specific_for` / `is_valid_refinement` | must not collapse to subtype | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-TYPE-REV | AgentType revision compatibility and Task pins | revisions mentioned, rules not | BLOCKS_SEMANTIC_LAYER | M6 |

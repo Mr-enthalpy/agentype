@@ -483,6 +483,11 @@ impl RunningSchedulerDaemon {
         crate::SchedulerControl::new(&self.kernel, lock.identity_debug(), lock.store_path())
     }
 
+    /// Root semantic control surface for managing generations and the admission frontier.
+    pub fn semantic_control(&self) -> crate::RootSemanticControl<'_> {
+        crate::RootSemanticControl::new(&self.kernel)
+    }
+
     /// Test-support: panic the health coordinator on its next tick, so its
     /// own fatal path is reachable from a regression test.
     #[cfg(any(test, feature = "test-support"))]

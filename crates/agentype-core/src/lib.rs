@@ -6,6 +6,7 @@ mod authority;
 mod clock;
 mod decisions;
 mod errors;
+mod frontier;
 mod ids;
 mod records;
 mod states;
@@ -31,6 +32,7 @@ pub use decisions::{
     PresenceAction,
 };
 pub use errors::Error;
+pub use frontier::*;
 pub use ids::*;
 pub use records::*;
 pub use states::*;

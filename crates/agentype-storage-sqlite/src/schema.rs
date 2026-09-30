@@ -4,9 +4,10 @@
 /// Schema version 2 added `executions.adapter_kind`. Version 3 adds the
 /// lossless pending-terminal envelope (`summary`, `incarnation_reusable`).
 /// Version 4 adds `executions.adapter_binding_key` (opaque domain identity
-/// frozen at Execution creation). Older files are rejected at open (fail
-/// closed); D-DB-MIGRATE is still unresolved.
-pub const SCHEMA_VERSION: i64 = 4;
+/// frozen at Execution creation). Version 5 adds M6-A Semantic Frontier Kernel
+/// tables (`generations`, `compiled_work_proposals`, `generation_task_bindings`).
+/// Older files are rejected at open (fail closed); D-DB-MIGRATE is still unresolved.
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -291,4 +292,47 @@ CREATE TRIGGER IF NOT EXISTS tasks_required_update_only
 BEFORE UPDATE OF required ON tasks WHEN NEW.required<>1 BEGIN
     SELECT RAISE(ABORT,'optional Tasks are not supported');
 END;
+
+CREATE TABLE IF NOT EXISTS generations (
+    generation_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('OPEN','FROZEN','CLOSED')),
+    revision INTEGER NOT NULL DEFAULT 0,
+    admission_seq INTEGER NOT NULL DEFAULT 0,
+    seed_payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    frozen_at REAL,
+    closed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS compiled_work_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES generations(generation_id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    raw_intent_key TEXT NOT NULL,
+    information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
+    normalized_task_spec_json TEXT NOT NULL,
+    semantic_input_set_json TEXT NOT NULL DEFAULT '[]',
+    compiler_version INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL CHECK (state IN ('PENDING','ADMITTED','REJECTED','EXPIRED')),
+    admitted_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    expiration_reason TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(source_ref, raw_intent_key, compiler_version)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_admitted_task_id
+ON compiled_work_proposals(admitted_task_id)
+WHERE admitted_task_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS generation_task_bindings (
+    generation_id TEXT NOT NULL REFERENCES generations(generation_id) ON DELETE CASCADE,
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    proposal_id TEXT NOT NULL REFERENCES compiled_work_proposals(proposal_id) ON DELETE RESTRICT,
+    information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
+    admission_seq INTEGER NOT NULL,
+    semantic_input_set_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
 "#;

@@ -18,82 +18,84 @@ Workers MUST NOT receive spawning authority from a Generation.
 
 ## States
 
-These names are the V0.2 normative machine. Exact extra flags on policy are
-DEFERRED (D-GEN-POLICY).
+In M6-A, the durable Generation state machine is frozen to three states:
 
-| From | Operation | To | Who |
-|---|---|---|---|
-| (none) | Root admits bounded slice | OPEN | Root intent; Scheduler persists |
-| OPEN | first Task materialized or work running | ACTIVE | Scheduler |
-| ACTIVE | drained + durable Results + intents + compilation-if-configured | REVIEWABLE | Scheduler |
-| REVIEWABLE | Root reject/defer/close without successor | CLOSED | Root |
-| REVIEWABLE | Root admits successor slice | CLOSED (this) + OPEN (next) | Root |
-| OPEN/ACTIVE | Root or policy cancel | CANCELLED | Root |
-| OPEN/ACTIVE | mechanical safety stop (writer-safety; scope unchanged) | SUSPENDED | Scheduler |
-| OPEN/ACTIVE | semantic / decision-required Escalation | SUSPENDED | Scheduler |
-| SUSPENDED | resume (mechanical or semantic) | ACTIVE or OPEN | **DEFERRED** D-GEN-RESUME |
+```text
+OPEN
+  |
+  | freeze (atomic: increments revision, expires pending EXPAND proposals, writes outbox)
+  v
+FROZEN
+  |
+  | close (atomic: requires is_generation_settled barrier, increments revision, expires remaining proposals, writes outbox)
+  v
+CLOSED
+```
 
-`CLOSED` and `CANCELLED` are terminal for that id.
+| State | Semantic Meaning | Allowed Admissions |
+|---|---|---|
+| `OPEN` | Semantic breadth may expand. Root may explore depth or breadth. | `EXPAND`, `COMPRESS_POSITIVE`, `COMPRESS_NEGATIVE` |
+| `FROZEN` | Semantic breadth is sealed. Expansion stops; only convergence/compression permitted. | `COMPRESS_POSITIVE`, `COMPRESS_NEGATIVE` (EXPAND is rejected) |
+| `CLOSED` | Terminal. Bounded slice completed and settled. | None |
 
-Intent (not a frozen resume API): mechanical vs semantic suspension MUST
-eventually be distinguished — Scheduler MUST NOT regain frontier authority
-on a decision-required Escalation. **Do not implement** Scheduler-owned
-`SUSPENDED → ACTIVE/OPEN` yet: Task has no SUSPENDED recovery edge, and
-Batch `SUSPENDED → ACTIVE` is a Root recovery operation
-([03](03-task-attempt-lease-result.md)). Alignment of Generation / Task /
-Batch / Escalation resume is D-GEN-RESUME.
+### State Transitions and Atomic Barriers
 
-How a model-backed compilation Task participates in drain/REVIEWABLE is
-DEFERRED (D-COMPILATION-CLOSURE). Compilation MUST NOT recursively expand
-the frontier.
+1. **`create_generation`**: Transitions `(none) -> OPEN`. Materializes the generation record with initial seed payload and revision 0.
+2. **`freeze_generation(generation_id, expected_revision)`**: Transitions `OPEN -> FROZEN`.
+   - Atomic SQLite transaction:
+     - Verifies `expected_revision` matches current revision.
+     - Transitions state to `FROZEN` and increments `revision`.
+     - Atomically expires all pending `EXPAND` proposals belonging to this generation with reason `GENERATION_FROZEN`.
+     - Writes outbox event `generation.frozen` in the same transaction.
+   - Race condition rule (Race A): If an admission commits before freeze, the resulting task is part of the generation and must settle before closure. If freeze commits before admission, any pending EXPAND admission is rejected.
+3. **`close_generation(generation_id, expected_revision)`**: Transitions `FROZEN -> CLOSED`.
+   - Requires `is_generation_settled` barrier predicate:
+     - `generation.state == FROZEN`.
+     - Every task admitted into the generation has reached a terminal M5 disposition (`Completed`, `Failed`, or `Cancelled`).
+   - Atomic SQLite transaction:
+     - Verifies `expected_revision` matches current revision.
+     - Transitions state to `CLOSED` and increments `revision`.
+     - Atomically expires any remaining pending proposals with reason `GENERATION_CLOSED`.
+     - Writes outbox event `generation.closed` in the same transaction.
 
-### REVIEWABLE (MUST)
+### Settled Barrier Predicate
 
-A Generation becomes REVIEWABLE only when:
+```text
+GenerationSettled(G) :=
+    G.state == FROZEN
+    AND
+    every Task admitted into G has reached an M5 terminal disposition (Completed, Failed, Cancelled)
+```
 
-1. no Task in the Generation can still run (all terminal, or only blocked in a
-   way the drain definition treats as stopped — drain exactness DEFERRED
-   D-GEN-POLICY if it depends on policy encoding);
-2. authoritative Results for completed Tasks are durable;
-3. generated RawWorkIntents are durable;
-4. WorkIntent compilation pass is complete if configured.
+Mechanical work (retries, recovery, adapter reconciliation, lease renewals) remains inside the originating semantic Task and Generation. It MUST NOT create a new Generation.
 
-Root Result ACK MUST NOT be required for REVIEWABLE.
+## Task Materialization and Admission
 
-### Mechanical work MUST NOT advance Generation
+Every semantic Task MUST belong to exactly one Generation via an explicit `GenerationTaskBinding`.
 
-Retry, recovery, adapter reconciliation, and revival MUST remain inside the
-originating semantic Task/Generation. They MUST NOT create a new Generation.
+- Who may request materialization: Root (via explicit proposal admission).
+- Scheduler MUST persist: atomic creation of the M5 `TaskRecord` and `GenerationTaskBindingRecord` in one transaction.
+- Workers and compilers MUST NOT materialize executable Tasks directly.
+- **D-GEN-INTRA Resolution**: Root MAY add Tasks to an already `OPEN` or `FROZEN` generation dynamically (subject to information function admission rules). In `FROZEN`, only `COMPRESS_POSITIVE` and `COMPRESS_NEGATIVE` proposals may be admitted.
 
-## Task materialization
+## Information Functions
 
-Every semantic Task MUST belong to exactly one Generation.
+Every work proposal and task binding is classified under an explicit `InformationFunction`:
 
-Who may request materialization: Root (admission / review).
-Scheduler MUST persist.
-Workers and compilers MUST NOT materialize executable Tasks.
+- `EXPAND`: Expands semantic breadth or depth (investigations, audits, reproductions, explorations). Can only be admitted while generation is `OPEN`.
+- `COMPRESS_POSITIVE`: Synthesizes accepted evidence, architectures, or findings into consumable summaries. May be admitted in `OPEN` or `FROZEN`.
+- `COMPRESS_NEGATIVE`: Distills failed paths, invalid assumptions, or rejected alternatives into scoped negative evidence. May be admitted in `OPEN` or `FROZEN`.
 
-Whether Root MAY add Tasks to an already OPEN/ACTIVE Generation after initial
-admission is DEFERRED (D-GEN-INTRA). Until resolved, implementations SHOULD
-treat initial admission as the Task set unless a later spec row says otherwise.
+## Provenance Model (D-GEN-TOPOLOGY Resolution)
 
-## Expansion bound
+- Each task binding carries an immutable `SemanticInputSet` capturing references to upstream results, seeds, and artifacts.
+- Provenance forms a clean semantic DAG via parent generation references and task input bindings without requiring an external ontology engine.
 
-Every Generation MUST have a bounded expansion policy.
-Audit/verification Generations MAY be non-expansive: read-only, no mutation,
-no RawWorkIntent, no frontier expansion. Follow-ups remain findings for Root.
+## Ingress and Compilation (D-INTENT-SCHEMA Resolution)
 
-Workers MAY emit RawWorkIntent only if that Generation's policy permits.
-`proposal != admission`.
-
-Bounds MUST be mechanical (counts/budgets), not prompt reminders.
-Exact budget representation is DEFERRED (D-GEN-POLICY).
-
-## Provenance
-
-A Generation MAY record `parent_generation_id`. Whether the graph is a chain
-or a DAG is DEFERRED (D-GEN-TOPOLOGY). Implementations MUST still persist
-enough provenance to explain successor admission.
+- `RawWorkIntent` is an unprivileged semantic suggestion emitted by workers or Root.
+- A deterministic compiler translates `RawWorkIntent` into a durable `CompiledWorkProposal`.
+- Proposals become executable Tasks only upon explicit Root admission.
 
 ## Batch
 

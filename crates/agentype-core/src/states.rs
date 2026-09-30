@@ -514,3 +514,117 @@ impl ContinuityPreference {
         }
     }
 }
+
+closed_enum!(GenerationState {
+    Open,
+    Frozen,
+    Closed,
+});
+
+impl GenerationState {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Frozen => "FROZEN",
+            Self::Closed => "CLOSED",
+        }
+    }
+
+    pub fn parse_sql(s: &str) -> Result<Self, Error> {
+        match s {
+            "OPEN" => Ok(Self::Open),
+            "FROZEN" => Ok(Self::Frozen),
+            "CLOSED" => Ok(Self::Closed),
+            other => Err(Error::InvariantViolation(format!(
+                "unknown GenerationState {other}"
+            ))),
+        }
+    }
+}
+
+closed_enum!(InformationFunction {
+    Expand,
+    CompressPositive,
+    CompressNegative,
+});
+
+impl InformationFunction {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Expand => "EXPAND",
+            Self::CompressPositive => "COMPRESS_POSITIVE",
+            Self::CompressNegative => "COMPRESS_NEGATIVE",
+        }
+    }
+
+    pub fn parse_sql(s: &str) -> Result<Self, Error> {
+        match s {
+            "EXPAND" => Ok(Self::Expand),
+            "COMPRESS_POSITIVE" => Ok(Self::CompressPositive),
+            "COMPRESS_NEGATIVE" => Ok(Self::CompressNegative),
+            other => Err(Error::InvariantViolation(format!(
+                "unknown InformationFunction {other}"
+            ))),
+        }
+    }
+}
+
+closed_enum!(ProposalStateKind {
+    Pending,
+    Admitted,
+    Rejected,
+    Expired,
+});
+
+impl ProposalStateKind {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Admitted => "ADMITTED",
+            Self::Rejected => "REJECTED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    pub fn parse_sql(s: &str) -> Result<Self, Error> {
+        match s {
+            "PENDING" => Ok(Self::Pending),
+            "ADMITTED" => Ok(Self::Admitted),
+            "REJECTED" => Ok(Self::Rejected),
+            "EXPIRED" => Ok(Self::Expired),
+            other => Err(Error::InvariantViolation(format!(
+                "unknown ProposalStateKind {other}"
+            ))),
+        }
+    }
+}
+
+closed_enum!(ProposalExpirationReason {
+    GenerationFrozen,
+    GenerationClosed,
+    Superseded,
+    PolicyChanged,
+});
+
+impl ProposalExpirationReason {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::GenerationFrozen => "GENERATION_FROZEN",
+            Self::GenerationClosed => "GENERATION_CLOSED",
+            Self::Superseded => "SUPERSEDED",
+            Self::PolicyChanged => "POLICY_CHANGED",
+        }
+    }
+
+    pub fn parse_sql(s: &str) -> Result<Self, Error> {
+        match s {
+            "GENERATION_FROZEN" => Ok(Self::GenerationFrozen),
+            "GENERATION_CLOSED" => Ok(Self::GenerationClosed),
+            "SUPERSEDED" => Ok(Self::Superseded),
+            "POLICY_CHANGED" => Ok(Self::PolicyChanged),
+            other => Err(Error::InvariantViolation(format!(
+                "unknown ProposalExpirationReason {other}"
+            ))),
+        }
+    }
+}

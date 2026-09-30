@@ -5,7 +5,7 @@ use crate::states::*;
 use crate::UnixTime;
 use serde_json::Value;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub retry_classes: Vec<FailureClass>,
@@ -40,7 +40,7 @@ impl RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TaskSpec {
     pub name: String,
     pub payload: Value,

@@ -18,6 +18,7 @@ pub mod observer;
 pub mod process_lock;
 pub mod recovery;
 pub mod scheduler_control;
+pub mod semantic_control;
 pub mod supervision;
 pub mod timing;
 
@@ -32,6 +33,7 @@ pub mod timing;
 pub use daemon::{
     DaemonError, DaemonExit, DaemonPhase, RunningSchedulerDaemon, SchedulerDaemonBuilder,
 };
+pub use semantic_control::RootSemanticControl;
 // `DaemonError::Control` carries it, so a production host can inspect why the
 // daemon's control worker failed.
 pub use control::ControlError;

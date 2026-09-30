@@ -186,4 +186,13 @@ pub fn supported_composition() {}
 ///     let _ = DispatchGate::closed();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 13. Worker ACK/NACK is not reachable through RootSemanticControl.
+/// use agentype_core::{AttemptId, LeaseEpoch};
+/// use agentype_runtime::RootSemanticControl;
+/// fn _no_root_semantic_ack(control: &RootSemanticControl<'_>, attempt: &AttemptId, epoch: LeaseEpoch) {
+///     let _ = control.ack_success(attempt, epoch, None, &serde_json::Value::Null, None, true, false);
+/// }
+/// ```
 pub fn probes() {}
