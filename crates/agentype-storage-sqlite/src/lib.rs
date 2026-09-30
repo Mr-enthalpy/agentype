@@ -31,6 +31,6 @@ pub use kernel::{
 };
 pub use schema::SCHEMA_VERSION;
 // Shared with `agentype-runtime`: the process lock resolves store identity
-// from a filesystem handle while SQLite resolves the same string its own way,
-// so both crates must agree on which filenames are URI filenames.
-pub use store::{is_uri_filename, IMPLEMENTATION_LINE};
+// from a filesystem handle while SQLite resolves the same string with its own
+// special-filename rules, so both crates classify store paths with one table.
+pub use store::{classify_store_path, StorePathKind, IMPLEMENTATION_LINE};

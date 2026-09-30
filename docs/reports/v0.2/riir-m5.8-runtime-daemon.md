@@ -37,21 +37,44 @@ The dispatch permit is taken before `claim_next_available`; a gate that
 is already stopping or failed does not create an Attempt.
 
 The lock and SQLite must resolve the same file from the same string, so the
-production store is a literal file-backed filesystem path only. `file:`
-filenames are SQLite URI filenames: the lock layer would have opened the
-literal `./file:scheduler.sqlite` while SQLite opened `./scheduler.sqlite`,
-letting two daemons each hold a lock and share one store.
-`SqliteRuntimeConfig` now rejects every `file:` spelling — including
-`file::memory:?cache=shared`, which the exact `:memory:` comparison never
-caught — and the store opens with explicit
-`SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NO_MUTEX`, so URI
-interpretation is off rather than merely unreached.
+production store is a literal file-backed filesystem path only. One shared
+classifier (`classify_store_path`, applied by both `SqliteRuntimeConfig` and
+`Store::open`) refuses every SQLite special filename:
+
+```text
+file:...   URI filename — the lock would hold ./file:scheduler.sqlite while
+           SQLite opened ./scheduler.sqlite, so two daemons could each hold
+           a lock and share one store
+:memory:   private in-memory database
+""         private temporary database
+```
+
+`:memory:` and the empty filename are special even with URI processing
+entirely off, which is why the contract is a positive check on the kind
+rather than a list of URI rejections. The load-bearing guard is that Agentype
+rejects every `file:` filename *before* SQLite is asked to open anything; the
+connection additionally does not request `SQLITE_OPEN_URI`, which is not by
+itself sufficient because SQLite can also enable URI handling through
+`SQLITE_CONFIG_URI` or compile-time `SQLITE_USE_URI`.
+`Store::open_memory` / `Kernel::open_memory` remain the explicit ephemeral
+path.
+
+The startup path `RuntimeProcessLock(path)` → `Kernel::open(path)` →
+`confirm_store_identity(path)` assumes the Scheduler database pathname is not
+adversarially replaced during startup: the confirmation re-opens the path
+rather than reading the identity of the file the live connection holds, so a
+pathname ABA in that window is not detected. That is the same assumption the
+process singleton already rests on.
+
 Regressions: `uri_filenames_are_not_a_production_store`,
-`literal_filesystem_paths_stay_accepted`,
-`uri_filename_alias_fails_closed_before_any_runtime_action`,
-`only_the_literal_file_scheme_is_a_uri_filename`,
+`literal_filesystem_paths_stay_accepted`, `memory_path_fails_closed`,
+`temporary_database_path_fails_closed`,
+`config_and_store_share_one_classification`,
+`special_store_filenames_fail_closed_before_any_runtime_action`,
+`classification_table_names_every_sqlite_special_filename`,
 `literal_path_stays_file_backed_and_reopenable`,
-`uri_filename_is_refused_by_the_store_boundary`.
+`sqlite_special_filenames_are_refused_by_the_store_boundary`,
+`explicit_memory_store_still_works`.
 
 ## Ownership graph
 

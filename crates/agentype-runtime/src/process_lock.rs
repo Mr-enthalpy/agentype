@@ -34,28 +34,31 @@ impl SqliteRuntimeConfig {
         continuity_max_bytes: usize,
     ) -> Result<Self, ProcessLockError> {
         let path = path.into();
-        if path.as_os_str().is_empty() {
-            return Err(ProcessLockError::IdentityUnresolvable(
-                "scheduler store path is empty".into(),
-            ));
-        }
-        if path == Path::new(":memory:") {
-            return Err(ProcessLockError::IdentityUnresolvable(
-                "in-memory sqlite is not a production scheduler store".into(),
-            ));
-        }
-        // The production store contract is a literal file-backed filesystem
-        // path. A SQLite URI filename would be locked as the literal file
-        // `./file:...` by this module while SQLite opened the URI's path
-        // component, so two daemons could each hold a lock and still share one
-        // Scheduler store. This also covers the in-memory URI spelling
-        // `file::memory:?cache=shared`, which the exact `:memory:` comparison
-        // above does not catch.
-        if agentype_storage_sqlite::is_uri_filename(&path) {
-            return Err(ProcessLockError::IdentityUnresolvable(format!(
-                "sqlite URI filenames are not a production scheduler store: {}",
-                path.display()
-            )));
+        // One shared classification table decides what a production store path
+        // is, and `agentype-storage-sqlite` applies the same table at the
+        // boundary that actually hands the filename to SQLite. That is what
+        // keeps the process lock and SQLite from resolving one string to two
+        // different databases. Empty, `:memory:`, and every `file:` spelling
+        // are refused here; a literal file is the only accepted kind.
+        use agentype_storage_sqlite::StorePathKind;
+        match agentype_storage_sqlite::classify_store_path(&path) {
+            StorePathKind::LiteralFile => {}
+            StorePathKind::SqliteUri => {
+                return Err(ProcessLockError::IdentityUnresolvable(format!(
+                    "sqlite URI filenames are not a production scheduler store: {}",
+                    path.display()
+                )));
+            }
+            StorePathKind::Memory => {
+                return Err(ProcessLockError::IdentityUnresolvable(
+                    "in-memory sqlite is not a production scheduler store".into(),
+                ));
+            }
+            StorePathKind::Temporary => {
+                return Err(ProcessLockError::IdentityUnresolvable(
+                    "a temporary sqlite database is not a production scheduler store".into(),
+                ));
+            }
         }
         if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
             return Err(ProcessLockError::IdentityUnresolvable(
@@ -494,9 +497,31 @@ mod tests {
 
     #[test]
     fn memory_path_fails_closed() {
-        match SqliteRuntimeConfig::new(":memory:", 10.0, 16_384) {
-            Err(ProcessLockError::IdentityUnresolvable(_)) => {}
-            other => panic!("expected IdentityUnresolvable, got {other:?}"),
+        for rejected in [":memory:", ":memory:?cache=shared"] {
+            match SqliteRuntimeConfig::new(rejected, 10.0, 16_384) {
+                Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                    assert!(
+                        detail.contains("in-memory"),
+                        "rejection must name the in-memory contract, got {detail}"
+                    );
+                }
+                other => panic!("{rejected} must fail closed, got {other:?}"),
+            }
+        }
+    }
+
+    /// The empty filename is SQLite's private temporary-database spelling, not
+    /// a durable store, so the config boundary must refuse it too.
+    #[test]
+    fn temporary_database_path_fails_closed() {
+        match SqliteRuntimeConfig::new("", 10.0, 16_384) {
+            Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                assert!(
+                    detail.contains("temporary"),
+                    "rejection must name the temporary contract, got {detail}"
+                );
+            }
+            other => panic!("the empty filename must fail closed, got {other:?}"),
         }
     }
 
@@ -528,9 +553,35 @@ mod tests {
         }
     }
 
-    /// The same predicate must not reject an ordinary relative or absolute
-    /// filesystem path: only the literal `file:` prefix triggers SQLite URI
-    /// processing, so nothing else may be refused here.
+    /// The config boundary and the store boundary must apply one table: a path
+    /// the config accepts as a literal file is exactly a path the classifier
+    /// calls a literal file. Otherwise a caller could reach `Kernel::open`
+    /// with a spelling the lock never validated.
+    #[test]
+    fn config_and_store_share_one_classification() {
+        for path in [
+            "scheduler.sqlite",
+            "./scheduler.sqlite",
+            "/tmp/scheduler.sqlite",
+            ":memory:",
+            ":memory:?cache=shared",
+            "",
+            "file:scheduler.sqlite",
+            "file::memory:?cache=shared",
+            "./:memory:",
+        ] {
+            let accepted = SqliteRuntimeConfig::new(path, 10.0, 16_384).is_ok();
+            let literal = agentype_storage_sqlite::classify_store_path(std::path::Path::new(path))
+                == agentype_storage_sqlite::StorePathKind::LiteralFile;
+            assert_eq!(
+                accepted, literal,
+                "config acceptance and the store classification must agree on {path:?}"
+            );
+        }
+    }
+
+    /// The classifier must not reject an ordinary relative or absolute
+    /// filesystem path: only SQLite's own special spellings are refused.
     #[test]
     fn literal_filesystem_paths_stay_accepted() {
         for accepted in [

@@ -1059,23 +1059,27 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// M5.8 audit round 5 P1: a SQLite URI filename must be refused at the
-    /// store/config boundary, not left to fail later as a SQLite BUSY. The
-    /// daemon composes `SqliteRuntimeConfig` first, so the rejection happens
-    /// before the process lock, before recovery mutation, before any Adapter
-    /// I/O, and before supervision or the notifier start.
+    /// M5.8 audit round 5 P1 / round 6 P1: every SQLite special filename must
+    /// be refused at the store/config boundary, not left to fail later as a
+    /// SQLite BUSY. The daemon composes `SqliteRuntimeConfig` first, so the
+    /// rejection happens before the process lock, before recovery mutation,
+    /// before any Adapter I/O, and before supervision or the notifier start.
     ///
     /// The second half states the aliasing fact directly: the lock layer
     /// resolves `file:scheduler.sqlite` as a literal filesystem name while
     /// SQLite resolves the same string as a URI pointing at
     /// `scheduler.sqlite`. That is why the string must never reach either.
     #[test]
-    fn uri_filename_alias_fails_closed_before_any_runtime_action() {
+    fn special_store_filenames_fail_closed_before_any_runtime_action() {
         for rejected in [
             "file:scheduler.sqlite",
             "file::memory:?cache=shared",
             "file:scheduler.sqlite?mode=rwc",
             "file:///var/lib/agentype/scheduler.sqlite",
+            // Round 6: special even with URI processing entirely off.
+            ":memory:",
+            ":memory:?cache=shared",
+            "",
         ] {
             let cfg = SqliteRuntimeConfig::new(rejected, LEASE, 16_384);
             assert!(
