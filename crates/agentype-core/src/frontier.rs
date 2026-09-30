@@ -11,6 +11,9 @@ use crate::UnixTime;
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub const GENERATION_FROZEN: &str = "GENERATION_FROZEN";
+pub const GENERATION_CLOSED: &str = "GENERATION_CLOSED";
+
 /// Immutable set of semantic evidence/seed inputs captured at admission time.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SemanticInputSet {
@@ -51,6 +54,58 @@ pub struct RawWorkIntent {
     pub suggested_task_spec: Option<TaskSpec>,
 }
 
+impl RawWorkIntent {
+    /// Deterministic canonical fingerprint of this intent's semantic content.
+    pub fn fingerprint(&self) -> String {
+        let mut sorted_res = self
+            .semantic_input_set
+            .result_ids
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect::<Vec<_>>();
+        sorted_res.sort();
+        let mut sorted_art = self.semantic_input_set.artifact_refs.clone();
+        sorted_art.sort();
+        let mut sorted_seed = self.semantic_input_set.seed_refs.clone();
+        sorted_seed.sort();
+
+        let val = serde_json::json!({
+            "key": self.raw_intent_key,
+            "obj": self.objective,
+            "fn": self.information_function.as_sql(),
+            "rat": self.rationale,
+            "inputs": {
+                "results": sorted_res,
+                "artifacts": sorted_art,
+                "seeds": sorted_seed,
+            },
+            "spec": self.suggested_task_spec.as_ref().map(|s| {
+                let mut retry_classes = s
+                    .retry_policy
+                    .retry_classes
+                    .iter()
+                    .map(|c| c.as_sql())
+                    .collect::<Vec<_>>();
+                retry_classes.sort();
+                serde_json::json!({
+                    "name": s.name,
+                    "payload": s.payload,
+                    "acceptance": s.acceptance,
+                    "partition": s.partition.as_str(),
+                    "workstream": s.workstream_id.as_ref().map(|w| w.as_str()),
+                    "continuity": s.continuity.as_sql(),
+                    "tags": s.affinity_tags,
+                    "mode": s.workspace_mode.as_sql(),
+                    "priority": s.priority,
+                    "retry_attempts": s.retry_policy.max_attempts,
+                    "retry_classes": retry_classes,
+                })
+            }),
+        });
+        val.to_string()
+    }
+}
+
 /// Durable compiled candidate proposal validated and normalized by deterministic compiler.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProposalRecord {
@@ -59,8 +114,9 @@ pub struct ProposalRecord {
     pub source_kind: String,
     pub source_ref: String,
     pub raw_intent_key: String,
+    pub intent_fingerprint: String,
     pub information_function: InformationFunction,
-    pub normalized_task_spec: TaskSpec,
+    pub normalized_task_spec: Option<TaskSpec>,
     pub semantic_input_set: SemanticInputSet,
     pub compiler_version: u32,
     pub state: ProposalStateKind,
@@ -91,6 +147,7 @@ pub struct GenerationTaskBindingRecord {
     pub proposal_id: ProposalId,
     pub information_function: InformationFunction,
     pub admission_seq: u64,
+    pub admitted_task_spec: TaskSpec,
     pub semantic_input_set: SemanticInputSet,
     pub created_at: UnixTime,
 }

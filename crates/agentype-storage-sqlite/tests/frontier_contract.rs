@@ -10,9 +10,13 @@
 //! - INV-A10: Generation barrier depends on M5 Task authority (terminal disposition).
 //! - INV-A11: Every compression Task has an immutable SemanticInputSet.
 
+mod common;
+use common::*;
+
 use agentype_core::{
-    Clock, GenerationState, InformationFunction, ManualClock, PartitionId, PartitionSpec,
-    ProposalStateKind, RawWorkIntent, ResultId, Retention, SemanticInputSet, TaskState,
+    BatchId, BatchState, Clock, GenerationState, InformationFunction, ManualClock, PartitionId,
+    PartitionSpec, ProposalStateKind, RawWorkIntent, ResultId, Retention, SemanticInputSet,
+    TaskSpec, TaskState,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
@@ -25,17 +29,46 @@ fn test_kernel() -> Kernel {
     let kernel =
         Kernel::open_memory(clock, 30.0, CONTINUITY_MAX_BYTES).expect("open in-memory kernel");
 
-    // Upsert default partition
-    let part = PartitionSpec {
-        name: PartitionId::new("default"),
-        desired_capacity: 5,
-        retention: Retention::Resident,
-        execution_target: "local".into(),
-        execution_profile: "default".into(),
-        tags: vec![],
-    };
-    kernel.upsert_partition(&part).expect("upsert partition");
+    // Upsert partitions
+    for name in ["default", "general"] {
+        let part = PartitionSpec {
+            name: PartitionId::new(name),
+            desired_capacity: 5,
+            retention: Retention::Resident,
+            execution_target: "local".into(),
+            execution_profile: "default".into(),
+            tags: vec![],
+        };
+        kernel.upsert_partition(&part).expect("upsert partition");
+    }
+    kernel.reconcile_pool().expect("reconcile pool");
     kernel
+}
+
+fn create_test_result(kernel: &Kernel) -> ResultId {
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("producer", json!({}))])
+        .unwrap();
+    let _task_id = ids.values().next().unwrap();
+    let claim = kernel.claim_next_available().unwrap().expect("claim");
+    let safety = unisolated_launch_binding(&claim);
+    let launch = kernel.create_execution(&claim, safety).unwrap();
+    let exec_id = launch.execution_id().clone();
+    kernel
+        .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
+        .unwrap();
+    kernel
+        .ack_success(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            Some(&exec_id),
+            &json!({"produced": true}),
+            None,
+            false,
+            false,
+        )
+        .unwrap()
+        .expect("must produce result")
 }
 
 #[test]
@@ -58,7 +91,7 @@ fn test_generation_lifecycle_and_admit_contract() {
         information_function: InformationFunction::Expand,
         semantic_input_set: input_set.clone(),
         rationale: Some("Suspected memory leak in buffer pool".into()),
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("inspect_heap", json!({}))),
     };
 
     let proposal = kernel
@@ -112,7 +145,7 @@ fn test_generation_lifecycle_and_admit_contract() {
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("inspect_caches", json!({}))),
     };
     let proposal_expand_2 = kernel
         .compile_intent(
@@ -124,14 +157,17 @@ fn test_generation_lifecycle_and_admit_contract() {
         )
         .expect("compile second expand");
 
+    // Produce a real durable Result for provenance validation
+    let real_result = create_test_result(&kernel);
+
     // Compile a COMPRESS_POSITIVE intent
     let compress_intent = RawWorkIntent {
         raw_intent_key: "summarize_findings".into(),
         objective: "Summarize leak investigation findings".into(),
         information_function: InformationFunction::CompressPositive,
-        semantic_input_set: SemanticInputSet::new().with_result(ResultId::new()),
+        semantic_input_set: SemanticInputSet::new().with_result(real_result),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("summarize_findings", json!({}))),
     };
     let proposal_compress = kernel
         .compile_intent(
@@ -203,7 +239,7 @@ fn test_generation_lifecycle_and_admit_contract() {
         information_function: InformationFunction::CompressPositive,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("late_compress", json!({}))),
     };
     let compile_closed_fail = kernel.compile_intent(
         &gen.generation_id,
@@ -228,7 +264,7 @@ fn test_proposal_rejection() {
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("unneeded_work", json!({}))),
     };
 
     let proposal = kernel
@@ -262,7 +298,7 @@ fn test_race_b_concurrent_admissions_same_proposal_single_winner() {
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("single_winner_test", json!({}))),
     };
 
     let proposal = kernel
@@ -316,7 +352,7 @@ fn test_race_a_freeze_vs_admit_serializable() {
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(TaskSpec::new("freeze_race_test", json!({}))),
     };
 
     let proposal = kernel
@@ -352,4 +388,335 @@ fn test_race_a_freeze_vs_admit_serializable() {
             assert!(view.expired_proposal_ids.contains(&proposal.proposal_id));
         }
     }
+}
+
+#[test]
+fn test_p0_1_proposal_isolation_across_generations() {
+    let kernel = test_kernel();
+    let g1 = kernel.create_generation(json!({"g": 1})).unwrap();
+    let g2 = kernel.create_generation(json!({"g": 2})).unwrap();
+
+    let intent1 = RawWorkIntent {
+        raw_intent_key: "audit_code".into(),
+        objective: "Audit repository code".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("audit_code", json!({}))),
+    };
+    let intent2 = intent1.clone();
+
+    let p1 = kernel
+        .compile_intent(&g1.generation_id, intent1, "root", "session_root", 1)
+        .unwrap();
+    let p2 = kernel
+        .compile_intent(&g2.generation_id, intent2, "root", "session_root", 1)
+        .unwrap();
+
+    assert_ne!(p1.proposal_id, p2.proposal_id);
+    assert_eq!(p1.generation_id, g1.generation_id);
+    assert_eq!(p2.generation_id, g2.generation_id);
+
+    let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
+    let v1 = kernel.get_generation_view(&g1.generation_id).unwrap();
+    let v2 = kernel.get_generation_view(&g2.generation_id).unwrap();
+
+    assert!(v1.admitted_task_ids.is_empty());
+    assert_eq!(v2.admitted_task_ids, vec![t2]);
+}
+
+#[test]
+fn test_p0_1_proposal_content_mismatch_conflict() {
+    let kernel = test_kernel();
+    let g = kernel.create_generation(json!({})).unwrap();
+
+    let intent1 = RawWorkIntent {
+        raw_intent_key: "inspect_sql".into(),
+        objective: "Inspect SQL queries for optimization".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
+    };
+    let p1 = kernel
+        .compile_intent(&g.generation_id, intent1, "root", "session_1", 1)
+        .unwrap();
+
+    // Same identity (gen, kind, ref, key, version) but changed objective/payload
+    let intent2 = RawWorkIntent {
+        raw_intent_key: "inspect_sql".into(),
+        objective: "DIFFERENT objective for the same key".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
+    };
+    let err = kernel
+        .compile_intent(&g.generation_id, intent2, "root", "session_1", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+
+    // Recompilation with exact same content returns original proposal
+    let intent1_dup = RawWorkIntent {
+        raw_intent_key: "inspect_sql".into(),
+        objective: "Inspect SQL queries for optimization".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
+    };
+    let p1_dup = kernel
+        .compile_intent(&g.generation_id, intent1_dup, "root", "session_1", 1)
+        .unwrap();
+    assert_eq!(p1.proposal_id, p1_dup.proposal_id);
+}
+
+#[test]
+fn test_p0_2_generation_open_dynamic_admissions_with_completed_batches() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // 1. Admit T1
+    let intent1 = RawWorkIntent {
+        raw_intent_key: "task_1".into(),
+        objective: "First dynamic task".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_1", json!({}))),
+    };
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent1, "root", "session", 1)
+        .unwrap();
+    let t1 = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
+
+    // 2. Complete T1 via M5 worker workflow
+    let claim1 = kernel.claim_next_available().unwrap().expect("claim T1");
+    assert_eq!(claim1.task_id, t1);
+    let safety = unisolated_launch_binding(&claim1);
+    let launch1 = kernel.create_execution(&claim1, safety).unwrap();
+    let exec_id1 = launch1.execution_id().clone();
+    kernel
+        .confirm_running_and_renew(
+            &claim1.attempt_id,
+            claim1.lease_epoch,
+            &exec_id1,
+            &json!({}),
+        )
+        .unwrap();
+    let _res1 = kernel
+        .ack_success(
+            &claim1.attempt_id,
+            claim1.lease_epoch,
+            Some(&exec_id1),
+            &json!({"done": true}),
+            None,
+            false,
+            false,
+        )
+        .unwrap()
+        .expect("result for T1");
+
+    // Verify T1's batch is completed
+    let b1 = kernel
+        .batch(&BatchId::from_string(format!("batch_{t1}")))
+        .unwrap();
+    assert_eq!(b1.state, BatchState::Completed);
+
+    // 3. Generation is STILL Open! Now Root admits T2 dynamically into the same Generation
+    let view_now = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view_now.generation.state, GenerationState::Open);
+
+    let intent2 = RawWorkIntent {
+        raw_intent_key: "task_2".into(),
+        objective: "Second dynamic task after T1 completion".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_2", json!({}))),
+    };
+    let p2 = kernel
+        .compile_intent(&gen.generation_id, intent2, "root", "session", 1)
+        .unwrap();
+    let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
+
+    // 4. Assert T2 has its own ACTIVE batch and is immediately claimable/executable!
+    let b2 = kernel
+        .batch(&BatchId::from_string(format!("batch_{t2}")))
+        .unwrap();
+    assert_eq!(b2.state, BatchState::Active);
+
+    let claim2 = kernel.claim_next_available().unwrap().expect("claim T2");
+    assert_eq!(claim2.task_id, t2);
+}
+
+#[test]
+fn test_p0_2_generation_open_dynamic_admissions_with_cancelled_batches() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Admit T1
+    let intent1 = RawWorkIntent {
+        raw_intent_key: "task_cancel".into(),
+        objective: "Task to be cancelled".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_cancel", json!({}))),
+    };
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent1, "root", "session", 1)
+        .unwrap();
+    let t1 = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
+
+    // Cancel T1
+    kernel.cancel_task(&t1, true).unwrap();
+    let t1_row = kernel.task(&t1).unwrap();
+    assert_eq!(t1_row.state, TaskState::Cancelled);
+
+    // Generation remains OPEN; admit T2
+    let intent2 = RawWorkIntent {
+        raw_intent_key: "task_after_cancel".into(),
+        objective: "Task after cancellation".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_after_cancel", json!({}))),
+    };
+    let p2 = kernel
+        .compile_intent(&gen.generation_id, intent2, "root", "session", 1)
+        .unwrap();
+    let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
+
+    // T2 is claimable and not blocked by T1's cancelled status
+    let claim2 = kernel.claim_next_available().unwrap().expect("claim T2");
+    assert_eq!(claim2.task_id, t2);
+}
+
+#[test]
+fn test_p1_1_task_spec_dependencies_rejected() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Rejected at compile_intent if suggested_task_spec has dependencies
+    let spec_with_dep = TaskSpec::new("child", json!({})).depends_on(["parent"]);
+    let intent = RawWorkIntent {
+        raw_intent_key: "dep_task".into(),
+        objective: "Dependent task".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_with_dep.clone()),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvalidAuthority(_)));
+
+    // Also rejected at admit_proposal if override_task_spec has dependencies
+    let clean_intent = RawWorkIntent {
+        raw_intent_key: "clean_task".into(),
+        objective: "Clean intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: None,
+    };
+    let p = kernel
+        .compile_intent(&gen.generation_id, clean_intent, "root", "session", 1)
+        .unwrap();
+
+    let admit_err = kernel
+        .admit_proposal(&p.proposal_id, 0, Some(spec_with_dep))
+        .unwrap_err();
+    assert!(matches!(
+        admit_err,
+        agentype_core::Error::InvalidAuthority(_)
+    ));
+}
+
+#[test]
+fn test_p1_2_provenance_validation_nonexistent_result_rejected() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let fake_id = ResultId::new();
+    let intent = RawWorkIntent {
+        raw_intent_key: "compression_fake".into(),
+        objective: "Compress non-existent result".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new().with_result(fake_id),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("compression_fake", json!({}))),
+    };
+
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::NotFound(_)));
+
+    // Test fail-closed JSON decoding of semantic_input_set
+    use agentype_storage_sqlite::frontier::semantic_input_set_from_json;
+    // 1. Not an object
+    let not_obj = json!(["not", "an", "object"]);
+    assert!(semantic_input_set_from_json(&not_obj).is_err());
+
+    // 2. Unknown field
+    let unknown_field = json!({"result_ids": [], "unrecognized_field": 123});
+    assert!(semantic_input_set_from_json(&unknown_field).is_err());
+
+    // 3. Array elements not string
+    let non_string_el = json!({"result_ids": [12345]});
+    assert!(semantic_input_set_from_json(&non_string_el).is_err());
+}
+
+#[test]
+fn test_p1_3_compiler_unspecified_spec_and_admission_enforcement() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // 1. Intent with suggested_task_spec: None
+    let intent = RawWorkIntent {
+        raw_intent_key: "unspecified_spec".into(),
+        objective: "Unspecified spec intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: None,
+    };
+    let p = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    assert!(p.normalized_task_spec.is_none());
+
+    // 2. Admission fails if Root provides no spec
+    let err = kernel.admit_proposal(&p.proposal_id, 0, None).unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvalidAuthority(_)));
+
+    // 3. Admission succeeds when Root explicitly provides spec
+    let root_spec = TaskSpec::new("admitted_spec", json!({"root_decided": true}));
+    let tid = kernel
+        .admit_proposal(&p.proposal_id, 0, Some(root_spec.clone()))
+        .unwrap();
+    let task = kernel.task(&tid).unwrap();
+    assert_eq!(task.name, "admitted_spec");
+
+    // 4. If proposal has Some(spec) and Root provides conflicting spec, reject with Conflict
+    let intent_with_spec = RawWorkIntent {
+        raw_intent_key: "specified_spec".into(),
+        objective: "Specified spec intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("original_spec", json!({}))),
+    };
+    let p2 = kernel
+        .compile_intent(&gen.generation_id, intent_with_spec, "root", "session", 1)
+        .unwrap();
+
+    let conflict_spec = TaskSpec::new("conflicting_spec", json!({}));
+    let conflict_err = kernel
+        .admit_proposal(&p2.proposal_id, 0, Some(conflict_spec))
+        .unwrap_err();
+    assert!(matches!(conflict_err, agentype_core::Error::Conflict(_)));
 }

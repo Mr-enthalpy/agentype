@@ -16,7 +16,8 @@ use agentype_core::{
     GenerationId, GenerationRecord, GenerationState, GenerationView, InformationFunction,
     OutboxEventId, PartitionId, ProposalExpirationReason, ProposalId, ProposalRecord,
     ProposalStateKind, RawWorkIntent, ResultId, RetryPolicy, SemanticInputSet, TaskId,
-    TaskSettledSnapshot, TaskSpec, TaskState, UnixTime, WorkstreamId,
+    TaskSettledSnapshot, TaskSpec, TaskState, UnixTime, WorkstreamId, GENERATION_CLOSED,
+    GENERATION_FROZEN,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -47,29 +48,75 @@ pub fn semantic_input_set_to_json(set: &SemanticInputSet) -> Value {
 }
 
 pub fn semantic_input_set_from_json(val: &Value) -> Result<SemanticInputSet, Error> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::invariant("semantic_input_set must be a JSON object"))?;
+    for k in obj.keys() {
+        if k != "result_ids" && k != "artifact_refs" && k != "seed_refs" {
+            return Err(Error::invariant(format!(
+                "unknown field in semantic_input_set: {k}"
+            )));
+        }
+    }
     let mut set = SemanticInputSet::new();
-    if let Some(arr) = val.get("result_ids").and_then(Value::as_array) {
+    if let Some(arr_val) = obj.get("result_ids") {
+        let arr = arr_val
+            .as_array()
+            .ok_or_else(|| Error::invariant("result_ids must be an array of strings"))?;
         for v in arr {
-            if let Some(s) = v.as_str() {
-                set.result_ids.push(ResultId::from_string(s));
-            }
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::invariant("result_ids element must be a string"))?;
+            set.result_ids.push(ResultId::from_string(s));
         }
     }
-    if let Some(arr) = val.get("artifact_refs").and_then(Value::as_array) {
+    if let Some(arr_val) = obj.get("artifact_refs") {
+        let arr = arr_val
+            .as_array()
+            .ok_or_else(|| Error::invariant("artifact_refs must be an array of strings"))?;
         for v in arr {
-            if let Some(s) = v.as_str() {
-                set.artifact_refs.push(s.to_string());
-            }
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::invariant("artifact_refs element must be a string"))?;
+            set.artifact_refs.push(s.to_string());
         }
     }
-    if let Some(arr) = val.get("seed_refs").and_then(Value::as_array) {
+    if let Some(arr_val) = obj.get("seed_refs") {
+        let arr = arr_val
+            .as_array()
+            .ok_or_else(|| Error::invariant("seed_refs must be an array of strings"))?;
         for v in arr {
-            if let Some(s) = v.as_str() {
-                set.seed_refs.push(s.to_string());
-            }
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::invariant("seed_refs element must be a string"))?;
+            set.seed_refs.push(s.to_string());
         }
     }
     Ok(set)
+}
+
+pub fn validate_semantic_input_set(
+    tx: &Transaction<'_>,
+    set: &SemanticInputSet,
+) -> Result<(), Error> {
+    for rid in &set.result_ids {
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM results WHERE id = ?1",
+                params![rid.as_str()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(map_sqlite)?
+            .unwrap_or(false);
+        if !exists {
+            return Err(Error::not_found(format!(
+                "provenance result_id {:?} does not exist",
+                rid.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn task_spec_to_json(spec: &TaskSpec) -> Value {
@@ -298,7 +345,7 @@ pub fn create_generation(
 
 /// Compile a raw intent into a durable CompiledWorkProposal.
 ///
-/// Idempotent on `(source_ref, raw_intent_key, compiler_version)`.
+/// Idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)`.
 pub fn compile_intent(
     tx: &Transaction<'_>,
     now: UnixTime,
@@ -327,34 +374,55 @@ pub fn compile_intent(
         )));
     }
 
-    // 2. Check for existing proposal with same (source_ref, raw_intent_key, compiler_version)
+    // 2. Validate semantic input set provenance
+    validate_semantic_input_set(tx, &intent.semantic_input_set)?;
+
+    // 3. TaskSpec dependencies must be empty in M6-A
+    if let Some(ref spec) = intent.suggested_task_spec {
+        if !spec.dependencies.is_empty() {
+            return Err(Error::invalid_authority(
+                "TaskSpec dependencies must be empty in M6-A",
+            ));
+        }
+    }
+
+    let fingerprint = intent.fingerprint();
+
+    // 4. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
     if let Some(existing) = query_opt(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
-                information_function, normalized_task_spec_json, semantic_input_set_json,
+                intent_fingerprint, information_function, normalized_task_spec_json, semantic_input_set_json,
                 compiler_version, state, admitted_task_id, expiration_reason, created_at, updated_at
          FROM compiled_work_proposals
-         WHERE source_ref=?1 AND raw_intent_key=?2 AND compiler_version=?3",
-        params![source_ref, intent.raw_intent_key, compiler_version],
+         WHERE generation_id=?1 AND source_kind=?2 AND source_ref=?3 AND raw_intent_key=?4 AND compiler_version=?5",
+        params![
+            generation_id.as_str(),
+            source_kind,
+            source_ref,
+            intent.raw_intent_key,
+            compiler_version
+        ],
         |r| {
             let pid: String = r.get(0)?;
             let gid: String = r.get(1)?;
             let sk: String = r.get(2)?;
             let sr: String = r.get(3)?;
             let rik: String = r.get(4)?;
-            let if_str: String = r.get(5)?;
-            let spec_str: String = r.get(6)?;
-            let set_str: String = r.get(7)?;
-            let cv: u32 = r.get(8)?;
-            let st_str: String = r.get(9)?;
-            let at_str: Option<String> = r.get(10)?;
-            let er_str: Option<String> = r.get(11)?;
-            let cat: f64 = r.get(12)?;
-            let uat: f64 = r.get(13)?;
+            let ifp: String = r.get(5)?;
+            let if_str: String = r.get(6)?;
+            let spec_str: Option<String> = r.get(7)?;
+            let set_str: String = r.get(8)?;
+            let cv: u32 = r.get(9)?;
+            let st_str: String = r.get(10)?;
+            let at_str: Option<String> = r.get(11)?;
+            let er_str: Option<String> = r.get(12)?;
+            let cat: f64 = r.get(13)?;
+            let uat: f64 = r.get(14)?;
 
             Ok((
-                pid, gid, sk, sr, rik, if_str, spec_str, set_str, cv, st_str, at_str, er_str, cat,
-                uat,
+                pid, gid, sk, sr, rik, ifp, if_str, spec_str, set_str, cv, st_str, at_str, er_str,
+                cat, uat,
             ))
         },
     )? {
@@ -364,6 +432,7 @@ pub fn compile_intent(
             sk,
             sr,
             rik,
+            ifp,
             if_str,
             spec_str,
             set_str,
@@ -374,9 +443,22 @@ pub fn compile_intent(
             cat,
             uat,
         ) = existing;
+
+        if ifp != fingerprint {
+            return Err(Error::conflict(format!(
+                "compiled proposal already exists with different intent content for key {:?}",
+                intent.raw_intent_key
+            )));
+        }
+
         let info_fn = InformationFunction::parse_sql(&if_str)?;
-        let spec_val = json_load(&spec_str)?;
-        let norm_spec = task_spec_from_json(&spec_val)?;
+        let norm_spec = match spec_str {
+            Some(s) => {
+                let spec_val = json_load(&s)?;
+                Some(task_spec_from_json(&spec_val)?)
+            }
+            None => None,
+        };
         let set_val = json_load(&set_str)?;
         let input_set = semantic_input_set_from_json(&set_val)?;
         let state = ProposalStateKind::parse_sql(&st_str)?;
@@ -391,6 +473,7 @@ pub fn compile_intent(
             source_kind: sk,
             source_ref: sr,
             raw_intent_key: rik,
+            intent_fingerprint: ifp,
             information_function: info_fn,
             normalized_task_spec: norm_spec,
             semantic_input_set: input_set,
@@ -403,52 +486,28 @@ pub fn compile_intent(
         });
     }
 
-    // 3. Normalize TaskSpec
-    let norm_spec = match intent.suggested_task_spec {
-        Some(s) => s,
-        None => {
-            let mut payload = serde_json::Map::new();
-            payload.insert("objective".into(), Value::String(intent.objective.clone()));
-            if let Some(r) = &intent.rationale {
-                payload.insert("rationale".into(), Value::String(r.clone()));
-            }
-            TaskSpec {
-                name: intent.raw_intent_key.clone(),
-                payload: Value::Object(payload),
-                acceptance: Value::Object(Default::default()),
-                partition: PartitionId::new("default"),
-                workstream_id: None,
-                continuity: ContinuityPreference::None,
-                affinity_tags: Vec::new(),
-                workspace_mode: agentype_core::WorkspaceMode::Write,
-                dependencies: Vec::new(),
-                priority: 0,
-                retry_policy: RetryPolicy::default(),
-                supersedes_task_id: None,
-                task_id: None,
-            }
-        }
-    };
-
+    // 5. Build proposal record and insert
+    let norm_spec = intent.suggested_task_spec;
+    let spec_json_opt = norm_spec.as_ref().map(|s| json_dump(&task_spec_to_json(s)));
     let proposal_id = ProposalId::new();
-    let spec_json = json_dump(&task_spec_to_json(&norm_spec));
     let set_json = json_dump(&semantic_input_set_to_json(&intent.semantic_input_set));
 
     tx.execute(
         "INSERT INTO compiled_work_proposals(
             proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
-            information_function, normalized_task_spec_json, semantic_input_set_json,
+            intent_fingerprint, information_function, normalized_task_spec_json, semantic_input_set_json,
             compiler_version, state, created_at, updated_at
          )
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'PENDING', ?10, ?10)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'PENDING', ?11, ?11)",
         params![
             proposal_id.as_str(),
             generation_id.as_str(),
             source_kind,
             source_ref,
             intent.raw_intent_key,
+            fingerprint,
             intent.information_function.as_sql(),
-            spec_json,
+            spec_json_opt,
             set_json,
             compiler_version,
             now
@@ -492,6 +551,7 @@ pub fn compile_intent(
         source_kind: source_kind.to_string(),
         source_ref: source_ref.to_string(),
         raw_intent_key: intent.raw_intent_key,
+        intent_fingerprint: fingerprint,
         information_function: intent.information_function,
         normalized_task_spec: norm_spec,
         semantic_input_set: intent.semantic_input_set,
@@ -524,7 +584,7 @@ pub fn admit_proposal(
         |r| {
             let gid: String = r.get(0)?;
             let if_str: String = r.get(1)?;
-            let spec_str: String = r.get(2)?;
+            let spec_str: Option<String> = r.get(2)?;
             let set_str: String = r.get(3)?;
             let st_str: String = r.get(4)?;
             let at_str: Option<String> = r.get(5)?;
@@ -533,7 +593,7 @@ pub fn admit_proposal(
     )?
     .ok_or_else(|| Error::not_found(format!("proposal {:?}", proposal_id.as_str())))?;
 
-    let (gid, if_str, spec_str, set_str, st_str, admitted_tid) = proposal_row;
+    let (gid, if_str, spec_str_opt, set_str, st_str, admitted_tid) = proposal_row;
     let prop_state = ProposalStateKind::parse_sql(&st_str)?;
     let info_fn = InformationFunction::parse_sql(&if_str)?;
 
@@ -581,20 +641,50 @@ pub fn admit_proposal(
         )));
     }
 
-    // 3. Resolve TaskSpec
-    let task_spec = match override_task_spec {
-        Some(s) => s,
-        None => {
-            let spec_val = json_load(&spec_str)?;
-            task_spec_from_json(&spec_val)?
+    // 3. Validate semantic input set provenance
+    let semantic_input_set = semantic_input_set_from_json(&json_load(&set_str)?)?;
+    validate_semantic_input_set(tx, &semantic_input_set)?;
+
+    // 4. Resolve TaskSpec
+    let norm_spec_opt: Option<TaskSpec> = match spec_str_opt {
+        Some(s) => {
+            let spec_val = json_load(&s)?;
+            Some(task_spec_from_json(&spec_val)?)
+        }
+        None => None,
+    };
+
+    let task_spec = match (norm_spec_opt, override_task_spec) {
+        (None, None) => {
+            return Err(Error::invalid_authority(
+                "proposal has no suggested task spec; override_task_spec must be provided at admission",
+            ));
+        }
+        (None, Some(override_spec)) => override_spec,
+        (Some(norm_spec), None) => norm_spec,
+        (Some(norm_spec), Some(override_spec)) => {
+            if norm_spec != override_spec {
+                return Err(Error::conflict(
+                    "override_task_spec conflicts with compiled proposal normalized_task_spec",
+                ));
+            }
+            norm_spec
         }
     };
+
+    // TaskSpec dependencies must be empty in M6-A
+    if !task_spec.dependencies.is_empty() {
+        return Err(Error::invalid_authority(
+            "TaskSpec dependencies must be empty in M6-A",
+        ));
+    }
 
     // Verify target partition exists and is active
     required_partition(tx, task_spec.partition.as_str(), true)?;
 
-    // 4. Ensure internal batch for this Generation exists
-    let batch_id = format!("batch_gen_{gid}");
+    // 5. Ensure independent mechanical execution batch for this Task exists
+    let task_id = task_spec.task_id.clone().unwrap_or_else(TaskId::new);
+    let batch_id = format!("batch_{task_id}");
     tx.execute(
         "INSERT INTO batches(id, state, metadata_json, created_at, updated_at)
          VALUES(?1, 'ACTIVE', '{}', ?2, ?2)
@@ -603,14 +693,7 @@ pub fn admit_proposal(
     )
     .map_err(map_sqlite)?;
 
-    // 5. Create M5 Task
-    let task_id = task_spec.task_id.unwrap_or_else(TaskId::new);
-    let state = if task_spec.dependencies.is_empty() {
-        "QUEUED"
-    } else {
-        "BLOCKED"
-    };
-
+    // 6. Create M5 Task
     let retry_json = Value::Array(
         task_spec
             .retry_policy
@@ -627,7 +710,7 @@ pub fn admit_proposal(
             max_attempts, retry_classes_json, base_backoff_seconds, max_backoff_seconds,
             supersedes_task_id, created_at, updated_at
          )
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 'QUEUED', ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
         params![
             task_id.as_str(),
             batch_id,
@@ -642,7 +725,6 @@ pub fn admit_proposal(
             )),
             task_spec.workspace_mode.as_sql(),
             task_spec.priority,
-            state,
             task_spec.retry_policy.max_attempts as i64,
             json_dump(&retry_json),
             task_spec.retry_policy.base_backoff_seconds,
@@ -653,35 +735,29 @@ pub fn admit_proposal(
     )
     .map_err(map_sqlite)?;
 
-    for dep in &task_spec.dependencies {
-        tx.execute(
-            "INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES(?1, ?2)",
-            params![task_id.as_str(), dep],
-        )
-        .map_err(map_sqlite)?;
-    }
-
-    // 6. Create GenerationTaskBinding
+    // 7. Create GenerationTaskBinding
     let new_seq = gen_seq + 1;
+    let admitted_spec_json = json_dump(&task_spec_to_json(&task_spec));
     tx.execute(
         "INSERT INTO generation_task_bindings(
             generation_id, task_id, proposal_id, information_function,
-            admission_seq, semantic_input_set_json, created_at
+            admission_seq, admitted_task_spec_json, semantic_input_set_json, created_at
          )
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             gid,
             task_id.as_str(),
             proposal_id.as_str(),
             info_fn.as_sql(),
             new_seq,
+            admitted_spec_json,
             set_str,
             now
         ],
     )
     .map_err(map_sqlite)?;
 
-    // 7. Transition proposal to ADMITTED
+    // 8. Transition proposal to ADMITTED
     let updated = tx
         .execute(
             "UPDATE compiled_work_proposals
@@ -698,7 +774,7 @@ pub fn admit_proposal(
         )));
     }
 
-    // 8. Increment generation admission_seq
+    // 9. Increment generation admission_seq
     tx.execute(
         "UPDATE generations SET admission_seq=?1 WHERE generation_id=?2",
         params![new_seq, gid],
@@ -765,9 +841,9 @@ pub fn freeze_generation(
     // Atomically expire all PENDING EXPAND proposals in this generation
     tx.execute(
         "UPDATE compiled_work_proposals
-         SET state='EXPIRED', expiration_reason='GENERATION_FROZEN', updated_at=?1
-         WHERE generation_id=?2 AND state='PENDING' AND information_function='EXPAND'",
-        params![now, generation_id.as_str()],
+         SET state='EXPIRED', expiration_reason=?1, updated_at=?2
+         WHERE generation_id=?3 AND state='PENDING' AND information_function='EXPAND'",
+        params![GENERATION_FROZEN, now, generation_id.as_str()],
     )
     .map_err(map_sqlite)?;
 
@@ -785,9 +861,10 @@ pub fn freeze_generation(
             id, event_type, aggregate_type, aggregate_id, payload_json,
             state, delivery_attempts, next_delivery_at, created_at
          )
-         VALUES(?1, 'GENERATION_FROZEN', 'generation', ?2, ?3, 'PENDING', 0, ?4, ?4)",
+         VALUES(?1, ?2, 'generation', ?3, ?4, 'PENDING', 0, ?5, ?5)",
         params![
             event_id.as_str(),
+            GENERATION_FROZEN,
             generation_id.as_str(),
             json_dump(&Value::Object(payload)),
             now
@@ -890,9 +967,9 @@ pub fn close_generation(
     // Expire all remaining PENDING proposals
     tx.execute(
         "UPDATE compiled_work_proposals
-         SET state='EXPIRED', expiration_reason='GENERATION_CLOSED', updated_at=?1
-         WHERE generation_id=?2 AND state='PENDING'",
-        params![now, generation_id.as_str()],
+         SET state='EXPIRED', expiration_reason=?1, updated_at=?2
+         WHERE generation_id=?3 AND state='PENDING'",
+        params![GENERATION_CLOSED, now, generation_id.as_str()],
     )
     .map_err(map_sqlite)?;
 
@@ -910,9 +987,10 @@ pub fn close_generation(
             id, event_type, aggregate_type, aggregate_id, payload_json,
             state, delivery_attempts, next_delivery_at, created_at
          )
-         VALUES(?1, 'GENERATION_CLOSED', 'generation', ?2, ?3, 'PENDING', 0, ?4, ?4)",
+         VALUES(?1, ?2, 'generation', ?3, ?4, 'PENDING', 0, ?5, ?5)",
         params![
             event_id.as_str(),
+            GENERATION_CLOSED,
             generation_id.as_str(),
             json_dump(&Value::Object(payload)),
             now

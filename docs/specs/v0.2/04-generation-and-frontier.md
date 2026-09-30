@@ -46,17 +46,17 @@ CLOSED
      - Verifies `expected_revision` matches current revision.
      - Transitions state to `FROZEN` and increments `revision`.
      - Atomically expires all pending `EXPAND` proposals belonging to this generation with reason `GENERATION_FROZEN`.
-     - Writes outbox event `generation.frozen` in the same transaction.
+     - Writes outbox event `GENERATION_FROZEN` in the same transaction.
    - Race condition rule (Race A): If an admission commits before freeze, the resulting task is part of the generation and must settle before closure. If freeze commits before admission, any pending EXPAND admission is rejected.
 3. **`close_generation(generation_id, expected_revision)`**: Transitions `FROZEN -> CLOSED`.
    - Requires `is_generation_settled` barrier predicate:
      - `generation.state == FROZEN`.
-     - Every task admitted into the generation has reached a terminal M5 disposition (`Completed`, `Failed`, or `Cancelled`).
+     - Every task admitted into the generation has reached a terminal M5 disposition (`Completed` or `Cancelled`; note that retry exhaustion leaves tasks in `Suspended` until Root explicit intervention).
    - Atomic SQLite transaction:
      - Verifies `expected_revision` matches current revision.
      - Transitions state to `CLOSED` and increments `revision`.
      - Atomically expires any remaining pending proposals with reason `GENERATION_CLOSED`.
-     - Writes outbox event `generation.closed` in the same transaction.
+     - Writes outbox event `GENERATION_CLOSED` in the same transaction.
 
 ### Settled Barrier Predicate
 
@@ -64,7 +64,7 @@ CLOSED
 GenerationSettled(G) :=
     G.state == FROZEN
     AND
-    every Task admitted into G has reached an M5 terminal disposition (Completed, Failed, Cancelled)
+    every Task admitted into G has reached an M5 terminal disposition (Completed or Cancelled; Suspended tasks require Root disposition)
 ```
 
 Mechanical work (retries, recovery, adapter reconciliation, lease renewals) remains inside the originating semantic Task and Generation. It MUST NOT create a new Generation.
@@ -77,6 +77,8 @@ Every semantic Task MUST belong to exactly one Generation via an explicit `Gener
 - Scheduler MUST persist: atomic creation of the M5 `TaskRecord` and `GenerationTaskBindingRecord` in one transaction.
 - Workers and compilers MUST NOT materialize executable Tasks directly.
 - **D-GEN-INTRA Resolution**: Root MAY add Tasks to an already `OPEN` or `FROZEN` generation dynamically (subject to information function admission rules). In `FROZEN`, only `COMPRESS_POSITIVE` and `COMPRESS_NEGATIVE` proposals may be admitted.
+- **Task Dependencies**: In M6-A, `TaskSpec.dependencies` MUST be empty. Semantic order is expressed by `SemanticInputSet` provenance and Root admission timing.
+- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, whereas Batch is an aggregate execution barrier. To preserve orthogonality and prevent deadlocks on dynamic admissions, each admitted semantic task is materialized into its own internal mechanical execution batch (`batch_{task_id}`). Prior task completions or cancellations never compromise the eligibility of subsequently admitted tasks in an `OPEN` Generation.
 
 ## Information Functions
 
@@ -89,12 +91,14 @@ Every work proposal and task binding is classified under an explicit `Informatio
 ## Provenance Model (D-GEN-TOPOLOGY Resolution)
 
 - Each task binding carries an immutable `SemanticInputSet` capturing references to upstream results, seeds, and artifacts.
+- Provenance `result_ids` must resolve to existing durable Result rows.
 - Provenance forms a clean semantic DAG via parent generation references and task input bindings without requiring an external ontology engine.
 
 ## Ingress and Compilation (D-INTENT-SCHEMA Resolution)
 
 - `RawWorkIntent` is an unprivileged semantic suggestion emitted by workers or Root.
 - A deterministic compiler translates `RawWorkIntent` into a durable `CompiledWorkProposal`.
+- Proposal deduplication identity is scoped to `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)` with canonical payload fingerprinting. Content mismatches for the same identity are rejected with Conflict.
 - Proposals become executable Tasks only upon explicit Root admission.
 
 ## Batch

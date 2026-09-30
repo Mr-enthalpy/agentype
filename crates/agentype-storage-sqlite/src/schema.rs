@@ -310,16 +310,17 @@ CREATE TABLE IF NOT EXISTS compiled_work_proposals (
     source_kind TEXT NOT NULL,
     source_ref TEXT NOT NULL,
     raw_intent_key TEXT NOT NULL,
+    intent_fingerprint TEXT NOT NULL,
     information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
-    normalized_task_spec_json TEXT NOT NULL,
-    semantic_input_set_json TEXT NOT NULL DEFAULT '[]',
+    normalized_task_spec_json TEXT,
+    semantic_input_set_json TEXT NOT NULL DEFAULT '{}',
     compiler_version INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL CHECK (state IN ('PENDING','ADMITTED','REJECTED','EXPIRED')),
     admitted_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
     expiration_reason TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    UNIQUE(source_ref, raw_intent_key, compiler_version)
+    UNIQUE(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_admitted_task_id
@@ -332,7 +333,8 @@ CREATE TABLE IF NOT EXISTS generation_task_bindings (
     proposal_id TEXT NOT NULL REFERENCES compiled_work_proposals(proposal_id) ON DELETE RESTRICT,
     information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
     admission_seq INTEGER NOT NULL,
-    semantic_input_set_json TEXT NOT NULL DEFAULT '[]',
+    admitted_task_spec_json TEXT NOT NULL,
+    semantic_input_set_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
 );
 "#;

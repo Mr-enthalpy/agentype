@@ -97,7 +97,7 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
    - Enforces optimistic concurrency (`revision == expected_revision`).
    - Atomically updates state to `FROZEN` and increments `revision`.
    - Atomically marks all unadmitted `PENDING` proposals with information function `EXPAND` as `EXPIRED` (`reason: GENERATION_FROZEN`).
-   - Emits an outbox event `generation.frozen` in the same transaction.
+   - Emits an outbox event `GENERATION_FROZEN` in the same transaction.
    - **Race A (admit vs freeze)**: Serialized by SQLite transaction. If admission commits first, the task is bound to the generation and must settle before closure. If freeze commits first, subsequent EXPAND admissions fail immediately with `GenerationFrozen`.
 3. **`close_generation(generation_id, expected_revision)`**:
    - Enforces the `is_generation_settled` barrier predicate:
@@ -105,23 +105,26 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
      GenerationSettled(G) :=
          G.state == FROZEN
          AND
-         every Task admitted into G has reached an M5 terminal disposition (Completed, Failed, Cancelled)
+         every Task admitted into G has reached an M5 terminal disposition (Completed, Cancelled; Suspended tasks require Root disposition)
      ```
    - Atomically updates state to `CLOSED` and increments `revision`.
    - Atomically marks any remaining unadmitted `PENDING` proposals as `EXPIRED` (`reason: GENERATION_CLOSED`).
-   - Emits an outbox event `generation.closed` in the same transaction.
+   - Emits an outbox event `GENERATION_CLOSED` in the same transaction.
 
 ---
 
 ## 4. Admission and Compilation Semantics
 
-- **Deterministic Compilation**: `compile_intent` maps a `RawWorkIntent` into a unique `CompiledWorkProposal`. It is idempotent on `(generation_id, raw_intent_key)`.
+- **Deterministic Compilation**: `compile_intent` maps a `RawWorkIntent` into a unique `CompiledWorkProposal`. It is idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)` with canonical payload fingerprinting (content changes for the same identity are rejected with Conflict).
+- **TaskSpec Dependencies**: In M6-A, `TaskSpec.dependencies` must be empty. Cross-admission dependency is expressed by `SemanticInputSet` provenance and Root admission order.
+- **Generation / Batch Orthogonality**: Generation is a semantic frontier barrier, not an aggregate execution barrier. Each admitted task is materialized into its own independent mechanical Batch (`batch_{task_id}`), ensuring completion or cancellation of prior tasks never blocks dynamic admissions into an `OPEN` Generation.
 - **Atomic Admission**: `admit_proposal` executes in a single SQLite transaction:
   1. Checks generation admission rules (`generation_allows_admit`).
   2. Transitions proposal state from `PENDING` to `ADMITTED`. Concurrent duplicate admissions result in exactly one winner (Race B).
-  3. Creates an M5 `TaskRecord` in state `Pending`.
-  4. Creates a `GenerationTaskBindingRecord` linking the task, generation, information function, and frozen `SemanticInputSet`.
-  5. Emits an outbox event `task.admitted`.
+  3. Validates that provenance `result_ids` exist in durable storage.
+  4. Resolves `TaskSpec` (enforcing explicit Root decision if unspecified in proposal, and detecting conflicts).
+  5. Creates an M5 `TaskRecord` in state `Queued` inside its dedicated mechanical execution batch (`batch_{task_id}`).
+  6. Creates a `GenerationTaskBindingRecord` linking the task, generation, information function, admitted `TaskSpec`, and frozen `SemanticInputSet`.
 
 ---
 

@@ -168,7 +168,10 @@ fn test_semantic_control_e2e_through_daemon() {
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: None,
+        suggested_task_spec: Some(agentype_core::TaskSpec::new(
+            "profile_cpu",
+            serde_json::json!({}),
+        )),
     };
 
     let prop = sem
