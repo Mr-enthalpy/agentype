@@ -16,7 +16,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 | Batch | id | Scheduler | execution barrier | state machine | Y | Y | N | Y | N |
 | Task | id | Scheduler | until terminal | state machine | Y | Y | N | Y | N |
 | TaskRequirement | part of Task/Proposal | Root intent / compiler | with Task or proposal | immutable after materialize | Y | Y | N | Y | N |
-| RawWorkIntent | id | Scheduler record; worker proposes | until Root disposition | immutable evidence | Y | Y | N | Y | N |
+| RawWorkIntent | none (ingress value) | worker proposes; carried by source Result / compile input | transient until compilation | immutable evidence | Y | Y | N | N (durability via source Result / Proposal) | N |
 | CompiledWorkProposal | id | Scheduler record; compiler produces | until Root decision | immutable | Y | Y | N | Y | N |
 | AgentType | type_id + revision | Scheduler registry; Root intent | until GC | revisions immutable | Y | Y | N | Y | Y |
 | LogicalAgent | id | Scheduler | until RETIRED | identity immutable | Y | Y | N | Y | N |
@@ -54,9 +54,18 @@ execution authority.
 MUST NOT encode a model name as identity.
 
 **RawWorkIntent** is domain-semantic and architecture-light. Workers MUST NOT
-be required to understand Scheduler internals to emit one. Lifetime lasts
-until **Root** disposition (admit / reject / defer / accept a redundancy
-candidate). Compiler rejection MUST NOT end the intent's Root-visible life.
+be required to understand Scheduler internals to emit one. It is an
+unprivileged **ingress value**, not an independent durable aggregate: it has no
+Scheduler identity or lifecycle of its own and MUST NOT be persisted as a
+standalone authority record in M6-A. Worker-originated durability derives from
+the durable source `Result` that carried the intent; Root-originated intent is
+command input. The first Scheduler-owned durable review object is the
+`CompiledWorkProposal`, whose stable replay identity is
+`(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)` and
+which retains the intent's objective, rationale, information function,
+provenance, and content fingerprint. Root-visibility and auditability of a
+proposed intent are therefore satisfied by the durable proposal, not by a
+separate intent row.
 
 **CompiledWorkProposal** is architecture-aware and execution-unbound. It MUST
 NOT normally bind logical_agent_id, incarnation_id, attempt_id, lease_id, or a
@@ -101,8 +110,11 @@ thread/session semantics. Storage/security details DEFERRED (D-CONTINUITY-BIND).
 - **M6:** every semantic Task belongs to exactly one Generation and one Batch.
 - Attempt belongs to one Task; Lease belongs to one Attempt.
 - Execution belongs to one Attempt; Incarnation hosts Executions.
-- RawWorkIntent originates from a Result when policy allows.
-- CompiledWorkProposal originates from a RawWorkIntent.
+- RawWorkIntent originates from a Result (or Root command input) when policy
+  allows; in M6-A its durability is inherited from that source, not from an
+  independent record.
+- CompiledWorkProposal originates from a RawWorkIntent and is the first durable
+  Scheduler-owned review object for it.
 - Transform successor LogicalAgent `supersedes` source; same AgentLineage.
 - Result `derived_from` Task; evidence refs are first-class.
 - Causal graph MAY include caused_by, depends_on, derived_from, audits,

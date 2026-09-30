@@ -33,7 +33,9 @@ Generation                        durable semantic admission frontier
 CompiledWorkProposal              durable, unprivileged candidate work item
 GenerationTaskBinding             task <-> generation membership + frozen inputs
 
-RawWorkIntent                     unprivileged ingress value (no authority)
+RawWorkIntent                     unprivileged ingress value (no authority, no
+                                  independent durable identity; durability
+                                  inherited from the source Result)
 SemanticInputSet                  immutable provenance value object
 ArtifactRef                       content-addressed artifact reference
 GenerationView                    derived, rebuildable read model
@@ -83,6 +85,16 @@ before consulting current Generation state, so a proposal committed before
 freeze or close replays to its final state instead of failing.
 ```
 
+`RawWorkIntent` is an ingress value, not a durable Scheduler record:
+worker-originated durability derives from the durable source `Result`, and
+`CompiledWorkProposal` is the first Scheduler-owned durable review object for
+it. Admission override consistency and crash replay compare `TaskSpec`s under
+canonicalization (`canonical(A) == canonical(B)`), never Rust struct equality,
+so a committed spec replayed with its original, differently-ordered affinity
+tags, retry classes, or dependencies returns the same `TaskId`. The M5 retry
+contract is preserved unchanged: `base_backoff_seconds >= 0` and
+`max_backoff_seconds >= base_backoff_seconds` remain legal.
+
 The derived `GenerationView.is_settled` field is a terminal projection distinct
 from the `close_generation` gate: it is true for a settled `FROZEN` generation
 and remains true for its `CLOSED` successor
@@ -128,6 +140,7 @@ M6-A correctness remains defined by the V0.2 normative specs and architecture
 documents. This report does not supersede them.
 
 ```text
+spec 01 domain-model                   normative ingress/durability model
 spec 04 generation-and-frontier        normative frontier contract
 spec 05 work-intent-compilation        normative compilation contract
 spec 17 deferred-open-questions        D-GEN-* / D-INTENT-* / D-ROOT-API resolved
@@ -150,16 +163,36 @@ the `GenerationView` settled projection from terminality, with regressions for
 EXPAND-after-freeze, ADMITTED/REJECTED-after-close, COMPRESS-after-close replay,
 and the CLOSED view projection.
 
+A second closure review of
+`main@c174f1585a82d6b3fac3ba30c4c374485d25cb9e` returned:
+
+```text
+P0 = 0
+P1 = 2   closed in the closure PR (canonical TaskSpec replay; normative RawWorkIntent model)
+P2 = 1   closed in the closure PR (zero retry backoff held legal for M5 parity)
+```
+
+The canonical-replay defect made `admit_proposal` compare a canonically-stored
+`TaskSpec` against a raw override with Rust struct equality, so a committed spec
+replayed with differently-ordered vectors wrongly conflicted; it is closed by
+comparing canonical forms. The normative-ingress defect is closed by stating in
+specs 01 and 05 that `RawWorkIntent` is an ingress value with no independent
+durable identity, and that `CompiledWorkProposal` is the first durable review
+object. The M6-A freeze claim holds only after this closure lands.
+
 ## Baseline
 
 ```text
 M5 frozen base (main):
 c1629e42ec142f73c7981f10972809bc2ef9b4de
 
-Audited M6-A closure head:
+First audited M6-A closure head:
 ae3436416687c4681a0e5b5541d59dd9783462b9
 
-M6-A baseline is the merge of PR #16 into main.
+M6-A baseline is the merge of PR #16 into main. The M6-A freeze claim is
+confirmed by the subsequent closure PR (fix/m6a-audit-closure) on top of
+c174f1585a82d6b3fac3ba30c4c374485d25cb9e.
+
 SCHEMA_VERSION = 5 at M6-A freeze.
 ```
 
