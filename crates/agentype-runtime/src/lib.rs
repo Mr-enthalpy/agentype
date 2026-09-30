@@ -43,8 +43,7 @@ pub use observer::{
     PhysicalObserverService,
 };
 pub use process_lock::{
-    hold_process_lock_until_stdin_closes, ProcessLockError, ReadyPermit, RuntimeProcessGuard,
-    RuntimeProcessLock, SqliteRuntimeConfig,
+    ProcessLockError, ReadyPermit, RuntimeProcessGuard, RuntimeProcessLock, SqliteRuntimeConfig,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use recovery::{recover_runtime_without_notifier, recover_runtime_without_process_lock};

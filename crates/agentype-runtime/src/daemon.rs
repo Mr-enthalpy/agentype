@@ -246,36 +246,44 @@ impl SchedulerDaemonBuilder {
             notifier,
             gate,
             stop: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            watchdog_fault: AtomicBool::new(false),
             phase: Mutex::new(DaemonPhase::Stopping),
         });
         let watchdog_inner = inner.clone();
         let watchdog = std::thread::Builder::new()
             .name("daemon-health".into())
-            .spawn(move || loop {
-                if watchdog_inner.stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                let failed = watchdog_inner.control.is_failed()
-                    || watchdog_inner.observer.is_failed()
-                    || watchdog_inner.supervision.is_failed()
-                    || watchdog_inner
-                        .notifier
-                        .as_ref()
-                        .is_some_and(|n| n.is_failed());
-                if failed {
-                    watchdog_inner.gate.fail();
-                    let mut phase = watchdog_inner.phase.lock().expect("daemon phase");
-                    *phase = DaemonPhase::Failed;
-                    drop(phase);
-                    watchdog_inner.control.request_stop();
-                    watchdog_inner.observer.request_stop();
-                    watchdog_inner.supervision.request_stop();
-                    if let Some(n) = &watchdog_inner.notifier {
-                        n.request_stop();
+            .spawn(move || {
+                // The watchdog is the global fatal coordinator, so it must be
+                // INSIDE the fatal contract it enforces (M5.8 audit round 4,
+                // P1-2). A coordinator that dies silently would leave
+                // supervision and observation running with nothing left to
+                // stop them, so any exit that is not an orderly shutdown
+                // fails the runtime.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    if watchdog_inner.stop.load(Ordering::SeqCst) {
+                        return;
                     }
-                    break;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if watchdog_inner.watchdog_fault.load(Ordering::SeqCst) {
+                        panic!("armed daemon-health watchdog fault");
+                    }
+                    let failed = watchdog_inner.control.is_failed()
+                        || watchdog_inner.observer.is_failed()
+                        || watchdog_inner.supervision.is_failed()
+                        || watchdog_inner
+                            .notifier
+                            .as_ref()
+                            .is_some_and(|n| n.is_failed());
+                    if failed {
+                        publish_runtime_fatal(&watchdog_inner);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }));
+                if outcome.is_err() {
+                    publish_runtime_fatal(&watchdog_inner);
                 }
-                std::thread::sleep(Duration::from_millis(50));
             });
         let watchdog = match watchdog {
             Ok(handle) => handle,
@@ -434,6 +442,10 @@ struct DaemonInner {
     notifier: Option<NotifierRunner>,
     gate: DispatchGate,
     stop: AtomicBool,
+    /// Test-support fault seam: panics the health watchdog on its next tick,
+    /// so the coordinator's own fatal path is reachable from a test.
+    #[cfg(any(test, feature = "test-support"))]
+    watchdog_fault: AtomicBool,
     phase: Mutex<DaemonPhase>,
 }
 
@@ -470,6 +482,15 @@ impl RunningSchedulerDaemon {
         crate::SchedulerControl::new(&self.kernel, lock.identity_debug(), lock.store_path())
     }
 
+    /// Test-support: panic the health coordinator on its next tick, so its
+    /// own fatal path is reachable from a regression test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn arm_watchdog_panic(&self) {
+        if let Some(inner) = &self.inner {
+            inner.watchdog_fault.store(true, Ordering::SeqCst);
+        }
+    }
+
     pub fn poll_health(&self) {
         let inner = self.inner.as_ref().expect("daemon inner");
         let failed = inner.control.is_failed()
@@ -503,17 +524,29 @@ impl RunningSchedulerDaemon {
 
     pub fn join(mut self) -> DaemonExit {
         self.request_shutdown();
-        if let Some(watchdog) = self.watchdog.take() {
-            let _ = watchdog.join();
-        }
+        // The coordinator is part of the fatal contract, so its own death is
+        // reported rather than swallowed (M5.8 audit round 4, P1-2). Its
+        // exit guard already publishes the fatal; this makes the exit status
+        // independent of that publication winning the race.
+        let coordinator_died = self
+            .watchdog
+            .take()
+            .is_some_and(|watchdog| watchdog.join().is_err());
         let inner = match Arc::try_unwrap(self.inner.take().expect("daemon inner")) {
             Ok(inner) => inner,
             Err(shared) => {
                 let cause = first_worker_fatal(&shared);
-                return if *shared.phase.lock().expect("daemon phase") == DaemonPhase::Failed
+                return if coordinator_died
+                    || *shared.phase.lock().expect("daemon phase") == DaemonPhase::Failed
                     || cause.is_some()
                 {
-                    DaemonExit::Failed(cause.unwrap_or_else(|| "runtime worker failed".into()))
+                    DaemonExit::Failed(cause.unwrap_or_else(|| {
+                        if coordinator_died {
+                            "the daemon health coordinator died".into()
+                        } else {
+                            "runtime worker failed".into()
+                        }
+                    }))
                 } else {
                     DaemonExit::Stopped
                 };
@@ -538,12 +571,35 @@ impl RunningSchedulerDaemon {
             .or(observer_fatal)
             .or(supervision_fatal.map(|err| err.to_string()))
             .or(notifier_fatal.map(|err| err.to_string()));
-        let failed = *phase.lock().expect("daemon phase") == DaemonPhase::Failed || cause.is_some();
+        let failed = coordinator_died
+            || *phase.lock().expect("daemon phase") == DaemonPhase::Failed
+            || cause.is_some();
         if failed {
-            DaemonExit::Failed(cause.unwrap_or_else(|| "runtime worker failed".into()))
+            DaemonExit::Failed(cause.unwrap_or_else(|| {
+                if coordinator_died {
+                    "the daemon health coordinator died".into()
+                } else {
+                    "runtime worker failed".into()
+                }
+            }))
         } else {
             DaemonExit::Stopped
         }
+    }
+}
+
+/// Publish a runtime-wide fatal. Idempotent: the gate flip is the interlock,
+/// and it is what makes every runner's synchronous `fail()` sufficient.
+fn publish_runtime_fatal(inner: &DaemonInner) {
+    inner.gate.fail();
+    let mut phase = inner.phase.lock().expect("daemon phase");
+    *phase = DaemonPhase::Failed;
+    drop(phase);
+    inner.control.request_stop();
+    inner.observer.request_stop();
+    inner.supervision.request_stop();
+    if let Some(notifier) = &inner.notifier {
+        notifier.request_stop();
     }
 }
 
@@ -903,6 +959,37 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// M5.8 audit round 4, P1-2: the global fatal coordinator is itself part
+    /// of the fatal contract. A dead coordinator must not leave supervision
+    /// and observation running with nothing to stop them.
+    #[test]
+    fn watchdog_death_is_a_runtime_fatal() {
+        let path = temp_store();
+        let daemon = builder_for(&path).start().unwrap();
+        assert_eq!(daemon.phase(), DaemonPhase::Ready);
+
+        daemon.arm_watchdog_panic();
+        wait_until(Duration::from_secs(8), || {
+            daemon.phase() == DaemonPhase::Failed
+        });
+        assert_eq!(
+            daemon.phase(),
+            DaemonPhase::Failed,
+            "a dead coordinator must fail the daemon"
+        );
+        assert!(
+            matches!(daemon.join(), DaemonExit::Failed(_)),
+            "a dead coordinator must be reported as a failure"
+        );
+
+        // Workers stopped and the lock was released, so the next lifecycle
+        // can take the store.
+        let again = builder_for(&path).start().unwrap();
+        assert_eq!(again.phase(), DaemonPhase::Ready);
+        again.join();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

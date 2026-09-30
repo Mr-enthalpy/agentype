@@ -181,6 +181,36 @@ drive a renewal step, because `RecoveredRuntime` already has a live heartbeat
 loop that owns renewal, and a test that competed with it would be reading a
 racing registry.
 
+## Fatal coordinator closure
+
+The daemon health watchdog is the global fatal coordinator, so it is now
+inside the fatal contract it enforces. Its body runs under `catch_unwind`
+with an exit guard: any exit that is not an orderly shutdown publishes the
+runtime fatal — gate failed, daemon phase Failed, every worker asked to stop.
+`join` reports a dead coordinator as `DaemonExit::Failed` independently of
+that publication winning the race, so the exit status cannot be lost.
+
+Without this, a coordinator that died while the notifier failed would leave
+supervision and observation running and renewing, which contradicts
+"structural runner failure stops the whole production Runtime".
+
+Regression: `watchdog_death_is_a_runtime_fatal`, driven by a test-support
+fault seam (`arm_watchdog_panic`).
+
+The cross-process lock helper moved out of the production surface: the logic
+now lives entirely in `src/bin/hold-process-lock.rs`, and
+`hold_process_lock_until_stdin_closes` is no longer exported. It takes OS
+ownership of a store, so nothing a production consumer should be able to
+call.
+
+### Open: production API boundary
+
+`agentype-storage-sqlite::Kernel` remains a public API, so a consumer can
+still build a second claim/renew control plane without the process lock,
+recovery, `ReadyPermit`, or the dispatch gate, and `SupervisionService`'s
+renewal surface is still re-exported. Those are the M5.8 audit round 4 P1-1
+findings and are **not** closed by this change.
+
 ## Composition closure follow-ups
 
 `Kernel::attempt_count_for_task` is a test-support read that makes "no

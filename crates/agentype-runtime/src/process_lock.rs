@@ -14,7 +14,7 @@
 use fs4::fs_std::FileExt;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -380,19 +380,6 @@ impl std::fmt::Debug for ReadyPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadyPermit").finish_non_exhaustive()
     }
-}
-
-/// Tiny helper used by cross-process lock tests: acquire and wait for stdin EOF.
-#[doc(hidden)]
-pub fn hold_process_lock_until_stdin_closes(path: &Path) -> Result<(), ProcessLockError> {
-    let config = SqliteRuntimeConfig::new(path, 10.0, 16_384)?;
-    let _guard = RuntimeProcessGuard::acquire(&config)?;
-    let mut stdout = io::stdout();
-    stdout.write_all(b"LOCKED\n")?;
-    stdout.flush()?;
-    let mut sink = String::new();
-    let _ = io::stdin().read_line(&mut sink);
-    Ok(())
 }
 
 #[cfg(test)]
