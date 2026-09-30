@@ -195,6 +195,10 @@ fn test_semantic_control_e2e_through_daemon() {
 
     let view_closed = sem.read_generation_view(&gen.generation_id).unwrap();
     assert_eq!(view_closed.generation.state, GenerationState::Closed);
+    assert!(
+        view_closed.is_settled,
+        "CLOSED generation must project is_settled = true"
+    );
 
     daemon.join();
     let _ = std::fs::remove_file(path);

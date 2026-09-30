@@ -226,6 +226,17 @@ pub fn is_generation_settled(state: GenerationState, tasks: &[TaskSettledSnapsho
     state == GenerationState::Frozen && tasks.iter().all(|t| t.is_terminal)
 }
 
+/// Predicate: terminal projection for the `GenerationView.is_settled` read model.
+///
+/// `is_generation_settled` is the *close gate*: it is deliberately false once a
+/// generation has advanced to `CLOSED`. The read model instead reports the
+/// natural-language property "this frontier no longer has unsettled admitted
+/// work", which is true for a settled `FROZEN` generation and remains true for
+/// its terminal `CLOSED` successor.
+pub fn is_generation_view_settled(state: GenerationState, tasks: &[TaskSettledSnapshot]) -> bool {
+    state == GenerationState::Closed || is_generation_settled(state, tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +342,37 @@ mod tests {
 
         // Empty task set when FROZEN is settled
         assert!(is_generation_settled(GenerationState::Frozen, &[]));
+    }
+
+    #[test]
+    fn test_generation_view_settled_projection() {
+        let terminal = TaskSettledSnapshot {
+            task_id: TaskId::new(),
+            is_terminal: true,
+        };
+        let open_task = TaskSettledSnapshot {
+            task_id: TaskId::new(),
+            is_terminal: false,
+        };
+
+        // A settled FROZEN generation is reported settled in the view.
+        assert!(is_generation_view_settled(
+            GenerationState::Frozen,
+            std::slice::from_ref(&terminal)
+        ));
+        // An unsettled FROZEN generation stays unsettled.
+        assert!(!is_generation_view_settled(
+            GenerationState::Frozen,
+            std::slice::from_ref(&open_task)
+        ));
+        // CLOSED is terminal and always reports settled, even though the close
+        // gate predicate itself is false there.
+        assert!(is_generation_view_settled(GenerationState::Closed, &[]));
+        assert!(is_generation_view_settled(
+            GenerationState::Closed,
+            std::slice::from_ref(&terminal)
+        ));
+        // OPEN is never settled.
+        assert!(!is_generation_view_settled(GenerationState::Open, &[]));
     }
 }

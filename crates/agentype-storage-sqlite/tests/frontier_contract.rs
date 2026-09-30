@@ -15,8 +15,8 @@ use common::*;
 
 use agentype_core::{
     ArtifactRef, BatchState, Clock, GenerationState, InformationFunction, ManualClock, PartitionId,
-    PartitionSpec, ProposalStateKind, RawWorkIntent, ResultId, Retention, SemanticInputSet,
-    TaskSpec, TaskState,
+    PartitionSpec, ProposalExpirationReason, ProposalStateKind, RawWorkIntent, ResultId, Retention,
+    SemanticInputSet, TaskSpec, TaskState,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
@@ -236,6 +236,11 @@ fn test_generation_lifecycle_and_admit_contract() {
         .expect("view after close");
     assert_eq!(view_closed.generation.state, GenerationState::Closed);
     assert_eq!(view_closed.generation.revision, 2);
+    // INV/P1-2: a CLOSED generation is a terminal, settled frontier in the view.
+    assert!(
+        view_closed.is_settled,
+        "CLOSED generation must project is_settled = true"
+    );
 
     // INV-A8: No task can be admitted into CLOSED generation
     let late_compress_intent = RawWorkIntent {
@@ -771,6 +776,141 @@ fn test_p1_1_rejected_proposal_deterministic_replay() {
     assert_eq!(p2.state, ProposalStateKind::Rejected);
     assert!(p2.expiration_reason.is_none());
     assert_eq!(p2.rejection_reason.as_deref(), Some(rejection_text));
+}
+
+#[test]
+fn test_p1_1_expand_replay_after_freeze_returns_expired() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "expand_replay_freeze".into(),
+        objective: "Committed EXPAND survives freeze replay".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("expand_replay", json!({}))),
+    };
+
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent.clone(), "root", "session", 1)
+        .unwrap();
+    assert_eq!(p1.state, ProposalStateKind::Pending);
+
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert!(view.expired_proposal_ids.contains(&p1.proposal_id));
+
+    // Exact stable-identity replay observes the committed proposal even though
+    // the generation frontier has advanced to FROZEN.
+    let replay = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Expired);
+    assert_eq!(
+        replay.expiration_reason,
+        Some(ProposalExpirationReason::GenerationFrozen)
+    );
+}
+
+#[test]
+fn test_p1_1_admitted_replay_after_close_returns_admitted() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "admitted_replay_close".into(),
+        objective: "Committed ADMITTED survives close replay".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("admitted_replay", json!({}))),
+    };
+
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent.clone(), "root", "session", 1)
+        .unwrap();
+    let task_id = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
+
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    kernel.cancel_task(&task_id, true).unwrap();
+    kernel.close_generation(&gen.generation_id, 1).unwrap();
+
+    let replay = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Admitted);
+    assert_eq!(replay.admitted_task_id, Some(task_id));
+}
+
+#[test]
+fn test_p1_1_rejected_replay_after_close_returns_rejected() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "rejected_replay_close".into(),
+        objective: "Committed REJECTED survives close replay".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("rejected_replay", json!({}))),
+    };
+
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent.clone(), "root", "session", 1)
+        .unwrap();
+    kernel
+        .reject_proposal(&p1.proposal_id, "out of scope")
+        .unwrap();
+
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    kernel.close_generation(&gen.generation_id, 1).unwrap();
+
+    let replay = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Rejected);
+    assert_eq!(replay.rejection_reason.as_deref(), Some("out of scope"));
+}
+
+#[test]
+fn test_p1_1_compress_replay_after_close_returns_expired() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // COMPRESS is admissible while FROZEN, so it survives freeze as PENDING.
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "compress_replay_close".into(),
+        objective: "Committed COMPRESS survives close replay".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("compress_replay", json!({}))),
+    };
+
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent.clone(), "root", "session", 1)
+        .unwrap();
+    assert_eq!(p1.state, ProposalStateKind::Pending);
+
+    kernel.close_generation(&gen.generation_id, 1).unwrap();
+
+    let replay = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Expired);
+    assert_eq!(
+        replay.expiration_reason,
+        Some(ProposalExpirationReason::GenerationClosed)
+    );
 }
 
 #[test]

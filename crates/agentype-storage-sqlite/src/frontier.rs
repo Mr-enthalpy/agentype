@@ -12,12 +12,12 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt};
 use crate::txutil::required_partition;
 use agentype_core::{
-    generation_allows_admit, is_generation_settled, ArtifactRef, BatchId, ContinuityPreference,
-    Error, FailureClass, GenerationId, GenerationRecord, GenerationState, GenerationView,
-    InformationFunction, OutboxEventId, PartitionId, ProposalExpirationReason, ProposalId,
-    ProposalRecord, ProposalStateKind, RawWorkIntent, ResultId, RetryPolicy, SemanticInputSet,
-    TaskId, TaskSettledSnapshot, TaskSpec, TaskState, UnixTime, WorkstreamId, GENERATION_CLOSED,
-    GENERATION_FROZEN,
+    generation_allows_admit, is_generation_settled, is_generation_view_settled, ArtifactRef,
+    BatchId, ContinuityPreference, Error, FailureClass, GenerationId, GenerationRecord,
+    GenerationState, GenerationView, InformationFunction, OutboxEventId, PartitionId,
+    ProposalExpirationReason, ProposalId, ProposalRecord, ProposalStateKind, RawWorkIntent,
+    ResultId, RetryPolicy, SemanticInputSet, TaskId, TaskSettledSnapshot, TaskSpec, TaskState,
+    UnixTime, WorkstreamId, GENERATION_CLOSED, GENERATION_FROZEN,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -369,48 +369,12 @@ pub fn compile_intent(
     source_ref: &str,
     compiler_version: u32,
 ) -> Result<ProposalRecord, Error> {
-    // 1. Verify generation exists and is not CLOSED.
-    let gen_state_str: String = tx
-        .query_row(
-            "SELECT state FROM generations WHERE generation_id=?1",
-            params![generation_id.as_str()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(map_sqlite)?
-        .ok_or_else(|| Error::not_found(format!("generation {:?}", generation_id.as_str())))?;
-
-    let gen_state = GenerationState::parse_sql(&gen_state_str)?;
-    if gen_state == GenerationState::Closed {
-        return Err(Error::invalid_transition(format!(
-            "cannot compile intent for CLOSED generation {:?}",
-            generation_id.as_str()
-        )));
-    }
-    if gen_state == GenerationState::Frozen
-        && intent.information_function == InformationFunction::Expand
-    {
-        return Err(Error::invalid_transition(format!(
-            "cannot compile EXPAND intent for FROZEN generation {:?}",
-            generation_id.as_str()
-        )));
-    }
-
-    // 2. Validate semantic input set provenance
-    validate_semantic_input_set(tx, generation_id, &intent.semantic_input_set)?;
-
-    // 3. TaskSpec dependencies must be empty in M6-A
-    if let Some(ref spec) = intent.suggested_task_spec {
-        if !spec.dependencies.is_empty() {
-            return Err(Error::invalid_authority(
-                "TaskSpec dependencies must be empty in M6-A",
-            ));
-        }
-    }
-
+    // 1. Compute the canonical content fingerprint up front. Current frontier
+    // state governs whether a *new* semantic commitment may be created; it does
+    // not govern replay/observation of a commitment that already durably exists.
     let fingerprint = intent.fingerprint()?;
 
-    // 4. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
+    // 2. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
     if let Some(existing) = query_opt(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
@@ -516,6 +480,46 @@ pub fn compile_intent(
             created_at: cat,
             updated_at: uat,
         });
+    }
+
+    // 3. No durable proposal exists yet, so this is a new semantic commitment.
+    // Verify the generation exists and its frontier admits a *new* compilation.
+    let gen_state_str: String = tx
+        .query_row(
+            "SELECT state FROM generations WHERE generation_id=?1",
+            params![generation_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?
+        .ok_or_else(|| Error::not_found(format!("generation {:?}", generation_id.as_str())))?;
+
+    let gen_state = GenerationState::parse_sql(&gen_state_str)?;
+    if gen_state == GenerationState::Closed {
+        return Err(Error::invalid_transition(format!(
+            "cannot compile intent for CLOSED generation {:?}",
+            generation_id.as_str()
+        )));
+    }
+    if gen_state == GenerationState::Frozen
+        && intent.information_function == InformationFunction::Expand
+    {
+        return Err(Error::invalid_transition(format!(
+            "cannot compile EXPAND intent for FROZEN generation {:?}",
+            generation_id.as_str()
+        )));
+    }
+
+    // 4. Validate semantic input set provenance
+    validate_semantic_input_set(tx, generation_id, &intent.semantic_input_set)?;
+
+    // TaskSpec dependencies must be empty in M6-A
+    if let Some(ref spec) = intent.suggested_task_spec {
+        if !spec.dependencies.is_empty() {
+            return Err(Error::invalid_authority(
+                "TaskSpec dependencies must be empty in M6-A",
+            ));
+        }
     }
 
     // 5. Build proposal record and insert
@@ -1291,7 +1295,7 @@ pub fn get_generation_view(
         });
     }
 
-    let is_settled = is_generation_settled(state, &task_snapshots);
+    let is_settled = is_generation_view_settled(state, &task_snapshots);
 
     // Proposals
     let mut prop_stmt = tx
