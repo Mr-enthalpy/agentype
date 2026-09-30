@@ -36,6 +36,23 @@ known folder, so a cross-session rename cannot split the singleton.
 The dispatch permit is taken before `claim_next_available`; a gate that
 is already stopping or failed does not create an Attempt.
 
+The lock and SQLite must resolve the same file from the same string, so the
+production store is a literal file-backed filesystem path only. `file:`
+filenames are SQLite URI filenames: the lock layer would have opened the
+literal `./file:scheduler.sqlite` while SQLite opened `./scheduler.sqlite`,
+letting two daemons each hold a lock and share one store.
+`SqliteRuntimeConfig` now rejects every `file:` spelling — including
+`file::memory:?cache=shared`, which the exact `:memory:` comparison never
+caught — and the store opens with explicit
+`SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NO_MUTEX`, so URI
+interpretation is off rather than merely unreached.
+Regressions: `uri_filenames_are_not_a_production_store`,
+`literal_filesystem_paths_stay_accepted`,
+`uri_filename_alias_fails_closed_before_any_runtime_action`,
+`only_the_literal_file_scheme_is_a_uri_filename`,
+`literal_path_stays_file_backed_and_reopenable`,
+`uri_filename_is_refused_by_the_store_boundary`.
+
 ## Ownership graph
 
 ```text
@@ -83,7 +100,11 @@ about the missing API rather than a missing crate.
 ## READY publication barrier
 
 `ReadyPermit` gates *construction* of the control loop; it does not gate
-*action*. M5.8 audit round 3 found that the observer runner started before
+*action*. Three things must hold before a physical start is dispatched —
+`ReadyPermit` (the loop may exist), `ReadyRelease` (the worker may leave its
+paused state), and `DispatchGate::Ready` (the gate admits a start) — so the
+permit must not be read as "READY has been published" (M5.8 audit round 5
+P2-1). M5.8 audit round 3 found that the observer runner started before
 `try_commit_ready`, so a steady-state observation could stop renewal
 eligibility between the final freshness check and the gate flip — READY would
 be published with the invariant already false.

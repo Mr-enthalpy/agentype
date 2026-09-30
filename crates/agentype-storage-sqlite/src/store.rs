@@ -3,7 +3,7 @@
 
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 use agentype_core::{Clock, Error, UnixTime};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -18,9 +18,51 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// True when `path` would be read as a SQLite **URI filename** rather than as
+/// a filesystem path.
+///
+/// SQLite interprets a filename as a URI exactly when it begins with the
+/// literal, case-sensitive prefix `file:`. Nothing else triggers URI
+/// processing, so every other string — including a Windows drive letter such
+/// as `C:\...` — is opened as a literal filesystem path.
+///
+/// This predicate exists because the Runtime's process lock resolves store
+/// identity from a filesystem handle while SQLite resolves the *same* string
+/// its own way. The two resolutions must agree, so a URI filename is not part
+/// of the production store contract and is rejected before either side acts.
+pub fn is_uri_filename(path: &Path) -> bool {
+    path.as_os_str()
+        .to_str()
+        .is_some_and(|text| text.starts_with("file:"))
+}
+
+/// SQLite open flags for the production file-backed store.
+///
+/// `rusqlite::Connection::open` implies `SQLITE_OPEN_URI`, which is what makes
+/// the `file:` prefix a URI. Production opens the Scheduler store with these
+/// flags instead, so the filename SQLite opens is byte-for-byte the filesystem
+/// path the process lock already owns.
+const FILE_BACKED_OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    .union(OpenFlags::SQLITE_OPEN_CREATE)
+    .union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
+
 impl Store {
+    /// Open the production file-backed Scheduler store.
+    ///
+    /// The URI-filename rejection is repeated here on purpose: this is the
+    /// boundary that actually opens the database, so the invariant holds even
+    /// for a caller that reached `Kernel::open` without going through
+    /// `SqliteRuntimeConfig`. URI interpretation is disabled by flags rather
+    /// than by the guard alone, so the guard is defence in depth.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let conn = Connection::open(path.as_ref())
+        let path = path.as_ref();
+        if is_uri_filename(path) {
+            return Err(Error::storage_failure(format!(
+                "sqlite URI filenames are not a production Scheduler store: {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(path, FILE_BACKED_OPEN_FLAGS)
             .map_err(|e| Error::storage_failure(format!("open sqlite: {e}")))?;
         verify_lineage_before_configure(&conn)?;
         configure(&conn)?;

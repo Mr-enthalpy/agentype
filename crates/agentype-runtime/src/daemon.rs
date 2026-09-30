@@ -687,7 +687,7 @@ mod tests {
     use agentype_core::{ExecutionState, PartitionSpec, Retention, TaskSpec, TaskState};
     use agentype_execution_config::{ExecutionProfileConfig, ExecutionTargetConfig};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const LEASE: f64 = 10.0;
@@ -1057,5 +1057,50 @@ mod tests {
         }
         daemon.join();
         let _ = std::fs::remove_file(path);
+    }
+
+    /// M5.8 audit round 5 P1: a SQLite URI filename must be refused at the
+    /// store/config boundary, not left to fail later as a SQLite BUSY. The
+    /// daemon composes `SqliteRuntimeConfig` first, so the rejection happens
+    /// before the process lock, before recovery mutation, before any Adapter
+    /// I/O, and before supervision or the notifier start.
+    ///
+    /// The second half states the aliasing fact directly: the lock layer
+    /// resolves `file:scheduler.sqlite` as a literal filesystem name while
+    /// SQLite resolves the same string as a URI pointing at
+    /// `scheduler.sqlite`. That is why the string must never reach either.
+    #[test]
+    fn uri_filename_alias_fails_closed_before_any_runtime_action() {
+        for rejected in [
+            "file:scheduler.sqlite",
+            "file::memory:?cache=shared",
+            "file:scheduler.sqlite?mode=rwc",
+            "file:///var/lib/agentype/scheduler.sqlite",
+        ] {
+            let cfg = SqliteRuntimeConfig::new(rejected, LEASE, 16_384);
+            assert!(
+                matches!(cfg, Err(ProcessLockError::IdentityUnresolvable(_))),
+                "{rejected} must be refused by the production store contract, got {:?}",
+                cfg.map(|c| c.path().to_path_buf())
+            );
+        }
+
+        let alias = Path::new("file:scheduler.sqlite");
+        assert_eq!(
+            alias.file_name().and_then(|name| name.to_str()),
+            Some("file:scheduler.sqlite"),
+            "the filesystem layer sees one literal file name"
+        );
+        // SQLite strips the URI scheme and opens this instead.
+        let sqlite_resolved = alias
+            .to_str()
+            .and_then(|text| text.strip_prefix("file:"))
+            .expect("URI scheme");
+        assert_eq!(sqlite_resolved, "scheduler.sqlite");
+        assert_ne!(
+            alias.to_str().unwrap(),
+            sqlite_resolved,
+            "lock interpretation and SQLite interpretation must be the same string"
+        );
     }
 }

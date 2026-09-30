@@ -44,6 +44,19 @@ impl SqliteRuntimeConfig {
                 "in-memory sqlite is not a production scheduler store".into(),
             ));
         }
+        // The production store contract is a literal file-backed filesystem
+        // path. A SQLite URI filename would be locked as the literal file
+        // `./file:...` by this module while SQLite opened the URI's path
+        // component, so two daemons could each hold a lock and still share one
+        // Scheduler store. This also covers the in-memory URI spelling
+        // `file::memory:?cache=shared`, which the exact `:memory:` comparison
+        // above does not catch.
+        if agentype_storage_sqlite::is_uri_filename(&path) {
+            return Err(ProcessLockError::IdentityUnresolvable(format!(
+                "sqlite URI filenames are not a production scheduler store: {}",
+                path.display()
+            )));
+        }
         if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
             return Err(ProcessLockError::IdentityUnresolvable(
                 "lease_seconds must be finite and positive".into(),
@@ -363,8 +376,25 @@ fn store_identity_for_tests(path: &Path) -> Option<String> {
     store_identity(&file, path).ok().map(|id| id.file_id)
 }
 
-/// Production dispatch eligibility. Runtime-local, non-serializable, no
-/// public constructor. Minted only after lock + recovery + activation.
+/// Permission to **construct a not-yet-published control loop**. Runtime-local,
+/// non-serializable, no public constructor. Minted after the process lock,
+/// recovery, and the activation sweep.
+///
+/// This is deliberately *not* "READY has been published". Three things must
+/// hold before a physical start may be dispatched, and this is only the first:
+///
+/// ```text
+/// ReadyPermit          control loop may be constructed
+/// + ReadyRelease       the worker may leave its paused state
+/// + DispatchGate::Ready  the gate actually admits a physical start
+/// ```
+///
+/// M5.8 audit round 5 P2-1: the stronger reading ("minted only after final
+/// activation / health barrier") described an earlier shape. The composition
+/// root mints this permit, constructs the control loop, starts the workers
+/// paused behind `ReadyRelease`, and only then validates freshness and flips
+/// the gate. The READY barrier is correct as written and is not reordered to
+/// match the old wording.
 pub(crate) struct ReadyPermit {
     _private: (),
 }
@@ -467,6 +497,51 @@ mod tests {
         match SqliteRuntimeConfig::new(":memory:", 10.0, 16_384) {
             Err(ProcessLockError::IdentityUnresolvable(_)) => {}
             other => panic!("expected IdentityUnresolvable, got {other:?}"),
+        }
+    }
+
+    /// M5.8 audit round 5 P1: the process lock would have opened
+    /// `./file:scheduler.sqlite` and locked *that* file, while SQLite resolved
+    /// the same string as a URI and opened `./scheduler.sqlite`. Both daemons
+    /// would then hold a lock and share one Scheduler store. Production
+    /// accepts literal file-backed paths only, so the config boundary rejects
+    /// every `file:` spelling before the lock or the kernel acts.
+    #[test]
+    fn uri_filenames_are_not_a_production_store() {
+        for rejected in [
+            "file:scheduler.sqlite",
+            "file:./scheduler.sqlite",
+            "file:/var/lib/agentype/scheduler.sqlite",
+            "file:///var/lib/agentype/scheduler.sqlite",
+            "file::memory:?cache=shared",
+            "file:scheduler.sqlite?mode=rwc",
+        ] {
+            match SqliteRuntimeConfig::new(rejected, 10.0, 16_384) {
+                Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                    assert!(
+                        detail.contains("URI"),
+                        "rejection must name the URI contract, got {detail}"
+                    );
+                }
+                other => panic!("{rejected} must fail closed, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same predicate must not reject an ordinary relative or absolute
+    /// filesystem path: only the literal `file:` prefix triggers SQLite URI
+    /// processing, so nothing else may be refused here.
+    #[test]
+    fn literal_filesystem_paths_stay_accepted() {
+        for accepted in [
+            "scheduler.sqlite",
+            "./scheduler.sqlite",
+            "/tmp/scheduler.sqlite",
+        ] {
+            assert!(
+                SqliteRuntimeConfig::new(accepted, 10.0, 16_384).is_ok(),
+                "{accepted} is a literal filesystem path and must be accepted"
+            );
         }
     }
 

@@ -48,6 +48,12 @@ required-features = ["test-support"]
 name = "topology"
 required-features = ["test-support"]
 
+# The production store contract: literal file-backed paths open, SQLite URI
+# filenames are refused at the store boundary. This target needs no mechanical
+# Kernel surface, so it runs under the default feature set as well.
+[[test]]
+name = "store_contract"
+
 [dependencies]
 agentype-core.workspace = true
 agentype-execution-config.workspace = true

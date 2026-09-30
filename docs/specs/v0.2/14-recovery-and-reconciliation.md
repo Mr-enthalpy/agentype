@@ -72,12 +72,18 @@ shutdown is in progress MUST be rejected.
 
 **M5.8:** one Scheduler store has exactly one production daemon, identified
 by OS process lock on store file identity (not a Scheduler Lease). Startup
-MUST acquire that lock before Kernel recovery mutation or Adapter I/O.
-`recover_runtime` grants activation, not dispatch. READY requires a
-runtime-local `ReadyPermit` minted only after physical-observation
-activation and runner health. Physical observation does not renew
-authority; stale freshness stops renewal eligibility without inventing
-death, termination, or quiescence. Shutdown stops Scheduler mechanics; it
-MUST NOT cancel semantic work or terminate external agents. The only safe
-recovery from a failed Runtime component is a new Runtime lifecycle through
-the full restart barrier.
+MUST acquire that lock before Kernel recovery mutation or Adapter I/O. The
+production store is a literal file-backed filesystem path; SQLite URI
+filenames (`file:...`) and in-memory spelling MUST be rejected at the config
+and store-open boundaries, because the lock resolves a filesystem handle
+while SQLite would resolve the same string as a URI. `recover_runtime` grants
+activation, not dispatch. READY requires the composition of a runtime-local
+`ReadyPermit` (minted after the process lock, recovery, and the
+physical-observation activation sweep, and only permitting construction of a
+not-yet-published control loop), the worker's `ReadyRelease`, and the
+DispatchGate being Ready; no one of them alone publishes READY. Physical
+observation does not renew authority; stale freshness stops renewal
+eligibility without inventing death, termination, or quiescence. Shutdown
+stops Scheduler mechanics; it MUST NOT cancel semantic work or terminate
+external agents. The only safe recovery from a failed Runtime component is a
+new Runtime lifecycle through the full restart barrier.

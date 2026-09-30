@@ -30,4 +30,7 @@ pub use kernel::{
     SupervisedRenewal,
 };
 pub use schema::SCHEMA_VERSION;
-pub use store::IMPLEMENTATION_LINE;
+// Shared with `agentype-runtime`: the process lock resolves store identity
+// from a filesystem handle while SQLite resolves the same string its own way,
+// so both crates must agree on which filenames are URI filenames.
+pub use store::{is_uri_filename, IMPLEMENTATION_LINE};
