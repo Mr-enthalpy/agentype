@@ -28,5 +28,9 @@ libc.workspace = true
 
 [dev-dependencies]
 agentype-runtime = { workspace = true, features = ["test-support"] }
-agentype-storage-sqlite.workspace = true
+# The daemon acceptance tests deliberately drive the mechanical Kernel path
+# (a second `Kernel` handle plus `ack_success`), so they request the
+# runtime-mechanical surface explicitly instead of relying on feature
+# unification with the runtime crate.
+agentype-storage-sqlite = { workspace = true, features = ["runtime-internal"] }
 agentype-execution-config = { workspace = true, features = ["test-support"] }

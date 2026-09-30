@@ -10,6 +10,8 @@ Superseded by M5.7 (do not treat the following M5.6-era facts as current):
 - registry identity is now `(adapter_kind, adapter_binding_key)`, not kind-only
 - recovery routes with `resolve_exact(kind, key)`, not `resolve(kind)`
 - `SCHEMA_VERSION` is 4 (`adapter_binding_key` column)
+- successful `collect_outcome` is physical end + artifact refs, not Task proof
+  (normative: spec 07 + M5.6 amendment + M5.7/M5.8)
 
 Deadline algebra, `AdapterError` mapping, and the production façade remain
 frozen as written below.

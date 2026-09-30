@@ -45,8 +45,19 @@ authoritative (`RESOURCE_UNAVAILABLE`, no adapter default); configuration
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`; daemon
 single-run; adapter absolute deadlines including cleanup; first-adapter
 runtime/live parity for **one named** reference adapter (opaque handles
-only; which adapter is IMPLEMENTATION-DEFINED). M5 MUST NOT require both
-V0.1.3 transports.
+only; which adapter is IMPLEMENTATION-DEFINED). **M5.8:** OS process
+singleton for one Scheduler store; physical freshness gates heartbeat
+renewal; `collect_outcome` / physical end MUST NOT mint a Task Result;
+second process MUST fail before recovery mutation. The M5.8 store-path
+invariant MUST be covered as well: a production store is a literal, UTF-8
+representable, file-backed filesystem path. Three SQLite special filenames —
+a `file:` URI filename (including one whose prefix is only visible in raw
+filename bytes, not in a UTF-8 string), bare `:memory:`, and the empty
+filename — MUST be refused at both the config boundary and the store-open
+boundary, with an explicit `open_memory`-style path remaining for ephemeral
+stores. A non-UTF-8 path is not a SQLite special filename but MUST be refused
+as well, and the config boundary and the store boundary MUST agree on which
+paths are accepted. M5 MUST NOT require both V0.1.3 transports.
 
 ## B. V0.2 semantic tests (M6)
 

@@ -1,0 +1,689 @@
+//! OS-owned exclusive lock for one Scheduler store.
+//!
+//! Ownership is an OS Runtime property, not a Scheduler Lease, PID file, or
+//! SQLite row. The same file identity is exclusive even if the path is
+//! renamed to another directory. Identity is read from the open handle,
+//! never by resolving the path again. Unix flocks that inode (`flock` does
+//! not share SQLite's `fcntl` locks). Windows locks a file under the
+//! machine ProgramData known folder, keyed only by that handle identity —
+//! not `Local\`, and not the database directory. A canonical-path sidecar
+//! still stops two processes that open the same path. Hard links fail
+//! closed. Lock files are never placed in `temp_dir`, `XDG_RUNTIME_DIR`,
+//! `HOME`, or `LOCALAPPDATA`.
+
+use fs4::fs_std::FileExt;
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Production file-backed Scheduler store. `:memory:` is test-only and
+/// cannot acquire a process lock.
+#[derive(Debug, Clone)]
+pub struct SqliteRuntimeConfig {
+    path: PathBuf,
+    lease_seconds: f64,
+    continuity_max_bytes: usize,
+}
+
+impl SqliteRuntimeConfig {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        lease_seconds: f64,
+        continuity_max_bytes: usize,
+    ) -> Result<Self, ProcessLockError> {
+        let path = path.into();
+        // One shared classification table decides what a production store path
+        // is, and `agentype-storage-sqlite` applies the same table at the
+        // boundary that actually hands the filename to SQLite. That is what
+        // keeps the process lock and SQLite from resolving one string to two
+        // different databases. Empty, `:memory:`, and every `file:` spelling
+        // are refused here; a literal file is the only accepted kind.
+        use agentype_storage_sqlite::StorePathKind;
+        match agentype_storage_sqlite::classify_store_path(&path) {
+            StorePathKind::LiteralFile => {}
+            StorePathKind::SqliteUri => {
+                return Err(ProcessLockError::IdentityUnresolvable(format!(
+                    "sqlite URI filenames are not a production scheduler store: {}",
+                    path.display()
+                )));
+            }
+            StorePathKind::Memory => {
+                return Err(ProcessLockError::IdentityUnresolvable(
+                    "in-memory sqlite is not a production scheduler store".into(),
+                ));
+            }
+            StorePathKind::Temporary => {
+                return Err(ProcessLockError::IdentityUnresolvable(
+                    "a temporary sqlite database is not a production scheduler store".into(),
+                ));
+            }
+            StorePathKind::UnsupportedEncoding => {
+                return Err(ProcessLockError::IdentityUnresolvable(format!(
+                    "the scheduler store path must be UTF-8 representable; this one is not, \
+                     so a `file:` prefix could not be detected in it: {}",
+                    path.display()
+                )));
+            }
+        }
+        if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "lease_seconds must be finite and positive".into(),
+            ));
+        }
+        if continuity_max_bytes == 0 {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "continuity_max_bytes must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            path,
+            lease_seconds,
+            continuity_max_bytes,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn lease_seconds(&self) -> f64 {
+        self.lease_seconds
+    }
+
+    pub fn continuity_max_bytes(&self) -> usize {
+        self.continuity_max_bytes
+    }
+}
+
+/// Failure to acquire exclusive ownership of a Scheduler store.
+#[derive(Debug)]
+pub enum ProcessLockError {
+    AlreadyRunning,
+    IdentityUnresolvable(String),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ProcessLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning => {
+                write!(f, "another scheduler daemon already owns this store")
+            }
+            Self::IdentityUnresolvable(detail) => {
+                write!(f, "scheduler store identity unresolvable: {detail}")
+            }
+            Self::Io(err) => write!(f, "process lock i/o: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessLockError {}
+
+impl From<io::Error> for ProcessLockError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// Diagnostic store identity. Never treated as Scheduler authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreIdentity {
+    file_id: String,
+    canonical: String,
+}
+
+fn fnv64(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in value.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Exclusive, nonblocking, crash-released ownership of one Scheduler store.
+///
+/// Non-Clone. Dropping the lock (or process death) releases the OS lock.
+pub struct RuntimeProcessLock {
+    _files: Vec<File>,
+    _reservation: IdentityReservation,
+    identity: StoreIdentity,
+    store_path: PathBuf,
+}
+
+impl RuntimeProcessLock {
+    /// Acquire exclusive ownership before any recovery mutation or Adapter call.
+    pub fn acquire(config: &SqliteRuntimeConfig) -> Result<Self, ProcessLockError> {
+        Self::acquire_path(config.path())
+    }
+
+    fn acquire_path(store_path: &Path) -> Result<Self, ProcessLockError> {
+        if let Some(parent) = store_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let store = open_store(store_path)?;
+        let identity = store_identity(&store, store_path)?;
+        let reservation = IdentityReservation::claim(&identity)?;
+        // Unix: flock the inode we already opened. Windows: a machine-wide
+        // lock file named only from that handle's identity. Never LockFile
+        // the database, and never use the `Local\` namespace.
+        #[cfg(unix)]
+        match store.try_lock_exclusive() {
+            Ok(true) => {}
+            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+            Err(err) => return Err(err.into()),
+        }
+        let mut files = vec![store];
+        #[cfg(windows)]
+        files.push(lock_windows_identity(&identity.file_id)?);
+        let lock_path = canonical_lock_path(&identity)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(true) => files.push(file),
+            Ok(false) => return Err(ProcessLockError::AlreadyRunning),
+            Err(err) => return Err(err.into()),
+        }
+        // The path may have been replaced. Compare a fresh handle, not
+        // another path lookup of the file id.
+        let reopened = open_store(store_path)?;
+        let again = agentype_nlink::file_identity(&reopened)?;
+        if again != identity.file_id {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "scheduler store identity changed while the lock was acquired".into(),
+            ));
+        }
+        let links = agentype_nlink::link_count(files.first().expect("store fd"))?;
+        if links > 1 {
+            return Err(ProcessLockError::IdentityUnresolvable(format!(
+                "scheduler store has {links} hard links; production refuses multi-name databases"
+            )));
+        }
+        Ok(Self {
+            _files: files,
+            _reservation: reservation,
+            identity,
+            store_path: store_path.to_path_buf(),
+        })
+    }
+
+    /// Fail closed when `path` is no longer the file this lock owns.
+    /// Startup calls this after `Kernel::open` re-resolves the path.
+    pub fn confirm_store_identity(&self, path: &Path) -> Result<(), ProcessLockError> {
+        let file = open_store(path)?;
+        let again = agentype_nlink::file_identity(&file)?;
+        if again != self.identity.file_id {
+            return Err(ProcessLockError::IdentityUnresolvable(
+                "scheduler store identity changed before the kernel opened it".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical store identity string. Diagnostic only — not ownership.
+    pub fn identity_debug(&self) -> &str {
+        &self.identity.file_id
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+}
+
+struct IdentityReservation {
+    keys: Vec<String>,
+}
+
+impl IdentityReservation {
+    fn claim(identity: &StoreIdentity) -> Result<Self, ProcessLockError> {
+        let mut held = held_identities()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut keys = Vec::new();
+        for key in [identity.file_id.clone(), identity.canonical.clone()] {
+            if !held.insert(key.clone()) {
+                for added in &keys {
+                    held.remove(added);
+                }
+                return Err(ProcessLockError::AlreadyRunning);
+            }
+            keys.push(key);
+        }
+        Ok(Self { keys })
+    }
+}
+
+impl Drop for IdentityReservation {
+    fn drop(&mut self) {
+        let mut held = held_identities()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            held.remove(key);
+        }
+    }
+}
+
+fn held_identities() -> &'static Mutex<HashSet<String>> {
+    static HELD: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn identity_keys_held(identity: &StoreIdentity) -> bool {
+    let held = held_identities()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    held.contains(&identity.file_id) && held.contains(&identity.canonical)
+}
+
+/// Holds the process lock until Runtime workers have stopped.
+pub struct RuntimeProcessGuard {
+    lock: RuntimeProcessLock,
+}
+
+impl std::fmt::Debug for RuntimeProcessGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeProcessGuard")
+            .field("identity", &self.lock.identity.file_id)
+            .field("store_path", &self.lock.store_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeProcessGuard {
+    pub fn acquire(config: &SqliteRuntimeConfig) -> Result<Self, ProcessLockError> {
+        Ok(Self {
+            lock: RuntimeProcessLock::acquire(config)?,
+        })
+    }
+
+    pub fn lock(&self) -> &RuntimeProcessLock {
+        &self.lock
+    }
+}
+
+fn canonical_lock_path(identity: &StoreIdentity) -> Result<PathBuf, ProcessLockError> {
+    let canonical = PathBuf::from(&identity.canonical);
+    let parent = canonical.parent().ok_or_else(|| {
+        ProcessLockError::IdentityUnresolvable(
+            "canonical store path has no parent directory".into(),
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".agentype-runtime-path-{}",
+        fnv64(&identity.canonical)
+    )))
+}
+
+fn open_store(path: &Path) -> Result<File, ProcessLockError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    // Share delete so a rename of the open store is possible. The identity
+    // lock, not the sharing mode, is what keeps a second daemon out.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0x1 | 0x2 | 0x4);
+    }
+    Ok(opts.open(path)?)
+}
+
+#[cfg(windows)]
+fn lock_windows_identity(file_id: &str) -> Result<File, ProcessLockError> {
+    let dir = agentype_nlink::machine_lock_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(".agentype-runtime-lock-{}", fnv64(file_id)));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(ProcessLockError::AlreadyRunning),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn store_identity(file: &File, path: &Path) -> Result<StoreIdentity, ProcessLockError> {
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        ProcessLockError::IdentityUnresolvable(format!(
+            "cannot canonicalize {}: {err}",
+            path.display()
+        ))
+    })?;
+    let links = agentype_nlink::link_count(file)?;
+    if links > 1 {
+        return Err(ProcessLockError::IdentityUnresolvable(format!(
+            "scheduler store has {links} hard links; production refuses multi-name databases"
+        )));
+    }
+    let file_id = agentype_nlink::file_identity(file).map_err(|err| {
+        ProcessLockError::IdentityUnresolvable(format!(
+            "cannot read file identity for {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(StoreIdentity {
+        file_id,
+        canonical: canonical.to_string_lossy().into_owned(),
+    })
+}
+
+#[cfg(test)]
+fn store_identity_for_tests(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    store_identity(&file, path).ok().map(|id| id.file_id)
+}
+
+/// Permission to **construct a not-yet-published control loop**. Runtime-local,
+/// non-serializable, no public constructor. Minted after the process lock,
+/// recovery, and the activation sweep.
+///
+/// This is deliberately *not* "READY has been published". Three things must
+/// hold before a physical start may be dispatched, and this is only the first:
+///
+/// ```text
+/// ReadyPermit          control loop may be constructed
+/// + ReadyRelease       the worker may leave its paused state
+/// + DispatchGate::Ready  the gate actually admits a physical start
+/// ```
+///
+/// M5.8 audit round 5 P2-1: the stronger reading ("minted only after final
+/// activation / health barrier") described an earlier shape. The composition
+/// root mints this permit, constructs the control loop, starts the workers
+/// paused behind `ReadyRelease`, and only then validates freshness and flips
+/// the gate. The READY barrier is correct as written and is not reordered to
+/// match the old wording.
+pub(crate) struct ReadyPermit {
+    _private: (),
+}
+
+impl ReadyPermit {
+    #[allow(dead_code)]
+    pub(crate) fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl std::fmt::Debug for ReadyPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadyPermit").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_store() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("agentype-lock-{nanos}.sqlite"))
+    }
+
+    #[test]
+    fn first_lock_succeeds_and_is_not_clone() {
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        assert!(!guard.lock().identity_debug().is_empty());
+        drop(guard);
+        let _again = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_process_second_acquire_is_already_running() {
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let _guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        match RuntimeProcessGuard::acquire(&cfg) {
+            Err(ProcessLockError::AlreadyRunning) => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        let file = File::open(&path).unwrap();
+        let id = store_identity(&file, &path).unwrap();
+        assert!(
+            identity_keys_held(&id),
+            "failed second claim must not drop the holder's reservation"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_second_claim_does_not_drop_first_reservation() {
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        let file = File::open(&path).unwrap();
+        let id = store_identity(&file, &path).unwrap();
+        assert!(identity_keys_held(&id));
+        assert!(matches!(
+            RuntimeProcessGuard::acquire(&cfg),
+            Err(ProcessLockError::AlreadyRunning)
+        ));
+        assert!(identity_keys_held(&id));
+        drop(guard);
+        assert!(!identity_keys_held(&id));
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_lock_is_not_session_local_or_beside_the_store() {
+        let dir = agentype_nlink::machine_lock_dir().unwrap();
+        let rendered = dir.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            !rendered.contains("local\\agentype"),
+            "identity lock must not use the Local namespace: {rendered}"
+        );
+        assert!(dir.ends_with(std::path::Path::new("agentype").join("locks")));
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let _guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        assert!(
+            !dir.starts_with(path.parent().unwrap()),
+            "identity lock must not live next to the store"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn memory_path_fails_closed() {
+        // Bare `:memory:` only: with additional text it is an ordinary disk
+        // filename, and the shared-cache spelling is a `file:` URI.
+        match SqliteRuntimeConfig::new(":memory:", 10.0, 16_384) {
+            Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                assert!(
+                    detail.contains("in-memory"),
+                    "rejection must name the in-memory contract, got {detail}"
+                );
+            }
+            other => panic!("`:memory:` must fail closed, got {other:?}"),
+        }
+    }
+
+    /// The empty filename is SQLite's private temporary-database spelling, not
+    /// a durable store, so the config boundary must refuse it too.
+    #[test]
+    fn temporary_database_path_fails_closed() {
+        match SqliteRuntimeConfig::new("", 10.0, 16_384) {
+            Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                assert!(
+                    detail.contains("temporary"),
+                    "rejection must name the temporary contract, got {detail}"
+                );
+            }
+            other => panic!("the empty filename must fail closed, got {other:?}"),
+        }
+    }
+
+    /// M5.8 audit round 5 P1: the process lock would have opened
+    /// `./file:scheduler.sqlite` and locked *that* file, while SQLite resolved
+    /// the same string as a URI and opened `./scheduler.sqlite`. Both daemons
+    /// would then hold a lock and share one Scheduler store. Production
+    /// accepts literal file-backed paths only, so the config boundary rejects
+    /// every `file:` spelling before the lock or the kernel acts.
+    #[test]
+    fn uri_filenames_are_not_a_production_store() {
+        for rejected in [
+            "file:scheduler.sqlite",
+            "file:./scheduler.sqlite",
+            "file:/var/lib/agentype/scheduler.sqlite",
+            "file:///var/lib/agentype/scheduler.sqlite",
+            "file::memory:?cache=shared",
+            "file:scheduler.sqlite?mode=rwc",
+        ] {
+            match SqliteRuntimeConfig::new(rejected, 10.0, 16_384) {
+                Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                    assert!(
+                        detail.contains("URI"),
+                        "rejection must name the URI contract, got {detail}"
+                    );
+                }
+                other => panic!("{rejected} must fail closed, got {other:?}"),
+            }
+        }
+    }
+
+    /// The config boundary and the store boundary must apply one table: a path
+    /// the config accepts as a literal file is exactly a path the classifier
+    /// calls a literal file. Otherwise a caller could reach `Kernel::open`
+    /// with a spelling the lock never validated.
+    #[test]
+    fn config_and_store_share_one_classification() {
+        for path in [
+            "scheduler.sqlite",
+            "./scheduler.sqlite",
+            "/tmp/scheduler.sqlite",
+            ":memory:",
+            ":memory:?cache=shared",
+            "",
+            "file:scheduler.sqlite",
+            "file::memory:?cache=shared",
+            "./:memory:",
+        ] {
+            let accepted = SqliteRuntimeConfig::new(path, 10.0, 16_384).is_ok();
+            let literal = agentype_storage_sqlite::classify_store_path(std::path::Path::new(path))
+                == agentype_storage_sqlite::StorePathKind::LiteralFile;
+            assert_eq!(
+                accepted, literal,
+                "config acceptance and the store classification must agree on {path:?}"
+            );
+        }
+    }
+
+    /// The classifier must not reject an ordinary relative or absolute
+    /// filesystem path: only SQLite's own special spellings are refused.
+    #[test]
+    fn literal_filesystem_paths_stay_accepted() {
+        for accepted in [
+            "scheduler.sqlite",
+            "./scheduler.sqlite",
+            "/tmp/scheduler.sqlite",
+            // Bare `:memory:` is special only with no additional text.
+            ":memory:?cache=shared",
+        ] {
+            assert!(
+                SqliteRuntimeConfig::new(accepted, 10.0, 16_384).is_ok(),
+                "{accepted} is a literal filesystem path and must be accepted"
+            );
+        }
+    }
+
+    /// M5.8 audit round 7 P1: a `file:` prefix can be hidden in a filename that
+    /// is not valid UTF-8, and on Unix SQLite sees those raw bytes. The
+    /// classifier therefore tests the prefix on bytes.
+    ///
+    /// M5.8 audit round 8 P1: the production store contract is also UTF-8
+    /// representable, so a non-UTF-8 filename that is *not* a URI is refused
+    /// as well. This is not mere strictness: `store_identity` keeps its
+    /// canonical pathname as a lossy UTF-8 string and rebuilds the sidecar
+    /// lock path from it, so an arbitrary Unix byte path is not a losslessly
+    /// representable Scheduler identity.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_store_path_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        for (label, bytes) in [
+            ("hidden URI", b"file:agentype-\xff.sqlite".to_vec()),
+            ("ordinary filename", b"agentype-\xff.sqlite".to_vec()),
+        ] {
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            assert!(
+                matches!(
+                    SqliteRuntimeConfig::new(path, 10.0, 16_384),
+                    Err(ProcessLockError::IdentityUnresolvable(_))
+                ),
+                "a non-UTF-8 store path ({label}) must not be accepted as a production store"
+            );
+        }
+    }
+
+    /// The same contract on the storage side: the classifier the config
+    /// boundary uses must not call a non-UTF-8 filename a literal file.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_literal_is_not_a_literal_store_kind() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"agentype-\xff.sqlite".to_vec()));
+        assert_eq!(
+            agentype_storage_sqlite::classify_store_path(&path),
+            agentype_storage_sqlite::StorePathKind::UnsupportedEncoding,
+            "config acceptance and the store classification must agree here too"
+        );
+    }
+
+    #[test]
+    fn hardlink_cannot_create_independent_ownership() {
+        let path = temp_store();
+        let cfg = SqliteRuntimeConfig::new(&path, 10.0, 16_384).unwrap();
+        let guard = RuntimeProcessGuard::acquire(&cfg).unwrap();
+        let alias = path.with_extension("hardlink.sqlite");
+        match fs::hard_link(&path, &alias) {
+            Ok(()) => {
+                let original_id = guard.lock().identity_debug().to_string();
+                let alias_id = store_identity_for_tests(&alias);
+                if alias_id.as_deref() == Some(original_id.as_str()) {
+                    let alias_cfg = SqliteRuntimeConfig::new(&alias, 10.0, 16_384).unwrap();
+                    match RuntimeProcessGuard::acquire(&alias_cfg) {
+                        Err(ProcessLockError::IdentityUnresolvable(_)) => {}
+                        other => panic!("multi-link store must fail closed, got {other:?}"),
+                    }
+                    match RuntimeProcessGuard::acquire(&cfg) {
+                        Err(ProcessLockError::IdentityUnresolvable(_)) => {}
+                        other => {
+                            panic!(
+                                "original path must also refuse a multi-link store, got {other:?}"
+                            )
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&alias);
+            }
+            Err(err) => {
+                let _ = err;
+            }
+        }
+        drop(guard);
+        let _ = fs::remove_file(path);
+    }
+}

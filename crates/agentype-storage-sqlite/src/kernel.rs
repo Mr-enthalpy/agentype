@@ -3,8 +3,15 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_core::*;
+// Only the runtime-mechanical methods (claim, execution commitment, renewal,
+// physical history, outbox delivery commits) use these, so the default build
+// neither imports nor compiles them. `params` stays unconditional: the
+// non-mechanical partition / pool / batch methods use it too.
+#[cfg(any(test, feature = "runtime-internal"))]
 use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenPhysicalExecutionBinding};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
+#[cfg(any(test, feature = "runtime-internal"))]
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -23,6 +30,10 @@ use std::path::Path;
 pub enum SupervisedRenewal {
     Renewed(UnixTime),
     NotRunning,
+    /// Process-local physical freshness expired at the renewal
+    /// serialization point. Not authority loss and not a durable
+    /// physical-state change.
+    FreshnessExpired,
 }
 
 /// The authoritative output of the fenced RUNNING-confirmation-and-renewal
@@ -41,6 +52,12 @@ pub enum SupervisedRenewal {
 /// which `SupervisionAdmission::from_grant` consumes into one admission.
 /// A later `confirm_running_and_renew` may mint a *new* grant (a new fenced
 /// validation). Cloning one grant into many admissions is forbidden.
+// The accessors are read only by the runtime-mechanical admission paths, so a
+// default build carries the identity without reading it.
+#[cfg_attr(
+    not(any(test, feature = "runtime-internal")),
+    allow(dead_code, reason = "read only by the runtime admission path")
+)]
 #[derive(Debug)]
 pub struct RunningAuthorityGrant {
     execution_id: ExecutionId,
@@ -51,6 +68,7 @@ pub struct RunningAuthorityGrant {
     expires_at: UnixTime,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 impl RunningAuthorityGrant {
     pub(crate) fn new(
         execution_id: ExecutionId,
@@ -388,13 +406,16 @@ pub struct OutboxDeliverySnapshot {
     pub last_error: Option<String>,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 const LAST_ERROR_MAX_CHARS: usize = 512;
 
+#[cfg(any(test, feature = "runtime-internal"))]
 enum DeliveryCommit {
     Success,
     Failure { delay: f64, diagnostic: String },
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn bound_last_error(diagnostic: &str) -> String {
     diagnostic.chars().take(LAST_ERROR_MAX_CHARS).collect()
 }
@@ -404,6 +425,7 @@ fn parse_delivery_attempts(value: i64) -> Result<u32, Error> {
         .map_err(|_| Error::invariant(format!("negative delivery_attempts is corrupt: {value}")))
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn missing_outbox(event_id: &OutboxEventId) -> Error {
     Error::invariant(format!(
         "outbox event {} is missing; retained events cannot disappear",
@@ -411,6 +433,7 @@ fn missing_outbox(event_id: &OutboxEventId) -> Error {
     ))
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn commit_outbox_delivery_locked(
     tx: &rusqlite::Transaction<'_>,
     event_id: &OutboxEventId,
@@ -468,10 +491,25 @@ fn commit_outbox_delivery_locked(
 
 use std::sync::Arc;
 
+/// Frozen adapter routing plus locator for one Execution.
+#[derive(Debug, Clone)]
+pub struct ExecutionRoutingFacts {
+    pub adapter_kind: String,
+    pub adapter_binding_key: String,
+    pub request_id: RequestId,
+    pub runtime_handle: Value,
+}
+
 pub struct Kernel {
     store: Store,
     clock: Arc<dyn Clock>,
     lease_seconds: f64,
+    // Scheduler configuration, read only by the runtime-mechanical
+    // `promote_checkpoint`, so the default build stores it without reading it.
+    #[cfg_attr(
+        not(any(test, feature = "runtime-internal")),
+        allow(dead_code, reason = "read only by promote_checkpoint")
+    )]
     continuity_max_bytes: usize,
 }
 
@@ -1215,6 +1253,97 @@ impl Kernel {
         })
     }
 
+    /// Birth a temporary consumer when a QUEUED task has no compatible READY
+    /// identity. May exceed desired capacity; later reconciliation retires excess.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn ensure_task_consumers(&self) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT t.id,t.partition_name,t.workstream_id,t.continuity,t.affinity_tags_json,
+                            p.tags_json
+                     FROM tasks t
+                     JOIN batches b ON b.id=t.batch_id
+                     JOIN pool_partitions p ON p.name=t.partition_name
+                     WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1
+                     ORDER BY t.priority DESC,t.created_at,t.id",
+                )
+                .map_err(map_sqlite)?;
+            let tasks = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(map_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite)?;
+            drop(stmt);
+            for (_id, partition, workstream, continuity, tags_json, partition_tags_json) in tasks {
+                let required = parse_str_list(&tags_json)?;
+                let continuity = ContinuityPreference::parse_sql(&continuity)?;
+                let mut agent_stmt = tx
+                    .prepare(
+                        "SELECT id,state,workstream_id,tags_json,current_task_id,available_since,created_at
+                         FROM logical_agents WHERE partition_name=?1 AND state='READY'",
+                    )
+                    .map_err(map_sqlite)?;
+                let raw_agents = agent_stmt
+                    .query_map(params![partition], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<f64>>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
+                    })
+                    .map_err(map_sqlite)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_sqlite)?;
+                drop(agent_stmt);
+                let mut agents = Vec::with_capacity(raw_agents.len());
+                for (id, workstream_id, tags_json, current_task, available_since, created_at) in
+                    raw_agents
+                {
+                    agents.push(ClaimAgentSnapshot {
+                        id,
+                        state: LogicalAgentState::Ready,
+                        assigned_to_task: current_task.is_some(),
+                        partition: partition.clone(),
+                        workstream_id,
+                        tags: parse_str_list(&tags_json)?,
+                        available_since,
+                        created_at,
+                    });
+                }
+                let intent = ClaimIntent {
+                    partition: &partition,
+                    required_tags: &required,
+                    workstream_id: workstream.as_deref(),
+                    continuity,
+                };
+                if select_claim_agent(&agents, &intent).is_none() {
+                    let mut tags = parse_str_list(&partition_tags_json)?;
+                    for tag in required {
+                        if !tags.iter().any(|existing| existing == &tag) {
+                            tags.push(tag);
+                        }
+                    }
+                    birth_agent(tx, &partition, workstream.as_deref(), Some(&tags), now)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn claim_next_available(&self) -> Result<Option<Claim>, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
@@ -1344,6 +1473,7 @@ impl Kernel {
     /// durable Attempt is rejected (InvalidAuthority) — both BEFORE any
     /// configuration resolution, so a forged claim cannot turn a fully
     /// configured Task into a RESOURCE_UNAVAILABLE preparation failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn resolve_execution_binding(
         &self,
         claim: &Claim,
@@ -1380,6 +1510,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn create_execution(
         &self,
         claim: &Claim,
@@ -1571,6 +1702,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn confirm_running_and_renew(
         &self,
         attempt_id: &AttemptId,
@@ -1639,6 +1771,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn record_physical_outcome(
         &self,
         execution_id: &ExecutionId,
@@ -1665,6 +1798,8 @@ impl Kernel {
             require_physical_transition(from, state)?;
             let handle_json = runtime_handle.map(json_dump);
             let outcome_json = payload.map(json_dump);
+            let attached =
+                execution_still_attached(tx, &execution.id, &execution.incarnation_id)?;
             tx.execute(
                 "UPDATE executions SET state=?1,runtime_handle_json=COALESCE(?2,runtime_handle_json),
                  outcome_json=COALESCE(?3,outcome_json),
@@ -1686,22 +1821,51 @@ impl Kernel {
                 ],
             )
             .map_err(map_sqlite)?;
-            if let Some(h) = &handle_json {
+            if attached {
+                if let Some(h) = &handle_json {
+                    tx.execute(
+                        "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
+                        params![h, execution.incarnation_id],
+                    )
+                    .map_err(map_sqlite)?;
+                }
+                record_incarnation_presence(
+                    tx,
+                    Some(&execution.incarnation_id),
+                    state,
+                    terminal_confirmed,
+                    quiescent_confirmed,
+                    false,
+                    now,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Persist a better opaque locator without inventing physical state,
+    /// Task/Lease mutation, or terminal/quiescence proof.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn record_runtime_handle_hint(
+        &self,
+        execution_id: &ExecutionId,
+        handle: &Value,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            let execution = required_execution(tx, execution_id.as_str())?;
+            let handle_json = json_dump(handle);
+            tx.execute(
+                "UPDATE executions SET runtime_handle_json=?1, updated_at=?2 WHERE id=?3",
+                params![handle_json, now, execution.id],
+            )
+            .map_err(map_sqlite)?;
+            if execution_still_attached(tx, &execution.id, &execution.incarnation_id)? {
                 tx.execute(
                     "UPDATE incarnations SET runtime_handle_json=?1 WHERE id=?2",
-                    params![h, execution.incarnation_id],
+                    params![handle_json, execution.incarnation_id],
                 )
                 .map_err(map_sqlite)?;
             }
-            record_incarnation_presence(
-                tx,
-                Some(&execution.incarnation_id),
-                state,
-                terminal_confirmed,
-                quiescent_confirmed,
-                false,
-                now,
-            )?;
             Ok(())
         })
     }
@@ -1712,6 +1876,7 @@ impl Kernel {
     /// commit leaves `SUCCEEDED`/`FAILED` + `terminal_confirmed` with
     /// Attempt/Lease still ACTIVE. Incarnation WARM/TERMINATED is decided
     /// by the subsequent ACK/NACK (`incarnation_reusable`).
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn record_pending_physical_terminal(
         &self,
         execution_id: &ExecutionId,
@@ -1768,6 +1933,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn ack_success(
         &self,
         attempt_id: &AttemptId,
@@ -1907,6 +2073,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn nack(
         &self,
         attempt_id: &AttemptId,
@@ -2019,6 +2186,132 @@ impl Kernel {
             let suspension = suspension_failure_class(writer_safe, failure_class);
             suspend_current(tx, &attempt, &lease, &task, suspension, None, None, now)?;
             Ok(TaskState::Suspended)
+        })
+    }
+
+    /// Close current Attempt/Lease authority without inventing a physical
+    /// Execution state. Mechanical failure, retry, and writer-safety still
+    /// apply. Terminal/quiescence proof and Result are not created.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn nack_preserving_physical_history(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        failure_class: FailureClass,
+        execution_id: Option<&ExecutionId>,
+    ) -> Result<TaskState, Error> {
+        self.tx(|tx, now| {
+            let (attempt, lease, task) =
+                validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            let execution = execution_for_attempt(
+                tx,
+                &attempt.id,
+                execution_id.map(|e| e.as_str()),
+            )?;
+            let resolved_id = execution.as_ref().map(|e| e.id.clone());
+            record_failure(
+                tx,
+                &task.id,
+                Some(&attempt.id),
+                resolved_id.as_deref(),
+                failure_class,
+                None,
+                None,
+                None,
+                now,
+            )?;
+            let presence = if failure_class == FailureClass::ExecutionLost {
+                ExecutionState::Lost
+            } else {
+                ExecutionState::Failed
+            };
+            record_incarnation_presence(
+                tx,
+                attempt.incarnation_id.as_deref(),
+                presence,
+                false,
+                false,
+                false,
+                now,
+            )?;
+            let policy = task_retry_policy(&task)?;
+            let retry_allowed = retry_allowed(&policy, failure_class, attempt.attempt_number as u32);
+            let writer_safe = writer_is_safe_to_replace(
+                task.workspace_mode == "write",
+                execution.is_some(),
+                false,
+                execution.as_ref().map(|e| e.attempt_isolation).unwrap_or(false),
+            );
+            if retry_allowed && writer_safe {
+                let delay = retry_backoff_seconds(&policy, attempt.attempt_number as u32);
+                tx.execute(
+                    "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
+                    params![now, attempt.id],
+                )
+                .map_err(map_sqlite)?;
+                tx.execute(
+                    "UPDATE leases SET state='RELEASED',ended_at=?1 WHERE id=?2",
+                    params![now, lease.id],
+                )
+                .map_err(map_sqlite)?;
+                tx.execute(
+                    "UPDATE tasks SET state='RETRY_WAIT',current_attempt_id=NULL,next_eligible_at=?1,updated_at=?2 WHERE id=?3",
+                    params![now + delay, now, task.id],
+                )
+                .map_err(map_sqlite)?;
+                release_agent(tx, &attempt.logical_agent_id, now)?;
+                return Ok(TaskState::RetryWait);
+            }
+            let suspension = suspension_failure_class(writer_safe, failure_class);
+            suspend_current(tx, &attempt, &lease, &task, suspension, None, None, now)?;
+            Ok(TaskState::Suspended)
+        })
+    }
+
+    /// The adapter was never called. Remove the STARTING row, then close
+    /// authority as if no execution existed, so an unisolated writer is not
+    /// given a quiescence obligation.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn abort_before_physical_start(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        execution_id: &ExecutionId,
+    ) -> Result<TaskState, Error> {
+        self.tx(|tx, now| {
+            let (_attempt, _lease, _task) =
+                validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            let execution = required_execution(tx, execution_id.as_str())?;
+            if execution.attempt_id != attempt_id.as_str() {
+                return Err(Error::stale("execution does not belong to current attempt"));
+            }
+            if execution.state != "STARTING" {
+                return Err(Error::invalid_transition(
+                    "only an unstarted STARTING execution can be aborted before the adapter",
+                ));
+            }
+            tx.execute(
+                "DELETE FROM executions WHERE id=?1 AND state='STARTING'",
+                params![execution.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE attempts SET state='FAILED',ended_at=?1 WHERE id=?2",
+                params![now, _attempt.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE leases SET state='RELEASED',ended_at=?1 WHERE id=?2",
+                params![now, _lease.id],
+            )
+            .map_err(map_sqlite)?;
+            tx.execute(
+                "UPDATE tasks SET state='QUEUED',current_attempt_id=NULL,updated_at=?1 WHERE id=?2",
+                params![now, _task.id],
+            )
+            .map_err(map_sqlite)?;
+            release_agent(tx, &_attempt.logical_agent_id, now)?;
+            Ok(TaskState::Queued)
         })
     }
 
@@ -2246,6 +2539,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn expire_leases(&self, recover_unstarted: bool) -> Result<ExpireReport, Error> {
         self.tx(|tx, now| {
             let mut report = ExpireReport::default();
@@ -2401,6 +2695,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn promote_retry_wait(&self) -> Result<u32, Error> {
         self.tx(|tx, now| {
             let n = tx
@@ -2630,6 +2925,7 @@ impl Kernel {
     /// PENDING → DELIVERED (attempts++, delivered_at, last_error NULL).
     /// DELIVERED / ACKED → no-op (do not regress ACKED to DELIVERED).
     /// Missing identity is an invariant failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn commit_outbox_delivery_success(
         &self,
         event_id: &OutboxEventId,
@@ -2643,6 +2939,7 @@ impl Kernel {
     /// PENDING → PENDING (attempts++, next_delivery_at = now+delay, last_error).
     /// DELIVERED / ACKED → no-op (do not restore PENDING, do not schedule retry).
     /// Missing identity is an invariant failure.
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn commit_outbox_delivery_failure(
         &self,
         event_id: &OutboxEventId,
@@ -2667,12 +2964,35 @@ impl Kernel {
         })
     }
 
+    /// Test-support only: how many Attempts a Task has ever created.
+    ///
+    /// A claim derives its `attempt_number` from exactly this count, so this
+    /// read makes "no Attempt was created" directly assertable instead of
+    /// inferable from the next claim's number. It exists so a regression that
+    /// spends retry budget without a physical start is visible before any
+    /// Execution exists.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attempt_count_for_task(&self, task_id: &TaskId) -> Result<u32, Error> {
+        self.store.query(|conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)?;
+            Ok(count as u32)
+        })
+    }
+
     /// LEGACY M4 primitive (frozen test surface only). This renewal is
     /// fenced by attempt_id + lease_epoch alone: it takes no execution
     /// identity and is NOT wired to supervision admission. Production
     /// periodic renewal MUST use `renew_supervised_execution`, which is
     /// fenced by the positively admitted execution identity. Visibility
     /// reduction is scheduled for the M5.8 composition freeze.
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn heartbeat(
         &self,
         attempt_id: &AttemptId,
@@ -2714,14 +3034,33 @@ impl Kernel {
     /// `attempt_id` + `lease_epoch` + `execution_id` — never by TaskId or
     /// LogicalAgentId alone. An already-expired lease fails stale; a renewal
     /// can never revive expired authority.
+    /// Test/oracle renewal with no physical-freshness constraint.
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn renew_supervised_execution(
         &self,
         attempt_id: &AttemptId,
         lease_epoch: LeaseEpoch,
         execution_id: &ExecutionId,
     ) -> Result<SupervisedRenewal, Error> {
+        self.renew_supervised_execution_guarded(attempt_id, lease_epoch, execution_id, f64::MAX)
+    }
+
+    /// Fenced renewal. `fresh_until` is required: there is no production
+    /// call that renews without a physical-freshness endpoint.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn renew_supervised_execution_guarded(
+        &self,
+        attempt_id: &AttemptId,
+        lease_epoch: LeaseEpoch,
+        execution_id: &ExecutionId,
+        fresh_until: UnixTime,
+    ) -> Result<SupervisedRenewal, Error> {
         let lease_seconds = self.lease_seconds;
         self.tx(|tx, now| {
+            if now >= fresh_until {
+                return Ok(SupervisedRenewal::FreshnessExpired);
+            }
             let (attempt, lease, _) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
             let execution = required_execution(tx, execution_id.as_str())?;
@@ -2831,6 +3170,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn promote_checkpoint(
         &self,
         attempt_id: &AttemptId,
@@ -3003,6 +3343,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn report_configuration_unavailable(
         &self,
         attempt_id: &AttemptId,
@@ -3024,6 +3365,7 @@ impl Kernel {
         )
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn revive_agent(
         &self,
         logical_agent_id: &LogicalAgentId,
@@ -3078,6 +3420,7 @@ impl Kernel {
         })
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn revive_eligible_agents(&self) -> Result<u32, Error> {
         let candidates: Vec<(String, String)> = self.store.query(|conn| {
             let mut stmt = conn
@@ -3101,6 +3444,7 @@ impl Kernel {
         Ok(n)
     }
 
+    #[cfg(any(test, feature = "runtime-internal"))]
     pub fn recover_authority(&self) -> Result<ExpireReport, Error> {
         let expired = self.expire_leases(true)?;
         self.promote_retry_wait()?;
@@ -3347,6 +3691,42 @@ impl Kernel {
         })
     }
 
+    /// Frozen adapter routing plus locator for one Execution. Observer
+    /// candidates come from process-local supervision; this reader only
+    /// loads facts for those tickets.
+    pub fn execution_routing_facts(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<ExecutionRoutingFacts, Error> {
+        self.store.query(|conn| {
+            conn.query_row(
+                "SELECT adapter_kind,adapter_binding_key,request_id,runtime_handle_json
+                 FROM executions WHERE id=?1",
+                params![id.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(map_sqlite)
+            .and_then(|(kind, key, request_id, handle)| {
+                Ok(ExecutionRoutingFacts {
+                    adapter_kind: kind,
+                    adapter_binding_key: key,
+                    request_id: RequestId::from_string(&request_id),
+                    runtime_handle: match handle {
+                        Some(raw) => json_load(&raw)?,
+                        None => Value::Null,
+                    },
+                })
+            })
+        })
+    }
+
     pub fn open_escalation_for_task(&self, task_id: &TaskId) -> Result<EscalationRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(
@@ -3473,6 +3853,7 @@ struct ReconciliationRow {
     current_attempt_id: Option<String>,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn claim_selected(
     tx: &rusqlite::Transaction<'_>,
     agent: &AgentRow,
@@ -3592,6 +3973,7 @@ fn assert_acyclic(graph: &HashMap<String, Vec<String>>) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 struct ExpireRow {
     lease_id: String,
     attempt_id: String,
@@ -3684,4 +4066,35 @@ impl PartitionRow {
             topology_revision: r.get(8)?,
         })
     }
+}
+
+/// True only while this Execution is still the incarnation's live attachment.
+/// A later Execution in STARTING/RUNNING/UNKNOWN owns the incarnation; late
+/// evidence from an older Execution must not rewrite it.
+#[cfg(any(test, feature = "runtime-internal"))]
+fn execution_still_attached(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    incarnation_id: &str,
+) -> Result<bool, Error> {
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM executions WHERE id=?1",
+            params![execution_id],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite)?;
+    if !matches!(state.as_str(), "STARTING" | "RUNNING" | "UNKNOWN") {
+        return Ok(false);
+    }
+    let other: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM executions WHERE incarnation_id=?1 AND id!=?2
+             AND state IN ('STARTING','RUNNING','UNKNOWN') LIMIT 1",
+            params![incarnation_id, execution_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?;
+    Ok(other.is_none())
 }

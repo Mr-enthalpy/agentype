@@ -9,7 +9,7 @@
 //! stdin, interrupt, and pid-level terminate. No helper threads.
 
 #[cfg(test)]
-use agentype_adapter_api::ExecutionOutcome;
+use agentype_adapter_api::worker_protocol_v01::ExecutionOutcome;
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterResult, EnvironmentStartRequest, ExecutionAdapter,
     ExecutionObservation, ImportableAdapter, PhysicalExecutionOutcome, RuntimeHandle,

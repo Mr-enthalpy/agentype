@@ -69,3 +69,36 @@ Backoff clock: [03](03-task-attempt-lease-result.md) (completion, not start).
 
 A SchedulerDaemon object MUST be single-run. A second `run` while notifier
 shutdown is in progress MUST be rejected.
+
+**M5.8:** one Scheduler store has exactly one production daemon, identified
+by OS process lock on store file identity (not a Scheduler Lease). Startup
+MUST acquire that lock before Kernel recovery mutation or Adapter I/O. The
+production store is a literal, UTF-8 representable, file-backed filesystem
+path. Three SQLite special filenames — URI filenames (`file:...`, which are
+special only while SQLite URI processing is enabled), the bare in-memory
+spelling (`:memory:`, and only that exact spelling: any additional text makes
+it an ordinary filename), and the empty filename that selects a private
+temporary database (both of which are special independently of URI
+processing) — MUST be rejected at the config boundary and at the store-open
+boundary, because the lock resolves a filesystem handle while SQLite applies
+its own special-filename rules to the same filename. Separately, the store
+identity MUST be UTF-8 representable: a non-UTF-8 path is not a SQLite
+special filename but is likewise rejected, and the rejection MUST be decided
+on the filename bytes SQLite actually receives, so that a `file:` prefix
+hidden inside a filename that is not valid UTF-8 is refused as a URI
+filename rather than mistaken for a literal path. The in-memory store MUST
+remain reachable only through an explicit `open_memory`-style entry point.
+Startup also assumes the Scheduler database pathname is not adversarially
+replaced between lock acquisition and Kernel open; the post-open identity
+confirmation
+re-resolves the path, so a pathname ABA inside that window is not detected. `recover_runtime` grants
+activation, not dispatch. READY requires the composition of a runtime-local
+`ReadyPermit` (minted after the process lock, recovery, and the
+physical-observation activation sweep, and only permitting construction of a
+not-yet-published control loop), the worker's `ReadyRelease`, and the
+DispatchGate being Ready; no one of them alone publishes READY. Physical
+observation does not renew authority; stale freshness stops renewal
+eligibility without inventing death, termination, or quiescence. Shutdown
+stops Scheduler mechanics; it MUST NOT cancel semantic work or terminate
+external agents. The only safe recovery from a failed Runtime component is a
+new Runtime lifecycle through the full restart barrier.

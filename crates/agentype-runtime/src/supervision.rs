@@ -74,6 +74,9 @@ pub enum RenewalOutcome {
     /// is dropped; the durable physical state is never repaired from
     /// heartbeat code (M5.4 reconciliation owns it).
     NoLongerRunning { execution_id: ExecutionId },
+    /// Physical freshness is stale. Heartbeat MUST NOT renew. This is not
+    /// LOST, TERMINATED, Task failure, or quiescence.
+    FreshnessStale { execution_id: ExecutionId },
 }
 
 /// Supervision failures. Ordinary authority loss is an outcome, not an
@@ -150,7 +153,7 @@ pub(crate) struct SupervisionIdentity {
 }
 
 impl SupervisionIdentity {
-    pub(crate) fn new(
+    pub fn new(
         execution_id: ExecutionId,
         request_id: RequestId,
         attempt_id: AttemptId,
@@ -182,6 +185,10 @@ impl SupervisionIdentity {
         self.generation
     }
 
+    pub(crate) fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
     /// Exact identity equality (the four durable identity fields). The
     /// ephemeral generation is deliberately excluded: two admissions with
     /// the same identity describe the same admitted authority.
@@ -199,6 +206,11 @@ impl SupervisionIdentity {
 struct SupervisedExecution {
     identity: SupervisionIdentity,
     next_due_at: UnixTime,
+    last_positive_observed_at: UnixTime,
+    /// Bumps on every positive observation. A stale renewal result may
+    /// only revoke the epoch it actually checked.
+    freshness_epoch: u64,
+    renewal_eligible: bool,
 }
 
 /// In-memory registry of the executions THIS runtime instance currently owns
@@ -217,10 +229,11 @@ struct SupervisedExecution {
 pub struct SupervisionRegistry {
     entries: HashMap<ExecutionId, SupervisedExecution>,
     consumed_generations: HashSet<u64>,
+    freshness_limit: Option<f64>,
 }
 
 impl SupervisionRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -234,6 +247,7 @@ impl SupervisionRegistry {
         admission: SupervisionAdmission,
         next_due_at: UnixTime,
     ) -> Result<(), SupervisionError> {
+        let last_positive_observed_at = admission.first_renewed_at();
         let identity = admission.identity();
         if self.consumed_generations.contains(&identity.generation()) {
             return Err(SupervisionError::AdmissionConsumed);
@@ -251,9 +265,13 @@ impl SupervisionRegistry {
                     SupervisedExecution {
                         identity,
                         next_due_at,
+                        last_positive_observed_at,
+                        freshness_epoch: 0,
+                        renewal_eligible: true,
                     },
                 );
                 Ok(())
+                // poke happens after the registry lock is released by the caller
             }
         }
     }
@@ -262,6 +280,7 @@ impl SupervisionRegistry {
     /// longer owns lease-renewal responsibility" — it never mutates
     /// Execution state, never claims quiescence, and never revokes or
     /// completes Task authority by itself.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&mut self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let entry = self
             .entries
@@ -282,18 +301,30 @@ impl SupervisionRegistry {
         }
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.entries.contains_key(execution_id)
     }
 
+    /// This runtime still has the entry. Distinct from renewal eligibility.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.contains(execution_id)
+    }
+
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.entries.len()
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Only the test façade `renew_one` reads this.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     fn entry_identity(&self, execution_id: &ExecutionId) -> Option<SupervisionIdentity> {
         self.entries.get(execution_id).map(|e| e.identity.clone())
     }
@@ -346,6 +377,63 @@ impl SupervisionRegistry {
             self.consumed_generations.insert(identity.generation());
         }
     }
+
+    fn snapshots(&self) -> Vec<SupervisedSnapshot> {
+        self.entries
+            .values()
+            .map(|entry| SupervisedSnapshot {
+                identity: entry.identity.clone(),
+                last_positive_observed_at: entry.last_positive_observed_at,
+                renewal_eligible: entry.renewal_eligible,
+            })
+            .collect()
+    }
+
+    /// A positive physical observation re-establishes freshness. Returns
+    /// whether this mutated the current entry, so the caller only wakes the
+    /// heartbeat loop for a refresh that actually happened.
+    fn refresh_freshness(&mut self, identity: &SupervisionIdentity, observed_at: UnixTime) -> bool {
+        let current = self
+            .entries
+            .get(identity.execution_id())
+            .is_some_and(|entry| entry.identity.generation() == identity.generation());
+        if !current {
+            return false;
+        }
+        if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
+            entry.last_positive_observed_at = observed_at;
+            entry.freshness_epoch = entry.freshness_epoch.saturating_add(1);
+            entry.renewal_eligible = true;
+            // Re-arm the schedule (M5.8 audit round 2, P1). Recovery from
+            // stale freshness only re-enabling eligibility would leave the
+            // deadline the stale tick pushed past the durable expiry, so a
+            // healthy Execution would lose authority to the Scheduler's own
+            // schedule. Keep the EARLIER deadline: a refresh may bring a
+            // renewal forward, never push one later.
+            entry.next_due_at = entry.next_due_at.min(observed_at);
+        }
+        true
+    }
+
+    fn stop_renewal_if_current(&mut self, identity: &SupervisionIdentity) {
+        let current = self
+            .entries
+            .get(identity.execution_id())
+            .is_some_and(|entry| entry.identity.generation() == identity.generation());
+        if current {
+            if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
+                entry.renewal_eligible = false;
+            }
+        }
+    }
+}
+
+/// Runtime-local snapshot for the physical observer. Not an admission.
+#[derive(Debug, Clone)]
+pub(crate) struct SupervisedSnapshot {
+    pub identity: SupervisionIdentity,
+    pub last_positive_observed_at: UnixTime,
+    pub renewal_eligible: bool,
 }
 
 /// Deterministic supervision service (M5.3 §29): owns the registry and the
@@ -364,10 +452,41 @@ impl SupervisionRegistry {
 /// [`SupervisionRunner`], which stops its loop and clears ownership on
 /// Fatal. A service that has produced a Fatal must not be reused for
 /// renewal; the Runner enforces this mechanically.
-pub struct SupervisionService {
+/// Wakeups are counted under the same mutex the observer waits on, so a
+/// notification cannot be lost between computing the deadline and sleeping.
+pub(crate) struct ObserverWake {
+    generation: Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl ObserverWake {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn poke(&self) {
+        let mut generation = self.generation.lock().expect("observer wake");
+        *generation = generation.saturating_add(1);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn wait(&self, timeout: Duration) {
+        let generation = self.generation.lock().expect("observer wake");
+        let seen = *generation;
+        let _ = self
+            .cv
+            .wait_timeout_while(generation, timeout, |generation| *generation == seen);
+    }
+}
+
+pub(crate) struct SupervisionService {
     kernel: Arc<Kernel>,
     registry: Arc<Mutex<SupervisionRegistry>>,
     heartbeat_interval: Duration,
+    observer_wake: Arc<ObserverWake>,
 }
 
 impl Clone for SupervisionService {
@@ -376,6 +495,7 @@ impl Clone for SupervisionService {
             kernel: self.kernel.clone(),
             registry: self.registry.clone(),
             heartbeat_interval: self.heartbeat_interval,
+            observer_wake: self.observer_wake.clone(),
         }
     }
 }
@@ -390,7 +510,7 @@ impl SupervisionService {
     /// Compose the service against a Kernel. The configured lease duration
     /// must exactly match the Kernel's lease authority; the supervisor never
     /// decides lease extension durations independently (M5.3 §30).
-    pub fn new(
+    pub(crate) fn new(
         kernel: Arc<Kernel>,
         timing: &RuntimeTimingConfig,
     ) -> Result<Self, SupervisionError> {
@@ -404,7 +524,26 @@ impl SupervisionService {
             kernel,
             registry: Arc::new(Mutex::new(SupervisionRegistry::new())),
             heartbeat_interval: timing.heartbeat_interval(),
+            observer_wake: Arc::new(ObserverWake::new()),
         })
+    }
+
+    pub(crate) fn observer_wake(&self) -> Arc<ObserverWake> {
+        self.observer_wake.clone()
+    }
+
+    fn poke_observer(&self) {
+        self.observer_wake.poke();
+    }
+
+    /// Enable the M5.8 physical-freshness gate. Default is off so M5.3
+    /// tests keep renewing without an observer. Production attaches a
+    /// positive limit strictly below `lease_seconds`.
+    pub(crate) fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .freshness_limit = Some(freshness_limit_seconds);
     }
 
     /// The Kernel's current clock reading (the supervision clock IS the
@@ -429,7 +568,7 @@ impl SupervisionService {
     /// same token can never be admitted anywhere again, which is what makes
     /// "one runtime supervision owner per admitted Execution" structural
     /// rather than per-registry discipline (M5.3 audit P1-3).
-    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
         // Fail closed on a malformed capability: the scheduling anchor and
         // the durable expiry must be finite, and the fenced first renewal
         // must precede the expiry it produced.
@@ -450,24 +589,45 @@ impl SupervisionService {
         // `heartbeat_interval < lease_seconds` (the §A2 gate), this due
         // point is always strictly before the durable expiry.
         let next_due_at = admission.first_renewed_at() + self.heartbeat_interval.as_secs_f64();
-        let mut registry = self.registry.lock().expect("supervision registry lock");
-        registry.admit(admission, next_due_at)
+        let admitted = {
+            let mut registry = self.registry.lock().expect("supervision registry lock");
+            registry.admit(admission, next_due_at)
+        };
+        if admitted.is_ok() {
+            self.poke_observer();
+        }
+        admitted
     }
 
     /// Explicitly drop supervision ownership (terminal handling, invariant
     /// mismatch). Never touches durable state.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let mut registry = self.registry.lock().expect("supervision registry lock");
         registry.remove(execution_id)
     }
 
+    /// Renewal eligibility, not ownership. A stale entry stays owned.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.registry
             .lock()
             .expect("supervision registry lock")
-            .contains(execution_id)
+            .entries
+            .get(execution_id)
+            .is_some_and(|e| e.renewal_eligible)
     }
 
+    /// This runtime's registry still has the entry, even if renewal is stopped.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .owns(execution_id)
+    }
+
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.registry
             .lock()
@@ -476,7 +636,12 @@ impl SupervisionService {
     }
 
     /// Renew one admitted execution right now (deterministic single step).
-    pub fn renew_one(
+    ///
+    /// Test façade: production renewal is the heartbeat loop's, reached
+    /// through the daemon. Not part of the supported production surface.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn renew_one(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<RenewalOutcome, SupervisionError> {
@@ -492,7 +657,7 @@ impl SupervisionService {
     /// Renew every entry whose deadline has arrived at `now` (deterministic
     /// tick). A fatal persistence fault on any entry stops the batch and
     /// propagates.
-    pub fn renew_due(&self, now: UnixTime) -> Result<Vec<RenewalOutcome>, SupervisionError> {
+    pub(crate) fn renew_due(&self, now: UnixTime) -> Result<Vec<RenewalOutcome>, SupervisionError> {
         let due = {
             let registry = self.registry.lock().expect("supervision registry lock");
             registry.due(now)
@@ -511,7 +676,7 @@ impl SupervisionService {
     }
 
     /// Renew whatever is due at the Kernel's current time.
-    pub fn renew_due_now(&self) -> Result<Vec<RenewalOutcome>, SupervisionError> {
+    pub(crate) fn renew_due_now(&self) -> Result<Vec<RenewalOutcome>, SupervisionError> {
         let now = self.kernel.now();
         self.renew_due(now)
     }
@@ -524,22 +689,62 @@ impl SupervisionService {
         identity: SupervisionIdentity,
     ) -> Result<RenewalOutcome, SupervisionError> {
         let execution_id = identity.execution_id().clone();
+        let now = self.kernel.now();
+        {
+            let mut registry = self.registry.lock().expect("supervision registry lock");
+            match registry.entries.get(&execution_id) {
+                None => return Err(SupervisionError::NoSuchEntry),
+                Some(entry) if entry.identity.generation() != identity.generation() => {
+                    return Err(SupervisionError::NoSuchEntry);
+                }
+                Some(entry) => {
+                    let stale = registry.freshness_limit.is_some_and(|limit| {
+                        !entry.renewal_eligible || now >= entry.last_positive_observed_at + limit
+                    });
+                    if stale {
+                        let next_due_at = now + self.heartbeat_interval.as_secs_f64();
+                        registry.record_renewal(&identity, next_due_at);
+                        // Keep the entry. Stop renewal only. Recovery still
+                        // owns this execution until activation refreshes it.
+                        registry.stop_renewal_if_current(&identity);
+                        return Ok(RenewalOutcome::FreshnessStale { execution_id });
+                    }
+                }
+            }
+        }
         // Anchor BEFORE the renewal (M5.3 audit P1-1): the next deadline is
         // then anchor + interval, which is strictly earlier than the
         // renewal's own new durable expiry (anchor + interval < anchor +
         // lease under the §A2 gate) — a healthy supervisor can never
         // schedule itself past the durable expiry.
         let anchor = self.kernel.now();
-        let outcome = match self.kernel.renew_supervised_execution(
+        let (fresh_until, checked_epoch) = {
+            let registry = self.registry.lock().expect("supervision registry lock");
+            match registry.entries.get(&execution_id) {
+                Some(entry) => (
+                    registry
+                        .freshness_limit
+                        .map(|limit| entry.last_positive_observed_at + limit)
+                        .unwrap_or(f64::MAX),
+                    entry.freshness_epoch,
+                ),
+                None => (f64::MAX, 0),
+            }
+        };
+        let outcome = match self.kernel.renew_supervised_execution_guarded(
             identity.attempt_id(),
             identity.lease_epoch(),
             &execution_id,
+            fresh_until,
         ) {
             Ok(SupervisedRenewal::Renewed(new_expires_at)) => RenewalOutcome::Renewed {
                 execution_id,
                 new_expires_at,
             },
             Ok(SupervisedRenewal::NotRunning) => RenewalOutcome::NoLongerRunning { execution_id },
+            Ok(SupervisedRenewal::FreshnessExpired) => {
+                RenewalOutcome::FreshnessStale { execution_id }
+            }
             Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                 RenewalOutcome::AuthorityLost { execution_id }
             }
@@ -557,11 +762,82 @@ impl SupervisionService {
         let mut registry = self.registry.lock().expect("supervision registry lock");
         match &outcome {
             RenewalOutcome::Renewed { .. } => registry.record_renewal(&identity, next_due_at),
+            RenewalOutcome::FreshnessStale { .. } => {
+                let still_same =
+                    registry
+                        .entries
+                        .get(identity.execution_id())
+                        .is_some_and(|entry| {
+                            entry.identity.generation() == identity.generation()
+                                && entry.freshness_epoch == checked_epoch
+                        });
+                if still_same {
+                    registry.record_renewal(&identity, next_due_at);
+                    registry.stop_renewal_if_current(&identity);
+                } else {
+                    registry.record_renewal(&identity, self.kernel.now());
+                }
+            }
             RenewalOutcome::AuthorityLost { .. } | RenewalOutcome::NoLongerRunning { .. } => {
-                registry.remove_if_current(&identity);
+                registry.stop_renewal_if_current(&identity);
+                registry.record_renewal(&identity, next_due_at);
             }
         }
         Ok(outcome)
+    }
+
+    pub(crate) fn observation_snapshots(&self) -> Vec<SupervisedSnapshot> {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .snapshots()
+    }
+
+    /// Run `decide` as the supervision readiness barrier.
+    ///
+    /// The registry lock is held for the whole call, so no observation-driven
+    /// or heartbeat-driven change to renewal eligibility or to the renewal
+    /// schedule can interleave with the decision. The composition root
+    /// validates READY and flips the DispatchGate inside this barrier, which
+    /// is what gives READY publication a linearization point: at the instant
+    /// of the flip, the invariant was decided against a state that nothing
+    /// else could be mutating.
+    ///
+    /// The registry lock is a leaf: holders release it before any Kernel
+    /// transaction, so holding it across a short validation is safe.
+    pub(crate) fn with_readiness_barrier<T>(
+        &self,
+        decide: impl FnOnce(&[SupervisedSnapshot]) -> T,
+    ) -> T {
+        let registry = self.registry.lock().expect("supervision registry lock");
+        decide(&registry.snapshots())
+    }
+
+    /// Re-establish physical freshness for an owned entry. Returns whether a
+    /// current entry was refreshed.
+    pub(crate) fn refresh_freshness(
+        &self,
+        identity: &SupervisionIdentity,
+        observed_at: UnixTime,
+    ) -> bool {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .refresh_freshness(identity, observed_at)
+    }
+
+    pub(crate) fn stop_renewal_eligibility(&self, identity: &SupervisionIdentity) {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .stop_renewal_if_current(identity);
+    }
+
+    pub(crate) fn drop_if_current(&self, identity: &SupervisionIdentity) {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .remove_if_current(identity);
     }
 
     /// Drop all supervision ownership (local shutdown path). No Lease is
@@ -570,6 +846,26 @@ impl SupervisionService {
     pub fn clear(&self) {
         let mut registry = self.registry.lock().expect("supervision registry lock");
         registry.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_positive_observed_at(&self, execution_id: &ExecutionId) -> Option<UnixTime> {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .entries
+            .get(execution_id)
+            .map(|e| e.last_positive_observed_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn renewal_eligible(&self, execution_id: &ExecutionId) -> Option<bool> {
+        self.registry
+            .lock()
+            .expect("supervision registry lock")
+            .entries
+            .get(execution_id)
+            .map(|e| e.renewal_eligible)
     }
 }
 
@@ -638,9 +934,18 @@ impl SupervisionRunner {
     /// spawns, so a timing/lease mismatch fails fast. Admissions enter
     /// through the runner's handles (`admit`), always AFTER the dispatcher's
     /// fenced first renewal committed (M5.3 §21).
-    pub fn start(
+    #[cfg(test)]
+    pub(crate) fn start(
         kernel: Arc<Kernel>,
         timing: RuntimeTimingConfig,
+    ) -> Result<Self, SupervisionError> {
+        Self::start_with_fatal_gate(kernel, timing, None)
+    }
+
+    pub(crate) fn start_with_fatal_gate(
+        kernel: Arc<Kernel>,
+        timing: RuntimeTimingConfig,
+        fatal_gate: Option<crate::control::DispatchGate>,
     ) -> Result<Self, SupervisionError> {
         let service = SupervisionService::new(kernel.clone(), &timing)?;
         let shared = Arc::new(RunnerShared::default());
@@ -667,6 +972,9 @@ impl SupervisionRunner {
                             }
                             state.phase = RunnerPhase::Failed;
                             drop(state);
+                            if let Some(gate) = &fatal_gate {
+                                gate.fail();
+                            }
                             break 'supervision;
                         }
                         // Deadline wait (M5.3 audit P1-1): sleep until the
@@ -713,6 +1021,10 @@ impl SupervisionRunner {
                             "the supervision heartbeat thread panicked",
                         )));
                     }
+                    drop(state);
+                    if let Some(gate) = &fatal_gate {
+                        gate.fail();
+                    }
                 }
                 // Local shutdown: drop ownership. No revocation, no
                 // terminality, no quiescence claim (M5.3 §33).
@@ -733,7 +1045,7 @@ impl SupervisionRunner {
     /// Admit an execution whose fenced RUNNING confirmation + first renewal
     /// has just committed (dispatcher → supervision handoff, M5.3 §19).
     /// Consumes the move-only admission capability.
-    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
         // Serialize the mutation with the loop's deadline computation (the
         // loop reads the earliest deadline under the same state lock), so a
         // new admission's wake-up can never be lost and the loop can never
@@ -759,6 +1071,7 @@ impl SupervisionRunner {
 
     /// Drop supervision ownership for one execution. Never touches durable
     /// state.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn remove(&self, execution_id: &ExecutionId) -> Result<(), SupervisionError> {
         let state = self.shared.state.lock().expect("runner state lock");
         let result = self.service.remove(execution_id);
@@ -769,10 +1082,41 @@ impl SupervisionRunner {
         result
     }
 
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn contains(&self, execution_id: &ExecutionId) -> bool {
         self.service.contains(execution_id)
     }
 
+    /// Owned supervision entry, whether or not it may currently renew.
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
+    pub fn owns(&self, execution_id: &ExecutionId) -> bool {
+        self.service.owns(execution_id)
+    }
+
+    /// Shared process-local registry handle for the physical observer.
+    pub(crate) fn service(&self) -> SupervisionService {
+        self.service.clone()
+    }
+
+    /// Narrow physical-freshness path for the physical observer: re-arms the
+    /// renewal deadline and wakes this runner. It cannot renew a Lease.
+    pub fn freshness_sink(&self) -> SupervisionFreshnessSink {
+        SupervisionFreshnessSink::new(self.service.clone(), self.shared.clone())
+    }
+
+    /// Cloneable admit path that still honors the runner lifecycle gate.
+    pub fn admit_sink(&self) -> SupervisionAdmitSink {
+        SupervisionAdmitSink {
+            service: self.service.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.shared.state.lock().expect("runner state lock").phase == RunnerPhase::Failed
+    }
+
+    #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
     pub fn active_count(&self) -> usize {
         self.service.active_count()
     }
@@ -828,6 +1172,103 @@ impl SupervisionRunner {
     /// recorded fatal fault, if any (M5.3 §33/§34).
     pub fn shutdown(mut self) -> Result<(), SupervisionError> {
         self.stop_and_join().map_or(Ok(()), Err)
+    }
+}
+
+/// Cloneable admit path that rejects admits after the runner stops.
+#[derive(Clone)]
+pub struct SupervisionAdmitSink {
+    service: SupervisionService,
+    shared: Arc<RunnerShared>,
+}
+
+impl SupervisionAdmitSink {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+        let state = self.shared.state.lock().expect("runner state lock");
+        if state.phase != RunnerPhase::Running {
+            return Err(SupervisionError::RunnerStopped(
+                "admission is only accepted while the heartbeat loop is running",
+            ));
+        }
+        let result = self.service.admit(admission);
+        if result.is_ok() {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
+        result
+    }
+}
+
+/// Cloneable physical-freshness path for the physical observer.
+///
+/// It re-arms the renewal deadline and wakes the heartbeat loop. It can never
+/// renew a Lease: the observer must not become a Lease renewer, so this sink
+/// deliberately exposes no `renew_one` or `renew_due`. Renewal stays with the
+/// heartbeat loop, which is the only owner of Kernel Lease renewal.
+#[derive(Clone)]
+pub struct SupervisionFreshnessSink {
+    service: SupervisionService,
+    shared: Arc<RunnerShared>,
+}
+
+impl SupervisionFreshnessSink {
+    /// Bind to a live heartbeat loop's scheduling state, so a refresh can
+    /// wake it. Module-private: the only way to obtain a bound sink is
+    /// [`SupervisionRunner::freshness_sink`], which is what keeps the shared
+    /// scheduling state out of any other visibility.
+    fn new(service: SupervisionService, shared: Arc<RunnerShared>) -> Self {
+        Self { service, shared }
+    }
+
+    /// A sink with no heartbeat loop behind it. Refreshes still re-arm the
+    /// registry, but nothing is woken. Test composition only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn standalone(service: SupervisionService) -> Self {
+        Self {
+            service,
+            shared: Arc::new(RunnerShared::default()),
+        }
+    }
+
+    /// Composition knob, not a renewal capability.
+    pub(crate) fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
+        self.service.enable_freshness_gate(freshness_limit_seconds);
+    }
+
+    /// The observer's own scheduling wake, poked when supervision ownership
+    /// changes.
+    pub(crate) fn observer_wake(&self) -> Arc<ObserverWake> {
+        self.service.observer_wake()
+    }
+
+    pub(crate) fn observation_snapshots(&self) -> Vec<SupervisedSnapshot> {
+        self.service.observation_snapshots()
+    }
+
+    pub(crate) fn stop_renewal_eligibility(&self, identity: &SupervisionIdentity) {
+        self.service.stop_renewal_eligibility(identity);
+    }
+
+    pub(crate) fn drop_if_current(&self, identity: &SupervisionIdentity) {
+        self.service.drop_if_current(identity);
+    }
+
+    /// A positive physical observation re-establishes freshness.
+    ///
+    /// The runner's scheduling mutex is held across the registry mutation and
+    /// the notification. That is what makes the wake-up unloseable: the
+    /// heartbeat loop computes its wait from `earliest_next_due()` while
+    /// holding the same mutex, so a re-armed deadline can never land between
+    /// that computation and the sleep.
+    ///
+    /// This re-arms and wakes. It does not renew.
+    pub(crate) fn refresh_positive(&self, identity: &SupervisionIdentity, observed_at: UnixTime) {
+        let state = self.shared.state.lock().expect("runner state lock");
+        if self.service.refresh_freshness(identity, observed_at) {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
     }
 }
 
@@ -1555,6 +1996,132 @@ mod tests {
         assert!(!exec_state.terminal_confirmed);
         assert!(!exec_state.quiescent_confirmed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M5.8 audit round 2, P1 (wake half): re-arming the deadline is not
+    /// enough on its own. The heartbeat thread is already sleeping toward the
+    /// deadline the stale tick scheduled past the durable expiry, so a
+    /// positive observation must also WAKE it — otherwise the fix leaves a
+    /// second bug ("deadline changed but the condvar never fired").
+    ///
+    /// The manual clock makes the arithmetic exact. The loop derives its
+    /// remaining wait from that clock, so a renewal arriving promptly after
+    /// the refresh can only be the wake: an unwoken loop would keep sleeping
+    /// out the rest of its multi-second wait.
+    #[test]
+    fn freshness_recovery_wakes_the_heartbeat_loop() {
+        let (clock, kernel) = env();
+        // heartbeat = 6 < lease = 10; freshness limit = 4.
+        let timing = RuntimeTimingConfig::new(1.0, 6.0, LEASE_SECONDS).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+        let sink = runner.freshness_sink();
+        sink.enable_freshness_gate(4.0);
+
+        let (claim, exec) = running_execution(&kernel, "runner-wake");
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
+        let t0 = kernel.now();
+        let expiry = |kernel: &Kernel| {
+            kernel
+                .lease_supervision_view(&claim.attempt_id)
+                .unwrap()
+                .expires_at
+        };
+        assert_eq!(expiry(&kernel), t0 + LEASE_SECONDS);
+
+        // Let the loop settle into its wait (a 6s sleep computed from the
+        // manual clock), then move logical time past that deadline without
+        // waking it: this is the state the stale tick leaves behind.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        clock.advance(7.0);
+        assert_eq!(runner.service().earliest_next_due(), Some(t0 + 6.0));
+        assert_eq!(expiry(&kernel), t0 + LEASE_SECONDS, "nothing renewed yet");
+
+        let identity = runner
+            .service()
+            .observation_snapshots()
+            .into_iter()
+            .find(|snap| snap.identity.execution_id() == &exec)
+            .expect("admitted snapshot")
+            .identity;
+
+        // One positive physical observation: re-arm the deadline AND wake.
+        sink.refresh_positive(&identity, kernel.now());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let renewed = expiry(&kernel);
+            if renewed > t0 + LEASE_SECONDS {
+                assert_eq!(renewed, t0 + 17.0, "renewed against the refresh time");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refreshed entry was never renewed: the heartbeat loop was not woken"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        runner.shutdown().unwrap();
+    }
+
+    /// M5.8 audit round 3, P1-1: the readiness barrier must exclude every
+    /// freshness mutation, which is what lets the composition root decide
+    /// READY against a state nothing else can be changing.
+    #[test]
+    fn readiness_barrier_excludes_freshness_mutation() {
+        let (_clock, kernel) = env();
+        let svc = SupervisionService::new(kernel.clone(), &timing()).unwrap();
+        let (claim, exec) = running_execution(&kernel, "ready-barrier");
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+        svc.enable_freshness_gate(4.0);
+        svc.stop_renewal_eligibility(
+            &svc.observation_snapshots()
+                .into_iter()
+                .find(|snap| snap.identity.execution_id() == &exec)
+                .expect("admitted snapshot")
+                .identity,
+        );
+        assert_eq!(svc.renewal_eligible(&exec), Some(false));
+
+        let sink = SupervisionFreshnessSink::standalone(svc.clone());
+        let identity = svc
+            .observation_snapshots()
+            .into_iter()
+            .find(|snap| snap.identity.execution_id() == &exec)
+            .expect("admitted snapshot")
+            .identity;
+
+        // The refresher needs the registry lock the barrier holds, so it must
+        // not be joined from inside the barrier.
+        let mut refresher = None;
+        let mut applied_inside = true;
+        svc.with_readiness_barrier(|snapshots| {
+            refresher = Some({
+                let sink = sink.clone();
+                let identity = identity.clone();
+                std::thread::spawn(move || sink.refresh_positive(&identity, 1_010.0))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            applied_inside = snapshots
+                .iter()
+                .find(|snap| snap.identity.execution_id() == &exec)
+                .expect("snapshot inside barrier")
+                .renewal_eligible;
+        });
+        refresher
+            .expect("refresher spawned")
+            .join()
+            .expect("refresher thread");
+
+        assert!(
+            !applied_inside,
+            "a refresh must not land inside the readiness barrier"
+        );
+        assert_eq!(
+            svc.renewal_eligible(&exec),
+            Some(true),
+            "the refresh applies once the barrier is released"
+        );
     }
 
     /// Fatal smoke: a corrupted durable lease row stops the loop and

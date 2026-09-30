@@ -13,9 +13,20 @@ agentype-core.workspace = true
 agentype-execution-config.workspace = true
 agentype-adapter-api.workspace = true
 agentype-root-bridge.workspace = true
-agentype-storage-sqlite.workspace = true
+# The Runtime owns the daemon, so it is the one crate that compiles the
+# mechanical Kernel surface in: claim, execution commitment, renewal,
+# physical-history recording, ACK/NACK, and recovery. The flag is a package
+# trust boundary, not an unforgeable capability: a consumer that deliberately
+# depends on the internal crate may request it too.
+agentype-storage-sqlite = { workspace = true, features = ["runtime-internal"] }
 serde_json.workspace = true
+fs4.workspace = true
+agentype-nlink.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
 agentype-execution-config = { workspace = true, features = ["test-support"] }
+# `Kernel::attempt_count_for_task` is a test-support read, so this crate's own
+# tests need storage's test surface. It stays out of the production feature
+# set: only dev-dependency builds unify this feature in.
+agentype-storage-sqlite = { workspace = true, features = ["test-support"] }

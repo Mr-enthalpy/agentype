@@ -1106,6 +1106,52 @@ fn nack_without_named_retry_class_suspends() {
 }
 
 #[test]
+fn nack_preserving_physical_history_does_not_rewrite_execution() {
+    let Env { k, .. } = memory_env();
+    let (_b, task_id, claim, execution_id) = run_claim(&k, retryable_read("preserve"), false);
+    let before = k.execution(&execution_id).unwrap();
+    assert_eq!(before.state, ExecutionState::Running);
+    let state = k
+        .nack_preserving_physical_history(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            FailureClass::Timeout,
+            Some(&execution_id),
+        )
+        .unwrap();
+    assert_eq!(state, TaskState::RetryWait);
+    let after = k.execution(&execution_id).unwrap();
+    assert_eq!(after.state, ExecutionState::Running);
+    assert!(!after.terminal_confirmed);
+    assert!(!after.quiescent_confirmed);
+    assert_eq!(k.task(&task_id).unwrap().state, TaskState::RetryWait);
+    assert!(k.result_for_task(&task_id).is_err());
+}
+
+#[test]
+fn record_runtime_handle_hint_does_not_change_physical_state() {
+    let Env { k, .. } = memory_env();
+    let (_b, _task, claim, execution_id) = run_claim(&k, retryable_read("hint"), false);
+    k.confirm_running_and_renew(
+        &claim.attempt_id,
+        claim.lease_epoch,
+        &execution_id,
+        &json!({"first": 1}),
+    )
+    .unwrap();
+    k.record_runtime_handle_hint(&execution_id, &json!({"better": 2}))
+        .unwrap();
+    let exec = k.execution(&execution_id).unwrap();
+    assert_eq!(exec.state, ExecutionState::Running);
+    assert!(!exec.terminal_confirmed);
+    assert!(!exec.quiescent_confirmed);
+    assert_eq!(
+        k.execution_runtime_handle(&execution_id).unwrap(),
+        json!({"better": 2})
+    );
+}
+
+#[test]
 fn epoch_is_monotonic() {
     let Env { k, clock } = memory_env();
     let spec = retryable_read("mono");

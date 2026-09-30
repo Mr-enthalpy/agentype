@@ -3,7 +3,7 @@
 
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 use agentype_core::{Clock, Error, UnixTime};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -18,9 +18,133 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// What SQLite would do with a store filename.
+///
+/// Agentype supports exactly one of these for a production Scheduler store:
+/// [`StorePathKind::LiteralFile`]. The others are rejected before either the
+/// Runtime's process lock or SQLite acts.
+///
+/// The classification exists because two layers must agree on one filename.
+/// The process lock resolves a filesystem handle; SQLite resolves the same
+/// filename with its own special-filename rules. Anything the two resolve
+/// differently is not a production store.
+///
+/// The `file:` test is performed on the *filename bytes* SQLite would receive,
+/// not on a Rust `str`. On Unix, rusqlite hands SQLite `OsStrExt::as_bytes()`
+/// and SQLite's URI test is a raw `memcmp` against `b"file:"`, so a URI
+/// filename can hide inside a filename that is not valid UTF-8. Everything
+/// else about the production contract is UTF-8 representable, so such a
+/// filename is classified as [`StorePathKind::UnsupportedEncoding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorePathKind {
+    /// A literal filesystem path: one durable file, the same file the process
+    /// lock owns. This is the only production kind.
+    LiteralFile,
+    /// A SQLite URI filename, identified by the literal, case-sensitive
+    /// `file:` byte prefix. SQLite would open the URI's path component
+    /// instead of this filename.
+    SqliteUri,
+    /// SQLite's private in-memory spelling: exactly `:memory:`, and nothing
+    /// else. Any additional text makes it an ordinary disk filename, so the
+    /// shared-cache form is written `file::memory:?cache=shared` and is
+    /// classified as [`StorePathKind::SqliteUri`]. Neither creates a durable
+    /// store, and `SQLITE_OPEN_URI` is not involved for the bare spelling.
+    Memory,
+    /// SQLite's private temporary-database spelling: the empty filename. It
+    /// creates a temporary on-disk database that is deleted when the last
+    /// connection closes, and it never touches a named path.
+    Temporary,
+    /// A filename that is not valid UTF-8 and does not begin with the `file:`
+    /// bytes. A production store path must be UTF-8 representable, so this is
+    /// fail-closed rather than literal.
+    ///
+    /// This is not mere strictness. The Runtime's process-lock identity keeps
+    /// its canonical pathname as a lossy UTF-8 `String` and rebuilds the
+    /// sidecar lock path from it, so an arbitrary Unix byte path is not a
+    /// losslessly representable Scheduler identity. Distinct byte paths could
+    /// collapse onto one canonical string and collide, or the rebuilt sidecar
+    /// parent could name a directory that does not exist.
+    UnsupportedEncoding,
+}
+
+/// The filename bytes SQLite would receive, when they are UTF-8 representable.
+///
+/// `None` means the filename is not valid UTF-8. On Unix, rusqlite passes
+/// `OsStrExt::as_bytes()` through unchanged, so the byte-level `file:` test in
+/// [`classify_store_path`] still runs through `OsStr` equality before this is
+/// consulted. Everywhere else rusqlite goes through `Path::to_str` and fails
+/// with `InvalidPath` for such a filename, so it can never reach SQLite.
+fn store_path_text(path: &Path) -> Option<&str> {
+    path.as_os_str().to_str()
+}
+
+/// Classify a Scheduler store filename.
+///
+/// `SQLITE_OPEN_URI` is not the only special-filename rule, which is why this
+/// is a classifier rather than a URI test: `:memory:` and the empty filename
+/// are special even with URI processing completely off. The production
+/// contract is therefore enforced as a positive check — the kind must be
+/// [`StorePathKind::LiteralFile`] — instead of as a list of rejections that
+/// can miss a spelling.
+///
+/// The `file:` test is byte-based and therefore the *same* test SQLite
+/// performs, so a URI filename that is not valid UTF-8 is still caught. A
+/// non-URI filename that is not valid UTF-8 is refused as
+/// [`StorePathKind::UnsupportedEncoding`].
+///
+/// A literal file literally named `:memory:` is still reachable as
+/// `./:memory:`, which is what SQLite itself recommends.
+pub fn classify_store_path(path: &Path) -> StorePathKind {
+    let name = path.as_os_str();
+    // Byte-level URI test: works on raw bytes on Unix and on the UTF-8 view
+    // everywhere else, so it cannot be fooled by a non-UTF-8 filename.
+    if name == "file:" || name.as_encoded_bytes().starts_with(b"file:") {
+        return StorePathKind::SqliteUri;
+    }
+    let Some(text) = store_path_text(path) else {
+        return StorePathKind::UnsupportedEncoding;
+    };
+    if text == ":memory:" {
+        return StorePathKind::Memory;
+    }
+    if text.is_empty() {
+        return StorePathKind::Temporary;
+    }
+    StorePathKind::LiteralFile
+}
+
+/// SQLite open flags for the production file-backed store.
+///
+/// `rusqlite::Connection::open` implies `SQLITE_OPEN_URI`; production does not
+/// request it. This is the *secondary* half of the contract: URI processing
+/// can also be switched on globally by `SQLITE_CONFIG_URI` or at compile time
+/// by `SQLITE_USE_URI`, so the load-bearing guard is the
+/// [`classify_store_path`] rejection of every `file:` filename before SQLite
+/// is asked to open anything. These flags exist so the connection does not
+/// itself ask for URI handling on top of that.
+const FILE_BACKED_OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    .union(OpenFlags::SQLITE_OPEN_CREATE)
+    .union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
+
 impl Store {
+    /// Open the production file-backed Scheduler store.
+    ///
+    /// The classification is repeated here on purpose: this is the boundary
+    /// that actually hands a filename to SQLite, so the contract holds even
+    /// for a caller that reached `Kernel::open` without going through
+    /// `SqliteRuntimeConfig`. `Store::open` accepts durable named files only;
+    /// an explicitly ephemeral store goes through [`Store::open_memory`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let conn = Connection::open(path.as_ref())
+        let path = path.as_ref();
+        let kind = classify_store_path(path);
+        if kind != StorePathKind::LiteralFile {
+            return Err(Error::storage_failure(format!(
+                "a production Scheduler store must be a literal file-backed path; \
+                 {kind:?} is not one: {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(path, FILE_BACKED_OPEN_FLAGS)
             .map_err(|e| Error::storage_failure(format!("open sqlite: {e}")))?;
         verify_lineage_before_configure(&conn)?;
         configure(&conn)?;
@@ -31,6 +155,7 @@ impl Store {
         Ok(store)
     }
 
+    /// Explicitly ephemeral in-memory store. Not a Scheduler store.
     pub fn open_memory() -> Result<Self, Error> {
         let conn = Connection::open_in_memory()
             .map_err(|e| Error::storage_failure(format!("open memory sqlite: {e}")))?;
