@@ -52,22 +52,25 @@ non-UTF-8  the `file:` prefix could be invisible to a str comparison
 
 `:memory:` and the empty filename are special even with URI processing
 entirely off, which is why the contract is a positive check on the kind
-rather than a list of URI rejections. The classifier is defined over the
-filename *bytes* SQLite receives: on Unix rusqlite passes
-`OsStrExt::as_bytes()` through unchanged and SQLite's URI test is a raw
-`memcmp` against `b"file:"`, so a `file:` prefix inside a non-UTF-8 filename
-is still detected and refused as an unsupported encoding, while a non-UTF-8
-filename that is not a URI stays a valid literal store. On Windows rusqlite
-requires UTF-8 and fails with `InvalidPath`, so the contract is a UTF-8
-representable path there. Bare `:memory:` is special only with no additional
-text: `:memory:?cache=shared` is an ordinary filename, and the shared-cache
-spelling is `file::memory:?cache=shared`. The load-bearing guard is that
-Agentype rejects every `file:` filename *before* SQLite is asked to open
-anything; the connection additionally does not request `SQLITE_OPEN_URI`,
-which is not by itself sufficient because SQLite can also enable URI handling
-through `SQLITE_CONFIG_URI` or compile-time `SQLITE_USE_URI`.
-`Store::open_memory` / `Kernel::open_memory` remain the explicit ephemeral
-path.
+rather than a list of URI rejections. The `file:` test runs on the filename
+*bytes* SQLite receives — on Unix rusqlite passes `OsStrExt::as_bytes()`
+through unchanged and SQLite's URI test is a raw `memcmp` against
+`b"file:"`, so a prefix hidden inside a non-UTF-8 filename is still caught —
+while everything else about the contract is UTF-8 representable. A non-UTF-8
+filename that is *not* a URI is therefore refused as `UnsupportedEncoding`
+rather than accepted: the process-lock identity stores its canonical pathname
+as a lossy UTF-8 string and rebuilds the sidecar lock path from it, so
+arbitrary Unix byte paths are not a losslessly representable Scheduler
+identity. On Windows rusqlite requires UTF-8 and fails with `InvalidPath`, so
+both platforms reject the same inputs. Bare `:memory:` is special only with
+no additional text: `:memory:?cache=shared` is an ordinary filename, and the
+shared-cache spelling is `file::memory:?cache=shared`. The load-bearing guard
+is that Agentype rejects every `file:` filename *before* SQLite is asked to
+open anything; the connection additionally does not request
+`SQLITE_OPEN_URI`, which is not by itself sufficient because SQLite can also
+enable URI handling through `SQLITE_CONFIG_URI` or compile-time
+`SQLITE_USE_URI`. `Store::open_memory` / `Kernel::open_memory` remain the
+explicit ephemeral path.
 
 The startup path `RuntimeProcessLock(path)` → `Kernel::open(path)` →
 `confirm_store_identity(path)` assumes the Scheduler database pathname is not
@@ -85,9 +88,11 @@ Regressions: `uri_filenames_are_not_a_production_store`,
 `literal_path_stays_file_backed_and_reopenable`,
 `sqlite_special_filenames_are_refused_by_the_store_boundary`,
 `explicit_memory_store_still_works`, and the Unix-only
-`non_utf8_store_path_fails_closed` plus
-`non_utf8_filenames_are_classified_by_bytes`, which pin the byte-level
-`file:` test and the continued support for non-UTF-8 literal filenames.
+`non_utf8_filenames_are_classified_by_bytes` plus
+`non_utf8_store_path_fails_closed` and
+`non_utf8_literal_is_not_a_literal_store_kind`, which pin the byte-level
+`file:` test, the `UnsupportedEncoding` refusal, and that the config boundary
+and the store classifier agree on it.
 
 ## Ownership graph
 

@@ -106,9 +106,12 @@ fn classification_table_names_every_sqlite_special_filename() {
 /// against `b"file:"`, so a URI filename that is not valid UTF-8 would slip
 /// past a `str`-based test and reproduce the lock/store identity split.
 ///
-/// The second half is the counterweight: a non-UTF-8 filename that is not a
-/// URI is still a perfectly good literal store, so this is not a blanket ban
-/// on Unix byte paths.
+/// The other half is deliberate: a non-UTF-8 filename that is *not* a URI is
+/// refused as `UnsupportedEncoding` rather than accepted, because the
+/// production store contract is a UTF-8 representable path. The Runtime's
+/// process-lock identity keeps its canonical pathname as a lossy UTF-8 string
+/// and rebuilds the sidecar lock path from it, so an arbitrary Unix byte path
+/// is not a losslessly representable Scheduler identity.
 #[cfg(unix)]
 #[test]
 fn non_utf8_filenames_are_classified_by_bytes() {
@@ -125,24 +128,29 @@ fn non_utf8_filenames_are_classified_by_bytes() {
     let literal = PathBuf::from(OsStr::from_bytes(b"agentype-\xff.sqlite"));
     assert_eq!(
         classify_store_path(&literal),
-        StorePathKind::LiteralFile,
-        "a non-UTF-8 filename without the `file:` prefix is still a literal path"
+        StorePathKind::UnsupportedEncoding,
+        "a non-UTF-8 filename is not a UTF-8 representable production store"
     );
 
-    // The same two filenames must be refused and accepted respectively by the
-    // boundary that actually hands them to SQLite. The error text is not
-    // inspected here: it embeds the path, which is not valid UTF-8.
+    // Both filenames must be refused by the boundary that actually hands them
+    // to SQLite. The error text is not inspected here: it embeds the path,
+    // which is not valid UTF-8.
     if Kernel::open(&uri, clock(), 10.0, CONTINUITY_MAX_BYTES).is_ok() {
         panic!("a non-UTF-8 URI filename must not open as a production store");
     }
 
     let dir = scratch("non-utf8");
     let path = dir.join(OsStr::from_bytes(b"agentype-\xff.sqlite"));
-    Kernel::open(&path, clock(), 10.0, CONTINUITY_MAX_BYTES)
-        .expect("a non-UTF-8 literal filename must still open");
-    assert!(path.exists(), "the literal file must exist on disk");
+    if Kernel::open(&path, clock(), 10.0, CONTINUITY_MAX_BYTES).is_ok() {
+        panic!("a non-UTF-8 literal filename must not open as a production store");
+    }
+    assert!(
+        !path.exists(),
+        "the refusal must happen before SQLite creates anything"
+    );
 
-    // Fully non-UTF-8 bytes behind the prefix: the byte-level test still fires.
+    // Fully non-UTF-8 bytes behind the prefix: the byte-level URI test still
+    // wins over the encoding check, so the security-relevant reason is named.
     let hidden_uri = PathBuf::from(OsStr::from_bytes(b"file:\xfe\xff"));
     assert_eq!(
         classify_store_path(&hidden_uri),

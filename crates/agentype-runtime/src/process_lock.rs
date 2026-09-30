@@ -606,21 +606,49 @@ mod tests {
     }
 
     /// M5.8 audit round 7 P1: a `file:` prefix can be hidden in a filename that
-    /// is not valid UTF-8, and on Unix SQLite sees those raw bytes. The config
-    /// boundary must refuse such a path instead of treating it as literal.
+    /// is not valid UTF-8, and on Unix SQLite sees those raw bytes. The
+    /// classifier therefore tests the prefix on bytes.
+    ///
+    /// M5.8 audit round 8 P1: the production store contract is also UTF-8
+    /// representable, so a non-UTF-8 filename that is *not* a URI is refused
+    /// as well. This is not mere strictness: `store_identity` keeps its
+    /// canonical pathname as a lossy UTF-8 string and rebuilds the sidecar
+    /// lock path from it, so an arbitrary Unix byte path is not a losslessly
+    /// representable Scheduler identity.
     #[cfg(unix)]
     #[test]
     fn non_utf8_store_path_fails_closed() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let hidden_uri = PathBuf::from(OsString::from_vec(b"file:agentype-\xff.sqlite".to_vec()));
-        assert!(
-            matches!(
-                SqliteRuntimeConfig::new(hidden_uri, 10.0, 16_384),
-                Err(ProcessLockError::IdentityUnresolvable(_))
-            ),
-            "a non-UTF-8 URI filename must not be accepted as a production store"
+        for (label, bytes) in [
+            ("hidden URI", b"file:agentype-\xff.sqlite".to_vec()),
+            ("ordinary filename", b"agentype-\xff.sqlite".to_vec()),
+        ] {
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            assert!(
+                matches!(
+                    SqliteRuntimeConfig::new(path, 10.0, 16_384),
+                    Err(ProcessLockError::IdentityUnresolvable(_))
+                ),
+                "a non-UTF-8 store path ({label}) must not be accepted as a production store"
+            );
+        }
+    }
+
+    /// The same contract on the storage side: the classifier the config
+    /// boundary uses must not call a non-UTF-8 filename a literal file.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_literal_is_not_a_literal_store_kind() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"agentype-\xff.sqlite".to_vec()));
+        assert_eq!(
+            agentype_storage_sqlite::classify_store_path(&path),
+            agentype_storage_sqlite::StorePathKind::UnsupportedEncoding,
+            "config acceptance and the store classification must agree here too"
         );
     }
 

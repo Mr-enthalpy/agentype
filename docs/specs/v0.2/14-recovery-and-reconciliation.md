@@ -82,11 +82,13 @@ the store-open boundary, because the lock resolves a filesystem handle while
 SQLite applies its own special-filename rules to the same filename. The
 rejection MUST be decided on the filename bytes SQLite actually receives, so
 that a `file:` prefix hidden inside a filename that is not valid UTF-8 is
-still refused. The in-memory store MUST remain reachable only through an
-explicit `open_memory`-style entry point. Startup also assumes the Scheduler
-database pathname is not adversarially replaced between lock acquisition and
-Kernel open; the post-open identity confirmation re-resolves the path, so a
-pathname ABA inside that window is not detected. `recover_runtime` grants
+still refused as a URI filename; the same byte test MUST NOT be used to admit
+non-UTF-8 literal paths, which are not a losslessly representable Scheduler
+identity and MUST be refused as well. The in-memory store MUST remain
+reachable only through an explicit `open_memory`-style entry point. Startup
+also assumes the Scheduler database pathname is not adversarially replaced
+between lock acquisition and Kernel open; the post-open identity confirmation
+re-resolves the path, so a pathname ABA inside that window is not detected. `recover_runtime` grants
 activation, not dispatch. READY requires the composition of a runtime-local
 `ReadyPermit` (minted after the process lock, recovery, and the
 physical-observation activation sweep, and only permitting construction of a

@@ -3,8 +3,15 @@
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_core::*;
+// Only the runtime-mechanical methods (claim, execution commitment, renewal,
+// physical history, outbox delivery commits) use these, so the default build
+// neither imports nor compiles them. `params` stays unconditional: the
+// non-mechanical partition / pool / batch methods use it too.
+#[cfg(any(test, feature = "runtime-internal"))]
 use agentype_execution_config::{ExecutionLaunchSnapshot, FrozenPhysicalExecutionBinding};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
+#[cfg(any(test, feature = "runtime-internal"))]
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,6 +52,12 @@ pub enum SupervisedRenewal {
 /// which `SupervisionAdmission::from_grant` consumes into one admission.
 /// A later `confirm_running_and_renew` may mint a *new* grant (a new fenced
 /// validation). Cloning one grant into many admissions is forbidden.
+// The accessors are read only by the runtime-mechanical admission paths, so a
+// default build carries the identity without reading it.
+#[cfg_attr(
+    not(any(test, feature = "runtime-internal")),
+    allow(dead_code, reason = "read only by the runtime admission path")
+)]
 #[derive(Debug)]
 pub struct RunningAuthorityGrant {
     execution_id: ExecutionId,
@@ -55,6 +68,7 @@ pub struct RunningAuthorityGrant {
     expires_at: UnixTime,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 impl RunningAuthorityGrant {
     pub(crate) fn new(
         execution_id: ExecutionId,
@@ -392,13 +406,16 @@ pub struct OutboxDeliverySnapshot {
     pub last_error: Option<String>,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 const LAST_ERROR_MAX_CHARS: usize = 512;
 
+#[cfg(any(test, feature = "runtime-internal"))]
 enum DeliveryCommit {
     Success,
     Failure { delay: f64, diagnostic: String },
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn bound_last_error(diagnostic: &str) -> String {
     diagnostic.chars().take(LAST_ERROR_MAX_CHARS).collect()
 }
@@ -408,6 +425,7 @@ fn parse_delivery_attempts(value: i64) -> Result<u32, Error> {
         .map_err(|_| Error::invariant(format!("negative delivery_attempts is corrupt: {value}")))
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn missing_outbox(event_id: &OutboxEventId) -> Error {
     Error::invariant(format!(
         "outbox event {} is missing; retained events cannot disappear",
@@ -415,6 +433,7 @@ fn missing_outbox(event_id: &OutboxEventId) -> Error {
     ))
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn commit_outbox_delivery_locked(
     tx: &rusqlite::Transaction<'_>,
     event_id: &OutboxEventId,
@@ -485,6 +504,12 @@ pub struct Kernel {
     store: Store,
     clock: Arc<dyn Clock>,
     lease_seconds: f64,
+    // Scheduler configuration, read only by the runtime-mechanical
+    // `promote_checkpoint`, so the default build stores it without reading it.
+    #[cfg_attr(
+        not(any(test, feature = "runtime-internal")),
+        allow(dead_code, reason = "read only by promote_checkpoint")
+    )]
     continuity_max_bytes: usize,
 }
 
@@ -3828,6 +3853,7 @@ struct ReconciliationRow {
     current_attempt_id: Option<String>,
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 fn claim_selected(
     tx: &rusqlite::Transaction<'_>,
     agent: &AgentRow,
@@ -3947,6 +3973,7 @@ fn assert_acyclic(graph: &HashMap<String, Vec<String>>) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "runtime-internal"))]
 struct ExpireRow {
     lease_id: String,
     attempt_id: String,
@@ -4044,6 +4071,7 @@ impl PartitionRow {
 /// True only while this Execution is still the incarnation's live attachment.
 /// A later Execution in STARTING/RUNNING/UNKNOWN owns the incarnation; late
 /// evidence from an older Execution must not rewrite it.
+#[cfg(any(test, feature = "runtime-internal"))]
 fn execution_still_attached(
     tx: &rusqlite::Transaction<'_>,
     execution_id: &str,
