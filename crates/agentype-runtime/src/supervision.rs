@@ -381,18 +381,30 @@ impl SupervisionRegistry {
             .collect()
     }
 
-    fn refresh_freshness(&mut self, identity: &SupervisionIdentity, observed_at: UnixTime) {
+    /// A positive physical observation re-establishes freshness. Returns
+    /// whether this mutated the current entry, so the caller only wakes the
+    /// heartbeat loop for a refresh that actually happened.
+    fn refresh_freshness(&mut self, identity: &SupervisionIdentity, observed_at: UnixTime) -> bool {
         let current = self
             .entries
             .get(identity.execution_id())
             .is_some_and(|entry| entry.identity.generation() == identity.generation());
-        if current {
-            if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
-                entry.last_positive_observed_at = observed_at;
-                entry.freshness_epoch = entry.freshness_epoch.saturating_add(1);
-                entry.renewal_eligible = true;
-            }
+        if !current {
+            return false;
         }
+        if let Some(entry) = self.entries.get_mut(identity.execution_id()) {
+            entry.last_positive_observed_at = observed_at;
+            entry.freshness_epoch = entry.freshness_epoch.saturating_add(1);
+            entry.renewal_eligible = true;
+            // Re-arm the schedule (M5.8 audit round 2, P1). Recovery from
+            // stale freshness only re-enabling eligibility would leave the
+            // deadline the stale tick pushed past the durable expiry, so a
+            // healthy Execution would lose authority to the Scheduler's own
+            // schedule. Keep the EARLIER deadline: a refresh may bring a
+            // renewal forward, never push one later.
+            entry.next_due_at = entry.next_due_at.min(observed_at);
+        }
+        true
     }
 
     fn stop_renewal_if_current(&mut self, identity: &SupervisionIdentity) {
@@ -764,11 +776,17 @@ impl SupervisionService {
             .snapshots()
     }
 
-    pub(crate) fn refresh_freshness(&self, identity: &SupervisionIdentity, observed_at: UnixTime) {
+    /// Re-establish physical freshness for an owned entry. Returns whether a
+    /// current entry was refreshed.
+    pub(crate) fn refresh_freshness(
+        &self,
+        identity: &SupervisionIdentity,
+        observed_at: UnixTime,
+    ) -> bool {
         self.registry
             .lock()
             .expect("supervision registry lock")
-            .refresh_freshness(identity, observed_at);
+            .refresh_freshness(identity, observed_at)
     }
 
     pub(crate) fn stop_renewal_eligibility(&self, identity: &SupervisionIdentity) {
@@ -1040,6 +1058,12 @@ impl SupervisionRunner {
         self.service.clone()
     }
 
+    /// Narrow physical-freshness path for the physical observer: re-arms the
+    /// renewal deadline and wakes this runner. It cannot renew a Lease.
+    pub fn freshness_sink(&self) -> SupervisionFreshnessSink {
+        SupervisionFreshnessSink::new(self.service.clone(), self.shared.clone())
+    }
+
     /// Cloneable admit path that still honors the runner lifecycle gate.
     pub fn admit_sink(&self) -> SupervisionAdmitSink {
         SupervisionAdmitSink {
@@ -1131,6 +1155,78 @@ impl SupervisionAdmitSink {
         }
         drop(state);
         result
+    }
+}
+
+/// Cloneable physical-freshness path for the physical observer.
+///
+/// It re-arms the renewal deadline and wakes the heartbeat loop. It can never
+/// renew a Lease: the observer must not become a Lease renewer, so this sink
+/// deliberately exposes no `renew_one` or `renew_due`. Renewal stays with the
+/// heartbeat loop, which is the only owner of Kernel Lease renewal.
+#[derive(Clone)]
+pub struct SupervisionFreshnessSink {
+    service: SupervisionService,
+    shared: Arc<RunnerShared>,
+}
+
+impl SupervisionFreshnessSink {
+    /// Bind to a live heartbeat loop's scheduling state, so a refresh can
+    /// wake it. Module-private: the only way to obtain a bound sink is
+    /// [`SupervisionRunner::freshness_sink`], which is what keeps the shared
+    /// scheduling state out of any other visibility.
+    fn new(service: SupervisionService, shared: Arc<RunnerShared>) -> Self {
+        Self { service, shared }
+    }
+
+    /// A sink with no heartbeat loop behind it. Refreshes still re-arm the
+    /// registry, but nothing is woken. Test composition only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn standalone(service: SupervisionService) -> Self {
+        Self {
+            service,
+            shared: Arc::new(RunnerShared::default()),
+        }
+    }
+
+    /// Composition knob, not a renewal capability.
+    pub fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
+        self.service.enable_freshness_gate(freshness_limit_seconds);
+    }
+
+    /// The observer's own scheduling wake, poked when supervision ownership
+    /// changes.
+    pub(crate) fn observer_wake(&self) -> Arc<ObserverWake> {
+        self.service.observer_wake()
+    }
+
+    pub(crate) fn observation_snapshots(&self) -> Vec<SupervisedSnapshot> {
+        self.service.observation_snapshots()
+    }
+
+    pub(crate) fn stop_renewal_eligibility(&self, identity: &SupervisionIdentity) {
+        self.service.stop_renewal_eligibility(identity);
+    }
+
+    pub(crate) fn drop_if_current(&self, identity: &SupervisionIdentity) {
+        self.service.drop_if_current(identity);
+    }
+
+    /// A positive physical observation re-establishes freshness.
+    ///
+    /// The runner's scheduling mutex is held across the registry mutation and
+    /// the notification. That is what makes the wake-up unloseable: the
+    /// heartbeat loop computes its wait from `earliest_next_due()` while
+    /// holding the same mutex, so a re-armed deadline can never land between
+    /// that computation and the sleep.
+    ///
+    /// This re-arms and wakes. It does not renew.
+    pub(crate) fn refresh_positive(&self, identity: &SupervisionIdentity, observed_at: UnixTime) {
+        let state = self.shared.state.lock().expect("runner state lock");
+        if self.service.refresh_freshness(identity, observed_at) {
+            self.shared.signal.notify_all();
+        }
+        drop(state);
     }
 }
 
@@ -1858,6 +1954,72 @@ mod tests {
         assert!(!exec_state.terminal_confirmed);
         assert!(!exec_state.quiescent_confirmed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M5.8 audit round 2, P1 (wake half): re-arming the deadline is not
+    /// enough on its own. The heartbeat thread is already sleeping toward the
+    /// deadline the stale tick scheduled past the durable expiry, so a
+    /// positive observation must also WAKE it — otherwise the fix leaves a
+    /// second bug ("deadline changed but the condvar never fired").
+    ///
+    /// The manual clock makes the arithmetic exact. The loop derives its
+    /// remaining wait from that clock, so a renewal arriving promptly after
+    /// the refresh can only be the wake: an unwoken loop would keep sleeping
+    /// out the rest of its multi-second wait.
+    #[test]
+    fn freshness_recovery_wakes_the_heartbeat_loop() {
+        let (clock, kernel) = env();
+        // heartbeat = 6 < lease = 10; freshness limit = 4.
+        let timing = RuntimeTimingConfig::new(1.0, 6.0, LEASE_SECONDS).unwrap();
+        let runner = SupervisionRunner::start(kernel.clone(), timing).unwrap();
+        let sink = runner.freshness_sink();
+        sink.enable_freshness_gate(4.0);
+
+        let (claim, exec) = running_execution(&kernel, "runner-wake");
+        runner.admit(mint(&claim, &exec, &kernel)).unwrap();
+        let t0 = kernel.now();
+        let expiry = |kernel: &Kernel| {
+            kernel
+                .lease_supervision_view(&claim.attempt_id)
+                .unwrap()
+                .expires_at
+        };
+        assert_eq!(expiry(&kernel), t0 + LEASE_SECONDS);
+
+        // Let the loop settle into its wait (a 6s sleep computed from the
+        // manual clock), then move logical time past that deadline without
+        // waking it: this is the state the stale tick leaves behind.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        clock.advance(7.0);
+        assert_eq!(runner.service().earliest_next_due(), Some(t0 + 6.0));
+        assert_eq!(expiry(&kernel), t0 + LEASE_SECONDS, "nothing renewed yet");
+
+        let identity = runner
+            .service()
+            .observation_snapshots()
+            .into_iter()
+            .find(|snap| snap.identity.execution_id() == &exec)
+            .expect("admitted snapshot")
+            .identity;
+
+        // One positive physical observation: re-arm the deadline AND wake.
+        sink.refresh_positive(&identity, kernel.now());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let renewed = expiry(&kernel);
+            if renewed > t0 + LEASE_SECONDS {
+                assert_eq!(renewed, t0 + 17.0, "renewed against the refresh time");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refreshed entry was never renewed: the heartbeat loop was not woken"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        runner.shutdown().unwrap();
     }
 
     /// Fatal smoke: a corrupted durable lease row stops the loop and

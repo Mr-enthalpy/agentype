@@ -189,7 +189,7 @@ impl SchedulerDaemonBuilder {
         let observer_service = PhysicalObserverService::new(
             kernel.clone(),
             self.adapters.clone(),
-            supervision.service(),
+            supervision.freshness_sink(),
             self.observer,
         );
         observer_service

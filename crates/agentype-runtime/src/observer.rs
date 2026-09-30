@@ -4,7 +4,7 @@
 //! SupervisionRunner remains the only component allowed to perform renewal.
 
 use crate::observation::adapter_invocation_failure_class;
-use crate::supervision::{SupervisionIdentity, SupervisionService};
+use crate::supervision::{SupervisionFreshnessSink, SupervisionIdentity};
 use crate::{
     persist_physical_end_then_nack, AdapterBindingKey, AdapterRegistry, AuthorityConsequence,
     ExecutionId,
@@ -219,7 +219,7 @@ pub enum ObserveApply {
 pub struct PhysicalObserverService {
     kernel: Arc<Kernel>,
     adapters: AdapterRegistry,
-    supervision: SupervisionService,
+    supervision: SupervisionFreshnessSink,
     config: PhysicalObserverConfig,
     watch: Mutex<HashMap<ExecutionId, WatchState>>,
 }
@@ -228,7 +228,7 @@ impl PhysicalObserverService {
     pub fn new(
         kernel: Arc<Kernel>,
         adapters: AdapterRegistry,
-        supervision: SupervisionService,
+        supervision: SupervisionFreshnessSink,
         config: PhysicalObserverConfig,
     ) -> Self {
         supervision.enable_freshness_gate(config.freshness_limit);
@@ -249,7 +249,7 @@ impl PhysicalObserverService {
         self.observe_due(self.kernel.now())
     }
 
-    fn supervision_wake_target(&self) -> &SupervisionService {
+    fn supervision_wake_target(&self) -> &SupervisionFreshnessSink {
         &self.supervision
     }
 
@@ -438,7 +438,7 @@ impl PhysicalObserverService {
         match kind {
             PhysicalObservationKind::ExactRunning => {
                 self.supervision
-                    .refresh_freshness(&ticket.identity, self.kernel.now());
+                    .refresh_positive(&ticket.identity, self.kernel.now());
                 self.schedule_next(ticket, self.kernel.now() + self.config.poll_interval);
                 Ok(ObserveApply::Refreshed)
             }
@@ -578,7 +578,10 @@ impl PhysicalObserverService {
     }
 }
 
-fn generation_current(supervision: &SupervisionService, identity: &SupervisionIdentity) -> bool {
+fn generation_current(
+    supervision: &SupervisionFreshnessSink,
+    identity: &SupervisionIdentity,
+) -> bool {
     supervision
         .observation_snapshots()
         .iter()
@@ -714,6 +717,7 @@ impl Drop for PhysicalObserverRunner {
 mod tests {
     use super::*;
     use crate::deadlines::test_deadlines;
+    use crate::supervision::SupervisionService;
     use crate::timing::RuntimeTimingConfig;
     use crate::SupervisionAdmission;
     use agentype_adapter_api::{FakeAdapter, PhysicalExecutionOutcome, PhysicalState};
@@ -808,7 +812,12 @@ mod tests {
         adapters
             .register_kind("process", fake, test_deadlines())
             .unwrap();
-        let observer = PhysicalObserverService::new(kernel, adapters, svc.clone(), observer_cfg());
+        let observer = PhysicalObserverService::new(
+            kernel,
+            adapters,
+            SupervisionFreshnessSink::standalone(svc.clone()),
+            observer_cfg(),
+        );
         (svc, observer)
     }
 
@@ -891,6 +900,95 @@ mod tests {
             kernel.task(&claim.task_id).unwrap().state,
             TaskState::Completed
         );
+    }
+
+    fn lease_expiry(kernel: &Kernel, claim: &agentype_core::Claim) -> f64 {
+        kernel
+            .lease_for_attempt(&claim.attempt_id)
+            .unwrap()
+            .expires_at
+    }
+
+    /// M5.8 audit round 2, P1: recovering from stale physical freshness must
+    /// RE-ARM the renewal deadline, not merely flip renewal eligibility back
+    /// to true. Leaving the post-expiry deadline in place lets a healthy
+    /// external agent lose authority to the Scheduler's own schedule.
+    ///
+    /// lease=10, heartbeat=6, freshness=4.
+    #[test]
+    fn freshness_recovery_rearms_the_renewal_deadline() {
+        let (clock, kernel) = env();
+        let fake = Arc::new(FakeAdapter::new());
+        let svc = SupervisionService::new(
+            kernel.clone(),
+            &RuntimeTimingConfig::new(1.0, 6.0, LEASE).unwrap(),
+        )
+        .unwrap();
+        let mut adapters = AdapterRegistry::new();
+        adapters
+            .register_kind("process", fake.clone(), test_deadlines())
+            .unwrap();
+        let observer = PhysicalObserverService::new(
+            kernel.clone(),
+            adapters,
+            SupervisionFreshnessSink::standalone(svc.clone()),
+            observer_cfg(),
+        );
+
+        let (claim, exec) = running(&kernel, "obs-rearm");
+        svc.admit(mint(&claim, &exec, &kernel)).unwrap();
+        let t0 = kernel.now();
+
+        // t=0: the fenced first renewal put the durable expiry at 10, and the
+        // next heartbeat at 6 — strictly before it, under the §A2 gate.
+        assert_eq!(lease_expiry(&kernel, &claim), t0 + 10.0);
+        assert_eq!(svc.earliest_next_due(), Some(t0 + 6.0));
+
+        // t=6: freshness (limit 4, last positive at 0) is stale, so renewal
+        // stops fail-closed and the deadline is pushed past the expiry.
+        clock.advance(6.0);
+        assert_eq!(
+            svc.renew_due(kernel.now()).unwrap(),
+            vec![crate::RenewalOutcome::FreshnessStale {
+                execution_id: exec.clone()
+            }]
+        );
+        assert_eq!(
+            lease_expiry(&kernel, &claim),
+            t0 + 10.0,
+            "a stale supervisor must not renew"
+        );
+        assert_eq!(svc.renewal_eligible(&exec), Some(false));
+        assert_eq!(svc.earliest_next_due(), Some(t0 + 12.0));
+
+        // t=7: the observer re-establishes exact RUNNING while the durable
+        // Lease is still active.
+        clock.advance(1.0);
+        fake.set_next_observe(ExecutionObservation {
+            state: ExecutionState::Running,
+            terminal_confirmed: false,
+            quiescent_confirmed: false,
+            detail: None,
+        });
+        assert_eq!(
+            observer.activation_sweep().unwrap(),
+            vec![ObserveApply::Refreshed]
+        );
+        assert_eq!(svc.renewal_eligible(&exec), Some(true));
+        assert!(
+            svc.earliest_next_due().unwrap() <= t0 + 7.0,
+            "recovered freshness must re-arm the deadline, got {:?}",
+            svc.earliest_next_due()
+        );
+
+        // The heartbeat step must therefore renew before the old expiry.
+        match svc.renew_due(kernel.now()).unwrap().as_slice() {
+            [crate::RenewalOutcome::Renewed { new_expires_at, .. }] => {
+                assert_eq!(*new_expires_at, t0 + 17.0)
+            }
+            other => panic!("expected exactly one renewal, got {other:?}"),
+        }
+        assert_eq!(lease_expiry(&kernel, &claim), t0 + 17.0);
     }
 
     #[test]
@@ -981,8 +1079,12 @@ mod tests {
         adapters
             .register_kind("process", fake.clone(), test_deadlines())
             .unwrap();
-        let observer =
-            PhysicalObserverService::new(kernel.clone(), adapters, svc.clone(), observer_cfg());
+        let observer = PhysicalObserverService::new(
+            kernel.clone(),
+            adapters,
+            SupervisionFreshnessSink::standalone(svc.clone()),
+            observer_cfg(),
+        );
         kernel
             .submit_batch(&[TaskSpec::new("act-to", json!({"o": 1})).retry(
                 agentype_core::RetryPolicy {
@@ -1034,7 +1136,7 @@ mod tests {
         let observer = PhysicalObserverService::new(
             kernel.clone(),
             adapters,
-            svc.clone(),
+            SupervisionFreshnessSink::standalone(svc.clone()),
             PhysicalObserverConfig::new(1.0, 4.0, 1, LEASE).unwrap(),
         );
         let (c1, e1) = running(&kernel, "starve-a");

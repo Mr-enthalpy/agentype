@@ -80,6 +80,59 @@ Four `compile_fail` doctests pin the absences, and one of them is backed by a
 probe run confirming the referenced externs resolve, so each failure is
 about the missing API rather than a missing crate.
 
+## Freshness recovery closure
+
+A stale freshness tick stops renewal and re-schedules the entry one heartbeat
+interval later. If the observer then re-established freshness by only setting
+`renewal_eligible = true`, the deadline stayed where the stale tick put it —
+past the durable expiry under legal `heartbeat < lease` timing — so a healthy
+Execution lost authority to the Scheduler's own schedule.
+
+Recovery now has both halves, and both are required:
+
+```text
+positive RUNNING
+    ↓
+next_due_at = min(next_due_at, observed_at)     re-arm
+    ↓
+wake the heartbeat loop                          wake
+    ↓
+SupervisionRunner performs the fenced renewal
+```
+
+The observer reaches this through `SupervisionFreshnessSink`, which exposes
+`refresh_positive` plus the observation read/stop/drop paths and no renewal
+at all: `PhysicalObserver` remains not a Lease renewer. `refresh_positive`
+takes the runner's scheduling mutex across the registry mutation and the
+notification, which is what makes the wake unloseable — the loop computes its
+wait from `earliest_next_due()` under the same mutex. A refresh may bring a
+renewal forward, never push one later.
+
+Three regressions cover it, and the two clock-exact ones were confirmed red
+before the re-arm landed:
+
+| Test | Asserts |
+| --- | --- |
+| `freshness_recovery_rearms_the_renewal_deadline` | stale tick does not renew and moves the deadline to 12; the refresh must re-arm it to ≤ 7; the heartbeat step then renews to 17 |
+| `freshness_recovery_wakes_the_heartbeat_loop` | with the loop asleep toward the old deadline, a refresh wakes it and the renewal lands before the old expiry |
+| `stale_freshness_during_recovery_still_reaches_activation` | after recovery + activation refresh, reaching READY leaves the entry renewable, not skipped as not-yet-due |
+
+The wake test was confirmed to fail with the notification removed, so it
+detects the second "deadline changed but the condvar never fired" bug rather
+than passing for another reason.
+
+## Deferred: daemon end-to-end fatal test
+
+M5.8's own end-to-end fatal evidence remains thin: each runner has fatal and
+gate tests, but `daemon.rs` has only lifecycle tests. A test asserting
+observer fatal → `DispatchGate::Failed` → no new Claim → supervision stopped →
+`DaemonExit::Failed` → lock released after workers is **not** in this change.
+Inducing a real observer fatal requires a fatal-injection point in the
+daemon's private composition, and the daemon tests need a machine-writable
+ProgramData lock, so the test could not be executed in the environment where
+it was written. Adding an unverifiable test to the freeze candidate was the
+worse risk; this stays an explicit open item.
+
 ## Composition closure follow-ups
 
 `Kernel::attempt_count_for_task` is a test-support read that makes "no
