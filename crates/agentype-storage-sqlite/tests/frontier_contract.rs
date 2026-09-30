@@ -14,9 +14,9 @@ mod common;
 use common::*;
 
 use agentype_core::{
-    ArtifactRef, BatchState, Clock, GenerationState, InformationFunction, ManualClock, PartitionId,
-    PartitionSpec, ProposalExpirationReason, ProposalStateKind, RawWorkIntent, ResultId, Retention,
-    SemanticInputSet, TaskSpec, TaskState,
+    ArtifactRef, BatchState, Clock, FailureClass, GenerationState, InformationFunction,
+    ManualClock, PartitionId, PartitionSpec, ProposalExpirationReason, ProposalStateKind,
+    RawWorkIntent, ResultId, Retention, SemanticInputSet, TaskSpec, TaskState,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
@@ -914,6 +914,76 @@ fn test_p1_1_compress_replay_after_close_returns_expired() {
 }
 
 #[test]
+fn test_p1_1_canonical_task_spec_order_does_not_conflict_at_admission() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Compiled proposal carries the sorted/canonical spec.
+    let mut compiled_spec = TaskSpec::new("canonical_order", json!({}));
+    compiled_spec.affinity_tags = vec!["a".into(), "z".into()];
+    compiled_spec.retry_policy.retry_classes =
+        vec![FailureClass::ExecutionLost, FailureClass::Timeout];
+    let intent = RawWorkIntent {
+        raw_intent_key: "canonical_order".into(),
+        objective: "Canonical order must not conflict".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(compiled_spec),
+    };
+    let p = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+
+    // Root expresses the SAME canonical spec with different vector order.
+    let mut override_spec = TaskSpec::new("canonical_order", json!({}));
+    override_spec.affinity_tags = vec!["z".into(), "a".into()];
+    override_spec.retry_policy.retry_classes =
+        vec![FailureClass::Timeout, FailureClass::ExecutionLost];
+
+    let task_id = kernel
+        .admit_proposal(&p.proposal_id, 0, Some(override_spec))
+        .expect("canonically-equivalent override must admit");
+    let task_row = kernel.task(&task_id).unwrap();
+    assert_eq!(task_row.name, "canonical_order");
+}
+
+#[test]
+fn test_p1_1_canonical_task_spec_retry_after_commit_returns_same_task_id() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Proposal intentionally has no compiled spec; Root supplies the override.
+    let intent = RawWorkIntent {
+        raw_intent_key: "canonical_retry".into(),
+        objective: "Retry with original override".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: None,
+    };
+    let p = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+
+    let original_override = || {
+        let mut spec = TaskSpec::new("canonical_retry", json!({}));
+        spec.affinity_tags = vec!["z".into(), "a".into()];
+        spec.retry_policy.retry_classes = vec![FailureClass::Timeout, FailureClass::ExecutionLost];
+        spec
+    };
+
+    let first = kernel
+        .admit_proposal(&p.proposal_id, 0, Some(original_override()))
+        .expect("first admission");
+    // Crash-replay the exact original (unsorted) override.
+    let retry = kernel
+        .admit_proposal(&p.proposal_id, 0, Some(original_override()))
+        .expect("canonically-equivalent retry must return the same TaskId");
+    assert_eq!(first, retry);
+}
+
+#[test]
 fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
     let kernel = test_kernel();
     let gen = kernel.create_generation(json!({})).unwrap();
@@ -1051,13 +1121,14 @@ fn test_p1_4_durable_task_spec_fail_closed() {
     bad["retry_classes"] = json!(["UNKNOWN_FAILURE_CLASS"]);
     assert!(task_spec_from_json(&bad).is_err());
 
-    // 7. Non-positive or non-finite base_backoff_seconds
-    let mut bad = valid_json.clone();
-    bad["base_backoff_seconds"] = json!(0.0);
-    assert!(task_spec_from_json(&bad).is_err());
+    // 7. Negative or non-finite base_backoff_seconds; zero stays legal for M5 parity
     let mut bad = valid_json.clone();
     bad["base_backoff_seconds"] = json!(-5.0);
     assert!(task_spec_from_json(&bad).is_err());
+    let mut zero_base = valid_json.clone();
+    zero_base["base_backoff_seconds"] = json!(0.0);
+    zero_base["max_backoff_seconds"] = json!(0.0);
+    assert!(task_spec_from_json(&zero_base).is_ok());
 
     // 8. max_backoff_seconds < base_backoff_seconds
     let mut bad = valid_json.clone();
@@ -1502,12 +1573,9 @@ fn test_p2_1_canonical_json_rejects_nan_and_inf_backoff() {
         Err(agentype_core::Error::InvariantViolation(_))
     ));
 
-    // 3. base_backoff is 0.0
+    // 3. base_backoff 0.0 stays legal for M5 parity (max >= base holds)
     spec.retry_policy.base_backoff_seconds = 0.0;
-    assert!(matches!(
-        spec.canonical_json(),
-        Err(agentype_core::Error::InvariantViolation(_))
-    ));
+    assert!(spec.canonical_json().is_ok());
 
     // 4. base_backoff is negative
     spec.retry_policy.base_backoff_seconds = -1.0;
@@ -1548,4 +1616,40 @@ fn test_p2_1_canonical_json_rejects_nan_and_inf_backoff() {
         intent.fingerprint(),
         Err(agentype_core::Error::InvariantViolation(_))
     ));
+}
+
+#[test]
+fn test_p2_1_zero_backoff_task_spec_roundtrips_and_can_be_admitted() {
+    use agentype_storage_sqlite::frontier::task_spec_from_json;
+
+    let mut spec = TaskSpec::new("zero_backoff", json!({}));
+    spec.retry_policy.base_backoff_seconds = 0.0;
+    spec.retry_policy.max_backoff_seconds = 0.0;
+
+    // Zero backoff is legal M5 Task semantics and must survive canonical roundtrip.
+    let json = spec.canonical_json().expect("zero backoff is legal");
+    let parsed = task_spec_from_json(&json).expect("zero backoff parses");
+    assert_eq!(parsed.retry_policy.base_backoff_seconds, 0.0);
+    assert_eq!(parsed.retry_policy.max_backoff_seconds, 0.0);
+    assert!(parsed.equivalent(&spec).unwrap());
+
+    // And it is admissible through the M6-A semantic path.
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "zero_backoff".into(),
+        objective: "Zero backoff must remain legal".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec),
+    };
+    let p = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .expect("zero backoff compiles");
+    let task_id = kernel
+        .admit_proposal(&p.proposal_id, 0, None)
+        .expect("zero backoff admits");
+    let task_row = kernel.task(&task_id).unwrap();
+    assert_eq!(task_row.name, "zero_backoff");
 }

@@ -275,9 +275,9 @@ pub fn task_spec_from_json(val: &Value) -> Result<TaskSpec, Error> {
         .get("base_backoff_seconds")
         .and_then(Value::as_f64)
         .ok_or_else(|| Error::invariant("missing or invalid field: base_backoff_seconds"))?;
-    if !base_backoff_seconds.is_finite() || base_backoff_seconds <= 0.0 {
+    if !base_backoff_seconds.is_finite() || base_backoff_seconds < 0.0 {
         return Err(Error::invariant(
-            "base_backoff_seconds must be a finite positive number",
+            "base_backoff_seconds must be a finite non-negative number",
         ));
     }
 
@@ -756,7 +756,7 @@ pub fn admit_proposal(
                     .map_err(map_sqlite)?;
                 if let Some(spec_str) = admitted_spec_json {
                     let admitted_spec = task_spec_from_json(&json_load(&spec_str)?)?;
-                    if admitted_spec != override_spec {
+                    if !admitted_spec.equivalent(&override_spec)? {
                         return Err(Error::conflict(
                             "override_task_spec conflicts with previously admitted task_spec",
                         ));
@@ -825,7 +825,7 @@ pub fn admit_proposal(
         (None, Some(override_spec)) => override_spec,
         (Some(norm_spec), None) => norm_spec,
         (Some(norm_spec), Some(override_spec)) => {
-            if norm_spec != override_spec {
+            if !norm_spec.equivalent(&override_spec)? {
                 return Err(Error::conflict(
                     "override_task_spec conflicts with compiled proposal normalized_task_spec",
                 ));
