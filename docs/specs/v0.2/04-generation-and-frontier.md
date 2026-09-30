@@ -10,9 +10,9 @@ and not a Batch.
 ## Ownership
 
 Root MUST retain semantic frontier admission.
-Admitting a Generation MUST materialize a bounded slice whose **scope and
-expansion ceiling are fixed by Root** at admission.
-GenerationPolicy MUST constrain admitted work.
+In M6-A, worker suggestions (`RawWorkIntent`) are strictly unprivileged and non-expansive by default.
+Frontier expansion occurs exclusively through explicit Root admission of `EXPAND` proposals into an `OPEN` Generation.
+Automated policy-governed admission (`GenerationPolicy`) is deferred to later extensions.
 A Generation MUST NOT receive independent frontier-admission authority.
 Workers MUST NOT receive spawning authority from a Generation.
 
@@ -92,7 +92,7 @@ Every work proposal and task binding is classified under an explicit `Informatio
 
 - Each task binding carries an immutable `SemanticInputSet` capturing references to upstream results, seeds, and artifacts.
 - Provenance `result_ids` must resolve to existing durable Result rows.
-- Provenance forms a clean semantic DAG via parent generation references and task input bindings without requiring an external ontology engine.
+- Provenance forms a clean semantic DAG via `SemanticInputSet` upstream `ResultId`s, artifact references, and seed inputs without requiring an external ontology engine or dedicated generation parent links.
 
 ## Ingress and Compilation (D-INTENT-SCHEMA Resolution)
 

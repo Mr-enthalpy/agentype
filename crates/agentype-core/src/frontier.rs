@@ -79,28 +79,7 @@ impl RawWorkIntent {
                 "artifacts": sorted_art,
                 "seeds": sorted_seed,
             },
-            "spec": self.suggested_task_spec.as_ref().map(|s| {
-                let mut retry_classes = s
-                    .retry_policy
-                    .retry_classes
-                    .iter()
-                    .map(|c| c.as_sql())
-                    .collect::<Vec<_>>();
-                retry_classes.sort();
-                serde_json::json!({
-                    "name": s.name,
-                    "payload": s.payload,
-                    "acceptance": s.acceptance,
-                    "partition": s.partition.as_str(),
-                    "workstream": s.workstream_id.as_ref().map(|w| w.as_str()),
-                    "continuity": s.continuity.as_sql(),
-                    "tags": s.affinity_tags,
-                    "mode": s.workspace_mode.as_sql(),
-                    "priority": s.priority,
-                    "retry_attempts": s.retry_policy.max_attempts,
-                    "retry_classes": retry_classes,
-                })
-            }),
+            "spec": self.suggested_task_spec.as_ref().map(|s| s.canonical_json()),
         });
         val.to_string()
     }
@@ -122,6 +101,7 @@ pub struct ProposalRecord {
     pub state: ProposalStateKind,
     pub admitted_task_id: Option<TaskId>,
     pub expiration_reason: Option<ProposalExpirationReason>,
+    pub rejection_reason: Option<String>,
     pub created_at: UnixTime,
     pub updated_at: UnixTime,
 }

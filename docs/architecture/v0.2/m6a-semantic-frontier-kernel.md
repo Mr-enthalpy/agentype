@@ -133,7 +133,7 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
 Compression is an analytical convenience, not a replacement of historical truth:
 - A compression task consumes an immutable `SemanticInputSet` specifying the exact inputs it summarizes.
 - Original raw results are never deleted or mutated upon compression.
-- Provenance forms a clean directed acyclic graph (DAG) through parent generation references and task input bindings, supporting selective zoom-in and audit without external graph databases.
+- Provenance forms a clean directed acyclic graph (DAG) through `SemanticInputSet` upstream `ResultId`s, artifact references, and seed inputs on each task binding, supporting selective zoom-in and audit without external graph databases or dedicated generation parent links.
 
 ---
 

@@ -14,26 +14,26 @@ Classification:
 
 | ID | Question | Why unresolved | Blocks | Resolve by |
 |---|---|---|---|---|
-| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | design forbids guessing a workflow DSL | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | **RESOLVED in M6-A**: Explicit Root admission is the sole frontier expansion authority; workers/compilers never auto-expand; automated policy DSL deferred | None (Resolved) | M6-A |
 | D-GEN-INTRA | May Root add Tasks after a Generation is already OPEN/ACTIVE? | **RESOLVED in M6-A**: Root may add Tasks dynamically; in OPEN all functions allowed, in FROZEN only compression allowed | None (Resolved) | M6-A |
 | D-GEN-TOPOLOGY | Generation provenance chain vs DAG | **RESOLVED in M6-A**: DAG tracked via immutable `SemanticInputSet` on each task binding and generation seed | None (Resolved) | M6-A |
 | D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | **RESOLVED in M6-A**: Ingress `RawWorkIntent` structure compiles deterministically to `CompiledWorkProposal` | None (Resolved) | M6-A |
-| D-INTENT-FANOUT | Whether 1-to-many compile is ever allowed | design prefers 0..1 | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-INTENT-FANOUT | Whether 1-to-many compile is ever allowed | **RESOLVED in M6-A**: 1 intent deterministically compiles to at most 1 proposal (0..1); fanout deferred | None (Resolved) | M6-A |
 | D-TYPE-REL | Concrete `can_execute` / `can_provision` / `more_specific_for` / `is_valid_refinement` | must not collapse to subtype | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-TYPE-REV | AgentType revision compatibility and Task pins | revisions mentioned, rules not | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-INFO-FN | Information-function set/trait encoding | exclusivity frozen; encoding not | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-INFO-FN | Information-function set/trait encoding | **RESOLVED in M6-A**: Fixed 3-value closed enum (`EXPAND`, `COMPRESS_POSITIVE`, `COMPRESS_NEGATIVE`) with strict state-gated admission rules | None (Resolved) | M6-A |
 | D-MEM-SCHEMA | MemoryCapsule size, fields, merge, pos/neg specialization | design lists needs | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-MEM-PROMOTE | Who promotes Result delta to canonical MemoryCapsule | Root vs integration Task vs other | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-NEG-GC | Negative entry scope/assumptions/applicability/supersession/hot-cold GC | without it prohibitions rot | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-CONTINUITY-BIND | ContinuityBinding storage, security, expiry | opaque handle only | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-ROOT-API | Exact Generation review / admit / defer API | doctrine is behavioral, not wire | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-ROOT-API | Exact Generation review / admit / defer API | **RESOLVED in M6-A**: Narrow `RootSemanticControl` surface (`compile_intent`, `admit_proposal`, `reject_proposal`, `freeze_generation`, `close_generation`, `get_generation_view`) | None (Resolved) | M6-A |
 | D-TRANSFORM-FAIL | Transform suspend/cancel/partial/rollback | saga happy path frozen | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-TOPOLOGY | Remaining type-refinement vs capacity vs MOVE vs MERGE vs TRANSFORM split | V0.1 MOVE/MERGE kernel is enough for M4 | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-ADAPTER2 | Minimal second-adapter conformance extras | M7 demonstration | DOES_NOT_BLOCK_RIIR_KERNEL | M7 |
 | D-DB-MIGRATE | In-place V0.1 SQLite migrate vs import vs new DB | decide before upgrade claims | DOES_NOT_BLOCK_RIIR_KERNEL | before storage upgrade; M3 MAY use new DB |
-| D-OBJECTIVE | Objective/problem-scope schema | optional Root model | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-COMPILATION-CLOSURE | How model-backed compilation Tasks participate in Generation drain/REVIEWABLE (same-generation closure phase vs dedicated non-frontier system work vs other bounded form) | ordinary Task vs drain vs “every semantic Task has a Generation” | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-GEN-RESUME | Align Generation resume with Task/Batch/Escalation: mechanical vs semantic discriminator, recovery edges, atomicity. Scheduler-owned Generation SUSPENDED→ACTIVE is **not** frozen | Task has no SUSPENDED recovery edge; Batch resume is Root recovery | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-OBJECTIVE | Objective/problem-scope schema | **RESOLVED in M6-A**: `RawWorkIntent.objective` string + optional rationale + `SemanticInputSet` provenance references | None (Resolved) | M6-A |
+| D-COMPILATION-CLOSURE | How model-backed compilation Tasks participate in Generation drain/REVIEWABLE (same-generation closure phase vs dedicated non-frontier system work vs other bounded form) | **RESOLVED in M6-A**: Compilation produces inert proposals; tasks only materialize upon explicit Root admission; compilation tasks do not occupy frontier membership | None (Resolved) | M6-A |
+| D-GEN-RESUME | Align Generation resume with Task/Batch/Escalation: mechanical vs semantic discriminator, recovery edges, atomicity. Scheduler-owned Generation SUSPENDED→ACTIVE is **not** frozen | **RESOLVED in M6-A**: Strictly monotonic state machine `OPEN -> FROZEN -> CLOSED`; no intermediate SUSPENDED state or resume machine | None (Resolved) | M6-A |
 
 The first landing of this spec omitted V0.1.2 physical Execution transitions,
 LogicalAgent excess-retire, Outbox ACKED, and the Batch-COMPLETED/outbox

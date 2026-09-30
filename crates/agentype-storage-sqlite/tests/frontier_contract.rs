@@ -720,3 +720,374 @@ fn test_p1_3_compiler_unspecified_spec_and_admission_enforcement() {
         .unwrap_err();
     assert!(matches!(conflict_err, agentype_core::Error::Conflict(_)));
 }
+
+#[test]
+fn test_p1_1_rejected_proposal_deterministic_replay() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "replayable_key".into(),
+        objective: "Test replay of rejected proposal".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task1", json!({}))),
+    };
+
+    let p1 = kernel
+        .compile_intent(&gen.generation_id, intent.clone(), "root", "session", 1)
+        .unwrap();
+    assert_eq!(p1.state, ProposalStateKind::Pending);
+    assert!(p1.expiration_reason.is_none());
+    assert!(p1.rejection_reason.is_none());
+
+    let rejection_text = "Out of scope for current objective";
+    kernel
+        .reject_proposal(&p1.proposal_id, rejection_text)
+        .unwrap();
+
+    // Replay compilation of the EXACT same intent
+    let p2 = kernel
+        .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+        .unwrap();
+
+    assert_eq!(p2.proposal_id, p1.proposal_id);
+    assert_eq!(p2.state, ProposalStateKind::Rejected);
+    assert!(p2.expiration_reason.is_none());
+    assert_eq!(p2.rejection_reason.as_deref(), Some(rejection_text));
+}
+
+#[test]
+fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let base_spec = TaskSpec::new("task_base", json!({"x": 1}));
+    let base_intent = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(base_spec.clone()),
+    };
+
+    let _p = kernel
+        .compile_intent(&gen.generation_id, base_intent, "root", "session", 1)
+        .unwrap();
+
+    // 1. Changing base_backoff_seconds produces different fingerprint & causes Conflict on compile
+    let mut spec_backoff = base_spec.clone();
+    spec_backoff.retry_policy.base_backoff_seconds = 42.0;
+    let intent_backoff = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_backoff),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent_backoff, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+
+    // 2. Changing max_backoff_seconds causes Conflict
+    let mut spec_max_backoff = base_spec.clone();
+    spec_max_backoff.retry_policy.max_backoff_seconds = 120.0;
+    let intent_max_backoff = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_max_backoff),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent_max_backoff, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+
+    // 3. Changing supersedes_task_id causes Conflict
+    let mut spec_supersedes = base_spec.clone();
+    spec_supersedes.supersedes_task_id = Some(agentype_core::TaskId::new());
+    let intent_supersedes = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_supersedes),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent_supersedes, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+
+    // 4. Changing task_id causes Conflict
+    let mut spec_tid = base_spec.clone();
+    spec_tid.task_id = Some(agentype_core::TaskId::new());
+    let intent_tid = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_tid),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent_tid, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+
+    // 5. Changing priority causes Conflict
+    let mut spec_pri = base_spec;
+    spec_pri.priority = 99;
+    let intent_pri = RawWorkIntent {
+        raw_intent_key: "spec_diff_key".into(),
+        objective: "Base intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(spec_pri),
+    };
+    let err = kernel
+        .compile_intent(&gen.generation_id, intent_pri, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::Conflict(_)));
+}
+
+#[test]
+fn test_p1_4_durable_task_spec_fail_closed() {
+    use agentype_storage_sqlite::frontier::task_spec_from_json;
+
+    let valid_spec = TaskSpec::new("task1", json!({"k": "v"}));
+    let valid_json = valid_spec.canonical_json();
+    assert!(task_spec_from_json(&valid_json).is_ok());
+
+    // 1. Missing name
+    let mut bad = valid_json.clone();
+    bad.as_object_mut().unwrap().remove("name");
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 2. Missing partition
+    let mut bad = valid_json.clone();
+    bad.as_object_mut().unwrap().remove("partition");
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 3. Empty partition
+    let mut bad = valid_json.clone();
+    bad["partition"] = json!("   ");
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 4. Unknown workspace_mode MUST NOT default to Write, must fail closed
+    let mut bad = valid_json.clone();
+    bad["workspace_mode"] = json!("SUPER_PRIVILEGED_WRITE");
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 5. Unknown continuity preference must fail closed
+    let mut bad = valid_json.clone();
+    bad["continuity"] = json!("MAGIC_CONTINUITY");
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 6. Unknown retry_class must fail closed
+    let mut bad = valid_json.clone();
+    bad["retry_classes"] = json!(["UNKNOWN_FAILURE_CLASS"]);
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 7. Non-positive or non-finite base_backoff_seconds
+    let mut bad = valid_json.clone();
+    bad["base_backoff_seconds"] = json!(0.0);
+    assert!(task_spec_from_json(&bad).is_err());
+    let mut bad = valid_json.clone();
+    bad["base_backoff_seconds"] = json!(-5.0);
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 8. max_backoff_seconds < base_backoff_seconds
+    let mut bad = valid_json.clone();
+    bad["base_backoff_seconds"] = json!(10.0);
+    bad["max_backoff_seconds"] = json!(5.0);
+    assert!(task_spec_from_json(&bad).is_err());
+
+    // 9. max_attempts == 0
+    let mut bad = valid_json.clone();
+    bad["max_attempts"] = json!(0);
+    assert!(task_spec_from_json(&bad).is_err());
+}
+
+#[test]
+fn test_p2_1_generation_view_order_determinism() {
+    let clock = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open_memory(clock.clone(), 30.0, CONTINUITY_MAX_BYTES)
+        .expect("open in-memory kernel");
+
+    for name in ["default", "general"] {
+        let part = PartitionSpec {
+            name: PartitionId::new(name),
+            desired_capacity: 5,
+            retention: Retention::Resident,
+            execution_target: "local".into(),
+            execution_profile: "default".into(),
+            tags: vec![],
+        };
+        kernel.upsert_partition(&part).unwrap();
+    }
+
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Compile multiple proposals with distinct timestamps by advancing clock
+    let mut proposal_ids = Vec::new();
+    for i in 0..5 {
+        clock.advance(1.0);
+        let intent = RawWorkIntent {
+            raw_intent_key: format!("prop_{i}"),
+            objective: format!("Objective {i}"),
+            information_function: InformationFunction::Expand,
+            semantic_input_set: SemanticInputSet::new(),
+            rationale: None,
+            suggested_task_spec: Some(TaskSpec::new(format!("task_{i}"), json!({}))),
+        };
+        let p = kernel
+            .compile_intent(&gen.generation_id, intent, "root", "session", 1)
+            .unwrap();
+        proposal_ids.push(p.proposal_id);
+    }
+
+    // Admit the proposals in a distinct sequence: 2, 0, 4
+    let mut admitted_tasks = Vec::new();
+    for idx in [2, 0, 4] {
+        let rev = kernel
+            .get_generation_view(&gen.generation_id)
+            .unwrap()
+            .generation
+            .revision;
+        let tid = kernel
+            .admit_proposal(&proposal_ids[idx], rev, None)
+            .unwrap();
+        admitted_tasks.push(tid);
+    }
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+
+    // Admitted tasks must be strictly ordered by admission_seq ASC
+    assert_eq!(view.admitted_task_ids, admitted_tasks);
+
+    // Pending proposals must be strictly ordered by created_at ASC, proposal_id ASC
+    let remaining_pending: Vec<_> = view.pending_proposal_ids;
+    assert_eq!(remaining_pending.len(), 2);
+    // Proposal 1 and Proposal 3 were created in chronological order (created_at=1002.0 then 1004.0)
+    assert_eq!(remaining_pending[0], proposal_ids[1]);
+    assert_eq!(remaining_pending[1], proposal_ids[3]);
+}
+
+#[test]
+fn test_p2_3_generation_task_bindings_proposal_unique_constraint() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(agentype_storage_sqlite::SCHEMA_SQL)
+        .unwrap();
+
+    let now = 1000.0;
+    // Insert generation
+    conn.execute(
+        "INSERT INTO generations(generation_id, state, revision, admission_seq, seed_payload_json, created_at)
+         VALUES('gen_1', 'OPEN', 0, 0, '{}', ?1)",
+        rusqlite::params![now],
+    ).unwrap();
+
+    // Insert pool_partitions for tasks FK
+    conn.execute(
+        "INSERT INTO pool_partitions(name, desired_capacity, retention, execution_target, execution_profile, created_at, updated_at)
+         VALUES('default', 1, 'resident', 'local', 'default', ?1, ?1)",
+        rusqlite::params![now],
+    ).unwrap();
+
+    // Insert batches for tasks
+    conn.execute(
+        "INSERT INTO batches(id, state, metadata_json, created_at, updated_at)
+         VALUES('batch_1', 'ACTIVE', '{}', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .unwrap();
+
+    // Insert task 1 and task 2
+    for tid in ["task_1", "task_2"] {
+        conn.execute(
+            "INSERT INTO tasks(id, batch_id, name, payload_json, acceptance_json, partition_name,
+                               workstream_id, continuity, affinity_tags_json, workspace_mode, required, priority, state,
+                               max_attempts, retry_classes_json, base_backoff_seconds, max_backoff_seconds, created_at, updated_at)
+             VALUES(?1, 'batch_1', 't', '{}', '{}', 'default', NULL, 'none', '[]', 'write', 1, 0, 'QUEUED', 1, '[]', 1.0, 60.0, ?2, ?2)",
+            rusqlite::params![tid, now],
+        ).unwrap();
+    }
+
+    // Insert proposal
+    conn.execute(
+        "INSERT INTO compiled_work_proposals(proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
+                                             intent_fingerprint, information_function, compiler_version, state, created_at, updated_at)
+         VALUES('prop_1', 'gen_1', 'root', 'sess', 'k', 'fp', 'EXPAND', 1, 'ADMITTED', ?1, ?1)",
+        rusqlite::params![now],
+    ).unwrap();
+
+    // First binding with prop_1 succeeds
+    conn.execute(
+        "INSERT INTO generation_task_bindings(generation_id, task_id, proposal_id, information_function,
+                                              admission_seq, admitted_task_spec_json, created_at)
+         VALUES('gen_1', 'task_1', 'prop_1', 'EXPAND', 1, '{}', ?1)",
+        rusqlite::params![now],
+    ).unwrap();
+
+    // Second binding with SAME proposal_id ('prop_1') MUST fail the UNIQUE constraint
+    let err = conn.execute(
+        "INSERT INTO generation_task_bindings(generation_id, task_id, proposal_id, information_function,
+                                              admission_seq, admitted_task_spec_json, created_at)
+         VALUES('gen_1', 'task_2', 'prop_1', 'EXPAND', 2, '{}', ?1)",
+        rusqlite::params![now],
+    ).unwrap_err();
+
+    let err_str = err.to_string();
+    assert!(err_str.contains("UNIQUE constraint failed: generation_task_bindings.proposal_id"));
+}
+
+#[test]
+fn test_p2_4_frozen_generation_rejects_expand_compilation() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    // Freeze generation
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+
+    // 1. Attempt to compile EXPAND intent on FROZEN generation -> Rejected with InvalidTransition
+    let expand_intent = RawWorkIntent {
+        raw_intent_key: "expand_after_freeze".into(),
+        objective: "Should fail".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_exp", json!({}))),
+    };
+
+    let err = kernel
+        .compile_intent(&gen.generation_id, expand_intent, "root", "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvalidTransition(_)));
+
+    // 2. Attempt to compile COMPRESS_POSITIVE intent on FROZEN generation -> Succeeds
+    let compress_intent = RawWorkIntent {
+        raw_intent_key: "compress_after_freeze".into(),
+        objective: "Should succeed".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("task_comp", json!({}))),
+    };
+
+    let prop = kernel
+        .compile_intent(&gen.generation_id, compress_intent, "root", "session", 1)
+        .unwrap();
+    assert_eq!(
+        prop.information_function,
+        InformationFunction::CompressPositive
+    );
+    assert_eq!(prop.state, ProposalStateKind::Pending);
+}

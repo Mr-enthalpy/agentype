@@ -120,178 +120,142 @@ pub fn validate_semantic_input_set(
 }
 
 pub fn task_spec_to_json(spec: &TaskSpec) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert("name".into(), Value::String(spec.name.clone()));
-    map.insert("payload".into(), spec.payload.clone());
-    map.insert("acceptance".into(), spec.acceptance.clone());
-    map.insert(
-        "partition".into(),
-        Value::String(spec.partition.as_str().to_string()),
-    );
-    map.insert(
-        "workstream_id".into(),
-        spec.workstream_id
-            .as_ref()
-            .map(|w| Value::String(w.as_str().to_string()))
-            .unwrap_or(Value::Null),
-    );
-    map.insert(
-        "continuity".into(),
-        Value::String(spec.continuity.as_sql().to_string()),
-    );
-    map.insert(
-        "affinity_tags".into(),
-        Value::Array(
-            spec.affinity_tags
-                .iter()
-                .map(|t| Value::String(t.clone()))
-                .collect(),
-        ),
-    );
-    map.insert(
-        "workspace_mode".into(),
-        Value::String(spec.workspace_mode.as_sql().to_string()),
-    );
-    map.insert(
-        "dependencies".into(),
-        Value::Array(
-            spec.dependencies
-                .iter()
-                .map(|d| Value::String(d.clone()))
-                .collect(),
-        ),
-    );
-    map.insert("priority".into(), Value::Number(spec.priority.into()));
-    map.insert(
-        "max_attempts".into(),
-        Value::Number(spec.retry_policy.max_attempts.into()),
-    );
-    map.insert(
-        "retry_classes".into(),
-        Value::Array(
-            spec.retry_policy
-                .retry_classes
-                .iter()
-                .map(|c| Value::String(c.as_sql().to_string()))
-                .collect(),
-        ),
-    );
-    map.insert(
-        "base_backoff_seconds".into(),
-        serde_json::Number::from_f64(spec.retry_policy.base_backoff_seconds)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::Number(1.into())),
-    );
-    map.insert(
-        "max_backoff_seconds".into(),
-        serde_json::Number::from_f64(spec.retry_policy.max_backoff_seconds)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::Number(60.into())),
-    );
-    map.insert(
-        "supersedes_task_id".into(),
-        spec.supersedes_task_id
-            .as_ref()
-            .map(|s| Value::String(s.as_str().to_string()))
-            .unwrap_or(Value::Null),
-    );
-    map.insert(
-        "task_id".into(),
-        spec.task_id
-            .as_ref()
-            .map(|t| Value::String(t.as_str().to_string()))
-            .unwrap_or(Value::Null),
-    );
-    Value::Object(map)
+    spec.canonical_json()
 }
 
 pub fn task_spec_from_json(val: &Value) -> Result<TaskSpec, Error> {
-    let name = val
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::invariant("task_spec must be a JSON object"))?;
+
+    let name = obj
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or("task")
+        .ok_or_else(|| Error::invariant("missing or invalid field: name"))?
         .to_string();
-    let payload = val
+
+    let payload = obj
         .get("payload")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-    let acceptance = val
+        .ok_or_else(|| Error::invariant("missing field: payload"))?
+        .clone();
+
+    let acceptance = obj
         .get("acceptance")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-    let partition = PartitionId::new(
-        val.get("partition")
-            .and_then(Value::as_str)
-            .unwrap_or("default"),
-    );
-    let workstream_id = val
-        .get("workstream_id")
+        .ok_or_else(|| Error::invariant("missing field: acceptance"))?
+        .clone();
+
+    let part_str = obj
+        .get("partition")
         .and_then(Value::as_str)
-        .map(WorkstreamId::from_string);
-    let continuity = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: partition"))?;
+    if part_str.trim().is_empty() {
+        return Err(Error::invariant("partition cannot be empty"));
+    }
+    let partition = PartitionId::new(part_str);
+
+    let workstream_id = match obj.get("workstream_id") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(WorkstreamId::from_string(s)),
+        Some(_) => return Err(Error::invariant("workstream_id must be a string or null")),
+    };
+
+    let continuity_str = obj
         .get("continuity")
         .and_then(Value::as_str)
-        .and_then(|s| ContinuityPreference::parse_sql(s).ok())
-        .unwrap_or(ContinuityPreference::None);
-    let affinity_tags = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: continuity"))?;
+    let continuity = ContinuityPreference::parse_sql(continuity_str)?;
+
+    let tags_arr = obj
         .get("affinity_tags")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let workspace_mode = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: affinity_tags"))?;
+    let mut affinity_tags = Vec::with_capacity(tags_arr.len());
+    for item in tags_arr {
+        let t = item
+            .as_str()
+            .ok_or_else(|| Error::invariant("affinity_tags element must be a string"))?;
+        affinity_tags.push(t.to_string());
+    }
+
+    let mode_str = obj
         .get("workspace_mode")
         .and_then(Value::as_str)
-        .and_then(|s| agentype_core::WorkspaceMode::parse_sql(s).ok())
-        .unwrap_or(agentype_core::WorkspaceMode::Write);
-    let dependencies = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: workspace_mode"))?;
+    let workspace_mode = agentype_core::WorkspaceMode::parse_sql(mode_str)?;
+
+    let deps_arr = obj
         .get("dependencies")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let priority = val.get("priority").and_then(Value::as_i64).unwrap_or(0);
+        .ok_or_else(|| Error::invariant("missing or invalid field: dependencies"))?;
+    let mut dependencies = Vec::with_capacity(deps_arr.len());
+    for item in deps_arr {
+        let d = item
+            .as_str()
+            .ok_or_else(|| Error::invariant("dependencies element must be a string"))?;
+        dependencies.push(d.to_string());
+    }
 
-    let max_attempts = val
+    let priority = obj
+        .get("priority")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::invariant("missing or invalid field: priority"))?;
+
+    let max_attempts = obj
         .get("max_attempts")
         .and_then(Value::as_u64)
-        .map(|u| u as u32)
-        .unwrap_or(1);
-    let retry_classes = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: max_attempts"))?
+        as u32;
+    if max_attempts == 0 {
+        return Err(Error::invariant("max_attempts must be >= 1"));
+    }
+
+    let rc_arr = obj
         .get("retry_classes")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter_map(|s| FailureClass::parse_sql(s).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let base_backoff_seconds = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: retry_classes"))?;
+    let mut retry_classes = Vec::with_capacity(rc_arr.len());
+    for item in rc_arr {
+        let c_str = item
+            .as_str()
+            .ok_or_else(|| Error::invariant("retry_classes element must be a string"))?;
+        retry_classes.push(FailureClass::parse_sql(c_str)?);
+    }
+
+    let base_backoff_seconds = obj
         .get("base_backoff_seconds")
         .and_then(Value::as_f64)
-        .unwrap_or(1.0);
-    let max_backoff_seconds = val
+        .ok_or_else(|| Error::invariant("missing or invalid field: base_backoff_seconds"))?;
+    if !base_backoff_seconds.is_finite() || base_backoff_seconds <= 0.0 {
+        return Err(Error::invariant(
+            "base_backoff_seconds must be a finite positive number",
+        ));
+    }
+
+    let max_backoff_seconds = obj
         .get("max_backoff_seconds")
         .and_then(Value::as_f64)
-        .unwrap_or(60.0);
+        .ok_or_else(|| Error::invariant("missing or invalid field: max_backoff_seconds"))?;
+    if !max_backoff_seconds.is_finite() || max_backoff_seconds < base_backoff_seconds {
+        return Err(Error::invariant(
+            "max_backoff_seconds must be a finite number >= base_backoff_seconds",
+        ));
+    }
 
-    let supersedes_task_id = val
-        .get("supersedes_task_id")
-        .and_then(Value::as_str)
-        .map(TaskId::from_string);
-    let task_id = val
-        .get("task_id")
-        .and_then(Value::as_str)
-        .map(TaskId::from_string);
+    let supersedes_task_id = match obj.get("supersedes_task_id") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(TaskId::from_string(s)),
+        Some(_) => {
+            return Err(Error::invariant(
+                "supersedes_task_id must be a string or null",
+            ))
+        }
+    };
+
+    let task_id = match obj.get("task_id") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(TaskId::from_string(s)),
+        Some(_) => return Err(Error::invariant("task_id must be a string or null")),
+    };
 
     Ok(TaskSpec {
         name,
@@ -373,6 +337,14 @@ pub fn compile_intent(
             generation_id.as_str()
         )));
     }
+    if gen_state == GenerationState::Frozen
+        && intent.information_function == InformationFunction::Expand
+    {
+        return Err(Error::invalid_transition(format!(
+            "cannot compile EXPAND intent for FROZEN generation {:?}",
+            generation_id.as_str()
+        )));
+    }
 
     // 2. Validate semantic input set provenance
     validate_semantic_input_set(tx, &intent.semantic_input_set)?;
@@ -393,7 +365,7 @@ pub fn compile_intent(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
                 intent_fingerprint, information_function, normalized_task_spec_json, semantic_input_set_json,
-                compiler_version, state, admitted_task_id, expiration_reason, created_at, updated_at
+                compiler_version, state, admitted_task_id, expiration_reason, rejection_reason, created_at, updated_at
          FROM compiled_work_proposals
          WHERE generation_id=?1 AND source_kind=?2 AND source_ref=?3 AND raw_intent_key=?4 AND compiler_version=?5",
         params![
@@ -417,12 +389,13 @@ pub fn compile_intent(
             let st_str: String = r.get(10)?;
             let at_str: Option<String> = r.get(11)?;
             let er_str: Option<String> = r.get(12)?;
-            let cat: f64 = r.get(13)?;
-            let uat: f64 = r.get(14)?;
+            let rej_str: Option<String> = r.get(13)?;
+            let cat: f64 = r.get(14)?;
+            let uat: f64 = r.get(15)?;
 
             Ok((
                 pid, gid, sk, sr, rik, ifp, if_str, spec_str, set_str, cv, st_str, at_str, er_str,
-                cat, uat,
+                rej_str, cat, uat,
             ))
         },
     )? {
@@ -440,6 +413,7 @@ pub fn compile_intent(
             st_str,
             at_str,
             er_str,
+            rej_str,
             cat,
             uat,
         ) = existing;
@@ -481,6 +455,7 @@ pub fn compile_intent(
             state,
             admitted_task_id: at_str.map(TaskId::from_string),
             expiration_reason: exp_reason,
+            rejection_reason: rej_str,
             created_at: cat,
             updated_at: uat,
         });
@@ -559,6 +534,7 @@ pub fn compile_intent(
         state: ProposalStateKind::Pending,
         admitted_task_id: None,
         expiration_reason: None,
+        rejection_reason: None,
         created_at: now,
         updated_at: now,
     })
@@ -1011,7 +987,7 @@ pub fn reject_proposal(
     let updated = tx
         .execute(
             "UPDATE compiled_work_proposals
-         SET state='REJECTED', expiration_reason=?1, updated_at=?2
+         SET state='REJECTED', rejection_reason=?1, updated_at=?2
          WHERE proposal_id=?3 AND state='PENDING'",
             params![reason, now, proposal_id.as_str()],
         )
@@ -1088,7 +1064,8 @@ pub fn get_generation_view(
             "SELECT b.information_function, t.id, t.state
          FROM generation_task_bindings b
          JOIN tasks t ON b.task_id = t.id
-         WHERE b.generation_id = ?1",
+         WHERE b.generation_id = ?1
+         ORDER BY b.admission_seq ASC",
         )
         .map_err(map_sqlite)?;
 
@@ -1123,7 +1100,12 @@ pub fn get_generation_view(
 
     // Proposals
     let mut prop_stmt = tx
-        .prepare("SELECT proposal_id, state FROM compiled_work_proposals WHERE generation_id = ?1")
+        .prepare(
+            "SELECT proposal_id, state
+         FROM compiled_work_proposals
+         WHERE generation_id = ?1
+         ORDER BY created_at ASC, proposal_id ASC",
+        )
         .map_err(map_sqlite)?;
 
     let prop_rows = prop_stmt

@@ -317,7 +317,8 @@ CREATE TABLE IF NOT EXISTS compiled_work_proposals (
     compiler_version INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL CHECK (state IN ('PENDING','ADMITTED','REJECTED','EXPIRED')),
     admitted_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-    expiration_reason TEXT,
+    expiration_reason TEXT CHECK (expiration_reason IS NULL OR expiration_reason IN ('GENERATION_FROZEN','GENERATION_CLOSED','SUPERSEDED','POLICY_CHANGED')),
+    rejection_reason TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
@@ -330,7 +331,7 @@ WHERE admitted_task_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS generation_task_bindings (
     generation_id TEXT NOT NULL REFERENCES generations(generation_id) ON DELETE CASCADE,
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    proposal_id TEXT NOT NULL REFERENCES compiled_work_proposals(proposal_id) ON DELETE RESTRICT,
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES compiled_work_proposals(proposal_id) ON DELETE RESTRICT,
     information_function TEXT NOT NULL CHECK (information_function IN ('EXPAND','COMPRESS_POSITIVE','COMPRESS_NEGATIVE')),
     admission_seq INTEGER NOT NULL,
     admitted_task_spec_json TEXT NOT NULL,
