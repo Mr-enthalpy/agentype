@@ -18,6 +18,10 @@ Normative: [docs/architecture/overview.md](architecture/overview.md) (long-lived
 Informational: acceptance, reports, development notes, CHANGELOG, this index.
 Layout notes and remaining documentation debt: [docs/development/repo-normalization.md](development/repo-normalization.md) (full list there only).
 
+V0.2 implementation status: the M5 execution/runtime substrate is frozen. The
+repository is entering M6 semantic organization/design. See the
+[M5 runtime freeze and M6 handoff report](reports/v0.2/riir-m5-runtime-freeze.md).
+
 ## Taxonomy (where a new file goes)
 
 | Directory | Holds | Does not hold |
