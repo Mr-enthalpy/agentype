@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "SQLite WAL authority for the Agentype M4 kernel"
+# Internal implementation crate: the supported Agentype production API is
+# `agentype-runtime`. Direct `Kernel` use is not a supported production API
+# and does not constitute a Scheduler runtime composition surface.
+publish = false
 
 [features]
 test-support = []

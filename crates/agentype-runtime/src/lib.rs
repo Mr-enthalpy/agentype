@@ -54,7 +54,6 @@ pub use recovery::{
 pub use scheduler_control::{BatchSubmission, SchedulerControl};
 pub use supervision::{
     RenewalOutcome, SupervisionAdmitSink, SupervisionError, SupervisionRegistry, SupervisionRunner,
-    SupervisionService,
 };
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 
@@ -1337,6 +1336,7 @@ pub fn recover_authority(kernel: &Kernel) -> Result<ExpireReport, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervision::SupervisionService;
     use agentype_adapter_api::{
         AdapterResult, ExecutionObservation, FakeAdapter, PhysicalExecutionOutcome, RuntimeHandle,
     };

@@ -481,7 +481,8 @@ mod tests {
     use super::*;
     use crate::deadlines::test_deadlines;
     use crate::process_lock::ReadyPermit;
-    use crate::{AdapterRegistry, SupervisionRunner, SupervisionService};
+    use crate::supervision::SupervisionService;
+    use crate::{AdapterRegistry, SupervisionRunner};
     use agentype_adapter_api::FakeAdapter;
     use agentype_core::{
         FailureClass, LeaseState, ManualClock, PartitionSpec, Retention, RetryPolicy, TaskSpec,

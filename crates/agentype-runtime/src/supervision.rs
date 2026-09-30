@@ -153,7 +153,7 @@ pub(crate) struct SupervisionIdentity {
 }
 
 impl SupervisionIdentity {
-    pub(crate) fn new(
+    pub fn new(
         execution_id: ExecutionId,
         request_id: RequestId,
         attempt_id: AttemptId,
@@ -317,6 +317,9 @@ impl SupervisionRegistry {
         self.entries.is_empty()
     }
 
+    /// Only the test façade `renew_one` reads this.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     fn entry_identity(&self, execution_id: &ExecutionId) -> Option<SupervisionIdentity> {
         self.entries.get(execution_id).map(|e| e.identity.clone())
     }
@@ -474,7 +477,7 @@ impl ObserverWake {
     }
 }
 
-pub struct SupervisionService {
+pub(crate) struct SupervisionService {
     kernel: Arc<Kernel>,
     registry: Arc<Mutex<SupervisionRegistry>>,
     heartbeat_interval: Duration,
@@ -502,7 +505,7 @@ impl SupervisionService {
     /// Compose the service against a Kernel. The configured lease duration
     /// must exactly match the Kernel's lease authority; the supervisor never
     /// decides lease extension durations independently (M5.3 §30).
-    pub fn new(
+    pub(crate) fn new(
         kernel: Arc<Kernel>,
         timing: &RuntimeTimingConfig,
     ) -> Result<Self, SupervisionError> {
@@ -531,7 +534,7 @@ impl SupervisionService {
     /// Enable the M5.8 physical-freshness gate. Default is off so M5.3
     /// tests keep renewing without an observer. Production attaches a
     /// positive limit strictly below `lease_seconds`.
-    pub fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
+    pub(crate) fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
         self.registry
             .lock()
             .expect("supervision registry lock")
@@ -560,7 +563,7 @@ impl SupervisionService {
     /// same token can never be admitted anywhere again, which is what makes
     /// "one runtime supervision owner per admitted Execution" structural
     /// rather than per-registry discipline (M5.3 audit P1-3).
-    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
         // Fail closed on a malformed capability: the scheduling anchor and
         // the durable expiry must be finite, and the fenced first renewal
         // must precede the expiry it produced.
@@ -624,7 +627,12 @@ impl SupervisionService {
     }
 
     /// Renew one admitted execution right now (deterministic single step).
-    pub fn renew_one(
+    ///
+    /// Test façade: production renewal is the heartbeat loop's, reached
+    /// through the daemon. Not part of the supported production surface.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn renew_one(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<RenewalOutcome, SupervisionError> {
@@ -640,7 +648,7 @@ impl SupervisionService {
     /// Renew every entry whose deadline has arrived at `now` (deterministic
     /// tick). A fatal persistence fault on any entry stops the batch and
     /// propagates.
-    pub fn renew_due(&self, now: UnixTime) -> Result<Vec<RenewalOutcome>, SupervisionError> {
+    pub(crate) fn renew_due(&self, now: UnixTime) -> Result<Vec<RenewalOutcome>, SupervisionError> {
         let due = {
             let registry = self.registry.lock().expect("supervision registry lock");
             registry.due(now)
@@ -659,7 +667,7 @@ impl SupervisionService {
     }
 
     /// Renew whatever is due at the Kernel's current time.
-    pub fn renew_due_now(&self) -> Result<Vec<RenewalOutcome>, SupervisionError> {
+    pub(crate) fn renew_due_now(&self) -> Result<Vec<RenewalOutcome>, SupervisionError> {
         let now = self.kernel.now();
         self.renew_due(now)
     }
@@ -1028,7 +1036,7 @@ impl SupervisionRunner {
     /// Admit an execution whose fenced RUNNING confirmation + first renewal
     /// has just committed (dispatcher → supervision handoff, M5.3 §19).
     /// Consumes the move-only admission capability.
-    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
         // Serialize the mutation with the loop's deadline computation (the
         // loop reads the earliest deadline under the same state lock), so a
         // new admission's wake-up can never be lost and the loop can never
@@ -1074,7 +1082,7 @@ impl SupervisionRunner {
     }
 
     /// Shared process-local registry handle for the physical observer.
-    pub fn service(&self) -> SupervisionService {
+    pub(crate) fn service(&self) -> SupervisionService {
         self.service.clone()
     }
 
@@ -1162,7 +1170,7 @@ pub struct SupervisionAdmitSink {
 }
 
 impl SupervisionAdmitSink {
-    pub fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
+    pub(crate) fn admit(&self, admission: SupervisionAdmission) -> Result<(), SupervisionError> {
         let state = self.shared.state.lock().expect("runner state lock");
         if state.phase != RunnerPhase::Running {
             return Err(SupervisionError::RunnerStopped(
@@ -1202,7 +1210,8 @@ impl SupervisionFreshnessSink {
     /// A sink with no heartbeat loop behind it. Refreshes still re-arm the
     /// registry, but nothing is woken. Test composition only.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn standalone(service: SupervisionService) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn standalone(service: SupervisionService) -> Self {
         Self {
             service,
             shared: Arc::new(RunnerShared::default()),
@@ -1210,7 +1219,7 @@ impl SupervisionFreshnessSink {
     }
 
     /// Composition knob, not a renewal capability.
-    pub fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
+    pub(crate) fn enable_freshness_gate(&self, freshness_limit_seconds: f64) {
         self.service.enable_freshness_gate(freshness_limit_seconds);
     }
 
