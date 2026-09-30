@@ -59,6 +59,13 @@ impl SqliteRuntimeConfig {
                     "a temporary sqlite database is not a production scheduler store".into(),
                 ));
             }
+            StorePathKind::UnsupportedEncoding => {
+                return Err(ProcessLockError::IdentityUnresolvable(format!(
+                    "the scheduler store path must be UTF-8 representable; this one is not, \
+                     so a `file:` prefix could not be detected in it: {}",
+                    path.display()
+                )));
+            }
         }
         if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
             return Err(ProcessLockError::IdentityUnresolvable(
@@ -497,16 +504,16 @@ mod tests {
 
     #[test]
     fn memory_path_fails_closed() {
-        for rejected in [":memory:", ":memory:?cache=shared"] {
-            match SqliteRuntimeConfig::new(rejected, 10.0, 16_384) {
-                Err(ProcessLockError::IdentityUnresolvable(detail)) => {
-                    assert!(
-                        detail.contains("in-memory"),
-                        "rejection must name the in-memory contract, got {detail}"
-                    );
-                }
-                other => panic!("{rejected} must fail closed, got {other:?}"),
+        // Bare `:memory:` only: with additional text it is an ordinary disk
+        // filename, and the shared-cache spelling is a `file:` URI.
+        match SqliteRuntimeConfig::new(":memory:", 10.0, 16_384) {
+            Err(ProcessLockError::IdentityUnresolvable(detail)) => {
+                assert!(
+                    detail.contains("in-memory"),
+                    "rejection must name the in-memory contract, got {detail}"
+                );
             }
+            other => panic!("`:memory:` must fail closed, got {other:?}"),
         }
     }
 
@@ -588,12 +595,33 @@ mod tests {
             "scheduler.sqlite",
             "./scheduler.sqlite",
             "/tmp/scheduler.sqlite",
+            // Bare `:memory:` is special only with no additional text.
+            ":memory:?cache=shared",
         ] {
             assert!(
                 SqliteRuntimeConfig::new(accepted, 10.0, 16_384).is_ok(),
                 "{accepted} is a literal filesystem path and must be accepted"
             );
         }
+    }
+
+    /// M5.8 audit round 7 P1: a `file:` prefix can be hidden in a filename that
+    /// is not valid UTF-8, and on Unix SQLite sees those raw bytes. The config
+    /// boundary must refuse such a path instead of treating it as literal.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_store_path_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let hidden_uri = PathBuf::from(OsString::from_vec(b"file:agentype-\xff.sqlite".to_vec()));
+        assert!(
+            matches!(
+                SqliteRuntimeConfig::new(hidden_uri, 10.0, 16_384),
+                Err(ProcessLockError::IdentityUnresolvable(_))
+            ),
+            "a non-UTF-8 URI filename must not be accepted as a production store"
+        );
     }
 
     #[test]

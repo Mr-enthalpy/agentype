@@ -55,13 +55,25 @@ fn classification_table_names_every_sqlite_special_filename() {
         );
     }
 
-    for memory in [":memory:", ":memory:?cache=shared"] {
-        assert_eq!(
-            classify_store_path(Path::new(memory)),
-            StorePathKind::Memory,
-            "{memory} must classify as the in-memory spelling"
-        );
-    }
+    assert_eq!(
+        classify_store_path(Path::new(":memory:")),
+        StorePathKind::Memory,
+        "bare `:memory:` is the in-memory spelling"
+    );
+
+    // Bare `:memory:` is special only when there is no additional text. The
+    // shared-cache spelling is a URI filename, and a bare `:memory:` with a
+    // tail is an ordinary disk filename — it is *not* the memory database.
+    assert_eq!(
+        classify_store_path(Path::new(":memory:?cache=shared")),
+        StorePathKind::LiteralFile,
+        "`:memory:` with a query tail is an ordinary disk filename"
+    );
+    assert_eq!(
+        classify_store_path(Path::new("file::memory:?cache=shared")),
+        StorePathKind::SqliteUri,
+        "the shared-cache memory spelling is a URI filename"
+    );
 
     assert_eq!(
         classify_store_path(Path::new("")),
@@ -86,6 +98,59 @@ fn classification_table_names_every_sqlite_special_filename() {
             "{literal} is a literal filesystem path"
         );
     }
+}
+
+/// M5.8 audit round 7 P1: the classifier must work on the filename *bytes*
+/// SQLite receives, not on a Rust `str`. On Unix, rusqlite hands SQLite
+/// `OsStrExt::as_bytes()` unchanged and SQLite's URI test is a raw `memcmp`
+/// against `b"file:"`, so a URI filename that is not valid UTF-8 would slip
+/// past a `str`-based test and reproduce the lock/store identity split.
+///
+/// The second half is the counterweight: a non-UTF-8 filename that is not a
+/// URI is still a perfectly good literal store, so this is not a blanket ban
+/// on Unix byte paths.
+#[cfg(unix)]
+#[test]
+fn non_utf8_filenames_are_classified_by_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let uri = PathBuf::from(OsStr::from_bytes(b"file:agentype-\xff.sqlite"));
+    assert_eq!(
+        classify_store_path(&uri),
+        StorePathKind::SqliteUri,
+        "a `file:` prefix must be detected in raw bytes, not only in valid UTF-8"
+    );
+
+    let literal = PathBuf::from(OsStr::from_bytes(b"agentype-\xff.sqlite"));
+    assert_eq!(
+        classify_store_path(&literal),
+        StorePathKind::LiteralFile,
+        "a non-UTF-8 filename without the `file:` prefix is still a literal path"
+    );
+
+    // The same two filenames must be refused and accepted respectively by the
+    // boundary that actually hands them to SQLite. The error text is not
+    // inspected here: it embeds the path, which is not valid UTF-8.
+    if Kernel::open(&uri, clock(), 10.0, CONTINUITY_MAX_BYTES).is_ok() {
+        panic!("a non-UTF-8 URI filename must not open as a production store");
+    }
+
+    let dir = scratch("non-utf8");
+    let path = dir.join(OsStr::from_bytes(b"agentype-\xff.sqlite"));
+    Kernel::open(&path, clock(), 10.0, CONTINUITY_MAX_BYTES)
+        .expect("a non-UTF-8 literal filename must still open");
+    assert!(path.exists(), "the literal file must exist on disk");
+
+    // Fully non-UTF-8 bytes behind the prefix: the byte-level test still fires.
+    let hidden_uri = PathBuf::from(OsStr::from_bytes(b"file:\xfe\xff"));
+    assert_eq!(
+        classify_store_path(&hidden_uri),
+        StorePathKind::SqliteUri,
+        "the byte-level `file:` test must fire regardless of UTF-8 validity"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The production store must still open normally, and it must be genuinely
@@ -128,7 +193,6 @@ fn sqlite_special_filenames_are_refused_by_the_store_boundary() {
         ("file::memory:?cache=shared", "SqliteUri"),
         ("file:scheduler.sqlite?mode=rwc", "SqliteUri"),
         (":memory:", "Memory"),
-        (":memory:?cache=shared", "Memory"),
         ("", "Temporary"),
     ] {
         let path = Path::new(name);

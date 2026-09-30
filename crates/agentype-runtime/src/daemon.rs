@@ -1078,7 +1078,6 @@ mod tests {
             "file:///var/lib/agentype/scheduler.sqlite",
             // Round 6: special even with URI processing entirely off.
             ":memory:",
-            ":memory:?cache=shared",
             "",
         ] {
             let cfg = SqliteRuntimeConfig::new(rejected, LEASE, 16_384);
@@ -1088,6 +1087,14 @@ mod tests {
                 cfg.map(|c| c.path().to_path_buf())
             );
         }
+
+        // Round 7: bare `:memory:` is special only with no additional text, so
+        // this spelling is an ordinary disk filename, not a memory database.
+        // It is therefore accepted as a literal path.
+        assert!(
+            SqliteRuntimeConfig::new(":memory:?cache=shared", LEASE, 16_384).is_ok(),
+            "`:memory:` with a query tail is a literal filename, not the memory database"
+        );
 
         let alias = Path::new("file:scheduler.sqlite");
         assert_eq!(

@@ -73,16 +73,19 @@ shutdown is in progress MUST be rejected.
 **M5.8:** one Scheduler store has exactly one production daemon, identified
 by OS process lock on store file identity (not a Scheduler Lease). Startup
 MUST acquire that lock before Kernel recovery mutation or Adapter I/O. The
-production store is a literal file-backed filesystem path. Every SQLite
-special filename — URI filenames (`file:...`), the in-memory spelling
-(`:memory:`, including a URI query tail), and the empty filename that selects
-a private temporary database — MUST be rejected at the config boundary and at
+production store is a literal, UTF-8 representable, file-backed filesystem
+path. Every SQLite special filename — URI filenames (`file:...`), the bare
+in-memory spelling (`:memory:`, and only that exact spelling: any additional
+text makes it an ordinary filename), and the empty filename that selects a
+private temporary database — MUST be rejected at the config boundary and at
 the store-open boundary, because the lock resolves a filesystem handle while
-SQLite applies its own special-filename rules to the same string. The
-in-memory store MUST remain reachable only through an explicit
-`open_memory`-style entry point. Startup also assumes the Scheduler database
-pathname is not adversarially replaced between lock acquisition and Kernel
-open; the post-open identity confirmation re-resolves the path, so a
+SQLite applies its own special-filename rules to the same filename. The
+rejection MUST be decided on the filename bytes SQLite actually receives, so
+that a `file:` prefix hidden inside a filename that is not valid UTF-8 is
+still refused. The in-memory store MUST remain reachable only through an
+explicit `open_memory`-style entry point. Startup also assumes the Scheduler
+database pathname is not adversarially replaced between lock acquisition and
+Kernel open; the post-open identity confirmation re-resolves the path, so a
 pathname ABA inside that window is not detected. `recover_runtime` grants
 activation, not dispatch. READY requires the composition of a runtime-local
 `ReadyPermit` (minted after the process lock, recovery, and the

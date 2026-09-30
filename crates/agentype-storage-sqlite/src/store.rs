@@ -24,27 +24,61 @@ pub struct Store {
 /// [`StorePathKind::LiteralFile`]. The others are rejected before either the
 /// Runtime's process lock or SQLite acts.
 ///
-/// The classification exists because two layers must agree on one string. The
-/// process lock resolves a filesystem handle; SQLite resolves the same string
-/// with its own special-filename rules. Anything the two resolve differently
-/// is not a production store.
+/// The classification exists because two layers must agree on one filename.
+/// The process lock resolves a filesystem handle; SQLite resolves the same
+/// filename with its own special-filename rules. Anything the two resolve
+/// differently is not a production store.
+///
+/// The classification is defined over the *filename bytes* SQLite actually
+/// receives, not over a Rust `str`. On Unix, rusqlite hands SQLite
+/// `OsStrExt::as_bytes()` and SQLite's URI test is a raw `memcmp` against
+/// `b"file:"`, so a path that is not valid UTF-8 can still be a URI filename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorePathKind {
     /// A literal filesystem path: one durable file, the same file the process
     /// lock owns. This is the only production kind.
     LiteralFile,
     /// A SQLite URI filename, identified by the literal, case-sensitive
-    /// `file:` prefix. SQLite would open the URI's path component instead of
-    /// this string.
+    /// `file:` byte prefix. SQLite would open the URI's path component
+    /// instead of this filename.
     SqliteUri,
-    /// SQLite's private in-memory spelling `:memory:` (or `:memory:` with a
-    /// URI query tail). It creates a database that is not durable and is not
-    /// the file the process lock opened. `SQLITE_OPEN_URI` is not involved.
+    /// SQLite's private in-memory spelling: exactly `:memory:`, and nothing
+    /// else. Any additional text makes it an ordinary disk filename, so the
+    /// shared-cache form is written `file::memory:?cache=shared` and is
+    /// classified as [`StorePathKind::SqliteUri`]. Neither creates a durable
+    /// store, and `SQLITE_OPEN_URI` is not involved for the bare spelling.
     Memory,
     /// SQLite's private temporary-database spelling: the empty filename. It
     /// creates a temporary on-disk database that is deleted when the last
     /// connection closes, and it never touches a named path.
     Temporary,
+    /// A filename that is not valid UTF-8. On Unix such a filename reaches
+    /// SQLite unchanged, so it can carry a `file:` prefix that a `str`
+    /// comparison would miss; on Windows rusqlite rejects it outright. A
+    /// production store path must be UTF-8 representable, so this is
+    /// fail-closed rather than literal.
+    UnsupportedEncoding,
+}
+
+/// The filename bytes SQLite receives, exactly as rusqlite passes them.
+///
+/// On Unix this is the raw filename, whether or not it is UTF-8, which is what
+/// makes the `file:` test byte-exact. On every other platform rusqlite
+/// requires UTF-8 (`Path::to_str`) before it will open anything, so the bytes
+/// come from the UTF-8 view; a filename that is not UTF-8 is classified
+/// separately and never reaches SQLite.
+///
+/// `None` means the filename is not UTF-8 representable — see
+/// [`StorePathKind::UnsupportedEncoding`].
+#[cfg(unix)]
+fn store_path_bytes(path: &Path) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn store_path_bytes(path: &Path) -> Option<&[u8]> {
+    path.as_os_str().to_str().map(str::as_bytes)
 }
 
 /// Classify a Scheduler store filename.
@@ -56,21 +90,25 @@ pub enum StorePathKind {
 /// [`StorePathKind::LiteralFile`] — instead of as a list of rejections that
 /// can miss a spelling.
 ///
+/// The `file:` test is byte-based and therefore the *same* test SQLite
+/// performs, so it also catches a URI filename that is not valid UTF-8.
+///
 /// A literal file literally named `:memory:` is still reachable as
 /// `./:memory:`, which is what SQLite itself recommends.
 pub fn classify_store_path(path: &Path) -> StorePathKind {
-    let Some(text) = path.as_os_str().to_str() else {
-        // A path that is not representable as UTF-8 cannot carry any of
-        // SQLite's special spellings, so it is an ordinary filesystem path.
-        return StorePathKind::LiteralFile;
+    let Some(bytes) = store_path_bytes(path) else {
+        return StorePathKind::UnsupportedEncoding;
     };
-    if text.starts_with("file:") {
+    if bytes.starts_with(b"file:") {
         return StorePathKind::SqliteUri;
     }
-    if text == ":memory:" || text.starts_with(":memory:?") || text.starts_with(":memory:#") {
+    // The spellings compared below are ASCII, so on Unix a non-UTF-8 filename
+    // can never match them; on other platforms a non-UTF-8 filename already
+    // returned above.
+    if bytes == b":memory:" {
         return StorePathKind::Memory;
     }
-    if text.is_empty() {
+    if bytes.is_empty() {
         return StorePathKind::Temporary;
     }
     StorePathKind::LiteralFile
