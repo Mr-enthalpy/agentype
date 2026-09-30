@@ -74,20 +74,23 @@ shutdown is in progress MUST be rejected.
 by OS process lock on store file identity (not a Scheduler Lease). Startup
 MUST acquire that lock before Kernel recovery mutation or Adapter I/O. The
 production store is a literal, UTF-8 representable, file-backed filesystem
-path. Every SQLite special filename — URI filenames (`file:...`), the bare
-in-memory spelling (`:memory:`, and only that exact spelling: any additional
-text makes it an ordinary filename), and the empty filename that selects a
-private temporary database — MUST be rejected at the config boundary and at
-the store-open boundary, because the lock resolves a filesystem handle while
-SQLite applies its own special-filename rules to the same filename. The
-rejection MUST be decided on the filename bytes SQLite actually receives, so
-that a `file:` prefix hidden inside a filename that is not valid UTF-8 is
-still refused as a URI filename; the same byte test MUST NOT be used to admit
-non-UTF-8 literal paths, which are not a losslessly representable Scheduler
-identity and MUST be refused as well. The in-memory store MUST remain
-reachable only through an explicit `open_memory`-style entry point. Startup
-also assumes the Scheduler database pathname is not adversarially replaced
-between lock acquisition and Kernel open; the post-open identity confirmation
+path. Three SQLite special filenames — URI filenames (`file:...`, which are
+special only while SQLite URI processing is enabled), the bare in-memory
+spelling (`:memory:`, and only that exact spelling: any additional text makes
+it an ordinary filename), and the empty filename that selects a private
+temporary database (both of which are special independently of URI
+processing) — MUST be rejected at the config boundary and at the store-open
+boundary, because the lock resolves a filesystem handle while SQLite applies
+its own special-filename rules to the same filename. Separately, the store
+identity MUST be UTF-8 representable: a non-UTF-8 path is not a SQLite
+special filename but is likewise rejected, and the rejection MUST be decided
+on the filename bytes SQLite actually receives, so that a `file:` prefix
+hidden inside a filename that is not valid UTF-8 is refused as a URI
+filename rather than mistaken for a literal path. The in-memory store MUST
+remain reachable only through an explicit `open_memory`-style entry point.
+Startup also assumes the Scheduler database pathname is not adversarially
+replaced between lock acquisition and Kernel open; the post-open identity
+confirmation
 re-resolves the path, so a pathname ABA inside that window is not detected. `recover_runtime` grants
 activation, not dispatch. READY requires the composition of a runtime-local
 `ReadyPermit` (minted after the process lock, recovery, and the

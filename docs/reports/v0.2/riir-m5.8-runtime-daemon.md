@@ -39,15 +39,24 @@ is already stopping or failed does not create an Attempt.
 The lock and SQLite must resolve the same file from the same filename, so the
 production store is a literal file-backed filesystem path only. One shared
 classifier (`classify_store_path`, applied by both `SqliteRuntimeConfig` and
-`Store::open`) refuses every SQLite special filename:
+`Store::open`) refuses three SQLite special filenames plus one Agentype
+store-identity restriction:
 
 ```text
-file:...   URI filename — the lock would hold ./file:scheduler.sqlite while
-           SQLite opened ./scheduler.sqlite, so two daemons could each hold
-           a lock and share one store
-:memory:   private in-memory database (bare spelling only)
-""         private temporary database
-non-UTF-8  the `file:` prefix could be invisible to a str comparison
+SQLite special filenames
+    file:...   URI filename — the lock would hold ./file:scheduler.sqlite
+               while SQLite opened ./scheduler.sqlite, so two daemons could
+               each hold a lock and share one store; special only while URI
+               processing is enabled
+    :memory:   private in-memory database (bare spelling only); special
+               independently of URI processing
+    ""         private temporary database; special independently of URI
+               processing
+
+Agentype store-identity restriction
+    non-UTF-8  not a SQLite special filename: the store identity must be
+               UTF-8 representable, and the byte-level `file:` test exists so
+               such a name cannot hide a URI prefix
 ```
 
 `:memory:` and the empty filename are special even with URI processing
