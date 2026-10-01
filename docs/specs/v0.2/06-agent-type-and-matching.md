@@ -50,10 +50,12 @@ resolved) and implemented in `agentype-agent-contract`:
   capability **at its exact revision** (the source envelope is the provisionable
   ceiling; config/source declarations MUST stay within it), the imported
   `ENFORCED` evidence for security-class capabilities, mechanically enforceable
-  workspace/network modes and isolation, and the policy-bound evidence. A
-  capability's matcher kind and security class are defined once by a canonical
-  `CapabilityCatalog`; a `DECLARED`/`ENFORCED` claim label is never a proof, and
-  restrictions MUST NOT be inferred from a stronger capability.
+  workspace/network modes and isolation, the pinned sandbox policy, and the
+  policy-bound evidence **subject** (the exact `SpawnSourceRef`, `SourceConfigRef`
+  and config digest it was resolved for). A capability's matcher kind and
+  security class are defined once by a canonical `CapabilityCatalog`; a
+  `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
+  be inferred from a stronger capability.
 - `more_specific_for` is defined only once both types are executable and uses a
   single shared capability-constraint order. It MUST be strict (two types with
   equivalent authority are incomparable), includes affinity, lifecycle, sandbox
@@ -62,7 +64,9 @@ resolved) and implemented in `agentype-agent-contract`:
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
   tools, roots, affinity, budget, information functions, sandbox policy, anchor,
   security policy, and capability constraints; a derived type MUST NOT widen the
-  lifecycle mode set, weaken continuity, or weaken required isolation.
+  lifecycle mode set, weaken continuity, or weaken required isolation. Affinity
+  is an allowed-tag ceiling (`Derived ⊆ Base`), so a valid refinement never
+  enlarges the set of executable Tasks.
 
 ## Refinement monotonicity
 

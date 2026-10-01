@@ -67,7 +67,8 @@ CapabilityCatalog / CapabilityDefinition
                           the single authority for a capability's matcher kind
                           and security class; redefining a revision fails closed
 CapabilityValue           BOOL | SET | ORDERED | QUANTITY | EXACT
-CapabilityClaim           (exact reference, value, assurance declaration, evidence)
+CapabilityClaim           (exact reference, value, assurance declaration, and a
+                          diagnostic provenance ref; the ref is NOT a proof)
 TaskRequirement           information function, required capabilities/permissions/
                           tools/affinity, workspace/network, continuity, sandbox
                           policy, anchor, budget
@@ -82,8 +83,11 @@ SandboxPolicyRef          exact reference to the full spec-10 sandbox vocabulary
 PhysicalSafety            private, validated enforceable sets: isolation,
                           workspace modes, network modes
 ResolvedProvisioningEvidence
-                          imported enforcement facts bound to one AdapterPolicyRef;
-                          NO public production constructor in B.1
+                          imported enforcement facts bound to one exact candidate
+                          tuple: SpawnSourceRef + SourceConfigRef + config digest +
+                          AdapterPolicyRef; carries enforceable safety, enforced
+                          sandbox policies, and enforced capabilities; NO public
+                          production constructor in B.1
 AgentTypeSelector         Exact(ref) | Latest(id), resolved to exact pre-commit
 ```
 
@@ -127,6 +131,9 @@ task budget               <= agent budget_ceiling
 config.config_ref.source == source.source_ref        (exact revision)
 source/config active
 evidence.adapter_policy == source.adapter_policy     (adapter A's facts never fit source B)
+evidence.subject == (source_ref, config_ref, config_digest)
+                                                     (config A's evidence never covers config B)
+agent.sandbox_policy (if pinned) ∈ evidence.enforced sandbox policies
 agent lifecycle  ⊆ source lifecycle_modes
 agent continuity ∈ source continuity_modes
 for each exact capability revision the agent requires:
@@ -162,7 +169,7 @@ DerivedPermission ⊆ BasePermission
 DerivedVisibility ⊆ BaseVisibility
 DerivedTools      ⊆ BaseTools
 DerivedRoots      ⊆ BaseRoots
-DerivedAffinity   ⊇ BaseAffinity (affinity MAY narrow, never broaden)
+DerivedAffinity   ⊆ BaseAffinity (affinity is an allowed-tag ceiling: narrowing only)
 DerivedBudget     ≤ BaseBudget
 DerivedInformationFunctions ⊆ BaseInformationFunctions
 DerivedLifecycle ⊆ BaseLifecycle (lifecycle mode set MUST NOT widen)
@@ -210,6 +217,12 @@ REST/gRPC wire API                              (unspecified)
 
 Wild agency stays external: observing a harness-native subagent never yields a
 LogicalAgentId, Generation membership, Lease, or Result authority.
+
+B.2 obligations recorded here (not implemented in B.1): a published
+`(ref, canonical content digest)` MUST be immutable — the same exact ref with a
+different canonical content is an invariant violation, not a Rust caller
+discipline; and `config_digest` MUST be a validated canonical representation
+before it enters schema v6.
 
 ---
 
