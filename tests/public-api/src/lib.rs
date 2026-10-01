@@ -88,6 +88,24 @@
 /// ```
 pub fn supported_composition() {}
 
+/// The supported result-backed ingress, as a `no_run` doctest.
+///
+/// A host submits a worker suggestion by selecting the intent its durable
+/// Result already carries. The caller cannot pass a `RawWorkIntent`, so the
+/// proposal's provenance cannot be forged.
+///
+/// ```no_run
+/// use agentype_core::{GenerationId, ResultId};
+/// use agentype_runtime::IntentIngress;
+///
+/// fn submit(ingress: &IntentIngress<'_>, generation: &GenerationId, result: &ResultId) {
+///     let _proposal = ingress
+///         .compile_from_result(generation, result, "audit-session-race", 1)
+///         .expect("result-backed compile");
+/// }
+/// ```
+pub fn result_carried_ingress() {}
+
 /// Boundary probes: one `compile_fail` doctest per unreachable item.
 ///
 /// The numbering is the boundary list this milestone was audited against.

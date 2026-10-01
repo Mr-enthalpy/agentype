@@ -1840,6 +1840,36 @@ fn test_result_carried_intent_replay_is_idempotent() {
 }
 
 #[test]
+fn test_result_carried_intent_replay_after_close_returns_existing() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "carried_close_replay".into(),
+        objective: "Carried intent survives close replay".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("carried_close_replay", json!({}))),
+    };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+
+    let p1 = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "carried_close_replay", 1)
+        .unwrap();
+    let task_id = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    kernel.cancel_task(&task_id, true).unwrap();
+    kernel.close_generation(&gen.generation_id, 1).unwrap();
+
+    // Replay observes the durable commitment, not the now-CLOSED frontier.
+    let replay = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "carried_close_replay", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Admitted);
+}
+
+#[test]
 fn test_result_carried_expand_after_generation_freeze_is_not_compiled() {
     let kernel = test_kernel();
     let gen = kernel.create_generation(json!({})).unwrap();
