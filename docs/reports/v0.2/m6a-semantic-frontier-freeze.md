@@ -9,6 +9,11 @@ This is a milestone boundary marker. It records that M6-A is closed and frozen
 on top of the frozen M5 runtime substrate, and that it satisfies the freeze gate
 in the M6-A design. It adds no feature and supersedes no specification.
 
+> Historical note: this freeze was subsequently qualified by
+> [m6a-result-carried-intent-binding.md](m6a-result-carried-intent-binding.md).
+> Use that report for the final Result-backed ingress contract: a Result-backed
+> intent is bound to the Result's **content**, not merely its identity.
+
 ## Status
 
 ```text

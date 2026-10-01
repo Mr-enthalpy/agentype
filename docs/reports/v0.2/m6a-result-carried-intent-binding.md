@@ -109,16 +109,59 @@ P2 hardening (set semantics, fault-injection rollback proof, root README status)
 was then added on the same branch; those changes do not alter M6-A authority or
 the frozen frontier contract.
 
-## Still queued (non-blocking P2)
+## Systemic freeze
+
+A follow-up systemic audit of
+`main@a9020631561c6e211c7b7ea9f15d94917d2b02c9` returned:
 
 ```text
-schema relational hardening (admission_seq uniqueness, lifecycle CHECKs,
-    ON DELETE RESTRICT)
+P0 = 0
+P1 = 0
+P2 = deferred hardening
+VERDICT = FROZEN
+```
+
+M6-A is frozen:
+
+```text
+M5 execution/runtime substrate        FROZEN
+M6-A Semantic Frontier Kernel         FROZEN
+  Generation                          FROZEN
+  InformationFunction                 FROZEN
+  RawWorkIntent ingress contract      FROZEN
+  Result-carried intent binding       FROZEN
+  CompiledWorkProposal                FROZEN
+  GenerationTaskBinding               FROZEN
+  SemanticInputSet                    FROZEN
+  Root explicit admission             FROZEN
+  M5/M6 authority separation          FROZEN
+M6-B Agent Contract / SpawnSource      NEXT
+```
+
+## Still queued (non-blocking P2)
+
+Schema relational hardening — do it in a future migration window and do **not**
+bump schema v5 for this alone:
+
+```text
+UNIQUE(generation_id, admission_seq) on generation_task_bindings
+CHECK revision >= 0 and admission_seq >= 0 on generations
+state/timestamp consistency CHECKs on generations
+review semantic-history FKs toward RESTRICT or an explicit retention policy:
+    compiled_work_proposals.generation_id       (currently ON DELETE CASCADE)
+    compiled_work_proposals.admitted_task_id    (currently ON DELETE SET NULL)
+    generation_task_bindings.generation_id/task_id (currently ON DELETE CASCADE)
+```
+
+```text
 v4 -> v5 SQLite migration policy (D-DB-MIGRATE)
 strict nested unknown-field policy unification across all decoders
 ```
 
-These remain out of scope for this closure.
+Current correctness does not depend on the hardening: there is no
+Generation/Task deletion API, the only supported mutation path is
+`RootSemanticControl` / `IntentIngress`, and every mutation is serialized by a
+`BEGIN IMMEDIATE` write transaction. The items above are defense-in-depth.
 
 ## Baseline
 
@@ -129,6 +172,9 @@ Audited P1 closure head: 23b7727ac3310de7c3b7a588f9d2f5d6eefc53bc
 
 M6-A re-freeze merge (PR #20):
 414752a748f71f1ba4a82c1bff342ae7f369c852
+
+Systemic freeze audited main:
+a9020631561c6e211c7b7ea9f15d94917d2b02c9
 
 SCHEMA_VERSION = 5 (unchanged)
 ```
