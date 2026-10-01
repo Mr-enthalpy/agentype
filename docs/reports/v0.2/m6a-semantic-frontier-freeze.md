@@ -36,18 +36,24 @@ GenerationTaskBinding             task <-> generation membership + frozen inputs
 RawWorkIntent                     unprivileged ingress value (no authority, no
                                   independent durable identity; durability
                                   inherited from the source Result)
+IntentSource                      typed ingress provenance
+                                  Root   -> Root command reference
+                                  Result -> durable ResultId (verified)
 SemanticInputSet                  immutable provenance value object
 ArtifactRef                       content-addressed artifact reference
 GenerationView                    derived, rebuildable read model
 
 RootSemanticControl               create_generation
-                                  compile_intent
+                                  compile_root_intent
                                   admit_proposal
                                   reject_proposal
                                   freeze_generation
                                   close_generation
                                   read_generation_view
                                   read_proposal
+
+IntentIngress                     compile_from_result   (proposal-only; no
+                                  admit / reject / freeze / close)
 ```
 
 ## Frozen invariants
@@ -84,6 +90,13 @@ compile_intent resolves the durable proposal on its stable identity
 before consulting current Generation state, so a proposal committed before
 freeze or close replays to its final state instead of failing.
 ```
+
+Intent provenance is typed, not free-form: `IntentSource::Root` is anchored to a
+Root command reference, and `IntentSource::Result` is mechanically anchored to a
+durable `Result` (a missing result fails closed). The proposal-only
+`IntentIngress::compile_from_result` exposes exactly that result-backed path and
+holds no admission, freeze, or close authority; `RootSemanticControl` keeps the
+sole `compile_root_intent` plus frontier authority.
 
 `RawWorkIntent` is an ingress value, not a durable Scheduler record:
 worker-originated durability derives from the durable source `Result`, and
