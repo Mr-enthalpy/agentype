@@ -63,25 +63,38 @@ AgentTypeContract         information functions, capability envelope, permission
                           ceiling, visibility, tools, roots, budget ceiling,
                           security, lifecycle, continuity, anchor constraint
 CapabilityRef             exact (capability_id, revision); private fields
-CapabilitySpec            (matcher_kind, security_class), keyed by CapabilityRef
+CapabilityCatalog / CapabilityDefinition
+                          the single authority for a capability's matcher kind
+                          and security class; redefining a revision fails closed
 CapabilityValue           BOOL | SET | ORDERED | QUANTITY | EXACT
 CapabilityClaim           (exact reference, value, assurance declaration, evidence)
 TaskRequirement           information function, required capabilities/permissions/
-                          tools/affinity, workspace/network, continuity, anchor,
-                          budget
-SpawnSource               advertised lifecycle/continuity envelopes, functional
-                          capability envelope, source-wide declarations, status
-SourceConfig              opaque source-private config: exact source ref,
-                          identity, digest, credential refs, config-specific
+                          tools/affinity, workspace/network, continuity, sandbox
+                          policy, anchor, budget
+SpawnSource               advertised lifecycle/continuity envelopes, the
+                          provisionable functional envelope (ceiling), source-wide
                           declarations, status
-AdapterBindingPolicy      stable alias -> exact runtime binding, required safety
-AdapterBindingKey         opaque concrete physical execution domain
+SourceConfig              opaque source-private config: exact source ref,
+                          identity, digest, credential refs, config declarations
+                          (which MUST stay within the source envelope), status
+AdapterBindingPolicy      stable alias -> physical binding, required safety
+SandboxPolicyRef          exact reference to the full spec-10 sandbox vocabulary
 PhysicalSafety            private, validated enforceable sets: isolation,
                           workspace modes, network modes
-ProvisioningEvidenceSource / ResolvedProvisioningEvidence
-                          imported enforcement facts bound to one AdapterPolicyRef
+ResolvedProvisioningEvidence
+                          imported enforcement facts bound to one AdapterPolicyRef;
+                          NO public production constructor in B.1
 AgentTypeSelector         Exact(ref) | Latest(id), resolved to exact pre-commit
 ```
+
+A capability's security class is defined once by the [`CapabilityCatalog`], not
+per AgentType, so two AgentTypes cannot disagree about whether `network.lock@1`
+is `Sandbox` or `Functional`. The physical adapter binding key is **not**
+modeled here: B.4 consumes the canonical `agentype-execution-config`
+`AdapterBindingKey`. `ResolvedProvisioningEvidence` has no public constructor in
+B.1 (only `for_tests` under `test-support`); the M5 imported-binding bridge owns
+the production producer, exactly as `FrozenExecutionSafety` is owned by
+`agentype-execution-config`.
 
 `AgentType` MUST NOT be defined by model, provider, terminal, price tier, prompt
 alias, `SourceConfig`, or `AdapterBinding`. `SourceConfig` payloads are opaque:
@@ -117,10 +130,12 @@ evidence.adapter_policy == source.adapter_policy     (adapter A's facts never fi
 agent lifecycle  ⊆ source lifecycle_modes
 agent continuity ∈ source continuity_modes
 for each exact capability revision the agent requires:
-    spec = CapabilitySpec(capability_id, revision)   (missing spec fails closed)
-    functional: provided = config declaration, else source declaration, else envelope
+    definition = CapabilityCatalog(reference)        (missing definition fails closed)
+    functional: the source envelope is the provisionable CEILING; source and
+                config declarations MUST stay within it; provided is the config
+                declaration, else the source declaration, else the envelope
     security class: provided = evidence.enforced_capability(exact revision)
-    value must satisfy the spec matcher
+    value must satisfy the definition matcher
 required isolation / workspace / network enforcement comes from evidence.enforceable_safety
 ```
 
@@ -133,11 +148,11 @@ capability claim at a different revision never satisfies a requirement.
 
 Only defined once both `can_execute`, and only when A is no wider than B on
 *every* relevant dimension (information functions, permission, visibility,
-tools, roots, affinity, budget, workspace/network, tool roots, isolation,
-continuity, anchor, and capability constraints) with at least one dimension
-strictly narrower. Capability constraints use the same shared order as
-refinement (no requirement disappears; matcher and security class are never
-downgraded). Two types with equivalent authority are **incomparable**, not
+tools, roots, affinity, budget, **lifecycle**, workspace/network, tool roots,
+isolation, continuity, sandbox policy, anchor, and capability constraints) with
+at least one dimension strictly narrower. Capability constraints use the same
+shared order as refinement (no requirement disappears; each is at least as
+restrictive). Two types with equivalent authority are **incomparable**, not
 mutually more specific. Ranking MUST NOT use nominal inheritance depth.
 
 ### `is_valid_refinement(Base, Derived)`
@@ -150,12 +165,13 @@ DerivedRoots      ⊆ BaseRoots
 DerivedAffinity   ⊇ BaseAffinity (affinity MAY narrow, never broaden)
 DerivedBudget     ≤ BaseBudget
 DerivedInformationFunctions ⊆ BaseInformationFunctions
-lifecycle MUST NOT widen
+DerivedLifecycle ⊆ BaseLifecycle (lifecycle mode set MUST NOT widen)
 continuity MAY strengthen but MUST NOT weaken the base guarantee
 anchor MUST satisfy base anchor constraint
+sandbox policy MUST NOT widen (a base None may be pinned; a base Some must match)
 workspace/network/tool-roots/required-isolation MUST NOT weaken base
-capability constraints MUST NOT disappear, downgrade a matcher, or downgrade a
-    security class, and MUST be at least as restrictive per matcher
+capability constraints MUST NOT disappear and MUST be at least as restrictive
+    per matcher (security classes are catalog-global, so they cannot be downgraded)
 ```
 
 ---

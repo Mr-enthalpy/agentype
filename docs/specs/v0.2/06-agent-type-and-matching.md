@@ -29,7 +29,7 @@ upgrade (D-TYPE-REV-PIN resolved to exact-pin).
 Implementations MUST provide distinct predicates:
 
 - `can_execute(AgentType, TaskRequirement)`
-- `can_provision(SpawnSource, AgentType)`
+- `can_provision(SpawnSource, SourceConfig, AgentType, imported enforcement evidence)`
 - `more_specific_for(A, B, TaskRequirement)`
 - `is_valid_refinement(Base, Derived)`
 
@@ -44,24 +44,25 @@ resolved) and implemented in `agentype-agent-contract`:
 
 - `can_execute` checks the information function, capability envelope, permission
   ceiling, tools, task affinity, workspace/network policy, continuity minimum,
-  anchor, and budget.
+  sandbox policy, anchor, and budget.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle and continuity coverage, every required
-  capability **at its exact revision** (config declarations, then source
-  declarations, then the functional envelope), the imported `ENFORCED`
-  evidence for security-class capabilities, mechanically enforceable
+  capability **at its exact revision** (the source envelope is the provisionable
+  ceiling; config/source declarations MUST stay within it), the imported
+  `ENFORCED` evidence for security-class capabilities, mechanically enforceable
   workspace/network modes and isolation, and the policy-bound evidence. A
-  `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
-  be inferred from a stronger capability.
+  capability's matcher kind and security class are defined once by a canonical
+  `CapabilityCatalog`; a `DECLARED`/`ENFORCED` claim label is never a proof, and
+  restrictions MUST NOT be inferred from a stronger capability.
 - `more_specific_for` is defined only once both types are executable and uses a
-  single shared capability-constraint order (no requirement disappears; matcher
-  and security class are never downgraded). It MUST be strict (two types with
-  equivalent authority are incomparable), includes affinity and every authority
-  dimension, and MUST NOT rank by nominal inheritance depth.
+  single shared capability-constraint order. It MUST be strict (two types with
+  equivalent authority are incomparable), includes affinity, lifecycle, sandbox
+  policy, and every authority dimension, and MUST NOT rank by nominal
+  inheritance depth.
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
-  tools, roots, affinity, budget, information functions, anchor, security policy,
-  and capability constraints; a derived type MAY strengthen but MUST NOT weaken
-  lifecycle, continuity, or required isolation.
+  tools, roots, affinity, budget, information functions, sandbox policy, anchor,
+  security policy, and capability constraints; a derived type MUST NOT widen the
+  lifecycle mode set, weaken continuity, or weaken required isolation.
 
 ## Refinement monotonicity
 
