@@ -25,6 +25,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentype-agent-contract"
+version = "0.2.0"
+dependencies = [
+ "agentype-core",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "agentype-core"
 version = "0.2.0"
 dependencies = [
