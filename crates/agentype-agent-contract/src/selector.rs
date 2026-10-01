@@ -12,6 +12,19 @@ pub enum AgentTypeSelector {
     Latest(AgentTypeId),
 }
 
+impl AgentTypeSelector {
+    /// Build a `Latest` selector from a non-empty type id.
+    pub fn latest(type_id: impl Into<String>) -> Result<Self, ContractError> {
+        let type_id = AgentTypeId::from_string(type_id);
+        if type_id.as_str().trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "selector type id cannot be empty".into(),
+            });
+        }
+        Ok(Self::Latest(type_id))
+    }
+}
+
 pub fn resolve_selector(
     selector: &AgentTypeSelector,
     catalog: &impl AgentTypeLookup,
@@ -22,17 +35,24 @@ pub fn resolve_selector(
                 Ok(reference.clone())
             } else {
                 Err(ContractError::AgentTypeNotFound {
-                    type_id: reference.type_id().as_str().to_string(),
+                    type_id: reference.id().as_str().to_string(),
                     revision: reference.revision(),
                 })
             }
         }
-        AgentTypeSelector::Latest(type_id) => match catalog.latest_revision(type_id) {
-            Some(revision) => AgentTypeRef::new(type_id.as_str(), revision),
-            None => Err(ContractError::AgentTypeNotFound {
-                type_id: type_id.as_str().to_string(),
-                revision: 0,
-            }),
-        },
+        AgentTypeSelector::Latest(type_id) => {
+            if type_id.as_str().trim().is_empty() {
+                return Err(ContractError::InvalidRef {
+                    reason: "selector type id cannot be empty".into(),
+                });
+            }
+            match catalog.latest_revision(type_id) {
+                Some(revision) => AgentTypeRef::from_id(type_id.clone(), revision),
+                None => Err(ContractError::AgentTypeNotFound {
+                    type_id: type_id.as_str().to_string(),
+                    revision: 0,
+                }),
+            }
+        }
     }
 }

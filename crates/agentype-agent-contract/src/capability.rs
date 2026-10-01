@@ -1,14 +1,15 @@
-//! Capability vocabulary: a small, provable matcher set.
+//! Capability vocabulary and its canonical catalog.
 //!
-//! M6-B v1 deliberately rejects arbitrary expression DSLs (CEL, JS, LLM
-//! matchers, provider-specific predicate languages). A capability is one of a
-//! handful of shapes that can be decided mechanically, and it is always keyed
-//! by an **exact revision** so a v1 claim can never satisfy a v2 requirement.
+//! A capability's semantics (matcher kind, security class) are defined **once**
+//! by a catalog keyed on the exact `(capability_id, revision)`. An AgentType
+//! references a capability; it never owns a private definition that could
+//! redefine what a security class means. `ENFORCED` is imported evidence, not
+//! an enum label.
 
 use crate::error::ContractError;
 use crate::ids::CapabilityId;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The five matcher shapes supported in M6-B v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +46,7 @@ impl Quantity {
     }
 }
 
-/// A capability value. The shape is determined by the capability spec.
+/// A capability value. The shape is determined by the capability definition.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CapabilityValue {
     Bool(bool),
@@ -86,8 +87,6 @@ pub enum Assurance {
 }
 
 impl SecurityClass {
-    /// Functional features may be satisfied by a declared/envelope value;
-    /// authority/sandbox/continuity require imported enforcement evidence.
     pub fn requires_evidence(self) -> bool {
         !matches!(self, Self::Functional)
     }
@@ -129,16 +128,59 @@ impl CapabilityRef {
     }
 }
 
-/// Declares the shape and security class of an exact capability revision. The
-/// revision identity is the map key, not a duplicated field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapabilitySpec {
+/// The canonical semantics of one exact capability revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityDefinition {
     pub matcher_kind: MatcherKind,
     pub security_class: SecurityClass,
 }
 
-/// A source's (or config's) concrete declaration about one exact capability
-/// revision.
+/// Canonical, single-authority set of capability definitions.
+#[derive(Clone, Debug, Default)]
+pub struct CapabilityCatalog {
+    definitions: BTreeMap<CapabilityRef, CapabilityDefinition>,
+}
+
+impl CapabilityCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Define a capability revision. Redefining it with different semantics is
+    /// rejected, so a security class can never be redefined per AgentType.
+    pub fn define(
+        &mut self,
+        reference: CapabilityRef,
+        matcher_kind: MatcherKind,
+        security_class: SecurityClass,
+    ) -> Result<(), ContractError> {
+        let definition = CapabilityDefinition {
+            matcher_kind,
+            security_class,
+        };
+        match self.definitions.get(&reference) {
+            Some(existing) if existing == &definition => Ok(()),
+            Some(_) => Err(ContractError::CapabilityDefinitionConflict {
+                capability: reference.capability_id().as_str().to_string(),
+                revision: reference.revision(),
+            }),
+            None => {
+                self.definitions.insert(reference, definition);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn get(&self, reference: &CapabilityRef) -> Option<&CapabilityDefinition> {
+        self.definitions.get(reference)
+    }
+
+    pub fn contains(&self, reference: &CapabilityRef) -> bool {
+        self.definitions.contains_key(reference)
+    }
+}
+
+/// A source's (or config's) declaration about one exact capability revision.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityClaim {
     pub reference: CapabilityRef,
@@ -171,6 +213,28 @@ pub fn value_satisfies(
             p.get() >= r.get()
         }
         (MatcherKind::Exact, r, p) => r == p,
+        _ => false,
+    }
+}
+
+/// Whether `value` stays within a `ceiling` (used to keep config/source
+/// declarations from exceeding a SpawnSource's provisionable envelope).
+pub fn value_within(ceiling: &CapabilityValue, value: &CapabilityValue) -> bool {
+    match (ceiling, value) {
+        (CapabilityValue::Bool(a), CapabilityValue::Bool(b)) => a == b,
+        (CapabilityValue::Set(a), CapabilityValue::Set(b)) => b.is_subset(a),
+        (
+            CapabilityValue::Ordered {
+                class: ac,
+                rank: ar,
+            },
+            CapabilityValue::Ordered {
+                class: bc,
+                rank: br,
+            },
+        ) => ac == bc && br <= ar,
+        (CapabilityValue::Quantity(a), CapabilityValue::Quantity(b)) => b.get() <= a.get(),
+        (CapabilityValue::Exact(a), CapabilityValue::Exact(b)) => a == b,
         _ => false,
     }
 }

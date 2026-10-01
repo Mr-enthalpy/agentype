@@ -4,9 +4,9 @@
 //! every numeric contract value is a validated finite non-negative newtype, so
 //! a durable digest can never be formed from an invalid or non-canonical value.
 
-use crate::capability::{CapabilityClaim, CapabilityRef, CapabilitySpec, CapabilityValue};
+use crate::capability::{CapabilityCatalog, CapabilityClaim, CapabilityRef, CapabilityValue};
 use crate::error::ContractError;
-use crate::ids::{AdapterPolicyId, AgentTypeId, SourceConfigId, SpawnSourceId};
+use crate::ids::{AdapterPolicyId, AgentTypeId, SandboxPolicyId, SourceConfigId, SpawnSourceId};
 use agentype_core::{InformationFunction, WorkspaceMode};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -54,26 +54,6 @@ impl CredentialRef {
     }
 }
 
-/// An opaque concrete physical execution domain (adapter-owned).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AdapterBindingKey(String);
-
-impl AdapterBindingKey {
-    pub fn new(key: impl Into<String>) -> Result<Self, ContractError> {
-        let key = key.into();
-        if key.trim().is_empty() {
-            return Err(ContractError::InvalidRef {
-                reason: "adapter binding key cannot be empty".into(),
-            });
-        }
-        Ok(Self(key))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 fn validate_identity(id: &str, revision: u64, what: &str) -> Result<(), ContractError> {
     if id.trim().is_empty() {
         return Err(ContractError::InvalidRef {
@@ -88,54 +68,41 @@ fn validate_identity(id: &str, revision: u64, what: &str) -> Result<(), Contract
     Ok(())
 }
 
-/// Exact, immutable `(type_id, revision)`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AgentTypeRef {
-    type_id: AgentTypeId,
-    revision: u64,
+macro_rules! revision_ref {
+    ($name:ident, $id_ty:ty, $label:expr) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name {
+            id: $id_ty,
+            revision: u64,
+        }
+
+        impl $name {
+            pub fn new(id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
+                let id = <$id_ty>::from_string(id);
+                validate_identity(id.as_str(), revision, $label)?;
+                Ok(Self { id, revision })
+            }
+
+            pub fn from_id(id: $id_ty, revision: u64) -> Result<Self, ContractError> {
+                validate_identity(id.as_str(), revision, $label)?;
+                Ok(Self { id, revision })
+            }
+
+            pub fn id(&self) -> &$id_ty {
+                &self.id
+            }
+
+            pub fn revision(&self) -> u64 {
+                self.revision
+            }
+        }
+    };
 }
 
-impl AgentTypeRef {
-    pub fn new(type_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
-        let type_id = AgentTypeId::from_string(type_id);
-        validate_identity(type_id.as_str(), revision, "agent type")?;
-        Ok(Self { type_id, revision })
-    }
-
-    pub fn type_id(&self) -> &AgentTypeId {
-        &self.type_id
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-}
-
-/// Exact, immutable `(source_id, revision)`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SpawnSourceRef {
-    source_id: SpawnSourceId,
-    revision: u64,
-}
-
-impl SpawnSourceRef {
-    pub fn new(source_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
-        let source_id = SpawnSourceId::from_string(source_id);
-        validate_identity(source_id.as_str(), revision, "spawn source")?;
-        Ok(Self {
-            source_id,
-            revision,
-        })
-    }
-
-    pub fn source_id(&self) -> &SpawnSourceId {
-        &self.source_id
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-}
+revision_ref!(AgentTypeRef, AgentTypeId, "agent type");
+revision_ref!(SpawnSourceRef, SpawnSourceId, "spawn source");
+revision_ref!(SandboxPolicyRef, SandboxPolicyId, "sandbox policy");
+revision_ref!(AdapterPolicyRef, AdapterPolicyId, "adapter policy");
 
 /// Exact, immutable `(source, config_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -166,32 +133,6 @@ impl SourceConfigRef {
 
     pub fn config_id(&self) -> &SourceConfigId {
         &self.config_id
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-}
-
-/// Exact adapter policy revision.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AdapterPolicyRef {
-    policy_id: AdapterPolicyId,
-    revision: u64,
-}
-
-impl AdapterPolicyRef {
-    pub fn new(policy_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
-        let policy_id = AdapterPolicyId::from_string(policy_id);
-        validate_identity(policy_id.as_str(), revision, "adapter policy")?;
-        Ok(Self {
-            policy_id,
-            revision,
-        })
-    }
-
-    pub fn policy_id(&self) -> &AdapterPolicyId {
-        &self.policy_id
     }
 
     pub fn revision(&self) -> u64 {
@@ -236,7 +177,8 @@ pub fn network_rank(policy: NetworkPolicy) -> u8 {
     }
 }
 
-/// Security envelope of an AgentType contract.
+/// Security envelope of an AgentType contract (enforceable facts used by
+/// `can_provision`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityContract {
     pub workspace: WorkspaceMode,
@@ -246,27 +188,27 @@ pub struct SecurityContract {
 }
 
 /// The AgentType contract: semantic/security/lifecycle/continuity/affinity
-/// envelope.
+/// envelope plus an optional full sandbox policy reference.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTypeContract {
     /// `InformationFunction` is a closed enum without `Ord`, so this stays a
     /// `Vec`; call [`AgentTypeContract::normalize`] before digesting.
     pub allowed_information_functions: Vec<InformationFunction>,
     /// Capabilities the type requires an execution source to provide, keyed by
-    /// exact revision.
+    /// exact revision. Semantics come from the [`CapabilityCatalog`].
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
-    /// Exact capability specs (matcher kind + security class) per revision.
-    pub capability_specs: BTreeMap<CapabilityRef, CapabilitySpec>,
     pub permission_ceiling: BTreeSet<String>,
     pub visibility: BTreeSet<String>,
     pub tools: BTreeSet<String>,
     pub roots: BTreeSet<String>,
-    /// Semantic affinity tags. Narrowing is allowed; broadening authority is not.
+    /// Semantic affinity tags. Narrowing is allowed; broadening is not.
     pub affinity: BTreeSet<String>,
     pub budget_ceiling: Budget,
     pub security: SecurityContract,
     pub lifecycle: BTreeSet<LifecycleMode>,
     pub continuity: ContinuityMode,
+    /// Reference to the full sandbox policy (spec 10 vocabulary) when one applies.
+    pub sandbox_policy: Option<SandboxPolicyRef>,
     pub anchor_constraint: Option<String>,
 }
 
@@ -279,12 +221,19 @@ impl AgentTypeContract {
         self.allowed_information_functions.dedup();
     }
 
-    /// Whole-record invariant: every required capability must have an exact spec.
-    pub fn validate(&self) -> Result<(), ContractError> {
-        for reference in self.required_capabilities.keys() {
-            if !self.capability_specs.contains_key(reference) {
+    /// Whole-record invariant: every required capability has a catalog
+    /// definition, and the declared value shape matches that definition.
+    pub fn validate(&self, catalog: &CapabilityCatalog) -> Result<(), ContractError> {
+        for (reference, value) in &self.required_capabilities {
+            let definition =
+                catalog
+                    .get(reference)
+                    .ok_or_else(|| ContractError::CapabilityMismatch {
+                        capability: reference.capability_id().as_str().to_string(),
+                    })?;
+            if definition.matcher_kind != value.matcher_kind() {
                 return Err(ContractError::InvariantViolation(format!(
-                    "missing capability spec for {}@{}",
+                    "capability value shape does not match the definition for {}@{}",
                     reference.capability_id().as_str(),
                     reference.revision()
                 )));
@@ -310,11 +259,11 @@ pub struct TaskRequirement {
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
     pub required_permissions: BTreeSet<String>,
     pub required_tools: BTreeSet<String>,
-    /// Semantic affinity tags this Task needs the agent to carry.
     pub required_affinity: BTreeSet<String>,
     pub required_workspace: WorkspaceMode,
     pub required_network: NetworkPolicy,
     pub required_continuity: ContinuityMode,
+    pub sandbox_policy: Option<SandboxPolicyRef>,
     pub required_anchor: Option<String>,
     pub budget: Budget,
 }
@@ -340,6 +289,7 @@ pub struct SpawnSource {
     pub adapter_policy: AdapterPolicyRef,
     pub lifecycle_modes: BTreeSet<LifecycleMode>,
     pub continuity_modes: BTreeSet<ContinuityMode>,
+    /// The provisionable capability ceiling for this source.
     pub functional_envelope: BTreeMap<CapabilityRef, CapabilityValue>,
     pub claims: Vec<CapabilityClaim>,
     pub status: SourceStatus,
@@ -347,7 +297,7 @@ pub struct SpawnSource {
 
 /// A source-specific operator configuration. The payload is opaque to Core;
 /// only its identity, digest, credential references, and any config-specific
-/// declarations are modeled here.
+/// declarations (which MUST stay within the source envelope) are modeled here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
@@ -359,7 +309,7 @@ pub struct SourceConfig {
 
 /// Physical facts a source/adapter can actually *enforce*. Private fields and a
 /// validated, canonicalizing constructor so a caller cannot assemble an
-/// arbitrary enforcement claim.
+/// arbitrary enforcement claim; the enforced facts live in imported evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalSafety {
     attempt_isolation: bool,
@@ -453,7 +403,7 @@ impl AgentTypeLookup for PublishedCatalog {
     fn latest_revision(&self, type_id: &AgentTypeId) -> Option<u64> {
         self.published
             .iter()
-            .filter(|r| r.type_id() == type_id)
+            .filter(|r| r.id() == type_id)
             .map(|r| r.revision())
             .max()
     }

@@ -32,6 +32,8 @@ pub enum ContractError {
     InvalidNumber { field: String },
     /// An identity was empty or a revision was zero.
     InvalidRef { reason: String },
+    /// A capability revision was redefined with different semantics.
+    CapabilityDefinitionConflict { capability: String, revision: u64 },
     /// A durable relation that must hold does not.
     InvariantViolation(String),
 }
@@ -64,6 +66,13 @@ impl fmt::Display for ContractError {
             Self::EmptySelector => write!(f, "empty selector"),
             Self::InvalidNumber { field } => write!(f, "invalid number for {field}"),
             Self::InvalidRef { reason } => write!(f, "invalid ref: {reason}"),
+            Self::CapabilityDefinitionConflict {
+                capability,
+                revision,
+            } => write!(
+                f,
+                "capability {capability}@{revision} redefined with different semantics"
+            ),
             Self::InvariantViolation(msg) => write!(f, "invariant violation: {msg}"),
         }
     }

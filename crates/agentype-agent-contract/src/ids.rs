@@ -53,3 +53,4 @@ contract_id!(SpawnSourceId, "spawn-source");
 contract_id!(SourceConfigId, "source-config");
 contract_id!(CapabilityId, "capability");
 contract_id!(AdapterPolicyId, "adapter-policy");
+contract_id!(SandboxPolicyId, "sandbox-policy");

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Pure M6-B agent contract ontology and the four matching predicates (no I/O)"
 
+[features]
+test-support = []
+
 [dependencies]
 agentype-core.workspace = true
 serde_json.workspace = true

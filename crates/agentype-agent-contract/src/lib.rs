@@ -25,18 +25,21 @@ mod records;
 mod selector;
 
 pub use capability::{
-    assurance_satisfies, value_satisfies, Assurance, CapabilityClaim, CapabilityRef,
-    CapabilitySpec, CapabilityValue, MatcherKind, Quantity, SecurityClass,
+    assurance_satisfies, value_satisfies, value_within, Assurance, CapabilityCatalog,
+    CapabilityClaim, CapabilityDefinition, CapabilityRef, CapabilityValue, MatcherKind, Quantity,
+    SecurityClass,
 };
 pub use error::ContractError;
-pub use evidence::{ProvisioningEvidenceSource, ResolvedProvisioningEvidence};
-pub use ids::{AdapterPolicyId, AgentTypeId, CapabilityId, SourceConfigId, SpawnSourceId};
+pub use evidence::ResolvedProvisioningEvidence;
+pub use ids::{
+    AdapterPolicyId, AgentTypeId, CapabilityId, SandboxPolicyId, SourceConfigId, SpawnSourceId,
+};
 pub use predicates::{can_execute, can_provision, is_valid_refinement, more_specific_for};
 pub use records::{
-    network_rank, workspace_rank, AdapterBindingKey, AdapterBindingPolicy, AdapterPolicyRef,
-    AgentType, AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigStatus,
-    ContinuityMode, CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
-    SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
-    TaskRequirement,
+    network_rank, workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
+    AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigStatus, ContinuityMode,
+    CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
+    SandboxPolicyRef, SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource,
+    SpawnSourceRef, TaskRequirement,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

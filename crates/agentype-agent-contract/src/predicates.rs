@@ -1,20 +1,24 @@
 //! The four M6-B relations, kept independent as spec 06 requires.
 //!
-//! - `can_execute(AgentType, TaskRequirement)`
-//! - `can_provision(SpawnSource, SourceConfig, AgentType, evidence)`
-//! - `more_specific_for(A, B, TaskRequirement)`
-//! - `is_valid_refinement(Base, Derived)`
+//! - `can_execute(AgentType, TaskRequirement, CapabilityCatalog)`
+//! - `can_provision(SpawnSource, SourceConfig, AgentType, evidence, catalog)`
+//! - `more_specific_for(A, B, TaskRequirement, catalog)`
+//! - `is_valid_refinement(Base, Derived, catalog)`
 //!
 //! They MUST NOT be collapsed into a single subtype/inheritance operator. The
 //! capability-constraint ordering is defined once and shared by refinement and
-//! specificity.
+//! specificity; capability semantics come from the catalog, not from either
+//! AgentType.
 
-use crate::capability::{value_satisfies, Assurance, CapabilityClaim, CapabilityRef, MatcherKind};
+use crate::capability::{
+    value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim, CapabilityRef,
+    CapabilityValue, MatcherKind,
+};
 use crate::error::ContractError;
 use crate::evidence::ResolvedProvisioningEvidence;
 use crate::records::{
-    network_rank, workspace_rank, AgentType, AgentTypeContract, ConfigStatus, SourceConfig,
-    SourceStatus, SpawnSource, TaskRequirement,
+    network_rank, workspace_rank, AgentType, AgentTypeContract, ConfigStatus, SandboxPolicyRef,
+    SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
 };
 
 /// Deterministic declaration lookup. Conflicting values at the same exact
@@ -37,8 +41,6 @@ fn resolve_claim<'a>(
             reference.revision()
         )));
     }
-    // Prefer an ENFORCED-declared claim, but this is only a declaration tiebreak;
-    // security classes still require imported evidence.
     Ok(matching
         .iter()
         .copied()
@@ -47,8 +49,12 @@ fn resolve_claim<'a>(
 }
 
 /// Can this AgentType contract execute the Task requirement?
-pub fn can_execute(agent: &AgentType, req: &TaskRequirement) -> Result<(), ContractError> {
-    agent.contract.validate()?;
+pub fn can_execute(
+    agent: &AgentType,
+    req: &TaskRequirement,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    agent.contract.validate(catalog)?;
 
     if !agent
         .contract
@@ -61,13 +67,12 @@ pub fn can_execute(agent: &AgentType, req: &TaskRequirement) -> Result<(), Contr
     }
 
     for (reference, required) in &req.required_capabilities {
-        let spec = agent
-            .contract
-            .capability_specs
-            .get(reference)
-            .ok_or_else(|| ContractError::CapabilityMismatch {
-                capability: reference.capability_id().as_str().to_string(),
-            })?;
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: reference.capability_id().as_str().to_string(),
+                })?;
         let provided = agent
             .contract
             .required_capabilities
@@ -75,7 +80,7 @@ pub fn can_execute(agent: &AgentType, req: &TaskRequirement) -> Result<(), Contr
             .ok_or_else(|| ContractError::CapabilityMismatch {
                 capability: reference.capability_id().as_str().to_string(),
             })?;
-        if !value_satisfies(spec.matcher_kind, required, provided) {
+        if !value_satisfies(definition.matcher_kind, required, provided) {
             return Err(ContractError::CapabilityMismatch {
                 capability: reference.capability_id().as_str().to_string(),
             });
@@ -117,6 +122,11 @@ pub fn can_execute(agent: &AgentType, req: &TaskRequirement) -> Result<(), Contr
             capability: "continuity".into(),
         });
     }
+    if !sandbox_policy_within(&req.sandbox_policy, &agent.contract.sandbox_policy) {
+        return Err(ContractError::CapabilityMismatch {
+            capability: "sandbox_policy".into(),
+        });
+    }
     if let Some(required_anchor) = &req.required_anchor {
         if let Some(constraint) = &agent.contract.anchor_constraint {
             if constraint != required_anchor {
@@ -136,14 +146,15 @@ pub fn can_execute(agent: &AgentType, req: &TaskRequirement) -> Result<(), Contr
 }
 
 /// Can this source + config provision an environment that realizes the
-/// AgentType contract, given the imported, policy-bound enforcement evidence?
+/// AgentType contract, given imported, policy-bound enforcement evidence?
 pub fn can_provision(
     agent: &AgentType,
     source: &SpawnSource,
     config: &SourceConfig,
     evidence: &ResolvedProvisioningEvidence,
+    catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
-    agent.contract.validate()?;
+    agent.contract.validate(catalog)?;
 
     if config.config_ref.source() != &source.source_ref {
         return Err(ContractError::SourceConfigInvalid {
@@ -157,8 +168,8 @@ pub fn can_provision(
     }
     if evidence.adapter_policy() != &source.adapter_policy {
         return Err(ContractError::EvidencePolicyMismatch {
-            expected: source.adapter_policy.policy_id().as_str().to_string(),
-            actual: evidence.adapter_policy().policy_id().as_str().to_string(),
+            expected: source.adapter_policy.id().as_str().to_string(),
+            actual: evidence.adapter_policy().id().as_str().to_string(),
         });
     }
 
@@ -174,56 +185,66 @@ pub fn can_provision(
     }
 
     for (reference, required) in &agent.contract.required_capabilities {
-        let spec = agent
-            .contract
-            .capability_specs
-            .get(reference)
-            .ok_or_else(|| ContractError::CapabilityMismatch {
-                capability: reference.capability_id().as_str().to_string(),
-            })?;
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: reference.capability_id().as_str().to_string(),
+                })?;
+        let capability_name = reference.capability_id().as_str().to_string();
 
-        if spec.security_class.requires_evidence() {
-            // Only imported enforcement evidence satisfies a security class.
+        if definition.security_class.requires_evidence() {
             let provided = evidence.enforced_capability(reference).ok_or_else(|| {
                 ContractError::SecurityUnenforceable {
                     reason: format!(
                         "capability {}@{} has no imported enforcement evidence",
-                        reference.capability_id().as_str(),
+                        capability_name,
                         reference.revision()
                     ),
                 }
             })?;
-            if !value_satisfies(spec.matcher_kind, required, provided) {
+            if !value_satisfies(definition.matcher_kind, required, provided) {
                 return Err(ContractError::CapabilityMismatch {
-                    capability: reference.capability_id().as_str().to_string(),
+                    capability: capability_name,
                 });
             }
             continue;
         }
 
-        // Functional: config declarations take precedence over source declarations.
-        let claim = match resolve_claim(&config.claims, reference)? {
-            Some(claim) => Some(claim),
-            None => resolve_claim(&source.claims, reference)?,
-        };
-        let envelope = source.functional_envelope.get(reference);
-        let provided = match (claim, envelope) {
-            (Some(claim), _) => &claim.value,
-            (None, Some(value)) => value,
-            (None, None) => {
-                return Err(ContractError::CapabilityMismatch {
-                    capability: reference.capability_id().as_str().to_string(),
-                })
+        // Functional: the source envelope is the provisionable ceiling; neither
+        // the source nor the config may declare a value beyond it.
+        let ceiling = source.functional_envelope.get(reference).ok_or_else(|| {
+            ContractError::CapabilityMismatch {
+                capability: capability_name.clone(),
             }
-        };
-        if !value_satisfies(spec.matcher_kind, required, provided) {
+        })?;
+        let source_claim = resolve_claim(&source.claims, reference)?;
+        if let Some(claim) = source_claim {
+            if !value_within(ceiling, &claim.value) {
+                return Err(ContractError::InvariantViolation(format!(
+                    "source declaration for {capability_name} exceeds its provisionable envelope"
+                )));
+            }
+        }
+        let config_claim = resolve_claim(&config.claims, reference)?;
+        if let Some(claim) = config_claim {
+            if !value_within(ceiling, &claim.value) {
+                return Err(ContractError::InvariantViolation(format!(
+                    "config declaration for {capability_name} exceeds the source envelope"
+                )));
+            }
+        }
+        let provided: &CapabilityValue = config_claim
+            .map(|c| &c.value)
+            .or_else(|| source_claim.map(|c| &c.value))
+            .unwrap_or(ceiling);
+        if !value_satisfies(definition.matcher_kind, required, provided) {
             return Err(ContractError::CapabilityMismatch {
-                capability: reference.capability_id().as_str().to_string(),
+                capability: capability_name,
             });
         }
     }
 
-    // Restrictions must be mechanically enforceable, never inferred.
     let safety = evidence.enforceable_safety();
     if !safety.enforces_workspace(agent.contract.security.workspace) {
         return Err(ContractError::SecurityUnenforceable {
@@ -247,15 +268,12 @@ pub fn can_provision(
 /// Is `derived` at least as restrictive as `base` for one capability revision?
 fn requirement_no_wider(
     matcher: MatcherKind,
-    base: &crate::capability::CapabilityValue,
-    derived: &crate::capability::CapabilityValue,
+    base: &CapabilityValue,
+    derived: &CapabilityValue,
 ) -> bool {
-    use crate::capability::CapabilityValue;
     match (matcher, base, derived) {
-        // Equality matchers admit no ordering; a change is not monotone.
         (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => b == d,
         (MatcherKind::Exact, b, d) => b == d,
-        // Derived demanding a superset is at least as restrictive.
         (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => b.is_subset(d),
         (
             MatcherKind::Ordered,
@@ -276,25 +294,20 @@ fn requirement_no_wider(
 }
 
 /// `derived`'s capability constraints are at least as restrictive as `base`'s:
-/// no requirement disappears, and no matcher or security class is downgraded.
-fn capability_constraints_no_wider(derived: &AgentTypeContract, base: &AgentTypeContract) -> bool {
+/// no requirement disappears and each is at least as restrictive.
+fn capability_constraints_no_wider(
+    derived: &AgentTypeContract,
+    base: &AgentTypeContract,
+    catalog: &CapabilityCatalog,
+) -> bool {
     for (reference, base_value) in &base.required_capabilities {
         let Some(derived_value) = derived.required_capabilities.get(reference) else {
             return false;
         };
-        let (Some(base_spec), Some(derived_spec)) = (
-            base.capability_specs.get(reference),
-            derived.capability_specs.get(reference),
-        ) else {
+        let Some(definition) = catalog.get(reference) else {
             return false;
         };
-        if derived_spec.matcher_kind != base_spec.matcher_kind {
-            return false;
-        }
-        if derived_spec.security_class != base_spec.security_class {
-            return false;
-        }
-        if !requirement_no_wider(base_spec.matcher_kind, base_value, derived_value) {
+        if !requirement_no_wider(definition.matcher_kind, base_value, derived_value) {
             return false;
         }
     }
@@ -308,8 +321,34 @@ fn anchor_no_wider(derived: &Option<String>, base: &Option<String>) -> bool {
     }
 }
 
+/// `derived` no wider than `base` for the full sandbox policy reference.
+fn sandbox_policy_no_wider(
+    derived: &Option<SandboxPolicyRef>,
+    base: &Option<SandboxPolicyRef>,
+) -> bool {
+    match base {
+        None => true,
+        Some(_) => derived == base,
+    }
+}
+
+/// Whether a Task sandbox requirement is allowed by an agent sandbox policy.
+fn sandbox_policy_within(
+    requirement: &Option<SandboxPolicyRef>,
+    allowance: &Option<SandboxPolicyRef>,
+) -> bool {
+    match requirement {
+        None => true,
+        Some(_) => requirement == allowance,
+    }
+}
+
 /// A grants no more authority than B on every relevant dimension.
-fn authority_no_wider(a: &AgentTypeContract, b: &AgentTypeContract) -> bool {
+fn authority_no_wider(
+    a: &AgentTypeContract,
+    b: &AgentTypeContract,
+    catalog: &CapabilityCatalog,
+) -> bool {
     a.allowed_information_functions
         .iter()
         .all(|f| b.allowed_information_functions.contains(f))
@@ -319,34 +358,46 @@ fn authority_no_wider(a: &AgentTypeContract, b: &AgentTypeContract) -> bool {
         && a.roots.is_subset(&b.roots)
         && a.affinity.is_superset(&b.affinity)
         && a.budget_ceiling <= b.budget_ceiling
+        && a.lifecycle.is_subset(&b.lifecycle)
+        && a.continuity >= b.continuity
         && workspace_rank(a.security.workspace) <= workspace_rank(b.security.workspace)
         && network_rank(a.security.network) <= network_rank(b.security.network)
         && a.security.tool_roots.is_subset(&b.security.tool_roots)
         && (!b.security.requires_attempt_isolation || a.security.requires_attempt_isolation)
-        && a.continuity >= b.continuity
+        && sandbox_policy_no_wider(&a.sandbox_policy, &b.sandbox_policy)
         && anchor_no_wider(&a.anchor_constraint, &b.anchor_constraint)
-        && capability_constraints_no_wider(a, b)
+        && capability_constraints_no_wider(a, b, catalog)
 }
 
 /// Is A strictly more specific than B for this Task? Only defined once both are
 /// executable; never ranked by nominal inheritance depth. Two types with
 /// equivalent authority are incomparable, not mutually more specific.
-pub fn more_specific_for(a: &AgentType, b: &AgentType, req: &TaskRequirement) -> bool {
+pub fn more_specific_for(
+    a: &AgentType,
+    b: &AgentType,
+    req: &TaskRequirement,
+    catalog: &CapabilityCatalog,
+) -> bool {
     if a.type_ref == b.type_ref {
         return false;
     }
-    if can_execute(a, req).is_err() || can_execute(b, req).is_err() {
+    if can_execute(a, req, catalog).is_err() || can_execute(b, req, catalog).is_err() {
         return false;
     }
-    authority_no_wider(&a.contract, &b.contract) && !authority_no_wider(&b.contract, &a.contract)
+    authority_no_wider(&a.contract, &b.contract, catalog)
+        && !authority_no_wider(&b.contract, &a.contract, catalog)
 }
 
 /// Spec 06 refinement monotonicity: the derived type MUST NOT enlarge authority
 /// and MUST NOT weaken a base guarantee (lifecycle, continuity, security,
 /// capability constraints).
-pub fn is_valid_refinement(base: &AgentType, derived: &AgentType) -> Result<(), ContractError> {
-    base.contract.validate()?;
-    derived.contract.validate()?;
+pub fn is_valid_refinement(
+    base: &AgentType,
+    derived: &AgentType,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    base.contract.validate(catalog)?;
+    derived.contract.validate(catalog)?;
 
     let base_c = &base.contract;
     let derived_c = &derived.contract;
@@ -380,9 +431,11 @@ pub fn is_valid_refinement(base: &AgentType, derived: &AgentType) -> Result<(), 
     if !derived_c.lifecycle.is_subset(&base_c.lifecycle) {
         return invalid("derived lifecycle widens base lifecycle");
     }
-    // Continuity is a guarantee: a derived type may strengthen it, never weaken it.
     if derived_c.continuity < base_c.continuity {
         return invalid("derived continuity weakens base continuity");
+    }
+    if !sandbox_policy_no_wider(&derived_c.sandbox_policy, &base_c.sandbox_policy) {
+        return invalid("derived sandbox policy is wider than base sandbox policy");
     }
     if let Some(constraint) = &base_c.anchor_constraint {
         if derived_c.anchor_constraint.as_ref() != Some(constraint) {
@@ -413,7 +466,7 @@ pub fn is_valid_refinement(base: &AgentType, derived: &AgentType) -> Result<(), 
     {
         return invalid("derived type adds an information function not allowed by base");
     }
-    if !capability_constraints_no_wider(derived_c, base_c) {
+    if !capability_constraints_no_wider(derived_c, base_c, catalog) {
         return invalid("derived capability constraints are wider than base");
     }
 
