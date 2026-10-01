@@ -2205,3 +2205,177 @@ fn test_admission_rolls_back_on_binding_failure() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn test_result_ack_races_freeze_preserves_result_and_membership() {
+    let kernel = Arc::new(test_kernel());
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "ack_vs_freeze".into(),
+        objective: "Result ACK races freeze".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("ack_vs_freeze", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    let task_id = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
+
+    let ack_kernel = Arc::clone(&kernel);
+    let ack_handle = std::thread::spawn(move || -> bool {
+        let claim = ack_kernel
+            .claim_next_available()
+            .unwrap()
+            .expect("claim admitted task");
+        let safety = unisolated_launch_binding(&claim);
+        let launch = ack_kernel.create_execution(&claim, safety).unwrap();
+        let exec_id = launch.execution_id().clone();
+        ack_kernel
+            .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
+            .unwrap();
+        ack_kernel
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(&exec_id),
+                &json!({"ok": true}),
+                None,
+                false,
+                false,
+            )
+            .unwrap()
+            .is_some()
+    });
+
+    let freeze_kernel = Arc::clone(&kernel);
+    let gid = gen.generation_id.clone();
+    let freeze_handle = std::thread::spawn(move || freeze_kernel.freeze_generation(&gid, 0));
+
+    assert!(
+        ack_handle.join().unwrap(),
+        "worker ACK must produce a durable Result even if freeze wins"
+    );
+    assert!(
+        freeze_handle.join().unwrap().is_ok(),
+        "freeze must succeed independently of the Result ACK"
+    );
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.state, GenerationState::Frozen);
+    assert!(
+        view.admitted_task_ids.contains(&task_id),
+        "admitted membership must survive a Result-ACK/freeze race"
+    );
+}
+
+#[test]
+fn test_compression_input_snapshot_survives_late_expand() {
+    let kernel = Arc::new(test_kernel());
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let source = create_test_result(&kernel);
+
+    let compress = RawWorkIntent {
+        raw_intent_key: "compress_snapshot".into(),
+        objective: "Compress frozen evidence".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new().with_result(source),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("compress_snapshot", json!({}))),
+    };
+    let pc = kernel
+        .compile_root_intent(&gen.generation_id, compress, "session", 1)
+        .unwrap();
+    kernel.admit_proposal(&pc.proposal_id, 0, None).unwrap();
+    let snapshot = kernel
+        .get_proposal(&pc.proposal_id)
+        .unwrap()
+        .semantic_input_set;
+
+    let late = RawWorkIntent {
+        raw_intent_key: "late_expand".into(),
+        objective: "Late expand".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("late_expand", json!({}))),
+    };
+    let pe = kernel
+        .compile_root_intent(&gen.generation_id, late, "session", 1)
+        .unwrap();
+
+    let admit_kernel = Arc::clone(&kernel);
+    let late_pid = pe.proposal_id.clone();
+    let late_handle = std::thread::spawn(move || admit_kernel.admit_proposal(&late_pid, 0, None));
+
+    for _ in 0..50 {
+        assert_eq!(
+            kernel
+                .get_proposal(&pc.proposal_id)
+                .unwrap()
+                .semantic_input_set,
+            snapshot,
+            "compression input set is frozen at admission time"
+        );
+    }
+    late_handle.join().unwrap().unwrap();
+    assert_eq!(
+        kernel
+            .get_proposal(&pc.proposal_id)
+            .unwrap()
+            .semantic_input_set,
+        snapshot
+    );
+}
+
+#[test]
+fn test_compile_rolls_back_on_outbox_failure() {
+    let (path, kernel) = file_kernel("compile_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    install_abort_trigger(
+        &path,
+        "fail_proposal_outbox",
+        "notification_outbox",
+        Some("NEW.event_type = 'PROPOSAL_AVAILABLE'"),
+    );
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "compile_rollback".into(),
+        objective: "Compilation must roll back".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("compile_rollback", json!({}))),
+    };
+    assert!(kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .is_err());
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert!(view.pending_proposal_ids.is_empty());
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let proposals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM compiled_work_proposals WHERE generation_id=?1",
+            rusqlite::params![gen.generation_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        proposals, 0,
+        "proposal insert must roll back with the outbox"
+    );
+    let outbox: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='PROPOSAL_AVAILABLE'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outbox, 0);
+    let _ = std::fs::remove_file(&path);
+}
