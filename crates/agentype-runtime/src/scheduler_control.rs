@@ -133,6 +133,14 @@ impl<'a> SchedulerControl<'a> {
         crate::RootSemanticControl::new(self.kernel)
     }
 
+    /// Borrow the proposal-only intent ingress for this running daemon.
+    ///
+    /// This surface can submit a result-backed suggestion but cannot admit,
+    /// reject, freeze, or close anything.
+    pub fn intent_ingress(&self) -> crate::IntentIngress<'_> {
+        crate::IntentIngress::new(self.kernel)
+    }
+
     // ------------------------------------------------------------ submit
 
     /// Accept a Batch of Tasks for durable execution.

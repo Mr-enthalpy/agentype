@@ -12,6 +12,7 @@ pub use agentype_execution_config::*;
 pub mod control;
 pub mod daemon;
 pub mod deadlines;
+pub mod intent_ingress;
 pub mod notifier;
 pub mod observation;
 pub mod observer;
@@ -33,6 +34,7 @@ pub mod timing;
 pub use daemon::{
     DaemonError, DaemonExit, DaemonPhase, RunningSchedulerDaemon, SchedulerDaemonBuilder,
 };
+pub use intent_ingress::IntentIngress;
 pub use semantic_control::RootSemanticControl;
 // `DaemonError::Control` carries it, so a production host can inspect why the
 // daemon's control worker failed.

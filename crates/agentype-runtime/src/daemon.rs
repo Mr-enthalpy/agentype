@@ -490,6 +490,14 @@ impl RunningSchedulerDaemon {
         crate::RootSemanticControl::new(&self.kernel)
     }
 
+    /// Proposal-only intent ingress surface for external harnesses and workers.
+    ///
+    /// It can submit a result-backed suggestion but carries no admission,
+    /// freeze, or close authority.
+    pub fn intent_ingress(&self) -> crate::IntentIngress<'_> {
+        crate::IntentIngress::new(&self.kernel)
+    }
+
     /// Test-support: panic the health coordinator on its next tick, so its
     /// own fatal path is reachable from a regression test.
     #[cfg(any(test, feature = "test-support"))]

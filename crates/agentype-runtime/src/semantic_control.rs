@@ -8,8 +8,8 @@
 //! absent from this surface.
 
 use agentype_core::{
-    Error, GenerationId, GenerationRecord, GenerationView, ProposalId, ProposalRecord,
-    RawWorkIntent, TaskId, TaskSpec,
+    Error, GenerationId, GenerationRecord, GenerationView, IntentSource, ProposalId,
+    ProposalRecord, RawWorkIntent, TaskId, TaskSpec,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
@@ -27,21 +27,18 @@ impl<'a> RootSemanticControl<'a> {
         self.kernel.create_generation(seed_payload)
     }
 
-    pub fn compile_intent(
+    /// Compile a Root-originated intent. Root authority is the only path that
+    /// may originate an intent outside a durable Result.
+    pub fn compile_root_intent(
         &self,
         generation_id: &GenerationId,
         intent: RawWorkIntent,
-        source_kind: &str,
-        source_ref: &str,
+        command_ref: &str,
         compiler_version: u32,
     ) -> Result<ProposalRecord, Error> {
-        self.kernel.compile_intent(
-            generation_id,
-            intent,
-            source_kind,
-            source_ref,
-            compiler_version,
-        )
+        let source = IntentSource::root(command_ref)?;
+        self.kernel
+            .compile_intent(generation_id, intent, source, compiler_version)
     }
 
     pub fn admit_proposal(
