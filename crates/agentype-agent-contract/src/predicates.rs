@@ -17,8 +17,8 @@ use crate::capability::{
 use crate::error::ContractError;
 use crate::evidence::ResolvedProvisioningEvidence;
 use crate::records::{
-    network_rank, workspace_rank, AgentType, AgentTypeContract, ConfigStatus, SandboxPolicyRef,
-    SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
+    network_rank, workspace_rank, AffinityConstraint, AgentType, AgentTypeContract, ConfigStatus,
+    SandboxPolicyRef, SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
 };
 
 /// Deterministic declaration lookup. Conflicting values at the same exact
@@ -101,7 +101,7 @@ pub fn can_execute(
             });
         }
     }
-    if !req.required_affinity.is_subset(&agent.contract.affinity) {
+    if !affinity_accepts(&agent.contract.affinity, &req.required_affinity) {
         return Err(ContractError::CapabilityMismatch {
             capability: "affinity".into(),
         });
@@ -342,6 +342,28 @@ fn anchor_no_wider(derived: &Option<String>, base: &Option<String>) -> bool {
     }
 }
 
+/// Does an affinity constraint accept a Task's required tags? `Any` accepts
+/// every Task; `Only(S)` accepts a subset of `S`.
+fn affinity_accepts(
+    constraint: &AffinityConstraint,
+    required: &std::collections::BTreeSet<String>,
+) -> bool {
+    match constraint {
+        AffinityConstraint::Any => true,
+        AffinityConstraint::Only(allowed) => required.is_subset(allowed),
+    }
+}
+
+/// `a` grants no broader affinity than `b` (`Any` is the top element).
+fn affinity_no_wider(a: &AffinityConstraint, b: &AffinityConstraint) -> bool {
+    match (a, b) {
+        (AffinityConstraint::Any, AffinityConstraint::Any) => true,
+        (AffinityConstraint::Any, AffinityConstraint::Only(_)) => false,
+        (AffinityConstraint::Only(_), AffinityConstraint::Any) => true,
+        (AffinityConstraint::Only(x), AffinityConstraint::Only(y)) => x.is_subset(y),
+    }
+}
+
 /// `derived` no wider than `base` for the full sandbox policy reference.
 fn sandbox_policy_no_wider(
     derived: &Option<SandboxPolicyRef>,
@@ -381,13 +403,12 @@ fn authority_no_wider(
         && a.visibility.is_subset(&b.visibility)
         && a.tools.is_subset(&b.tools)
         && a.roots.is_subset(&b.roots)
-        && a.affinity.is_subset(&b.affinity)
+        && affinity_no_wider(&a.affinity, &b.affinity)
         && a.budget_ceiling <= b.budget_ceiling
         && a.lifecycle.is_subset(&b.lifecycle)
         && a.continuity >= b.continuity
         && workspace_rank(a.security.workspace) <= workspace_rank(b.security.workspace)
         && network_rank(a.security.network) <= network_rank(b.security.network)
-        && a.security.tool_roots.is_subset(&b.security.tool_roots)
         && (!b.security.requires_attempt_isolation || a.security.requires_attempt_isolation)
         && sandbox_policy_no_wider(&a.sandbox_policy, &b.sandbox_policy)
         && anchor_no_wider(&a.anchor_constraint, &b.anchor_constraint)
@@ -448,9 +469,8 @@ pub fn is_valid_refinement(
         return invalid("derived roots widen base roots");
     }
     // Affinity is an allowed-tag ceiling like permission/tools: a derived type
-    // may only support a subset, so refinement never enlarges the executable
-    // Task set.
-    if !derived_c.affinity.is_subset(&base_c.affinity) {
+    // may only narrow, so refinement never enlarges the executable Task set.
+    if !affinity_no_wider(&derived_c.affinity, &base_c.affinity) {
         return invalid("derived affinity broadens base affinity");
     }
     if derived_c.budget_ceiling > base_c.budget_ceiling {
@@ -475,13 +495,6 @@ pub fn is_valid_refinement(
     }
     if network_rank(derived_c.security.network) > network_rank(base_c.security.network) {
         return invalid("derived network policy widens base network policy");
-    }
-    if !derived_c
-        .security
-        .tool_roots
-        .is_subset(&base_c.security.tool_roots)
-    {
-        return invalid("derived tool roots widen base tool roots");
     }
     if base_c.security.requires_attempt_isolation && !derived_c.security.requires_attempt_isolation
     {

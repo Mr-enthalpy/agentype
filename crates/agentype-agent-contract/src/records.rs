@@ -17,7 +17,8 @@ pub struct Budget(f64);
 impl Budget {
     pub fn new(value: f64) -> Result<Self, ContractError> {
         if value.is_finite() && value >= 0.0 {
-            Ok(Self(value))
+            // Canonicalize negative zero so equal values cannot digest differently.
+            Ok(Self(if value == 0.0 { 0.0 } else { value }))
         } else {
             Err(ContractError::InvalidNumber {
                 field: "budget".into(),
@@ -197,14 +198,27 @@ pub fn network_rank(policy: NetworkPolicy) -> u8 {
     }
 }
 
-/// Security envelope of an AgentType contract (enforceable facts used by
-/// `can_provision`).
+/// Coarse security envelope of an AgentType contract: the mechanically
+/// enforceable facts `can_provision` proves against imported evidence.
+///
+/// Filesystem/tool/visibility restrictions are NOT represented here: they
+/// belong to the full [`SandboxPolicyRef`], which must also carry imported
+/// enforcement evidence. This keeps every field in this struct backed by a
+/// proof path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityContract {
     pub workspace: WorkspaceMode,
     pub network: NetworkPolicy,
-    pub tool_roots: BTreeSet<String>,
     pub requires_attempt_isolation: bool,
+}
+
+/// Semantic affinity constraint. `Any` is the explicit top element (a truly
+/// general agent that accepts every Task affinity); `Only(S)` accepts only
+/// Tasks whose required tags are a subset of `S`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AffinityConstraint {
+    Any,
+    Only(BTreeSet<String>),
 }
 
 /// The AgentType contract: semantic/security/lifecycle/continuity/affinity
@@ -221,8 +235,8 @@ pub struct AgentTypeContract {
     pub visibility: BTreeSet<String>,
     pub tools: BTreeSet<String>,
     pub roots: BTreeSet<String>,
-    /// Semantic affinity tags. Narrowing is allowed; broadening is not.
-    pub affinity: BTreeSet<String>,
+    /// Semantic affinity constraint. Narrowing is allowed; broadening is not.
+    pub affinity: AffinityConstraint,
     pub budget_ceiling: Budget,
     pub security: SecurityContract,
     pub lifecycle: BTreeSet<LifecycleMode>,

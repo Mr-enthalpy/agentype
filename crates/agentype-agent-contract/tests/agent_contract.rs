@@ -108,12 +108,11 @@ fn base_contract() -> AgentTypeContract {
         visibility: set(&["public"]),
         tools: set(&["git"]),
         roots: set(&["repo"]),
-        affinity: BTreeSet::new(),
+        affinity: AffinityConstraint::Any,
         budget_ceiling: budget(100.0),
         security: SecurityContract {
             workspace: WorkspaceMode::ReadOnly,
             network: NetworkPolicy::Restricted,
-            tool_roots: set(&["repo"]),
             requires_attempt_isolation: false,
         },
         lifecycle: [LifecycleMode::Resident].into_iter().collect(),
@@ -204,7 +203,11 @@ fn test_can_execute_gates() {
 
     let mut req = base_task();
     req.required_affinity = set(&["sqlite"]);
-    assert!(can_execute(&base_agent(), &req, &cat).is_err());
+    // The general agent (Any) accepts it; a specialized type does not.
+    let mut specialized = base_agent();
+    specialized.contract.affinity = AffinityConstraint::Only(set(&["rust"]));
+    assert!(can_execute(&base_agent(), &req, &cat).is_ok());
+    assert!(can_execute(&specialized, &req, &cat).is_err());
 
     let mut req = base_task();
     req.required_workspace = WorkspaceMode::Write;
@@ -270,13 +273,13 @@ fn test_can_execute_requires_capability_value() {
 fn test_refinement_accepts_narrowing() {
     let cat = CapabilityCatalog::new();
     let mut base = base_agent();
-    base.contract.affinity = set(&["rust", "sqlite"]);
+    base.contract.affinity = AffinityConstraint::Only(set(&["rust", "sqlite"]));
     let mut derived = base_agent();
     derived.type_ref = type_ref("readonly-rust-reviewer", 1);
     derived.based_on = Some(base.type_ref.clone());
     derived.contract.budget_ceiling = budget(25.0);
     // Affinity may only shrink.
-    derived.contract.affinity = set(&["rust"]);
+    derived.contract.affinity = AffinityConstraint::Only(set(&["rust"]));
 
     assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
 }
@@ -318,10 +321,6 @@ fn test_refinement_rejects_each_widening() {
 
     let mut d = base_agent();
     d.contract.security.network = NetworkPolicy::Enabled;
-    assert!(is_valid_refinement(&base, &d, &cat).is_err());
-
-    let mut d = base_agent();
-    d.contract.security.tool_roots = set(&["repo", "/etc"]);
     assert!(is_valid_refinement(&base, &d, &cat).is_err());
 
     let mut d = base_agent();
@@ -965,6 +964,14 @@ fn test_nan_quantity_is_rejected() {
 }
 
 #[test]
+fn test_negative_zero_is_canonicalized() {
+    assert!(Budget::new(-0.0).unwrap().get().is_sign_positive());
+    assert_eq!(Budget::new(-0.0).unwrap(), Budget::new(0.0).unwrap());
+    assert!(Quantity::new(-0.0).unwrap().get().is_sign_positive());
+    assert_eq!(Quantity::new(-0.0).unwrap(), Quantity::new(0.0).unwrap());
+}
+
+#[test]
 fn test_information_functions_are_canonicalized() {
     let mut contract = base_contract();
     contract.allowed_information_functions = vec![
@@ -1100,14 +1107,37 @@ fn test_affinity_participates_in_specificity() {
     let req = base_task();
 
     let mut broad = base_agent();
-    broad.contract.affinity = set(&["rust", "sqlite"]);
+    broad.contract.affinity = AffinityConstraint::Only(set(&["rust", "sqlite"]));
 
     let mut narrow = base_agent();
     narrow.type_ref = type_ref("rust-reviewer", 1);
-    narrow.contract.affinity = set(&["rust"]);
+    narrow.contract.affinity = AffinityConstraint::Only(set(&["rust"]));
 
     assert!(more_specific_for(&narrow, &broad, &req, &cat));
     assert!(!more_specific_for(&broad, &narrow, &req, &cat));
+}
+
+#[test]
+fn test_affinity_has_unconstrained_top() {
+    let cat = CapabilityCatalog::new();
+
+    let general = base_agent(); // affinity = Any
+    let mut rust = base_agent();
+    rust.type_ref = type_ref("rust-reviewer", 1);
+    rust.contract.affinity = AffinityConstraint::Only(set(&["rust"]));
+
+    // A general (Any) agent accepts a previously unseen affinity tag.
+    let mut unseen = base_task();
+    unseen.required_affinity = set(&["postgres"]);
+    assert!(can_execute(&general, &unseen, &cat).is_ok());
+    assert!(can_execute(&rust, &unseen, &cat).is_err());
+
+    // Any -> Only is a valid narrowing; Only -> Any is not.
+    assert!(is_valid_refinement(&general, &rust, &cat).is_ok());
+    assert!(is_valid_refinement(&rust, &general, &cat).is_err());
+
+    // And the narrowing is more specific for a task both can execute.
+    assert!(more_specific_for(&rust, &general, &base_task(), &cat));
 }
 
 #[test]
@@ -1115,21 +1145,21 @@ fn test_refinement_must_not_expand_executable_task_set_via_affinity() {
     let cat = CapabilityCatalog::new();
 
     let mut base = base_agent();
-    base.contract.affinity = set(&["rust"]);
+    base.contract.affinity = AffinityConstraint::Only(set(&["rust"]));
 
     // Derived adds {sqlite}: it could execute Tasks the base cannot, so it is
     // authority expansion and must be rejected.
     let mut derived = base_agent();
     derived.type_ref = type_ref("broader", 1);
     derived.based_on = Some(base.type_ref.clone());
-    derived.contract.affinity = set(&["rust", "sqlite"]);
+    derived.contract.affinity = AffinityConstraint::Only(set(&["rust", "sqlite"]));
     assert!(is_valid_refinement(&base, &derived, &cat).is_err());
 
     // Algebra invariant on a valid narrowing: Derived executable tasks ⊆ Base.
     let mut narrowed = base_agent();
     narrowed.type_ref = type_ref("narrower", 1);
     narrowed.based_on = Some(base.type_ref.clone());
-    narrowed.contract.affinity = BTreeSet::new();
+    narrowed.contract.affinity = AffinityConstraint::Only(BTreeSet::new());
     assert!(is_valid_refinement(&base, &narrowed, &cat).is_ok());
 
     let mut req = base_task();

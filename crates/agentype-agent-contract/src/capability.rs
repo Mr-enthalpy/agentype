@@ -33,7 +33,8 @@ pub struct Quantity(f64);
 impl Quantity {
     pub fn new(value: f64) -> Result<Self, ContractError> {
         if value.is_finite() && value >= 0.0 {
-            Ok(Self(value))
+            // Canonicalize negative zero so equal values cannot digest differently.
+            Ok(Self(if value == 0.0 { 0.0 } else { value }))
         } else {
             Err(ContractError::InvalidNumber {
                 field: "quantity".into(),
@@ -243,8 +244,6 @@ pub fn value_within(ceiling: &CapabilityValue, value: &CapabilityValue) -> bool 
     }
 }
 
-/// Whether a claim's declaration satisfies a security class. Retained for
-/// catalog vocabulary; it is never a substitute for imported evidence.
-pub fn assurance_satisfies(class: SecurityClass, assurance: Assurance) -> bool {
-    !class.requires_evidence() || assurance == Assurance::Enforced
-}
+// NOTE: there is deliberately no `assurance_satisfies` helper. `Assurance` is
+// declaration metadata only; no public API may express "a claim label satisfies
+// a security class". Only imported `ResolvedProvisioningEvidence` does.
