@@ -52,7 +52,7 @@ fn claim(id: &str, revision: u64, value: CapabilityValue, assurance: Assurance) 
         reference: cref(id, revision),
         value,
         assurance,
-        evidence_ref: None,
+        declaration_provenance_ref: None,
     }
 }
 
@@ -71,22 +71,33 @@ fn base_physical() -> PhysicalSafety {
     .unwrap()
 }
 
-fn base_evidence() -> ResolvedProvisioningEvidence {
+/// Evidence bound to the exact `base_source()` / `base_config()` candidate.
+fn evidence_for(
+    policy: AdapterPolicyRef,
+    safety: PhysicalSafety,
+    sandbox: Vec<SandboxPolicyRef>,
+    enforced: Vec<(CapabilityRef, CapabilityValue)>,
+) -> ResolvedProvisioningEvidence {
     ResolvedProvisioningEvidence::for_tests(
-        policy_ref("codex-local-adapter", 3),
+        policy,
         "codex_cli",
-        base_physical(),
-        Vec::new(),
+        base_source().source_ref,
+        base_config().config_ref,
+        base_config().config_digest,
+        safety,
+        sandbox,
+        enforced,
     )
     .unwrap()
 }
 
-fn evidence_with(
-    policy: AdapterPolicyRef,
-    safety: PhysicalSafety,
-    enforced: Vec<(CapabilityRef, CapabilityValue)>,
-) -> ResolvedProvisioningEvidence {
-    ResolvedProvisioningEvidence::for_tests(policy, "codex_cli", safety, enforced).unwrap()
+fn base_evidence() -> ResolvedProvisioningEvidence {
+    evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 fn base_contract() -> AgentTypeContract {
@@ -155,7 +166,7 @@ fn base_source() -> SpawnSource {
 fn base_config() -> SourceConfig {
     SourceConfig {
         config_ref: SourceConfigRef::new(base_source().source_ref, "deep-reasoning", 7).unwrap(),
-        config_digest: "sha256:abc".into(),
+        config_digest: ConfigDigest::new("sha256:abc").unwrap(),
         credential_refs: vec![CredentialRef::new("vault://codex-prod").unwrap()],
         claims: Vec::new(),
         status: ConfigStatus::Active,
@@ -258,11 +269,13 @@ fn test_can_execute_requires_capability_value() {
 #[test]
 fn test_refinement_accepts_narrowing() {
     let cat = CapabilityCatalog::new();
-    let base = base_agent();
+    let mut base = base_agent();
+    base.contract.affinity = set(&["rust", "sqlite"]);
     let mut derived = base_agent();
     derived.type_ref = type_ref("readonly-rust-reviewer", 1);
     derived.based_on = Some(base.type_ref.clone());
     derived.contract.budget_ceiling = budget(25.0);
+    // Affinity may only shrink.
     derived.contract.affinity = set(&["rust"]);
 
     assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
@@ -502,9 +515,10 @@ fn test_security_class_requires_imported_evidence() {
         Err(ContractError::SecurityUnenforceable { .. })
     ));
 
-    let evidence = evidence_with(
+    let evidence = evidence_for(
         policy_ref("codex-local-adapter", 3),
         base_physical(),
+        Vec::new(),
         vec![(reference.clone(), CapabilityValue::Bool(true))],
     );
     assert!(can_provision(&agent, &source, &base_config(), &evidence, &cat).is_ok());
@@ -537,9 +551,10 @@ fn test_enforced_requires_imported_evidence_not_claim_label() {
     ));
     assert!(can_provision(&agent, &source, &base_config(), &base_evidence(), &cat).is_err());
 
-    let evidence = evidence_with(
+    let evidence = evidence_for(
         policy_ref("codex-local-adapter", 3),
         base_physical(),
+        Vec::new(),
         vec![(reference.clone(), CapabilityValue::Bool(true))],
     );
     assert!(can_provision(&agent, &source, &base_config(), &evidence, &cat).is_ok());
@@ -549,7 +564,12 @@ fn test_enforced_requires_imported_evidence_not_claim_label() {
 fn test_evidence_must_match_source_adapter_policy() {
     let cat = CapabilityCatalog::new();
     let agent = base_agent();
-    let evidence = evidence_with(policy_ref("other-adapter", 9), base_physical(), Vec::new());
+    let evidence = evidence_for(
+        policy_ref("other-adapter", 9),
+        base_physical(),
+        Vec::new(),
+        Vec::new(),
+    );
     assert!(matches!(
         can_provision(&agent, &base_source(), &base_config(), &evidence, &cat),
         Err(ContractError::EvidencePolicyMismatch { .. })
@@ -834,7 +854,12 @@ fn test_physical_enabled_network_does_not_prove_restricted_enforcement() {
             .collect(),
     )
     .unwrap();
-    let evidence = evidence_with(policy_ref("codex-local-adapter", 3), safety, Vec::new());
+    let evidence = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        safety,
+        Vec::new(),
+        Vec::new(),
+    );
     assert!(matches!(
         can_provision(&agent, &base_source(), &base_config(), &evidence, &cat),
         Err(ContractError::SecurityUnenforceable { .. })
@@ -1073,14 +1098,129 @@ fn test_more_specific_does_not_treat_weaker_capability_as_narrower() {
 fn test_affinity_participates_in_specificity() {
     let cat = CapabilityCatalog::new();
     let req = base_task();
-    let broad = base_agent();
+
+    let mut broad = base_agent();
+    broad.contract.affinity = set(&["rust", "sqlite"]);
 
     let mut narrow = base_agent();
-    narrow.type_ref = type_ref("sqlite-reviewer", 1);
-    narrow.contract.affinity = set(&["sqlite"]);
+    narrow.type_ref = type_ref("rust-reviewer", 1);
+    narrow.contract.affinity = set(&["rust"]);
 
     assert!(more_specific_for(&narrow, &broad, &req, &cat));
     assert!(!more_specific_for(&broad, &narrow, &req, &cat));
+}
+
+#[test]
+fn test_refinement_must_not_expand_executable_task_set_via_affinity() {
+    let cat = CapabilityCatalog::new();
+
+    let mut base = base_agent();
+    base.contract.affinity = set(&["rust"]);
+
+    // Derived adds {sqlite}: it could execute Tasks the base cannot, so it is
+    // authority expansion and must be rejected.
+    let mut derived = base_agent();
+    derived.type_ref = type_ref("broader", 1);
+    derived.based_on = Some(base.type_ref.clone());
+    derived.contract.affinity = set(&["rust", "sqlite"]);
+    assert!(is_valid_refinement(&base, &derived, &cat).is_err());
+
+    // Algebra invariant on a valid narrowing: Derived executable tasks ⊆ Base.
+    let mut narrowed = base_agent();
+    narrowed.type_ref = type_ref("narrower", 1);
+    narrowed.based_on = Some(base.type_ref.clone());
+    narrowed.contract.affinity = BTreeSet::new();
+    assert!(is_valid_refinement(&base, &narrowed, &cat).is_ok());
+
+    let mut req = base_task();
+    req.required_affinity = set(&["rust"]);
+    if can_execute(&narrowed, &req, &cat).is_ok() {
+        assert!(can_execute(&base, &req, &cat).is_ok());
+    }
+    // And the narrowing genuinely cannot execute the {sqlite} task the base can.
+    let mut sqlite_req = base_task();
+    sqlite_req.required_affinity = set(&["sqlite"]);
+    assert!(can_execute(&base, &sqlite_req, &cat).is_err());
+    assert!(can_execute(&narrowed, &sqlite_req, &cat).is_err());
+}
+
+#[test]
+fn test_sandbox_policy_requirement_compatible_with_unconstrained_agent() {
+    let cat = CapabilityCatalog::new();
+    let policy = sandbox_ref("strict-sandbox", 4);
+
+    // Unconstrained agent (None) accepts any Task sandbox requirement.
+    let unconstrained = base_agent();
+    let mut req = base_task();
+    req.sandbox_policy = Some(policy.clone());
+    assert!(can_execute(&unconstrained, &req, &cat).is_ok());
+
+    // A pinned agent accepts only its own policy.
+    let mut pinned = base_agent();
+    pinned.contract.sandbox_policy = Some(policy.clone());
+    assert!(can_execute(&pinned, &req, &cat).is_ok());
+
+    let mut other = base_task();
+    other.sandbox_policy = Some(sandbox_ref("other", 1));
+    assert!(can_execute(&pinned, &other, &cat).is_err());
+}
+
+#[test]
+fn test_sandbox_policy_must_have_provisioning_enforcement_proof() {
+    let cat = CapabilityCatalog::new();
+    let policy = sandbox_ref("strict-sandbox", 4);
+    let mut agent = base_agent();
+    agent.contract.sandbox_policy = Some(policy.clone());
+
+    // Evidence without the sandbox policy does not enforce it.
+    assert!(matches!(
+        can_provision(
+            &agent,
+            &base_source(),
+            &base_config(),
+            &base_evidence(),
+            &cat
+        ),
+        Err(ContractError::SecurityUnenforceable { .. })
+    ));
+
+    let evidence = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        vec![policy],
+        Vec::new(),
+    );
+    assert!(can_provision(&agent, &base_source(), &base_config(), &evidence, &cat).is_ok());
+}
+
+#[test]
+fn test_provisioning_evidence_for_config_a_must_not_authorize_config_b() {
+    let cat = CapabilityCatalog::new();
+    let agent = base_agent();
+
+    // Evidence resolved for config B.
+    let mut config_b = base_config();
+    config_b.config_ref = SourceConfigRef::new(base_source().source_ref, "fast-review", 4).unwrap();
+    config_b.config_digest = ConfigDigest::new("sha256:def").unwrap();
+    let evidence_b = ResolvedProvisioningEvidence::for_tests(
+        policy_ref("codex-local-adapter", 3),
+        "codex_cli",
+        base_source().source_ref,
+        config_b.config_ref.clone(),
+        config_b.config_digest.clone(),
+        base_physical(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    // Evidence bound to B must NOT authorize config A.
+    assert!(matches!(
+        can_provision(&agent, &base_source(), &base_config(), &evidence_b, &cat),
+        Err(ContractError::EvidenceSubjectMismatch { .. })
+    ));
+    // It authorizes its own config B.
+    assert!(can_provision(&agent, &base_source(), &config_b, &evidence_b, &cat).is_ok());
 }
 
 #[test]

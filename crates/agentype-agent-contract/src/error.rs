@@ -26,6 +26,8 @@ pub enum ContractError {
     AdapterBindingMissing,
     /// Imported enforcement evidence does not belong to the source's policy.
     EvidencePolicyMismatch { expected: String, actual: String },
+    /// Imported enforcement evidence was resolved for a different candidate.
+    EvidenceSubjectMismatch { reason: String },
     /// A selector carried no usable identity.
     EmptySelector,
     /// A numeric contract value was non-finite or out of range.
@@ -63,6 +65,9 @@ impl fmt::Display for ContractError {
                 f,
                 "enforcement evidence policy {actual} does not match source policy {expected}"
             ),
+            Self::EvidenceSubjectMismatch { reason } => {
+                write!(f, "enforcement evidence subject mismatch: {reason}")
+            }
             Self::EmptySelector => write!(f, "empty selector"),
             Self::InvalidNumber { field } => write!(f, "invalid number for {field}"),
             Self::InvalidRef { reason } => write!(f, "invalid ref: {reason}"),

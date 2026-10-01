@@ -34,6 +34,26 @@ impl Budget {
     }
 }
 
+/// A canonical, non-empty config content digest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConfigDigest(String);
+
+impl ConfigDigest {
+    pub fn new(digest: impl Into<String>) -> Result<Self, ContractError> {
+        let digest = digest.into();
+        if digest.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "config digest cannot be empty".into(),
+            });
+        }
+        Ok(Self(digest))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// An opaque credential reference. Never a secret value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CredentialRef(String);
@@ -301,7 +321,7 @@ pub struct SpawnSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
-    pub config_digest: String,
+    pub config_digest: ConfigDigest,
     pub credential_refs: Vec<CredentialRef>,
     pub claims: Vec<CapabilityClaim>,
     pub status: ConfigStatus,

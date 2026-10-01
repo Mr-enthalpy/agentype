@@ -172,6 +172,16 @@ pub fn can_provision(
             actual: evidence.adapter_policy().id().as_str().to_string(),
         });
     }
+    // Evidence is bound to the exact candidate it was resolved for: evidence
+    // for config A must never authorize config B under the same source.
+    if evidence.source_ref() != &source.source_ref
+        || evidence.source_config_ref() != &config.config_ref
+        || evidence.config_digest() != &config.config_digest
+    {
+        return Err(ContractError::EvidenceSubjectMismatch {
+            reason: "evidence was not resolved for this exact source config digest".into(),
+        });
+    }
 
     if !agent.contract.lifecycle.is_subset(&source.lifecycle_modes) {
         return Err(ContractError::CapabilityMismatch {
@@ -261,6 +271,17 @@ pub fn can_provision(
             reason: "attempt isolation is required but not enforceable".into(),
         });
     }
+    if let Some(policy) = &agent.contract.sandbox_policy {
+        if !evidence.enforces_sandbox_policy(policy) {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "sandbox policy {}@{} is not enforced by imported evidence",
+                    policy.id().as_str(),
+                    policy.revision()
+                ),
+            });
+        }
+    }
 
     Ok(())
 }
@@ -333,13 +354,17 @@ fn sandbox_policy_no_wider(
 }
 
 /// Whether a Task sandbox requirement is allowed by an agent sandbox policy.
+///
+/// `None` on the allowance side is unconstrained (consistent with the
+/// refinement order, where `None -> Some(P)` is a narrowing).
 fn sandbox_policy_within(
     requirement: &Option<SandboxPolicyRef>,
     allowance: &Option<SandboxPolicyRef>,
 ) -> bool {
-    match requirement {
-        None => true,
-        Some(_) => requirement == allowance,
+    match (requirement, allowance) {
+        (_, None) => true,
+        (None, _) => true,
+        (Some(r), Some(a)) => r == a,
     }
 }
 
@@ -356,7 +381,7 @@ fn authority_no_wider(
         && a.visibility.is_subset(&b.visibility)
         && a.tools.is_subset(&b.tools)
         && a.roots.is_subset(&b.roots)
-        && a.affinity.is_superset(&b.affinity)
+        && a.affinity.is_subset(&b.affinity)
         && a.budget_ceiling <= b.budget_ceiling
         && a.lifecycle.is_subset(&b.lifecycle)
         && a.continuity >= b.continuity
@@ -422,7 +447,10 @@ pub fn is_valid_refinement(
     if !derived_c.roots.is_subset(&base_c.roots) {
         return invalid("derived roots widen base roots");
     }
-    if !derived_c.affinity.is_superset(&base_c.affinity) {
+    // Affinity is an allowed-tag ceiling like permission/tools: a derived type
+    // may only support a subset, so refinement never enlarges the executable
+    // Task set.
+    if !derived_c.affinity.is_subset(&base_c.affinity) {
         return invalid("derived affinity broadens base affinity");
     }
     if derived_c.budget_ceiling > base_c.budget_ceiling {

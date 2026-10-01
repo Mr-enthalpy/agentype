@@ -37,8 +37,8 @@ pub use ids::{
 pub use predicates::{can_execute, can_provision, is_valid_refinement, more_specific_for};
 pub use records::{
     network_rank, workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
-    AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigStatus, ContinuityMode,
-    CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
+    AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigDigest, ConfigStatus,
+    ContinuityMode, CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
     SandboxPolicyRef, SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource,
     SpawnSourceRef, TaskRequirement,
 };

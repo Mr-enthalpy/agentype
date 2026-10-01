@@ -181,12 +181,16 @@ impl CapabilityCatalog {
 }
 
 /// A source's (or config's) declaration about one exact capability revision.
+///
+/// `declaration_provenance_ref` is diagnostic metadata only. It MUST NOT
+/// satisfy `SecurityClass::requires_evidence()`: only imported
+/// `ResolvedProvisioningEvidence` does.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityClaim {
     pub reference: CapabilityRef,
     pub value: CapabilityValue,
     pub assurance: Assurance,
-    pub evidence_ref: Option<String>,
+    pub declaration_provenance_ref: Option<String>,
 }
 
 /// Decide whether `provided` satisfies `required` under `matcher`.
