@@ -16,9 +16,13 @@ type_id, revision, affinity, capabilities, sandbox policy ref, lifecycle,
 continuity, anchor constraint, spawn requirements, information-function set
 and memory policy, transform policy, optional `based_on_type_id`.
 
-Revisions, if retained, MUST be immutable once published. Cross-revision
-compatibility, whether Tasks pin exact vs compatible revision, and Transform
-across revisions are DEFERRED (D-TYPE-REV).
+Revisions MUST be immutable once published. A committed LogicalAgent, and any
+admitted Task agent requirement, MUST pin an exact immutable
+`AgentTypeRef(type_id, revision)`. `latest`, ranges, and aliases are pre-commit
+selectors only and MUST resolve to an exact revision before any durable binding
+is written. Cross-revision compatibility and Transform across revisions remain
+DEFERRED; M6-B v1 performs no automatic cross-revision upgrade (D-TYPE-REV
+resolved to exact-pin).
 
 ## Relations (MUST remain four)
 
@@ -35,7 +39,20 @@ A broad SpawnSource MAY provision a narrower AgentType if it can enforce it.
 A more specific AgentType MAY be preferred for assignment over a broader
 compatible one. These directions differ and MUST NOT be inverted.
 
-Concrete encodings of the four relations are DEFERRED (D-TYPE-REL).
+Concrete encodings of the four relations are FROZEN in M6-B.1 (D-TYPE-REL
+resolved) and implemented in `agentype-agent-contract`:
+
+- `can_execute` checks the information function, capability envelope, permission
+  ceiling, tools, workspace/network policy, continuity minimum, anchor, and
+  budget.
+- `can_provision` checks source/config activity, lifecycle and continuity
+  coverage, the functional capability envelope, `ENFORCED` sandbox claims
+  intersected with the imported physical safety, and exact AdapterBinding
+  availability.
+- `more_specific_for` compares authority envelopes and is defined only once both
+  types are executable; it MUST NOT rank by nominal inheritance depth.
+- `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
+  tools, roots, budget, lifecycle, continuity, anchor, and security policy.
 
 ## Refinement monotonicity
 

@@ -19,8 +19,8 @@ Classification:
 | D-GEN-TOPOLOGY | Generation provenance chain vs DAG | **RESOLVED in M6-A**: DAG tracked via immutable `SemanticInputSet` on each task binding and generation seed | None (Resolved) | M6-A |
 | D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | **RESOLVED in M6-A**: Ingress `RawWorkIntent` structure compiles deterministically to `CompiledWorkProposal` | None (Resolved) | M6-A |
 | D-INTENT-FANOUT | Whether 1-to-many compile is ever allowed | **RESOLVED in M6-A**: 1 intent deterministically compiles to at most 1 proposal (0..1); fanout deferred | None (Resolved) | M6-A |
-| D-TYPE-REL | Concrete `can_execute` / `can_provision` / `more_specific_for` / `is_valid_refinement` | must not collapse to subtype | BLOCKS_SEMANTIC_LAYER | M6 |
-| D-TYPE-REV | AgentType revision compatibility and Task pins | revisions mentioned, rules not | BLOCKS_SEMANTIC_LAYER | M6 |
+| D-TYPE-REL | Concrete `can_execute` / `can_provision` / `more_specific_for` / `is_valid_refinement` | **RESOLVED in M6-B.1**: four independent predicates frozen in `agentype-agent-contract`; MUST NOT collapse to subtype | None (Resolved) | M6-B.1 |
+| D-TYPE-REV | AgentType revision compatibility and Task pins | **RESOLVED in M6-B.1**: published revisions immutable; LogicalAgent and admitted Task requirements pin an exact `AgentTypeRef`; selectors resolve to exact pre-commit; no cross-revision upgrade | None (Resolved) | M6-B.1 |
 | D-INFO-FN | Information-function set/trait encoding | **RESOLVED in M6-A**: Fixed 3-value closed enum (`EXPAND`, `COMPRESS_POSITIVE`, `COMPRESS_NEGATIVE`) with strict state-gated admission rules | None (Resolved) | M6-A |
 | D-MEM-SCHEMA | MemoryCapsule size, fields, merge, pos/neg specialization | design lists needs | BLOCKS_SEMANTIC_LAYER | M6 |
 | D-MEM-PROMOTE | Who promotes Result delta to canonical MemoryCapsule | Root vs integration Task vs other | BLOCKS_SEMANTIC_LAYER | M6 |
