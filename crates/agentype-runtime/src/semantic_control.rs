@@ -8,8 +8,8 @@
 //! absent from this surface.
 
 use agentype_core::{
-    Error, GenerationId, GenerationRecord, GenerationView, IntentSource, ProposalId,
-    ProposalRecord, RawWorkIntent, TaskId, TaskSpec,
+    Error, GenerationId, GenerationRecord, GenerationView, ProposalId, ProposalRecord,
+    RawWorkIntent, TaskId, TaskSpec,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::Value;
@@ -36,9 +36,8 @@ impl<'a> RootSemanticControl<'a> {
         command_ref: &str,
         compiler_version: u32,
     ) -> Result<ProposalRecord, Error> {
-        let source = IntentSource::root(command_ref)?;
         self.kernel
-            .compile_intent(generation_id, intent, source, compiler_version)
+            .compile_root_intent(generation_id, intent, command_ref, compiler_version)
     }
 
     pub fn admit_proposal(

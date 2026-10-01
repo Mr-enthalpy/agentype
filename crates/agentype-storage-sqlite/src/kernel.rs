@@ -628,20 +628,39 @@ impl Kernel {
         self.tx(|tx, now| crate::frontier::create_generation(tx, now, seed_payload))
     }
 
-    pub fn compile_intent(
+    pub fn compile_root_intent(
         &self,
         generation_id: &agentype_core::GenerationId,
         intent: agentype_core::RawWorkIntent,
-        source: agentype_core::IntentSource,
+        command_ref: &str,
         compiler_version: u32,
     ) -> Result<agentype_core::ProposalRecord, Error> {
         self.tx(|tx, now| {
-            crate::frontier::compile_intent(
+            crate::frontier::compile_root_intent(
                 tx,
                 now,
                 generation_id,
                 intent,
-                source,
+                command_ref,
+                compiler_version,
+            )
+        })
+    }
+
+    pub fn compile_result_intent(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+        result_id: &agentype_core::ResultId,
+        raw_intent_key: &str,
+        compiler_version: u32,
+    ) -> Result<agentype_core::ProposalRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::compile_result_intent(
+                tx,
+                now,
+                generation_id,
+                result_id,
+                raw_intent_key,
                 compiler_version,
             )
         })
