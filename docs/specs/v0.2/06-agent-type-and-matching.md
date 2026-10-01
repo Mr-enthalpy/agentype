@@ -43,8 +43,17 @@ Concrete encodings of the four relations are FROZEN in M6-B.1 (D-TYPE-REL
 resolved) and implemented in `agentype-agent-contract`:
 
 - `can_execute` checks the information function, capability envelope, permission
-  ceiling, tools, task affinity, workspace/network policy, continuity minimum,
-  sandbox policy, anchor, and budget.
+  ceiling, tools, task affinity (an agent with the `Any` affinity accepts any
+  requirement; `Only(S)` requires the Task tags to be a subset of `S`),
+  workspace/network policy, continuity minimum, sandbox policy, anchor, and
+  budget.
+- Restrictions split into a **semantic matching envelope** (information
+  functions, permission ceiling, visibility, tools, roots, capability
+  constraints) with no physical proof requirement, and **mechanical sandbox
+  authority** (workspace, network, attempt isolation — proven by
+  `ResolvedProvisioningEvidence.enforceable_safety`; full filesystem/tool
+  restrictions — proven by an evidence-enforced `SandboxPolicyRef`). A field
+  MUST NOT be treated as a physical restriction without a proof path.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle and continuity coverage, every required
   capability **at its exact revision** (the source envelope is the provisionable
@@ -65,8 +74,9 @@ resolved) and implemented in `agentype-agent-contract`:
   tools, roots, affinity, budget, information functions, sandbox policy, anchor,
   security policy, and capability constraints; a derived type MUST NOT widen the
   lifecycle mode set, weaken continuity, or weaken required isolation. Affinity
-  is an allowed-tag ceiling (`Derived ⊆ Base`), so a valid refinement never
-  enlarges the set of executable Tasks.
+  is an allowed-tag ceiling with an explicit top: `Any` is general and
+  unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and `Any ≤ Only(B)` is false.
+  A valid refinement therefore never enlarges the set of executable Tasks.
 
 ## Refinement monotonicity
 
