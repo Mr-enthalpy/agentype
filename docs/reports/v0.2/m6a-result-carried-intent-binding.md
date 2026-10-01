@@ -124,8 +124,11 @@ These remain out of scope for this closure.
 
 ```text
 Base (main): 4c04aa76579b076325e14f2c18a558f30613d303
-SCHEMA_VERSION = 5 (unchanged)
 
-M6-A re-freeze is the merge of the result-carried intent closure PR. If project
-convention requires, the merge commit is recorded by a follow-up commit on main.
+Audited P1 closure head: 23b7727ac3310de7c3b7a588f9d2f5d6eefc53bc
+
+M6-A re-freeze merge (PR #20):
+414752a748f71f1ba4a82c1bff342ae7f369c852
+
+SCHEMA_VERSION = 5 (unchanged)
 ```
