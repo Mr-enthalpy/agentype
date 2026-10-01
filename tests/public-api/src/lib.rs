@@ -195,4 +195,40 @@ pub fn supported_composition() {}
 ///     let _ = control.ack_success(attempt, epoch, None, &serde_json::Value::Null, None, true, false);
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 14. The proposal-only IntentIngress has no admission authority.
+/// use agentype_core::ProposalId;
+/// use agentype_runtime::IntentIngress;
+/// fn _ingress_cannot_admit(ingress: &IntentIngress<'_>, proposal: &ProposalId) {
+///     let _ = ingress.admit_proposal(proposal, 0, None);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 15. The proposal-only IntentIngress cannot reject a proposal.
+/// use agentype_core::ProposalId;
+/// use agentype_runtime::IntentIngress;
+/// fn _ingress_cannot_reject(ingress: &IntentIngress<'_>, proposal: &ProposalId) {
+///     let _ = ingress.reject_proposal(proposal, "no");
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 16. The proposal-only IntentIngress cannot freeze a generation.
+/// use agentype_core::GenerationId;
+/// use agentype_runtime::IntentIngress;
+/// fn _ingress_cannot_freeze(ingress: &IntentIngress<'_>, generation: &GenerationId) {
+///     let _ = ingress.freeze_generation(generation, 0);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 17. The proposal-only IntentIngress cannot close a generation.
+/// use agentype_core::GenerationId;
+/// use agentype_runtime::IntentIngress;
+/// fn _ingress_cannot_close(ingress: &IntentIngress<'_>, generation: &GenerationId) {
+///     let _ = ingress.close_generation(generation, 0);
+/// }
+/// ```
 pub fn probes() {}

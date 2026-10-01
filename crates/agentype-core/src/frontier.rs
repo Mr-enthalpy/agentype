@@ -72,6 +72,40 @@ impl SemanticInputSet {
     }
 }
 
+/// Typed provenance of an intent ingress.
+///
+/// A [`RawWorkIntent`] carries no Scheduler authority, so the ingress must be
+/// able to state *where* it came from without trusting a free-form string.
+/// A result-backed intent is mechanically anchored to a durable `Result`; a
+/// Root-originated intent is anchored to a Root command reference. The
+/// persisted `(source_kind, source_ref)` identity is derived from this type,
+/// never supplied as arbitrary text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentSource {
+    /// Root-originated intent, anchored to a Root command reference.
+    Root { command_ref: String },
+    /// Worker/harness-originated intent, anchored to a durable `Result`.
+    Result { result_id: ResultId },
+}
+
+impl IntentSource {
+    /// Construct a Root source, rejecting an empty or whitespace command ref.
+    pub fn root(command_ref: impl Into<String>) -> Result<Self, crate::Error> {
+        let command_ref = command_ref.into();
+        if command_ref.trim().is_empty() {
+            return Err(crate::Error::invariant(
+                "root intent command_ref cannot be empty",
+            ));
+        }
+        Ok(Self::Root { command_ref })
+    }
+
+    /// Construct a result-backed source.
+    pub fn result(result_id: ResultId) -> Self {
+        Self::Result { result_id }
+    }
+}
+
 /// Unauthoritative semantic suggestion submitted from workers, Root, or external harnesses.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawWorkIntent {

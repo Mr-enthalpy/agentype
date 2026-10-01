@@ -14,7 +14,7 @@ use crate::txutil::required_partition;
 use agentype_core::{
     generation_allows_admit, is_generation_settled, is_generation_view_settled, ArtifactRef,
     BatchId, ContinuityPreference, Error, FailureClass, GenerationId, GenerationRecord,
-    GenerationState, GenerationView, InformationFunction, OutboxEventId, PartitionId,
+    GenerationState, GenerationView, InformationFunction, IntentSource, OutboxEventId, PartitionId,
     ProposalExpirationReason, ProposalId, ProposalRecord, ProposalStateKind, RawWorkIntent,
     ResultId, RetryPolicy, SemanticInputSet, TaskId, TaskSettledSnapshot, TaskSpec, TaskState,
     UnixTime, WorkstreamId, GENERATION_CLOSED, GENERATION_FROZEN,
@@ -357,24 +357,64 @@ pub fn create_generation(
     })
 }
 
+/// Resolve a typed intent source into the persisted `(source_kind, source_ref)`
+/// identity, mechanically anchoring a result-backed intent to a durable Result.
+pub fn resolve_intent_source(
+    tx: &Transaction<'_>,
+    source: &IntentSource,
+) -> Result<(String, String), Error> {
+    match source {
+        IntentSource::Root { command_ref } => {
+            if command_ref.trim().is_empty() {
+                return Err(Error::invalid_authority(
+                    "root intent command_ref cannot be empty",
+                ));
+            }
+            Ok(("root".to_string(), command_ref.clone()))
+        }
+        IntentSource::Result { result_id } => {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM results WHERE id = ?1",
+                    params![result_id.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(map_sqlite)?
+                .unwrap_or(false);
+            if !exists {
+                return Err(Error::not_found(format!(
+                    "intent source result {:?} does not exist",
+                    result_id.as_str()
+                )));
+            }
+            Ok(("result".to_string(), result_id.as_str().to_string()))
+        }
+    }
+}
+
 /// Compile a raw intent into a durable CompiledWorkProposal.
 ///
-/// Idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)`.
+/// Idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)`,
+/// where `(source_kind, source_ref)` is derived from the typed [`IntentSource`].
 pub fn compile_intent(
     tx: &Transaction<'_>,
     now: UnixTime,
     generation_id: &GenerationId,
     intent: RawWorkIntent,
-    source_kind: &str,
-    source_ref: &str,
+    source: IntentSource,
     compiler_version: u32,
 ) -> Result<ProposalRecord, Error> {
-    // 1. Compute the canonical content fingerprint up front. Current frontier
+    // 1. Resolve the typed source; a result-backed intent must name a durable
+    // Result, so provenance cannot be forged as arbitrary text.
+    let (source_kind, source_ref) = resolve_intent_source(tx, &source)?;
+
+    // 2. Compute the canonical content fingerprint up front. Current frontier
     // state governs whether a *new* semantic commitment may be created; it does
     // not govern replay/observation of a commitment that already durably exists.
     let fingerprint = intent.fingerprint()?;
 
-    // 2. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
+    // 3. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
     if let Some(existing) = query_opt(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
@@ -482,7 +522,7 @@ pub fn compile_intent(
         });
     }
 
-    // 3. No durable proposal exists yet, so this is a new semantic commitment.
+    // 4. No durable proposal exists yet, so this is a new semantic commitment.
     // Verify the generation exists and its frontier admits a *new* compilation.
     let gen_state_str: String = tx
         .query_row(
@@ -510,7 +550,7 @@ pub fn compile_intent(
         )));
     }
 
-    // 4. Validate semantic input set provenance
+    // 5. Validate semantic input set provenance
     validate_semantic_input_set(tx, generation_id, &intent.semantic_input_set)?;
 
     // TaskSpec dependencies must be empty in M6-A
@@ -522,7 +562,7 @@ pub fn compile_intent(
         }
     }
 
-    // 5. Build proposal record and insert
+    // 6. Build proposal record and insert
     let norm_spec = intent.suggested_task_spec;
     let spec_json_opt = match norm_spec.as_ref() {
         Some(s) => Some(json_dump(&task_spec_to_json(s)?)),
@@ -589,8 +629,8 @@ pub fn compile_intent(
     Ok(ProposalRecord {
         proposal_id,
         generation_id: generation_id.clone(),
-        source_kind: source_kind.to_string(),
-        source_ref: source_ref.to_string(),
+        source_kind,
+        source_ref,
         raw_intent_key: intent.raw_intent_key,
         intent_fingerprint: fingerprint,
         objective: intent.objective,

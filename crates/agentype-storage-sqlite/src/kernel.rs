@@ -632,8 +632,7 @@ impl Kernel {
         &self,
         generation_id: &agentype_core::GenerationId,
         intent: agentype_core::RawWorkIntent,
-        source_kind: &str,
-        source_ref: &str,
+        source: agentype_core::IntentSource,
         compiler_version: u32,
     ) -> Result<agentype_core::ProposalRecord, Error> {
         self.tx(|tx, now| {
@@ -642,8 +641,7 @@ impl Kernel {
                 now,
                 generation_id,
                 intent,
-                source_kind,
-                source_ref,
+                source,
                 compiler_version,
             )
         })

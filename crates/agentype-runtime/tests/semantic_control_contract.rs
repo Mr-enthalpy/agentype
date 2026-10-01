@@ -174,7 +174,7 @@ fn test_semantic_control_e2e_through_daemon() {
     };
 
     let prop = sem
-        .compile_intent(&gen.generation_id, intent, "root", "root_cli", 1)
+        .compile_root_intent(&gen.generation_id, intent, "root_cli", 1)
         .unwrap();
 
     let task_id = sem.admit_proposal(&prop.proposal_id, 0, None).unwrap();
