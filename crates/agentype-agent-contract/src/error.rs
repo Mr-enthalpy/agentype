@@ -24,6 +24,8 @@ pub enum ContractError {
     CredentialUnavailable { reference: String },
     /// No imported adapter binding matches the required exact domain.
     AdapterBindingMissing,
+    /// Imported enforcement evidence does not belong to the source's policy.
+    EvidencePolicyMismatch { expected: String, actual: String },
     /// A selector carried no usable identity.
     EmptySelector,
     /// A numeric contract value was non-finite or out of range.
@@ -55,6 +57,10 @@ impl fmt::Display for ContractError {
                 write!(f, "credential unavailable: {reference}")
             }
             Self::AdapterBindingMissing => write!(f, "exact adapter binding missing"),
+            Self::EvidencePolicyMismatch { expected, actual } => write!(
+                f,
+                "enforcement evidence policy {actual} does not match source policy {expected}"
+            ),
             Self::EmptySelector => write!(f, "empty selector"),
             Self::InvalidNumber { field } => write!(f, "invalid number for {field}"),
             Self::InvalidRef { reason } => write!(f, "invalid ref: {reason}"),

@@ -1,8 +1,8 @@
 //! M6-B contract records. Pure value types; persistence is a later milestone.
 //!
-//! All numeric contract values are validated newtypes and all identity refs
-//! reject empty ids / zero revisions, so a durable digest can never be formed
-//! from an invalid or non-canonical value.
+//! Every identity is a private-field newtype with a validated constructor and
+//! every numeric contract value is a validated finite non-negative newtype, so
+//! a durable digest can never be formed from an invalid or non-canonical value.
 
 use crate::capability::{CapabilityClaim, CapabilityRef, CapabilitySpec, CapabilityValue};
 use crate::error::ContractError;
@@ -54,6 +54,26 @@ impl CredentialRef {
     }
 }
 
+/// An opaque concrete physical execution domain (adapter-owned).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AdapterBindingKey(String);
+
+impl AdapterBindingKey {
+    pub fn new(key: impl Into<String>) -> Result<Self, ContractError> {
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding key cannot be empty".into(),
+            });
+        }
+        Ok(Self(key))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 fn validate_identity(id: &str, revision: u64, what: &str) -> Result<(), ContractError> {
     if id.trim().is_empty() {
         return Err(ContractError::InvalidRef {
@@ -71,8 +91,8 @@ fn validate_identity(id: &str, revision: u64, what: &str) -> Result<(), Contract
 /// Exact, immutable `(type_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentTypeRef {
-    pub type_id: AgentTypeId,
-    pub revision: u64,
+    type_id: AgentTypeId,
+    revision: u64,
 }
 
 impl AgentTypeRef {
@@ -81,13 +101,21 @@ impl AgentTypeRef {
         validate_identity(type_id.as_str(), revision, "agent type")?;
         Ok(Self { type_id, revision })
     }
+
+    pub fn type_id(&self) -> &AgentTypeId {
+        &self.type_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 /// Exact, immutable `(source_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpawnSourceRef {
-    pub source_id: SpawnSourceId,
-    pub revision: u64,
+    source_id: SpawnSourceId,
+    revision: u64,
 }
 
 impl SpawnSourceRef {
@@ -99,14 +127,22 @@ impl SpawnSourceRef {
             revision,
         })
     }
+
+    pub fn source_id(&self) -> &SpawnSourceId {
+        &self.source_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 /// Exact, immutable `(source, config_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceConfigRef {
-    pub source: SpawnSourceRef,
-    pub config_id: SourceConfigId,
-    pub revision: u64,
+    source: SpawnSourceRef,
+    config_id: SourceConfigId,
+    revision: u64,
 }
 
 impl SourceConfigRef {
@@ -123,13 +159,25 @@ impl SourceConfigRef {
             revision,
         })
     }
+
+    pub fn source(&self) -> &SpawnSourceRef {
+        &self.source
+    }
+
+    pub fn config_id(&self) -> &SourceConfigId {
+        &self.config_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 /// Exact adapter policy revision.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AdapterPolicyRef {
-    pub policy_id: AdapterPolicyId,
-    pub revision: u64,
+    policy_id: AdapterPolicyId,
+    revision: u64,
 }
 
 impl AdapterPolicyRef {
@@ -141,12 +189,14 @@ impl AdapterPolicyRef {
             revision,
         })
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AgentTypeStatus {
-    Published,
-    Deprecated,
+    pub fn policy_id(&self) -> &AdapterPolicyId {
+        &self.policy_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 /// How strong a continuity guarantee an agent contract requires. A higher mode
@@ -195,7 +245,8 @@ pub struct SecurityContract {
     pub requires_attempt_isolation: bool,
 }
 
-/// The AgentType contract: semantic/security/lifecycle/continuity envelope.
+/// The AgentType contract: semantic/security/lifecycle/continuity/affinity
+/// envelope.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTypeContract {
     /// `InformationFunction` is a closed enum without `Ord`, so this stays a
@@ -210,6 +261,8 @@ pub struct AgentTypeContract {
     pub visibility: BTreeSet<String>,
     pub tools: BTreeSet<String>,
     pub roots: BTreeSet<String>,
+    /// Semantic affinity tags. Narrowing is allowed; broadening authority is not.
+    pub affinity: BTreeSet<String>,
     pub budget_ceiling: Budget,
     pub security: SecurityContract,
     pub lifecycle: BTreeSet<LifecycleMode>,
@@ -225,15 +278,29 @@ impl AgentTypeContract {
             .sort_by_key(|f| f.as_sql());
         self.allowed_information_functions.dedup();
     }
+
+    /// Whole-record invariant: every required capability must have an exact spec.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        for reference in self.required_capabilities.keys() {
+            if !self.capability_specs.contains_key(reference) {
+                return Err(ContractError::InvariantViolation(format!(
+                    "missing capability spec for {}@{}",
+                    reference.capability_id().as_str(),
+                    reference.revision()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// A published, immutable AgentType revision.
+/// A published, immutable AgentType revision. Publication/deprecation status is
+/// owned by the catalog, not duplicated here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentType {
     pub type_ref: AgentTypeRef,
     pub based_on: Option<AgentTypeRef>,
     pub contract: AgentTypeContract,
-    pub status: AgentTypeStatus,
 }
 
 /// A Task's hard agent requirement (derived from admission).
@@ -243,6 +310,8 @@ pub struct TaskRequirement {
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
     pub required_permissions: BTreeSet<String>,
     pub required_tools: BTreeSet<String>,
+    /// Semantic affinity tags this Task needs the agent to carry.
+    pub required_affinity: BTreeSet<String>,
     pub required_workspace: WorkspaceMode,
     pub required_network: NetworkPolicy,
     pub required_continuity: ContinuityMode,
@@ -264,7 +333,7 @@ pub enum ConfigStatus {
     Disabled,
 }
 
-/// A physical provisioning source: advertised envelopes plus capability claims.
+/// A physical provisioning source: advertised envelopes plus declarations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpawnSource {
     pub source_ref: SpawnSourceRef,
@@ -278,7 +347,7 @@ pub struct SpawnSource {
 
 /// A source-specific operator configuration. The payload is opaque to Core;
 /// only its identity, digest, credential references, and any config-specific
-/// capability claims are modeled here.
+/// declarations are modeled here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
@@ -288,16 +357,42 @@ pub struct SourceConfig {
     pub status: ConfigStatus,
 }
 
-/// Physical facts a source/config can actually *enforce*.
-///
-/// This is deliberately a set of enforceable modes, not a maximum privilege
-/// level: being able to enable networking does not prove the environment can
-/// mechanically enforce a restricted or disabled network.
+/// Physical facts a source/adapter can actually *enforce*. Private fields and a
+/// validated, canonicalizing constructor so a caller cannot assemble an
+/// arbitrary enforcement claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalSafety {
-    pub attempt_isolation: bool,
-    pub enforceable_workspace_modes: Vec<WorkspaceMode>,
-    pub enforceable_network_modes: BTreeSet<NetworkPolicy>,
+    attempt_isolation: bool,
+    enforceable_workspace_modes: Vec<WorkspaceMode>,
+    enforceable_network_modes: BTreeSet<NetworkPolicy>,
+}
+
+impl PhysicalSafety {
+    pub fn new(
+        attempt_isolation: bool,
+        mut workspace_modes: Vec<WorkspaceMode>,
+        network_modes: BTreeSet<NetworkPolicy>,
+    ) -> Result<Self, ContractError> {
+        workspace_modes.sort_by_key(|m| workspace_rank(*m));
+        workspace_modes.dedup();
+        Ok(Self {
+            attempt_isolation,
+            enforceable_workspace_modes: workspace_modes,
+            enforceable_network_modes: network_modes,
+        })
+    }
+
+    pub fn attempt_isolation(&self) -> bool {
+        self.attempt_isolation
+    }
+
+    pub fn enforces_workspace(&self, mode: WorkspaceMode) -> bool {
+        self.enforceable_workspace_modes.contains(&mode)
+    }
+
+    pub fn enforces_network(&self, policy: NetworkPolicy) -> bool {
+        self.enforceable_network_modes.contains(&policy)
+    }
 }
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
@@ -318,8 +413,9 @@ pub trait AgentTypeLookup {
 
 /// A tiny in-memory published catalog for selector tests and early wiring.
 ///
-/// Deprecation only affects *future selection*: it removes the revision from
-/// the selectable set. Existing exact refs are unaffected by construction.
+/// The catalog is the single publication-status authority. Deprecation is
+/// monotonic: a deprecated revision cannot be resurrected, only superseded by a
+/// new revision.
 #[derive(Clone, Debug, Default)]
 pub struct PublishedCatalog {
     published: BTreeSet<AgentTypeRef>,
@@ -332,12 +428,12 @@ impl PublishedCatalog {
     }
 
     pub fn publish(&mut self, reference: AgentTypeRef) -> bool {
-        self.deprecated.remove(&reference);
+        if self.deprecated.contains(&reference) {
+            return false;
+        }
         self.published.insert(reference)
     }
 
-    /// Mark a revision deprecated for future selection without rewriting any
-    /// existing exact pin.
     pub fn deprecate(&mut self, reference: &AgentTypeRef) -> bool {
         let was_published = self.published.remove(reference);
         let recorded = self.deprecated.insert(reference.clone());
@@ -357,8 +453,8 @@ impl AgentTypeLookup for PublishedCatalog {
     fn latest_revision(&self, type_id: &AgentTypeId) -> Option<u64> {
         self.published
             .iter()
-            .filter(|r| &r.type_id == type_id)
-            .map(|r| r.revision)
+            .filter(|r| r.type_id() == type_id)
+            .map(|r| r.revision())
             .max()
     }
 }

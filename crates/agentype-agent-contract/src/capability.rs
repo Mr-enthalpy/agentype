@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 /// The five matcher shapes supported in M6-B v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MatcherKind {
-    /// Exact boolean (e.g. `terminal.attach = true`).
+    /// Exact boolean: `provided == required`.
     Bool,
     /// Required subset of a provided set (e.g. `tools ⊇ {git,ripgrep}`).
     Set,
@@ -68,7 +68,7 @@ impl CapabilityValue {
 }
 
 /// Whether a capability participates in functional features or in a
-/// security/authority proof (which then requires `ENFORCED`).
+/// security/authority proof (which then requires imported `ENFORCED` evidence).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SecurityClass {
     Functional,
@@ -77,8 +77,8 @@ pub enum SecurityClass {
     Continuity,
 }
 
-/// A claim is either merely declared by a source/config or enforced by the
-/// imported physical domain.
+/// Declaration metadata for a claim. This is *not* a proof: only imported
+/// `ResolvedProvisioningEvidence` can satisfy a security requirement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Assurance {
     Declared,
@@ -86,18 +86,19 @@ pub enum Assurance {
 }
 
 impl SecurityClass {
-    /// Functional features may be satisfied by a `DECLARED` claim when policy
-    /// allows; authority/sandbox/continuity claims MUST be `ENFORCED`.
-    pub fn requires_enforced(self) -> bool {
+    /// Functional features may be satisfied by a declared/envelope value;
+    /// authority/sandbox/continuity require imported enforcement evidence.
+    pub fn requires_evidence(self) -> bool {
         !matches!(self, Self::Functional)
     }
 }
 
-/// Exact `(capability_id, revision)` identity.
+/// Exact `(capability_id, revision)` identity. Fields are private so an
+/// unvalidated reference cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapabilityRef {
-    pub capability_id: CapabilityId,
-    pub revision: u64,
+    capability_id: CapabilityId,
+    revision: u64,
 }
 
 impl CapabilityRef {
@@ -118,24 +119,26 @@ impl CapabilityRef {
             revision,
         })
     }
+
+    pub fn capability_id(&self) -> &CapabilityId {
+        &self.capability_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
-/// Declares the shape and security class of an exact capability revision.
+/// Declares the shape and security class of an exact capability revision. The
+/// revision identity is the map key, not a duplicated field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilitySpec {
-    pub reference: CapabilityRef,
     pub matcher_kind: MatcherKind,
     pub security_class: SecurityClass,
 }
 
-/// A Task's (or AgentType contract's) requirement under an exact revision.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CapabilityRequirement {
-    pub reference: CapabilityRef,
-    pub value: CapabilityValue,
-}
-
-/// A source's (or config's) concrete claim about one exact capability revision.
+/// A source's (or config's) concrete declaration about one exact capability
+/// revision.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityClaim {
     pub reference: CapabilityRef,
@@ -151,7 +154,7 @@ pub fn value_satisfies(
     provided: &CapabilityValue,
 ) -> bool {
     match (matcher, required, provided) {
-        (MatcherKind::Bool, CapabilityValue::Bool(r), CapabilityValue::Bool(p)) => !*r || *p,
+        (MatcherKind::Bool, CapabilityValue::Bool(r), CapabilityValue::Bool(p)) => r == p,
         (MatcherKind::Set, CapabilityValue::Set(r), CapabilityValue::Set(p)) => r.is_subset(p),
         (
             MatcherKind::Ordered,
@@ -172,7 +175,8 @@ pub fn value_satisfies(
     }
 }
 
-/// `DECLARED` never satisfies a security/authority requirement.
+/// Whether a claim's declaration satisfies a security class. Retained for
+/// catalog vocabulary; it is never a substitute for imported evidence.
 pub fn assurance_satisfies(class: SecurityClass, assurance: Assurance) -> bool {
-    !class.requires_enforced() || assurance == Assurance::Enforced
+    !class.requires_evidence() || assurance == Assurance::Enforced
 }

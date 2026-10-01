@@ -22,16 +22,13 @@ pub fn resolve_selector(
                 Ok(reference.clone())
             } else {
                 Err(ContractError::AgentTypeNotFound {
-                    type_id: reference.type_id.as_str().to_string(),
-                    revision: reference.revision,
+                    type_id: reference.type_id().as_str().to_string(),
+                    revision: reference.revision(),
                 })
             }
         }
         AgentTypeSelector::Latest(type_id) => match catalog.latest_revision(type_id) {
-            Some(revision) => Ok(AgentTypeRef {
-                type_id: type_id.clone(),
-                revision,
-            }),
+            Some(revision) => AgentTypeRef::new(type_id.as_str(), revision),
             None => Err(ContractError::AgentTypeNotFound {
                 type_id: type_id.as_str().to_string(),
                 revision: 0,

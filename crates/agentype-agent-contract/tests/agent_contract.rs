@@ -1,7 +1,7 @@
 //! M6-B.1 conformance: AgentType purity, four independent relations,
-//! refinement monotonicity, matcher semantics, exact-revision capability proof
-//! paths, enforceability (never "stronger capability implies restriction"),
-//! and validated numeric values.
+//! refinement monotonicity, the shared capability-constraint order, exact
+//! capability-revision proof paths, imported (never asserted) enforcement
+//! evidence, affinity, and validated construction.
 
 use agentype_agent_contract::*;
 use agentype_core::{InformationFunction, WorkspaceMode};
@@ -19,6 +19,10 @@ fn type_ref(id: &str, revision: u64) -> AgentTypeRef {
     AgentTypeRef::new(id, revision).unwrap()
 }
 
+fn policy_ref(id: &str, revision: u64) -> AdapterPolicyRef {
+    AdapterPolicyRef::new(id, revision).unwrap()
+}
+
 fn budget(value: f64) -> Budget {
     Budget::new(value).unwrap()
 }
@@ -27,9 +31,8 @@ fn quantity(value: f64) -> Quantity {
     Quantity::new(value).unwrap()
 }
 
-fn spec(id: &str, revision: u64, matcher: MatcherKind, class: SecurityClass) -> CapabilitySpec {
+fn spec(matcher: MatcherKind, class: SecurityClass) -> CapabilitySpec {
     CapabilitySpec {
-        reference: cref(id, revision),
         matcher_kind: matcher,
         security_class: class,
     }
@@ -44,6 +47,62 @@ fn claim(id: &str, revision: u64, value: CapabilityValue, assurance: Assurance) 
     }
 }
 
+/// Trusted-integration stand-in: mirrors how M6-B.4 wires an imported adapter.
+struct TestEvidence {
+    policy: AdapterPolicyRef,
+    kind: String,
+    key: AdapterBindingKey,
+    safety: PhysicalSafety,
+    enforced: Vec<(CapabilityRef, CapabilityValue)>,
+}
+
+impl ProvisioningEvidenceSource for TestEvidence {
+    fn adapter_policy(&self) -> AdapterPolicyRef {
+        self.policy.clone()
+    }
+    fn adapter_kind(&self) -> String {
+        self.kind.clone()
+    }
+    fn adapter_binding_key(&self) -> AdapterBindingKey {
+        self.key.clone()
+    }
+    fn enforceable_safety(&self) -> PhysicalSafety {
+        self.safety.clone()
+    }
+    fn enforced_capabilities(&self) -> Vec<(CapabilityRef, CapabilityValue)> {
+        self.enforced.clone()
+    }
+}
+
+fn base_physical() -> PhysicalSafety {
+    PhysicalSafety::new(
+        false,
+        vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write],
+        [
+            NetworkPolicy::Disabled,
+            NetworkPolicy::Restricted,
+            NetworkPolicy::Enabled,
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap()
+}
+
+fn resolve(evidence: TestEvidence) -> ResolvedProvisioningEvidence {
+    ResolvedProvisioningEvidence::from_source(&evidence).unwrap()
+}
+
+fn base_evidence() -> ResolvedProvisioningEvidence {
+    resolve(TestEvidence {
+        policy: policy_ref("codex-local-adapter", 3),
+        kind: "codex_cli".into(),
+        key: AdapterBindingKey::new("linux:boot:pidns").unwrap(),
+        safety: base_physical(),
+        enforced: Vec::new(),
+    })
+}
+
 fn base_contract() -> AgentTypeContract {
     AgentTypeContract {
         allowed_information_functions: vec![InformationFunction::Expand],
@@ -53,6 +112,7 @@ fn base_contract() -> AgentTypeContract {
         visibility: set(&["public"]),
         tools: set(&["git"]),
         roots: set(&["repo"]),
+        affinity: BTreeSet::new(),
         budget_ceiling: budget(100.0),
         security: SecurityContract {
             workspace: WorkspaceMode::ReadOnly,
@@ -71,7 +131,6 @@ fn base_agent() -> AgentType {
         type_ref: type_ref("general-reviewer", 1),
         based_on: None,
         contract: base_contract(),
-        status: AgentTypeStatus::Published,
     }
 }
 
@@ -81,6 +140,7 @@ fn base_task() -> TaskRequirement {
         required_capabilities: BTreeMap::new(),
         required_permissions: set(&["read"]),
         required_tools: set(&["git"]),
+        required_affinity: BTreeSet::new(),
         required_workspace: WorkspaceMode::ReadOnly,
         required_network: NetworkPolicy::Restricted,
         required_continuity: ContinuityMode::None,
@@ -92,7 +152,7 @@ fn base_task() -> TaskRequirement {
 fn base_source() -> SpawnSource {
     SpawnSource {
         source_ref: SpawnSourceRef::new("codex-local", 2).unwrap(),
-        adapter_policy: AdapterPolicyRef::new("codex-local-adapter", 3).unwrap(),
+        adapter_policy: policy_ref("codex-local-adapter", 3),
         lifecycle_modes: [LifecycleMode::Resident, LifecycleMode::Ephemeral]
             .into_iter()
             .collect(),
@@ -115,20 +175,6 @@ fn base_config() -> SourceConfig {
     }
 }
 
-fn base_physical() -> PhysicalSafety {
-    PhysicalSafety {
-        attempt_isolation: false,
-        enforceable_workspace_modes: vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write],
-        enforceable_network_modes: [
-            NetworkPolicy::Disabled,
-            NetworkPolicy::Restricted,
-            NetworkPolicy::Enabled,
-        ]
-        .into_iter()
-        .collect(),
-    }
-}
-
 #[test]
 fn test_base_contract_satisfies_base_task() {
     assert!(can_execute(&base_agent(), &base_task()).is_ok());
@@ -136,8 +182,7 @@ fn test_base_contract_satisfies_base_task() {
         &base_agent(),
         &base_source(),
         &base_config(),
-        &base_physical(),
-        true
+        &base_evidence()
     )
     .is_ok());
 }
@@ -160,6 +205,10 @@ fn test_can_execute_gates() {
     assert!(can_execute(&base_agent(), &req).is_err());
 
     let mut req = base_task();
+    req.required_affinity = set(&["sqlite"]);
+    assert!(can_execute(&base_agent(), &req).is_err());
+
+    let mut req = base_task();
     req.required_workspace = WorkspaceMode::Write;
     assert!(matches!(
         can_execute(&base_agent(), &req),
@@ -174,11 +223,9 @@ fn test_can_execute_gates() {
     req.budget = budget(200.0);
     assert!(can_execute(&base_agent(), &req).is_err());
 
-    // An unconstrained agent accepts any anchor requirement ...
     let mut req = base_task();
     req.required_anchor = Some("other".into());
     assert!(can_execute(&base_agent(), &req).is_ok());
-    // ... but a constrained agent must match exactly.
     let mut constrained = base_agent();
     constrained.contract.anchor_constraint = Some("region-a".into());
     req.required_anchor = Some("region-b".into());
@@ -197,12 +244,7 @@ fn test_can_execute_requires_capability_value() {
         .insert(reference.clone(), CapabilityValue::Bool(true));
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec(
-            "workspace.write",
-            1,
-            MatcherKind::Bool,
-            SecurityClass::Authority,
-        ),
+        spec(MatcherKind::Bool, SecurityClass::Authority),
     );
 
     let mut req = base_task();
@@ -227,11 +269,8 @@ fn test_refinement_accepts_narrowing() {
     let mut derived = base_agent();
     derived.type_ref = type_ref("readonly-rust-reviewer", 1);
     derived.based_on = Some(base.type_ref.clone());
-    derived.contract.permission_ceiling = set(&["read"]);
-    derived.contract.tools = set(&["git"]);
-    derived.contract.roots = set(&["repo"]);
     derived.contract.budget_ceiling = budget(25.0);
-    derived.contract.lifecycle = [LifecycleMode::Resident].into_iter().collect();
+    derived.contract.affinity = set(&["rust"]);
 
     assert!(is_valid_refinement(&base, &derived).is_ok());
 }
@@ -331,46 +370,22 @@ fn test_refinement_anchor_must_satisfy_base() {
 #[test]
 fn test_can_provision_gates() {
     let agent = base_agent();
-    let physical = base_physical();
+    let evidence = base_evidence();
 
     let mut inactive = base_source();
     inactive.status = SourceStatus::Draining;
     assert!(matches!(
-        can_provision(&agent, &inactive, &base_config(), &physical, true),
+        can_provision(&agent, &inactive, &base_config(), &evidence),
         Err(ContractError::SourceConfigInvalid { .. })
     ));
 
     let mut narrow_life = base_source();
     narrow_life.lifecycle_modes = [LifecycleMode::Ephemeral].into_iter().collect();
-    assert!(can_provision(&agent, &narrow_life, &base_config(), &physical, true).is_err());
+    assert!(can_provision(&agent, &narrow_life, &base_config(), &evidence).is_err());
 
     let mut narrow_cont = base_source();
     narrow_cont.continuity_modes = [ContinuityMode::None].into_iter().collect();
-    assert!(can_provision(&agent, &narrow_cont, &base_config(), &physical, true).is_err());
-
-    assert!(matches!(
-        can_provision(&agent, &base_source(), &base_config(), &physical, false),
-        Err(ContractError::AdapterBindingMissing)
-    ));
-
-    // Workspace policy must be in the enforceable set, not implied by rank.
-    let mut write_agent = base_agent();
-    write_agent.contract.security.workspace = WorkspaceMode::Write;
-    let readonly_only = PhysicalSafety {
-        attempt_isolation: false,
-        enforceable_workspace_modes: vec![WorkspaceMode::ReadOnly],
-        enforceable_network_modes: [NetworkPolicy::Restricted].into_iter().collect(),
-    };
-    assert!(matches!(
-        can_provision(
-            &write_agent,
-            &base_source(),
-            &base_config(),
-            &readonly_only,
-            true
-        ),
-        Err(ContractError::SecurityUnenforceable { .. })
-    ));
+    assert!(can_provision(&agent, &narrow_cont, &base_config(), &evidence).is_err());
 }
 
 #[test]
@@ -383,7 +398,7 @@ fn test_functional_envelope_must_cover_agent_capabilities() {
     );
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec("tools", 1, MatcherKind::Set, SecurityClass::Functional),
+        spec(MatcherKind::Set, SecurityClass::Functional),
     );
 
     let mut source = base_source();
@@ -391,16 +406,16 @@ fn test_functional_envelope_must_cover_agent_capabilities() {
         reference.clone(),
         CapabilityValue::Set(set(&["git", "ripgrep", "jq"])),
     );
-    assert!(can_provision(&agent, &source, &base_config(), &base_physical(), true).is_ok());
+    assert!(can_provision(&agent, &source, &base_config(), &base_evidence()).is_ok());
 
     let mut weak = base_source();
     weak.functional_envelope
         .insert(reference.clone(), CapabilityValue::Set(set(&["git"])));
-    assert!(can_provision(&agent, &weak, &base_config(), &base_physical(), true).is_err());
+    assert!(can_provision(&agent, &weak, &base_config(), &base_evidence()).is_err());
 }
 
 #[test]
-fn test_security_class_requires_enforced_for_generic_capability() {
+fn test_security_class_requires_imported_evidence() {
     let reference = cref("sandbox.network_lock", 1);
     let mut agent = base_agent();
     agent
@@ -409,40 +424,91 @@ fn test_security_class_requires_enforced_for_generic_capability() {
         .insert(reference.clone(), CapabilityValue::Bool(true));
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec(
-            "sandbox.network_lock",
-            1,
-            MatcherKind::Bool,
-            SecurityClass::Sandbox,
-        ),
+        spec(MatcherKind::Bool, SecurityClass::Sandbox),
     );
 
-    // A functional envelope entry is not an ENFORCED proof.
+    // A functional envelope is not evidence.
     let mut source = base_source();
     source
         .functional_envelope
         .insert(reference.clone(), CapabilityValue::Bool(true));
     assert!(matches!(
-        can_provision(&agent, &source, &base_config(), &base_physical(), true),
+        can_provision(&agent, &source, &base_config(), &base_evidence()),
         Err(ContractError::SecurityUnenforceable { .. })
     ));
 
-    // A DECLARED claim is not an ENFORCED proof either.
+    // Neither is a DECLARED/ENFORCED claim label.
     source.functional_envelope.clear();
     source.claims.push(claim(
         "sandbox.network_lock",
         1,
         CapabilityValue::Bool(true),
-        Assurance::Declared,
+        Assurance::Enforced,
     ));
     assert!(matches!(
-        can_provision(&agent, &source, &base_config(), &base_physical(), true),
+        can_provision(&agent, &source, &base_config(), &base_evidence()),
         Err(ContractError::SecurityUnenforceable { .. })
     ));
 
-    // Only an ENFORCED claim at the exact revision proves it.
-    source.claims[0].assurance = Assurance::Enforced;
-    assert!(can_provision(&agent, &source, &base_config(), &base_physical(), true).is_ok());
+    // Only imported enforcement evidence proves it.
+    let evidence = resolve(TestEvidence {
+        policy: policy_ref("codex-local-adapter", 3),
+        kind: "codex_cli".into(),
+        key: AdapterBindingKey::new("linux:boot:pidns").unwrap(),
+        safety: base_physical(),
+        enforced: vec![(reference.clone(), CapabilityValue::Bool(true))],
+    });
+    assert!(can_provision(&agent, &source, &base_config(), &evidence).is_ok());
+}
+
+#[test]
+fn test_enforced_requires_imported_evidence_not_claim_label() {
+    let reference = cref("authority.deploy", 1);
+    let mut agent = base_agent();
+    agent
+        .contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    agent.contract.capability_specs.insert(
+        reference.clone(),
+        spec(MatcherKind::Bool, SecurityClass::Authority),
+    );
+
+    let mut source = base_source();
+    source.claims.push(claim(
+        "authority.deploy",
+        1,
+        CapabilityValue::Bool(true),
+        Assurance::Enforced,
+    ));
+
+    let no_evidence = base_evidence();
+    assert!(can_provision(&agent, &source, &base_config(), &no_evidence).is_err());
+
+    let evidence = resolve(TestEvidence {
+        policy: policy_ref("codex-local-adapter", 3),
+        kind: "codex_cli".into(),
+        key: AdapterBindingKey::new("linux:boot:pidns").unwrap(),
+        safety: base_physical(),
+        enforced: vec![(reference.clone(), CapabilityValue::Bool(true))],
+    });
+    assert!(can_provision(&agent, &source, &base_config(), &evidence).is_ok());
+}
+
+#[test]
+fn test_evidence_must_match_source_adapter_policy() {
+    let agent = base_agent();
+    let evidence = resolve(TestEvidence {
+        policy: policy_ref("other-adapter", 9),
+        kind: "other".into(),
+        key: AdapterBindingKey::new("other-domain").unwrap(),
+        safety: base_physical(),
+        enforced: Vec::new(),
+    });
+    assert!(matches!(
+        can_provision(&agent, &base_source(), &base_config(), &evidence),
+        Err(ContractError::EvidencePolicyMismatch { .. })
+    ));
 }
 
 #[test]
@@ -455,23 +521,22 @@ fn test_capability_claim_revision_must_match_spec_revision() {
         .insert(reference.clone(), CapabilityValue::Set(set(&["git"])));
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec("tools", 2, MatcherKind::Set, SecurityClass::Functional),
+        spec(MatcherKind::Set, SecurityClass::Functional),
     );
 
-    // A v1 claim must not satisfy a v2 requirement.
     let mut source = base_source();
     source
         .functional_envelope
         .insert(cref("tools", 1), CapabilityValue::Set(set(&["git", "jq"])));
     assert!(matches!(
-        can_provision(&agent, &source, &base_config(), &base_physical(), true),
+        can_provision(&agent, &source, &base_config(), &base_evidence()),
         Err(ContractError::CapabilityMismatch { .. })
     ));
 
     source
         .functional_envelope
         .insert(reference.clone(), CapabilityValue::Set(set(&["git", "jq"])));
-    assert!(can_provision(&agent, &source, &base_config(), &base_physical(), true).is_ok());
+    assert!(can_provision(&agent, &source, &base_config(), &base_evidence()).is_ok());
 }
 
 #[test]
@@ -480,49 +545,36 @@ fn test_source_config_must_belong_to_exact_source_revision() {
     let mut other_source = base_source();
     other_source.source_ref = SpawnSourceRef::new("other-source", 1).unwrap();
     assert!(matches!(
-        can_provision(
-            &agent,
-            &other_source,
-            &base_config(),
-            &base_physical(),
-            true
-        ),
+        can_provision(&agent, &other_source, &base_config(), &base_evidence()),
         Err(ContractError::SourceConfigInvalid { .. })
     ));
 }
 
 #[test]
 fn test_config_specific_claims_affect_provisioning() {
-    let reference = cref("sandbox.network_lock", 1);
+    let reference = cref("tools", 1);
     let mut agent = base_agent();
     agent
         .contract
         .required_capabilities
-        .insert(reference.clone(), CapabilityValue::Bool(true));
+        .insert(reference.clone(), CapabilityValue::Set(set(&["git", "jq"])));
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec(
-            "sandbox.network_lock",
-            1,
-            MatcherKind::Bool,
-            SecurityClass::Sandbox,
-        ),
+        spec(MatcherKind::Set, SecurityClass::Functional),
     );
 
     let source = base_source();
-
-    // Config A enforces it; config B does not. Same source, different result.
     let mut config_a = base_config();
     config_a.claims.push(claim(
-        "sandbox.network_lock",
+        "tools",
         1,
-        CapabilityValue::Bool(true),
-        Assurance::Enforced,
+        CapabilityValue::Set(set(&["git", "jq"])),
+        Assurance::Declared,
     ));
     let config_b = base_config();
 
-    assert!(can_provision(&agent, &source, &config_a, &base_physical(), true).is_ok());
-    assert!(can_provision(&agent, &source, &config_b, &base_physical(), true).is_err());
+    assert!(can_provision(&agent, &source, &config_a, &base_evidence()).is_ok());
+    assert!(can_provision(&agent, &source, &config_b, &base_evidence()).is_err());
 }
 
 #[test]
@@ -535,7 +587,7 @@ fn test_conflicting_claims_fail_closed() {
         .insert(reference.clone(), CapabilityValue::Set(set(&["git"])));
     agent.contract.capability_specs.insert(
         reference.clone(),
-        spec("tools", 1, MatcherKind::Set, SecurityClass::Functional),
+        spec(MatcherKind::Set, SecurityClass::Functional),
     );
 
     let mut source = base_source();
@@ -552,7 +604,7 @@ fn test_conflicting_claims_fail_closed() {
         Assurance::Declared,
     ));
     assert!(matches!(
-        can_provision(&agent, &source, &base_config(), &base_physical(), true),
+        can_provision(&agent, &source, &base_config(), &base_evidence()),
         Err(ContractError::InvariantViolation(_))
     ));
 }
@@ -561,26 +613,11 @@ fn test_conflicting_claims_fail_closed() {
 fn test_relations_are_independent() {
     let agent = base_agent();
     assert!(can_execute(&agent, &base_task()).is_ok());
-    assert!(can_provision(
-        &agent,
-        &base_source(),
-        &base_config(),
-        &base_physical(),
-        false
-    )
-    .is_err());
 
     let mut req = base_task();
     req.information_function = InformationFunction::CompressPositive;
     assert!(can_execute(&agent, &req).is_err());
-    assert!(can_provision(
-        &agent,
-        &base_source(),
-        &base_config(),
-        &base_physical(),
-        true
-    )
-    .is_ok());
+    assert!(can_provision(&agent, &base_source(), &base_config(), &base_evidence()).is_ok());
 }
 
 #[test]
@@ -599,11 +636,8 @@ fn test_more_specific_rejects_wider_security_envelope() {
     let req = base_task();
     let broad = base_agent();
 
-    // A is narrower on tools/budget but WIDER on network authority: it must not
-    // be considered more specific for a task both can execute.
     let mut wider_security = base_agent();
     wider_security.type_ref = type_ref("wider-security", 1);
-    wider_security.contract.tools = set(&["git"]);
     wider_security.contract.budget_ceiling = budget(50.0);
     wider_security.contract.security.network = NetworkPolicy::Enabled;
 
@@ -618,20 +652,17 @@ fn test_more_specific_requires_executability_and_is_not_inheritance_depth() {
     let mut narrow = base_agent();
     narrow.type_ref = type_ref("readonly-rust-reviewer", 1);
     narrow.based_on = Some(broad.type_ref.clone());
-    narrow.contract.permission_ceiling = set(&["read"]);
     narrow.contract.budget_ceiling = budget(60.0);
 
     assert!(more_specific_for(&narrow, &broad, &req));
     assert!(!more_specific_for(&broad, &narrow, &req));
 
-    // Deeper nominal inheritance does not by itself make a type more specific.
     let mut wider = base_agent();
     wider.type_ref = type_ref("deeper", 1);
     wider.based_on = Some(narrow.type_ref.clone());
     wider.contract.budget_ceiling = budget(500.0);
     assert!(!more_specific_for(&wider, &broad, &req));
 
-    // A non-executable type is never "more specific".
     let mut detached = base_agent();
     detached.type_ref = type_ref("detached", 1);
     detached.contract.allowed_information_functions = vec![InformationFunction::CompressNegative];
@@ -643,17 +674,23 @@ fn test_physical_enabled_network_does_not_prove_restricted_enforcement() {
     let mut agent = base_agent();
     agent.contract.security.network = NetworkPolicy::Restricted;
 
-    // The environment can only do "all or nothing": Enabled is present but
-    // Restricted is not. Enabled must NOT be read as proving Restricted.
-    let physical = PhysicalSafety {
-        attempt_isolation: false,
-        enforceable_workspace_modes: vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write],
-        enforceable_network_modes: [NetworkPolicy::Disabled, NetworkPolicy::Enabled]
+    let safety = PhysicalSafety::new(
+        false,
+        vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write],
+        [NetworkPolicy::Disabled, NetworkPolicy::Enabled]
             .into_iter()
             .collect(),
-    };
+    )
+    .unwrap();
+    let evidence = resolve(TestEvidence {
+        policy: policy_ref("codex-local-adapter", 3),
+        kind: "codex_cli".into(),
+        key: AdapterBindingKey::new("linux:boot:pidns").unwrap(),
+        safety,
+        enforced: Vec::new(),
+    });
     assert!(matches!(
-        can_provision(&agent, &base_source(), &base_config(), &physical, true),
+        can_provision(&agent, &base_source(), &base_config(), &evidence),
         Err(ContractError::SecurityUnenforceable { .. })
     ));
 }
@@ -661,7 +698,7 @@ fn test_physical_enabled_network_does_not_prove_restricted_enforcement() {
 #[test]
 fn test_filter_precedes_ranking() {
     let agent = base_agent();
-    let physical = base_physical();
+    let evidence = base_evidence();
 
     let mut inactive = base_source();
     inactive.status = SourceStatus::Disabled;
@@ -670,7 +707,7 @@ fn test_filter_precedes_ranking() {
     let candidates = [inactive, eligible];
     let feasible: Vec<&SpawnSource> = candidates
         .iter()
-        .filter(|s| can_provision(&agent, s, &base_config(), &physical, true).is_ok())
+        .filter(|s| can_provision(&agent, s, &base_config(), &evidence).is_ok())
         .collect();
     assert_eq!(feasible.len(), 1);
 }
@@ -679,7 +716,7 @@ fn test_filter_precedes_ranking() {
 fn test_matcher_semantics() {
     assert!(value_satisfies(
         MatcherKind::Bool,
-        &CapabilityValue::Bool(false),
+        &CapabilityValue::Bool(true),
         &CapabilityValue::Bool(true)
     ));
     assert!(!value_satisfies(
@@ -735,11 +772,20 @@ fn test_matcher_semantics() {
         &CapabilityValue::Exact(serde_json::json!("read_only")),
         &CapabilityValue::Exact(serde_json::json!("write"))
     ));
+}
 
+#[test]
+fn test_bool_matcher_is_exact_equality() {
+    // The old implication (required=false, provided=true ⇒ true) is gone.
     assert!(!value_satisfies(
         MatcherKind::Bool,
-        &CapabilityValue::Bool(true),
-        &CapabilityValue::Quantity(quantity(1.0))
+        &CapabilityValue::Bool(false),
+        &CapabilityValue::Bool(true)
+    ));
+    assert!(value_satisfies(
+        MatcherKind::Bool,
+        &CapabilityValue::Bool(false),
+        &CapabilityValue::Bool(false)
     ));
 }
 
@@ -769,7 +815,6 @@ fn test_information_functions_are_canonicalized() {
         InformationFunction::Expand,
     ];
     contract.normalize();
-    // Canonical order is by the persisted SQL token: COMPRESS_POSITIVE < EXPAND.
     assert_eq!(
         contract.allowed_information_functions,
         vec![
@@ -777,6 +822,160 @@ fn test_information_functions_are_canonicalized() {
             InformationFunction::Expand
         ]
     );
+}
+
+#[test]
+fn test_refinement_rejects_capability_removal() {
+    let base = {
+        let mut b = base_agent();
+        let reference = cref("sandbox.network_lock", 1);
+        b.contract
+            .required_capabilities
+            .insert(reference.clone(), CapabilityValue::Bool(true));
+        b.contract
+            .capability_specs
+            .insert(reference, spec(MatcherKind::Bool, SecurityClass::Sandbox));
+        b
+    };
+
+    let derived = base_agent();
+    assert!(matches!(
+        is_valid_refinement(&base, &derived),
+        Err(ContractError::InvalidRefinement { .. })
+    ));
+}
+
+#[test]
+fn test_refinement_rejects_security_class_downgrade() {
+    let reference = cref("sandbox.network_lock", 1);
+    let mut base = base_agent();
+    base.contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    base.contract.capability_specs.insert(
+        reference.clone(),
+        spec(MatcherKind::Bool, SecurityClass::Sandbox),
+    );
+
+    let mut derived = base_agent();
+    derived
+        .contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    derived.contract.capability_specs.insert(
+        reference,
+        spec(MatcherKind::Bool, SecurityClass::Functional),
+    );
+
+    assert!(is_valid_refinement(&base, &derived).is_err());
+}
+
+#[test]
+fn test_refinement_rejects_matcher_downgrade() {
+    let reference = cref("tools", 1);
+    let mut base = base_agent();
+    base.contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Set(set(&["git", "jq"])));
+    base.contract.capability_specs.insert(
+        reference.clone(),
+        spec(MatcherKind::Set, SecurityClass::Functional),
+    );
+
+    let mut derived = base_agent();
+    derived
+        .contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Set(set(&["git", "jq"])));
+    derived.contract.capability_specs.insert(
+        reference,
+        spec(MatcherKind::Bool, SecurityClass::Functional),
+    );
+
+    assert!(is_valid_refinement(&base, &derived).is_err());
+}
+
+#[test]
+fn test_more_specific_does_not_treat_weaker_capability_as_narrower() {
+    let reference = cref("memory_mb", 1);
+    let mut broad = base_agent();
+    broad.type_ref = type_ref("broad", 1);
+    broad.contract.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(8192.0)),
+    );
+    broad.contract.capability_specs.insert(
+        reference.clone(),
+        spec(MatcherKind::Quantity, SecurityClass::Functional),
+    );
+
+    // A is narrower on budget but WEAKER on the memory capability.
+    let mut weaker = base_agent();
+    weaker.type_ref = type_ref("weaker", 1);
+    weaker.contract.budget_ceiling = budget(10.0);
+    weaker.contract.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(1024.0)),
+    );
+    weaker.contract.capability_specs.insert(
+        reference.clone(),
+        spec(MatcherKind::Quantity, SecurityClass::Functional),
+    );
+
+    let mut req = base_task();
+    req.budget = budget(5.0);
+    req.required_capabilities
+        .insert(reference, CapabilityValue::Quantity(quantity(1024.0)));
+
+    assert!(can_execute(&weaker, &req).is_ok());
+    assert!(can_execute(&broad, &req).is_ok());
+    assert!(!more_specific_for(&weaker, &broad, &req));
+}
+
+#[test]
+fn test_affinity_participates_in_specificity() {
+    let req = base_task();
+    let broad = base_agent();
+
+    let mut narrow = base_agent();
+    narrow.type_ref = type_ref("sqlite-reviewer", 1);
+    narrow.contract.affinity = set(&["sqlite"]);
+
+    assert!(more_specific_for(&narrow, &broad, &req));
+    assert!(!more_specific_for(&broad, &narrow, &req));
+}
+
+#[test]
+fn test_physical_safety_requires_validated_construction() {
+    // The constructor canonicalizes the enforceable workspace set.
+    let safety = PhysicalSafety::new(
+        false,
+        vec![
+            WorkspaceMode::Write,
+            WorkspaceMode::ReadOnly,
+            WorkspaceMode::ReadOnly,
+        ],
+        [NetworkPolicy::Restricted].into_iter().collect(),
+    )
+    .unwrap();
+    assert!(safety.enforces_workspace(WorkspaceMode::ReadOnly));
+    assert!(safety.enforces_workspace(WorkspaceMode::Write));
+    assert!(safety.enforces_network(NetworkPolicy::Restricted));
+    assert!(!safety.enforces_network(NetworkPolicy::Enabled));
+}
+
+#[test]
+fn test_invalid_ref_cannot_be_constructed_or_published() {
+    assert!(AgentTypeRef::new("", 1).is_err());
+    assert!(AgentTypeRef::new("x", 0).is_err());
+    assert!(SpawnSourceRef::new("", 1).is_err());
+    assert!(SourceConfigRef::new(SpawnSourceRef::new("s", 1).unwrap(), "", 1).is_err());
+    assert!(AdapterPolicyRef::new("p", 0).is_err());
+    assert!(CapabilityRef::new("", 1).is_err());
+    assert!(CapabilityRef::new("x", 0).is_err());
+    assert!(CredentialRef::new("").is_err());
+    assert!(AdapterBindingKey::new("   ").is_err());
+    assert!(AdapterBindingKey::new("domain").is_ok());
 }
 
 #[test]
@@ -808,27 +1007,19 @@ fn test_selector_resolution() {
 }
 
 #[test]
-fn test_identity_validation() {
-    assert!(AgentTypeRef::new("", 1).is_err());
-    assert!(AgentTypeRef::new("x", 0).is_err());
-    assert!(AgentTypeRef::new("x", 1).is_ok());
-    assert!(CapabilityRef::new("", 1).is_err());
-    assert!(CapabilityRef::new("x", 0).is_err());
-    assert!(CredentialRef::new("").is_err());
-    assert!(CredentialRef::new("vault://x").is_ok());
-}
-
-#[test]
-fn test_deprecation_is_future_selection_only() {
+fn test_deprecation_is_monotonic_and_future_selection_only() {
     let mut catalog = PublishedCatalog::new();
     let r2 = type_ref("auditor", 2);
     catalog.publish(r2.clone());
     catalog.publish(type_ref("auditor", 3));
 
-    catalog.deprecate(&r2);
-    // Deprecated: no longer selectable, and not the latest.
+    assert!(catalog.deprecate(&r2));
     assert!(!catalog.is_published(&r2));
     assert!(catalog.is_deprecated(&r2));
+
+    // A deprecated revision cannot be resurrected; publish a new revision.
+    assert!(!catalog.publish(r2.clone()));
+
     let latest = AgentTypeSelector::Latest(AgentTypeId::from_string("auditor"));
     assert_eq!(
         resolve_selector(&latest, &catalog).unwrap(),
