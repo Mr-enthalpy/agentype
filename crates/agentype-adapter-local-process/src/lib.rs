@@ -661,7 +661,11 @@ fn write_stdin_unix(
             if deadline.is_expired() {
                 return Err(AdapterError::deadline_exceeded("stdin write blocked"));
             }
-            let n = libc::write(fd, bytes.as_ptr().add(off), bytes.len() - off);
+            let n = libc::write(
+                fd,
+                bytes.as_ptr().add(off) as *const libc::c_void,
+                bytes.len() - off,
+            );
             if n > 0 {
                 off += n as usize;
                 continue;
