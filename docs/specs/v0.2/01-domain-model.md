@@ -17,7 +17,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 | Task | id | Scheduler | until terminal | state machine | Y | Y | N | Y | N |
 | TaskRequirement | part of Task/Proposal | Root intent / compiler | with Task or proposal | immutable after materialize | Y | Y | N | Y | N |
 | RawWorkIntent | none (ingress value) | worker proposes; carried by source Result / compile input | transient until compilation | immutable evidence | Y | Y | N | N (durability via source Result / Proposal) | N |
-| CompiledWorkProposal | id | Scheduler record; compiler produces | until Root decision | immutable | Y | Y | N | Y | N |
+| CompiledWorkProposal | id | Scheduler record; compiler produces | until Root decision | semantic content immutable; lifecycle monotonic | Y | Y | N | Y | N |
 | AgentType | type_id + revision | Scheduler registry; Root intent | until GC | revisions immutable | Y | Y | N | Y | Y |
 | LogicalAgent | id | Scheduler | until RETIRED | identity immutable | Y | Y | N | Y | N |
 | AgentLineage | id | Scheduler | across successors | append-only | Y | Y | N | Y | N |
@@ -69,7 +69,8 @@ separate intent row.
 
 **CompiledWorkProposal** is architecture-aware and execution-unbound. It MUST
 NOT normally bind logical_agent_id, incarnation_id, attempt_id, lease_id, or a
-concrete SpawnSource.
+concrete SpawnSource. Its semantic content is immutable once compiled, while its
+lifecycle disposition is monotonic `PENDING -> ADMITTED | REJECTED | EXPIRED`.
 
 **AgentType** is responsibility/capability/security/lifecycle/continuity. It
 MUST NOT be a model, provider, terminal, price tier, prompt alias, or
