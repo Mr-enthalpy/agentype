@@ -8,7 +8,8 @@ Not a specification.
 This report records a narrow correctness closure on top of the M6-A freeze
 ([m6a-semantic-frontier-freeze](m6a-semantic-frontier-freeze.md)). It does not
 rewrite that report; it adds the finding that motivated this fix and the
-invariant that now holds.
+invariant that now holds. The re-freeze claim takes effect when the closure PR
+merges.
 
 ## Finding (P1)
 
@@ -48,6 +49,16 @@ persists the proposal.
 - No schema change: `results.payload_json` already exists and M5 keeps the
   payload opaque; only the M6 ingress interprets the reserved namespace.
 
+Decode strictness is scoped to the envelope and the Agentype-owned fields.
+`raw_work_intent_from_json` rejects unknown fields in an intent entry, and
+`semantic_input_set_from_json` rejects unknown top-level fields; enum-valued
+fields fail closed on unknown values. The carried `suggested_task_spec`
+(including its nested `payload` / `acceptance`) and the remainder of the worker
+payload are intentionally opaque: `task_spec_from_json` validates the
+authority-bearing fields and their contract but does not reject every extra
+nested key. Unifying a strict nested unknown-field policy across all decoders is
+left as future hardening and is not claimed here.
+
 The resulting worker path is:
 
 ```text
@@ -83,14 +94,28 @@ Spec [05](../../specs/v0.2/05-work-intent-compilation.md) and the
 architecture note now define the `_agentype.raw_work_intents` envelope, the
 `(ResultId, raw_intent_key)` selection, and the fail-closed rules.
 
+## Freeze-gate resolution
+
+The result-carried intent closure was audited at head:
+
+```text
+Audited P1 closure head: 23b7727ac3310de7c3b7a588f9d2f5d6eefc53bc
+P0 = 0
+P1 = 0
+P2 = non-blocking
+```
+
+P2 hardening (set semantics, fault-injection rollback proof, root README status)
+was then added on the same branch; those changes do not alter M6-A authority or
+the frozen frontier contract.
+
 ## Still queued (non-blocking P2)
 
 ```text
-SemanticInputSet multiplicity canonicalization (set vs multiset)
-schema relational hardening (admission_seq uniqueness, lifecycle CHECKs)
-broader transaction fault-injection rollback tests
-root README Rust-status banner
+schema relational hardening (admission_seq uniqueness, lifecycle CHECKs,
+    ON DELETE RESTRICT)
 v4 -> v5 SQLite migration policy (D-DB-MIGRATE)
+strict nested unknown-field policy unification across all decoders
 ```
 
 These remain out of scope for this closure.
@@ -100,4 +125,7 @@ These remain out of scope for this closure.
 ```text
 Base (main): 4c04aa76579b076325e14f2c18a558f30613d303
 SCHEMA_VERSION = 5 (unchanged)
+
+M6-A re-freeze is the merge of the result-carried intent closure PR. If project
+convention requires, the merge commit is recorded by a follow-up commit on main.
 ```

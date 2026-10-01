@@ -60,6 +60,10 @@ Compilation selects `(ResultId, raw_intent_key)` and reconstructs the intent fro
 the immutable Result. A caller MUST NOT supply the intent separately, so a
 proposal's `source_ref` cannot claim provenance the Result does not carry. An
 absent or malformed envelope fails closed and produces no semantic commitment.
+Unknown fields in an intent entry, and unknown top-level fields in its
+`semantic_input_set`, MUST be rejected; the carried `suggested_task_spec` and
+the rest of the worker payload remain opaque and are not validated for extra
+keys.
 
 Ordinary workers MUST NOT need AgentType registries, Generation mechanics,
 Pool topology, SpawnSource, Transform, or Lease/Attempt/Incarnation knowledge.
