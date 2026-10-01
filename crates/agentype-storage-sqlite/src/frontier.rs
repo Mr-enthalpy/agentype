@@ -21,7 +21,7 @@ use agentype_core::{
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn semantic_input_set_to_json(set: &SemanticInputSet) -> Value {
     let results: Vec<Value> = set
@@ -108,11 +108,32 @@ pub fn semantic_input_set_from_json(val: &Value) -> Result<SemanticInputSet, Err
     Ok(set)
 }
 
+/// Reject repeated references so a `SemanticInputSet` has true set semantics
+/// (and therefore one canonical fingerprint per evidence set).
+fn reject_duplicate_refs<T>(refs: &[T], kind: &str) -> Result<(), Error>
+where
+    T: std::hash::Hash + Eq,
+{
+    let mut seen = HashSet::with_capacity(refs.len());
+    for r in refs {
+        if !seen.insert(r) {
+            return Err(Error::invariant(format!(
+                "duplicate {kind} reference in semantic input set"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_semantic_input_set(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
     set: &SemanticInputSet,
 ) -> Result<(), Error> {
+    reject_duplicate_refs(&set.result_ids, "result")?;
+    reject_duplicate_refs(&set.artifact_refs, "artifact")?;
+    reject_duplicate_refs(&set.seed_refs, "seed")?;
+
     for rid in &set.result_ids {
         let exists: bool = tx
             .query_row(

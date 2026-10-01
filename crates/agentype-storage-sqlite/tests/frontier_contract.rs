@@ -1971,3 +1971,237 @@ fn test_root_intent_uses_root_source_identity() {
     assert_eq!(p.source_kind, "root");
     assert_eq!(p.source_ref, "cli_cmd_7");
 }
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_result_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let result = ResultId::new();
+    let dup_set = SemanticInputSet::new()
+        .with_result(result.clone())
+        .with_result(result);
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_result".into(),
+        objective: "Duplicate result refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_result", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_artifact_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let art = ArtifactRef::new("heap.bin", "sha256:abc").unwrap();
+    let dup_set = SemanticInputSet::new()
+        .with_artifact(art.clone())
+        .with_artifact(art);
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_artifact".into(),
+        objective: "Duplicate artifact refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_artifact", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_seed_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let dup_set = SemanticInputSet::new()
+        .with_seed("seed_a")
+        .with_seed("seed_a");
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_seed".into(),
+        objective: "Duplicate seed refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_seed", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+/// Open a file-backed kernel with the standard partitions, under the writable
+/// test target temp dir (not the sandbox-blocked system temp dir).
+fn file_kernel(tag: &str) -> (std::path::PathBuf, Kernel) {
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join(format!(
+        "frontier_fault_{tag}_{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Arc::new(ManualClock::new(1_000.0)) as Arc<dyn Clock>;
+    let kernel = Kernel::open(&path, clock, 30.0, CONTINUITY_MAX_BYTES).expect("open file kernel");
+    for name in ["default", "general"] {
+        kernel
+            .upsert_partition(&PartitionSpec {
+                name: PartitionId::new(name),
+                desired_capacity: 5,
+                retention: Retention::Resident,
+                execution_target: "local".into(),
+                execution_profile: "default".into(),
+                tags: vec![],
+            })
+            .expect("upsert partition");
+    }
+    kernel.reconcile_pool().unwrap();
+    (path, kernel)
+}
+
+/// Install a test-only `BEFORE INSERT` trigger that aborts the statement.
+fn install_abort_trigger(path: &std::path::Path, trigger: &str, table: &str, when: Option<&str>) {
+    let conn = rusqlite::Connection::open(path).expect("open db for trigger");
+    let guard = when.map(|w| format!("WHEN {w}")).unwrap_or_default();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} {guard} \
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+    ))
+    .expect("create abort trigger");
+}
+
+#[test]
+fn test_freeze_rolls_back_on_outbox_failure() {
+    let (path, kernel) = file_kernel("freeze_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "pending_expand".into(),
+        objective: "Pending expand".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("pending_expand", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(
+        &path,
+        "fail_frozen_outbox",
+        "notification_outbox",
+        Some("NEW.event_type = 'GENERATION_FROZEN'"),
+    );
+
+    assert!(kernel.freeze_generation(&gen.generation_id, 0).is_err());
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.state, GenerationState::Open);
+    assert_eq!(view.generation.revision, 0);
+    assert!(view.pending_proposal_ids.contains(&prop.proposal_id));
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let frozen_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='GENERATION_FROZEN'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(frozen_events, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_close_rolls_back_on_outbox_failure() {
+    let (path, kernel) = file_kernel("close_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    let compress = RawWorkIntent {
+        raw_intent_key: "pending_compress".into(),
+        objective: "Pending compress".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("pending_compress", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, compress, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(
+        &path,
+        "fail_closed_outbox",
+        "notification_outbox",
+        Some("NEW.event_type = 'GENERATION_CLOSED'"),
+    );
+
+    assert!(kernel.close_generation(&gen.generation_id, 1).is_err());
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.state, GenerationState::Frozen);
+    assert_eq!(view.generation.revision, 1);
+    assert!(view.pending_proposal_ids.contains(&prop.proposal_id));
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let closed_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='GENERATION_CLOSED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(closed_events, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_admission_rolls_back_on_binding_failure() {
+    let (path, kernel) = file_kernel("admit_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "admit_rollback".into(),
+        objective: "Admission must roll back".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("admit_rollback", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(&path, "fail_binding", "generation_task_bindings", None);
+
+    assert!(kernel.admit_proposal(&prop.proposal_id, 0, None).is_err());
+
+    let reread = kernel.get_proposal(&prop.proposal_id).unwrap();
+    assert_eq!(reread.state, ProposalStateKind::Pending);
+    assert!(reread.admitted_task_id.is_none());
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.admission_seq, 0);
+    assert!(view.admitted_task_ids.is_empty());
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let tasks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE name='admit_rollback'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tasks, 0,
+        "Task insert must roll back with the failed binding"
+    );
+    let _ = std::fs::remove_file(&path);
+}
