@@ -21,7 +21,7 @@ use agentype_core::{
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn semantic_input_set_to_json(set: &SemanticInputSet) -> Value {
     let results: Vec<Value> = set
@@ -108,11 +108,32 @@ pub fn semantic_input_set_from_json(val: &Value) -> Result<SemanticInputSet, Err
     Ok(set)
 }
 
+/// Reject repeated references so a `SemanticInputSet` has true set semantics
+/// (and therefore one canonical fingerprint per evidence set).
+fn reject_duplicate_refs<T>(refs: &[T], kind: &str) -> Result<(), Error>
+where
+    T: std::hash::Hash + Eq,
+{
+    let mut seen = HashSet::with_capacity(refs.len());
+    for r in refs {
+        if !seen.insert(r) {
+            return Err(Error::invariant(format!(
+                "duplicate {kind} reference in semantic input set"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_semantic_input_set(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
     set: &SemanticInputSet,
 ) -> Result<(), Error> {
+    reject_duplicate_refs(&set.result_ids, "result")?;
+    reject_duplicate_refs(&set.artifact_refs, "artifact")?;
+    reject_duplicate_refs(&set.seed_refs, "seed")?;
+
     for rid in &set.result_ids {
         let exists: bool = tx
             .query_row(
@@ -393,28 +414,24 @@ pub fn resolve_intent_source(
     }
 }
 
-/// Compile a raw intent into a durable CompiledWorkProposal.
-///
-/// Idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)`,
-/// where `(source_kind, source_ref)` is derived from the typed [`IntentSource`].
-pub fn compile_intent(
+/// Shared compilation core once an intent and its resolved source identity are
+/// known. Idempotent on
+/// `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)`.
+fn compile_intent_inner(
     tx: &Transaction<'_>,
     now: UnixTime,
     generation_id: &GenerationId,
     intent: RawWorkIntent,
-    source: IntentSource,
+    source_kind: &str,
+    source_ref: &str,
     compiler_version: u32,
 ) -> Result<ProposalRecord, Error> {
-    // 1. Resolve the typed source; a result-backed intent must name a durable
-    // Result, so provenance cannot be forged as arbitrary text.
-    let (source_kind, source_ref) = resolve_intent_source(tx, &source)?;
-
-    // 2. Compute the canonical content fingerprint up front. Current frontier
+    // 1. Compute the canonical content fingerprint up front. Current frontier
     // state governs whether a *new* semantic commitment may be created; it does
     // not govern replay/observation of a commitment that already durably exists.
     let fingerprint = intent.fingerprint()?;
 
-    // 3. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
+    // 2. Check for existing proposal with same (generation_id, source_kind, source_ref, raw_intent_key, compiler_version)
     if let Some(existing) = query_opt(
         tx,
         "SELECT proposal_id, generation_id, source_kind, source_ref, raw_intent_key,
@@ -522,7 +539,7 @@ pub fn compile_intent(
         });
     }
 
-    // 4. No durable proposal exists yet, so this is a new semantic commitment.
+    // 3. No durable proposal exists yet, so this is a new semantic commitment.
     // Verify the generation exists and its frontier admits a *new* compilation.
     let gen_state_str: String = tx
         .query_row(
@@ -550,7 +567,7 @@ pub fn compile_intent(
         )));
     }
 
-    // 5. Validate semantic input set provenance
+    // 4. Validate semantic input set provenance
     validate_semantic_input_set(tx, generation_id, &intent.semantic_input_set)?;
 
     // TaskSpec dependencies must be empty in M6-A
@@ -562,7 +579,7 @@ pub fn compile_intent(
         }
     }
 
-    // 6. Build proposal record and insert
+    // 5. Build proposal record and insert
     let norm_spec = intent.suggested_task_spec;
     let spec_json_opt = match norm_spec.as_ref() {
         Some(s) => Some(json_dump(&task_spec_to_json(s)?)),
@@ -629,8 +646,8 @@ pub fn compile_intent(
     Ok(ProposalRecord {
         proposal_id,
         generation_id: generation_id.clone(),
-        source_kind,
-        source_ref,
+        source_kind: source_kind.to_string(),
+        source_ref: source_ref.to_string(),
         raw_intent_key: intent.raw_intent_key,
         intent_fingerprint: fingerprint,
         objective: intent.objective,
@@ -646,6 +663,201 @@ pub fn compile_intent(
         created_at: now,
         updated_at: now,
     })
+}
+
+/// Reserved payload namespace for M6-owned semantic ingress data.
+pub const RESULT_INTENT_ENVELOPE_KEY: &str = "_agentype";
+/// Reserved key under [`RESULT_INTENT_ENVELOPE_KEY`] holding carried intents.
+pub const RESULT_INTENT_MAP_KEY: &str = "raw_work_intents";
+
+const RESULT_INTENT_FIELDS: [&str; 5] = [
+    "objective",
+    "information_function",
+    "rationale",
+    "semantic_input_set",
+    "suggested_task_spec",
+];
+
+/// Encode one intent as an envelope entry (the map key is the `raw_intent_key`,
+/// so the entry itself must not carry it).
+pub fn raw_work_intent_to_json(intent: &RawWorkIntent) -> Result<Value, Error> {
+    let spec_val = match intent.suggested_task_spec.as_ref() {
+        Some(spec) => task_spec_to_json(spec)?,
+        None => Value::Null,
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("objective".into(), Value::String(intent.objective.clone()));
+    map.insert(
+        "information_function".into(),
+        Value::String(intent.information_function.as_sql().to_string()),
+    );
+    map.insert(
+        "rationale".into(),
+        intent
+            .rationale
+            .as_ref()
+            .map(|r| Value::String(r.clone()))
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "semantic_input_set".into(),
+        semantic_input_set_to_json(&intent.semantic_input_set),
+    );
+    map.insert("suggested_task_spec".into(), spec_val);
+    Ok(Value::Object(map))
+}
+
+/// Strictly decode one envelope entry into an intent under the given key.
+pub fn raw_work_intent_from_json(
+    raw_intent_key: &str,
+    val: &Value,
+) -> Result<RawWorkIntent, Error> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::invariant("raw_work_intent entry must be an object"))?;
+    for k in obj.keys() {
+        if !RESULT_INTENT_FIELDS.contains(&k.as_str()) {
+            return Err(Error::invariant(format!(
+                "unknown field in raw_work_intent entry: {k}"
+            )));
+        }
+    }
+
+    let objective = obj
+        .get("objective")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invariant("missing or invalid field: objective"))?
+        .to_string();
+
+    let if_str = obj
+        .get("information_function")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invariant("missing or invalid field: information_function"))?;
+    let information_function = InformationFunction::parse_sql(if_str)?;
+
+    let rationale = match obj.get("rationale") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(Error::invariant("rationale must be a string or null")),
+    };
+
+    let set_val = obj
+        .get("semantic_input_set")
+        .ok_or_else(|| Error::invariant("missing field: semantic_input_set"))?;
+    let semantic_input_set = semantic_input_set_from_json(set_val)?;
+
+    let suggested_task_spec = match obj.get("suggested_task_spec") {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(task_spec_from_json(v)?),
+    };
+
+    Ok(RawWorkIntent {
+        raw_intent_key: raw_intent_key.to_string(),
+        objective,
+        information_function,
+        semantic_input_set,
+        rationale,
+        suggested_task_spec,
+    })
+}
+
+/// Reconstruct a worker-originated intent from the immutable Result that carried
+/// it. Fails closed: a missing Result, a Result without the reserved envelope,
+/// a missing key, or a malformed entry each produce an error and no commitment.
+pub fn load_result_carried_intent(
+    tx: &Transaction<'_>,
+    result_id: &ResultId,
+    raw_intent_key: &str,
+) -> Result<RawWorkIntent, Error> {
+    if raw_intent_key.trim().is_empty() {
+        return Err(Error::invalid_authority("raw_intent_key cannot be empty"));
+    }
+
+    let payload_str: String = tx
+        .query_row(
+            "SELECT payload_json FROM results WHERE id = ?1",
+            params![result_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?
+        .ok_or_else(|| Error::not_found(format!("result {:?}", result_id.as_str())))?;
+    let payload = json_load(&payload_str)?;
+
+    let no_intent = || {
+        Error::not_found(format!(
+            "result {:?} does not carry a raw work intent for key {:?}",
+            result_id.as_str(),
+            raw_intent_key
+        ))
+    };
+
+    let envelope = match payload.get(RESULT_INTENT_ENVELOPE_KEY) {
+        Some(v) => v,
+        None => return Err(no_intent()),
+    };
+    let envelope_obj = envelope
+        .as_object()
+        .ok_or_else(|| Error::invariant("result intent envelope (_agentype) must be an object"))?;
+    let intents = match envelope_obj.get(RESULT_INTENT_MAP_KEY) {
+        Some(v) => v,
+        None => return Err(no_intent()),
+    };
+    let intents_obj = intents
+        .as_object()
+        .ok_or_else(|| Error::invariant("raw_work_intents envelope must be an object"))?;
+    let entry = match intents_obj.get(raw_intent_key) {
+        Some(v) => v,
+        None => return Err(no_intent()),
+    };
+
+    raw_work_intent_from_json(raw_intent_key, entry)
+}
+
+/// Compile a Root-originated intent, anchored to a Root command reference.
+pub fn compile_root_intent(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    generation_id: &GenerationId,
+    intent: RawWorkIntent,
+    command_ref: &str,
+    compiler_version: u32,
+) -> Result<ProposalRecord, Error> {
+    let (source_kind, source_ref) = resolve_intent_source(tx, &IntentSource::root(command_ref)?)?;
+    compile_intent_inner(
+        tx,
+        now,
+        generation_id,
+        intent,
+        &source_kind,
+        &source_ref,
+        compiler_version,
+    )
+}
+
+/// Compile a worker/harness-originated intent that is reconstructable from the
+/// immutable Result payload named by `result_id`. The caller cannot supply the
+/// intent: it is loaded from the Result, so provenance cannot be forged.
+pub fn compile_result_intent(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    generation_id: &GenerationId,
+    result_id: &ResultId,
+    raw_intent_key: &str,
+    compiler_version: u32,
+) -> Result<ProposalRecord, Error> {
+    let (source_kind, source_ref) =
+        resolve_intent_source(tx, &IntentSource::result(result_id.clone()))?;
+    let intent = load_result_carried_intent(tx, result_id, raw_intent_key)?;
+    compile_intent_inner(
+        tx,
+        now,
+        generation_id,
+        intent,
+        &source_kind,
+        &source_ref,
+        compiler_version,
+    )
 }
 
 /// Read a ProposalRecord by proposal_id.

@@ -119,7 +119,8 @@ OPEN  ──(freeze_generation)──>  FROZEN  ──(close_generation)──> 
 
 ## 4. Admission and Compilation Semantics
 
-- **Typed Intent Source**: an intent is compiled from a typed `IntentSource`, never from free-form text. `IntentSource::Root` is anchored to a Root command reference; `IntentSource::Result` is mechanically anchored to a durable `Result` and fails closed (`NotFound`) if that result does not exist. The persisted `(source_kind, source_ref)` identity (`"root"` / `"result"`) is derived from this type.
+- **Typed Intent Source**: an intent is compiled from a typed `IntentSource`, never from free-form text. `IntentSource::Root` is anchored to a Root command reference; `IntentSource::Result` is anchored to a durable `Result`. The persisted `(source_kind, source_ref)` identity (`"root"` / `"result"`) is derived from this type.
+- **Result-Carried Intent**: a worker/harness intent is not supplied separately. It is written into the ordinary Result payload under the reserved envelope `_agentype.raw_work_intents`, keyed by `raw_intent_key`, and selected by `(ResultId, raw_intent_key)`. Storage reconstructs the intent from the immutable Result payload, so a caller cannot label an unrelated intent with a Result it did not come from, and a committed Result always makes its carried intents recoverable across a crash. Absent or wrong-typed envelopes fail closed, and unknown fields in an intent entry (or in its top-level `semantic_input_set`) are rejected; the carried `suggested_task_spec` and the surrounding worker payload stay opaque and are not validated for extra keys.
 - **Deterministic Compilation**: `compile_intent` maps a `RawWorkIntent` into a unique `CompiledWorkProposal`. It is idempotent on `(generation_id, source_kind, source_ref, raw_intent_key, compiler_version)` with canonical payload fingerprinting (content changes for the same identity are rejected with Conflict).
 - **Task-Only Materialization**: the broader V0.2 operation vocabulary (Transform, type refinement, topology change) is not implemented here. Every proposal admissible in M6-A materializes as an ordinary M5 Task; there is no non-Task admission path.
 - **TaskSpec Dependencies**: In M6-A, `TaskSpec.dependencies` must be empty. Cross-admission dependency is expressed by `SemanticInputSet` provenance and Root admission order.
@@ -161,8 +162,8 @@ let view = sem.read_generation_view(&gen.generation_id)?;
 sem.freeze_generation(&gen.generation_id, 0)?;
 sem.close_generation(&gen.generation_id, 1)?;
 
-// Proposal-only surface: result-backed suggestion, no admission authority
-let prop = ingress.compile_from_result(&gen.generation_id, &source_result_id, intent, 1)?;
+// Proposal-only surface: select an intent the Result already carries.
+let prop = ingress.compile_from_result(&gen.generation_id, &source_result_id, "audit-session-race", 1)?;
 ```
 
 ### Package Boundary Witness
@@ -170,5 +171,5 @@ let prop = ingress.compile_from_result(&gen.generation_id, &source_result_id, in
 As verified by `agentype-public-api-boundary`:
 - `RootSemanticControl` does **not** expose worker acknowledgement (`ack_success`, `ack_failure`).
 - `RootSemanticControl` does **not** expose mechanical lease renewal or dispatch loops.
-- `IntentIngress` exposes **only** `compile_from_result`; it has no `admit_proposal`, `reject_proposal`, `freeze_generation`, or `close_generation`.
+- `IntentIngress` exposes **only** `compile_from_result(result_id, raw_intent_key, ...)`; it has no `admit_proposal`, `reject_proposal`, `freeze_generation`, or `close_generation`, and it cannot be handed an arbitrary intent — the intent is loaded from the named Result.
 - `Kernel` remains internal to the storage layer and cannot be named or instantiated by external consumers.

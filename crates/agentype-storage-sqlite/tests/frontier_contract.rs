@@ -15,22 +15,12 @@ use common::*;
 
 use agentype_core::{
     ArtifactRef, BatchState, Clock, FailureClass, GenerationState, InformationFunction,
-    IntentSource, ManualClock, PartitionId, PartitionSpec, ProposalExpirationReason,
-    ProposalStateKind, RawWorkIntent, ResultId, Retention, SemanticInputSet, TaskSpec, TaskState,
+    ManualClock, PartitionId, PartitionSpec, ProposalExpirationReason, ProposalStateKind,
+    RawWorkIntent, ResultId, Retention, SemanticInputSet, TaskSpec, TaskState,
 };
-
-fn root_source(command_ref: &str) -> IntentSource {
-    IntentSource::root(command_ref).expect("non-empty root command ref")
-}
-
-fn result_source(result_id: &ResultId) -> IntentSource {
-    IntentSource::result(result_id.clone())
-}
-
-/// A durable result-backed source for worker-originated intent compiles.
-fn worker_source(kernel: &Kernel) -> IntentSource {
-    result_source(&create_test_result(kernel))
-}
+use agentype_storage_sqlite::frontier::{
+    raw_work_intent_to_json, RESULT_INTENT_ENVELOPE_KEY, RESULT_INTENT_MAP_KEY,
+};
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
 use std::sync::Arc;
@@ -84,6 +74,55 @@ fn create_test_result(kernel: &Kernel) -> ResultId {
         .expect("must produce result")
 }
 
+/// ACK a worker Result whose payload is `payload`, returning its ResultId.
+fn create_result_with_payload(kernel: &Kernel, payload: serde_json::Value) -> ResultId {
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("producer", json!({}))])
+        .unwrap();
+    let _task_id = ids.values().next().unwrap();
+    let claim = kernel.claim_next_available().unwrap().expect("claim");
+    let safety = unisolated_launch_binding(&claim);
+    let launch = kernel.create_execution(&claim, safety).unwrap();
+    let exec_id = launch.execution_id().clone();
+    kernel
+        .confirm_running_and_renew(&claim.attempt_id, claim.lease_epoch, &exec_id, &json!({}))
+        .unwrap();
+    kernel
+        .ack_success(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            Some(&exec_id),
+            &payload,
+            None,
+            false,
+            false,
+        )
+        .unwrap()
+        .expect("must produce result")
+}
+
+/// Build a Result payload carrying the given intents under the reserved envelope.
+fn intent_envelope(intents: &[&RawWorkIntent]) -> serde_json::Value {
+    let mut intents_map = serde_json::Map::new();
+    for intent in intents {
+        intents_map.insert(
+            intent.raw_intent_key.clone(),
+            raw_work_intent_to_json(intent).expect("encode intent"),
+        );
+    }
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        RESULT_INTENT_MAP_KEY.into(),
+        serde_json::Value::Object(intents_map),
+    );
+    let mut root = serde_json::Map::new();
+    root.insert(
+        RESULT_INTENT_ENVELOPE_KEY.into(),
+        serde_json::Value::Object(envelope),
+    );
+    serde_json::Value::Object(root)
+}
+
 #[test]
 fn test_generation_lifecycle_and_admit_contract() {
     let kernel = test_kernel();
@@ -110,19 +149,14 @@ fn test_generation_lifecycle_and_admit_contract() {
     };
 
     let proposal = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("root_session_1"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "root_session_1", 1)
         .expect("compile intent");
     assert_eq!(proposal.state, ProposalStateKind::Pending);
     assert_eq!(proposal.information_function, InformationFunction::Expand);
 
     // Idempotent compilation returns the existing proposal
     let proposal_dup = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("root_session_1"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "root_session_1", 1)
         .expect("compile intent duplicate");
     assert_eq!(proposal_dup.proposal_id, proposal.proposal_id);
 
@@ -164,17 +198,15 @@ fn test_generation_lifecycle_and_admit_contract() {
         rationale: None,
         suggested_task_spec: Some(TaskSpec::new("inspect_caches", json!({}))),
     };
-    // Anchor the worker-originated intent to a real durable Result, which also
-    // serves as the compression provenance below.
-    let real_result = create_test_result(&kernel);
+    // A second EXPAND, compiled through the Root surface. This lifecycle test
+    // is not about ingress provenance; result-carried compilation is covered by
+    // the dedicated tests below.
     let proposal_expand_2 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            expand_intent_2,
-            result_source(&real_result),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, expand_intent_2, "worker_compilation", 1)
         .expect("compile second expand");
+
+    // Produce a real durable Result for compression provenance.
+    let real_result = create_test_result(&kernel);
 
     // Compile a COMPRESS_POSITIVE intent
     let compress_intent = RawWorkIntent {
@@ -186,12 +218,7 @@ fn test_generation_lifecycle_and_admit_contract() {
         suggested_task_spec: Some(TaskSpec::new("summarize_findings", json!({}))),
     };
     let proposal_compress = kernel
-        .compile_intent(
-            &gen.generation_id,
-            compress_intent,
-            root_source("root_session_1"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, compress_intent, "root_session_1", 1)
         .expect("compile compress proposal");
 
     // Now freeze generation
@@ -261,10 +288,10 @@ fn test_generation_lifecycle_and_admit_contract() {
         rationale: None,
         suggested_task_spec: Some(TaskSpec::new("late_compress", json!({}))),
     };
-    let compile_closed_fail = kernel.compile_intent(
+    let compile_closed_fail = kernel.compile_root_intent(
         &gen.generation_id,
         late_compress_intent,
-        root_source("root_session_1"),
+        "root_session_1",
         1,
     );
     assert!(compile_closed_fail.is_err());
@@ -287,7 +314,7 @@ fn test_proposal_rejection() {
     };
 
     let proposal = kernel
-        .compile_intent(&gen.generation_id, intent, worker_source(&kernel), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .expect("compile intent");
 
     kernel
@@ -321,7 +348,7 @@ fn test_race_b_concurrent_admissions_same_proposal_single_winner() {
     };
 
     let proposal = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .expect("compile intent");
 
     let mut handles = Vec::new();
@@ -383,7 +410,7 @@ fn test_race_a_freeze_vs_admit_serializable() {
     };
 
     let proposal = kernel
-        .compile_intent(&gen.generation_id, intent, worker_source(&kernel), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .expect("compile intent");
 
     let k1 = Arc::clone(&kernel);
@@ -434,10 +461,10 @@ fn test_p0_1_proposal_isolation_across_generations() {
     let intent2 = intent1.clone();
 
     let p1 = kernel
-        .compile_intent(&g1.generation_id, intent1, root_source("session_root"), 1)
+        .compile_root_intent(&g1.generation_id, intent1, "session_root", 1)
         .unwrap();
     let p2 = kernel
-        .compile_intent(&g2.generation_id, intent2, root_source("session_root"), 1)
+        .compile_root_intent(&g2.generation_id, intent2, "session_root", 1)
         .unwrap();
 
     assert_ne!(p1.proposal_id, p2.proposal_id);
@@ -466,7 +493,7 @@ fn test_p0_1_proposal_content_mismatch_conflict() {
         suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
     };
     let p1 = kernel
-        .compile_intent(&g.generation_id, intent1, root_source("session_1"), 1)
+        .compile_root_intent(&g.generation_id, intent1, "session_1", 1)
         .unwrap();
 
     // Same identity (gen, kind, ref, key, version) but changed objective/payload
@@ -479,7 +506,7 @@ fn test_p0_1_proposal_content_mismatch_conflict() {
         suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
     };
     let err = kernel
-        .compile_intent(&g.generation_id, intent2, root_source("session_1"), 1)
+        .compile_root_intent(&g.generation_id, intent2, "session_1", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 
@@ -493,7 +520,7 @@ fn test_p0_1_proposal_content_mismatch_conflict() {
         suggested_task_spec: Some(TaskSpec::new("inspect_sql", json!({}))),
     };
     let p1_dup = kernel
-        .compile_intent(&g.generation_id, intent1_dup, root_source("session_1"), 1)
+        .compile_root_intent(&g.generation_id, intent1_dup, "session_1", 1)
         .unwrap();
     assert_eq!(p1.proposal_id, p1_dup.proposal_id);
 }
@@ -513,7 +540,7 @@ fn test_p0_2_generation_open_dynamic_admissions_with_completed_batches() {
         suggested_task_spec: Some(TaskSpec::new("task_1", json!({}))),
     };
     let p1 = kernel
-        .compile_intent(&gen.generation_id, intent1, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent1, "session", 1)
         .unwrap();
     let t1 = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
 
@@ -562,7 +589,7 @@ fn test_p0_2_generation_open_dynamic_admissions_with_completed_batches() {
         suggested_task_spec: Some(TaskSpec::new("task_2", json!({}))),
     };
     let p2 = kernel
-        .compile_intent(&gen.generation_id, intent2, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent2, "session", 1)
         .unwrap();
     let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
 
@@ -594,7 +621,7 @@ fn test_p0_2_generation_open_dynamic_admissions_with_cancelled_batches() {
         suggested_task_spec: Some(TaskSpec::new("task_cancel", json!({}))),
     };
     let p1 = kernel
-        .compile_intent(&gen.generation_id, intent1, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent1, "session", 1)
         .unwrap();
     let t1 = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
 
@@ -613,7 +640,7 @@ fn test_p0_2_generation_open_dynamic_admissions_with_cancelled_batches() {
         suggested_task_spec: Some(TaskSpec::new("task_after_cancel", json!({}))),
     };
     let p2 = kernel
-        .compile_intent(&gen.generation_id, intent2, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent2, "session", 1)
         .unwrap();
     let t2 = kernel.admit_proposal(&p2.proposal_id, 0, None).unwrap();
 
@@ -638,7 +665,7 @@ fn test_p1_1_task_spec_dependencies_rejected() {
         suggested_task_spec: Some(spec_with_dep.clone()),
     };
     let err = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::InvalidAuthority(_)));
 
@@ -652,7 +679,7 @@ fn test_p1_1_task_spec_dependencies_rejected() {
         suggested_task_spec: None,
     };
     let p = kernel
-        .compile_intent(&gen.generation_id, clean_intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, clean_intent, "session", 1)
         .unwrap();
 
     let admit_err = kernel
@@ -680,7 +707,7 @@ fn test_p1_2_provenance_validation_nonexistent_result_rejected() {
     };
 
     let err = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::NotFound(_)));
 
@@ -714,7 +741,7 @@ fn test_p1_3_compiler_unspecified_spec_and_admission_enforcement() {
         suggested_task_spec: None,
     };
     let p = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     assert!(p.normalized_task_spec.is_none());
 
@@ -740,12 +767,7 @@ fn test_p1_3_compiler_unspecified_spec_and_admission_enforcement() {
         suggested_task_spec: Some(TaskSpec::new("original_spec", json!({}))),
     };
     let p2 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent_with_spec,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent_with_spec, "session", 1)
         .unwrap();
 
     let conflict_spec = TaskSpec::new("conflicting_spec", json!({}));
@@ -770,12 +792,7 @@ fn test_p1_1_rejected_proposal_deterministic_replay() {
     };
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "session", 1)
         .unwrap();
     assert_eq!(p1.state, ProposalStateKind::Pending);
     assert!(p1.expiration_reason.is_none());
@@ -788,7 +805,7 @@ fn test_p1_1_rejected_proposal_deterministic_replay() {
 
     // Replay compilation of the EXACT same intent
     let p2 = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
 
     assert_eq!(p2.proposal_id, p1.proposal_id);
@@ -812,12 +829,7 @@ fn test_p1_1_expand_replay_after_freeze_returns_expired() {
     };
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "session", 1)
         .unwrap();
     assert_eq!(p1.state, ProposalStateKind::Pending);
 
@@ -829,7 +841,7 @@ fn test_p1_1_expand_replay_after_freeze_returns_expired() {
     // Exact stable-identity replay observes the committed proposal even though
     // the generation frontier has advanced to FROZEN.
     let replay = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     assert_eq!(replay.proposal_id, p1.proposal_id);
     assert_eq!(replay.state, ProposalStateKind::Expired);
@@ -854,12 +866,7 @@ fn test_p1_1_admitted_replay_after_close_returns_admitted() {
     };
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "session", 1)
         .unwrap();
     let task_id = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
 
@@ -868,7 +875,7 @@ fn test_p1_1_admitted_replay_after_close_returns_admitted() {
     kernel.close_generation(&gen.generation_id, 1).unwrap();
 
     let replay = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     assert_eq!(replay.proposal_id, p1.proposal_id);
     assert_eq!(replay.state, ProposalStateKind::Admitted);
@@ -890,12 +897,7 @@ fn test_p1_1_rejected_replay_after_close_returns_rejected() {
     };
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "session", 1)
         .unwrap();
     kernel
         .reject_proposal(&p1.proposal_id, "out of scope")
@@ -905,7 +907,7 @@ fn test_p1_1_rejected_replay_after_close_returns_rejected() {
     kernel.close_generation(&gen.generation_id, 1).unwrap();
 
     let replay = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     assert_eq!(replay.proposal_id, p1.proposal_id);
     assert_eq!(replay.state, ProposalStateKind::Rejected);
@@ -930,19 +932,14 @@ fn test_p1_1_compress_replay_after_close_returns_expired() {
     };
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent.clone(), "session", 1)
         .unwrap();
     assert_eq!(p1.state, ProposalStateKind::Pending);
 
     kernel.close_generation(&gen.generation_id, 1).unwrap();
 
     let replay = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     assert_eq!(replay.proposal_id, p1.proposal_id);
     assert_eq!(replay.state, ProposalStateKind::Expired);
@@ -971,7 +968,7 @@ fn test_p1_1_canonical_task_spec_order_does_not_conflict_at_admission() {
         suggested_task_spec: Some(compiled_spec),
     };
     let p = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
 
     // Root expresses the SAME canonical spec with different vector order.
@@ -1002,7 +999,7 @@ fn test_p1_1_canonical_task_spec_retry_after_commit_returns_same_task_id() {
         suggested_task_spec: None,
     };
     let p = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
 
     let original_override = || {
@@ -1038,7 +1035,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
     };
 
     let _p = kernel
-        .compile_intent(&gen.generation_id, base_intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, base_intent, "session", 1)
         .unwrap();
 
     // 1. Changing base_backoff_seconds produces different fingerprint & causes Conflict on compile
@@ -1053,12 +1050,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
         suggested_task_spec: Some(spec_backoff),
     };
     let err = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent_backoff,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent_backoff, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 
@@ -1074,12 +1066,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
         suggested_task_spec: Some(spec_max_backoff),
     };
     let err = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent_max_backoff,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent_max_backoff, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 
@@ -1095,12 +1082,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
         suggested_task_spec: Some(spec_supersedes),
     };
     let err = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent_supersedes,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, intent_supersedes, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 
@@ -1116,7 +1098,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
         suggested_task_spec: Some(spec_tid),
     };
     let err = kernel
-        .compile_intent(&gen.generation_id, intent_tid, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent_tid, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 
@@ -1132,7 +1114,7 @@ fn test_p1_2_fingerprint_covers_all_task_spec_fields() {
         suggested_task_spec: Some(spec_pri),
     };
     let err = kernel
-        .compile_intent(&gen.generation_id, intent_pri, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent_pri, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::Conflict(_)));
 }
@@ -1229,7 +1211,7 @@ fn test_p2_1_generation_view_order_determinism() {
             suggested_task_spec: Some(TaskSpec::new(format!("task_{i}"), json!({}))),
         };
         let p = kernel
-            .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+            .compile_root_intent(&gen.generation_id, intent, "session", 1)
             .unwrap();
         proposal_ids.push(p.proposal_id);
     }
@@ -1348,7 +1330,7 @@ fn test_p2_4_frozen_generation_rejects_expand_compilation() {
     };
 
     let err = kernel
-        .compile_intent(&gen.generation_id, expand_intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, expand_intent, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::InvalidTransition(_)));
 
@@ -1363,12 +1345,7 @@ fn test_p2_4_frozen_generation_rejects_expand_compilation() {
     };
 
     let prop = kernel
-        .compile_intent(
-            &gen.generation_id,
-            compress_intent,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, compress_intent, "session", 1)
         .unwrap();
     assert_eq!(
         prop.information_function,
@@ -1392,7 +1369,7 @@ fn test_p1_1_proposal_retains_objective_and_reopen_read() {
     };
 
     let proposal = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session_1"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session_1", 1)
         .unwrap();
 
     assert_eq!(proposal.objective, "Audit cache leak on buffer pool");
@@ -1447,7 +1424,7 @@ fn test_p1_2_dedicated_batch_never_aliases_existing_active_batch() {
     };
 
     let prop = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     let admitted_task_id = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
     assert_eq!(admitted_task_id.as_str(), custom_task_id);
@@ -1502,7 +1479,7 @@ fn test_p1_2_dedicated_batch_never_strands_task_in_completed_batch() {
         suggested_task_spec: Some(TaskSpec::new("fresh_task", json!({}))),
     };
     let prop = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
     let tid = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
 
@@ -1535,7 +1512,7 @@ fn test_p1_3_admission_retry_returns_same_task_id() {
     };
 
     let prop = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
 
     let t1 = kernel.admit_proposal(&prop.proposal_id, 0, None).unwrap();
@@ -1594,7 +1571,7 @@ fn test_p1_4_seed_ref_validated_against_generation_seed() {
         suggested_task_spec: Some(TaskSpec::new("worker", json!({}))),
     };
     let prop = kernel
-        .compile_intent(&gen.generation_id, valid_intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, valid_intent, "session", 1)
         .unwrap();
     assert_eq!(prop.raw_intent_key, "valid_seed_intent");
 
@@ -1609,12 +1586,7 @@ fn test_p1_4_seed_ref_validated_against_generation_seed() {
         suggested_task_spec: Some(TaskSpec::new("worker", json!({}))),
     };
     let err = kernel
-        .compile_intent(
-            &gen.generation_id,
-            invalid_intent,
-            root_source("session"),
-            1,
-        )
+        .compile_root_intent(&gen.generation_id, invalid_intent, "session", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::NotFound(_)));
 }
@@ -1709,7 +1681,7 @@ fn test_p2_1_zero_backoff_task_spec_roundtrips_and_can_be_admitted() {
         suggested_task_spec: Some(spec),
     };
     let p = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("session"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .expect("zero backoff compiles");
     let task_id = kernel
         .admit_proposal(&p.proposal_id, 0, None)
@@ -1724,27 +1696,127 @@ fn test_result_backed_intent_source_must_exist() {
     let gen = kernel.create_generation(json!({})).unwrap();
 
     let missing = ResultId::new();
-    let intent = RawWorkIntent {
-        raw_intent_key: "missing_source".into(),
-        objective: "Source result does not exist".into(),
-        information_function: InformationFunction::Expand,
-        semantic_input_set: SemanticInputSet::new(),
-        rationale: None,
-        suggested_task_spec: Some(TaskSpec::new("missing_source", json!({}))),
-    };
-
     let err = kernel
-        .compile_intent(&gen.generation_id, intent, result_source(&missing), 1)
+        .compile_result_intent(&gen.generation_id, &missing, "any_key", 1)
         .unwrap_err();
     assert!(matches!(err, agentype_core::Error::NotFound(_)));
 }
 
 #[test]
-fn test_result_backed_intent_replay_is_idempotent() {
+fn test_result_carried_intent_is_loaded_from_result_payload() {
     let kernel = test_kernel();
     let gen = kernel.create_generation(json!({})).unwrap();
-    let source_result = create_test_result(&kernel);
 
+    let intent = RawWorkIntent {
+        raw_intent_key: "carried_probe".into(),
+        objective: "Audit session ownership race".into(),
+        information_function: InformationFunction::CompressNegative,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: Some("Observed inconsistent ownership".into()),
+        suggested_task_spec: Some(TaskSpec::new("carried_task", json!({"x": 1}))),
+    };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+
+    let prop = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "carried_probe", 1)
+        .unwrap();
+
+    assert_eq!(prop.raw_intent_key, "carried_probe");
+    assert_eq!(prop.objective, "Audit session ownership race");
+    assert_eq!(
+        prop.information_function,
+        InformationFunction::CompressNegative
+    );
+    assert_eq!(
+        prop.rationale.as_deref(),
+        Some("Observed inconsistent ownership")
+    );
+    assert_eq!(prop.source_kind, "result");
+    assert_eq!(prop.source_ref, result_id.as_str());
+    assert_eq!(prop.state, ProposalStateKind::Pending);
+    assert_eq!(
+        prop.normalized_task_spec.as_ref().map(|s| s.name.as_str()),
+        Some("carried_task")
+    );
+}
+
+#[test]
+fn test_result_without_requested_intent_fails_closed() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "present_key".into(),
+        objective: "Present intent".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("present", json!({}))),
+    };
+
+    // A Result with an ordinary payload carries no intents.
+    let plain = create_result_with_payload(&kernel, json!({"produced": true}));
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &plain, "anything", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::NotFound(_)));
+
+    // A Result carrying some intent cannot satisfy a different key.
+    let carried = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &carried, "wrong_key", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::NotFound(_)));
+}
+
+#[test]
+fn test_malformed_result_intent_envelope_fails_closed() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "k".into(),
+        objective: "Malformed envelope probe".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("probe", json!({}))),
+    };
+
+    // 1. _agentype present but not an object
+    let r1 = create_result_with_payload(&kernel, json!({"_agentype": "nope"}));
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &r1, "k", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+
+    // 2. raw_work_intents present but not an object
+    let r2 = create_result_with_payload(&kernel, json!({"_agentype": {"raw_work_intents": []}}));
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &r2, "k", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+
+    // 3. entry carries an unknown field
+    let mut entry = raw_work_intent_to_json(&intent).unwrap();
+    entry
+        .as_object_mut()
+        .unwrap()
+        .insert("surprise".into(), json!(1));
+    let mut map = serde_json::Map::new();
+    map.insert("k".into(), entry);
+    let r3 = create_result_with_payload(
+        &kernel,
+        json!({"_agentype": {"raw_work_intents": serde_json::Value::Object(map)}}),
+    );
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &r3, "k", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn test_result_carried_intent_replay_is_idempotent() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
     let intent = RawWorkIntent {
         raw_intent_key: "result_replay".into(),
         objective: "Replay a result-backed intent".into(),
@@ -1753,22 +1825,130 @@ fn test_result_backed_intent_replay_is_idempotent() {
         rationale: None,
         suggested_task_spec: Some(TaskSpec::new("result_replay", json!({}))),
     };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
 
     let p1 = kernel
-        .compile_intent(
-            &gen.generation_id,
-            intent.clone(),
-            result_source(&source_result),
-            1,
-        )
+        .compile_result_intent(&gen.generation_id, &result_id, "result_replay", 1)
         .unwrap();
     let p2 = kernel
-        .compile_intent(&gen.generation_id, intent, result_source(&source_result), 1)
+        .compile_result_intent(&gen.generation_id, &result_id, "result_replay", 1)
         .unwrap();
 
     assert_eq!(p1.proposal_id, p2.proposal_id);
     assert_eq!(p1.source_kind, "result");
-    assert_eq!(p1.source_ref, source_result.as_str());
+    assert_eq!(p1.source_ref, result_id.as_str());
+}
+
+#[test]
+fn test_result_carried_intent_replay_after_close_returns_existing() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "carried_close_replay".into(),
+        objective: "Carried intent survives close replay".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("carried_close_replay", json!({}))),
+    };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+
+    let p1 = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "carried_close_replay", 1)
+        .unwrap();
+    let task_id = kernel.admit_proposal(&p1.proposal_id, 0, None).unwrap();
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    kernel.cancel_task(&task_id, true).unwrap();
+    kernel.close_generation(&gen.generation_id, 1).unwrap();
+
+    // Replay observes the durable commitment, not the now-CLOSED frontier.
+    let replay = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "carried_close_replay", 1)
+        .unwrap();
+    assert_eq!(replay.proposal_id, p1.proposal_id);
+    assert_eq!(replay.state, ProposalStateKind::Admitted);
+}
+
+#[test]
+fn test_result_carried_expand_after_generation_freeze_is_not_compiled() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "expand_after_freeze".into(),
+        objective: "Expand after freeze".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("expand_after_freeze", json!({}))),
+    };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+
+    let err = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "expand_after_freeze", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvalidTransition(_)));
+}
+
+#[test]
+fn test_result_carried_intent_survives_file_backed_restart_before_compile() {
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join(format!(
+        "frontier_result_intent_restart_{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let clock = Arc::new(ManualClock::new(1_000.0)) as Arc<dyn Clock>;
+    let kernel = Kernel::open(&path, clock.clone(), 30.0, CONTINUITY_MAX_BYTES)
+        .expect("open file-backed kernel");
+    for name in ["default", "general"] {
+        kernel
+            .upsert_partition(&PartitionSpec {
+                name: PartitionId::new(name),
+                desired_capacity: 5,
+                retention: Retention::Resident,
+                execution_target: "local".into(),
+                execution_profile: "default".into(),
+                tags: vec![],
+            })
+            .expect("upsert partition");
+    }
+    kernel.reconcile_pool().unwrap();
+
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "restart_intent".into(),
+        objective: "Survive a restart before compilation".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("restart_intent", json!({}))),
+    };
+    let result_id = create_result_with_payload(&kernel, intent_envelope(&[&intent]));
+
+    // Simulate a process crash after the Result committed but before compile.
+    drop(kernel);
+
+    let kernel = Kernel::open(&path, clock.clone(), 30.0, CONTINUITY_MAX_BYTES)
+        .expect("reopen file-backed kernel");
+    let prop = kernel
+        .compile_result_intent(&gen.generation_id, &result_id, "restart_intent", 1)
+        .expect("result-carried intent is recoverable after restart");
+    assert_eq!(prop.raw_intent_key, "restart_intent");
+    assert_eq!(prop.source_ref, result_id.as_str());
+
+    // The proposal itself is durable across a second reopen.
+    drop(kernel);
+    let kernel = Kernel::open(&path, clock, 30.0, CONTINUITY_MAX_BYTES).unwrap();
+    let reloaded = kernel.get_proposal(&prop.proposal_id).unwrap();
+    assert_eq!(reloaded.proposal_id, prop.proposal_id);
+    assert_eq!(reloaded.objective, "Survive a restart before compilation");
+
+    drop(kernel);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1786,8 +1966,242 @@ fn test_root_intent_uses_root_source_identity() {
     };
 
     let p = kernel
-        .compile_intent(&gen.generation_id, intent, root_source("cli_cmd_7"), 1)
+        .compile_root_intent(&gen.generation_id, intent, "cli_cmd_7", 1)
         .unwrap();
     assert_eq!(p.source_kind, "root");
     assert_eq!(p.source_ref, "cli_cmd_7");
+}
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_result_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let result = ResultId::new();
+    let dup_set = SemanticInputSet::new()
+        .with_result(result.clone())
+        .with_result(result);
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_result".into(),
+        objective: "Duplicate result refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_result", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_artifact_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let art = ArtifactRef::new("heap.bin", "sha256:abc").unwrap();
+    let dup_set = SemanticInputSet::new()
+        .with_artifact(art.clone())
+        .with_artifact(art);
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_artifact".into(),
+        objective: "Duplicate artifact refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_artifact", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+#[test]
+fn test_semantic_input_set_rejects_duplicate_seed_refs() {
+    let kernel = test_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let dup_set = SemanticInputSet::new()
+        .with_seed("seed_a")
+        .with_seed("seed_a");
+    let intent = RawWorkIntent {
+        raw_intent_key: "dup_seed".into(),
+        objective: "Duplicate seed refs".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: dup_set,
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("dup_seed", json!({}))),
+    };
+    let err = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap_err();
+    assert!(matches!(err, agentype_core::Error::InvariantViolation(_)));
+}
+
+/// Open a file-backed kernel with the standard partitions, under the writable
+/// test target temp dir (not the sandbox-blocked system temp dir).
+fn file_kernel(tag: &str) -> (std::path::PathBuf, Kernel) {
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join(format!(
+        "frontier_fault_{tag}_{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Arc::new(ManualClock::new(1_000.0)) as Arc<dyn Clock>;
+    let kernel = Kernel::open(&path, clock, 30.0, CONTINUITY_MAX_BYTES).expect("open file kernel");
+    for name in ["default", "general"] {
+        kernel
+            .upsert_partition(&PartitionSpec {
+                name: PartitionId::new(name),
+                desired_capacity: 5,
+                retention: Retention::Resident,
+                execution_target: "local".into(),
+                execution_profile: "default".into(),
+                tags: vec![],
+            })
+            .expect("upsert partition");
+    }
+    kernel.reconcile_pool().unwrap();
+    (path, kernel)
+}
+
+/// Install a test-only `BEFORE INSERT` trigger that aborts the statement.
+fn install_abort_trigger(path: &std::path::Path, trigger: &str, table: &str, when: Option<&str>) {
+    let conn = rusqlite::Connection::open(path).expect("open db for trigger");
+    let guard = when.map(|w| format!("WHEN {w}")).unwrap_or_default();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} {guard} \
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+    ))
+    .expect("create abort trigger");
+}
+
+#[test]
+fn test_freeze_rolls_back_on_outbox_failure() {
+    let (path, kernel) = file_kernel("freeze_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "pending_expand".into(),
+        objective: "Pending expand".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("pending_expand", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(
+        &path,
+        "fail_frozen_outbox",
+        "notification_outbox",
+        Some("NEW.event_type = 'GENERATION_FROZEN'"),
+    );
+
+    assert!(kernel.freeze_generation(&gen.generation_id, 0).is_err());
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.state, GenerationState::Open);
+    assert_eq!(view.generation.revision, 0);
+    assert!(view.pending_proposal_ids.contains(&prop.proposal_id));
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let frozen_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='GENERATION_FROZEN'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(frozen_events, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_close_rolls_back_on_outbox_failure() {
+    let (path, kernel) = file_kernel("close_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    kernel.freeze_generation(&gen.generation_id, 0).unwrap();
+    let compress = RawWorkIntent {
+        raw_intent_key: "pending_compress".into(),
+        objective: "Pending compress".into(),
+        information_function: InformationFunction::CompressPositive,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("pending_compress", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, compress, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(
+        &path,
+        "fail_closed_outbox",
+        "notification_outbox",
+        Some("NEW.event_type = 'GENERATION_CLOSED'"),
+    );
+
+    assert!(kernel.close_generation(&gen.generation_id, 1).is_err());
+
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.state, GenerationState::Frozen);
+    assert_eq!(view.generation.revision, 1);
+    assert!(view.pending_proposal_ids.contains(&prop.proposal_id));
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let closed_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='GENERATION_CLOSED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(closed_events, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_admission_rolls_back_on_binding_failure() {
+    let (path, kernel) = file_kernel("admit_rollback");
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "admit_rollback".into(),
+        objective: "Admission must roll back".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("admit_rollback", json!({}))),
+    };
+    let prop = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+
+    install_abort_trigger(&path, "fail_binding", "generation_task_bindings", None);
+
+    assert!(kernel.admit_proposal(&prop.proposal_id, 0, None).is_err());
+
+    let reread = kernel.get_proposal(&prop.proposal_id).unwrap();
+    assert_eq!(reread.state, ProposalStateKind::Pending);
+    assert!(reread.admitted_task_id.is_none());
+    let view = kernel.get_generation_view(&gen.generation_id).unwrap();
+    assert_eq!(view.generation.admission_seq, 0);
+    assert!(view.admitted_task_ids.is_empty());
+
+    drop(kernel);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let tasks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE name='admit_rollback'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tasks, 0,
+        "Task insert must roll back with the failed binding"
+    );
+    let _ = std::fs::remove_file(&path);
 }

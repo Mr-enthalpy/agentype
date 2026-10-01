@@ -5,6 +5,15 @@ plane for durable agent work. It owns Tasks, Attempts, Leases, Results,
 LogicalAgents, Batches, pool topology, recovery, escalation, and durable Root
 notifications. Physical execution belongs to replaceable adapters.
 
+## Development status
+
+- The Python package `local-agent-scheduler` 0.1.3 is the current packaged
+  product line.
+- The Rust V0.2 mainline has a frozen M5 execution/runtime substrate and a
+  frozen M6-A semantic frontier kernel. See [docs/README.md](docs/README.md).
+- The M6-A freeze is recorded in
+  [docs/reports/v0.2/m6a-semantic-frontier-freeze.md](docs/reports/v0.2/m6a-semantic-frontier-freeze.md).
+
 The current implementation is the Python package `local-agent-scheduler` 0.1.3:
 SQLite WAL, a Codex `app-server` adapter, and a Grok ACP stdio adapter.
 Scheduler Core owns semantics; adapters and RootBridge own transport.
