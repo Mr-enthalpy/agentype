@@ -16,7 +16,12 @@ RawWorkIntent → compilation → CompiledWorkProposal → Root admission
        NEEDS_ROOT_DECISION → stays with Root
 ```
 
-Not every admitted proposal becomes a Task.
+The operation vocabulary above is the generic **V0.2** vocabulary. **M6-A
+implements only the `TASK` path**: every proposal admissible in M6-A
+materializes as an ordinary M5 Task. `TRANSFORM`, `TYPE_REFINEMENT`,
+`TOPOLOGY_CHANGE`, and their admission are **not** implemented by M6-A and MUST
+NOT be assumed to be. So in M6-A "not every admitted proposal becomes a Task"
+does not apply: admission always creates a Task.
 
 Compilation answers: if admitted, how would the architecture represent the
 work?
@@ -41,8 +46,10 @@ which is the first Scheduler-owned review object.
 Ordinary workers MUST NOT need AgentType registries, Generation mechanics,
 Pool topology, SpawnSource, Transform, or Lease/Attempt/Incarnation knowledge.
 
-How much structure is required is DEFERRED (D-INTENT-SCHEMA). Too little
-burdens the compiler; too much leaks Scheduler architecture.
+M6-A freezes the concrete ingress `RawWorkIntent` value defined by the Semantic
+Frontier Kernel. Richer domain-specific intent schemas are post-M6-A extensions
+and MUST NOT reopen `D-INTENT-SCHEMA`, which is RESOLVED in M6-A
+([17](17-deferred-open-questions.md)).
 
 ## CompiledWorkProposal
 
@@ -58,7 +65,9 @@ acceptance criteria, suggested Generation policy, candidate type constraints,
 decision requirements, compiler evidence.
 
 Proposal kinds MAY include TASK, TYPE_REFINEMENT, TRANSFORM, TOPOLOGY_CHANGE,
-NEEDS_ROOT_DECISION. These remain proposals until Root admission.
+NEEDS_ROOT_DECISION as future vocabulary. In M6-A only the TASK shape is
+admissible; see the Boundary scope above. These remain proposals until Root
+admission.
 
 ## Compiler
 

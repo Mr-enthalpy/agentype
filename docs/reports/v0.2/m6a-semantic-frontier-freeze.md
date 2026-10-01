@@ -193,6 +193,22 @@ specs 01 and 05 that `RawWorkIntent` is an ingress value with no independent
 durable identity, and that `CompiledWorkProposal` is the first durable review
 object. The M6-A freeze claim holds only after this closure lands.
 
+A third review of
+`main@d4bf49a1ade4d1ef2002a6c47dc6872f72a32e68` returned `PASS WITH P1 CLOSURE`
+with two thematic P1 items and four non-blocking P2 items, closed by two narrow
+PRs on top of that baseline:
+
+```text
+P1  intent ingress / provenance boundary   closed (typed IntentSource; proposal-only IntentIngress)
+P1  normative intent / proposal scope      closed (D-INTENT-SCHEMA resolution; M6-A TASK-only fence)
+P2  schema hardening, rollback/restart proof, SemanticInputSet
+    multiplicity, root README status       queued, non-blocking
+```
+
+The ingress boundary is now typed and result-anchored, and the normative docs no
+longer present a deferred intent schema or non-Task admission kinds as M6-A
+behavior. M6-A remains a TASK-only semantic frontier.
+
 ## Baseline
 
 ```text
@@ -203,8 +219,10 @@ First audited M6-A closure head:
 ae3436416687c4681a0e5b5541d59dd9783462b9
 
 M6-A baseline is the merge of PR #16 into main. The M6-A freeze claim is
-confirmed by the subsequent closure PR (fix/m6a-audit-closure) on top of
-c174f1585a82d6b3fac3ba30c4c374485d25cb9e.
+confirmed by the subsequent closure PRs (fix/m6a-audit-closure on
+c174f1585a82d6b3fac3ba30c4c374485d25cb9e, then the intent-ingress and
+normative-scope closures on
+d4bf49a1ade4d1ef2002a6c47dc6872f72a32e68).
 
 SCHEMA_VERSION = 5 at M6-A freeze.
 ```
