@@ -26,6 +26,10 @@ pub enum ContractError {
     AdapterBindingMissing,
     /// A selector carried no usable identity.
     EmptySelector,
+    /// A numeric contract value was non-finite or out of range.
+    InvalidNumber { field: String },
+    /// An identity was empty or a revision was zero.
+    InvalidRef { reason: String },
     /// A durable relation that must hold does not.
     InvariantViolation(String),
 }
@@ -52,6 +56,8 @@ impl fmt::Display for ContractError {
             }
             Self::AdapterBindingMissing => write!(f, "exact adapter binding missing"),
             Self::EmptySelector => write!(f, "empty selector"),
+            Self::InvalidNumber { field } => write!(f, "invalid number for {field}"),
+            Self::InvalidRef { reason } => write!(f, "invalid ref: {reason}"),
             Self::InvariantViolation(msg) => write!(f, "invariant violation: {msg}"),
         }
     }

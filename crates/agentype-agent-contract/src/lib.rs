@@ -24,16 +24,16 @@ mod records;
 mod selector;
 
 pub use capability::{
-    assurance_satisfies, value_satisfies, Assurance, CapabilityClaim, CapabilitySpec,
-    CapabilityValue, MatcherKind, SecurityClass,
+    assurance_satisfies, value_satisfies, Assurance, CapabilityClaim, CapabilityRef,
+    CapabilityRequirement, CapabilitySpec, CapabilityValue, MatcherKind, Quantity, SecurityClass,
 };
 pub use error::ContractError;
 pub use ids::{AdapterPolicyId, AgentTypeId, CapabilityId, SourceConfigId, SpawnSourceId};
 pub use predicates::{can_execute, can_provision, is_valid_refinement, more_specific_for};
 pub use records::{
     network_rank, workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
-    AgentTypeContract, AgentTypeLookup, AgentTypeRef, AgentTypeStatus, ConfigStatus,
-    ContinuityMode, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
+    AgentTypeContract, AgentTypeLookup, AgentTypeRef, AgentTypeStatus, Budget, ConfigStatus,
+    ContinuityMode, CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, PublishedCatalog,
     SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
     TaskRequirement,
 };

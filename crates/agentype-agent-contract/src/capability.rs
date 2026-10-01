@@ -2,8 +2,10 @@
 //!
 //! M6-B v1 deliberately rejects arbitrary expression DSLs (CEL, JS, LLM
 //! matchers, provider-specific predicate languages). A capability is one of a
-//! handful of shapes that can be decided mechanically.
+//! handful of shapes that can be decided mechanically, and it is always keyed
+//! by an **exact revision** so a v1 claim can never satisfy a v2 requirement.
 
+use crate::error::ContractError;
 use crate::ids::CapabilityId;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -23,13 +25,33 @@ pub enum MatcherKind {
     Exact,
 }
 
+/// A validated non-negative, finite quantity.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Quantity(f64);
+
+impl Quantity {
+    pub fn new(value: f64) -> Result<Self, ContractError> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ContractError::InvalidNumber {
+                field: "quantity".into(),
+            })
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
 /// A capability value. The shape is determined by the capability spec.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CapabilityValue {
     Bool(bool),
     Set(BTreeSet<String>),
     Ordered { class: String, rank: u32 },
-    Quantity(f64),
+    Quantity(Quantity),
     Exact(Value),
 }
 
@@ -71,20 +93,52 @@ impl SecurityClass {
     }
 }
 
-/// Declares the shape and security class of a capability id + revision.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapabilitySpec {
+/// Exact `(capability_id, revision)` identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CapabilityRef {
     pub capability_id: CapabilityId,
     pub revision: u64,
+}
+
+impl CapabilityRef {
+    pub fn new(capability_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
+        let capability_id = CapabilityId::from_string(capability_id);
+        if capability_id.as_str().trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "capability id cannot be empty".into(),
+            });
+        }
+        if revision == 0 {
+            return Err(ContractError::InvalidRef {
+                reason: "capability revision must be >= 1".into(),
+            });
+        }
+        Ok(Self {
+            capability_id,
+            revision,
+        })
+    }
+}
+
+/// Declares the shape and security class of an exact capability revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilitySpec {
+    pub reference: CapabilityRef,
     pub matcher_kind: MatcherKind,
     pub security_class: SecurityClass,
 }
 
-/// A source's (or config's) concrete claim about one capability.
+/// A Task's (or AgentType contract's) requirement under an exact revision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityRequirement {
+    pub reference: CapabilityRef,
+    pub value: CapabilityValue,
+}
+
+/// A source's (or config's) concrete claim about one exact capability revision.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityClaim {
-    pub capability_id: CapabilityId,
-    pub capability_revision: u64,
+    pub reference: CapabilityRef,
     pub value: CapabilityValue,
     pub assurance: Assurance,
     pub evidence_ref: Option<String>,
@@ -111,7 +165,7 @@ pub fn value_satisfies(
             },
         ) => rc == pc && pr >= rr,
         (MatcherKind::Quantity, CapabilityValue::Quantity(r), CapabilityValue::Quantity(p)) => {
-            p >= r
+            p.get() >= r.get()
         }
         (MatcherKind::Exact, r, p) => r == p,
         _ => false,

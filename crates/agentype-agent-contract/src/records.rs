@@ -1,9 +1,72 @@
 //! M6-B contract records. Pure value types; persistence is a later milestone.
+//!
+//! All numeric contract values are validated newtypes and all identity refs
+//! reject empty ids / zero revisions, so a durable digest can never be formed
+//! from an invalid or non-canonical value.
 
-use crate::capability::{CapabilityClaim, CapabilitySpec, CapabilityValue};
-use crate::ids::{AdapterPolicyId, AgentTypeId, CapabilityId, SourceConfigId, SpawnSourceId};
+use crate::capability::{CapabilityClaim, CapabilityRef, CapabilitySpec, CapabilityValue};
+use crate::error::ContractError;
+use crate::ids::{AdapterPolicyId, AgentTypeId, SourceConfigId, SpawnSourceId};
 use agentype_core::{InformationFunction, WorkspaceMode};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A validated non-negative, finite budget.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Budget(f64);
+
+impl Budget {
+    pub fn new(value: f64) -> Result<Self, ContractError> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ContractError::InvalidNumber {
+                field: "budget".into(),
+            })
+        }
+    }
+
+    pub fn zero() -> Self {
+        Self(0.0)
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// An opaque credential reference. Never a secret value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CredentialRef(String);
+
+impl CredentialRef {
+    pub fn new(reference: impl Into<String>) -> Result<Self, ContractError> {
+        let reference = reference.into();
+        if reference.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "credential reference cannot be empty".into(),
+            });
+        }
+        Ok(Self(reference))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn validate_identity(id: &str, revision: u64, what: &str) -> Result<(), ContractError> {
+    if id.trim().is_empty() {
+        return Err(ContractError::InvalidRef {
+            reason: format!("{what} id cannot be empty"),
+        });
+    }
+    if revision == 0 {
+        return Err(ContractError::InvalidRef {
+            reason: format!("{what} revision must be >= 1"),
+        });
+    }
+    Ok(())
+}
 
 /// Exact, immutable `(type_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -13,11 +76,10 @@ pub struct AgentTypeRef {
 }
 
 impl AgentTypeRef {
-    pub fn new(type_id: impl Into<String>, revision: u64) -> Self {
-        Self {
-            type_id: AgentTypeId::from_string(type_id),
-            revision,
-        }
+    pub fn new(type_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
+        let type_id = AgentTypeId::from_string(type_id);
+        validate_identity(type_id.as_str(), revision, "agent type")?;
+        Ok(Self { type_id, revision })
     }
 }
 
@@ -28,12 +90,39 @@ pub struct SpawnSourceRef {
     pub revision: u64,
 }
 
+impl SpawnSourceRef {
+    pub fn new(source_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
+        let source_id = SpawnSourceId::from_string(source_id);
+        validate_identity(source_id.as_str(), revision, "spawn source")?;
+        Ok(Self {
+            source_id,
+            revision,
+        })
+    }
+}
+
 /// Exact, immutable `(source, config_id, revision)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceConfigRef {
     pub source: SpawnSourceRef,
     pub config_id: SourceConfigId,
     pub revision: u64,
+}
+
+impl SourceConfigRef {
+    pub fn new(
+        source: SpawnSourceRef,
+        config_id: impl Into<String>,
+        revision: u64,
+    ) -> Result<Self, ContractError> {
+        let config_id = SourceConfigId::from_string(config_id);
+        validate_identity(config_id.as_str(), revision, "source config")?;
+        Ok(Self {
+            source,
+            config_id,
+            revision,
+        })
+    }
 }
 
 /// Exact adapter policy revision.
@@ -43,13 +132,25 @@ pub struct AdapterPolicyRef {
     pub revision: u64,
 }
 
+impl AdapterPolicyRef {
+    pub fn new(policy_id: impl Into<String>, revision: u64) -> Result<Self, ContractError> {
+        let policy_id = AdapterPolicyId::from_string(policy_id);
+        validate_identity(policy_id.as_str(), revision, "adapter policy")?;
+        Ok(Self {
+            policy_id,
+            revision,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentTypeStatus {
     Published,
     Deprecated,
 }
 
-/// How strong a continuity guarantee an agent contract requires.
+/// How strong a continuity guarantee an agent contract requires. A higher mode
+/// is a *stronger requirement* that narrows the eligible provisioning set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContinuityMode {
     None,
@@ -98,21 +199,32 @@ pub struct SecurityContract {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTypeContract {
     /// `InformationFunction` is a closed enum without `Ord`, so this stays a
-    /// sorted-by-construction `Vec` rather than a `BTreeSet`.
+    /// `Vec`; call [`AgentTypeContract::normalize`] before digesting.
     pub allowed_information_functions: Vec<InformationFunction>,
-    /// Capability ids and values the type requires an execution source to provide.
-    pub required_capabilities: BTreeMap<CapabilityId, CapabilityValue>,
-    /// Capability specs (matcher kind + security class) for each capability id.
-    pub capability_specs: BTreeMap<CapabilityId, CapabilitySpec>,
+    /// Capabilities the type requires an execution source to provide, keyed by
+    /// exact revision.
+    pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
+    /// Exact capability specs (matcher kind + security class) per revision.
+    pub capability_specs: BTreeMap<CapabilityRef, CapabilitySpec>,
     pub permission_ceiling: BTreeSet<String>,
     pub visibility: BTreeSet<String>,
     pub tools: BTreeSet<String>,
     pub roots: BTreeSet<String>,
-    pub budget_ceiling: f64,
+    pub budget_ceiling: Budget,
     pub security: SecurityContract,
     pub lifecycle: BTreeSet<LifecycleMode>,
     pub continuity: ContinuityMode,
     pub anchor_constraint: Option<String>,
+}
+
+impl AgentTypeContract {
+    /// Canonicalize the information-function list so equal contracts cannot
+    /// encode differently (and therefore cannot digest differently).
+    pub fn normalize(&mut self) {
+        self.allowed_information_functions
+            .sort_by_key(|f| f.as_sql());
+        self.allowed_information_functions.dedup();
+    }
 }
 
 /// A published, immutable AgentType revision.
@@ -128,14 +240,14 @@ pub struct AgentType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskRequirement {
     pub information_function: InformationFunction,
-    pub required_capabilities: BTreeMap<CapabilityId, CapabilityValue>,
+    pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
     pub required_permissions: BTreeSet<String>,
     pub required_tools: BTreeSet<String>,
     pub required_workspace: WorkspaceMode,
     pub required_network: NetworkPolicy,
     pub required_continuity: ContinuityMode,
     pub required_anchor: Option<String>,
-    pub budget: f64,
+    pub budget: Budget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -159,27 +271,33 @@ pub struct SpawnSource {
     pub adapter_policy: AdapterPolicyRef,
     pub lifecycle_modes: BTreeSet<LifecycleMode>,
     pub continuity_modes: BTreeSet<ContinuityMode>,
-    pub functional_envelope: BTreeMap<CapabilityId, CapabilityValue>,
+    pub functional_envelope: BTreeMap<CapabilityRef, CapabilityValue>,
     pub claims: Vec<CapabilityClaim>,
     pub status: SourceStatus,
 }
 
 /// A source-specific operator configuration. The payload is opaque to Core;
-/// only its identity, digest, and credential references are modeled here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// only its identity, digest, credential references, and any config-specific
+/// capability claims are modeled here.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
     pub config_digest: String,
-    pub credential_refs: Vec<String>,
+    pub credential_refs: Vec<CredentialRef>,
+    pub claims: Vec<CapabilityClaim>,
     pub status: ConfigStatus,
 }
 
-/// Physical safety facts a source/config can actually realize.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Physical facts a source/config can actually *enforce*.
+///
+/// This is deliberately a set of enforceable modes, not a maximum privilege
+/// level: being able to enable networking does not prove the environment can
+/// mechanically enforce a restricted or disabled network.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalSafety {
     pub attempt_isolation: bool,
-    pub workspace: WorkspaceMode,
-    pub network: NetworkPolicy,
+    pub enforceable_workspace_modes: Vec<WorkspaceMode>,
+    pub enforceable_network_modes: BTreeSet<NetworkPolicy>,
 }
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
@@ -199,9 +317,13 @@ pub trait AgentTypeLookup {
 }
 
 /// A tiny in-memory published catalog for selector tests and early wiring.
+///
+/// Deprecation only affects *future selection*: it removes the revision from
+/// the selectable set. Existing exact refs are unaffected by construction.
 #[derive(Clone, Debug, Default)]
 pub struct PublishedCatalog {
     published: BTreeSet<AgentTypeRef>,
+    deprecated: BTreeSet<AgentTypeRef>,
 }
 
 impl PublishedCatalog {
@@ -210,11 +332,20 @@ impl PublishedCatalog {
     }
 
     pub fn publish(&mut self, reference: AgentTypeRef) -> bool {
+        self.deprecated.remove(&reference);
         self.published.insert(reference)
     }
 
+    /// Mark a revision deprecated for future selection without rewriting any
+    /// existing exact pin.
     pub fn deprecate(&mut self, reference: &AgentTypeRef) -> bool {
-        self.published.remove(reference)
+        let was_published = self.published.remove(reference);
+        let recorded = self.deprecated.insert(reference.clone());
+        was_published || recorded
+    }
+
+    pub fn is_deprecated(&self, reference: &AgentTypeRef) -> bool {
+        self.deprecated.contains(reference)
     }
 }
 
