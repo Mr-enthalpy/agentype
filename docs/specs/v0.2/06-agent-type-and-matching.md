@@ -21,8 +21,8 @@ admitted Task agent requirement, MUST pin an exact immutable
 `AgentTypeRef(type_id, revision)`. `latest`, ranges, and aliases are pre-commit
 selectors only and MUST resolve to an exact revision before any durable binding
 is written. Cross-revision compatibility and Transform across revisions remain
-DEFERRED; M6-B v1 performs no automatic cross-revision upgrade (D-TYPE-REV
-resolved to exact-pin).
+DEFERRED (D-TYPE-REV-COMPAT); M6-B v1 performs no automatic cross-revision
+upgrade (D-TYPE-REV-PIN resolved to exact-pin).
 
 ## Relations (MUST remain four)
 
@@ -43,22 +43,25 @@ Concrete encodings of the four relations are FROZEN in M6-B.1 (D-TYPE-REL
 resolved) and implemented in `agentype-agent-contract`:
 
 - `can_execute` checks the information function, capability envelope, permission
-  ceiling, tools, workspace/network policy, continuity minimum, anchor, and
-  budget.
+  ceiling, tools, task affinity, workspace/network policy, continuity minimum,
+  anchor, and budget.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle and continuity coverage, every required
-  capability **at its exact revision** (config claims, then source claims, then
-  the functional envelope; security-class capabilities REQUIRE an `ENFORCED`
-  claim), mechanically enforceable workspace/network modes, required isolation,
-  and exact AdapterBinding availability. Restrictions MUST NOT be inferred from
-  a stronger capability.
-- `more_specific_for` compares authority envelopes and is defined only once both
-  types are executable; it MUST be a strict relation (two types with equivalent
-  authority are incomparable) and MUST NOT rank by nominal inheritance depth.
+  capability **at its exact revision** (config declarations, then source
+  declarations, then the functional envelope), the imported `ENFORCED`
+  evidence for security-class capabilities, mechanically enforceable
+  workspace/network modes and isolation, and the policy-bound evidence. A
+  `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
+  be inferred from a stronger capability.
+- `more_specific_for` is defined only once both types are executable and uses a
+  single shared capability-constraint order (no requirement disappears; matcher
+  and security class are never downgraded). It MUST be strict (two types with
+  equivalent authority are incomparable), includes affinity and every authority
+  dimension, and MUST NOT rank by nominal inheritance depth.
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
-  tools, roots, budget, information functions, anchor, and security policy; a
-  derived type MAY strengthen but MUST NOT weaken lifecycle, continuity, or
-  required isolation.
+  tools, roots, affinity, budget, information functions, anchor, security policy,
+  and capability constraints; a derived type MAY strengthen but MUST NOT weaken
+  lifecycle, continuity, or required isolation.
 
 ## Refinement monotonicity
 

@@ -62,30 +62,34 @@ AgentType                 published contract revision; optional based_on provena
 AgentTypeContract         information functions, capability envelope, permission
                           ceiling, visibility, tools, roots, budget ceiling,
                           security, lifecycle, continuity, anchor constraint
-CapabilitySpec            (capability_id, revision, matcher_kind, security_class)
+CapabilityRef             exact (capability_id, revision); private fields
+CapabilitySpec            (matcher_kind, security_class), keyed by CapabilityRef
 CapabilityValue           BOOL | SET | ORDERED | QUANTITY | EXACT
-CapabilityRef             exact (capability_id, revision)
-CapabilityClaim           (exact reference, value, assurance DECLARED|ENFORCED,
-                          evidence)
+CapabilityClaim           (exact reference, value, assurance declaration, evidence)
 TaskRequirement           information function, required capabilities/permissions/
-                          tools, workspace/network, continuity, anchor, budget
+                          tools/affinity, workspace/network, continuity, anchor,
+                          budget
 SpawnSource               advertised lifecycle/continuity envelopes, functional
-                          capability envelope, source-wide claims, status
+                          capability envelope, source-wide declarations, status
 SourceConfig              opaque source-private config: exact source ref,
                           identity, digest, credential refs, config-specific
-                          claims, status
+                          declarations, status
 AdapterBindingPolicy      stable alias -> exact runtime binding, required safety
-PhysicalSafety            enforceable sets: isolation, workspace modes, network
-                          modes
+AdapterBindingKey         opaque concrete physical execution domain
+PhysicalSafety            private, validated enforceable sets: isolation,
+                          workspace modes, network modes
+ProvisioningEvidenceSource / ResolvedProvisioningEvidence
+                          imported enforcement facts bound to one AdapterPolicyRef
 AgentTypeSelector         Exact(ref) | Latest(id), resolved to exact pre-commit
 ```
 
 `AgentType` MUST NOT be defined by model, provider, terminal, price tier, prompt
 alias, `SourceConfig`, or `AdapterBinding`. `SourceConfig` payloads are opaque:
 Core recognizes identity, digest, credential references, and config-specific
-capability claims only. All numeric contract values are validated finite
-non-negative newtypes (`Budget`, `Quantity`), and every ref rejects an empty id
-or zero revision, so a durable digest can never form from an invalid value.
+capability declarations only. All numeric contract values are validated finite
+non-negative newtypes (`Budget`, `Quantity`); every ref has private fields and a
+validated constructor rejecting empty ids / zero revisions, so a durable digest
+can never form from an invalid value.
 
 ---
 
@@ -104,35 +108,37 @@ task anchor requirement satisfies agent anchor constraint (None = unconstrained)
 task budget               <= agent budget_ceiling
 ```
 
-### `can_provision(SpawnSource, SourceConfig, AgentType, PhysicalSafety, exact binding)`
+### `can_provision(SpawnSource, SourceConfig, AgentType, ResolvedProvisioningEvidence)`
 
 ```text
 config.config_ref.source == source.source_ref        (exact revision)
 source/config active
+evidence.adapter_policy == source.adapter_policy     (adapter A's facts never fit source B)
 agent lifecycle  ⊆ source lifecycle_modes
 agent continuity ∈ source continuity_modes
 for each exact capability revision the agent requires:
     spec = CapabilitySpec(capability_id, revision)   (missing spec fails closed)
-    provided = config claim, else source claim, else functional envelope
-    security-class capabilities REQUIRE an ENFORCED claim at the exact revision
+    functional: provided = config declaration, else source declaration, else envelope
+    security class: provided = evidence.enforced_capability(exact revision)
     value must satisfy the spec matcher
-required isolation is an enforceable physical fact
-required workspace/network mode is in PhysicalSafety's enforceable set
-exact AdapterBinding available
+required isolation / workspace / network enforcement comes from evidence.enforceable_safety
 ```
 
-There is no string-keyed bypass: `attempt_isolation`, sandbox, authority, and
-continuity all go through the same exact-revision proof path. A capability claim
-at a different revision never satisfies a requirement.
+`ENFORCED` is imported **evidence**, not an enum label: a source/config that
+merely declares `ENFORCED` (or supplies a functional envelope) never satisfies a
+sandbox/authority/continuity requirement. There is no string-keyed bypass, and a
+capability claim at a different revision never satisfies a requirement.
 
 ### `more_specific_for(A, B, TaskRequirement)`
 
 Only defined once both `can_execute`, and only when A is no wider than B on
 *every* relevant dimension (information functions, permission, visibility,
-tools, roots, budget, workspace/network, tool roots, isolation, continuity,
-anchor, capability envelope) with at least one dimension strictly narrower.
-Two types with equivalent authority are **incomparable**, not mutually more
-specific. Ranking MUST NOT use nominal inheritance depth.
+tools, roots, affinity, budget, workspace/network, tool roots, isolation,
+continuity, anchor, and capability constraints) with at least one dimension
+strictly narrower. Capability constraints use the same shared order as
+refinement (no requirement disappears; matcher and security class are never
+downgraded). Two types with equivalent authority are **incomparable**, not
+mutually more specific. Ranking MUST NOT use nominal inheritance depth.
 
 ### `is_valid_refinement(Base, Derived)`
 
@@ -141,12 +147,15 @@ DerivedPermission ⊆ BasePermission
 DerivedVisibility ⊆ BaseVisibility
 DerivedTools      ⊆ BaseTools
 DerivedRoots      ⊆ BaseRoots
+DerivedAffinity   ⊇ BaseAffinity (affinity MAY narrow, never broaden)
 DerivedBudget     ≤ BaseBudget
 DerivedInformationFunctions ⊆ BaseInformationFunctions
 lifecycle MUST NOT widen
-continuity MAY strengthen by MUST NOT weaken the base guarantee
+continuity MAY strengthen but MUST NOT weaken the base guarantee
 anchor MUST satisfy base anchor constraint
 workspace/network/tool-roots/required-isolation MUST NOT weaken base
+capability constraints MUST NOT disappear, downgrade a matcher, or downgrade a
+    security class, and MUST be at least as restrictive per matcher
 ```
 
 ---
@@ -154,14 +163,18 @@ workspace/network/tool-roots/required-isolation MUST NOT weaken base
 ## 4. Security class and assurance
 
 ```text
-SecurityClass::Functional   DECLARED may suffice
-SecurityClass::Authority     MUST be ENFORCED
-SecurityClass::Sandbox       MUST be ENFORCED
-SecurityClass::Continuity    MUST be ENFORCED
+SecurityClass::Functional   a source/config declaration or envelope may suffice
+SecurityClass::Authority    requires imported evidence
+SecurityClass::Sandbox      requires imported evidence
+SecurityClass::Continuity   requires imported evidence
 ```
 
-A source that merely declares sandbox support produces no isolation proof; the
-imported `PhysicalSafety` fact must also hold.
+`DECLARED`/`ENFORCED` on a claim is declaration metadata only. A source that
+merely declares sandbox support produces no proof; only the imported,
+policy-bound `ResolvedProvisioningEvidence` (produced by the adapter
+integration, not assembled by a composition caller) satisfies a security class,
+and its enforceable safety must realize the required isolation / workspace /
+network.
 
 ---
 
