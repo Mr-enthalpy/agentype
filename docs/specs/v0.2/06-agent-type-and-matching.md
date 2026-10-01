@@ -45,14 +45,20 @@ resolved) and implemented in `agentype-agent-contract`:
 - `can_execute` checks the information function, capability envelope, permission
   ceiling, tools, workspace/network policy, continuity minimum, anchor, and
   budget.
-- `can_provision` checks source/config activity, lifecycle and continuity
-  coverage, the functional capability envelope, `ENFORCED` sandbox claims
-  intersected with the imported physical safety, and exact AdapterBinding
-  availability.
+- `can_provision` checks that the config belongs to the exact source revision,
+  source/config activity, lifecycle and continuity coverage, every required
+  capability **at its exact revision** (config claims, then source claims, then
+  the functional envelope; security-class capabilities REQUIRE an `ENFORCED`
+  claim), mechanically enforceable workspace/network modes, required isolation,
+  and exact AdapterBinding availability. Restrictions MUST NOT be inferred from
+  a stronger capability.
 - `more_specific_for` compares authority envelopes and is defined only once both
-  types are executable; it MUST NOT rank by nominal inheritance depth.
+  types are executable; it MUST be a strict relation (two types with equivalent
+  authority are incomparable) and MUST NOT rank by nominal inheritance depth.
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
-  tools, roots, budget, lifecycle, continuity, anchor, and security policy.
+  tools, roots, budget, information functions, anchor, and security policy; a
+  derived type MAY strengthen but MUST NOT weaken lifecycle, continuity, or
+  required isolation.
 
 ## Refinement monotonicity
 

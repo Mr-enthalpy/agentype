@@ -64,21 +64,28 @@ AgentTypeContract         information functions, capability envelope, permission
                           security, lifecycle, continuity, anchor constraint
 CapabilitySpec            (capability_id, revision, matcher_kind, security_class)
 CapabilityValue           BOOL | SET | ORDERED | QUANTITY | EXACT
-CapabilityClaim           (capability, value, assurance DECLARED|ENFORCED, evidence)
+CapabilityRef             exact (capability_id, revision)
+CapabilityClaim           (exact reference, value, assurance DECLARED|ENFORCED,
+                          evidence)
 TaskRequirement           information function, required capabilities/permissions/
                           tools, workspace/network, continuity, anchor, budget
 SpawnSource               advertised lifecycle/continuity envelopes, functional
-                          capability envelope, capability claims, status
-SourceConfig              opaque source-private config: identity, digest,
-                          credential refs, status
+                          capability envelope, source-wide claims, status
+SourceConfig              opaque source-private config: exact source ref,
+                          identity, digest, credential refs, config-specific
+                          claims, status
 AdapterBindingPolicy      stable alias -> exact runtime binding, required safety
-PhysicalSafety            imported enforceability: isolation, workspace, network
+PhysicalSafety            enforceable sets: isolation, workspace modes, network
+                          modes
 AgentTypeSelector         Exact(ref) | Latest(id), resolved to exact pre-commit
 ```
 
 `AgentType` MUST NOT be defined by model, provider, terminal, price tier, prompt
 alias, `SourceConfig`, or `AdapterBinding`. `SourceConfig` payloads are opaque:
-Core recognizes identity, digest, and credential references only.
+Core recognizes identity, digest, credential references, and config-specific
+capability claims only. All numeric contract values are validated finite
+non-negative newtypes (`Budget`, `Quantity`), and every ref rejects an empty id
+or zero revision, so a durable digest can never form from an invalid value.
 
 ---
 
@@ -100,19 +107,32 @@ task budget               <= agent budget_ceiling
 ### `can_provision(SpawnSource, SourceConfig, AgentType, PhysicalSafety, exact binding)`
 
 ```text
+config.config_ref.source == source.source_ref        (exact revision)
 source/config active
 agent lifecycle  ⊆ source lifecycle_modes
 agent continuity ∈ source continuity_modes
-agent capability envelope ⊆ source functional envelope / claims
-required isolation is ENFORCED by the source AND realized by PhysicalSafety
-PhysicalSafety workspace/network realize the agent security policy
+for each exact capability revision the agent requires:
+    spec = CapabilitySpec(capability_id, revision)   (missing spec fails closed)
+    provided = config claim, else source claim, else functional envelope
+    security-class capabilities REQUIRE an ENFORCED claim at the exact revision
+    value must satisfy the spec matcher
+required isolation is an enforceable physical fact
+required workspace/network mode is in PhysicalSafety's enforceable set
 exact AdapterBinding available
 ```
 
+There is no string-keyed bypass: `attempt_isolation`, sandbox, authority, and
+continuity all go through the same exact-revision proof path. A capability claim
+at a different revision never satisfies a requirement.
+
 ### `more_specific_for(A, B, TaskRequirement)`
 
-Only defined once both `can_execute`: A is more specific iff A's authority
-envelope is a subset of B's. Ranking MUST NOT use nominal inheritance depth.
+Only defined once both `can_execute`, and only when A is no wider than B on
+*every* relevant dimension (information functions, permission, visibility,
+tools, roots, budget, workspace/network, tool roots, isolation, continuity,
+anchor, capability envelope) with at least one dimension strictly narrower.
+Two types with equivalent authority are **incomparable**, not mutually more
+specific. Ranking MUST NOT use nominal inheritance depth.
 
 ### `is_valid_refinement(Base, Derived)`
 
@@ -122,7 +142,9 @@ DerivedVisibility ⊆ BaseVisibility
 DerivedTools      ⊆ BaseTools
 DerivedRoots      ⊆ BaseRoots
 DerivedBudget     ≤ BaseBudget
-lifecycle MUST NOT widen; continuity MUST NOT exceed base
+DerivedInformationFunctions ⊆ BaseInformationFunctions
+lifecycle MUST NOT widen
+continuity MAY strengthen by MUST NOT weaken the base guarantee
 anchor MUST satisfy base anchor constraint
 workspace/network/tool-roots/required-isolation MUST NOT weaken base
 ```
