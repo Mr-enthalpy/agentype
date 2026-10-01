@@ -43,6 +43,24 @@ through the source `Result` that carried it, and Root-originated intent is
 command input; the compiler turns it into a durable `CompiledWorkProposal`,
 which is the first Scheduler-owned review object.
 
+A worker/harness intent is carried inside the ordinary Result payload under the
+reserved envelope `_agentype.raw_work_intents`, keyed by `raw_intent_key`:
+
+```json
+{"_agentype": {"raw_work_intents": {"<key>": {
+    "objective": "...",
+    "information_function": "EXPAND",
+    "rationale": null,
+    "semantic_input_set": {"result_ids": [], "artifact_refs": [], "seed_refs": []},
+    "suggested_task_spec": null
+}}}}
+```
+
+Compilation selects `(ResultId, raw_intent_key)` and reconstructs the intent from
+the immutable Result. A caller MUST NOT supply the intent separately, so a
+proposal's `source_ref` cannot claim provenance the Result does not carry. An
+absent or malformed envelope fails closed and produces no semantic commitment.
+
 Ordinary workers MUST NOT need AgentType registries, Generation mechanics,
 Pool topology, SpawnSource, Transform, or Lease/Attempt/Incarnation knowledge.
 
