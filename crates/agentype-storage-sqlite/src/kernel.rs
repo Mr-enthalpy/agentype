@@ -1,7 +1,13 @@
 //! Transactional M4 kernel. Semantics come from the spec; this crate persists them.
 
+use crate::catalog::{AgentTypeStatus, SourceConfigBody};
 use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
+use agentype_agent_contract::{
+    resolve_selector, AdapterBindingPolicy, AdapterPolicyRef, AgentType, AgentTypeRef,
+    AgentTypeSelector, CapabilityCatalog, CapabilityDefinition, CapabilityRef, SourceConfig,
+    SourceConfigRef, SpawnSource, SpawnSourceRef,
+};
 use agentype_core::*;
 // Only the runtime-mechanical methods (claim, execution commitment, renewal,
 // physical history, outbox delivery commits) use these, so the default build
@@ -723,6 +729,126 @@ impl Kernel {
         proposal_id: &agentype_core::ProposalId,
     ) -> Result<agentype_core::ProposalRecord, Error> {
         self.tx(|tx, _| crate::frontier::get_proposal(tx, proposal_id))
+    }
+
+    // =========================================================================
+    // M6-B.2 Agent Contract Catalog
+    // =========================================================================
+
+    pub fn publish_capability_definition(
+        &self,
+        reference: &CapabilityRef,
+        definition: &CapabilityDefinition,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_capability_definition(tx, now, reference, definition)
+        })
+    }
+
+    pub fn publish_adapter_binding_policy(
+        &self,
+        policy: &AdapterBindingPolicy,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_adapter_binding_policy(tx, now, policy))
+    }
+
+    pub fn publish_agent_type(&self, agent: &AgentType) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_agent_type(tx, now, agent))
+    }
+
+    pub fn publish_spawn_source(&self, source: &SpawnSource) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_spawn_source(tx, now, source))
+    }
+
+    pub fn publish_source_config(
+        &self,
+        config: &SourceConfig,
+        body: &SourceConfigBody,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_source_config(tx, now, config, body))
+    }
+
+    pub fn load_capability_catalog(&self) -> Result<CapabilityCatalog, Error> {
+        self.tx(|tx, _| crate::catalog::load_capability_catalog(tx))
+    }
+
+    pub fn get_agent_type(
+        &self,
+        reference: &AgentTypeRef,
+    ) -> Result<Option<(AgentType, AgentTypeStatus)>, Error> {
+        self.tx(|tx, _| crate::catalog::get_agent_type(tx, reference))
+    }
+
+    pub fn get_spawn_source(
+        &self,
+        reference: &SpawnSourceRef,
+    ) -> Result<Option<SpawnSource>, Error> {
+        self.tx(|tx, _| crate::catalog::get_spawn_source(tx, reference))
+    }
+
+    pub fn get_source_config(
+        &self,
+        reference: &SourceConfigRef,
+    ) -> Result<Option<SourceConfig>, Error> {
+        self.tx(|tx, _| crate::catalog::get_source_config(tx, reference))
+    }
+
+    pub fn get_source_config_mode(
+        &self,
+        reference: &SourceConfigRef,
+    ) -> Result<Option<crate::catalog::ConfigMode>, Error> {
+        self.tx(|tx, _| crate::catalog::get_source_config_mode(tx, reference))
+    }
+
+    pub fn get_adapter_binding_policy(
+        &self,
+        reference: &AdapterPolicyRef,
+    ) -> Result<Option<AdapterBindingPolicy>, Error> {
+        self.tx(|tx, _| crate::catalog::get_adapter_binding_policy(tx, reference))
+    }
+
+    pub fn resolve_agent_type_selector(
+        &self,
+        selector: &AgentTypeSelector,
+    ) -> Result<AgentTypeRef, Error> {
+        self.tx(|tx, _| {
+            let lookup = crate::catalog::load_agent_type_lookup(tx)?;
+            resolve_selector(selector, &lookup).map_err(|e| Error::invariant(e.to_string()))
+        })
+    }
+
+    pub fn set_agent_type_status(
+        &self,
+        reference: &AgentTypeRef,
+        status: AgentTypeStatus,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::catalog::set_agent_type_status(tx, now, reference, status))
+    }
+
+    pub fn set_spawn_source_status(
+        &self,
+        reference: &SpawnSourceRef,
+        status: agentype_agent_contract::SourceStatus,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::catalog::set_spawn_source_status(tx, now, reference, status))
+    }
+
+    pub fn set_source_config_status(
+        &self,
+        reference: &SourceConfigRef,
+        status: agentype_agent_contract::ConfigStatus,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::catalog::set_source_config_status(tx, now, reference, status))
+    }
+
+    pub fn set_adapter_binding_policy_status(
+        &self,
+        reference: &AdapterPolicyRef,
+        status: agentype_agent_contract::ConfigStatus,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            crate::catalog::set_adapter_binding_policy_status(tx, now, reference, status)
+        })
     }
 
     // ------------------------------------------------------------------ topology

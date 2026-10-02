@@ -6,8 +6,13 @@
 /// Version 4 adds `executions.adapter_binding_key` (opaque domain identity
 /// frozen at Execution creation). Version 5 adds M6-A Semantic Frontier Kernel
 /// tables (`generations`, `compiled_work_proposals`, `generation_task_bindings`).
-/// Older files are rejected at open (fail closed); D-DB-MIGRATE is still unresolved.
-pub const SCHEMA_VERSION: i64 = 5;
+/// Version 6 adds the M6-B.2 Agent Contract catalog (`capability_definitions`,
+/// `agent_types`, `spawn_sources`, `source_configs`,
+/// `adapter_binding_policies`) with immutable revision content kept separate
+/// from mutable disposition overlays. Older files are rejected at open (fail
+/// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
+/// v5->v6 in-place upgrade.
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -340,4 +345,124 @@ CREATE TABLE IF NOT EXISTS generation_task_bindings (
     semantic_input_set_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
 );
+
+-- =========================================================================
+-- M6-B.2 Agent Contract catalog (schema v6)
+--
+-- Immutable revision content lives in the primary tables; the mutable
+-- ACTIVE/DRAINING/DISABLED/PUBLISHED/DEPRECATED dispositions live in separate
+-- overlay tables so status never enters a revision content digest.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS capability_definitions (
+    capability_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    matcher_kind TEXT NOT NULL CHECK (matcher_kind IN ('BOOL','SET','ORDERED','QUANTITY','EXACT')),
+    security_class TEXT NOT NULL CHECK (security_class IN ('FUNCTIONAL','AUTHORITY','SANDBOX','CONTINUITY')),
+    polarity TEXT NOT NULL CHECK (polarity IN ('ABILITY','RESTRICTION')),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (capability_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS adapter_binding_policies (
+    policy_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    adapter_kind TEXT NOT NULL,
+    binding_ref TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS adapter_binding_policy_dispositions (
+    policy_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (policy_id, revision),
+    FOREIGN KEY (policy_id, revision) REFERENCES adapter_binding_policies(policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS agent_types (
+    type_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    based_on_type_id TEXT,
+    based_on_revision INTEGER,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (type_id, revision),
+    CHECK ((based_on_type_id IS NULL) = (based_on_revision IS NULL)),
+    FOREIGN KEY (based_on_type_id, based_on_revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS agent_type_dispositions (
+    type_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PUBLISHED','DEPRECATED')),
+    deprecated_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (type_id, revision),
+    FOREIGN KEY (type_id, revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS spawn_sources (
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    adapter_policy_id TEXT NOT NULL,
+    adapter_policy_revision INTEGER NOT NULL,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (source_id, revision),
+    FOREIGN KEY (adapter_policy_id, adapter_policy_revision)
+        REFERENCES adapter_binding_policies(policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS spawn_source_dispositions (
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source_id, revision),
+    FOREIGN KEY (source_id, revision) REFERENCES spawn_sources(source_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS source_configs (
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    config_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL CHECK (config_revision >= 1),
+    config_mode TEXT NOT NULL CHECK (config_mode IN ('OPAQUE_JSON','EXTERNAL_REF')),
+    config_payload_json TEXT,
+    config_digest TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (source_id, source_revision, config_id, config_revision),
+    CHECK ((config_mode = 'EXTERNAL_REF') = (config_payload_json IS NULL)),
+    FOREIGN KEY (source_id, source_revision) REFERENCES spawn_sources(source_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS source_config_dispositions (
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    config_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source_id, source_revision, config_id, config_revision),
+    FOREIGN KEY (source_id, source_revision, config_id, config_revision)
+        REFERENCES source_configs(source_id, source_revision, config_id, config_revision)
+);
+
+CREATE INDEX IF NOT EXISTS agent_types_based_on_idx
+ON agent_types(based_on_type_id, based_on_revision);
+CREATE INDEX IF NOT EXISTS source_configs_source_idx
+ON source_configs(source_id, source_revision);
+CREATE INDEX IF NOT EXISTS spawn_sources_policy_idx
+ON spawn_sources(adapter_policy_id, adapter_policy_revision);
 "#;

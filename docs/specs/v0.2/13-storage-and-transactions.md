@@ -21,6 +21,29 @@ in-place upgrade.
 Times MUST be UTC epoch seconds or equivalent unambiguous UTC.
 IDs MUST be unique durable strings (UUID recommended, IMPLEMENTATION-DEFINED).
 
+## Schema version gate (MUST)
+
+The Rust-era store carries an exact schema version in `schema_migrations`.
+A database whose version is newer **or** older than the running binary's
+supported `SCHEMA_VERSION` MUST be rejected at open, fail closed. There is
+**no** in-place upgrade while `D-DB-MIGRATE` is unresolved, so v5 -> v6 is
+deliberately **not** a migration; M6-B.2 uses a fresh v6 database.
+
+The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
+content **separately** from the mutable disposition overlay, so a disposition
+change never alters a revision content digest:
+
+- immutable revision content: capability definitions, AgentType revisions,
+  SpawnSource revisions, SourceConfig revisions, AdapterBindingPolicy
+  revisions, each with a Core-computed canonical content digest;
+- mutable disposition overlays: AgentType `PUBLISHED`/`DEPRECATED`,
+  SpawnSource/SourceConfig/AdapterBindingPolicy `ACTIVE`/`DRAINING`/`DISABLED`,
+  monotonic and never entering revision content or digests.
+
+An opaque SourceConfig body or locator is source-private: Core stores it
+without interpreting it and validates only the caller-declared
+`config_digest` against its canonical body digest.
+
 ## Kernel unique constraints (MUST)
 
 - one ACTIVE lease per Task
@@ -52,6 +75,7 @@ IDs MUST be unique durable strings (UUID recommended, IMPLEMENTATION-DEFINED).
 | Proposal persist | intent → proposal outcome; MUST NOT admit |
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
+| Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
 
 Stale writes MUST fail closed (no canonical mutation). Physical-only history
 MAY still record on the old Execution/Incarnation.

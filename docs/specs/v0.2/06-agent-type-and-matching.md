@@ -149,6 +149,23 @@ locator (model/provider/CLI/config-file semantics) belongs to the source
 integration and is not part of AgentType semantics; Core MUST NOT interpret it,
 and it need not be stored in `agentype-agent-contract`.
 
+## Catalog persistence (M6-B.2)
+
+AgentType, SpawnSource, SourceConfig, capability definitions, and
+AdapterBindingPolicy revisions MUST be persisted immutably. Each published exact
+revision has a canonical content encoding and a Core-computed content digest:
+
+- republishing the same exact `(ref, content digest)` is idempotent; a different
+  canonical content for an already-published exact revision MUST fail closed;
+- the canonical encoding MUST be permutation-stable (set-like sequences sorted
+  and deduped) and MUST encode `Bool(false)` as omission, so one logical revision
+  has exactly one digest;
+- a derived AgentType's `based_on` provenance MUST be verified against the
+  published base, and the derived contract MUST pass `is_valid_refinement`
+  before it is published;
+- publication and deprecation status is a mutable **disposition overlay** that
+  MUST NOT enter the revision content or its digest; dispositions only advance.
+
 ## Refinement monotonicity
 
 A Root-created derived type MUST NOT enlarge authority.

@@ -78,6 +78,18 @@ MUST cover:
 - mechanical retry does not create a new Generation
 - worker `validated_delta` does not auto-write MemoryCapsule
 
+M6-B.2 catalog persistence MUST cover:
+
+- a published exact `(ref, content digest)` is immutable; a different canonical
+  content for the same exact revision fails closed
+- canonical content is permutation-stable (claims/credential refs sorted and
+  deduped) and `Bool(false)` is one canonical absence
+- a derived AgentType `based_on` provenance is verified and a widening
+  refinement is rejected at publication
+- disposition changes never alter revision content and are monotonic
+- an opaque SourceConfig body is validated against its declared `config_digest`
+- an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
+
 ## C. Provider/frontend neutrality (M7)
 
 A **second independent** adapter MUST be addable without Core state-machine

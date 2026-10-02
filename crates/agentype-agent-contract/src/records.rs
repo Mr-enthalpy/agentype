@@ -469,6 +469,17 @@ impl PhysicalSafety {
     pub fn enforces_network(&self, policy: NetworkPolicy) -> bool {
         self.enforceable_network_modes.contains(&policy)
     }
+
+    /// The full enforceable workspace-mode set, in canonical rank order.
+    /// Read-only: a caller cannot use this to mint an enforcement claim.
+    pub fn enforceable_workspace_modes(&self) -> &[WorkspaceMode] {
+        &self.enforceable_workspace_modes
+    }
+
+    /// The full enforceable network-mode set, in canonical order.
+    pub fn enforceable_network_modes(&self) -> &BTreeSet<NetworkPolicy> {
+        &self.enforceable_network_modes
+    }
 }
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
