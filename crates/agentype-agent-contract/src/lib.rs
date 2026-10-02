@@ -33,7 +33,10 @@ pub use evidence::ResolvedProvisioningEvidence;
 pub use ids::{
     AdapterPolicyId, AgentTypeId, CapabilityId, SandboxPolicyId, SourceConfigId, SpawnSourceId,
 };
-pub use predicates::{can_execute, can_provision, is_valid_refinement, more_specific_for};
+pub use predicates::{
+    can_execute, can_provision, is_valid_refinement, more_specific_for, validate_source_config,
+    validate_spawn_source,
+};
 pub use records::{
     network_rank, workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
     AgentType, AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigDigest,

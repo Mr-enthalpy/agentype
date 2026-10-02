@@ -1041,7 +1041,7 @@ fn test_capability_value_shape_must_match_definition() {
 }
 
 #[test]
-fn test_refinement_rejects_capability_removal() {
+fn test_refinement_allows_capability_removal_rejects_addition() {
     let mut cat = CapabilityCatalog::new();
     define(
         &mut cat,
@@ -1057,15 +1057,58 @@ fn test_refinement_rejects_capability_removal() {
         .required_capabilities
         .insert(reference, CapabilityValue::Bool(true));
 
+    // Dropping a capability narrows the executable Task set: a valid refinement.
     let derived = base_agent();
+    assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
+
+    // Adding one is expansion: invalid.
+    let mut broadened = base_agent();
+    broadened
+        .contract
+        .required_capabilities
+        .insert(cref("sandbox.network_lock", 1), CapabilityValue::Bool(true));
     assert!(matches!(
-        is_valid_refinement(&base, &derived, &cat),
+        is_valid_refinement(&base_agent(), &broadened, &cat),
         Err(ContractError::InvalidRefinement { .. })
     ));
 }
 
 #[test]
-fn test_more_specific_does_not_treat_weaker_capability_as_narrower() {
+fn test_derived_adds_authority_capability_is_not_valid_refinement() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "authority.deploy",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Authority,
+    );
+
+    let base = base_agent();
+    let mut derived = base_agent();
+    derived.type_ref = type_ref("deployer", 1);
+    derived.based_on = Some(base.type_ref.clone());
+    derived
+        .contract
+        .required_capabilities
+        .insert(cref("authority.deploy", 1), CapabilityValue::Bool(true));
+
+    // The derived type can execute (and be provisioned for) Tasks the base
+    // cannot: authority expansion.
+    assert!(matches!(
+        is_valid_refinement(&base, &derived, &cat),
+        Err(ContractError::InvalidRefinement { .. })
+    ));
+
+    let mut req = base_task();
+    req.required_capabilities
+        .insert(cref("authority.deploy", 1), CapabilityValue::Bool(true));
+    assert!(can_execute(&base, &req, &cat).is_err());
+    assert!(can_execute(&derived, &req, &cat).is_ok());
+}
+
+#[test]
+fn test_lower_provided_capability_is_more_specific() {
     let mut cat = CapabilityCatalog::new();
     define(
         &mut cat,
@@ -1083,22 +1126,160 @@ fn test_more_specific_does_not_treat_weaker_capability_as_narrower() {
         CapabilityValue::Quantity(quantity(8192.0)),
     );
 
-    let mut weaker = base_agent();
-    weaker.type_ref = type_ref("weaker", 1);
-    weaker.contract.budget_ceiling = budget(10.0);
-    weaker.contract.required_capabilities.insert(
+    // Advertises less: executes a subset of the broad agent's Tasks.
+    let mut narrow = base_agent();
+    narrow.type_ref = type_ref("narrow", 1);
+    narrow.contract.required_capabilities.insert(
         reference.clone(),
         CapabilityValue::Quantity(quantity(1024.0)),
     );
 
-    let mut req = base_task();
-    req.budget = budget(5.0);
-    req.required_capabilities
-        .insert(reference, CapabilityValue::Quantity(quantity(1024.0)));
+    let mut low = base_task();
+    low.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(1024.0)),
+    );
+    let mut high = base_task();
+    high.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(4096.0)),
+    );
 
-    assert!(can_execute(&weaker, &req, &cat).is_ok());
-    assert!(can_execute(&broad, &req, &cat).is_ok());
-    assert!(!more_specific_for(&weaker, &broad, &req, &cat));
+    assert!(can_execute(&narrow, &low, &cat).is_ok());
+    assert!(can_execute(&broad, &low, &cat).is_ok());
+    assert!(can_execute(&narrow, &high, &cat).is_err());
+    assert!(can_execute(&broad, &high, &cat).is_ok());
+
+    assert!(more_specific_for(&narrow, &broad, &low, &cat));
+    assert!(!more_specific_for(&broad, &narrow, &low, &cat));
+}
+
+#[test]
+fn test_derived_capability_must_not_expand_executable_task_set() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "memory_mb",
+        1,
+        MatcherKind::Quantity,
+        SecurityClass::Functional,
+    );
+    let reference = cref("memory_mb", 1);
+
+    let mut base = base_agent();
+    base.contract.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(4096.0)),
+    );
+
+    // A "stronger provisioning requirement" (higher advertised value) can
+    // execute more Tasks, so it is NOT a valid refinement and NOT more specific.
+    let mut stronger = base_agent();
+    stronger.type_ref = type_ref("stronger", 1);
+    stronger.contract.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Quantity(quantity(8192.0)),
+    );
+    assert!(is_valid_refinement(&base, &stronger, &cat).is_err());
+
+    let mut req = base_task();
+    req.required_capabilities
+        .insert(reference, CapabilityValue::Quantity(quantity(8192.0)));
+    assert!(!more_specific_for(&stronger, &base, &req, &cat));
+}
+
+#[test]
+fn test_empty_lifecycle_is_rejected() {
+    let cat = CapabilityCatalog::new();
+    let mut agent = base_agent();
+    agent.contract.lifecycle = BTreeSet::new();
+    assert!(can_execute(&agent, &base_task(), &cat).is_err());
+}
+
+#[test]
+fn test_unreferenced_config_claim_cannot_exceed_source_envelope() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "tools",
+        1,
+        MatcherKind::Set,
+        SecurityClass::Functional,
+    );
+
+    // The AgentType does not require "tools" at all.
+    let agent = base_agent();
+    let mut source = base_source();
+    source
+        .functional_envelope
+        .insert(cref("tools", 1), CapabilityValue::Set(set(&["git"])));
+    let mut config = base_config();
+    config.claims.push(claim(
+        "tools",
+        1,
+        CapabilityValue::Set(set(&["git", "shell"])),
+        Assurance::Declared,
+    ));
+
+    assert!(matches!(
+        can_provision(&agent, &source, &config, &base_evidence(), &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn test_unreferenced_conflicting_claims_fail_validation() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "tools",
+        1,
+        MatcherKind::Set,
+        SecurityClass::Functional,
+    );
+
+    let agent = base_agent();
+    let mut source = base_source();
+    source.functional_envelope.insert(
+        cref("tools", 1),
+        CapabilityValue::Set(set(&["git", "jq", "shell"])),
+    );
+    source.claims.push(claim(
+        "tools",
+        1,
+        CapabilityValue::Set(set(&["git"])),
+        Assurance::Declared,
+    ));
+    source.claims.push(claim(
+        "tools",
+        1,
+        CapabilityValue::Set(set(&["git", "jq"])),
+        Assurance::Declared,
+    ));
+    assert!(matches!(
+        can_provision(&agent, &source, &base_config(), &base_evidence(), &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn test_unknown_claim_capability_revision_fails_validation() {
+    let cat = CapabilityCatalog::new(); // "tools@9" is undefined
+    let agent = base_agent();
+    let mut source = base_source();
+    source
+        .functional_envelope
+        .insert(cref("tools", 9), CapabilityValue::Set(set(&["git"])));
+    source.claims.push(claim(
+        "tools",
+        9,
+        CapabilityValue::Set(set(&["git"])),
+        Assurance::Declared,
+    ));
+    assert!(matches!(
+        can_provision(&agent, &source, &base_config(), &base_evidence(), &cat),
+        Err(ContractError::CapabilityMismatch { .. })
+    ));
 }
 
 #[test]

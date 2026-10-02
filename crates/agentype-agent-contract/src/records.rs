@@ -255,9 +255,14 @@ impl AgentTypeContract {
         self.allowed_information_functions.dedup();
     }
 
-    /// Whole-record invariant: every required capability has a catalog
-    /// definition, and the declared value shape matches that definition.
+    /// Whole-record invariant: a non-empty lifecycle, every required capability
+    /// has a catalog definition, and the declared value shape matches it.
     pub fn validate(&self, catalog: &CapabilityCatalog) -> Result<(), ContractError> {
+        if self.lifecycle.is_empty() {
+            return Err(ContractError::InvariantViolation(
+                "agent lifecycle mode set must not be empty (uninhabited type)".into(),
+            ));
+        }
         for (reference, value) in &self.required_capabilities {
             let definition =
                 catalog
@@ -380,6 +385,10 @@ impl PhysicalSafety {
 }
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
+///
+/// B.1 defines only the value shape; B.2/B.4 own catalogue validation and the
+/// physical binding key. Use [`AdapterBindingPolicy::new`] so the non-empty
+/// invariant holds at construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterBindingPolicy {
     pub policy_ref: AdapterPolicyRef,
@@ -387,6 +396,36 @@ pub struct AdapterBindingPolicy {
     pub binding_ref: String,
     pub required_safety: PhysicalSafety,
     pub status: ConfigStatus,
+}
+
+impl AdapterBindingPolicy {
+    pub fn new(
+        policy_ref: AdapterPolicyRef,
+        adapter_kind: impl Into<String>,
+        binding_ref: impl Into<String>,
+        required_safety: PhysicalSafety,
+        status: ConfigStatus,
+    ) -> Result<Self, ContractError> {
+        let adapter_kind = adapter_kind.into();
+        let binding_ref = binding_ref.into();
+        if adapter_kind.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy kind cannot be empty".into(),
+            });
+        }
+        if binding_ref.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy binding_ref cannot be empty".into(),
+            });
+        }
+        Ok(Self {
+            policy_ref,
+            adapter_kind,
+            binding_ref,
+            required_safety,
+            status,
+        })
+    }
 }
 
 /// Read-only catalog view used by selector resolution.

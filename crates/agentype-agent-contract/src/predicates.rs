@@ -48,6 +48,115 @@ fn resolve_claim<'a>(
         .or(Some(first)))
 }
 
+fn capability_key(reference: &CapabilityRef) -> String {
+    reference.capability_id().as_str().to_string()
+}
+
+/// Claims must name a catalog capability and must not conflict at the same
+/// exact revision.
+fn validate_claims(
+    claims: &[CapabilityClaim],
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    for claim in claims {
+        if !catalog.contains(&claim.reference) {
+            return Err(ContractError::CapabilityMismatch {
+                capability: capability_key(&claim.reference),
+            });
+        }
+    }
+    // Deterministic conflict detection over every distinct reference.
+    let mut seen: Vec<&CapabilityRef> = Vec::new();
+    for claim in claims {
+        if !seen.contains(&&claim.reference) {
+            seen.push(&claim.reference);
+            let _ = resolve_claim(claims, &claim.reference)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whole-record validation for a [`SpawnSource`]: capabilities are catalog
+/// known, functional values match their definition shape, and functional
+/// declarations stay within the provisionable envelope. Security-class
+/// declarations are proven by evidence, not by the envelope.
+pub fn validate_spawn_source(
+    source: &SpawnSource,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    validate_claims(&source.claims, catalog)?;
+    for (reference, value) in &source.functional_envelope {
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: capability_key(reference),
+                })?;
+        if definition.matcher_kind != value.matcher_kind() {
+            return Err(ContractError::InvariantViolation(format!(
+                "source envelope value shape does not match the definition for {}@{}",
+                reference.capability_id().as_str(),
+                reference.revision()
+            )));
+        }
+    }
+    for claim in &source.claims {
+        let requires_evidence = catalog
+            .get(&claim.reference)
+            .map(|d| d.security_class.requires_evidence())
+            .unwrap_or(false);
+        if requires_evidence {
+            continue;
+        }
+        let ceiling = source
+            .functional_envelope
+            .get(&claim.reference)
+            .ok_or_else(|| ContractError::CapabilityMismatch {
+                capability: capability_key(&claim.reference),
+            })?;
+        if !value_within(ceiling, &claim.value) {
+            return Err(ContractError::InvariantViolation(format!(
+                "source declaration for {} exceeds its provisionable envelope",
+                claim.reference.capability_id().as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whole-record validation for a [`SourceConfig`] against its source: claims
+/// are catalog known and functional declarations stay within the source
+/// envelope, independent of which capabilities the AgentType happens to use.
+pub fn validate_source_config(
+    config: &SourceConfig,
+    source: &SpawnSource,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    validate_claims(&config.claims, catalog)?;
+    for claim in &config.claims {
+        let requires_evidence = catalog
+            .get(&claim.reference)
+            .map(|d| d.security_class.requires_evidence())
+            .unwrap_or(false);
+        if requires_evidence {
+            continue;
+        }
+        let ceiling = source
+            .functional_envelope
+            .get(&claim.reference)
+            .ok_or_else(|| ContractError::CapabilityMismatch {
+                capability: capability_key(&claim.reference),
+            })?;
+        if !value_within(ceiling, &claim.value) {
+            return Err(ContractError::InvariantViolation(format!(
+                "config declaration for {} exceeds the source envelope",
+                claim.reference.capability_id().as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Can this AgentType contract execute the Task requirement?
 pub fn can_execute(
     agent: &AgentType,
@@ -155,12 +264,15 @@ pub fn can_provision(
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
     agent.contract.validate(catalog)?;
-
     if config.config_ref.source() != &source.source_ref {
         return Err(ContractError::SourceConfigInvalid {
             reason: "config does not belong to this exact source revision".into(),
         });
     }
+    // Whole-record validation runs before per-requirement checks, so an illegal
+    // declaration fails even when no AgentType requires that capability.
+    validate_spawn_source(source, catalog)?;
+    validate_source_config(config, source, catalog)?;
     if source.status != SourceStatus::Active || config.status != ConfigStatus::Active {
         return Err(ContractError::SourceConfigInvalid {
             reason: "source or config is not active".into(),
@@ -286,8 +398,13 @@ pub fn can_provision(
     Ok(())
 }
 
-/// Is `derived` at least as restrictive as `base` for one capability revision?
-fn requirement_no_wider(
+/// Does `derived` advertise no broader capability value than `base`?
+///
+/// This is the **executable-Task-set** order, not the provisioning-requirement
+/// order: an agent that advertises a smaller/equal value executes a subset of
+/// the Tasks the base executes. Adding a capability key widens; removing or
+/// lowering one narrows.
+fn provision_value_no_wider(
     matcher: MatcherKind,
     base: &CapabilityValue,
     derived: &CapabilityValue,
@@ -295,7 +412,7 @@ fn requirement_no_wider(
     match (matcher, base, derived) {
         (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => b == d,
         (MatcherKind::Exact, b, d) => b == d,
-        (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => b.is_subset(d),
+        (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => d.is_subset(b),
         (
             MatcherKind::Ordered,
             CapabilityValue::Ordered {
@@ -306,29 +423,35 @@ fn requirement_no_wider(
                 class: dc,
                 rank: dr,
             },
-        ) => bc == dc && dr >= br,
+        ) => bc == dc && dr <= br,
         (MatcherKind::Quantity, CapabilityValue::Quantity(b), CapabilityValue::Quantity(d)) => {
-            d.get() >= b.get()
+            d.get() <= b.get()
         }
         _ => false,
     }
 }
 
-/// `derived`'s capability constraints are at least as restrictive as `base`'s:
-/// no requirement disappears and each is at least as restrictive.
-fn capability_constraints_no_wider(
+/// `derived` must not enlarge the executable Task set: it may not introduce a
+/// capability `base` lacks, and each shared capability must be no broader.
+fn capability_provision_no_wider(
     derived: &AgentTypeContract,
     base: &AgentTypeContract,
     catalog: &CapabilityCatalog,
 ) -> bool {
+    for reference in derived.required_capabilities.keys() {
+        if !base.required_capabilities.contains_key(reference) {
+            return false;
+        }
+    }
     for (reference, base_value) in &base.required_capabilities {
         let Some(derived_value) = derived.required_capabilities.get(reference) else {
-            return false;
+            // Dropping a capability narrows the executable set.
+            continue;
         };
         let Some(definition) = catalog.get(reference) else {
             return false;
         };
-        if !requirement_no_wider(definition.matcher_kind, base_value, derived_value) {
+        if !provision_value_no_wider(definition.matcher_kind, base_value, derived_value) {
             return false;
         }
     }
@@ -412,7 +535,7 @@ fn authority_no_wider(
         && (!b.security.requires_attempt_isolation || a.security.requires_attempt_isolation)
         && sandbox_policy_no_wider(&a.sandbox_policy, &b.sandbox_policy)
         && anchor_no_wider(&a.anchor_constraint, &b.anchor_constraint)
-        && capability_constraints_no_wider(a, b, catalog)
+        && capability_provision_no_wider(a, b, catalog)
 }
 
 /// Is A strictly more specific than B for this Task? Only defined once both are
@@ -507,7 +630,7 @@ pub fn is_valid_refinement(
     {
         return invalid("derived type adds an information function not allowed by base");
     }
-    if !capability_constraints_no_wider(derived_c, base_c, catalog) {
+    if !capability_provision_no_wider(derived_c, base_c, catalog) {
         return invalid("derived capability constraints are wider than base");
     }
 
