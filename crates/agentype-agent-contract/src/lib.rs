@@ -41,8 +41,8 @@ pub use predicates::{
 pub use records::{
     network_rank, workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
     AgentType, AgentTypeContract, AgentTypeLookup, AgentTypeRef, Budget, ConfigDigest,
-    ConfigStatus, ContinuityMode, CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety,
-    PublishedCatalog, SandboxPolicyRef, SecurityContract, SourceConfig, SourceConfigRef,
-    SourceStatus, SpawnSource, SpawnSourceRef, TaskRequirement,
+    ConfigStatus, ContinuityMode, CredentialRef, InMemorySelectorCatalog, LifecycleMode,
+    NetworkPolicy, PhysicalSafety, SandboxPolicyRef, SecurityContract, SourceConfig,
+    SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, TaskRequirement,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

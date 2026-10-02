@@ -70,6 +70,14 @@ impl CapabilityValue {
             Self::Exact(_) => MatcherKind::Exact,
         }
     }
+
+    /// Whether the value denotes presence. `Bool(false)` is the algebraic
+    /// bottom (absence); every other value is present. A canonical capability
+    /// map MUST encode absence by omitting the entry, never by an explicit
+    /// `Bool(false)`, so `get == None` and `Bool(false)` are the same state.
+    pub fn is_present(&self) -> bool {
+        !matches!(self, Self::Bool(false))
+    }
 }
 
 /// Whether a capability participates in functional features or in a

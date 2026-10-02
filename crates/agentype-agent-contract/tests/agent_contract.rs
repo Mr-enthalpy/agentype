@@ -1548,7 +1548,7 @@ fn test_latest_selector_empty_id_is_invalid() {
 
 #[test]
 fn test_selector_resolution() {
-    let mut catalog = PublishedCatalog::new();
+    let mut catalog = InMemorySelectorCatalog::new();
     catalog.publish(type_ref("auditor", 2));
     catalog.publish(type_ref("auditor", 3));
 
@@ -1576,7 +1576,7 @@ fn test_selector_resolution() {
 
 #[test]
 fn test_deprecation_is_monotonic_and_future_selection_only() {
-    let mut catalog = PublishedCatalog::new();
+    let mut catalog = InMemorySelectorCatalog::new();
     let r2 = type_ref("auditor", 2);
     catalog.publish(r2.clone());
     catalog.publish(type_ref("auditor", 3));
@@ -2102,4 +2102,90 @@ fn test_malformed_task_restriction_shape_fails_closed() {
         can_execute(&base_agent(), &task, &cat),
         Err(ContractError::InvariantViolation(_))
     ));
+}
+
+#[test]
+fn test_bool_false_is_absence_in_can_execute() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "workspace.write",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Authority,
+    );
+    let reference = cref("workspace.write", 1);
+    let agent = base_agent();
+
+    let mut explicit = base_task();
+    explicit
+        .required_capabilities
+        .insert(reference, CapabilityValue::Bool(false));
+    let omitted = base_task();
+
+    // `Bool(false)` and an omitted entry are the same absence state.
+    assert_eq!(
+        can_execute(&agent, &explicit, &cat).is_ok(),
+        can_execute(&agent, &omitted, &cat).is_ok()
+    );
+    assert!(can_execute(&agent, &explicit, &cat).is_ok());
+}
+
+#[test]
+fn test_bool_false_is_absence_in_specificity() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "sandbox.network_lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+    let reference = cref("sandbox.network_lock", 1);
+
+    let mut omitted = base_agent();
+    omitted.type_ref = type_ref("omitted", 1);
+    let mut explicit = base_agent();
+    explicit.type_ref = type_ref("explicit", 1);
+    explicit
+        .contract
+        .required_capabilities
+        .insert(reference, CapabilityValue::Bool(false));
+
+    let req = base_task();
+    assert!(can_execute(&omitted, &req, &cat).is_ok());
+    assert!(can_execute(&explicit, &req, &cat).is_ok());
+    // Semantically equivalent agents must not be strictly ranked.
+    assert!(!more_specific_for(&omitted, &explicit, &req, &cat));
+    assert!(!more_specific_for(&explicit, &omitted, &req, &cat));
+}
+
+#[test]
+fn test_task_bool_false_restriction_needs_no_proof() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "sandbox.network_lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+    let reference = cref("sandbox.network_lock", 1);
+
+    let agent = base_agent();
+    let mut task = base_task();
+    task.required_capabilities
+        .insert(reference, CapabilityValue::Bool(false));
+
+    // `false` means "no restriction": no envelope entry and no imported
+    // evidence may be required to prove it.
+    assert!(can_provision_task(
+        &agent,
+        &base_source(),
+        &base_config(),
+        &base_evidence(),
+        &cat,
+        &task
+    )
+    .is_ok());
 }

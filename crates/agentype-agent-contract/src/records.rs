@@ -266,6 +266,12 @@ impl AgentTypeContract {
             ));
         }
         for (reference, value) in &self.required_capabilities {
+            // Bool(false) is absence: normalize it away so a contract that
+            // omits a capability and one that spells Bool(false) validate and
+            // behave identically.
+            if !value.is_present() {
+                continue;
+            }
             let definition =
                 catalog
                     .get(reference)
@@ -469,18 +475,21 @@ pub trait AgentTypeLookup {
     fn latest_revision(&self, type_id: &AgentTypeId) -> Option<u64>;
 }
 
-/// A tiny in-memory published catalog for selector tests and early wiring.
+/// A tiny in-memory selector catalog for tests and early wiring.
 ///
-/// The catalog is the single publication-status authority. Deprecation is
-/// monotonic: a deprecated revision cannot be resurrected, only superseded by a
-/// new revision.
+/// This is **not** the production publication/content authority: it only holds
+/// publication/deprecation status keyed by `AgentTypeRef` and cannot prove that
+/// the contract content of an exact revision is immutable. B.2 owns the real
+/// catalog (content digests, canonical representation, `based_on` provenance).
+/// Deprecation here is monotonic: a deprecated revision cannot be resurrected,
+/// only superseded by a new revision.
 #[derive(Clone, Debug, Default)]
-pub struct PublishedCatalog {
+pub struct InMemorySelectorCatalog {
     published: BTreeSet<AgentTypeRef>,
     deprecated: BTreeSet<AgentTypeRef>,
 }
 
-impl PublishedCatalog {
+impl InMemorySelectorCatalog {
     pub fn new() -> Self {
         Self::default()
     }
@@ -503,7 +512,7 @@ impl PublishedCatalog {
     }
 }
 
-impl AgentTypeLookup for PublishedCatalog {
+impl AgentTypeLookup for InMemorySelectorCatalog {
     fn is_published(&self, reference: &AgentTypeRef) -> bool {
         self.published.contains(reference)
     }

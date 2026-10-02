@@ -20,7 +20,7 @@ use crate::records::{
     network_rank, workspace_rank, AffinityConstraint, AgentType, AgentTypeContract, ConfigStatus,
     ContinuityMode, SandboxPolicyRef, SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Deterministic declaration lookup. Conflicting values at the same exact
 /// reference fail closed rather than depending on insertion order.
@@ -30,7 +30,7 @@ fn resolve_claim<'a>(
 ) -> Result<Option<&'a CapabilityClaim>, ContractError> {
     let matching: Vec<&CapabilityClaim> = claims
         .iter()
-        .filter(|claim| &claim.reference == reference)
+        .filter(|claim| &claim.reference == reference && claim.value.is_present())
         .collect();
     let Some(first) = matching.first() else {
         return Ok(None);
@@ -53,6 +53,15 @@ fn capability_key(reference: &CapabilityRef) -> String {
     reference.capability_id().as_str().to_string()
 }
 
+/// Canonical capability lookup: an explicit `Bool(false)` entry denotes absence
+/// and is indistinguishable from an omitted entry, so it is never returned.
+fn present_cap<'a>(
+    map: &'a BTreeMap<CapabilityRef, CapabilityValue>,
+    reference: &CapabilityRef,
+) -> Option<&'a CapabilityValue> {
+    map.get(reference).filter(|value| value.is_present())
+}
+
 /// Continuity is a minimum guarantee: a source satisfies a requirement if it
 /// advertises any mode at least as strong (e.g. `{Logical}` satisfies `None`).
 fn continuity_satisfies(source_modes: &BTreeSet<ContinuityMode>, required: ContinuityMode) -> bool {
@@ -67,6 +76,10 @@ fn validate_claims(
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
     for claim in claims {
+        // Bool(false) is absence: a non-present claim is normalized away.
+        if !claim.value.is_present() {
+            continue;
+        }
         let definition =
             catalog
                 .get(&claim.reference)
@@ -102,6 +115,10 @@ pub fn validate_spawn_source(
 ) -> Result<(), ContractError> {
     validate_claims(&source.claims, catalog)?;
     for (reference, value) in &source.functional_envelope {
+        // Bool(false) is absence: normalize it away.
+        if !value.is_present() {
+            continue;
+        }
         let definition =
             catalog
                 .get(reference)
@@ -117,6 +134,9 @@ pub fn validate_spawn_source(
         }
     }
     for claim in &source.claims {
+        if !claim.value.is_present() {
+            continue;
+        }
         let requires_evidence = catalog
             .get(&claim.reference)
             .map(|d| d.security_class.requires_evidence())
@@ -176,6 +196,9 @@ pub fn validate_source_config(
     }
     validate_claims(&config.claims, catalog)?;
     for claim in &config.claims {
+        if !claim.value.is_present() {
+            continue;
+        }
         let requires_evidence = catalog
             .get(&claim.reference)
             .map(|d| d.security_class.requires_evidence())
@@ -218,6 +241,11 @@ pub fn can_execute(
     }
 
     for (reference, required) in &req.required_capabilities {
+        // Bool(false) is absence: a Task that expresses "no requirement" for a
+        // capability is exactly a Task that omits it.
+        if !required.is_present() {
+            continue;
+        }
         let definition =
             catalog
                 .get(reference)
@@ -238,12 +266,11 @@ pub fn can_execute(
         if definition.polarity == CapabilityPolarity::Restriction {
             continue;
         }
-        let provided = agent
-            .contract
-            .required_capabilities
-            .get(reference)
-            .ok_or_else(|| ContractError::CapabilityMismatch {
-                capability: reference.capability_id().as_str().to_string(),
+        let provided =
+            present_cap(&agent.contract.required_capabilities, reference).ok_or_else(|| {
+                ContractError::CapabilityMismatch {
+                    capability: reference.capability_id().as_str().to_string(),
+                }
             })?;
         if !value_satisfies(definition.matcher_kind, required, provided) {
             return Err(ContractError::CapabilityMismatch {
@@ -352,6 +379,10 @@ pub fn can_provision(
     }
 
     for (reference, required) in &agent.contract.required_capabilities {
+        // Bool(false) is absence and imposes no provisioning requirement.
+        if !required.is_present() {
+            continue;
+        }
         let definition =
             catalog
                 .get(reference)
@@ -380,7 +411,7 @@ pub fn can_provision(
 
         // Functional: the source envelope is the provisionable ceiling; neither
         // the source nor the config may declare a value beyond it.
-        let ceiling = source.functional_envelope.get(reference).ok_or_else(|| {
+        let ceiling = present_cap(&source.functional_envelope, reference).ok_or_else(|| {
             ContractError::CapabilityMismatch {
                 capability: capability_name.clone(),
             }
@@ -448,8 +479,9 @@ pub fn can_provision(
 /// `can_execute(agent, task) && can_provision(agent, source, config, evidence)`
 /// is **necessary but not sufficient**: the imported environment must also be
 /// able to enforce the Task's effective (stricter) restrictions, not merely the
-/// AgentType ceiling. This is the frozen seam that B.3/B.4 must use as the
-/// eligible-candidate predicate.
+/// AgentType ceiling. This is the frozen contract/sandbox eligibility seam: a
+/// mandatory conjunct that B.3/B.4 must include, not the complete physical
+/// candidate eligibility decision (which also needs adapter/credential checks).
 pub fn can_provision_task(
     agent: &AgentType,
     source: &SpawnSource,
@@ -497,6 +529,11 @@ pub fn can_provision_task(
     // and by the effective source/config functional value otherwise, keeping
     // SecurityClass (proof authority) orthogonal to polarity (composition).
     for (reference, task_value) in &task.required_capabilities {
+        // Bool(false) is absence: a Task expressing "no restriction" must not
+        // demand an enforcement proof for a capability it does not require.
+        if !task_value.is_present() {
+            continue;
+        }
         let definition =
             catalog
                 .get(reference)
@@ -506,7 +543,7 @@ pub fn can_provision_task(
         if definition.polarity != CapabilityPolarity::Restriction {
             continue;
         }
-        let effective = match agent.contract.required_capabilities.get(reference) {
+        let effective = match present_cap(&agent.contract.required_capabilities, reference) {
             Some(agent_value) => restriction_join(definition.matcher_kind, agent_value, task_value)
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: capability_key(reference),
@@ -549,7 +586,7 @@ fn effective_functional_value<'a>(
     config: &'a SourceConfig,
     reference: &CapabilityRef,
 ) -> Result<&'a CapabilityValue, ContractError> {
-    let ceiling = source.functional_envelope.get(reference).ok_or_else(|| {
+    let ceiling = present_cap(&source.functional_envelope, reference).ok_or_else(|| {
         ContractError::CapabilityMismatch {
             capability: capability_key(reference),
         }
@@ -672,9 +709,14 @@ fn capability_provision_no_wider(
     base: &AgentTypeContract,
     catalog: &CapabilityCatalog,
 ) -> bool {
-    // A capability `base` lacks.
-    for reference in derived.required_capabilities.keys() {
-        if base.required_capabilities.contains_key(reference) {
+    // A capability `derived` adds that `base` lacks. `Bool(false)` is absence
+    // on both sides, so a missing entry and a `Bool(false)` entry are the same
+    // state and are never treated as an addition or a drop.
+    for (reference, derived_value) in &derived.required_capabilities {
+        if !derived_value.is_present() {
+            continue;
+        }
+        if present_cap(&base.required_capabilities, reference).is_some() {
             continue;
         }
         let Some(definition) = catalog.get(reference) else {
@@ -688,10 +730,13 @@ fn capability_provision_no_wider(
     }
 
     for (reference, base_value) in &base.required_capabilities {
+        if !base_value.is_present() {
+            continue;
+        }
         let Some(definition) = catalog.get(reference) else {
             return false;
         };
-        let Some(derived_value) = derived.required_capabilities.get(reference) else {
+        let Some(derived_value) = present_cap(&derived.required_capabilities, reference) else {
             // Dropping an ability narrows (allowed); dropping a restriction
             // weakens the guarantee (rejected).
             if definition.polarity == CapabilityPolarity::Restriction {
