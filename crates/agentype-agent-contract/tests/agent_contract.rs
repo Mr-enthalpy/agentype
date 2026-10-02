@@ -104,10 +104,6 @@ fn base_contract() -> AgentTypeContract {
     AgentTypeContract {
         allowed_information_functions: vec![InformationFunction::Expand],
         required_capabilities: BTreeMap::new(),
-        permission_ceiling: set(&["read"]),
-        visibility: set(&["public"]),
-        tools: set(&["git"]),
-        roots: set(&["repo"]),
         affinity: AffinityConstraint::Any,
         budget_ceiling: budget(100.0),
         security: SecurityContract {
@@ -134,8 +130,6 @@ fn base_task() -> TaskRequirement {
     TaskRequirement {
         information_function: InformationFunction::Expand,
         required_capabilities: BTreeMap::new(),
-        required_permissions: set(&["read"]),
-        required_tools: set(&["git"]),
         required_affinity: BTreeSet::new(),
         required_workspace: WorkspaceMode::ReadOnly,
         required_network: NetworkPolicy::Restricted,
@@ -191,14 +185,6 @@ fn test_can_execute_gates() {
     let cat = CapabilityCatalog::new();
     let mut req = base_task();
     req.information_function = InformationFunction::CompressNegative;
-    assert!(can_execute(&base_agent(), &req, &cat).is_err());
-
-    let mut req = base_task();
-    req.required_permissions = set(&["write"]);
-    assert!(can_execute(&base_agent(), &req, &cat).is_err());
-
-    let mut req = base_task();
-    req.required_tools = set(&["ripgrep"]);
     assert!(can_execute(&base_agent(), &req, &cat).is_err());
 
     let mut req = base_task();
@@ -288,22 +274,6 @@ fn test_refinement_accepts_narrowing() {
 fn test_refinement_rejects_each_widening() {
     let cat = CapabilityCatalog::new();
     let base = base_agent();
-
-    let mut d = base_agent();
-    d.contract.permission_ceiling = set(&["read", "write"]);
-    assert!(is_valid_refinement(&base, &d, &cat).is_err());
-
-    let mut d = base_agent();
-    d.contract.visibility = set(&["public", "secret"]);
-    assert!(is_valid_refinement(&base, &d, &cat).is_err());
-
-    let mut d = base_agent();
-    d.contract.tools = set(&["git", "shell"]);
-    assert!(is_valid_refinement(&base, &d, &cat).is_err());
-
-    let mut d = base_agent();
-    d.contract.roots = set(&["repo", "/"]);
-    assert!(is_valid_refinement(&base, &d, &cat).is_err());
 
     let mut d = base_agent();
     d.contract.budget_ceiling = budget(500.0);
@@ -1041,7 +1011,7 @@ fn test_capability_value_shape_must_match_definition() {
 }
 
 #[test]
-fn test_refinement_allows_capability_removal_rejects_addition() {
+fn test_refinement_capability_polarity() {
     let mut cat = CapabilityCatalog::new();
     define(
         &mut cat,
@@ -1050,25 +1020,42 @@ fn test_refinement_allows_capability_removal_rejects_addition() {
         MatcherKind::Bool,
         SecurityClass::Sandbox,
     );
+    define(
+        &mut cat,
+        "tools.ripgrep",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Functional,
+    );
 
-    let reference = cref("sandbox.network_lock", 1);
-    let mut base = base_agent();
-    base.contract
-        .required_capabilities
-        .insert(reference, CapabilityValue::Bool(true));
-
-    // Dropping a capability narrows the executable Task set: a valid refinement.
-    let derived = base_agent();
-    assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
-
-    // Adding one is expansion: invalid.
-    let mut broadened = base_agent();
-    broadened
+    // A Sandbox capability is a restriction: dropping it weakens the guarantee.
+    let mut restricted = base_agent();
+    restricted
         .contract
         .required_capabilities
         .insert(cref("sandbox.network_lock", 1), CapabilityValue::Bool(true));
+    let mut dropped = base_agent();
+    dropped
+        .contract
+        .required_capabilities
+        .insert(cref("tools.ripgrep", 1), CapabilityValue::Bool(true));
     assert!(matches!(
-        is_valid_refinement(&base_agent(), &broadened, &cat),
+        is_valid_refinement(&restricted, &dropped, &cat),
+        Err(ContractError::InvalidRefinement { .. })
+    ));
+
+    // A Functional capability is an ability: dropping it narrows (valid).
+    let mut with_tool = base_agent();
+    with_tool
+        .contract
+        .required_capabilities
+        .insert(cref("tools.ripgrep", 1), CapabilityValue::Bool(true));
+    assert!(is_valid_refinement(&with_tool, &base_agent(), &cat).is_ok());
+
+    // Adding a restriction narrows (valid); adding an ability widens (invalid).
+    assert!(is_valid_refinement(&base_agent(), &restricted, &cat).is_ok());
+    assert!(matches!(
+        is_valid_refinement(&base_agent(), &with_tool, &cat),
         Err(ContractError::InvalidRefinement { .. })
     ));
 }
@@ -1624,4 +1611,32 @@ fn test_security_class_claim_value_shape_must_match_definition() {
         validate_spawn_source(&source, &cat),
         Err(ContractError::InvariantViolation(_))
     ));
+}
+
+#[test]
+fn test_losing_security_guarantee_is_not_more_specific() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "sandbox.network_lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+
+    let mut guaranteed = base_agent();
+    guaranteed.type_ref = type_ref("guarded", 1);
+    guaranteed
+        .contract
+        .required_capabilities
+        .insert(cref("sandbox.network_lock", 1), CapabilityValue::Bool(true));
+
+    // Drops the guarantee: physically less constrained, so it must not be
+    // ranked as more specific.
+    let unguarded = base_agent();
+
+    let req = base_task();
+    assert!(can_execute(&guaranteed, &req, &cat).is_ok());
+    assert!(can_execute(&unguarded, &req, &cat).is_ok());
+    assert!(!more_specific_for(&unguarded, &guaranteed, &req, &cat));
 }

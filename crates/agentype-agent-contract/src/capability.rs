@@ -91,6 +91,27 @@ impl SecurityClass {
     pub fn requires_evidence(self) -> bool {
         !matches!(self, Self::Functional)
     }
+
+    /// Which direction narrows for a capability of this class.
+    ///
+    /// `Ability` capabilities (Functional, Authority) widen the executable Task
+    /// set when their value grows; `Restriction` capabilities (Sandbox,
+    /// Continuity) narrow it when their value grows.
+    pub fn polarity(self) -> CapabilityPolarity {
+        match self {
+            Self::Functional | Self::Authority => CapabilityPolarity::Ability,
+            Self::Sandbox | Self::Continuity => CapabilityPolarity::Restriction,
+        }
+    }
+}
+
+/// Refinement direction of a capability value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CapabilityPolarity {
+    /// More value = more ability = wider authority.
+    Ability,
+    /// More value = more restriction = narrower.
+    Restriction,
 }
 
 /// Exact `(capability_id, revision)` identity. Fields are private so an

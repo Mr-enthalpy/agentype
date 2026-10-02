@@ -210,20 +210,6 @@ pub fn can_execute(
         }
     }
 
-    for permission in &req.required_permissions {
-        if !agent.contract.permission_ceiling.contains(permission) {
-            return Err(ContractError::CapabilityMismatch {
-                capability: format!("permission:{permission}"),
-            });
-        }
-    }
-    for tool in &req.required_tools {
-        if !agent.contract.tools.contains(tool) {
-            return Err(ContractError::CapabilityMismatch {
-                capability: format!("tool:{tool}"),
-            });
-        }
-    }
     if !affinity_accepts(&agent.contract.affinity, &req.required_affinity) {
         return Err(ContractError::CapabilityMismatch {
             capability: "affinity".into(),
@@ -457,13 +443,9 @@ pub fn can_provision_task(
     Ok(())
 }
 
-/// Does `derived` advertise no broader capability value than `base`?
-///
-/// This is the **executable-Task-set** order, not the provisioning-requirement
-/// order: an agent that advertises a smaller/equal value executes a subset of
-/// the Tasks the base executes. Adding a capability key widens; removing or
-/// lowering one narrows.
-fn provision_value_no_wider(
+/// `Ability` order: `derived` advertises no more than `base`. A smaller/equal
+/// value executes a subset of the Tasks the base executes.
+fn ability_value_no_wider(
     matcher: MatcherKind,
     base: &CapabilityValue,
     derived: &CapabilityValue,
@@ -490,27 +472,82 @@ fn provision_value_no_wider(
     }
 }
 
-/// `derived` must not enlarge the executable Task set: it may not introduce a
-/// capability `base` lacks, and each shared capability must be no broader.
+/// `Restriction` order: `derived` is at least as restrictive as `base`.
+fn restriction_value_no_wider(
+    matcher: MatcherKind,
+    base: &CapabilityValue,
+    derived: &CapabilityValue,
+) -> bool {
+    match (matcher, base, derived) {
+        // base=false -> derived=true is a new restriction (narrower);
+        // base=true -> derived=false weakens it.
+        (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => !*b || *d,
+        (MatcherKind::Exact, b, d) => b == d,
+        (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => b.is_subset(d),
+        (
+            MatcherKind::Ordered,
+            CapabilityValue::Ordered {
+                class: bc,
+                rank: br,
+            },
+            CapabilityValue::Ordered {
+                class: dc,
+                rank: dr,
+            },
+        ) => bc == dc && dr >= br,
+        (MatcherKind::Quantity, CapabilityValue::Quantity(b), CapabilityValue::Quantity(d)) => {
+            d.get() >= b.get()
+        }
+        _ => false,
+    }
+}
+
+/// `derived` must not widen. Whether a capability may be added/dropped or
+/// raised/lowered depends on the catalog-owned polarity: abilities narrow by
+/// shrinking, restrictions narrow by growing.
 fn capability_provision_no_wider(
     derived: &AgentTypeContract,
     base: &AgentTypeContract,
     catalog: &CapabilityCatalog,
 ) -> bool {
+    use crate::capability::CapabilityPolarity;
+
+    // A capability `base` lacks.
     for reference in derived.required_capabilities.keys() {
-        if !base.required_capabilities.contains_key(reference) {
-            return false;
-        }
-    }
-    for (reference, base_value) in &base.required_capabilities {
-        let Some(derived_value) = derived.required_capabilities.get(reference) else {
-            // Dropping a capability narrows the executable set.
+        if base.required_capabilities.contains_key(reference) {
             continue;
-        };
+        }
         let Some(definition) = catalog.get(reference) else {
             return false;
         };
-        if !provision_value_no_wider(definition.matcher_kind, base_value, derived_value) {
+        if definition.security_class.polarity() == CapabilityPolarity::Ability {
+            // Adding an ability widens.
+            return false;
+        }
+        // Adding a restriction narrows: allowed.
+    }
+
+    for (reference, base_value) in &base.required_capabilities {
+        let Some(definition) = catalog.get(reference) else {
+            return false;
+        };
+        let Some(derived_value) = derived.required_capabilities.get(reference) else {
+            // Dropping an ability narrows (allowed); dropping a restriction
+            // weakens the guarantee (rejected).
+            if definition.security_class.polarity() == CapabilityPolarity::Restriction {
+                return false;
+            }
+            continue;
+        };
+        let no_wider = match definition.security_class.polarity() {
+            CapabilityPolarity::Ability => {
+                ability_value_no_wider(definition.matcher_kind, base_value, derived_value)
+            }
+            CapabilityPolarity::Restriction => {
+                restriction_value_no_wider(definition.matcher_kind, base_value, derived_value)
+            }
+        };
+        if !no_wider {
             return false;
         }
     }
@@ -587,10 +624,6 @@ fn authority_no_wider(
     a.allowed_information_functions
         .iter()
         .all(|f| b.allowed_information_functions.contains(f))
-        && a.permission_ceiling.is_subset(&b.permission_ceiling)
-        && a.visibility.is_subset(&b.visibility)
-        && a.tools.is_subset(&b.tools)
-        && a.roots.is_subset(&b.roots)
         && affinity_no_wider(&a.affinity, &b.affinity)
         && a.budget_ceiling <= b.budget_ceiling
         && a.lifecycle.is_subset(&b.lifecycle)
@@ -641,23 +674,8 @@ pub fn is_valid_refinement(
         })
     };
 
-    if !derived_c
-        .permission_ceiling
-        .is_subset(&base_c.permission_ceiling)
-    {
-        return invalid("derived permission widens base permission");
-    }
-    if !derived_c.visibility.is_subset(&base_c.visibility) {
-        return invalid("derived visibility widens base visibility");
-    }
-    if !derived_c.tools.is_subset(&base_c.tools) {
-        return invalid("derived tools widen base tools");
-    }
-    if !derived_c.roots.is_subset(&base_c.roots) {
-        return invalid("derived roots widen base roots");
-    }
-    // Affinity is an allowed-tag ceiling like permission/tools: a derived type
-    // may only narrow, so refinement never enlarges the executable Task set.
+    // Affinity is an allowed-tag ceiling: a derived type may only narrow, so
+    // refinement never enlarges the executable Task set.
     if !affinity_no_wider(&derived_c.affinity, &base_c.affinity) {
         return invalid("derived affinity broadens base affinity");
     }

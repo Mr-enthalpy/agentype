@@ -26,7 +26,8 @@ mod selector;
 
 pub use capability::{
     value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
-    CapabilityDefinition, CapabilityRef, CapabilityValue, MatcherKind, Quantity, SecurityClass,
+    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
+    Quantity, SecurityClass,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;

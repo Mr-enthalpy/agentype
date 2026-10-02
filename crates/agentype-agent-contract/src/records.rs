@@ -229,12 +229,11 @@ pub struct AgentTypeContract {
     /// `Vec`; call [`AgentTypeContract::normalize`] before digesting.
     pub allowed_information_functions: Vec<InformationFunction>,
     /// Capabilities the type requires an execution source to provide, keyed by
-    /// exact revision. Semantics come from the [`CapabilityCatalog`].
+    /// exact revision. Semantics (matcher kind, security class, polarity) come
+    /// from the [`CapabilityCatalog`]. Authority, sandbox, and continuity
+    /// guarantees are carried here (and by the structured security fields
+    /// below), never as free-form tools/roots/visibility lists.
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
-    pub permission_ceiling: BTreeSet<String>,
-    pub visibility: BTreeSet<String>,
-    pub tools: BTreeSet<String>,
-    pub roots: BTreeSet<String>,
     /// Semantic affinity constraint. Narrowing is allowed; broadening is not.
     pub affinity: AffinityConstraint,
     pub budget_ceiling: Budget,
@@ -296,8 +295,6 @@ pub struct AgentType {
 pub struct TaskRequirement {
     pub information_function: InformationFunction,
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
-    pub required_permissions: BTreeSet<String>,
-    pub required_tools: BTreeSet<String>,
     pub required_affinity: BTreeSet<String>,
     pub required_workspace: WorkspaceMode,
     pub required_network: NetworkPolicy,
