@@ -42,20 +42,17 @@ compatible one. These directions differ and MUST NOT be inverted.
 Concrete encodings of the four relations are FROZEN in M6-B.1 (D-TYPE-REL
 resolved) and implemented in `agentype-agent-contract`:
 
-- `can_execute` checks the information function, capability envelope, permission
-  ceiling, tools, task affinity (an agent with the `Any` affinity accepts any
-  requirement; `Only(S)` requires the Task tags to be a subset of `S`),
-  workspace/network policy, continuity minimum, sandbox policy, anchor, and
-  budget.
-- Fields split into a **semantic scope** group (information functions,
-  permission ceiling, visibility, tools, roots, capability values) used only for
-  matching/ranking and for monotonic narrowing, and a **mechanical sandbox
-  authority** group (workspace, network, attempt isolation — proven by
-  `ResolvedProvisioningEvidence.enforceable_safety`; full filesystem/tool/
-  visibility restrictions — proven by an evidence-enforced `SandboxPolicyRef`).
-  A semantic-scope field is NOT a security guarantee and MUST NOT be presented
-  to the external environment as enforcement; a mechanical restriction MUST NOT
-  exist without a proof path.
+- `can_execute` checks the information function, capability envelope, task
+  affinity (an agent with the `Any` affinity accepts any requirement; `Only(S)`
+  requires the Task tags to be a subset of `S`), workspace/network policy,
+  continuity minimum, sandbox policy, anchor, and budget.
+- There is exactly one authoritative sandbox vocabulary. Restrictions are
+  expressed as security-class capabilities (evidence-proven) plus workspace,
+  network, attempt isolation, and the evidence-enforced `SandboxPolicyRef`; the
+  contract has no free-form `tools`/`roots`/`visibility`/permission lists that
+  look like security but have no enforcement path. A security/authority
+  restriction MUST NOT exist without a proof path, and a derived type MUST NOT
+  become narrower without an equal-or-narrower mechanically enforceable policy.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle and continuity coverage, every required
   capability **at its exact revision** (the source envelope is the provisionable
@@ -79,18 +76,22 @@ resolved) and implemented in `agentype-agent-contract`:
   guarantee counts as no-wider). It MUST be strict (two types with equivalent
   authority are incomparable), includes affinity, lifecycle, sandbox policy, and
   every authority dimension, and MUST NOT rank by nominal inheritance depth.
-- `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
-  tools, roots, affinity, budget, information functions, sandbox policy, anchor,
-  security policy, and capability values; a derived type MUST NOT widen the
-  lifecycle mode set, weaken required isolation, or **weaken a continuity
+- `is_valid_refinement` enforces monotonic narrowing of affinity, budget,
+  information functions, sandbox policy, anchor, security policy, and capability
+  values; a derived type MUST NOT widen the lifecycle mode set, weaken required
+  isolation, or **weaken a continuity
   guarantee** (`derived.continuity >= base.continuity` — strengthening is
   allowed). Affinity is an allowed-tag ceiling with an explicit top: `Any` is
   general and unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and
-  `Any ≤ Only(B)` is false. Capability values use the executable-Task-set order:
-  a derived type may remove or lower an advertised capability value, but never
-  add a capability or raise a value. The executable-Task-set-subset invariant
-  holds for the authority/scope dimensions; continuity is deliberately a
-  guarantee-strengthening dimension outside it.
+  `Any ≤ Only(B)` is false. Capability values use the catalog-owned **polarity**:
+  an `Ability` capability (Functional, Authority) narrows by shrinking — a
+  derived type may remove or lower it but never add or raise it; a `Restriction`
+  capability (Sandbox, Continuity) narrows by growing — a derived type may add
+  or raise it but never drop or lower it. The executable-Task-set-subset
+  invariant holds for the ability/scope dimensions; continuity is deliberately a
+  guarantee-strengthening dimension outside it. The `lifecycle` set is a
+  **required source envelope** (the source must support every listed mode), not
+  a set of alternative instantiation choices.
 
 ## Refinement monotonicity
 
@@ -98,14 +99,19 @@ A Root-created derived type MUST NOT enlarge authority.
 
 MUST hold:
 
-- DerivedPermission ⊆ BasePermission
-- DerivedVisibility ⊆ BaseVisibility
-- DerivedTools ⊆ BaseTools
-- DerivedRoots ⊆ BaseRoots
+- DerivedAffinity ≤ BaseAffinity (allowed-tag ceiling)
 - DerivedBudget ≤ BaseBudget
+- Derived lifecycle mode set ⊆ Base lifecycle mode set
+- Derived capability values follow catalog polarity: Ability values must not
+  exceed base; Restriction values must not fall below base
+- Derived continuity MUST NOT weaken the base guarantee
+- Derived workspace/network/attempt-isolation MUST NOT weaken base
+- Derived sandbox policy MUST NOT widen
+- Derived anchor MUST satisfy base anchor constraints
 
-Lifecycle MUST NOT widen beyond base. Affinity MAY narrow; it MUST NOT
-arbitrarily broaden authority. Anchor MUST satisfy base anchor constraints.
+Anchor MUST satisfy base anchor constraints. There is no free-form
+permission/visibility/tools/roots field: those concerns are capabilities
+(evidence-proven for security classes) or the sandbox policy reference.
 
 ## Information functions
 

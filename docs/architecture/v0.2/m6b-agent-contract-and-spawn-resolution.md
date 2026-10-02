@@ -59,19 +59,20 @@ ExecutionAdapter dependency.
 ```text
 AgentTypeRef              exact (type_id, revision); revisions immutable
 AgentType                 published contract revision; optional based_on provenance
-AgentTypeContract         information functions, capability envelope, permission
-                          ceiling, visibility, tools, roots, budget ceiling,
-                          security, lifecycle, continuity, anchor constraint
+AgentTypeContract         information functions, capability envelope, affinity,
+                          budget ceiling, security, lifecycle, continuity,
+                          sandbox policy, anchor constraint
 CapabilityRef             exact (capability_id, revision); private fields
 CapabilityCatalog / CapabilityDefinition
-                          the single authority for a capability's matcher kind
-                          and security class; redefining a revision fails closed
+                          the single authority for a capability's matcher kind,
+                          security class, and refinement polarity; redefining a
+                          revision fails closed
 CapabilityValue           BOOL | SET | ORDERED | QUANTITY | EXACT
 CapabilityClaim           (exact reference, value, assurance declaration, and a
                           diagnostic provenance ref; the ref is NOT a proof)
-TaskRequirement           information function, required capabilities/permissions/
-                          tools/affinity, workspace/network, continuity, sandbox
-                          policy, anchor, budget
+TaskRequirement           information function, required capabilities, affinity,
+                          workspace/network, continuity, sandbox policy, anchor,
+                          budget
 SpawnSource               advertised lifecycle/continuity envelopes, the
                           provisionable functional envelope (ceiling), source-wide
                           declarations, status
@@ -117,8 +118,6 @@ can never form from an invalid value.
 ```text
 task information_function ∈ agent allowed_information_functions
 task required_capabilities ⊆ agent capability envelope (under the matcher)
-task required_permissions ⊆ agent permission_ceiling
-task required_tools       ⊆ agent tools
 agent workspace/network policy >= task requirement (no narrowing)
 agent continuity          >= task continuity minimum
 task anchor requirement satisfies agent anchor constraint (None = unconstrained)
@@ -154,47 +153,40 @@ capability claim at a different revision never satisfies a requirement.
 ### `more_specific_for(A, B, TaskRequirement)`
 
 Only defined once both `can_execute`, and only when A is no wider than B on
-*every* relevant dimension (information functions, permission, visibility,
-tools, roots, affinity, budget, **lifecycle**, workspace/network, isolation,
-continuity, sandbox policy, anchor, and capability values) with at least one
-dimension strictly narrower. Capability values use the executable-Task-set
-order shared with refinement. Two types with equivalent authority are
-**incomparable**, not mutually more specific. Ranking MUST NOT use nominal
-inheritance depth.
+*every* relevant dimension (information functions, affinity, budget,
+**lifecycle**, workspace/network, isolation, continuity, sandbox policy, anchor,
+and capability values) with at least one dimension strictly narrower. Two types
+with equivalent authority are **incomparable**, not mutually more specific.
+Ranking MUST NOT use nominal inheritance depth.
 
-### Semantic scope vs mechanical sandbox authority
+### One authoritative sandbox vocabulary
 
-Two distinct kinds of field must not be conflated:
+There is no second, semantic-only representation of a security restriction:
 
 ```text
-semantic scope (matching/ranking + monotonic narrowing; NOT enforcement):
-    information functions, permission_ceiling, visibility, tools, roots,
-    capability values
-
-mechanical sandbox authority (every field has a proof path):
-    workspace, network, attempt_isolation   -> ResolvedProvisioningEvidence.enforceable_safety
-    full filesystem/tool/visibility policy  -> SandboxPolicyRef, enforced by imported evidence
+capabilities (evidence-proven for Authority/Sandbox/Continuity)
+    -> the refinement polarity decides whether growing narrows (Restriction)
+       or widens (Ability)
+workspace / network / attempt_isolation
+    -> ResolvedProvisioningEvidence.enforceable_safety
+full filesystem/tool/visibility policy
+    -> SandboxPolicyRef, enforced by imported evidence
 ```
 
-A semantic-scope field narrows the executable Task set but is **not** presented
-to the external environment as a security guarantee. A restriction is real only
-if it is mechanically enforceable: it either lives in the coarse proven set, is
-covered by an evidence-enforced `SandboxPolicyRef`, or is a security-class
-capability. `SecurityContract` therefore contains only the three coarse proven
-facts — filesystem/tool restrictions are not represented as free-text fields.
+The contract has no free-form `tools`/`roots`/`visibility`/permission lists: a
+field that looks like a security restriction MUST have a proof path, a derived
+type MUST NOT become narrower without an equal-or-narrower mechanically
+enforceable policy, and prompt/semantic labels are never enforcement.
 
-The capability-value order is the **executable-Task-set** order, not the
-provisioning-requirement order: a derived type may remove an advertised
-capability or lower its value, but adding a capability or raising a value can
-execute more Tasks and is rejected.
+Capability polarity (from the catalog security class): `Ability`
+(Functional/Authority) narrows by shrinking — remove or lower, never add or
+raise; `Restriction` (Sandbox/Continuity) narrows by growing — add or raise,
+never drop or lower. The `lifecycle` set is a required source envelope (the
+source must support every listed mode).
 
 ### `is_valid_refinement(Base, Derived)`
 
 ```text
-DerivedPermission ⊆ BasePermission
-DerivedVisibility ⊆ BaseVisibility
-DerivedTools      ⊆ BaseTools
-DerivedRoots      ⊆ BaseRoots
 DerivedAffinity   ≤ BaseAffinity (Any is the top; Only(A) ≤ Only(B) iff A ⊆ B)
 DerivedBudget     ≤ BaseBudget
 DerivedInformationFunctions ⊆ BaseInformationFunctions
@@ -203,8 +195,8 @@ continuity MAY strengthen but MUST NOT weaken the base guarantee
 anchor MUST satisfy base anchor constraint
 sandbox policy MUST NOT widen (a base None may be pinned; a base Some must match)
 workspace/network/required-isolation MUST NOT weaken base
-capability values MUST NOT add a capability or raise a value (may remove/lower);
-    matcher kind and security class are catalog-global and cannot be downgraded
+capability values follow catalog polarity: Ability must not grow, Restriction
+    must not shrink; matcher kind and security class are catalog-global
 ```
 
 `continuity` is the one **provisioning-guarantee** dimension: strengthening it
