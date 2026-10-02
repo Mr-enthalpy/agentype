@@ -236,6 +236,8 @@ can_provision_task(agent, source, config, evidence, task)
     = the above
       AND evidence can enforce the Task's effective (stricter)
           workspace / network / pinned sandbox policy / continuity
+      AND (AgentType.requires_attempt_isolation OR task.required_attempt_isolation)
+          implies evidence.enforceable_safety().attempt_isolation()
 ```
 
 `can_provision_task` is a mandatory eligibility conjunct (the contract/sandbox

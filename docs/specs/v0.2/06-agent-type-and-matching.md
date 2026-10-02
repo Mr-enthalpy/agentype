@@ -49,7 +49,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   be a subset of `S`), workspace/network policy, continuity minimum, sandbox
   policy, anchor, and budget. For `Ability` task capabilities the AgentType
   envelope must cover the requirement; `Restriction` task capabilities need not
-  be pre-advertised by the AgentType (they are composed at provisioning).
+  be pre-advertised by the AgentType, but where the AgentType already carries the
+  same restriction the pure contract join MUST exist (an incompatible pair fails
+  closed here rather than only at provisioning). The physical enforcement of the
+  joined restriction is still proven at provisioning.
 - There is exactly one authoritative sandbox vocabulary. Restrictions are
   expressed as security-class capabilities (evidence-proven) plus workspace,
   network, attempt isolation, and the evidence-enforced `SandboxPolicyRef`; the
@@ -82,8 +85,12 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   eligibility decision. The conjunction
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
-  enforce the Task's effective (stricter) workspace/network and pinned sandbox
-  policy, not merely the AgentType ceiling. Full eligibility additionally
+  enforce the Task's effective (stricter) workspace/network, attempt isolation,
+  and pinned sandbox policy, not merely the AgentType ceiling. Effective attempt
+  isolation is `AgentType.requires_attempt_isolation OR
+  Task.required_attempt_isolation` (a Task may tighten it; the AgentType flag
+  stays a per-task requirement), and when effective it MUST be physically
+  enforceable. Full eligibility additionally
   requires an active adapter policy, satisfied `required_safety`, a coherent
   adapter kind/binding, a currently resolvable exact binding, and available
   required credential refs (B.4/B.5); no second implicit eligibility relation may
