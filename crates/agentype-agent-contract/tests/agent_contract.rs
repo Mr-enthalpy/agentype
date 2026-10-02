@@ -914,8 +914,10 @@ fn test_matcher_semantics() {
 }
 
 #[test]
-fn test_bool_matcher_is_exact_equality() {
-    assert!(!value_satisfies(
+fn test_bool_matcher_presence_semantics() {
+    // `false` denotes absence (bottom); `true` denotes presence (top).
+    // A present value satisfies an absent requirement, but not the converse.
+    assert!(value_satisfies(
         MatcherKind::Bool,
         &CapabilityValue::Bool(false),
         &CapabilityValue::Bool(true)
@@ -925,6 +927,79 @@ fn test_bool_matcher_is_exact_equality() {
         &CapabilityValue::Bool(false),
         &CapabilityValue::Bool(false)
     ));
+    assert!(value_satisfies(
+        MatcherKind::Bool,
+        &CapabilityValue::Bool(true),
+        &CapabilityValue::Bool(true)
+    ));
+    assert!(!value_satisfies(
+        MatcherKind::Bool,
+        &CapabilityValue::Bool(true),
+        &CapabilityValue::Bool(false)
+    ));
+}
+
+#[test]
+fn test_bool_restriction_algebra_is_monotone() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "sandbox.network_lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+    let reference = cref("sandbox.network_lock", 1);
+
+    // Base requires no lock (false); derived requires the lock (true).
+    let base = base_agent();
+    let mut derived = base_agent();
+    derived.type_ref = type_ref("locked", 1);
+    derived.based_on = Some(base.type_ref.clone());
+    derived
+        .contract
+        .required_capabilities
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
+
+    // Enforcement that provides the lock must satisfy the stricter derived
+    // requirement *and* the weaker base requirement.
+    let provided = CapabilityValue::Bool(true);
+    assert!(value_satisfies(
+        MatcherKind::Bool,
+        &CapabilityValue::Bool(true),
+        &provided
+    ));
+    assert!(value_satisfies(
+        MatcherKind::Bool,
+        &CapabilityValue::Bool(false),
+        &provided
+    ));
+
+    // The joined effective restriction is proven by imported evidence.
+    let mut task = base_task();
+    task.required_capabilities
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    let mut source = base_source();
+    source
+        .functional_envelope
+        .insert(reference.clone(), CapabilityValue::Bool(true));
+    let evidence = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(reference.clone(), CapabilityValue::Bool(true))],
+    );
+    assert!(can_provision_task(&derived, &source, &base_config(), &evidence, &cat, &task).is_ok());
+
+    // Absence cannot satisfy the presence requirement.
+    let absent = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(reference, CapabilityValue::Bool(false))],
+    );
+    assert!(can_provision_task(&derived, &source, &base_config(), &absent, &cat, &task).is_err());
 }
 
 #[test]

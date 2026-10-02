@@ -610,7 +610,9 @@ fn ability_value_no_wider(
     derived: &CapabilityValue,
 ) -> bool {
     match (matcher, base, derived) {
-        (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => b == d,
+        // Presence: `derived` may advertise no more than `base`
+        // (`derived implies base`).
+        (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => !*d || *b,
         (MatcherKind::Exact, b, d) => b == d,
         (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => d.is_subset(b),
         (
@@ -638,8 +640,9 @@ fn restriction_value_no_wider(
     derived: &CapabilityValue,
 ) -> bool {
     match (matcher, base, derived) {
-        // base=false -> derived=true is a new restriction (narrower);
-        // base=true -> derived=false weakens it.
+        // Presence-derived order: `derived` at least as restrictive as `base`
+        // (`base implies derived`). base=false -> derived=true is a new
+        // restriction (narrower); base=true -> derived=false weakens it.
         (MatcherKind::Bool, CapabilityValue::Bool(b), CapabilityValue::Bool(d)) => !*b || *d,
         (MatcherKind::Exact, b, d) => b == d,
         (MatcherKind::Set, CapabilityValue::Set(b), CapabilityValue::Set(d)) => b.is_subset(d),

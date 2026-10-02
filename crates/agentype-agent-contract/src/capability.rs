@@ -14,7 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The five matcher shapes supported in M6-B v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MatcherKind {
-    /// Exact boolean: `provided == required`.
+    /// Boolean presence: `false` means absent, `true` means present.
+    /// `provided` satisfies `required` when `required` implies `provided`
+    /// (`!required || provided`), so a present value also satisfies an absent
+    /// requirement and the order is compositional.
     Bool,
     /// Required subset of a provided set (e.g. `tools ⊇ {git,ripgrep}`).
     Set,
@@ -221,7 +224,7 @@ pub fn value_satisfies(
     provided: &CapabilityValue,
 ) -> bool {
     match (matcher, required, provided) {
-        (MatcherKind::Bool, CapabilityValue::Bool(r), CapabilityValue::Bool(p)) => r == p,
+        (MatcherKind::Bool, CapabilityValue::Bool(r), CapabilityValue::Bool(p)) => !*r || *p,
         (MatcherKind::Set, CapabilityValue::Set(r), CapabilityValue::Set(p)) => r.is_subset(p),
         (
             MatcherKind::Ordered,
@@ -246,7 +249,7 @@ pub fn value_satisfies(
 /// declarations from exceeding a SpawnSource's provisionable envelope).
 pub fn value_within(ceiling: &CapabilityValue, value: &CapabilityValue) -> bool {
     match (ceiling, value) {
-        (CapabilityValue::Bool(a), CapabilityValue::Bool(b)) => a == b,
+        (CapabilityValue::Bool(a), CapabilityValue::Bool(b)) => !*b || *a,
         (CapabilityValue::Set(a), CapabilityValue::Set(b)) => b.is_subset(a),
         (
             CapabilityValue::Ordered {

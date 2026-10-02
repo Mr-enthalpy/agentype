@@ -322,6 +322,10 @@ pub enum ConfigStatus {
 }
 
 /// A physical provisioning source: advertised envelopes plus declarations.
+///
+/// `source_ref` identifies immutable revision content. `status` is a mutable
+/// operational disposition overlay, not part of the revision identity or any
+/// content digest (see spec 07 "Revision and disposition ownership").
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpawnSource {
     pub source_ref: SpawnSourceRef,
@@ -348,6 +352,8 @@ pub struct SourceConfig {
     pub continuity_modes: Option<BTreeSet<ContinuityMode>>,
     pub credential_refs: Vec<CredentialRef>,
     pub claims: Vec<CapabilityClaim>,
+    /// Mutable operational disposition, excluded from `config_digest` and from
+    /// the immutable config revision identity.
     pub status: ConfigStatus,
 }
 
