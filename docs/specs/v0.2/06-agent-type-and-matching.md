@@ -99,11 +99,15 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality). `Bool`
   uses presence semantics (`false` absent, `true` present); a present value
   satisfies an absent requirement but not the converse, so refinement, join, and
-  satisfaction stay mutually monotone. An explicit `Bool(false)` and an omitted
-  entry are the same state in every relation (`can_execute`,
-  `more_specific_for`, `is_valid_refinement`) and in validation; the durable
-  canonical encoding is omission, so `{}` and `{cap: Bool(false)}` MUST NOT be
-  persisted as two distinct contract forms. The joined value is proven by imported
+  satisfaction stay mutually monotone. `Bool(false)` means absence only after the
+  catalog has resolved the exact capability and confirmed it is a `Bool`
+  capability with a matching value shape; a `Bool(false)` for an unknown
+  capability or a non-`Bool` definition MUST fail closed, never silently vanish.
+  Once so normalized, an omitted entry and `Bool(false)` are the same state in
+  every relation (`can_execute`, `more_specific_for`, `is_valid_refinement`) and
+  in validation; the durable canonical encoding is omission, so `{}` and
+  `{cap: Bool(false)}` MUST NOT be persisted as two distinct contract forms. The
+  joined value is proven by imported
   evidence for security classes and by the effective source/config functional
   value otherwise — `SecurityClass` keeps
   controlling proof authority independently of polarity. Every Task capability

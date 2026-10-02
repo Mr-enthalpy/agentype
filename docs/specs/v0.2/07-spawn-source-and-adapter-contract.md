@@ -35,6 +35,12 @@ Similarly, a SourceConfig's exact revision is immutable content; a config
 disposition is a separate mutable overlay. B.2 MUST persist these as distinct
 tables so immutability and digest stability are not blurred.
 
+A resolved view that composes revision content with the live disposition MUST
+NOT hide the disposition behind a non-intuitive equality: ordinary `==` includes
+the current disposition, and revision-content identity is expressed explicitly
+(e.g. `same_revision_content`). Content digests, cache keys, and snapshots MUST
+use the content identity, never the composed `==`.
+
 ## Selection order (MUST)
 
 1. correctness constraints
