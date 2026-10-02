@@ -647,7 +647,6 @@ fn write_stdin_unix(
     extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
         fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
     }
     let fd = stdin.as_raw_fd();
     // SAFETY: fd is the owned ChildStdin; O_NONBLOCK + poll + write stay on
@@ -662,7 +661,11 @@ fn write_stdin_unix(
             if deadline.is_expired() {
                 return Err(AdapterError::deadline_exceeded("stdin write blocked"));
             }
-            let n = write(fd, bytes.as_ptr().add(off), bytes.len() - off);
+            let n = libc::write(
+                fd,
+                bytes.as_ptr().add(off) as *const libc::c_void,
+                bytes.len() - off,
+            );
             if n > 0 {
                 off += n as usize;
                 continue;

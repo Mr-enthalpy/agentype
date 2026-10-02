@@ -15,6 +15,41 @@ adapter_ref, target_selector, profile_selector, provisionable capability
 envelope, enforceable sandbox features, lifecycle modes, supported continuity
 modes, source_tags, availability.
 
+### Revision and disposition ownership (MUST)
+
+A published SpawnSource revision is immutable content:
+
+- `SpawnSourceRevision` = the exact `(source_id, revision)` contract content
+  (adapter policy, selectors, capability envelope, sandbox features, lifecycle,
+  continuity, tags) plus its content digest. `SourceConfigRef` and imported
+  evidence bind this exact revision; the digest MUST cover only immutable
+  content.
+- `SpawnSourceDisposition` = mutable operational state
+  (`ACTIVE`/`DRAINING`/`DISABLED`) owned by the catalog/operator lifecycle
+  overlay, mirroring the AgentType contract-revision vs publication-state split.
+  It is NOT part of the immutable revision content or digest, so a revision's
+  lifecycle state may change without publishing a new revision, and a new
+  revision does not inherit a prior disposition automatically.
+
+Similarly, a SourceConfig's exact revision is immutable content; a config
+disposition is a separate mutable overlay. B.2 MUST persist these as distinct
+tables so immutability and digest stability are not blurred.
+
+A resolved view that composes revision content with the live disposition MUST
+NOT hide the disposition behind a non-intuitive equality: ordinary `==` includes
+the current disposition, and revision-content identity is expressed explicitly
+(e.g. `same_revision_content`). Content digests, cache keys, and snapshots MUST
+use the content identity, never the composed `==`.
+
+Revision-content identity has a canonicalization precondition: `claims` and a
+config's `credential_refs` are set-like but stored as ordered sequences, so two
+semantically equal revisions in different orders MUST NOT be able to compare
+unequal. B.2 publication MUST sort and dedup claims and credential references
+(and reject duplicate claim values at one exact reference, per the canonical
+claim rule) before forming revision content or digests, and MUST include a
+permutation-invariance conformance test. Until then, `same_revision_content` is
+defined only over canonicalized records.
+
 ## Selection order (MUST)
 
 1. correctness constraints
@@ -90,8 +125,9 @@ An Execution MUST atomically freeze `adapter_kind` and
 `adapter_binding_key` at creation. Recovery MUST `resolve_exact(kind, key)`
 and MUST NOT fall back to another source of the same kind.
 
-Until M6 SpawnSource exists, launch MUST `resolve_unique(kind)`. Ambiguous
-installations of the same kind MUST fail closed.
+Until the M6 source-resolved exact-binding launch path is implemented, launch
+MUST `resolve_unique(kind)`. Ambiguous installations of the same kind MUST fail
+closed.
 
 An imported source owns its kind, binding key, and enforceable physical
 capabilities. Effective safety is the intersection of the ExecutionTarget

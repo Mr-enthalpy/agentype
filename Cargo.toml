@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/agentype-core",
+    "crates/agentype-agent-contract",
     "crates/agentype-execution-config",
     "crates/agentype-storage-sqlite",
     "crates/agentype-adapter-api",
@@ -23,6 +24,7 @@ version = "0.2.0"
 
 [workspace.dependencies]
 agentype-core = { path = "crates/agentype-core" }
+agentype-agent-contract = { path = "crates/agentype-agent-contract" }
 agentype-execution-config = { path = "crates/agentype-execution-config" }
 agentype-adapter-api = { path = "crates/agentype-adapter-api" }
 agentype-adapter-local-process = { path = "crates/agentype-adapter-local-process" }
