@@ -1962,3 +1962,69 @@ fn test_config_continuity_override_is_ordered() {
         Err(ContractError::SourceConfigInvalid { .. })
     ));
 }
+
+#[test]
+fn test_functional_restriction_proven_by_declaration_not_evidence() {
+    let mut cat = CapabilityCatalog::new();
+    cat.define(
+        cref("locked_paths", 1),
+        MatcherKind::Set,
+        SecurityClass::Functional,
+        CapabilityPolarity::Restriction,
+    )
+    .unwrap();
+
+    let agent = base_agent();
+    let mut task = base_task();
+    task.required_capabilities.insert(
+        cref("locked_paths", 1),
+        CapabilityValue::Set(set(&["/secret"])),
+    );
+
+    // Functional class: proven by the source envelope, not imported evidence.
+    let mut source = base_source();
+    source.functional_envelope.insert(
+        cref("locked_paths", 1),
+        CapabilityValue::Set(set(&["/secret", "/a"])),
+    );
+    assert!(can_provision_task(
+        &agent,
+        &source,
+        &base_config(),
+        &base_evidence(),
+        &cat,
+        &task
+    )
+    .is_ok());
+
+    // A weaker envelope cannot satisfy the joined restriction.
+    let mut weak = base_source();
+    weak.functional_envelope
+        .insert(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])));
+    assert!(
+        can_provision_task(&agent, &weak, &base_config(), &base_evidence(), &cat, &task).is_err()
+    );
+}
+
+#[test]
+fn test_malformed_task_restriction_shape_fails_closed() {
+    let mut cat = CapabilityCatalog::new();
+    cat.define(
+        cref("locked_paths", 1),
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+        CapabilityPolarity::Restriction,
+    )
+    .unwrap();
+
+    let mut task = base_task();
+    // Wrong shape (Bool) for a Set definition, even though the polarity is
+    // Restriction and the capability is not pre-advertised.
+    task.required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Bool(true));
+
+    assert!(matches!(
+        can_execute(&base_agent(), &task, &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}

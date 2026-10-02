@@ -224,10 +224,17 @@ pub fn can_execute(
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: reference.capability_id().as_str().to_string(),
                 })?;
+        // Fail closed on a malformed value shape before any polarity handling.
+        if definition.matcher_kind != required.matcher_kind() {
+            return Err(ContractError::InvariantViolation(format!(
+                "Task capability value shape does not match the definition for {}@{}",
+                reference.capability_id().as_str(),
+                reference.revision()
+            )));
+        }
         // Restriction capabilities are effective policy the Task may add or
-        // strengthen; they are composed with the AgentType and proven against
-        // imported evidence in `can_provision_task`, not required to be
-        // pre-advertised by the AgentType.
+        // strengthen; they are composed with the AgentType and proven in
+        // `can_provision_task`, not required to be pre-advertised here.
         if definition.polarity == CapabilityPolarity::Restriction {
             continue;
         }
@@ -485,8 +492,10 @@ pub fn can_provision_task(
         });
     }
 
-    // Task restrictions compose with the AgentType envelope (join), and the
-    // joined effective restriction must be enforced by imported evidence.
+    // Task restrictions compose with the AgentType envelope (join). The joined
+    // effective restriction is proven by imported evidence for security classes
+    // and by the effective source/config functional value otherwise, keeping
+    // SecurityClass (proof authority) orthogonal to polarity (composition).
     for (reference, task_value) in &task.required_capabilities {
         let definition =
             catalog
@@ -504,23 +513,53 @@ pub fn can_provision_task(
                 })?,
             None => task_value.clone(),
         };
-        let provided = evidence.enforced_capability(reference).ok_or_else(|| {
-            ContractError::SecurityUnenforceable {
-                reason: format!(
-                    "Task restriction {}@{} has no imported enforcement evidence",
-                    reference.capability_id().as_str(),
-                    reference.revision()
-                ),
+
+        if definition.security_class.requires_evidence() {
+            let provided = evidence.enforced_capability(reference).ok_or_else(|| {
+                ContractError::SecurityUnenforceable {
+                    reason: format!(
+                        "Task restriction {}@{} has no imported enforcement evidence",
+                        reference.capability_id().as_str(),
+                        reference.revision()
+                    ),
+                }
+            })?;
+            if !value_satisfies(definition.matcher_kind, &effective, provided) {
+                return Err(ContractError::CapabilityMismatch {
+                    capability: capability_key(reference),
+                });
             }
-        })?;
-        if !value_satisfies(definition.matcher_kind, &effective, provided) {
-            return Err(ContractError::CapabilityMismatch {
-                capability: capability_key(reference),
-            });
+        } else {
+            let provided = effective_functional_value(source, config, reference)?;
+            if !value_satisfies(definition.matcher_kind, &effective, provided) {
+                return Err(ContractError::CapabilityMismatch {
+                    capability: capability_key(reference),
+                });
+            }
         }
     }
 
     Ok(())
+}
+
+/// The effective functional value a source/config can provide: the config
+/// declaration, else the source declaration, else the source envelope ceiling.
+fn effective_functional_value<'a>(
+    source: &'a SpawnSource,
+    config: &'a SourceConfig,
+    reference: &CapabilityRef,
+) -> Result<&'a CapabilityValue, ContractError> {
+    let ceiling = source.functional_envelope.get(reference).ok_or_else(|| {
+        ContractError::CapabilityMismatch {
+            capability: capability_key(reference),
+        }
+    })?;
+    let source_claim = resolve_claim(&source.claims, reference)?;
+    let config_claim = resolve_claim(&config.claims, reference)?;
+    Ok(config_claim
+        .map(|c| &c.value)
+        .or_else(|| source_claim.map(|c| &c.value))
+        .unwrap_or(ceiling))
 }
 
 /// Deterministic join of two restriction values (the effective, strongest
