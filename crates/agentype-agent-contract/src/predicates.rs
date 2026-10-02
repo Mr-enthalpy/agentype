@@ -262,8 +262,19 @@ pub fn can_execute(
         }
         // Restriction capabilities are effective policy the Task may add or
         // strengthen; they are composed with the AgentType and proven in
-        // `can_provision_task`, not required to be pre-advertised here.
+        // `can_provision_task`, not required to be pre-advertised here. When the
+        // AgentType already carries the restriction, the pure contract join must
+        // at least exist, so an incompatible pair (e.g. disjoint `Exact`/class)
+        // fails closed here rather than only at provisioning.
         if definition.polarity == CapabilityPolarity::Restriction {
+            if let Some(agent_value) = present_cap(&agent.contract.required_capabilities, reference)
+            {
+                if restriction_join(definition.matcher_kind, agent_value, required).is_none() {
+                    return Err(ContractError::CapabilityMismatch {
+                        capability: reference.capability_id().as_str().to_string(),
+                    });
+                }
+            }
             continue;
         }
         let provided =
@@ -502,6 +513,17 @@ pub fn can_provision_task(
     if !safety.enforces_network(task.required_network) {
         return Err(ContractError::SecurityUnenforceable {
             reason: "environment cannot enforce the Task network policy".into(),
+        });
+    }
+    // Attempt isolation intersects as an OR: either the AgentType requires it for
+    // every task or this Task tightens it, and either way the environment must
+    // be able to enforce it.
+    if (agent.contract.security.requires_attempt_isolation || task.required_attempt_isolation)
+        && !safety.attempt_isolation()
+    {
+        return Err(ContractError::SecurityUnenforceable {
+            reason: "attempt isolation is required by the AgentType or Task but not enforceable"
+                .into(),
         });
     }
     if let Some(policy) = &task.sandbox_policy {

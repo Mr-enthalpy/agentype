@@ -141,6 +141,7 @@ fn base_task() -> TaskRequirement {
         required_affinity: BTreeSet::new(),
         required_workspace: WorkspaceMode::ReadOnly,
         required_network: NetworkPolicy::Restricted,
+        required_attempt_isolation: false,
         required_continuity: ContinuityMode::None,
         sandbox_policy: None,
         required_anchor: None,
@@ -2188,4 +2189,110 @@ fn test_task_bool_false_restriction_needs_no_proof() {
         &task
     )
     .is_ok());
+}
+
+#[test]
+fn test_task_attempt_isolation_intersection() {
+    let cat = CapabilityCatalog::new();
+    let source = base_source();
+    let config = base_config();
+    let agent = base_agent();
+
+    // agent false + task false -> isolation not required.
+    let plain = base_task();
+    assert!(can_provision_task(&agent, &source, &config, &base_evidence(), &cat, &plain).is_ok());
+
+    // agent false + task true -> physical isolation required but absent.
+    let mut isolated = base_task();
+    isolated.required_attempt_isolation = true;
+    assert!(matches!(
+        can_provision_task(&agent, &source, &config, &base_evidence(), &cat, &isolated),
+        Err(ContractError::SecurityUnenforceable { .. })
+    ));
+
+    // agent true + task false -> still required for every task.
+    let mut strict_agent = base_agent();
+    strict_agent.contract.security.requires_attempt_isolation = true;
+    assert!(matches!(
+        can_provision_task(
+            &strict_agent,
+            &source,
+            &config,
+            &base_evidence(),
+            &cat,
+            &plain
+        ),
+        Err(ContractError::SecurityUnenforceable { .. })
+    ));
+
+    // When the environment can isolate, both are satisfied.
+    let isolatable = PhysicalSafety::new(
+        true,
+        vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write],
+        [
+            NetworkPolicy::Disabled,
+            NetworkPolicy::Restricted,
+            NetworkPolicy::Enabled,
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    let evidence = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        isolatable,
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(can_provision_task(&agent, &source, &config, &evidence, &cat, &isolated).is_ok());
+    assert!(can_provision_task(&strict_agent, &source, &config, &evidence, &cat, &plain).is_ok());
+}
+
+#[test]
+fn test_incompatible_restriction_join_fails_can_execute() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "region",
+        1,
+        MatcherKind::Ordered,
+        SecurityClass::Sandbox,
+    );
+    let reference = cref("region", 1);
+
+    let mut agent = base_agent();
+    agent.contract.required_capabilities.insert(
+        reference.clone(),
+        CapabilityValue::Ordered {
+            class: "A".into(),
+            rank: 1,
+        },
+    );
+    let mut task = base_task();
+    task.required_capabilities.insert(
+        reference,
+        CapabilityValue::Ordered {
+            class: "B".into(),
+            rank: 1,
+        },
+    );
+
+    // The pure restriction join cannot exist, so `can_execute` already fails.
+    assert!(matches!(
+        can_execute(&agent, &task, &cat),
+        Err(ContractError::CapabilityMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_disposition_not_part_of_content_equality() {
+    let source = base_source();
+    let mut draining_source = base_source();
+    draining_source.status = SourceStatus::Draining;
+    assert_eq!(source, draining_source);
+
+    let config = base_config();
+    let mut draining_config = base_config();
+    draining_config.status = ConfigStatus::Draining;
+    assert_eq!(config, draining_config);
 }

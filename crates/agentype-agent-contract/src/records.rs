@@ -307,6 +307,9 @@ pub struct TaskRequirement {
     pub required_affinity: BTreeSet<String>,
     pub required_workspace: WorkspaceMode,
     pub required_network: NetworkPolicy,
+    /// A Task may tighten attempt isolation beyond the AgentType default; the
+    /// effective requirement is the OR with the AgentType's.
+    pub required_attempt_isolation: bool,
     pub required_continuity: ContinuityMode,
     pub sandbox_policy: Option<SandboxPolicyRef>,
     pub required_anchor: Option<String>,
@@ -327,12 +330,18 @@ pub enum ConfigStatus {
     Disabled,
 }
 
-/// A physical provisioning source: advertised envelopes plus declarations.
+/// A physical provisioning source: immutable revision content composed with the
+/// current operational disposition.
 ///
 /// `source_ref` identifies immutable revision content. `status` is a mutable
 /// operational disposition overlay, not part of the revision identity or any
 /// content digest (see spec 07 "Revision and disposition ownership").
-#[derive(Clone, Debug, PartialEq)]
+///
+/// This is a resolved *view*, not the immutable revision authority: `PartialEq`
+/// compares content only, so the mutable disposition can never leak into a
+/// content digest, cache key, or snapshot identity. B.2 persists the revision
+/// and the disposition separately.
+#[derive(Clone, Debug)]
 pub struct SpawnSource {
     pub source_ref: SpawnSourceRef,
     pub adapter_policy: AdapterPolicyRef,
@@ -344,10 +353,25 @@ pub struct SpawnSource {
     pub status: SourceStatus,
 }
 
+impl PartialEq for SpawnSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_ref == other.source_ref
+            && self.adapter_policy == other.adapter_policy
+            && self.lifecycle_modes == other.lifecycle_modes
+            && self.continuity_modes == other.continuity_modes
+            && self.functional_envelope == other.functional_envelope
+            && self.claims == other.claims
+    }
+}
+
 /// A source-specific operator configuration. The payload is opaque to Core;
 /// only its identity, digest, credential references, and any config-specific
 /// declarations (which MUST stay within the source envelope) are modeled here.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Like [`SpawnSource`], this is a resolved view: `PartialEq` compares
+/// immutable content only, so the mutable `status` disposition never enters a
+/// content digest or identity comparison.
+#[derive(Clone, Debug)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
     pub config_digest: ConfigDigest,
@@ -361,6 +385,17 @@ pub struct SourceConfig {
     /// Mutable operational disposition, excluded from `config_digest` and from
     /// the immutable config revision identity.
     pub status: ConfigStatus,
+}
+
+impl PartialEq for SourceConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.config_ref == other.config_ref
+            && self.config_digest == other.config_digest
+            && self.lifecycle_modes == other.lifecycle_modes
+            && self.continuity_modes == other.continuity_modes
+            && self.credential_refs == other.credential_refs
+            && self.claims == other.claims
+    }
 }
 
 impl SourceConfig {
