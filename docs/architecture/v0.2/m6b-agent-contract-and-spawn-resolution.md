@@ -238,10 +238,15 @@ can_provision_task(agent, source, config, evidence, task)
           workspace / network / pinned sandbox policy / continuity
 ```
 
-B.3/B.4 MUST use `can_provision_task` as the eligible-candidate predicate. A
-source that can realize the AgentType ceiling but not the Task's stricter
-policy is ineligible; this is the composition rule that prevents an
-"both predicates pass, but the sandbox cannot run the Task" hole.
+`can_provision_task` is a mandatory eligibility conjunct (the contract/sandbox
+eligibility predicate); it is NOT the complete physical candidate eligibility
+decision. B.3/B.4 MUST include it, and MUST additionally require an active
+adapter policy, satisfied `required_safety`, a coherent adapter kind/binding, a
+currently resolvable exact binding, and available required credential refs
+(B.4/B.5) — without inventing a second implicit eligibility relation. A source
+that can realize the AgentType ceiling but not the Task's stricter policy is
+ineligible; this is the composition rule that prevents an "both predicates pass,
+but the sandbox cannot run the Task" hole.
 
 ---
 
@@ -292,8 +297,11 @@ discipline; `config_digest` MUST be a validated canonical representation before
 it enters schema v6; and the immutable catalog schema MUST enforce a canonical
 claim representation (at most one value per exact `CapabilityRef`, or a
 deterministic dedup rule) so an exact revision cannot encode in more than one
-way; and publication MUST verify `based_on` provenance (`derived.based_on ==
-base.type_ref`) rather than trusting the field.
+way; publication MUST verify `based_on` provenance (`derived.based_on ==
+base.type_ref`) rather than trusting the field; and schema v6 MUST persist
+immutable revision content separately from the mutable
+`SpawnSourceDisposition`/config-disposition overlay, so status never enters the
+content digest (spec 07 "Revision and disposition ownership").
 
 B.4 binding-bridge obligations: `ResolvedProvisioningEvidence.adapter_kind` and
 `AdapterBindingPolicy.required_safety`/`status` are not consumed by the B.1

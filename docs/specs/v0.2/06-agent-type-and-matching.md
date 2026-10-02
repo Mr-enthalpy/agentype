@@ -77,19 +77,29 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   security class are defined once by a canonical `CapabilityCatalog`; a
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
   be inferred from a stronger capability.
-- `can_provision_task` is the eligible-candidate predicate. The conjunction
+- `can_provision_task` is the contract/sandbox eligibility predicate and a
+  **mandatory eligibility conjunct**; it is NOT the complete physical candidate
+  eligibility decision. The conjunction
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network and pinned sandbox
-  policy, not merely the AgentType ceiling. For `Restriction` capabilities the
+  policy, not merely the AgentType ceiling. Full eligibility additionally
+  requires an active adapter policy, satisfied `required_safety`, a coherent
+  adapter kind/binding, a currently resolvable exact binding, and available
+  required credential refs (B.4/B.5); no second implicit eligibility relation may
+  be introduced for these. For `Restriction` capabilities the
   effective value is the deterministic join of the AgentType and Task values
-  (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality), and that
-  joined value is proven by imported evidence for security classes and by the
-  effective source/config functional value otherwise — `SecurityClass` keeps
+  (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality). `Bool`
+  uses presence semantics (`false` absent, `true` present); a present value
+  satisfies an absent requirement but not the converse, so refinement, join, and
+  satisfaction stay mutually monotone. The joined value is proven by imported
+  evidence for security classes and by the effective source/config functional
+  value otherwise — `SecurityClass` keeps
   controlling proof authority independently of polarity. Every Task capability
   value MUST match its catalog definition shape and fail closed otherwise, even
   for `Restriction` capabilities the AgentType does not pre-advertise. B.3/B.4
-  MUST use `can_provision_task`, not the bare conjunction.
+  MUST include `can_provision_task` as a mandatory conjunct, not the bare
+  conjunction.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information
   functions, workspace/network, isolation, sandbox policy, anchor, and capability

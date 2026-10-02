@@ -15,6 +15,26 @@ adapter_ref, target_selector, profile_selector, provisionable capability
 envelope, enforceable sandbox features, lifecycle modes, supported continuity
 modes, source_tags, availability.
 
+### Revision and disposition ownership (MUST)
+
+A published SpawnSource revision is immutable content:
+
+- `SpawnSourceRevision` = the exact `(source_id, revision)` contract content
+  (adapter policy, selectors, capability envelope, sandbox features, lifecycle,
+  continuity, tags) plus its content digest. `SourceConfigRef` and imported
+  evidence bind this exact revision; the digest MUST cover only immutable
+  content.
+- `SpawnSourceDisposition` = mutable operational state
+  (`ACTIVE`/`DRAINING`/`DISABLED`) owned by the catalog/operator lifecycle
+  overlay, mirroring the AgentType contract-revision vs publication-state split.
+  It is NOT part of the immutable revision content or digest, so a revision's
+  lifecycle state may change without publishing a new revision, and a new
+  revision does not inherit a prior disposition automatically.
+
+Similarly, a SourceConfig's exact revision is immutable content; a config
+disposition is a separate mutable overlay. B.2 MUST persist these as distinct
+tables so immutability and digest stability are not blurred.
+
 ## Selection order (MUST)
 
 1. correctness constraints
