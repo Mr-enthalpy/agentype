@@ -39,13 +39,17 @@ A broad SpawnSource MAY provision a narrower AgentType if it can enforce it.
 A more specific AgentType MAY be preferred for assignment over a broader
 compatible one. These directions differ and MUST NOT be inverted.
 
-Concrete encodings of the four relations are FROZEN in M6-B.1 (D-TYPE-REL
-resolved) and implemented in `agentype-agent-contract`:
+Concrete encodings of the four relations are FROZEN in M6-B.1 for the defined
+dimensions (D-TYPE-REL resolved; sandbox-policy order/intersection remains
+deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
+`agentype-agent-contract`:
 
-- `can_execute` checks the information function, capability envelope, task
-  affinity (an agent with the `Any` affinity accepts any requirement; `Only(S)`
-  requires the Task tags to be a subset of `S`), workspace/network policy,
-  continuity minimum, sandbox policy, anchor, and budget.
+- `can_execute` checks the information function, task affinity (an agent with
+  the `Any` affinity accepts any requirement; `Only(S)` requires the Task tags to
+  be a subset of `S`), workspace/network policy, continuity minimum, sandbox
+  policy, anchor, and budget. For `Ability` task capabilities the AgentType
+  envelope must cover the requirement; `Restriction` task capabilities need not
+  be pre-advertised by the AgentType (they are composed at provisioning).
 - There is exactly one authoritative sandbox vocabulary. Restrictions are
   expressed as security-class capabilities (evidence-proven) plus workspace,
   network, attempt isolation, and the evidence-enforced `SandboxPolicyRef`; the
@@ -53,6 +57,11 @@ resolved) and implemented in `agentype-agent-contract`:
   look like security but have no enforcement path. A security/authority
   restriction MUST NOT exist without a proof path, and a derived type MUST NOT
   become narrower without an equal-or-narrower mechanically enforceable policy.
+  In M6-B.1 the sandbox policy is pinned by **exact reference** (equality);
+  ordering two policy references and intersecting AgentType with Task policy is
+  deferred (`D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION`), so the coarse
+  workspace/network/isolation fields and restriction capabilities are the
+  B.1-composable restrictions.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle coverage and the continuity minimum against
   the **effective** envelope (a config may narrow, never widen, the source's
@@ -72,7 +81,10 @@ resolved) and implemented in `agentype-agent-contract`:
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network and pinned sandbox
-  policy, not merely the AgentType ceiling. B.3/B.4 MUST use
+  policy, not merely the AgentType ceiling. For `Restriction` capabilities the
+  effective value is the deterministic join of the AgentType and Task values
+  (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality), and that
+  joined value MUST be enforced by imported evidence. B.3/B.4 MUST use
   `can_provision_task`, not the bare conjunction.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information

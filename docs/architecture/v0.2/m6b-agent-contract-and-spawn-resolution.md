@@ -292,7 +292,13 @@ discipline; `config_digest` MUST be a validated canonical representation before
 it enters schema v6; and the immutable catalog schema MUST enforce a canonical
 claim representation (at most one value per exact `CapabilityRef`, or a
 deterministic dedup rule) so an exact revision cannot encode in more than one
-way.
+way; and publication MUST verify `based_on` provenance (`derived.based_on ==
+base.type_ref`) rather than trusting the field.
+
+B.4 binding-bridge obligations: `ResolvedProvisioningEvidence.adapter_kind` and
+`AdapterBindingPolicy.required_safety`/`status` are not consumed by the B.1
+relations; the launch bridge MUST consume them (exact binding, safety
+intersection) so they do not remain dead metadata.
 
 ---
 
