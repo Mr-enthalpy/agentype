@@ -41,6 +41,15 @@ the current disposition, and revision-content identity is expressed explicitly
 (e.g. `same_revision_content`). Content digests, cache keys, and snapshots MUST
 use the content identity, never the composed `==`.
 
+Revision-content identity has a canonicalization precondition: `claims` and a
+config's `credential_refs` are set-like but stored as ordered sequences, so two
+semantically equal revisions in different orders MUST NOT be able to compare
+unequal. B.2 publication MUST sort and dedup claims and credential references
+(and reject duplicate claim values at one exact reference, per the canonical
+claim rule) before forming revision content or digests, and MUST include a
+permutation-invariance conformance test. Until then, `same_revision_content` is
+defined only over canonicalized records.
+
 ## Selection order (MUST)
 
 1. correctness constraints

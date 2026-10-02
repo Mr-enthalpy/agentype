@@ -353,6 +353,11 @@ pub struct SpawnSource {
 
 impl SpawnSource {
     /// Immutable revision-content identity, excluding the mutable disposition.
+    ///
+    /// Precondition: both records are **canonicalized**. `claims` is compared
+    /// as an ordered `Vec`, so non-canonical orderings of the same keyed claim
+    /// set compare unequal. B.2 publication MUST sort/dedup `claims` (and the
+    /// config's `credential_refs`) before forming revision content/digests.
     pub fn same_revision_content(&self, other: &Self) -> bool {
         self.source_ref == other.source_ref
             && self.adapter_policy == other.adapter_policy
@@ -389,6 +394,11 @@ pub struct SourceConfig {
 
 impl SourceConfig {
     /// Immutable revision-content identity, excluding the mutable disposition.
+    ///
+    /// Precondition: both records are **canonicalized**. `claims` and
+    /// `credential_refs` are compared as ordered `Vec`s, so non-canonical
+    /// orderings of the same set-like content compare unequal. B.2 publication
+    /// MUST sort/dedup them before forming revision content/digests.
     pub fn same_revision_content(&self, other: &Self) -> bool {
         self.config_ref == other.config_ref
             && self.config_digest == other.config_digest
