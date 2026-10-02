@@ -77,8 +77,9 @@ SpawnSource               advertised lifecycle/continuity envelopes, the
                           provisionable functional envelope (ceiling), source-wide
                           declarations, status
 SourceConfig              opaque source-private config: exact source ref,
-                          identity, digest, credential refs, config declarations
-                          (which MUST stay within the source envelope), status
+                          identity, digest, config declarations and optional
+                          lifecycle/continuity overrides (which MUST stay within
+                          the source envelope), credential refs, status
 AdapterBindingPolicy      stable alias -> physical binding, required safety
 SandboxPolicyRef          exact reference to the full spec-10 sandbox vocabulary
 PhysicalSafety            private, validated enforceable sets: isolation,
@@ -143,8 +144,11 @@ evidence.adapter_policy == source.adapter_policy     (adapter A's facts never fi
 evidence.subject == (source_ref, config_ref, config_digest)
                                                      (config A's evidence never covers config B)
 agent.sandbox_policy (if pinned) ∈ evidence.enforced sandbox policies
-agent lifecycle  ⊆ source lifecycle_modes
-source continuity_modes advertise a mode >= agent continuity
+config lifecycle/continuity overrides (if present) MUST be a subset of the source
+effective lifecycle  = config override else source lifecycle_modes
+effective continuity = config override else source continuity_modes
+agent lifecycle  ⊆ effective lifecycle
+effective continuity advertises a mode >= agent continuity
 for each exact capability revision the agent requires:
     definition = CapabilityCatalog(reference)        (missing definition fails closed)
     functional: the source envelope is the provisionable CEILING; source and
@@ -192,7 +196,9 @@ field that looks like a security restriction MUST have a proof path, a derived
 type MUST NOT become narrower without an equal-or-narrower mechanically
 enforceable policy, and prompt/semantic labels are never enforcement.
 
-Capability polarity (from the catalog security class): `Ability`
+Capability polarity is a catalog-owned field **independent of the security
+class**: `SecurityClass` answers "does this need imported evidence?" while
+`CapabilityPolarity` answers "which direction narrows?". `Ability`
 (Functional/Authority) narrows by shrinking — remove or lower, never add or
 raise; `Restriction` (Sandbox/Continuity) narrows by growing — add or raise,
 never drop or lower. The `lifecycle` set is a required source envelope (the
@@ -282,8 +288,11 @@ LogicalAgentId, Generation membership, Lease, or Result authority.
 B.2 obligations recorded here (not implemented in B.1): a published
 `(ref, canonical content digest)` MUST be immutable — the same exact ref with a
 different canonical content is an invariant violation, not a Rust caller
-discipline; and `config_digest` MUST be a validated canonical representation
-before it enters schema v6.
+discipline; `config_digest` MUST be a validated canonical representation before
+it enters schema v6; and the immutable catalog schema MUST enforce a canonical
+claim representation (at most one value per exact `CapabilityRef`, or a
+deterministic dedup rule) so an exact revision cannot encode in more than one
+way.
 
 ---
 

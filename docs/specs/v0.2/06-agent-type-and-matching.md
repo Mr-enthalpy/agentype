@@ -54,9 +54,11 @@ resolved) and implemented in `agentype-agent-contract`:
   restriction MUST NOT exist without a proof path, and a derived type MUST NOT
   become narrower without an equal-or-narrower mechanically enforceable policy.
 - `can_provision` checks that the config belongs to the exact source revision,
-  source/config activity, lifecycle coverage, the continuity minimum
-  (`source.continuity_modes` advertises a mode at least as strong as required),
-  every required
+  source/config activity, lifecycle coverage and the continuity minimum against
+  the **effective** envelope (a config may narrow, never widen, the source's
+  `lifecycle_modes`/`continuity_modes`; the effective set is the config override
+  when present, else the source envelope; continuity requires a mode at least as
+  strong as required), every required
   capability **at its exact revision** (the source envelope is the provisionable
   ceiling; config/source declarations MUST stay within it), the imported
   `ENFORCED` evidence for security-class capabilities, mechanically enforceable
@@ -87,11 +89,14 @@ resolved) and implemented in `agentype-agent-contract`:
   guarantee** (`derived.continuity >= base.continuity` — strengthening is
   allowed). Affinity is an allowed-tag ceiling with an explicit top: `Any` is
   general and unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and
-  `Any ≤ Only(B)` is false. Capability values use the catalog-owned **polarity**:
-  an `Ability` capability (Functional, Authority) narrows by shrinking — a
-  derived type may remove or lower it but never add or raise it; a `Restriction`
-  capability (Sandbox, Continuity) narrows by growing — a derived type may add
-  or raise it but never drop or lower it. The executable-Task-set-subset
+  `Any ≤ Only(B)` is false. Capability values use the catalog-owned **polarity**,
+  which is an independent field: `SecurityClass` decides whether imported
+  evidence is required, while `CapabilityPolarity` decides which direction
+  narrows. An `Ability` capability narrows by shrinking — a derived type may
+  remove or lower it but never add or raise it; a `Restriction` capability
+  narrows by growing — a derived type may add or raise it but never drop or
+  lower it. Functional/Authority and Sandbox/Continuity are only conventional
+  defaults, not bindings. The executable-Task-set-subset
   invariant holds for the ability/scope dimensions; continuity is deliberately a
   guarantee-strengthening dimension outside it. The `lifecycle` set is a
   **required source envelope** (the source must support every listed mode), not
