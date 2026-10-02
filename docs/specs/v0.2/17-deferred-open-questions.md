@@ -10,12 +10,13 @@ Classification:
 
 - `BLOCKS_KERNEL` — RIIR M4 cannot start
 - `BLOCKS_SEMANTIC_LAYER` — M6 cannot start
+- `BLOCKS_M6B_B3` — M6-B.1 may proceed; resolve before M6-B B.3 typed admission (does not retroactively block M6-A/B.1)
 - `BLOCKS_M6B_FREEZE` — M6-B.1 may proceed as a draft kernel, but M6-B MUST NOT be frozen/merged
 - `DOES_NOT_BLOCK_RIIR_KERNEL` — M4 may proceed; resolve before the named gate
 
 | ID | Question | Why unresolved | Blocks | Resolve by |
 |---|---|---|---|---|
-| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | **DEFERRED (Does not block M6-A)**: M6-A freezes explicit Root admission as the sole expansion authority; automated policy DSL and machine-governed admission deferred. Before M6-B B.3 typed admission, the interface by which a Generation policy folds into an immutable effective policy/requirement MUST be defined | BLOCKS_SEMANTIC_LAYER | post-M6-A (folding interface before M6-B B.3) |
+| D-GEN-POLICY | GenerationPolicy encoding (modes, budget shape, boolean vs numeric intents, drain/review flags) | **DEFERRED (Does not block M6-A)**: M6-A freezes explicit Root admission as the sole expansion authority; automated policy DSL and machine-governed admission deferred. Before M6-B B.3 typed admission, the interface by which a Generation policy folds into an immutable effective policy/requirement MUST be defined | BLOCKS_M6B_B3 | before M6-B B.3 |
 | D-GEN-INTRA | May Root add Tasks after a Generation is already OPEN/ACTIVE? | **RESOLVED in M6-A**: Root may add Tasks dynamically; in OPEN all functions allowed, in FROZEN only compression allowed | None (Resolved) | M6-A |
 | D-GEN-TOPOLOGY | Generation provenance chain vs DAG | **RESOLVED in M6-A**: DAG tracked via immutable `SemanticInputSet` on each task binding and generation seed | None (Resolved) | M6-A |
 | D-INTENT-SCHEMA | RawWorkIntent strictness for domain workers | **RESOLVED in M6-A**: Ingress `RawWorkIntent` structure compiles deterministically to `CompiledWorkProposal` | None (Resolved) | M6-A |

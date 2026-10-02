@@ -297,7 +297,9 @@ discipline; `config_digest` MUST be a validated canonical representation before
 it enters schema v6; and the immutable catalog schema MUST enforce a canonical
 claim representation (at most one value per exact `CapabilityRef`, or a
 deterministic dedup rule) so an exact revision cannot encode in more than one
-way; publication MUST verify `based_on` provenance (`derived.based_on ==
+way; the durable encoding MUST normalize `Bool(false)` to omission so absence has
+exactly one representation; publication MUST verify `based_on` provenance
+(`derived.based_on ==
 base.type_ref`) rather than trusting the field; and schema v6 MUST persist
 immutable revision content separately from the mutable
 `SpawnSourceDisposition`/config-disposition overlay, so status never enters the
