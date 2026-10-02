@@ -1823,3 +1823,142 @@ fn test_config_cannot_widen_source_lifecycle() {
         Err(ContractError::SourceConfigInvalid { .. })
     ));
 }
+
+#[test]
+fn test_task_adds_restriction_to_broad_agent() {
+    let mut cat = CapabilityCatalog::new();
+    cat.define(
+        cref("locked_paths", 1),
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+        CapabilityPolarity::Restriction,
+    )
+    .unwrap();
+
+    // Broad AgentType: no locked_paths.
+    let agent = base_agent();
+
+    let mut task = base_task();
+    task.required_capabilities.insert(
+        cref("locked_paths", 1),
+        CapabilityValue::Set(set(&["/secret"])),
+    );
+
+    // The Task adds a restriction the AgentType did not pre-advertise.
+    assert!(can_execute(&agent, &task, &cat).is_ok());
+
+    let enforced = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(
+            cref("locked_paths", 1),
+            CapabilityValue::Set(set(&["/secret"])),
+        )],
+    );
+    assert!(can_provision_task(
+        &agent,
+        &base_source(),
+        &base_config(),
+        &enforced,
+        &cat,
+        &task
+    )
+    .is_ok());
+
+    // No evidence for the restriction: ineligible.
+    assert!(matches!(
+        can_provision_task(
+            &agent,
+            &base_source(),
+            &base_config(),
+            &base_evidence(),
+            &cat,
+            &task
+        ),
+        Err(ContractError::SecurityUnenforceable { .. })
+    ));
+
+    // Evidence that does not actually enforce the joined restriction: ineligible.
+    let weak = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])))],
+    );
+    assert!(
+        can_provision_task(&agent, &base_source(), &base_config(), &weak, &cat, &task).is_err()
+    );
+}
+
+#[test]
+fn test_task_strengthens_restriction() {
+    let mut cat = CapabilityCatalog::new();
+    cat.define(
+        cref("locked_paths", 1),
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+        CapabilityPolarity::Restriction,
+    )
+    .unwrap();
+
+    let mut agent = base_agent();
+    agent
+        .contract
+        .required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])));
+
+    let mut task = base_task();
+    task.required_capabilities.insert(
+        cref("locked_paths", 1),
+        CapabilityValue::Set(set(&["/a", "/b"])),
+    );
+
+    assert!(can_execute(&agent, &task, &cat).is_ok());
+
+    let strong = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(
+            cref("locked_paths", 1),
+            CapabilityValue::Set(set(&["/a", "/b"])),
+        )],
+    );
+    assert!(
+        can_provision_task(&agent, &base_source(), &base_config(), &strong, &cat, &task).is_ok()
+    );
+
+    let weak = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        base_physical(),
+        Vec::new(),
+        vec![(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])))],
+    );
+    assert!(
+        can_provision_task(&agent, &base_source(), &base_config(), &weak, &cat, &task).is_err()
+    );
+}
+
+#[test]
+fn test_config_continuity_override_is_ordered() {
+    let cat = CapabilityCatalog::new();
+
+    let mut source = base_source();
+    source.continuity_modes = [ContinuityMode::Logical].into_iter().collect();
+
+    // A source that provides Logical permits a config that only commits to None.
+    let mut config = base_config();
+    config.continuity_modes = Some([ContinuityMode::None].into_iter().collect());
+    assert!(validate_source_config(&config, &source, &cat).is_ok());
+
+    // But a config cannot demand Logical from a source that only has None.
+    let mut weak_source = base_source();
+    weak_source.continuity_modes = [ContinuityMode::None].into_iter().collect();
+    let mut too_strong = base_config();
+    too_strong.continuity_modes = Some([ContinuityMode::Logical].into_iter().collect());
+    assert!(matches!(
+        validate_source_config(&too_strong, &weak_source, &cat),
+        Err(ContractError::SourceConfigInvalid { .. })
+    ));
+}

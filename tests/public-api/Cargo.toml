@@ -25,4 +25,7 @@ path = "src/lib.rs"
 agentype-runtime = { path = "../../crates/agentype-runtime" }
 agentype-core = { path = "../../crates/agentype-core" }
 agentype-root-bridge = { path = "../../crates/agentype-root-bridge" }
+# Pure M6-B semantic kernel; a consumer may depend on it, but its imported
+# enforcement evidence must have no constructor on the default surface.
+agentype-agent-contract = { path = "../../crates/agentype-agent-contract" }
 serde_json = { workspace = true }

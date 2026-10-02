@@ -35,7 +35,10 @@ impl Budget {
     }
 }
 
-/// A canonical, non-empty config content digest.
+/// A non-empty config content digest.
+///
+/// Only non-emptiness is enforced here; the canonical digest representation is a
+/// B.2 publication obligation and MUST NOT be assumed from this type alone.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConfigDigest(String);
 

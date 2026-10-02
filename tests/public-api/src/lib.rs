@@ -249,4 +249,14 @@ pub fn result_carried_ingress() {}
 ///     let _ = ingress.close_generation(generation, 0);
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 18. Imported enforcement evidence has no constructor on the supported
+/// //     default production surface; `for_tests` exists only under
+/// //     `test-support`, so an ordinary consumer cannot mint a security proof.
+/// use agentype_agent_contract::ResolvedProvisioningEvidence;
+/// fn _no_evidence_mint() {
+///     let _ = ResolvedProvisioningEvidence::for_tests;
+/// }
+/// ```
 pub fn probes() {}

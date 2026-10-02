@@ -11,8 +11,8 @@
 //! AgentType.
 
 use crate::capability::{
-    value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim, CapabilityRef,
-    CapabilityValue, MatcherKind,
+    value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
+    CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
 };
 use crate::error::ContractError;
 use crate::evidence::ResolvedProvisioningEvidence;
@@ -162,9 +162,15 @@ pub fn validate_source_config(
         }
     }
     if let Some(modes) = &config.continuity_modes {
-        if !modes.is_subset(&source.continuity_modes) {
+        // Continuity is an ordered minimum: a config may require a mode that the
+        // source can satisfy with a mode at least as strong (e.g. source
+        // {Logical} permits a config {None}).
+        let satisfiable = modes
+            .iter()
+            .all(|needed| source.continuity_modes.iter().any(|have| have >= needed));
+        if !satisfiable {
             return Err(ContractError::SourceConfigInvalid {
-                reason: "config continuity modes widen the source envelope".into(),
+                reason: "config continuity modes exceed the source envelope".into(),
             });
         }
     }
@@ -218,6 +224,13 @@ pub fn can_execute(
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: reference.capability_id().as_str().to_string(),
                 })?;
+        // Restriction capabilities are effective policy the Task may add or
+        // strengthen; they are composed with the AgentType and proven against
+        // imported evidence in `can_provision_task`, not required to be
+        // pre-advertised by the AgentType.
+        if definition.polarity == CapabilityPolarity::Restriction {
+            continue;
+        }
         let provided = agent
             .contract
             .required_capabilities
@@ -472,7 +485,82 @@ pub fn can_provision_task(
         });
     }
 
+    // Task restrictions compose with the AgentType envelope (join), and the
+    // joined effective restriction must be enforced by imported evidence.
+    for (reference, task_value) in &task.required_capabilities {
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: capability_key(reference),
+                })?;
+        if definition.polarity != CapabilityPolarity::Restriction {
+            continue;
+        }
+        let effective = match agent.contract.required_capabilities.get(reference) {
+            Some(agent_value) => restriction_join(definition.matcher_kind, agent_value, task_value)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: capability_key(reference),
+                })?,
+            None => task_value.clone(),
+        };
+        let provided = evidence.enforced_capability(reference).ok_or_else(|| {
+            ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "Task restriction {}@{} has no imported enforcement evidence",
+                    reference.capability_id().as_str(),
+                    reference.revision()
+                ),
+            }
+        })?;
+        if !value_satisfies(definition.matcher_kind, &effective, provided) {
+            return Err(ContractError::CapabilityMismatch {
+                capability: capability_key(reference),
+            });
+        }
+    }
+
     Ok(())
+}
+
+/// Deterministic join of two restriction values (the effective, strongest
+/// restriction). `None` means the two values are incompatible.
+fn restriction_join(
+    matcher: MatcherKind,
+    a: &CapabilityValue,
+    b: &CapabilityValue,
+) -> Option<CapabilityValue> {
+    match (matcher, a, b) {
+        (MatcherKind::Bool, CapabilityValue::Bool(x), CapabilityValue::Bool(y)) => {
+            Some(CapabilityValue::Bool(*x || *y))
+        }
+        (MatcherKind::Set, CapabilityValue::Set(x), CapabilityValue::Set(y)) => {
+            Some(CapabilityValue::Set(x.union(y).cloned().collect()))
+        }
+        (
+            MatcherKind::Ordered,
+            CapabilityValue::Ordered {
+                class: ac,
+                rank: ar,
+            },
+            CapabilityValue::Ordered {
+                class: bc,
+                rank: br,
+            },
+        ) if ac == bc => Some(CapabilityValue::Ordered {
+            class: ac.clone(),
+            rank: (*ar).max(*br),
+        }),
+        (MatcherKind::Quantity, CapabilityValue::Quantity(x), CapabilityValue::Quantity(y)) => {
+            Some(CapabilityValue::Quantity(if x.get() >= y.get() {
+                *x
+            } else {
+                *y
+            }))
+        }
+        (MatcherKind::Exact, x, y) if x == y => Some(x.clone()),
+        _ => None,
+    }
 }
 
 /// `Ability` order: `derived` advertises no more than `base`. A smaller/equal
@@ -542,8 +630,6 @@ fn capability_provision_no_wider(
     base: &AgentTypeContract,
     catalog: &CapabilityCatalog,
 ) -> bool {
-    use crate::capability::CapabilityPolarity;
-
     // A capability `base` lacks.
     for reference in derived.required_capabilities.keys() {
         if base.required_capabilities.contains_key(reference) {
