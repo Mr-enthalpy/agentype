@@ -1640,3 +1640,69 @@ fn test_losing_security_guarantee_is_not_more_specific() {
     assert!(can_execute(&unguarded, &req, &cat).is_ok());
     assert!(!more_specific_for(&unguarded, &guaranteed, &req, &cat));
 }
+
+#[test]
+fn test_continuity_is_ordered_minimum_guarantee() {
+    let cat = CapabilityCatalog::new();
+
+    // Source advertises {Logical}, which is at least None.
+    let mut source = base_source();
+    source.continuity_modes = [ContinuityMode::Logical].into_iter().collect();
+
+    let mut agent_none = base_agent();
+    agent_none.contract.continuity = ContinuityMode::None;
+    assert!(can_provision(&agent_none, &source, &base_config(), &base_evidence(), &cat).is_ok());
+
+    let mut agent_logical = base_agent();
+    agent_logical.contract.continuity = ContinuityMode::Logical;
+    assert!(can_provision(
+        &agent_logical,
+        &source,
+        &base_config(),
+        &base_evidence(),
+        &cat
+    )
+    .is_ok());
+
+    // Source advertises only {None}; a Logical requirement fails.
+    let mut weak_source = base_source();
+    weak_source.continuity_modes = [ContinuityMode::None].into_iter().collect();
+    assert!(can_provision(
+        &agent_logical,
+        &weak_source,
+        &base_config(),
+        &base_evidence(),
+        &cat
+    )
+    .is_err());
+
+    // Task minimum also uses the ordered semantics.
+    let task = base_task(); // required_continuity = None
+    assert!(can_provision_task(
+        &agent_logical,
+        &source,
+        &base_config(),
+        &base_evidence(),
+        &cat,
+        &task
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_continuity_is_not_semantic_specificity() {
+    let cat = CapabilityCatalog::new();
+    let req = base_task();
+
+    let mut logical = base_agent();
+    logical.type_ref = type_ref("logical", 1);
+    logical.contract.continuity = ContinuityMode::Logical;
+
+    let mut none = base_agent();
+    none.type_ref = type_ref("none", 1);
+    none.contract.continuity = ContinuityMode::None;
+
+    // Differing only in continuity: incomparable, not mutually more specific.
+    assert!(!more_specific_for(&logical, &none, &req, &cat));
+    assert!(!more_specific_for(&none, &logical, &req, &cat));
+}

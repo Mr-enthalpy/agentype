@@ -18,8 +18,9 @@ use crate::error::ContractError;
 use crate::evidence::ResolvedProvisioningEvidence;
 use crate::records::{
     network_rank, workspace_rank, AffinityConstraint, AgentType, AgentTypeContract, ConfigStatus,
-    SandboxPolicyRef, SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
+    ContinuityMode, SandboxPolicyRef, SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
 };
+use std::collections::BTreeSet;
 
 /// Deterministic declaration lookup. Conflicting values at the same exact
 /// reference fail closed rather than depending on insertion order.
@@ -50,6 +51,12 @@ fn resolve_claim<'a>(
 
 fn capability_key(reference: &CapabilityRef) -> String {
     reference.capability_id().as_str().to_string()
+}
+
+/// Continuity is a minimum guarantee: a source satisfies a requirement if it
+/// advertises any mode at least as strong (e.g. `{Logical}` satisfies `None`).
+fn continuity_satisfies(source_modes: &BTreeSet<ContinuityMode>, required: ContinuityMode) -> bool {
+    source_modes.iter().any(|mode| *mode >= required)
 }
 
 /// Claims must name a catalog capability, match its declared value shape, and
@@ -296,7 +303,7 @@ pub fn can_provision(
             capability: "lifecycle".into(),
         });
     }
-    if !source.continuity_modes.contains(&agent.contract.continuity) {
+    if !continuity_satisfies(&source.continuity_modes, agent.contract.continuity) {
         return Err(ContractError::CapabilityMismatch {
             capability: "continuity".into(),
         });
@@ -434,7 +441,7 @@ pub fn can_provision_task(
             });
         }
     }
-    if !source.continuity_modes.contains(&task.required_continuity) {
+    if !continuity_satisfies(&source.continuity_modes, task.required_continuity) {
         return Err(ContractError::CapabilityMismatch {
             capability: "continuity".into(),
         });
@@ -609,13 +616,13 @@ fn sandbox_policy_within(
     }
 }
 
-/// A grants no more authority than B on every relevant dimension.
+/// A grants no more authority/semantic scope than B on every relevant dimension.
 ///
-/// This is a **product order**: the authority/scope dimensions follow the
-/// executable-Task-set order, while `continuity` is a provisioning-guarantee
-/// dimension where a stronger guarantee counts as "no wider". `more_specific_for`
-/// is therefore not purely an executable-set subset; continuity strengthening
-/// (e.g. `None -> Logical`) is an intentional guarantee upgrade.
+/// `continuity` is deliberately **not** part of this order: it is a
+/// provisioning-guarantee dimension (a stronger guarantee lets a type execute
+/// more continuity-requiring Tasks), so it belongs to candidate ranking, not to
+/// semantic specificity. Two types differing only in continuity are incomparable
+/// for `more_specific_for`.
 fn authority_no_wider(
     a: &AgentTypeContract,
     b: &AgentTypeContract,
@@ -627,7 +634,6 @@ fn authority_no_wider(
         && affinity_no_wider(&a.affinity, &b.affinity)
         && a.budget_ceiling <= b.budget_ceiling
         && a.lifecycle.is_subset(&b.lifecycle)
-        && a.continuity >= b.continuity
         && workspace_rank(a.security.workspace) <= workspace_rank(b.security.workspace)
         && network_rank(a.security.network) <= network_rank(b.security.network)
         && (!b.security.requires_attempt_isolation || a.security.requires_attempt_isolation)
