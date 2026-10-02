@@ -96,15 +96,25 @@ A capability's security class is defined once by the [`CapabilityCatalog`], not
 per AgentType, so two AgentTypes cannot disagree about whether `network.lock@1`
 is `Sandbox` or `Functional`. The physical adapter binding key is **not**
 modeled here: B.4 consumes the canonical `agentype-execution-config`
-`AdapterBindingKey`. `ResolvedProvisioningEvidence` has no public constructor in
-B.1 (only `for_tests` under `test-support`); the M5 imported-binding bridge owns
-the production producer, exactly as `FrozenExecutionSafety` is owned by
+`AdapterBindingKey`. `ResolvedProvisioningEvidence` has no constructor on the
+supported default production surface in B.1 (it is available only via
+`for_tests` under `test-support`). This is a **supported-surface** boundary, not
+an unforgeable capability: a consumer that explicitly enables `test-support` can
+still construct it, so the wording MUST stay "not on the supported default
+production surface", never "unforgeable". B.4 owns the real production producer
+(M5 imported-binding / safety authority) and MUST add a production compile-fail
+boundary witness, exactly as `FrozenExecutionSafety` is owned by
 `agentype-execution-config`.
 
 `AgentType` MUST NOT be defined by model, provider, terminal, price tier, prompt
-alias, `SourceConfig`, or `AdapterBinding`. `SourceConfig` payloads are opaque:
-Core recognizes identity, digest, credential references, and config-specific
-capability declarations only. All numeric contract values are validated finite
+alias, `SourceConfig`, or `AdapterBinding`. `SourceConfig` is a **selection
+identity, not a config body**: `SourceConfigRef` + revision + `ConfigDigest` are
+the Core-visible identity, the source integration owns the actual
+model/provider/CLI/config-file semantics out of Core, and the source-private
+body/locator is not part of AgentType semantics and need not be stored in
+`agentype-agent-contract`. If B.2 persists an opaque locator or body, Core MUST
+never interpret it. Core recognizes identity, digest, credential references, and
+config-specific capability declarations only. All numeric contract values are validated finite
 non-negative newtypes (`Budget`, `Quantity`); every ref has private fields and a
 validated constructor rejecting empty ids / zero revisions, so a durable digest
 can never form from an invalid value.
@@ -134,7 +144,7 @@ evidence.subject == (source_ref, config_ref, config_digest)
                                                      (config A's evidence never covers config B)
 agent.sandbox_policy (if pinned) ∈ evidence.enforced sandbox policies
 agent lifecycle  ⊆ source lifecycle_modes
-agent continuity ∈ source continuity_modes
+source continuity_modes advertise a mode >= agent continuity
 for each exact capability revision the agent requires:
     definition = CapabilityCatalog(reference)        (missing definition fails closed)
     functional: the source envelope is the provisionable CEILING; source and
@@ -154,10 +164,14 @@ capability claim at a different revision never satisfies a requirement.
 
 Only defined once both `can_execute`, and only when A is no wider than B on
 *every* relevant dimension (information functions, affinity, budget,
-**lifecycle**, workspace/network, isolation, continuity, sandbox policy, anchor,
-and capability values) with at least one dimension strictly narrower. Two types
-with equivalent authority are **incomparable**, not mutually more specific.
-Ranking MUST NOT use nominal inheritance depth.
+**lifecycle**, workspace/network, isolation, sandbox policy, anchor, and
+capability values) with at least one dimension strictly narrower. Two types with
+equivalent authority are **incomparable**, not mutually more specific. Ranking
+MUST NOT use nominal inheritance depth.
+
+`continuity` is deliberately excluded: it is a candidate-ranking dimension
+applied after compatibility, not semantic specificity. Two types differing only
+in continuity are incomparable for `more_specific_for`.
 
 ### One authoritative sandbox vocabulary
 
@@ -202,8 +216,9 @@ capability values follow catalog polarity: Ability must not grow, Restriction
 `continuity` is the one **provisioning-guarantee** dimension: strengthening it
 is a valid refinement (`derived >= base`) even though it lets the type execute
 more continuity-requiring Tasks. The executable-Task-set-subset invariant is
-therefore scoped to the authority/scope dimensions, and `more_specific_for` is a
-product order over both groups.
+therefore scoped to the authority/scope dimensions. Continuity is **not** part
+of `more_specific_for`; it is a candidate-ranking dimension applied after
+compatibility.
 
 ### Physical eligibility seam
 

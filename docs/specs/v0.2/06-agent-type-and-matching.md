@@ -54,7 +54,9 @@ resolved) and implemented in `agentype-agent-contract`:
   restriction MUST NOT exist without a proof path, and a derived type MUST NOT
   become narrower without an equal-or-narrower mechanically enforceable policy.
 - `can_provision` checks that the config belongs to the exact source revision,
-  source/config activity, lifecycle and continuity coverage, every required
+  source/config activity, lifecycle coverage, the continuity minimum
+  (`source.continuity_modes` advertises a mode at least as strong as required),
+  every required
   capability **at its exact revision** (the source envelope is the provisionable
   ceiling; config/source declarations MUST stay within it), the imported
   `ENFORCED` evidence for security-class capabilities, mechanically enforceable
@@ -70,12 +72,14 @@ resolved) and implemented in `agentype-agent-contract`:
   enforce the Task's effective (stricter) workspace/network and pinned sandbox
   policy, not merely the AgentType ceiling. B.3/B.4 MUST use
   `can_provision_task`, not the bare conjunction.
-- `more_specific_for` is defined only once both types are executable. It is a
-  **product order**: the authority/scope dimensions use the executable-Task-set
-  order and `continuity` uses the provisioning-guarantee order (a stronger
-  guarantee counts as no-wider). It MUST be strict (two types with equivalent
-  authority are incomparable), includes affinity, lifecycle, sandbox policy, and
-  every authority dimension, and MUST NOT rank by nominal inheritance depth.
+- `more_specific_for` is defined only once both types are executable, over the
+  semantic/authority/scope dimensions (affinity, budget, lifecycle, information
+  functions, workspace/network, isolation, sandbox policy, anchor, and capability
+  values). It MUST be strict (two types with equivalent authority are
+  incomparable) and MUST NOT rank by nominal inheritance depth. `continuity`
+  strength is deliberately **not** part of semantic specificity: it is a
+  candidate-ranking dimension applied after compatibility (a stronger guarantee
+  lets a type execute more continuity-requiring Tasks).
 - `is_valid_refinement` enforces monotonic narrowing of affinity, budget,
   information functions, sandbox policy, anchor, security policy, and capability
   values; a derived type MUST NOT widen the lifecycle mode set, weaken required
@@ -92,6 +96,12 @@ resolved) and implemented in `agentype-agent-contract`:
   guarantee-strengthening dimension outside it. The `lifecycle` set is a
   **required source envelope** (the source must support every listed mode), not
   a set of alternative instantiation choices.
+
+`SourceConfigRef` + revision + `ConfigDigest` are the Core-visible **selection
+identity** of an opaque source-private configuration. The configuration body or
+locator (model/provider/CLI/config-file semantics) belongs to the source
+integration and is not part of AgentType semantics; Core MUST NOT interpret it,
+and it need not be stored in `agentype-agent-contract`.
 
 ## Refinement monotonicity
 
