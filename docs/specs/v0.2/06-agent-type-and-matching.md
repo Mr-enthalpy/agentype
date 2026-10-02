@@ -84,8 +84,12 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   policy, not merely the AgentType ceiling. For `Restriction` capabilities the
   effective value is the deterministic join of the AgentType and Task values
   (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality), and that
-  joined value MUST be enforced by imported evidence. B.3/B.4 MUST use
-  `can_provision_task`, not the bare conjunction.
+  joined value is proven by imported evidence for security classes and by the
+  effective source/config functional value otherwise — `SecurityClass` keeps
+  controlling proof authority independently of polarity. Every Task capability
+  value MUST match its catalog definition shape and fail closed otherwise, even
+  for `Restriction` capabilities the AgentType does not pre-advertise. B.3/B.4
+  MUST use `can_provision_task`, not the bare conjunction.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information
   functions, workspace/network, isolation, sandbox policy, anchor, and capability

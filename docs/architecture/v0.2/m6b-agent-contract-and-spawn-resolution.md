@@ -298,7 +298,13 @@ base.type_ref`) rather than trusting the field.
 B.4 binding-bridge obligations: `ResolvedProvisioningEvidence.adapter_kind` and
 `AdapterBindingPolicy.required_safety`/`status` are not consumed by the B.1
 relations; the launch bridge MUST consume them (exact binding, safety
-intersection) so they do not remain dead metadata.
+intersection) so they do not remain dead metadata. The production evidence
+authority fence is the Scheduler's internal resolution path, which may receive
+evidence only from the trusted imported-binding/safety authority; there MUST NOT
+be any production control API that injects caller-supplied evidence into an
+authoritative resolver. A constructor being absent on the default surface is not
+an authority proof, and B.4 MUST add a stronger conformance test than the
+`test-support` visibility.
 
 ---
 

@@ -24,7 +24,7 @@ Legend: **RV** Root-visible · **SI** Scheduler-internal · **AB** Adapter-bound
 | AgentTransform | id | Scheduler | saga until terminal | state machine | Y | Y | N | Y | N |
 | MemoryCapsule | id + version | Scheduler | with agent/lineage | versioned replace | limited | Y | N | Y | Y |
 | PoolPartition | id / name | Scheduler | until RETIRED | V0.1 immutability of structure | Y | Y | partial | Y | topology rev |
-| SpawnSource | source_id | config / composition | deployment | config | N | Y | Y | config | N |
+| SpawnSource | source_id + revision | config / composition | family until deprecated; revisions immutable | published revisions immutable | N | Y | Y | Y | revision |
 | Incarnation | id | Scheduler | one physical hosting | state machine | N | Y | Y | Y | gen |
 | Execution | id | Scheduler | one Task turn | physical history | N | Y | Y | Y | N |
 | Attempt | id | Scheduler | one claim try | state machine | N | Y | N | Y | epoch |
@@ -94,7 +94,11 @@ evolution is specified, kernel MOVE/MERGE/RETIRE rules in [11](11-pool-topology.
 remain. Exact V0.2 partition-vs-type split remainder is DEFERRED (D-TOPOLOGY).
 
 **SpawnSource** is physical provisioning capability. It MUST NOT be semantic
-identity.
+identity. Its stable family identity is `source_id`; a published
+`SpawnSourceRef(source_id, revision)` is an exact, immutable revision used by
+`SourceConfigRef`, evidence subject binding, and exact pinning. Verified
+enforcement facts come from imported evidence, never from the source record
+itself.
 
 **Lease** plus matching fencing epoch is execution authority.
 
