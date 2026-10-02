@@ -76,10 +76,8 @@ fn validate_claims(
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
     for claim in claims {
-        // Bool(false) is absence: a non-present claim is normalized away.
-        if !claim.value.is_present() {
-            continue;
-        }
+        // Resolve and shape-check before absence normalization: `Bool(false)` is
+        // absence only for a capability the catalog defines as `Bool`.
         let definition =
             catalog
                 .get(&claim.reference)
@@ -115,10 +113,7 @@ pub fn validate_spawn_source(
 ) -> Result<(), ContractError> {
     validate_claims(&source.claims, catalog)?;
     for (reference, value) in &source.functional_envelope {
-        // Bool(false) is absence: normalize it away.
-        if !value.is_present() {
-            continue;
-        }
+        // Resolve and shape-check before absence normalization.
         let definition =
             catalog
                 .get(reference)
@@ -241,24 +236,25 @@ pub fn can_execute(
     }
 
     for (reference, required) in &req.required_capabilities {
-        // Bool(false) is absence: a Task that expresses "no requirement" for a
-        // capability is exactly a Task that omits it.
-        if !required.is_present() {
-            continue;
-        }
         let definition =
             catalog
                 .get(reference)
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: reference.capability_id().as_str().to_string(),
                 })?;
-        // Fail closed on a malformed value shape before any polarity handling.
+        // Fail closed on a malformed value shape before any polarity or absence
+        // handling: `Bool(false)` is absence only for a `Bool` capability.
         if definition.matcher_kind != required.matcher_kind() {
             return Err(ContractError::InvariantViolation(format!(
                 "Task capability value shape does not match the definition for {}@{}",
                 reference.capability_id().as_str(),
                 reference.revision()
             )));
+        }
+        // A Task that expresses "no requirement" via Bool(false) is exactly a
+        // Task that omits it (shape already verified).
+        if !required.is_present() {
+            continue;
         }
         // Restriction capabilities are effective policy the Task may add or
         // strengthen; they are composed with the AgentType and proven in
@@ -390,16 +386,17 @@ pub fn can_provision(
     }
 
     for (reference, required) in &agent.contract.required_capabilities {
-        // Bool(false) is absence and imposes no provisioning requirement.
-        if !required.is_present() {
-            continue;
-        }
         let definition =
             catalog
                 .get(reference)
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: reference.capability_id().as_str().to_string(),
                 })?;
+        // Shape is already enforced by `agent.contract.validate`; a Bool(false)
+        // that reaches here is a canonical absence for a Bool capability.
+        if !required.is_present() {
+            continue;
+        }
         let capability_name = reference.capability_id().as_str().to_string();
 
         if definition.security_class.requires_evidence() {
@@ -551,17 +548,17 @@ pub fn can_provision_task(
     // and by the effective source/config functional value otherwise, keeping
     // SecurityClass (proof authority) orthogonal to polarity (composition).
     for (reference, task_value) in &task.required_capabilities {
-        // Bool(false) is absence: a Task expressing "no restriction" must not
-        // demand an enforcement proof for a capability it does not require.
-        if !task_value.is_present() {
-            continue;
-        }
         let definition =
             catalog
                 .get(reference)
                 .ok_or_else(|| ContractError::CapabilityMismatch {
                     capability: capability_key(reference),
                 })?;
+        // A Task expressing "no restriction" via Bool(false) must not demand an
+        // enforcement proof (shape is enforced by `can_execute` above).
+        if !task_value.is_present() {
+            continue;
+        }
         if definition.polarity != CapabilityPolarity::Restriction {
             continue;
         }

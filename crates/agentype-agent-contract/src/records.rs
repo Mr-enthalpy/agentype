@@ -266,12 +266,9 @@ impl AgentTypeContract {
             ));
         }
         for (reference, value) in &self.required_capabilities {
-            // Bool(false) is absence: normalize it away so a contract that
-            // omits a capability and one that spells Bool(false) validate and
-            // behave identically.
-            if !value.is_present() {
-                continue;
-            }
+            // Resolve and shape-check BEFORE any absence normalization: a
+            // `Bool(false)` is absence only when the catalog says the capability
+            // is a `Bool`. A malformed or unknown capability MUST fail closed.
             let definition =
                 catalog
                     .get(reference)
@@ -337,11 +334,12 @@ pub enum ConfigStatus {
 /// operational disposition overlay, not part of the revision identity or any
 /// content digest (see spec 07 "Revision and disposition ownership").
 ///
-/// This is a resolved *view*, not the immutable revision authority: `PartialEq`
-/// compares content only, so the mutable disposition can never leak into a
-/// content digest, cache key, or snapshot identity. B.2 persists the revision
-/// and the disposition separately.
-#[derive(Clone, Debug)]
+/// This is a resolved *view*, not the immutable revision authority. Ordinary
+/// `==` compares the whole value including the mutable disposition; callers that
+/// need revision-content identity (digests, cache keys, snapshots) MUST use
+/// [`SpawnSource::same_revision_content`] instead of relying on `==`. B.2
+/// persists the revision and the disposition separately.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SpawnSource {
     pub source_ref: SpawnSourceRef,
     pub adapter_policy: AdapterPolicyRef,
@@ -353,8 +351,9 @@ pub struct SpawnSource {
     pub status: SourceStatus,
 }
 
-impl PartialEq for SpawnSource {
-    fn eq(&self, other: &Self) -> bool {
+impl SpawnSource {
+    /// Immutable revision-content identity, excluding the mutable disposition.
+    pub fn same_revision_content(&self, other: &Self) -> bool {
         self.source_ref == other.source_ref
             && self.adapter_policy == other.adapter_policy
             && self.lifecycle_modes == other.lifecycle_modes
@@ -368,10 +367,11 @@ impl PartialEq for SpawnSource {
 /// only its identity, digest, credential references, and any config-specific
 /// declarations (which MUST stay within the source envelope) are modeled here.
 ///
-/// Like [`SpawnSource`], this is a resolved view: `PartialEq` compares
-/// immutable content only, so the mutable `status` disposition never enters a
-/// content digest or identity comparison.
-#[derive(Clone, Debug)]
+/// Like [`SpawnSource`], this is a resolved view. Ordinary `==` includes the
+/// mutable `status`; revision-content identity (digests, cache keys) MUST use
+/// [`SourceConfig::same_revision_content`], which excludes the disposition and
+/// the opaque `config_digest`-independent operational state.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
     pub config_digest: ConfigDigest,
@@ -387,8 +387,9 @@ pub struct SourceConfig {
     pub status: ConfigStatus,
 }
 
-impl PartialEq for SourceConfig {
-    fn eq(&self, other: &Self) -> bool {
+impl SourceConfig {
+    /// Immutable revision-content identity, excluding the mutable disposition.
+    pub fn same_revision_content(&self, other: &Self) -> bool {
         self.config_ref == other.config_ref
             && self.config_digest == other.config_digest
             && self.lifecycle_modes == other.lifecycle_modes

@@ -2285,14 +2285,98 @@ fn test_incompatible_restriction_join_fails_can_execute() {
 }
 
 #[test]
-fn test_disposition_not_part_of_content_equality() {
+fn test_disposition_is_separate_from_revision_content() {
     let source = base_source();
     let mut draining_source = base_source();
     draining_source.status = SourceStatus::Draining;
-    assert_eq!(source, draining_source);
+    // Ordinary equality sees the operational change...
+    assert_ne!(source, draining_source);
+    // ...while revision-content identity deliberately ignores it.
+    assert!(source.same_revision_content(&draining_source));
 
     let config = base_config();
     let mut draining_config = base_config();
     draining_config.status = ConfigStatus::Draining;
-    assert_eq!(config, draining_config);
+    assert_ne!(config, draining_config);
+    assert!(config.same_revision_content(&draining_config));
+}
+
+#[test]
+fn test_bool_false_does_not_bypass_shape_validation_task() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "locked_paths",
+        1,
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+    );
+    let mut task = base_task();
+    task.required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Bool(false));
+
+    // Bool(false) is absence only for a Bool capability; a Set definition must
+    // still fail closed on the wrong shape.
+    assert!(matches!(
+        can_execute(&base_agent(), &task, &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn test_bool_false_does_not_bypass_shape_validation_agent() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "locked_paths",
+        1,
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+    );
+    let mut agent = base_agent();
+    agent
+        .contract
+        .required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Bool(false));
+
+    assert!(matches!(
+        can_execute(&agent, &base_task(), &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn test_bool_false_does_not_bypass_catalog_lookup() {
+    let cat = CapabilityCatalog::new();
+    let mut task = base_task();
+    task.required_capabilities.insert(
+        cref("unknown_capability", 999),
+        CapabilityValue::Bool(false),
+    );
+
+    // An unknown capability must not be silently treated as absence.
+    assert!(matches!(
+        can_execute(&base_agent(), &task, &cat),
+        Err(ContractError::CapabilityMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_bool_false_absence_for_real_bool_capability() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "sandbox.network_lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+    let reference = cref("sandbox.network_lock", 1);
+    let mut explicit = base_task();
+    explicit
+        .required_capabilities
+        .insert(reference, CapabilityValue::Bool(false));
+
+    assert!(can_execute(&base_agent(), &explicit, &cat).is_ok());
+    assert!(can_execute(&base_agent(), &base_task(), &cat).is_ok());
 }
