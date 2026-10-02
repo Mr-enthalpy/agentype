@@ -1517,3 +1517,111 @@ fn test_deprecation_is_monotonic_and_future_selection_only() {
         type_ref("auditor", 3)
     );
 }
+
+#[test]
+fn test_continuity_strengthening_is_guarantee_not_executable_subset() {
+    let cat = CapabilityCatalog::new();
+
+    let mut base = base_agent();
+    base.contract.continuity = ContinuityMode::None;
+    let mut derived = base_agent();
+    derived.type_ref = type_ref("logical-guarantee", 1);
+    derived.based_on = Some(base.type_ref.clone());
+    derived.contract.continuity = ContinuityMode::Logical;
+
+    // Strengthening continuity is a valid refinement (a guarantee upgrade) ...
+    assert!(is_valid_refinement(&base, &derived, &cat).is_ok());
+
+    // ... but it deliberately enlarges the executable Task set, so the
+    // executable-subset invariant is scoped to the authority/scope dimensions.
+    let mut req = base_task();
+    req.required_continuity = ContinuityMode::Logical;
+    assert!(can_execute(&base, &req, &cat).is_err());
+    assert!(can_execute(&derived, &req, &cat).is_ok());
+}
+
+#[test]
+fn test_effective_task_policy_must_be_enforceable() {
+    let cat = CapabilityCatalog::new();
+
+    // AgentType ceiling is wide (write/enabled); Task is stricter.
+    let mut agent = base_agent();
+    agent.contract.security.workspace = WorkspaceMode::Write;
+    agent.contract.security.network = NetworkPolicy::Enabled;
+    let policy = sandbox_ref("strict-sandbox", 4);
+
+    let mut task = base_task();
+    task.required_workspace = WorkspaceMode::ReadOnly;
+    task.required_network = NetworkPolicy::Disabled;
+    task.sandbox_policy = Some(policy);
+
+    // Environment can enforce write/enabled but NOT read-only/disabled or P.
+    let safety = PhysicalSafety::new(
+        false,
+        vec![WorkspaceMode::Write],
+        [NetworkPolicy::Enabled].into_iter().collect(),
+    )
+    .unwrap();
+    let evidence = evidence_for(
+        policy_ref("codex-local-adapter", 3),
+        safety,
+        Vec::new(),
+        Vec::new(),
+    );
+
+    // The two per-predicate checks both pass ...
+    assert!(can_execute(&agent, &task, &cat).is_ok());
+    assert!(can_provision(&agent, &base_source(), &base_config(), &evidence, &cat).is_ok());
+
+    // ... but the conjunction is not sufficient: the Task's effective policy is
+    // not enforceable by the imported environment.
+    assert!(matches!(
+        can_provision_task(
+            &agent,
+            &base_source(),
+            &base_config(),
+            &evidence,
+            &cat,
+            &task
+        ),
+        Err(ContractError::SecurityUnenforceable { .. })
+    ));
+}
+
+#[test]
+fn test_validate_source_config_rejects_wrong_exact_source_revision() {
+    let cat = CapabilityCatalog::new();
+    let config_a = base_config();
+    let mut source_b = base_source();
+    source_b.source_ref = SpawnSourceRef::new("other-source", 1).unwrap();
+
+    assert!(matches!(
+        validate_source_config(&config_a, &source_b, &cat),
+        Err(ContractError::SourceConfigInvalid { .. })
+    ));
+}
+
+#[test]
+fn test_security_class_claim_value_shape_must_match_definition() {
+    let mut cat = CapabilityCatalog::new();
+    define(
+        &mut cat,
+        "network.lock",
+        1,
+        MatcherKind::Bool,
+        SecurityClass::Sandbox,
+    );
+
+    let mut source = base_source();
+    // Wrong shape (Set) for a Bool definition: rejected regardless of class.
+    source.claims.push(claim(
+        "network.lock",
+        1,
+        CapabilityValue::Set(set(&["nonsense"])),
+        Assurance::Declared,
+    ));
+    assert!(matches!(
+        validate_spawn_source(&source, &cat),
+        Err(ContractError::InvariantViolation(_))
+    ));
+}

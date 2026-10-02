@@ -52,17 +52,26 @@ fn capability_key(reference: &CapabilityRef) -> String {
     reference.capability_id().as_str().to_string()
 }
 
-/// Claims must name a catalog capability and must not conflict at the same
-/// exact revision.
+/// Claims must name a catalog capability, match its declared value shape, and
+/// must not conflict at the same exact revision — for every claim, Functional
+/// or security class.
 fn validate_claims(
     claims: &[CapabilityClaim],
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
     for claim in claims {
-        if !catalog.contains(&claim.reference) {
-            return Err(ContractError::CapabilityMismatch {
-                capability: capability_key(&claim.reference),
-            });
+        let definition =
+            catalog
+                .get(&claim.reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: capability_key(&claim.reference),
+                })?;
+        if definition.matcher_kind != claim.value.matcher_kind() {
+            return Err(ContractError::InvariantViolation(format!(
+                "claim value shape does not match the definition for {}@{}",
+                claim.reference.capability_id().as_str(),
+                claim.reference.revision()
+            )));
         }
     }
     // Deterministic conflict detection over every distinct reference.
@@ -132,6 +141,11 @@ pub fn validate_source_config(
     source: &SpawnSource,
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
+    if config.config_ref.source() != &source.source_ref {
+        return Err(ContractError::SourceConfigInvalid {
+            reason: "config does not belong to this exact source revision".into(),
+        });
+    }
     validate_claims(&config.claims, catalog)?;
     for claim in &config.claims {
         let requires_evidence = catalog
@@ -264,13 +278,9 @@ pub fn can_provision(
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
     agent.contract.validate(catalog)?;
-    if config.config_ref.source() != &source.source_ref {
-        return Err(ContractError::SourceConfigInvalid {
-            reason: "config does not belong to this exact source revision".into(),
-        });
-    }
     // Whole-record validation runs before per-requirement checks, so an illegal
-    // declaration fails even when no AgentType requires that capability.
+    // declaration (including config/source ownership) fails even when no
+    // AgentType requires that capability.
     validate_spawn_source(source, catalog)?;
     validate_source_config(config, source, catalog)?;
     if source.status != SourceStatus::Active || config.status != ConfigStatus::Active {
@@ -398,6 +408,55 @@ pub fn can_provision(
     Ok(())
 }
 
+/// Physical eligibility for a specific Task.
+///
+/// `can_execute(agent, task) && can_provision(agent, source, config, evidence)`
+/// is **necessary but not sufficient**: the imported environment must also be
+/// able to enforce the Task's effective (stricter) restrictions, not merely the
+/// AgentType ceiling. This is the frozen seam that B.3/B.4 must use as the
+/// eligible-candidate predicate.
+pub fn can_provision_task(
+    agent: &AgentType,
+    source: &SpawnSource,
+    config: &SourceConfig,
+    evidence: &ResolvedProvisioningEvidence,
+    catalog: &CapabilityCatalog,
+    task: &TaskRequirement,
+) -> Result<(), ContractError> {
+    can_execute(agent, task, catalog)?;
+    can_provision(agent, source, config, evidence, catalog)?;
+
+    let safety = evidence.enforceable_safety();
+    if !safety.enforces_workspace(task.required_workspace) {
+        return Err(ContractError::SecurityUnenforceable {
+            reason: "environment cannot enforce the Task workspace mode".into(),
+        });
+    }
+    if !safety.enforces_network(task.required_network) {
+        return Err(ContractError::SecurityUnenforceable {
+            reason: "environment cannot enforce the Task network policy".into(),
+        });
+    }
+    if let Some(policy) = &task.sandbox_policy {
+        if !evidence.enforces_sandbox_policy(policy) {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "Task sandbox policy {}@{} is not enforced by imported evidence",
+                    policy.id().as_str(),
+                    policy.revision()
+                ),
+            });
+        }
+    }
+    if !source.continuity_modes.contains(&task.required_continuity) {
+        return Err(ContractError::CapabilityMismatch {
+            capability: "continuity".into(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Does `derived` advertise no broader capability value than `base`?
 ///
 /// This is the **executable-Task-set** order, not the provisioning-requirement
@@ -514,6 +573,12 @@ fn sandbox_policy_within(
 }
 
 /// A grants no more authority than B on every relevant dimension.
+///
+/// This is a **product order**: the authority/scope dimensions follow the
+/// executable-Task-set order, while `continuity` is a provisioning-guarantee
+/// dimension where a stronger guarantee counts as "no wider". `more_specific_for`
+/// is therefore not purely an executable-set subset; continuity strengthening
+/// (e.g. `None -> Logical`) is an intentional guarantee upgrade.
 fn authority_no_wider(
     a: &AgentTypeContract,
     b: &AgentTypeContract,
