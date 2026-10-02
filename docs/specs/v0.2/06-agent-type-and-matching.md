@@ -67,21 +67,30 @@ resolved) and implemented in `agentype-agent-contract`:
   security class are defined once by a canonical `CapabilityCatalog`; a
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
   be inferred from a stronger capability.
-- `more_specific_for` is defined only once both types are executable and uses the
-  same executable-Task-set order as refinement. It MUST be strict (two types
-  with equivalent authority are incomparable), includes affinity, lifecycle,
-  sandbox policy, and every authority dimension, and MUST NOT rank by nominal
-  inheritance depth.
+- `can_provision_task` is the eligible-candidate predicate. The conjunction
+  `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
+  **necessary but not sufficient**: the imported environment MUST also be able to
+  enforce the Task's effective (stricter) workspace/network and pinned sandbox
+  policy, not merely the AgentType ceiling. B.3/B.4 MUST use
+  `can_provision_task`, not the bare conjunction.
+- `more_specific_for` is defined only once both types are executable. It is a
+  **product order**: the authority/scope dimensions use the executable-Task-set
+  order and `continuity` uses the provisioning-guarantee order (a stronger
+  guarantee counts as no-wider). It MUST be strict (two types with equivalent
+  authority are incomparable), includes affinity, lifecycle, sandbox policy, and
+  every authority dimension, and MUST NOT rank by nominal inheritance depth.
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
   tools, roots, affinity, budget, information functions, sandbox policy, anchor,
-  security policy, and capability constraints; a derived type MUST NOT widen the
-  lifecycle mode set, weaken continuity, or weaken required isolation. Affinity
-  is an allowed-tag ceiling with an explicit top: `Any` is general and
-  unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and `Any ≤ Only(B)` is false.
-  Capability values use the executable-Task-set order: a derived type may
-  remove or lower an advertised capability value, but never add a capability or
-  raise a value. A valid refinement therefore never enlarges the set of
-  executable Tasks.
+  security policy, and capability values; a derived type MUST NOT widen the
+  lifecycle mode set, weaken required isolation, or **weaken a continuity
+  guarantee** (`derived.continuity >= base.continuity` — strengthening is
+  allowed). Affinity is an allowed-tag ceiling with an explicit top: `Any` is
+  general and unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and
+  `Any ≤ Only(B)` is false. Capability values use the executable-Task-set order:
+  a derived type may remove or lower an advertised capability value, but never
+  add a capability or raise a value. The executable-Task-set-subset invariant
+  holds for the authority/scope dimensions; continuity is deliberately a
+  guarantee-strengthening dimension outside it.
 
 ## Refinement monotonicity
 

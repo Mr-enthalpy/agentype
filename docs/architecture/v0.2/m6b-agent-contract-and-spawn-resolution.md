@@ -207,6 +207,29 @@ capability values MUST NOT add a capability or raise a value (may remove/lower);
     matcher kind and security class are catalog-global and cannot be downgraded
 ```
 
+`continuity` is the one **provisioning-guarantee** dimension: strengthening it
+is a valid refinement (`derived >= base`) even though it lets the type execute
+more continuity-requiring Tasks. The executable-Task-set-subset invariant is
+therefore scoped to the authority/scope dimensions, and `more_specific_for` is a
+product order over both groups.
+
+### Physical eligibility seam
+
+```text
+can_execute(agent, task) && can_provision(agent, source, config, evidence)
+    => necessary but NOT sufficient for physical eligibility
+
+can_provision_task(agent, source, config, evidence, task)
+    = the above
+      AND evidence can enforce the Task's effective (stricter)
+          workspace / network / pinned sandbox policy / continuity
+```
+
+B.3/B.4 MUST use `can_provision_task` as the eligible-candidate predicate. A
+source that can realize the AgentType ceiling but not the Task's stricter
+policy is ineligible; this is the composition rule that prevents an
+"both predicates pass, but the sandbox cannot run the Task" hole.
+
 ---
 
 ## 4. Security class and assurance
