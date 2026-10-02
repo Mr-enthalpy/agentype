@@ -330,7 +330,7 @@ fn spawn_source_and_opaque_config_round_trip() {
 }
 
 #[test]
-fn external_ref_config_and_unknown_source_fail_closed() {
+fn external_ref_config_keeps_locator_and_digest_distinct() {
     let kernel = memory_kernel();
     publish_catalog(&kernel);
     kernel
@@ -338,14 +338,51 @@ fn external_ref_config_and_unknown_source_fail_closed() {
         .unwrap();
     kernel.publish_spawn_source(&base_source()).unwrap();
 
-    let config = base_config("external://codex/config.toml", Vec::new());
+    let locator = "file:///etc/codex/config.toml";
+    let config = base_config("sha256:external-config-content-digest", Vec::new());
     kernel
-        .publish_source_config(&config, &SourceConfigBody::ExternalRef)
+        .publish_source_config(
+            &config,
+            &SourceConfigBody::ExternalRef {
+                locator: locator.into(),
+            },
+        )
         .unwrap();
     assert_eq!(
         kernel.get_source_config_mode(&config.config_ref).unwrap(),
         Some(ConfigMode::ExternalRef)
     );
+    // The locator is stored verbatim and separately from the config digest.
+    assert_eq!(
+        kernel
+            .get_source_config_locator(&config.config_ref)
+            .unwrap(),
+        Some(locator.to_string())
+    );
+    assert_ne!(config.config_digest.as_str(), locator);
+
+    // A locator offered in place of a content digest is rejected.
+    let conflated = base_config(locator, Vec::new());
+    let err = kernel
+        .publish_source_config(
+            &conflated,
+            &SourceConfigBody::ExternalRef {
+                locator: locator.into(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
+
+    // An empty locator is rejected.
+    let err = kernel
+        .publish_source_config(
+            &base_config("sha256:abc", Vec::new()),
+            &SourceConfigBody::ExternalRef {
+                locator: "  ".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
 
     // A config whose source revision does not exist fails closed.
     let orphan =
@@ -360,7 +397,12 @@ fn external_ref_config_and_unknown_source_fail_closed() {
         status: ConfigStatus::Active,
     };
     let err = kernel
-        .publish_source_config(&orphan_config, &SourceConfigBody::ExternalRef)
+        .publish_source_config(
+            &orphan_config,
+            &SourceConfigBody::ExternalRef {
+                locator: "file:///x".into(),
+            },
+        )
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 }
@@ -394,6 +436,90 @@ fn disposition_is_separate_and_monotonic() {
     assert!(kernel
         .set_spawn_source_status(&source.source_ref, SourceStatus::Active)
         .is_err());
+}
+
+#[test]
+fn publication_persists_caller_initial_disposition() {
+    let kernel = memory_kernel();
+    publish_catalog(&kernel);
+
+    let policy = AdapterBindingPolicy::new(
+        policy_ref("codex-local-adapter", 3),
+        "codex_cli",
+        "workstation-primary",
+        full_safety(),
+        ConfigStatus::Disabled,
+    )
+    .unwrap();
+    kernel.publish_adapter_binding_policy(&policy).unwrap();
+    assert_eq!(
+        kernel
+            .get_adapter_binding_policy(&policy.policy_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        ConfigStatus::Disabled
+    );
+
+    let mut source = base_source();
+    source.status = SourceStatus::Disabled;
+    kernel.publish_spawn_source(&source).unwrap();
+    assert_eq!(
+        kernel
+            .get_spawn_source(&source.source_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        SourceStatus::Disabled
+    );
+
+    let mut config = base_config("sha256:abc", Vec::new());
+    config.status = ConfigStatus::Draining;
+    kernel
+        .publish_source_config(
+            &config,
+            &SourceConfigBody::ExternalRef {
+                locator: "file:///x".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        kernel
+            .get_source_config(&config.config_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        ConfigStatus::Draining
+    );
+}
+
+#[test]
+fn read_verifies_stored_content_integrity() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-i-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    // Tamper with the stored document without updating its content digest.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE agent_types SET content_json = content_json || ' ' WHERE type_id='general-reviewer'",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    let err = kernel.get_agent_type(&agent.type_ref).unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

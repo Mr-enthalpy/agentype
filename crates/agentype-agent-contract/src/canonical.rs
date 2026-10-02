@@ -61,6 +61,14 @@ fn shape_check(
 
 /// Sort/dedup a claim list into its canonical form: at most one claim per exact
 /// reference, `Bool(false)` (absence) dropped, and conflicting values rejected.
+///
+/// Within one exact reference the winner is deterministic: an `ENFORCED`
+/// declaration supersedes `DECLARED` ones, and the surviving declaration must be
+/// unique. Two `ENFORCED` declarations (or, when there is no `ENFORCED`, two
+/// `DECLARED` declarations) at the same reference with the same value but a
+/// different `declaration_provenance_ref` are an ambiguity and fail closed —
+/// provenance is diagnostic, never a tie-break, and never selected by input
+/// order.
 pub fn canonicalize_claims(
     claims: &mut Vec<CapabilityClaim>,
     catalog: &CapabilityCatalog,
@@ -95,12 +103,37 @@ pub fn canonicalize_claims(
                 first.reference.revision()
             )));
         }
-        // Deterministic pick: prefer the ENFORCED declaration, else the first.
-        let chosen = group
+        // A claim's provenance is never part of the identity tie-break, so the
+        // surviving declaration at one reference MUST be unique by content.
+        let enforced: Vec<&CapabilityClaim> = group
             .iter()
-            .find(|claim| claim.assurance == Assurance::Enforced)
-            .unwrap_or(first);
-        canonical.push(chosen.clone());
+            .filter(|claim| claim.assurance == Assurance::Enforced)
+            .collect();
+        let chosen =
+            if let Some(head) = enforced.first() {
+                if enforced.iter().any(|claim| {
+                    claim.declaration_provenance_ref != head.declaration_provenance_ref
+                }) {
+                    return Err(ContractError::InvariantViolation(format!(
+                        "ambiguous ENFORCED capability claims for {}@{}",
+                        head.reference.capability_id().as_str(),
+                        head.reference.revision()
+                    )));
+                }
+                (*head).clone()
+            } else {
+                if group.iter().any(|claim| {
+                    claim.declaration_provenance_ref != first.declaration_provenance_ref
+                }) {
+                    return Err(ContractError::InvariantViolation(format!(
+                        "ambiguous capability claims for {}@{}",
+                        first.reference.capability_id().as_str(),
+                        first.reference.revision()
+                    )));
+                }
+                first.clone()
+            };
+        canonical.push(chosen);
         index = end;
     }
     *claims = canonical;
@@ -302,8 +335,29 @@ fn contract_value(contract: &AgentTypeContract) -> Value {
     })
 }
 
+/// Recursively rewrite a JSON value so every object's keys are sorted. This is
+/// deliberately independent of `serde_json`'s map representation (which can
+/// switch from `BTreeMap` to `IndexMap` under the `preserve_order` feature), so
+/// the canonical bytes of a long-lived `CANONICAL_FORMAT_VERSION` cannot change
+/// because a transitive dependency toggled a feature.
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
 fn to_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).expect("canonical JSON is always serializable")
+    serde_json::to_vec(&canonical_json(&value)).expect("canonical JSON is always serializable")
 }
 
 // =============================================================================
@@ -341,7 +395,18 @@ pub fn canonical_spawn_source_bytes(source: &SpawnSource) -> Vec<u8> {
     }))
 }
 
-pub fn canonical_source_config_bytes(config: &SourceConfig) -> Vec<u8> {
+/// Canonical bytes of a SourceConfig revision.
+///
+/// `config_locator` is the opaque location of an `ExternalRef` configuration
+/// body (or `None` for an `OpaqueJson` body). It is part of the revision content
+/// so an exact revision freezes **both** where the configuration lives and the
+/// declared content digest. Core never interprets the locator. Keeping location
+/// and digest separate is a correctness requirement: a locator MUST NOT be used
+/// in place of a content digest.
+pub fn canonical_source_config_bytes(
+    config: &SourceConfig,
+    config_locator: Option<&str>,
+) -> Vec<u8> {
     to_bytes(json!({
         "canonical": CANONICAL_FORMAT_VERSION,
         "kind": "SOURCE_CONFIG",
@@ -350,6 +415,7 @@ pub fn canonical_source_config_bytes(config: &SourceConfig) -> Vec<u8> {
         "config_id": config.config_ref.config_id().as_str(),
         "revision": config.config_ref.revision(),
         "config_digest": config.config_digest.as_str(),
+        "config_locator": config_locator,
         "lifecycle_modes": config.lifecycle_modes.as_ref().map(|modes| {
             modes.iter().map(|m| lifecycle_str(*m)).collect::<Vec<_>>()
         }),
@@ -419,11 +485,12 @@ pub fn content_digest(bytes: &[u8]) -> String {
     out
 }
 
-/// Digest of an opaque JSON body. `serde_json::Value` objects serialize with
-/// sorted keys, so the digest is permutation-stable and can validate a
-/// `SourceConfig`'s `OpaqueJson` payload against its declared `config_digest`.
+/// Digest of an opaque JSON body. The body is recursively key-sorted first, so
+/// the digest is permutation-stable and independent of `serde_json`'s map
+/// feature configuration. Used to validate a `SourceConfig`'s `OpaqueJson`
+/// payload against its declared `config_digest`.
 pub fn canonical_json_body_digest(value: &Value) -> String {
-    content_digest(&serde_json::to_vec(value).expect("opaque JSON body is serializable"))
+    content_digest(&to_bytes(value.clone()))
 }
 
 pub fn agent_type_content_digest(agent: &AgentType) -> String {
@@ -434,8 +501,8 @@ pub fn spawn_source_content_digest(source: &SpawnSource) -> String {
     content_digest(&canonical_spawn_source_bytes(source))
 }
 
-pub fn source_config_content_digest(config: &SourceConfig) -> String {
-    content_digest(&canonical_source_config_bytes(config))
+pub fn source_config_content_digest(config: &SourceConfig, config_locator: Option<&str>) -> String {
+    content_digest(&canonical_source_config_bytes(config, config_locator))
 }
 
 pub fn adapter_binding_policy_content_digest(policy: &AdapterBindingPolicy) -> String {

@@ -438,12 +438,14 @@ CREATE TABLE IF NOT EXISTS source_configs (
     config_revision INTEGER NOT NULL CHECK (config_revision >= 1),
     config_mode TEXT NOT NULL CHECK (config_mode IN ('OPAQUE_JSON','EXTERNAL_REF')),
     config_payload_json TEXT,
+    config_locator TEXT,
     config_digest TEXT NOT NULL,
     content_json TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     created_at REAL NOT NULL,
     PRIMARY KEY (source_id, source_revision, config_id, config_revision),
-    CHECK ((config_mode = 'EXTERNAL_REF') = (config_payload_json IS NULL)),
+    CHECK ((config_mode = 'OPAQUE_JSON') = (config_payload_json IS NOT NULL)),
+    CHECK ((config_mode = 'EXTERNAL_REF') = (config_locator IS NOT NULL)),
     FOREIGN KEY (source_id, source_revision) REFERENCES spawn_sources(source_id, revision)
 );
 

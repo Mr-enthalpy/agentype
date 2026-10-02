@@ -800,6 +800,13 @@ impl Kernel {
         self.tx(|tx, _| crate::catalog::get_source_config_mode(tx, reference))
     }
 
+    pub fn get_source_config_locator(
+        &self,
+        reference: &SourceConfigRef,
+    ) -> Result<Option<String>, Error> {
+        self.tx(|tx, _| crate::catalog::get_source_config_locator(tx, reference))
+    }
+
     pub fn get_adapter_binding_policy(
         &self,
         reference: &AdapterPolicyRef,

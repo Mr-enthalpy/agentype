@@ -84,10 +84,19 @@ M6-B.2 catalog persistence MUST cover:
   content for the same exact revision fails closed
 - canonical content is permutation-stable (claims/credential refs sorted and
   deduped) and `Bool(false)` is one canonical absence
+- two claims at one exact reference with the same value but different
+  `declaration_provenance_ref` fail closed, and an `ENFORCED` declaration
+  supersedes `DECLARED` deterministically
+- golden digest vectors pin the canonical byte format
 - a derived AgentType `based_on` provenance is verified and a widening
   refinement is rejected at publication
+- a fresh publication persists the caller's initial disposition (a `Disabled`
+  source/config/policy is not silently stored as `Active`)
 - disposition changes never alter revision content and are monotonic
-- an opaque SourceConfig body is validated against its declared `config_digest`
+- an opaque `OpaqueJson` config body is validated against its declared
+  `config_digest`; an `ExternalRef` stores a locator separately from the digest,
+  and a locator offered as a digest is rejected
+- a read recomputes the stored content digest, so a tampered row fails closed
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 
 ## C. Provider/frontend neutrality (M7)

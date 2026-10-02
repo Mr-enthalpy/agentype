@@ -1,9 +1,14 @@
 //! Decoders for the canonical JSON documents produced by [`crate::canonical`].
 //!
 //! The canonical document is the durable representation of an immutable
-//! revision. Decoding is strict (missing fields, wrong shapes, and unknown enum
-//! spellings fail closed) so a corrupted catalog row is an invariant violation
-//! rather than a silent alternative record.
+//! revision. Decoding validates the canonical envelope (`canonical` version and
+//! `kind`) and every field the decoder consumes: missing fields, wrong shapes,
+//! unknown enum spellings, and an empty locator fail closed. Unknown **extra**
+//! fields are ignored here. A caller that treats the document as durability
+//! authority MUST also verify the stored content digest — and, at the catalog
+//! boundary, that re-encoding the decoded record reproduces the stored canonical
+//! bytes (see `agentype-storage-sqlite::catalog`); the decoders alone are not
+//! an integrity proof.
 //!
 //! SpawnSource / SourceConfig / AdapterBindingPolicy carry a mutable disposition
 //! that is deliberately not part of the canonical content; the decoders take the
@@ -70,6 +75,18 @@ fn opt_string(value: &Value) -> Result<Option<String>, ContractError> {
     match value {
         Value::Null => Ok(None),
         other => Ok(Some(string_of(other, "optional string")?)),
+    }
+}
+
+/// An optional opaque locator: `null` means absent, a non-empty string is a
+/// location. An empty or whitespace-only locator fails closed.
+fn optional_locator(value: &Value) -> Result<Option<String>, ContractError> {
+    match opt_string(value)? {
+        None => Ok(None),
+        Some(locator) if locator.trim().is_empty() => {
+            Err(err("config_locator must not be empty when present"))
+        }
+        Some(locator) => Ok(Some(locator)),
     }
 }
 
@@ -384,10 +401,13 @@ fn nullable_continuity(value: &Value) -> Result<Option<BTreeSet<ContinuityMode>>
     }
 }
 
-pub fn source_config_from_canonical_json(
+/// Decode a SourceConfig revision. The opaque `config_locator` (present only
+/// for an `ExternalRef` body) is returned separately from the `config_digest`:
+/// location and content identity are distinct and MUST NOT be conflated.
+pub fn source_config_revision_from_canonical_json(
     json: &str,
     status: ConfigStatus,
-) -> Result<SourceConfig, ContractError> {
+) -> Result<(SourceConfig, Option<String>), ContractError> {
     let value = parse_document(json, "SOURCE_CONFIG")?;
     let object = object(&value, "source config")?;
     let source = SpawnSourceRef::new(
@@ -403,7 +423,8 @@ pub fn source_config_from_canonical_json(
     for item in array(field(object, "credential_refs")?, "credential_refs")? {
         credential_refs.push(CredentialRef::new(string_of(item, "credential ref")?)?);
     }
-    Ok(SourceConfig {
+    let config_locator = optional_locator(field(object, "config_locator")?)?;
+    let config = SourceConfig {
         config_ref,
         config_digest: ConfigDigest::new(string_of(
             field(object, "config_digest")?,
@@ -414,7 +435,8 @@ pub fn source_config_from_canonical_json(
         credential_refs,
         claims: claims_from(field(object, "claims")?)?,
         status,
-    })
+    };
+    Ok((config, config_locator))
 }
 
 pub fn adapter_binding_policy_from_canonical_json(

@@ -340,22 +340,36 @@ immutable revision content                          mutable disposition overlay
 Rules now enforced by the durable catalog:
 
 - **Canonical digests.** Every revision is stored as canonical JSON
-  (`agentype-contract/1`) plus a `sha256:` content digest computed by Core.
-  Claims and credential references are sorted/deduped, `Bool(false)` is
-  normalized to omission only after catalog resolution, and at most one value
-  per exact `CapabilityRef` is kept (with the `ENFORCED` declaration preferred).
+  (`agentype-contract/1`) plus a `sha256:` content digest computed by Core. The
+  encoder recursively sorts every object key, so the bytes do not depend on
+  `serde_json`'s `preserve_order` feature configuration; golden digest vectors
+  pin the format. Claims and credential references are sorted/deduped,
+  `Bool(false)` is normalized to omission only after catalog resolution, and at
+  most one claim per exact `CapabilityRef` is kept. The surviving declaration
+  MUST be unique: an `ENFORCED` declaration supersedes `DECLARED` ones, and two
+  claims at the same reference with the same value but a different
+  `declaration_provenance_ref` are ambiguous and fail closed (provenance is
+  diagnostic, never a tie-break by input order).
 - **Immutability.** Republishing the same exact `(ref, content digest)` is
   idempotent; a different digest for an already-published exact revision fails
-  closed as an invariant violation.
+  closed as an invariant violation. Reads recompute the digest from the stored
+  document and re-encode the decoded record, so a drifted or non-canonical row
+  fails closed.
 - **Provenance and refinement.** Publishing a derived AgentType verifies that
   its `based_on` base exists and that `is_valid_refinement` holds; a missing
   base or a widening refinement fails closed.
-- **Disposition separation.** Status is a separate overlay and never enters a
-  digest. Dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`;
-  others `ACTIVE -> DRAINING -> DISABLED`).
-- **SourceConfig opacity.** A `SourceConfigBody` is either an `OpaqueJson`
-  body, whose `content_digest` MUST equal the config's declared `config_digest`,
-  or an `ExternalRef` with no stored body. Core never interprets the payload.
+- **Disposition separation and fidelity.** Status is a separate overlay and
+  never enters a digest. A fresh publication persists the caller's initial
+  disposition (an `ACTIVE` source/config is not silently substituted), and
+  dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`; others
+  `ACTIVE -> DRAINING -> DISABLED`). Re-publishing an existing exact revision is
+  content-idempotent and leaves the live disposition untouched.
+- **SourceConfig opacity and identity.** A `SourceConfigBody` is either an
+  `OpaqueJson` body, whose content digest MUST equal the config's declared
+  `config_digest`, or an `ExternalRef { locator }` that freezes **both** the
+  opaque `locator` and the declared `config_digest`; the locator MUST NOT be used
+  in place of a digest. Core never interprets either, and performs no external
+  I/O in B.2.
 - **Schema gate.** v5 and earlier are rejected at open; there is no v5 -> v6
   migration (`D-DB-MIGRATE` remains unresolved).
 

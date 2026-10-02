@@ -38,11 +38,23 @@ change never alters a revision content digest:
   revisions, each with a Core-computed canonical content digest;
 - mutable disposition overlays: AgentType `PUBLISHED`/`DEPRECATED`,
   SpawnSource/SourceConfig/AdapterBindingPolicy `ACTIVE`/`DRAINING`/`DISABLED`,
-  monotonic and never entering revision content or digests.
+  monotonic and never entering revision content or digests. A fresh publication
+  MUST persist the caller's initial disposition (never silently substitute
+  `ACTIVE`); re-publishing an existing exact revision is content-idempotent and
+  MUST NOT mutate the live disposition.
+
+A published exact revision's content digest is a durability witness: a read at
+the catalog authority boundary MUST recompute the digest from the stored
+canonical document (and MUST NOT accept a document that is not the canonical
+encoding of the record it decodes to).
 
 An opaque SourceConfig body or locator is source-private: Core stores it
-without interpreting it and validates only the caller-declared
-`config_digest` against its canonical body digest.
+without interpreting it. An `OpaqueJson` body's declared `config_digest` MUST
+equal its canonical body digest. An `ExternalRef` freezes **both** an opaque
+`locator` (where the configuration lives) and the declared `config_digest`
+(which content version is behind it); a locator MUST NOT be stored as, or
+substituted for, a content digest, and location and digest MUST remain distinct
+columns/fields.
 
 ## Kernel unique constraints (MUST)
 

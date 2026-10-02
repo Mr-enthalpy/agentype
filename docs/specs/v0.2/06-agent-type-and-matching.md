@@ -158,13 +158,23 @@ revision has a canonical content encoding and a Core-computed content digest:
 - republishing the same exact `(ref, content digest)` is idempotent; a different
   canonical content for an already-published exact revision MUST fail closed;
 - the canonical encoding MUST be permutation-stable (set-like sequences sorted
-  and deduped) and MUST encode `Bool(false)` as omission, so one logical revision
-  has exactly one digest;
+  and deduped), MUST recursively sort object keys so the bytes are independent
+  of the JSON library's map feature configuration, and MUST encode `Bool(false)`
+  as omission, so one logical revision has exactly one digest;
+- at most one claim per exact `CapabilityRef` may survive; an `ENFORCED`
+  declaration supersedes `DECLARED` ones, and two surviving declarations with
+  the same value but a different `declaration_provenance_ref` are ambiguous and
+  MUST fail closed (provenance is diagnostic, never an input-order tie-break);
 - a derived AgentType's `based_on` provenance MUST be verified against the
   published base, and the derived contract MUST pass `is_valid_refinement`
   before it is published;
 - publication and deprecation status is a mutable **disposition overlay** that
-  MUST NOT enter the revision content or its digest; dispositions only advance.
+  MUST NOT enter the revision content or its digest; a fresh publication MUST
+  persist the caller's initial disposition (never silently substitute
+  `ACTIVE`), and dispositions only advance;
+- a read at the catalog boundary MUST verify the stored content digest against
+  the stored canonical document, so the digest is a durability witness rather
+  than publication-time metadata.
 
 ## Refinement monotonicity
 

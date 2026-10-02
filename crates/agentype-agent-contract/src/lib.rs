@@ -43,7 +43,7 @@ pub use capability::{
 };
 pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,
-    capability_definition_from_canonical_json, source_config_from_canonical_json,
+    capability_definition_from_canonical_json, source_config_revision_from_canonical_json,
     spawn_source_from_canonical_json,
 };
 pub use error::ContractError;

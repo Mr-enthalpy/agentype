@@ -17,12 +17,12 @@ use agentype_agent_contract::{
     canonical_capability_definition_bytes, canonical_json_body_digest,
     canonical_source_config_bytes, canonical_spawn_source_bytes, canonicalize_agent_type,
     canonicalize_source_config, canonicalize_spawn_source, capability_definition_content_digest,
-    capability_definition_from_canonical_json, is_valid_refinement,
-    source_config_from_canonical_json, spawn_source_content_digest,
-    spawn_source_from_canonical_json, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
-    AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog, CapabilityDefinition,
-    CapabilityRef, ConfigStatus, ContractError, SourceConfig, SourceConfigRef, SourceStatus,
-    SpawnSource, SpawnSourceRef,
+    capability_definition_from_canonical_json, content_digest, is_valid_refinement,
+    source_config_content_digest, source_config_revision_from_canonical_json,
+    spawn_source_content_digest, spawn_source_from_canonical_json, AdapterBindingPolicy,
+    AdapterPolicyRef, AgentType, AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog,
+    CapabilityDefinition, CapabilityRef, ConfigStatus, ContractError, SourceConfig,
+    SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
 };
 use agentype_core::{Error, UnixTime};
 use rusqlite::{params, Transaction};
@@ -78,13 +78,21 @@ impl ConfigMode {
 }
 
 /// The source-private configuration body supplied at publication.
+///
+/// Location and content identity are deliberately separate: an `ExternalRef`
+/// freezes **both** an opaque `locator` (where the configuration lives) and the
+/// `config_digest` already carried by the `SourceConfig` (which version of the
+/// content is behind it). Core stores the locator verbatim and never treats it
+/// as, or substitutes it for, a digest.
 #[derive(Clone, Debug)]
 pub enum SourceConfigBody {
     /// A Core-opaque JSON body. `config_digest` MUST equal
-    /// [`canonical_json_body_digest`] of this value.
+    /// [`canonical_json_body_digest`] of this value; no locator is stored.
     OpaqueJson(serde_json::Value),
-    /// A locator owned entirely outside Core; no body is stored.
-    ExternalRef,
+    /// A non-empty opaque locator owned entirely outside Core. `config_digest`
+    /// is the caller-declared content digest that the source integration
+    /// resolves and attests later; B.2 performs no external I/O.
+    ExternalRef { locator: String },
 }
 
 fn source_status_sql(status: SourceStatus) -> &'static str {
@@ -160,6 +168,30 @@ fn guard_immutable(existing: Option<String>, digest: &str, what: &str) -> Result
     }
 }
 
+/// Durability integrity check at the catalog authority boundary: the stored
+/// canonical document MUST hash to the recorded content digest. A mismatch is
+/// corruption, never a silent alternative record.
+fn verify_content_digest(json: &str, digest: &str, what: &str) -> Result<(), Error> {
+    let recomputed = content_digest(json.as_bytes());
+    if recomputed != digest {
+        return Err(Error::invariant(format!(
+            "catalog {what} content digest {digest} does not match recomputed {recomputed}"
+        )));
+    }
+    Ok(())
+}
+
+/// The stored document MUST be exactly the canonical encoding of the record it
+/// decodes to; a non-canonical ordering or duplicate set entry fails closed.
+fn verify_reencoded(reencoded: &[u8], stored_json: &str, what: &str) -> Result<(), Error> {
+    if reencoded != stored_json.as_bytes() {
+        return Err(Error::invariant(format!(
+            "catalog {what} content is not the canonical encoding; refusing to read"
+        )));
+    }
+    Ok(())
+}
+
 // =============================================================================
 // CapabilityCatalog
 // =============================================================================
@@ -167,8 +199,8 @@ fn guard_immutable(existing: Option<String>, digest: &str, what: &str) -> Result
 pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog, Error> {
     let mut statement = tx
         .prepare(
-            "SELECT capability_id, revision, content_json FROM capability_definitions
-             ORDER BY capability_id, revision",
+            "SELECT capability_id, revision, content_json, content_digest
+             FROM capability_definitions ORDER BY capability_id, revision",
         )
         .map_err(map_sqlite)?;
     let rows = statement
@@ -177,16 +209,23 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .map_err(map_sqlite)?;
     let mut catalog = CapabilityCatalog::new();
     for row in rows {
-        let (capability_id, revision, content_json) = row.map_err(map_sqlite)?;
+        let (capability_id, revision, content_json, content_digest) = row.map_err(map_sqlite)?;
+        verify_content_digest(&content_json, &content_digest, "capability definition")?;
         let definition =
             capability_definition_from_canonical_json(&content_json).map_err(contract_fault)?;
         let reference =
             CapabilityRef::new(capability_id, revision as u64).map_err(contract_fault)?;
+        verify_reencoded(
+            &canonical_capability_definition_bytes(&reference, &definition),
+            &content_json,
+            "capability definition",
+        )?;
         catalog
             .define(
                 reference,
@@ -435,13 +474,17 @@ pub fn publish_spawn_source(
         .map_err(map_sqlite)?;
     }
     guard_immutable(existing, &digest, "spawn source")?;
+    // A fresh revision persists the caller's initial disposition; re-publishing
+    // an existing exact revision is content-idempotent and leaves the live
+    // disposition untouched (drive later changes through set_spawn_source_status).
     tx.execute(
         "INSERT OR IGNORE INTO spawn_source_dispositions(
              source_id, revision, status, updated_at)
-         VALUES(?1,?2,'ACTIVE',?3)",
+         VALUES(?1,?2,?3,?4)",
         params![
             canonical.source_ref.id().as_str(),
             canonical.source_ref.revision(),
+            source_status_sql(canonical.status),
             now
         ],
     )
@@ -467,7 +510,7 @@ pub fn publish_source_config(
         ))
     })?;
 
-    let (mode, payload_json) = match body {
+    let (mode, payload_json, config_locator) = match body {
         SourceConfigBody::OpaqueJson(payload) => {
             let expected = canonical_json_body_digest(payload);
             if config.config_digest.as_str() != expected {
@@ -476,25 +519,40 @@ pub fn publish_source_config(
                     config.config_digest.as_str()
                 )));
             }
-            (
-                ConfigMode::OpaqueJson,
-                Some(canonical_json_string(
-                    serde_json::to_vec(payload)
-                        .map_err(|e| Error::invariant(format!("config body: {e}")))?,
-                    "config body",
-                )?),
-            )
+            let payload_json = canonical_json_string(
+                serde_json::to_vec(payload)
+                    .map_err(|e| Error::invariant(format!("config body: {e}")))?,
+                "config body",
+            )?;
+            (ConfigMode::OpaqueJson, Some(payload_json), None)
         }
-        SourceConfigBody::ExternalRef => (ConfigMode::ExternalRef, None),
+        SourceConfigBody::ExternalRef { locator } => {
+            let locator = locator.trim();
+            if locator.is_empty() {
+                return Err(Error::invariant(
+                    "an ExternalRef config locator must not be empty",
+                ));
+            }
+            // Location and content identity are distinct: a locator MUST NOT be
+            // used in place of the declared content digest.
+            if config.config_digest.as_str() == locator {
+                return Err(Error::invariant(
+                    "an ExternalRef config locator must not equal its config digest",
+                ));
+            }
+            (ConfigMode::ExternalRef, None, Some(locator.to_string()))
+        }
     };
 
     let mut canonical = config.clone();
     let catalog = load_capability_catalog(tx)?;
     canonicalize_source_config(&mut canonical, &source, &catalog).map_err(contract_fault)?;
 
-    let digest = agentype_agent_contract::source_config_content_digest(&canonical);
-    let content_json =
-        canonical_json_string(canonical_source_config_bytes(&canonical), "source config")?;
+    let digest = source_config_content_digest(&canonical, config_locator.as_deref());
+    let content_json = canonical_json_string(
+        canonical_source_config_bytes(&canonical, config_locator.as_deref()),
+        "source config",
+    )?;
     let existing = existing_digest(
         tx,
         "SELECT content_digest FROM source_configs
@@ -510,9 +568,9 @@ pub fn publish_source_config(
         tx.execute(
             "INSERT INTO source_configs(
                  source_id, source_revision, config_id, config_revision,
-                 config_mode, config_payload_json, config_digest, content_json,
-                 content_digest, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 config_mode, config_payload_json, config_locator, config_digest,
+                 content_json, content_digest, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 config.config_ref.source().id().as_str(),
                 config.config_ref.source().revision(),
@@ -520,6 +578,7 @@ pub fn publish_source_config(
                 config.config_ref.revision(),
                 mode.as_sql(),
                 payload_json,
+                config_locator,
                 canonical.config_digest.as_str(),
                 content_json,
                 digest,
@@ -529,15 +588,19 @@ pub fn publish_source_config(
         .map_err(map_sqlite)?;
     }
     guard_immutable(existing, &digest, "source config")?;
+    // A fresh revision persists the caller's initial disposition; re-publishing
+    // an existing exact revision is content-idempotent and leaves the live
+    // disposition untouched (drive later changes through set_source_config_status).
     tx.execute(
         "INSERT OR IGNORE INTO source_config_dispositions(
              source_id, source_revision, config_id, config_revision, status, updated_at)
-         VALUES(?1,?2,?3,?4,'ACTIVE',?5)",
+         VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             config.config_ref.source().id().as_str(),
             config.config_ref.source().revision(),
             config.config_ref.config_id().as_str(),
             config.config_ref.revision(),
+            config_status_sql(canonical.status),
             now,
         ],
     )
@@ -553,15 +616,22 @@ fn load_agent_type(
     tx: &Transaction<'_>,
     reference: &AgentTypeRef,
 ) -> Result<Option<AgentType>, Error> {
-    let content = query_opt(
+    let row = query_opt(
         tx,
-        "SELECT content_json FROM agent_types WHERE type_id=?1 AND revision=?2",
+        "SELECT content_json, content_digest FROM agent_types
+         WHERE type_id=?1 AND revision=?2",
         params![reference.id().as_str(), reference.revision()],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
-    content
-        .map(|json| agent_type_from_canonical_json(&json).map_err(contract_fault))
-        .transpose()
+    match row {
+        None => Ok(None),
+        Some((json, digest)) => {
+            verify_content_digest(&json, &digest, "agent type")?;
+            let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
+            Ok(Some(agent))
+        }
+    }
 }
 
 pub fn get_agent_type(
@@ -570,20 +640,28 @@ pub fn get_agent_type(
 ) -> Result<Option<(AgentType, AgentTypeStatus)>, Error> {
     let row = query_opt(
         tx,
-        "SELECT at.content_json, d.status
+        "SELECT at.content_json, at.content_digest, d.status
          FROM agent_types at
          JOIN agent_type_dispositions d
            ON d.type_id=at.type_id AND d.revision=at.revision
          WHERE at.type_id=?1 AND at.revision=?2",
         params![reference.id().as_str(), reference.revision()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, status)) => Ok(Some((
-            agent_type_from_canonical_json(&json).map_err(contract_fault)?,
-            AgentTypeStatus::parse_sql(&status)?,
-        ))),
+        Some((json, digest, status)) => {
+            verify_content_digest(&json, &digest, "agent type")?;
+            let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
+            Ok(Some((agent, AgentTypeStatus::parse_sql(&status)?)))
+        }
     }
 }
 
@@ -600,20 +678,33 @@ fn load_spawn_source(
 ) -> Result<Option<SpawnSource>, Error> {
     let row = query_opt(
         tx,
-        "SELECT s.content_json, d.status
+        "SELECT s.content_json, s.content_digest, d.status
          FROM spawn_sources s
          JOIN spawn_source_dispositions d
            ON d.source_id=s.source_id AND d.revision=s.revision
          WHERE s.source_id=?1 AND s.revision=?2",
         params![reference.id().as_str(), reference.revision()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, status)) => Ok(Some(
-            spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
-                .map_err(contract_fault)?,
-        )),
+        Some((json, digest, status)) => {
+            verify_content_digest(&json, &digest, "spawn source")?;
+            let source = spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
+                .map_err(contract_fault)?;
+            verify_reencoded(
+                &canonical_spawn_source_bytes(&source),
+                &json,
+                "spawn source",
+            )?;
+            Ok(Some(source))
+        }
     }
 }
 
@@ -623,7 +714,7 @@ pub fn get_source_config(
 ) -> Result<Option<SourceConfig>, Error> {
     let row = query_opt(
         tx,
-        "SELECT c.content_json, d.status
+        "SELECT c.content_json, c.content_digest, d.status
          FROM source_configs c
          JOIN source_config_dispositions d
            ON d.source_id=c.source_id AND d.source_revision=c.source_revision
@@ -635,14 +726,62 @@ pub fn get_source_config(
             reference.config_id().as_str(),
             reference.revision()
         ],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, status)) => Ok(Some(
-            source_config_from_canonical_json(&json, config_status_parse(&status)?)
-                .map_err(contract_fault)?,
-        )),
+        Some((json, digest, status)) => {
+            verify_content_digest(&json, &digest, "source config")?;
+            let (config, locator) =
+                source_config_revision_from_canonical_json(&json, config_status_parse(&status)?)
+                    .map_err(contract_fault)?;
+            verify_reencoded(
+                &canonical_source_config_bytes(&config, locator.as_deref()),
+                &json,
+                "source config",
+            )?;
+            Ok(Some(config))
+        }
+    }
+}
+
+/// The opaque `ExternalRef` locator a published SourceConfig revision was stored
+/// with, or `None` for an `OpaqueJson` body. Distinct from `config_digest`.
+pub fn get_source_config_locator(
+    tx: &Transaction<'_>,
+    reference: &SourceConfigRef,
+) -> Result<Option<String>, Error> {
+    let row = query_opt(
+        tx,
+        "SELECT content_json, content_digest, config_locator
+         FROM source_configs
+         WHERE source_id=?1 AND source_revision=?2 AND config_id=?3 AND config_revision=?4",
+        params![
+            reference.source().id().as_str(),
+            reference.source().revision(),
+            reference.config_id().as_str(),
+            reference.revision()
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    match row {
+        None => Ok(None),
+        Some((json, digest, locator)) => {
+            verify_content_digest(&json, &digest, "source config")?;
+            Ok(locator)
+        }
     }
 }
 
@@ -672,20 +811,34 @@ pub fn get_adapter_binding_policy(
 ) -> Result<Option<AdapterBindingPolicy>, Error> {
     let row = query_opt(
         tx,
-        "SELECT p.content_json, d.status
+        "SELECT p.content_json, p.content_digest, d.status
          FROM adapter_binding_policies p
          JOIN adapter_binding_policy_dispositions d
            ON d.policy_id=p.policy_id AND d.revision=p.revision
          WHERE p.policy_id=?1 AND p.revision=?2",
         params![reference.id().as_str(), reference.revision()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, status)) => Ok(Some(
-            adapter_binding_policy_from_canonical_json(&json, config_status_parse(&status)?)
-                .map_err(contract_fault)?,
-        )),
+        Some((json, digest, status)) => {
+            verify_content_digest(&json, &digest, "adapter binding policy")?;
+            let policy =
+                adapter_binding_policy_from_canonical_json(&json, config_status_parse(&status)?)
+                    .map_err(contract_fault)?;
+            verify_reencoded(
+                &canonical_adapter_binding_policy_bytes(&policy),
+                &json,
+                "adapter binding policy",
+            )?;
+            Ok(Some(policy))
+        }
     }
 }
 
@@ -693,16 +846,27 @@ pub fn get_capability_definition(
     tx: &Transaction<'_>,
     reference: &CapabilityRef,
 ) -> Result<Option<CapabilityDefinition>, Error> {
-    let content = query_opt(
+    let row = query_opt(
         tx,
-        "SELECT content_json FROM capability_definitions
+        "SELECT content_json, content_digest FROM capability_definitions
          WHERE capability_id=?1 AND revision=?2",
         params![reference.capability_id().as_str(), reference.revision()],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
-    content
-        .map(|json| capability_definition_from_canonical_json(&json).map_err(contract_fault))
-        .transpose()
+    match row {
+        None => Ok(None),
+        Some((json, digest)) => {
+            verify_content_digest(&json, &digest, "capability definition")?;
+            let definition =
+                capability_definition_from_canonical_json(&json).map_err(contract_fault)?;
+            verify_reencoded(
+                &canonical_capability_definition_bytes(reference, &definition),
+                &json,
+                "capability definition",
+            )?;
+            Ok(Some(definition))
+        }
+    }
 }
 
 // =============================================================================

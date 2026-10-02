@@ -42,6 +42,21 @@ fn claim(id: &str, revision: u64, value: CapabilityValue, assurance: Assurance) 
     }
 }
 
+fn claim_with_provenance(
+    id: &str,
+    revision: u64,
+    value: CapabilityValue,
+    assurance: Assurance,
+    provenance: &str,
+) -> CapabilityClaim {
+    CapabilityClaim {
+        reference: cref(id, revision),
+        value,
+        assurance,
+        declaration_provenance_ref: Some(provenance.to_string()),
+    }
+}
+
 fn source_with_claims(claims: Vec<CapabilityClaim>) -> SpawnSource {
     SpawnSource {
         source_ref: SpawnSourceRef::new("codex-local", 2).unwrap(),
@@ -198,8 +213,115 @@ fn credential_ref_permutation_digests_identically() {
     canonicalize_credential_refs(&mut right.credential_refs);
     assert_eq!(left.credential_refs, vec![a, b]);
     assert_eq!(
-        source_config_content_digest(&left),
-        source_config_content_digest(&right)
+        source_config_content_digest(&left, None),
+        source_config_content_digest(&right, None)
+    );
+}
+
+#[test]
+fn ambiguous_claim_provenance_fails_closed() {
+    let catalog = catalog_with_bool();
+    let value = CapabilityValue::Bool(true);
+    let mut source = source_with_claims(vec![
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Declared,
+            "a",
+        ),
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Declared,
+            "b",
+        ),
+    ]);
+    assert!(canonicalize_spawn_source(&mut source, &catalog).is_err());
+
+    // Two ENFORCED declarations with different provenance are equally ambiguous.
+    let mut enforced = source_with_claims(vec![
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Enforced,
+            "a",
+        ),
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Enforced,
+            "b",
+        ),
+    ]);
+    assert!(canonicalize_spawn_source(&mut enforced, &catalog).is_err());
+}
+
+#[test]
+fn claim_provenance_permutation_is_deterministic() {
+    let catalog = catalog_with_bool();
+    let value = CapabilityValue::Bool(true);
+    let provenance = "codex-driver@4";
+    let mut left = source_with_claims(vec![
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Declared,
+            provenance,
+        ),
+        claim_with_provenance(
+            "terminal.attach",
+            1,
+            value.clone(),
+            Assurance::Declared,
+            provenance,
+        ),
+    ]);
+    let mut right = source_with_claims(vec![claim_with_provenance(
+        "terminal.attach",
+        1,
+        value.clone(),
+        Assurance::Declared,
+        provenance,
+    )]);
+    canonicalize_spawn_source(&mut left, &catalog).unwrap();
+    canonicalize_spawn_source(&mut right, &catalog).unwrap();
+    assert_eq!(left.claims, right.claims);
+    assert_eq!(
+        spawn_source_content_digest(&left),
+        spawn_source_content_digest(&right)
+    );
+}
+
+#[test]
+fn golden_digest_vectors_are_stable() {
+    // Frozen vectors: if a serde_json feature or the canonical encoder changes
+    // the byte format, these break instead of silently rotating every digest.
+    let catalog = catalog_with_bool();
+    let mut source = source_with_claims(vec![claim(
+        "terminal.attach",
+        1,
+        CapabilityValue::Bool(true),
+        Assurance::Enforced,
+    )]);
+    canonicalize_spawn_source(&mut source, &catalog).unwrap();
+    let mut config = config_with_credential_refs(vec![CredentialRef::new("vault://a").unwrap()]);
+    canonicalize_credential_refs(&mut config.credential_refs);
+    assert_eq!(
+        spawn_source_content_digest(&source),
+        "sha256:49e88707e0a3d8517c64a7007996a0ba8876380c5d666f2a20906564a594096e"
+    );
+    assert_eq!(
+        source_config_content_digest(&config, None),
+        "sha256:d62e85b99b73d78c77fe233db692c4308d0ed30e6e865911ad200424beff8bf9"
+    );
+    assert_eq!(
+        source_config_content_digest(&config, Some("file:///etc/codex.toml")),
+        "sha256:4f47dbd3a52d8c08fec6e1cc792802cc39d4bec76b0b19885480825b8fa58330"
     );
 }
 
