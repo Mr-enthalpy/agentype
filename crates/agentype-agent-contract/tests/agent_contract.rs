@@ -37,6 +37,9 @@ fn quantity(value: f64) -> Quantity {
     Quantity::new(value).unwrap()
 }
 
+/// Convenience catalog definition using the conventional polarity for a
+/// security class. Polarity is an independent field in the real API; tests that
+/// exercise non-default pairings call `CapabilityCatalog::define` directly.
 fn define(
     cat: &mut CapabilityCatalog,
     id: &str,
@@ -44,7 +47,12 @@ fn define(
     matcher: MatcherKind,
     class: SecurityClass,
 ) {
-    cat.define(cref(id, revision), matcher, class).unwrap();
+    let polarity = match class {
+        SecurityClass::Sandbox | SecurityClass::Continuity => CapabilityPolarity::Restriction,
+        SecurityClass::Functional | SecurityClass::Authority => CapabilityPolarity::Ability,
+    };
+    cat.define(cref(id, revision), matcher, class, polarity)
+        .unwrap();
 }
 
 fn claim(id: &str, revision: u64, value: CapabilityValue, assurance: Assurance) -> CapabilityClaim {
@@ -160,6 +168,8 @@ fn base_config() -> SourceConfig {
     SourceConfig {
         config_ref: SourceConfigRef::new(base_source().source_ref, "deep-reasoning", 7).unwrap(),
         config_digest: ConfigDigest::new("sha256:abc").unwrap(),
+        lifecycle_modes: None,
+        continuity_modes: None,
         credential_refs: vec![CredentialRef::new("vault://codex-prod").unwrap()],
         claims: Vec::new(),
         status: ConfigStatus::Active,
@@ -966,6 +976,7 @@ fn test_capability_definition_is_global_authority() {
         cref("network.lock", 1),
         MatcherKind::Bool,
         SecurityClass::Sandbox,
+        CapabilityPolarity::Restriction,
     )
     .unwrap();
 
@@ -974,7 +985,8 @@ fn test_capability_definition_is_global_authority() {
         .define(
             cref("network.lock", 1),
             MatcherKind::Bool,
-            SecurityClass::Sandbox
+            SecurityClass::Sandbox,
+            CapabilityPolarity::Restriction
         )
         .is_ok());
 
@@ -984,7 +996,8 @@ fn test_capability_definition_is_global_authority() {
         cat.define(
             cref("network.lock", 1),
             MatcherKind::Bool,
-            SecurityClass::Functional
+            SecurityClass::Functional,
+            CapabilityPolarity::Ability
         ),
         Err(ContractError::CapabilityDefinitionConflict { .. })
     ));
@@ -1705,4 +1718,108 @@ fn test_continuity_is_not_semantic_specificity() {
     // Differing only in continuity: incomparable, not mutually more specific.
     assert!(!more_specific_for(&logical, &none, &req, &cat));
     assert!(!more_specific_for(&none, &logical, &req, &cat));
+}
+
+#[test]
+fn test_capability_polarity_is_independent_of_security_class() {
+    let mut cat = CapabilityCatalog::new();
+    // Sandbox classification, but ability-shaped value: growing widens.
+    cat.define(
+        cref("allowed_commands", 1),
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+        CapabilityPolarity::Ability,
+    )
+    .unwrap();
+    // Sandbox classification with restriction-shaped value: growing narrows.
+    cat.define(
+        cref("locked_paths", 1),
+        MatcherKind::Set,
+        SecurityClass::Sandbox,
+        CapabilityPolarity::Restriction,
+    )
+    .unwrap();
+
+    let mut base = base_agent();
+    base.contract.required_capabilities.insert(
+        cref("allowed_commands", 1),
+        CapabilityValue::Set(set(&["git"])),
+    );
+    base.contract
+        .required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])));
+
+    // Growing an ability-shaped capability widens authority: rejected.
+    let mut grew_ability = base_agent();
+    grew_ability.contract.required_capabilities.insert(
+        cref("allowed_commands", 1),
+        CapabilityValue::Set(set(&["git", "shell"])),
+    );
+    grew_ability
+        .contract
+        .required_capabilities
+        .insert(cref("locked_paths", 1), CapabilityValue::Set(set(&["/a"])));
+    assert!(matches!(
+        is_valid_refinement(&base, &grew_ability, &cat),
+        Err(ContractError::InvalidRefinement { .. })
+    ));
+
+    // Growing a restriction-shaped capability narrows: accepted.
+    let mut grew_restriction = base_agent();
+    grew_restriction.contract.required_capabilities.insert(
+        cref("allowed_commands", 1),
+        CapabilityValue::Set(set(&["git"])),
+    );
+    grew_restriction.contract.required_capabilities.insert(
+        cref("locked_paths", 1),
+        CapabilityValue::Set(set(&["/a", "/b"])),
+    );
+    assert!(is_valid_refinement(&base, &grew_restriction, &cat).is_ok());
+}
+
+#[test]
+fn test_config_narrows_source_continuity() {
+    let cat = CapabilityCatalog::new();
+    let mut source = base_source();
+    source.continuity_modes = [ContinuityMode::None, ContinuityMode::Logical]
+        .into_iter()
+        .collect();
+
+    let mut agent = base_agent();
+    agent.contract.continuity = ContinuityMode::Logical;
+
+    // Config A keeps the source envelope: eligible.
+    let config_a = base_config();
+    assert!(can_provision(&agent, &source, &config_a, &base_evidence(), &cat).is_ok());
+
+    // Config B narrows to {None}: not eligible for a Logical requirement.
+    let mut config_b = base_config();
+    config_b.continuity_modes = Some([ContinuityMode::None].into_iter().collect());
+    assert!(can_provision(&agent, &source, &config_b, &base_evidence(), &cat).is_err());
+
+    // A config cannot widen beyond the source envelope.
+    let mut narrow_source = base_source();
+    narrow_source.continuity_modes = [ContinuityMode::None].into_iter().collect();
+    let mut widening = base_config();
+    widening.continuity_modes = Some([ContinuityMode::Logical].into_iter().collect());
+    assert!(matches!(
+        validate_source_config(&widening, &narrow_source, &cat),
+        Err(ContractError::SourceConfigInvalid { .. })
+    ));
+}
+
+#[test]
+fn test_config_cannot_widen_source_lifecycle() {
+    let cat = CapabilityCatalog::new();
+    let source = base_source(); // lifecycle {Resident, Ephemeral}
+    let mut config = base_config();
+    config.lifecycle_modes = Some(
+        [LifecycleMode::Resident, LifecycleMode::Revivable]
+            .into_iter()
+            .collect(),
+    );
+    assert!(matches!(
+        validate_source_config(&config, &source, &cat),
+        Err(ContractError::SourceConfigInvalid { .. })
+    ));
 }

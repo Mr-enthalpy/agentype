@@ -338,9 +338,38 @@ pub struct SpawnSource {
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
     pub config_digest: ConfigDigest,
+    /// Config-specific lifecycle narrowing of the source envelope (duplicate of
+    /// a source mode is allowed; a mode the source lacks is rejected).
+    pub lifecycle_modes: Option<BTreeSet<LifecycleMode>>,
+    /// Config-specific continuity narrowing of the source envelope.
+    pub continuity_modes: Option<BTreeSet<ContinuityMode>>,
     pub credential_refs: Vec<CredentialRef>,
     pub claims: Vec<CapabilityClaim>,
     pub status: ConfigStatus,
+}
+
+impl SourceConfig {
+    /// Effective lifecycle modes: the config override when present, else the
+    /// source envelope. The override is validated to be a subset.
+    pub fn effective_lifecycle<'a>(
+        &'a self,
+        source: &'a SpawnSource,
+    ) -> &'a BTreeSet<LifecycleMode> {
+        self.lifecycle_modes
+            .as_ref()
+            .unwrap_or(&source.lifecycle_modes)
+    }
+
+    /// Effective continuity modes: the config override when present, else the
+    /// source envelope.
+    pub fn effective_continuity<'a>(
+        &'a self,
+        source: &'a SpawnSource,
+    ) -> &'a BTreeSet<ContinuityMode> {
+        self.continuity_modes
+            .as_ref()
+            .unwrap_or(&source.continuity_modes)
+    }
 }
 
 /// Physical facts a source/adapter can actually *enforce*. Private fields and a

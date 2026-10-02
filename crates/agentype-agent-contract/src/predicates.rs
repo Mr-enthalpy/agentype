@@ -153,6 +153,21 @@ pub fn validate_source_config(
             reason: "config does not belong to this exact source revision".into(),
         });
     }
+    // A config may narrow the source envelope, never widen it.
+    if let Some(modes) = &config.lifecycle_modes {
+        if !modes.is_subset(&source.lifecycle_modes) {
+            return Err(ContractError::SourceConfigInvalid {
+                reason: "config lifecycle modes widen the source envelope".into(),
+            });
+        }
+    }
+    if let Some(modes) = &config.continuity_modes {
+        if !modes.is_subset(&source.continuity_modes) {
+            return Err(ContractError::SourceConfigInvalid {
+                reason: "config continuity modes widen the source envelope".into(),
+            });
+        }
+    }
     validate_claims(&config.claims, catalog)?;
     for claim in &config.claims {
         let requires_evidence = catalog
@@ -298,12 +313,19 @@ pub fn can_provision(
         });
     }
 
-    if !agent.contract.lifecycle.is_subset(&source.lifecycle_modes) {
+    if !agent
+        .contract
+        .lifecycle
+        .is_subset(config.effective_lifecycle(source))
+    {
         return Err(ContractError::CapabilityMismatch {
             capability: "lifecycle".into(),
         });
     }
-    if !continuity_satisfies(&source.continuity_modes, agent.contract.continuity) {
+    if !continuity_satisfies(
+        config.effective_continuity(source),
+        agent.contract.continuity,
+    ) {
         return Err(ContractError::CapabilityMismatch {
             capability: "continuity".into(),
         });
@@ -441,7 +463,10 @@ pub fn can_provision_task(
             });
         }
     }
-    if !continuity_satisfies(&source.continuity_modes, task.required_continuity) {
+    if !continuity_satisfies(
+        config.effective_continuity(source),
+        task.required_continuity,
+    ) {
         return Err(ContractError::CapabilityMismatch {
             capability: "continuity".into(),
         });
@@ -527,7 +552,7 @@ fn capability_provision_no_wider(
         let Some(definition) = catalog.get(reference) else {
             return false;
         };
-        if definition.security_class.polarity() == CapabilityPolarity::Ability {
+        if definition.polarity == CapabilityPolarity::Ability {
             // Adding an ability widens.
             return false;
         }
@@ -541,12 +566,12 @@ fn capability_provision_no_wider(
         let Some(derived_value) = derived.required_capabilities.get(reference) else {
             // Dropping an ability narrows (allowed); dropping a restriction
             // weakens the guarantee (rejected).
-            if definition.security_class.polarity() == CapabilityPolarity::Restriction {
+            if definition.polarity == CapabilityPolarity::Restriction {
                 return false;
             }
             continue;
         };
-        let no_wider = match definition.security_class.polarity() {
+        let no_wider = match definition.polarity {
             CapabilityPolarity::Ability => {
                 ability_value_no_wider(definition.matcher_kind, base_value, derived_value)
             }

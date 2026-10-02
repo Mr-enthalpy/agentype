@@ -88,29 +88,20 @@ pub enum Assurance {
 }
 
 impl SecurityClass {
+    /// Whether this class requires imported enforcement evidence. This is
+    /// independent of the refinement polarity.
     pub fn requires_evidence(self) -> bool {
         !matches!(self, Self::Functional)
     }
-
-    /// Which direction narrows for a capability of this class.
-    ///
-    /// `Ability` capabilities (Functional, Authority) widen the executable Task
-    /// set when their value grows; `Restriction` capabilities (Sandbox,
-    /// Continuity) narrow it when their value grows.
-    pub fn polarity(self) -> CapabilityPolarity {
-        match self {
-            Self::Functional | Self::Authority => CapabilityPolarity::Ability,
-            Self::Sandbox | Self::Continuity => CapabilityPolarity::Restriction,
-        }
-    }
 }
 
-/// Refinement direction of a capability value.
+/// Refinement direction of a capability value. This is an independent,
+/// catalog-owned property: it is NOT derived from the security class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CapabilityPolarity {
-    /// More value = more ability = wider authority.
+    /// More value = more ability = wider authority (narrows by shrinking).
     Ability,
-    /// More value = more restriction = narrower.
+    /// More value = more restriction = narrower (narrows by growing).
     Restriction,
 }
 
@@ -151,10 +142,16 @@ impl CapabilityRef {
 }
 
 /// The canonical semantics of one exact capability revision.
+///
+/// `security_class` (does it need imported evidence?) and `polarity` (which
+/// direction narrows?) are independent: a Sandbox-domain capability can still be
+/// ability-shaped (e.g. an allowed-command set), and both facts are catalog
+/// owned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapabilityDefinition {
     pub matcher_kind: MatcherKind,
     pub security_class: SecurityClass,
+    pub polarity: CapabilityPolarity,
 }
 
 /// Canonical, single-authority set of capability definitions.
@@ -175,10 +172,12 @@ impl CapabilityCatalog {
         reference: CapabilityRef,
         matcher_kind: MatcherKind,
         security_class: SecurityClass,
+        polarity: CapabilityPolarity,
     ) -> Result<(), ContractError> {
         let definition = CapabilityDefinition {
             matcher_kind,
             security_class,
+            polarity,
         };
         match self.definitions.get(&reference) {
             Some(existing) if existing == &definition => Ok(()),
