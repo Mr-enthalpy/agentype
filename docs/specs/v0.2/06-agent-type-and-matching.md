@@ -47,13 +47,15 @@ resolved) and implemented in `agentype-agent-contract`:
   requirement; `Only(S)` requires the Task tags to be a subset of `S`),
   workspace/network policy, continuity minimum, sandbox policy, anchor, and
   budget.
-- Restrictions split into a **semantic matching envelope** (information
-  functions, permission ceiling, visibility, tools, roots, capability
-  constraints) with no physical proof requirement, and **mechanical sandbox
-  authority** (workspace, network, attempt isolation — proven by
-  `ResolvedProvisioningEvidence.enforceable_safety`; full filesystem/tool
-  restrictions — proven by an evidence-enforced `SandboxPolicyRef`). A field
-  MUST NOT be treated as a physical restriction without a proof path.
+- Fields split into a **semantic scope** group (information functions,
+  permission ceiling, visibility, tools, roots, capability values) used only for
+  matching/ranking and for monotonic narrowing, and a **mechanical sandbox
+  authority** group (workspace, network, attempt isolation — proven by
+  `ResolvedProvisioningEvidence.enforceable_safety`; full filesystem/tool/
+  visibility restrictions — proven by an evidence-enforced `SandboxPolicyRef`).
+  A semantic-scope field is NOT a security guarantee and MUST NOT be presented
+  to the external environment as enforcement; a mechanical restriction MUST NOT
+  exist without a proof path.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle and continuity coverage, every required
   capability **at its exact revision** (the source envelope is the provisionable
@@ -65,10 +67,10 @@ resolved) and implemented in `agentype-agent-contract`:
   security class are defined once by a canonical `CapabilityCatalog`; a
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
   be inferred from a stronger capability.
-- `more_specific_for` is defined only once both types are executable and uses a
-  single shared capability-constraint order. It MUST be strict (two types with
-  equivalent authority are incomparable), includes affinity, lifecycle, sandbox
-  policy, and every authority dimension, and MUST NOT rank by nominal
+- `more_specific_for` is defined only once both types are executable and uses the
+  same executable-Task-set order as refinement. It MUST be strict (two types
+  with equivalent authority are incomparable), includes affinity, lifecycle,
+  sandbox policy, and every authority dimension, and MUST NOT rank by nominal
   inheritance depth.
 - `is_valid_refinement` enforces monotonic narrowing of permission, visibility,
   tools, roots, affinity, budget, information functions, sandbox policy, anchor,
@@ -76,7 +78,10 @@ resolved) and implemented in `agentype-agent-contract`:
   lifecycle mode set, weaken continuity, or weaken required isolation. Affinity
   is an allowed-tag ceiling with an explicit top: `Any` is general and
   unconstrained, `Only(A) ≤ Only(B)` iff `A ⊆ B`, and `Any ≤ Only(B)` is false.
-  A valid refinement therefore never enlarges the set of executable Tasks.
+  Capability values use the executable-Task-set order: a derived type may
+  remove or lower an advertised capability value, but never add a capability or
+  raise a value. A valid refinement therefore never enlarges the set of
+  executable Tasks.
 
 ## Refinement monotonicity
 
@@ -107,8 +112,10 @@ maintenance.
 Lifecycle (short-lived explore-and-retire vs long-lived continuity) is
 orthogonal.
 
-Concrete set/trait encoding is DEFERRED (D-INFO-FN). Implementations MUST NOT
-ship `enum AgentKind { Positive, Negative, Explorer }` as the type identity.
+Concrete set/trait encoding is RESOLVED in M6-A (D-INFO-FN): the closed
+three-value `InformationFunction` enum (`EXPAND`, `COMPRESS_POSITIVE`,
+`COMPRESS_NEGATIVE`) with state-gated admission. Implementations MUST NOT ship
+`enum AgentKind { Positive, Negative, Explorer }` as the type identity.
 
 Positive and negative semantic memory MUST be scoped and evidence-backed.
 Negative entries MUST retain applicability conditions. Implementations MUST

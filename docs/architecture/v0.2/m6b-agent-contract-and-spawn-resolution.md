@@ -156,31 +156,37 @@ capability claim at a different revision never satisfies a requirement.
 Only defined once both `can_execute`, and only when A is no wider than B on
 *every* relevant dimension (information functions, permission, visibility,
 tools, roots, affinity, budget, **lifecycle**, workspace/network, isolation,
-continuity, sandbox policy, anchor, and capability constraints) with at least
-one dimension strictly narrower. Capability constraints use the same shared
-order as refinement (no requirement disappears; each is at least as
-restrictive). Two types with equivalent authority are **incomparable**, not
-mutually more specific. Ranking MUST NOT use nominal inheritance depth.
+continuity, sandbox policy, anchor, and capability values) with at least one
+dimension strictly narrower. Capability values use the executable-Task-set
+order shared with refinement. Two types with equivalent authority are
+**incomparable**, not mutually more specific. Ranking MUST NOT use nominal
+inheritance depth.
 
-### Semantic envelope vs mechanical sandbox authority
+### Semantic scope vs mechanical sandbox authority
 
 Two distinct kinds of field must not be conflated:
 
 ```text
-semantic matching envelope (no physical proof required):
+semantic scope (matching/ranking + monotonic narrowing; NOT enforcement):
     information functions, permission_ceiling, visibility, tools, roots,
-    capability constraints
+    capability values
 
 mechanical sandbox authority (every field has a proof path):
     workspace, network, attempt_isolation   -> ResolvedProvisioningEvidence.enforceable_safety
     full filesystem/tool/visibility policy  -> SandboxPolicyRef, enforced by imported evidence
 ```
 
-A restriction is real only if it is mechanically enforceable; a field either
-lives in the coarse proven set, is covered by an evidence-enforced
-`SandboxPolicyRef`, or is a security-class capability. `SecurityContract`
-therefore contains only the three coarse proven facts — filesystem/tool
-restrictions are not represented as free-text fields.
+A semantic-scope field narrows the executable Task set but is **not** presented
+to the external environment as a security guarantee. A restriction is real only
+if it is mechanically enforceable: it either lives in the coarse proven set, is
+covered by an evidence-enforced `SandboxPolicyRef`, or is a security-class
+capability. `SecurityContract` therefore contains only the three coarse proven
+facts — filesystem/tool restrictions are not represented as free-text fields.
+
+The capability-value order is the **executable-Task-set** order, not the
+provisioning-requirement order: a derived type may remove an advertised
+capability or lower its value, but adding a capability or raising a value can
+execute more Tasks and is rejected.
 
 ### `is_valid_refinement(Base, Derived)`
 
@@ -197,8 +203,8 @@ continuity MAY strengthen but MUST NOT weaken the base guarantee
 anchor MUST satisfy base anchor constraint
 sandbox policy MUST NOT widen (a base None may be pinned; a base Some must match)
 workspace/network/required-isolation MUST NOT weaken base
-capability constraints MUST NOT disappear and MUST be at least as restrictive
-    per matcher (security classes are catalog-global, so they cannot be downgraded)
+capability values MUST NOT add a capability or raise a value (may remove/lower);
+    matcher kind and security class are catalog-global and cannot be downgraded
 ```
 
 ---
