@@ -467,4 +467,104 @@ CREATE INDEX IF NOT EXISTS source_configs_source_idx
 ON source_configs(source_id, source_revision);
 CREATE INDEX IF NOT EXISTS spawn_sources_policy_idx
 ON spawn_sources(adapter_policy_id, adapter_policy_revision);
+
+-- =========================================================================
+-- Mechanical catalog guards
+--
+-- Immutable revision content is frozen by SQLite itself, not only by the
+-- Kernel API: the parent revision row cannot be updated or deleted. Mutable
+-- disposition overlays stay writable but can only advance. Direct mutation
+-- that bypasses the Kernel transaction boundary is therefore rejected here.
+-- =========================================================================
+
+CREATE TRIGGER IF NOT EXISTS capability_definitions_immutable_update
+BEFORE UPDATE ON capability_definitions
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS capability_definitions_immutable_delete
+BEFORE DELETE ON capability_definitions
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policies_immutable_update
+BEFORE UPDATE ON adapter_binding_policies
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policies_immutable_delete
+BEFORE DELETE ON adapter_binding_policies
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_types_immutable_update
+BEFORE UPDATE ON agent_types
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_types_immutable_delete
+BEFORE DELETE ON agent_types
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_sources_immutable_update
+BEFORE UPDATE ON spawn_sources
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_sources_immutable_delete
+BEFORE DELETE ON spawn_sources
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_configs_immutable_update
+BEFORE UPDATE ON source_configs
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_configs_immutable_delete
+BEFORE DELETE ON source_configs
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_dispositions_monotonic
+BEFORE UPDATE OF status ON agent_type_dispositions
+WHEN OLD.status = 'DEPRECATED' AND NEW.status = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'a deprecated AgentType revision cannot be republished');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_dispositions_monotonic
+BEFORE UPDATE OF status ON spawn_source_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'spawn source disposition must not reverse');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_config_dispositions_monotonic
+BEFORE UPDATE OF status ON source_config_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'source config disposition must not reverse');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policy_dispositions_monotonic
+BEFORE UPDATE OF status ON adapter_binding_policy_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'adapter binding policy disposition must not reverse');
+END;
 "#;

@@ -190,6 +190,17 @@ fn source_with_two_claims() -> SpawnSource {
 }
 
 /// Rewrite `content_json` via `mutate` and recompute a matching `content_digest`,
+/// Drop the mechanical immutable-content guards for a table so a test can
+/// simulate storage-level corruption (an attacker or bit rot bypasses the
+/// triggers the same way). Reopening the Kernel recreates them.
+fn drop_immutable_guards(conn: &rusqlite::Connection, table: &str) {
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS {table}_immutable_update;
+         DROP TRIGGER IF EXISTS {table}_immutable_delete;"
+    ))
+    .unwrap();
+}
+
 /// so the row is self-consistent but (deliberately) not canonical.
 fn tamper_json(
     path: &Path,
@@ -198,6 +209,7 @@ fn tamper_json(
     mutate: impl FnOnce(&mut serde_json::Value),
 ) {
     let conn = rusqlite::Connection::open(path).unwrap();
+    drop_immutable_guards(&conn, table);
     let json: String = conn
         .query_row(
             &format!("SELECT content_json FROM {table} WHERE {where_clause}"),
@@ -219,6 +231,7 @@ fn tamper_json(
 /// Corrupt `content_json` without touching `content_digest`.
 fn corrupt_json_only(path: &Path, table: &str, where_clause: &str, suffix: &str) {
     let conn = rusqlite::Connection::open(path).unwrap();
+    drop_immutable_guards(&conn, table);
     conn.execute(
         &format!(
             "UPDATE {table} SET content_json = content_json || '{suffix}' WHERE {where_clause}"
@@ -617,6 +630,7 @@ fn read_verifies_stored_content_integrity() {
     // Tamper with the stored document without updating its content digest.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
+        drop_immutable_guards(&conn, "agent_types");
         conn.execute(
             "UPDATE agent_types SET content_json = content_json || ' ' WHERE type_id='general-reviewer'",
             [],
@@ -722,6 +736,7 @@ fn source_config_column_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
+        drop_immutable_guards(&conn, "source_configs");
         conn.execute(
             "UPDATE source_configs SET config_locator='file:///tampered' WHERE config_id='deep-reasoning'",
             [],
@@ -763,6 +778,7 @@ fn source_config_column_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
+        drop_immutable_guards(&conn, "source_configs");
         let other = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         conn.execute(
             "UPDATE source_configs SET config_digest=?1 WHERE config_id='deep-reasoning'",
@@ -800,6 +816,7 @@ fn opaque_payload_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
+        drop_immutable_guards(&conn, "source_configs");
         conn.execute(
             "UPDATE source_configs SET config_payload_json='{\"model\":\"tampered\"}' WHERE config_id='deep-reasoning'",
             [],
@@ -1065,6 +1082,7 @@ fn selector_lookup_rejects_based_on_relational_drift() {
     // without touching content_json.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
+        drop_immutable_guards(&conn, "agent_types");
         conn.execute(
             "UPDATE agent_types SET based_on_revision=2 WHERE type_id='derived-reviewer'",
             [],
@@ -1412,5 +1430,170 @@ fn repeated_deprecation_preserves_transition_timestamp() {
         .unwrap()
     };
     assert_eq!(first, second, "deprecated_at must be stable");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_component_disposition_preserves_timestamp() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-rd-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let source = base_source();
+    let config = base_config(VALID_DIGEST, Vec::new());
+    let policy = adapter_policy();
+    let source_ref = source.source_ref.clone();
+    let config_ref = config.config_ref.clone();
+    let policy_ref = policy.policy_ref.clone();
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_adapter_binding_policy(&policy).unwrap();
+        kernel.publish_spawn_source(&source).unwrap();
+        kernel
+            .publish_source_config(
+                &config,
+                &SourceConfigBody::ExternalRef {
+                    locator: "file:///x".into(),
+                },
+            )
+            .unwrap();
+        // ACTIVE -> ACTIVE must also be a no-op.
+        kernel
+            .set_spawn_source_status(&source_ref, SourceStatus::Active)
+            .unwrap();
+        kernel
+            .set_spawn_source_status(&source_ref, SourceStatus::Draining)
+            .unwrap();
+        kernel
+            .set_source_config_status(&config_ref, ConfigStatus::Draining)
+            .unwrap();
+        kernel
+            .set_adapter_binding_policy_status(&policy_ref, ConfigStatus::Draining)
+            .unwrap();
+    }
+    let read = |table: &str, id_clause: &str| -> f64 {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row(
+            &format!("SELECT updated_at FROM {table} WHERE {id_clause}"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let source_t1 = read(
+        "spawn_source_dispositions",
+        "source_id='codex-local' AND revision=2",
+    );
+    let config_t1 = read(
+        "source_config_dispositions",
+        "config_id='deep-reasoning' AND config_revision=7",
+    );
+    let policy_t1 = read(
+        "adapter_binding_policy_dispositions",
+        "policy_id='codex-local-adapter' AND revision=3",
+    );
+
+    // A later repeated command must not move any transition timestamp.
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        kernel
+            .set_spawn_source_status(&source_ref, SourceStatus::Draining)
+            .unwrap();
+        kernel
+            .set_source_config_status(&config_ref, ConfigStatus::Draining)
+            .unwrap();
+        kernel
+            .set_adapter_binding_policy_status(&policy_ref, ConfigStatus::Draining)
+            .unwrap();
+    }
+    assert_eq!(
+        source_t1,
+        read(
+            "spawn_source_dispositions",
+            "source_id='codex-local' AND revision=2"
+        )
+    );
+    assert_eq!(
+        config_t1,
+        read(
+            "source_config_dispositions",
+            "config_id='deep-reasoning' AND config_revision=7"
+        )
+    );
+    assert_eq!(
+        policy_t1,
+        read(
+            "adapter_binding_policy_dispositions",
+            "policy_id='codex-local-adapter' AND revision=3"
+        )
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sqlite_mechanically_rejects_immutable_catalog_mutation() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-tg-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // Immutable revision content cannot be mutated or deleted, even with a
+    // self-consistent rewrite (the trigger fires before the change).
+    assert!(conn
+        .execute(
+            "UPDATE agent_types SET content_json='{}', content_digest='sha256:00' WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "DELETE FROM agent_types WHERE type_id='general-reviewer'",
+            []
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE capability_definitions SET polarity='RESTRICTION'",
+            []
+        )
+        .is_err());
+    // Disposition overlays stay writable but cannot reverse.
+    assert!(conn
+        .execute(
+            "UPDATE agent_type_dispositions SET status='DEPRECATED' WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_ok());
+    assert!(conn
+        .execute(
+            "UPDATE agent_type_dispositions SET status='PUBLISHED' WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE spawn_source_dispositions SET status='DRAINING' WHERE source_id='codex-local'",
+            [],
+        )
+        .is_ok());
+    assert!(conn
+        .execute(
+            "UPDATE spawn_source_dispositions SET status='ACTIVE' WHERE source_id='codex-local'",
+            [],
+        )
+        .is_err());
+    drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
 }

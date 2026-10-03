@@ -180,7 +180,8 @@ revision has a canonical content encoding and a Core-computed content digest:
   whose overlay is missing is corruption that MUST fail closed with one meaning
   everywhere (reads, setters, idempotent republish, and selector resolution). An
   existing exact revision's overlay MUST NOT be created or repaired by
-  publication;
+  publication. The immutable-content and monotonic-disposition boundary MUST
+  also be enforced mechanically by SQLite triggers, not only by the Kernel API;
 - a read at the catalog boundary MUST verify the stored content digest against
   the stored canonical document, **re-canonicalize** the decoded record (decode
   -> canonicalize against the catalog -> re-encode -> byte equality; a

@@ -94,7 +94,10 @@ M6-B.2 catalog persistence MUST cover:
   `adapter_policy`) fails closed when the referenced revision is corrupt
   (missing overlay or invalid canonical content), and creates no new row
 - a repeated disposition command is an idempotent no-op that preserves the
-  transition timestamp
+  transition timestamp, for AgentType, SpawnSource, SourceConfig, and
+  AdapterBindingPolicy (including an initial `ACTIVE -> ACTIVE`)
+- SQLite mechanically rejects a direct `UPDATE`/`DELETE` of an immutable
+  revision row and a direct disposition status reversal, without the Kernel
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path
 - a fresh publication persists the caller's initial disposition (a `Disabled`

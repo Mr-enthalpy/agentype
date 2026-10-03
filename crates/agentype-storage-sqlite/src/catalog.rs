@@ -1166,6 +1166,11 @@ pub fn set_spawn_source_status(
     };
     let next = source_status_sql(status);
     check_monotonic(&current, next)?;
+    // Repeating the current disposition is a durable no-op that preserves the
+    // original transition timestamp (`updated_at`).
+    if current == next {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE spawn_source_dispositions SET status=?1, updated_at=?2
          WHERE source_id=?3 AND revision=?4",
@@ -1205,6 +1210,9 @@ pub fn set_source_config_status(
     };
     let next = config_status_sql(status);
     check_monotonic(&current, next)?;
+    if current == next {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE source_config_dispositions SET status=?1, updated_at=?2
          WHERE source_id=?3 AND source_revision=?4 AND config_id=?5 AND config_revision=?6",
@@ -1239,6 +1247,9 @@ pub fn set_adapter_binding_policy_status(
     };
     let next = config_status_sql(status);
     check_monotonic(&current, next)?;
+    if current == next {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE adapter_binding_policy_dispositions SET status=?1, updated_at=?2
          WHERE policy_id=?3 AND revision=?4",

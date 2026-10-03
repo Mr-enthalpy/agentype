@@ -359,7 +359,11 @@ Rules now enforced by the durable catalog:
   (decode -> canonicalize -> re-encode -> byte equality, not merely
   decode -> re-encode), and cross-check every duplicated relational column
   against the canonical document, so a self-consistent but non-canonical row
-  still fails closed.
+  still fails closed. This is enforced mechanically as well as by the Kernel:
+  SQLite `BEFORE UPDATE`/`BEFORE DELETE` triggers reject any mutation of an
+  immutable revision row, and `BEFORE UPDATE OF status` triggers on the
+  disposition overlays reject a status reversal, so direct SQL cannot bypass the
+  boundary.
 - **AdapterBindingPolicy invariant.** Its fields are public, so the durable
   publication and decode boundaries both call `AdapterBindingPolicy::validate`;
   a blank `adapter_kind` or `binding_ref` can never enter the catalog. The

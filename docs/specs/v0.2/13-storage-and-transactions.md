@@ -75,7 +75,15 @@ through its validated read, not merely verify that the row exists; a corrupt
 dependency MUST fail closed rather than propagate into new durable facts. A
 non-`ACTIVE`/`DEPRECATED` dependency may still be referenced; only corruption is
 rejected. Repeating the current disposition MUST be an idempotent no-op that
-preserves the transition timestamp.
+preserves the transition timestamp, for every disposition overlay (AgentType,
+SpawnSource, SourceConfig, AdapterBindingPolicy).
+
+The immutable-revision / monotonic-disposition boundary MUST also be enforced by
+SQLite itself, not only by the Kernel API: `BEFORE UPDATE` and `BEFORE DELETE`
+triggers MUST reject any mutation of an immutable revision row, and
+`BEFORE UPDATE OF status` triggers on the disposition overlays MUST reject a
+status reversal, so a direct SQL statement that bypasses the Kernel transaction
+cannot mutate frozen content or reverse a disposition.
 
 A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`
