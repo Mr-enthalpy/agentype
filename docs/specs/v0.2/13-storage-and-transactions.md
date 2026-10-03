@@ -69,6 +69,14 @@ same validated read, so selector resolution is not a second, weaker authority.
 Any corrupt published revision MUST fail the whole lookup closed (no silent drop
 and no fallback to another revision).
 
+A new immutable revision that references another catalog revision (an AgentType
+`based_on`, a SpawnSource `adapter_policy`) MUST resolve the referenced revision
+through its validated read, not merely verify that the row exists; a corrupt
+dependency MUST fail closed rather than propagate into new durable facts. A
+non-`ACTIVE`/`DEPRECATED` dependency may still be referenced; only corruption is
+rejected. Repeating the current disposition MUST be an idempotent no-op that
+preserves the transition timestamp.
+
 A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`
 configs, before it enters a durable revision.
@@ -94,7 +102,8 @@ place of the other. Core MUST reject an all-whitespace locator but MUST store a
 non-empty locator exactly as supplied (it MUST NOT trim a source-owned opaque
 identity). A single validated `SourceConfigRevision` read MUST be the only
 SourceConfig read path; getters MUST NOT read the duplicated columns
-independently.
+independently, and a later stage MUST read the opaque body through that validated
+record rather than issuing its own query.
 
 ## Kernel unique constraints (MUST)
 

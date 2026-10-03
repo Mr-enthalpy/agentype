@@ -90,6 +90,13 @@ M6-B.2 catalog persistence MUST cover:
 - golden digest vectors pin the canonical byte format
 - a derived AgentType `based_on` provenance is verified and a widening
   refinement is rejected at publication
+- a dependent immutable publication (AgentType `based_on`, SpawnSource
+  `adapter_policy`) fails closed when the referenced revision is corrupt
+  (missing overlay or invalid canonical content), and creates no new row
+- a repeated disposition command is an idempotent no-op that preserves the
+  transition timestamp
+- a `SourceConfigRevision` exposes its validated opaque body without a second
+  read path
 - a fresh publication persists the caller's initial disposition (a `Disabled`
   source/config/policy is not silently stored as `Active`)
 - disposition changes never alter revision content and are monotonic

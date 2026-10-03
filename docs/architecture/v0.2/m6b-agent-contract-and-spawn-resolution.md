@@ -366,17 +366,25 @@ Rules now enforced by the durable catalog:
   values are stored verbatim, and the schema carries a non-blank CHECK as
   defense in depth.
 - **Provenance and refinement.** Publishing a derived AgentType verifies that
-  its `based_on` base exists and that `is_valid_refinement` holds; a missing
-  base or a widening refinement fails closed.
+  its `based_on` base is a complete validated record (canonical content, mirror,
+  and present overlay) and that `is_valid_refinement` holds; a missing base, a
+  corrupt base, or a widening refinement fails closed.
+- **Dependent references.** A new immutable revision that references another
+  catalog revision (AgentType `based_on`, SpawnSource `adapter_policy`) MUST
+  resolve it through that revision's validated read, not merely check that the
+  row exists. A corrupt dependency fails closed and cannot propagate into new
+  durable facts. A non-`ACTIVE`/`DEPRECATED` dependency may still be referenced;
+  only corruption is rejected.
 - **Disposition separation and fidelity.** Status is a separate overlay and
   never enters a digest. A fresh publication persists the caller's initial
   disposition (an `ACTIVE` source/config is not silently substituted), and
   dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`; others
-  `ACTIVE -> DRAINING -> DISABLED`). A revision row whose overlay is missing is
-  durable corruption: reads, selector resolution, disposition setters, and
-  idempotent republish all fail closed, and no path may silently drop the
-  revision or recreate its overlay. Only a fresh immutable publication creates
-  an overlay, in the same transaction.
+  `ACTIVE -> DRAINING -> DISABLED`). Repeating the current disposition is an
+  idempotent no-op that preserves the transition timestamp. A revision row whose
+  overlay is missing is durable corruption: reads, selector resolution,
+  disposition setters, and idempotent republish all fail closed, and no path may
+  silently drop the revision or recreate its overlay. Only a fresh immutable
+  publication creates an overlay, in the same transaction.
 - **ConfigDigest grammar.** A config digest has the frozen grammar
   `sha256:<64 lowercase hex>`, validated for both body modes before it enters a
   durable revision. An `OpaqueJson` digest is Core-computed from the body; an
@@ -401,7 +409,9 @@ Rules now enforced by the durable catalog:
   belong behind `ExternalRef`/`CredentialRef` (B.5), so the database never
   becomes a provider-secret store. All SourceConfig getters derive from one
   validated `SourceConfigRevision` read that cross-checks the duplicated
-  mode/payload/locator/digest columns against the canonical document.
+  mode/payload/locator/digest columns against the canonical document. A later
+  stage (B.4) MUST read the opaque body through that same validated record
+  (`SourceConfigRevision::body` / `payload`), never with a separate query.
 - **Selector lookup.** Pre-commit `AgentTypeSelector` resolution builds its
   published set from the same validated canonical read as `get_agent_type`; a
   corrupt published revision (including a missing overlay) fails the whole

@@ -165,16 +165,22 @@ revision has a canonical content encoding and a Core-computed content digest:
   declaration supersedes `DECLARED` ones, and two surviving declarations with
   the same value but a different `declaration_provenance_ref` are ambiguous and
   MUST fail closed (provenance is diagnostic, never an input-order tie-break);
-- a derived AgentType's `based_on` provenance MUST be verified against the
-  published base, and the derived contract MUST pass `is_valid_refinement`
-  before it is published;
+- a derived AgentType's `based_on` provenance MUST be verified against the base
+  loaded through its validated read (canonical content, mirror, and present
+  overlay), and the derived contract MUST pass `is_valid_refinement` before it is
+  published; a corrupt base MUST fail closed and MUST NOT authorize a new
+  immutable revision. A new revision that references another catalog revision
+  (AgentType `based_on`, SpawnSource `adapter_policy`) MUST likewise resolve that
+  dependency through its validated read, not merely check that the row exists;
 - publication and deprecation status is a mutable **disposition overlay** that
   MUST NOT enter the revision content or its digest; a fresh publication MUST
   persist the caller's initial disposition (never silently substitute
-  `ACTIVE`), dispositions only advance, and a revision row whose overlay is
-  missing is corruption that MUST fail closed with one meaning everywhere
-  (reads, setters, idempotent republish, and selector resolution). An existing
-  exact revision's overlay MUST NOT be created or repaired by publication;
+  `ACTIVE`), dispositions only advance, repeating the current disposition MUST be
+  an idempotent no-op that preserves the transition timestamp, and a revision row
+  whose overlay is missing is corruption that MUST fail closed with one meaning
+  everywhere (reads, setters, idempotent republish, and selector resolution). An
+  existing exact revision's overlay MUST NOT be created or repaired by
+  publication;
 - a read at the catalog boundary MUST verify the stored content digest against
   the stored canonical document, **re-canonicalize** the decoded record (decode
   -> canonicalize against the catalog -> re-encode -> byte equality; a

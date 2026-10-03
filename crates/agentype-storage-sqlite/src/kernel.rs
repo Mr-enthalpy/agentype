@@ -807,6 +807,15 @@ impl Kernel {
         self.tx(|tx, _| crate::catalog::get_source_config_locator(tx, reference))
     }
 
+    /// The single validated SourceConfig revision read (metadata + opaque body).
+    /// Later stages MUST use this rather than re-reading `source_configs`.
+    pub fn get_source_config_revision(
+        &self,
+        reference: &SourceConfigRef,
+    ) -> Result<Option<crate::catalog::SourceConfigRevision>, Error> {
+        self.tx(|tx, _| crate::catalog::load_source_config_revision(tx, reference))
+    }
+
     pub fn get_adapter_binding_policy(
         &self,
         reference: &AdapterPolicyRef,

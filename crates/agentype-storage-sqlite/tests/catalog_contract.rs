@@ -12,7 +12,8 @@ use agentype_agent_contract::{
 };
 use agentype_core::{Clock, Error, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::{
-    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SourceConfigRevision, SCHEMA_VERSION,
+    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SourceConfigBodyView,
+    SourceConfigRevision, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1236,20 +1237,180 @@ fn source_config_revision_identity_includes_locator() {
         config: base_config(VALID_DIGEST, Vec::new()),
         mode: ConfigMode::ExternalRef,
         locator: Some("file:///a.toml".into()),
+        payload: None,
     };
     let b = SourceConfigRevision {
         config: base_config(VALID_DIGEST, Vec::new()),
         mode: ConfigMode::ExternalRef,
         locator: Some("file:///b.toml".into()),
+        payload: None,
     };
     let same = SourceConfigRevision {
         config: base_config(VALID_DIGEST, Vec::new()),
         mode: ConfigMode::ExternalRef,
         locator: Some("file:///a.toml".into()),
+        payload: None,
     };
     // The metadata-only relation says equal...
     assert!(a.config.same_config_contract_content(&b.config));
     // ...but the complete durable revision identity does not.
     assert!(!a.same_revision_content(&b));
     assert!(a.same_revision_content(&same));
+}
+
+#[test]
+fn derived_agent_type_rejects_base_with_missing_overlay() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-db-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let base = base_agent("general-reviewer", 1, None);
+    let mut derived = base_agent("derived-reviewer", 1, Some(type_ref("general-reviewer", 1)));
+    derived.contract.budget_ceiling = Budget::new(50.0).unwrap();
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&base).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // A base the catalog already treats as corrupt cannot authorize a new
+    // immutable revision.
+    assert!(matches!(
+        kernel.publish_agent_type(&derived),
+        Err(Error::InvariantViolation(_))
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_types WHERE type_id='derived-reviewer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "no derived immutable row may be created");
+    let overlays: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_type_dispositions WHERE type_id='derived-reviewer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlays, 0, "no derived overlay may be created");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spawn_source_rejects_corrupt_adapter_policy_dependency() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-sp-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM adapter_binding_policy_dispositions WHERE policy_id='codex-local-adapter' AND revision=3",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // The FK proves the row exists, but a corrupt dependency must not be
+    // referenced by a new immutable revision.
+    assert!(matches!(
+        kernel.publish_spawn_source(&base_source()),
+        Err(Error::InvariantViolation(_))
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM spawn_sources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no spawn source may be created");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn source_config_revision_exposes_validated_body() {
+    let kernel = memory_kernel();
+    publish_catalog(&kernel);
+    kernel
+        .publish_adapter_binding_policy(&adapter_policy())
+        .unwrap();
+    kernel.publish_spawn_source(&base_source()).unwrap();
+
+    let payload = serde_json::json!({"model": "x", "provider": "y"});
+    let config = base_config(&canonical_json_body_digest(&payload), Vec::new());
+    kernel
+        .publish_source_config(&config, &SourceConfigBody::OpaqueJson(payload.clone()))
+        .unwrap();
+    let revision = kernel
+        .get_source_config_revision(&config.config_ref)
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.mode, ConfigMode::OpaqueJson);
+    match revision.body() {
+        Some(SourceConfigBodyView::OpaqueJson(value)) => assert_eq!(*value, payload),
+        other => panic!("expected an opaque body, got {other:?}"),
+    }
+}
+
+#[test]
+fn repeated_deprecation_preserves_transition_timestamp() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-dd-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+        kernel
+            .set_agent_type_status(&agent.type_ref, AgentTypeStatus::Deprecated)
+            .unwrap();
+    }
+    let first: f64 = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row(
+            "SELECT deprecated_at FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    // A later repeated deprecation is a no-op: it must not move the timestamp.
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        kernel
+            .set_agent_type_status(&agent.type_ref, AgentTypeStatus::Deprecated)
+            .unwrap();
+    }
+    let second: f64 = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row(
+            "SELECT deprecated_at FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(first, second, "deprecated_at must be stable");
+    let _ = std::fs::remove_dir_all(&dir);
 }

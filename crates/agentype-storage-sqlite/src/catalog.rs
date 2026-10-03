@@ -428,11 +428,14 @@ pub fn publish_agent_type(
     let catalog = load_capability_catalog(tx)?;
     canonicalize_agent_type(&mut canonical, &catalog).map_err(contract_fault)?;
 
-    // based_on provenance: the base must exist and the derived contract must be
-    // a monotonic narrowing of it (spec 06). A missing base fails closed rather
-    // than trusting the field.
+    // based_on provenance: the base must be a complete, valid catalog record
+    // (validated canonical content AND a present disposition overlay) before it
+    // can be used as authority for a new immutable revision. A base that the
+    // catalog already treats as corrupt must not propagate into new durable
+    // facts. The base may be PUBLISHED or DEPRECATED; only a missing overlay
+    // fails closed.
     if let Some(base_ref) = &canonical.based_on {
-        let base = load_agent_type(tx, base_ref)?.ok_or_else(|| {
+        let (base, _status) = get_agent_type(tx, base_ref)?.ok_or_else(|| {
             Error::not_found(format!(
                 "based_on agent type {}@{} does not exist",
                 base_ref.id().as_str(),
@@ -502,6 +505,19 @@ pub fn publish_spawn_source(
     let mut canonical = source.clone();
     let catalog = load_capability_catalog(tx)?;
     canonicalize_spawn_source(&mut canonical, &catalog).map_err(contract_fault)?;
+
+    // The referenced adapter binding policy MUST be a complete, valid catalog
+    // record (validated canonical content AND a present disposition overlay).
+    // The SQL FK only proves the immutable row exists; it cannot prove the row
+    // is not corrupt, so a corrupt dependency must not be referenced by a new
+    // immutable revision. A DRAINING/DISABLED policy is still referenceable.
+    get_adapter_binding_policy(tx, &canonical.adapter_policy)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "adapter binding policy {}@{} does not exist",
+            canonical.adapter_policy.id().as_str(),
+            canonical.adapter_policy.revision()
+        ))
+    })?;
 
     let digest = spawn_source_content_digest(&canonical);
     let content_json =
@@ -681,54 +697,6 @@ pub fn publish_source_config(
 // Reads
 // =============================================================================
 
-fn load_agent_type(
-    tx: &Transaction<'_>,
-    reference: &AgentTypeRef,
-) -> Result<Option<AgentType>, Error> {
-    let row = query_opt(
-        tx,
-        "SELECT content_json, content_digest, based_on_type_id, based_on_revision
-         FROM agent_types WHERE type_id=?1 AND revision=?2",
-        params![reference.id().as_str(), reference.revision()],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        },
-    )?;
-    match row {
-        None => Ok(None),
-        Some((json, digest, base_id, base_revision)) => {
-            verify_content_digest(&json, &digest, "agent type")?;
-            let mut agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
-            cross_check(agent.type_ref == *reference, "agent type")?;
-            let canonical_base = agent
-                .based_on
-                .as_ref()
-                .map(|base| (base.id().as_str().to_string(), base.revision() as i64));
-            let row_base = match (base_id, base_revision) {
-                (Some(id), Some(revision)) => Some((id, revision)),
-                (None, None) => None,
-                _ => {
-                    return Err(Error::invariant(
-                        "catalog agent type based_on mirror is half-populated",
-                    ))
-                }
-            };
-            cross_check(canonical_base == row_base, "agent type")?;
-            // The stored document MUST be the unique canonical encoding: decode,
-            // re-canonicalize against the catalog, then require byte equality.
-            let catalog = load_capability_catalog(tx)?;
-            canonicalize_agent_type(&mut agent, &catalog).map_err(contract_fault)?;
-            verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
-            Ok(Some(agent))
-        }
-    }
-}
-
 pub fn get_agent_type(
     tx: &Transaction<'_>,
     reference: &AgentTypeRef,
@@ -854,6 +822,18 @@ pub struct SourceConfigRevision {
     pub config: SourceConfig,
     pub mode: ConfigMode,
     pub locator: Option<String>,
+    /// The validated opaque body, `Some` only for `OpaqueJson`. This is the only
+    /// supported way for a later stage (B.4) to read a config body; it MUST NOT
+    /// be re-read with a separate SQL query, which would bypass this validated
+    /// read path.
+    pub payload: Option<serde_json::Value>,
+}
+
+/// A borrowed view of a validated `SourceConfigRevision` body.
+#[derive(Clone, Copy, Debug)]
+pub enum SourceConfigBodyView<'a> {
+    OpaqueJson(&'a serde_json::Value),
+    ExternalRef(&'a str),
 }
 
 impl SourceConfigRevision {
@@ -866,6 +846,15 @@ impl SourceConfigRevision {
         self.mode == other.mode
             && self.locator == other.locator
             && self.config.same_config_contract_content(&other.config)
+    }
+
+    /// The validated opaque body, if the record is well-formed.
+    pub fn body(&self) -> Option<SourceConfigBodyView<'_>> {
+        match (&self.payload, &self.locator) {
+            (Some(payload), _) => Some(SourceConfigBodyView::OpaqueJson(payload)),
+            (None, Some(locator)) => Some(SourceConfigBodyView::ExternalRef(locator)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -930,11 +919,12 @@ pub fn load_source_config_revision(
         "source config",
     )?;
     let mode = ConfigMode::parse_sql(&mode)?;
-    match mode {
+    let payload = match mode {
         ConfigMode::ExternalRef => {
             cross_check(payload_json.is_none(), "source config")?;
             cross_check(locator.is_some(), "source config")?;
             cross_check(locator == canonical_locator, "source config")?;
+            None
         }
         ConfigMode::OpaqueJson => {
             cross_check(locator.is_none(), "source config")?;
@@ -947,12 +937,14 @@ pub fn load_source_config_revision(
                 canonical_json_body_digest(&payload) == config.config_digest.as_str(),
                 "source config",
             )?;
+            Some(payload)
         }
-    }
+    };
     Ok(Some(SourceConfigRevision {
         config,
         mode,
         locator: canonical_locator,
+        payload,
     }))
 }
 
@@ -1102,23 +1094,22 @@ pub fn set_agent_type_status(
             return Err(absent_disposition(exists, "agent type"));
         }
     };
+    // Idempotent: repeating the current disposition is a no-op that preserves
+    // the original transition timestamp (`deprecated_at`).
+    if current == status.as_sql() {
+        return Ok(());
+    }
     if current == "DEPRECATED" && status == AgentTypeStatus::Published {
         return Err(Error::invalid_transition(
             "a deprecated AgentType revision cannot be republished",
         ));
     }
-    let deprecated_at = (status == AgentTypeStatus::Deprecated).then_some(now);
+    // The only remaining transition is PUBLISHED -> DEPRECATED.
     tx.execute(
         "UPDATE agent_type_dispositions
-         SET status=?1, deprecated_at=?2, updated_at=?3
-         WHERE type_id=?4 AND revision=?5",
-        params![
-            status.as_sql(),
-            deprecated_at,
-            now,
-            reference.id().as_str(),
-            reference.revision()
-        ],
+         SET status='DEPRECATED', deprecated_at=?1, updated_at=?1
+         WHERE type_id=?2 AND revision=?3",
+        params![now, reference.id().as_str(), reference.revision()],
     )
     .map_err(map_sqlite)?;
     Ok(())

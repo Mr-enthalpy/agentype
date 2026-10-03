@@ -30,7 +30,8 @@ mod store;
 pub mod txutil;
 
 pub use catalog::{
-    AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigRevision,
+    AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigBodyView,
+    SourceConfigRevision,
 };
 pub use kernel::{
     CurrentAuthorityHint, ExecutionReconciliationSnapshot, ExecutionRoutingFacts, Kernel,
