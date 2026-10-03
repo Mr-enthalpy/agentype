@@ -103,6 +103,13 @@ M6-B.2 catalog persistence MUST cover:
   payload) fails every SourceConfig read closed through the single validated
   `SourceConfigRevision` path
 - a read recomputes the stored content digest, so a tampered row fails closed
+- a self-consistent but non-canonical row (duplicate/permuted claims, an
+  explicit `Bool(false)`, duplicated/permuted credential refs) fails closed
+  because the read re-canonicalizes before re-encoding
+- a blank `AdapterBindingPolicy` `adapter_kind`/`binding_ref` is rejected at
+  publication and at decode
+- an idempotent republish of an existing exact revision fails closed if that
+  stored revision is corrupt
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 
 ## C. Provider/frontend neutrality (M7)

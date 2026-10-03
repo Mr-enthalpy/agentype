@@ -392,3 +392,32 @@ fn agent_type_digest_ignores_information_function_order() {
         ])
     );
 }
+
+#[test]
+fn adapter_binding_policy_blank_fields_fail_closed() {
+    let safety =
+        PhysicalSafety::new(false, vec![WorkspaceMode::ReadOnly], BTreeSet::new()).unwrap();
+    let blank_kind = AdapterBindingPolicy {
+        policy_ref: policy_ref("p", 1),
+        adapter_kind: "".into(),
+        binding_ref: "workstation-primary".into(),
+        required_safety: safety.clone(),
+        status: ConfigStatus::Active,
+    };
+    assert!(blank_kind.validate().is_err());
+    // A document the encoder happily produces for an invalid record MUST still be
+    // rejected by the canonical decoder.
+    let json = String::from_utf8(canonical_adapter_binding_policy_bytes(&blank_kind)).unwrap();
+    assert!(adapter_binding_policy_from_canonical_json(&json, ConfigStatus::Active).is_err());
+
+    let blank_ref = AdapterBindingPolicy {
+        policy_ref: policy_ref("p", 1),
+        adapter_kind: "codex_cli".into(),
+        binding_ref: "   ".into(),
+        required_safety: safety,
+        status: ConfigStatus::Active,
+    };
+    assert!(blank_ref.validate().is_err());
+    let json = String::from_utf8(canonical_adapter_binding_policy_bytes(&blank_ref)).unwrap();
+    assert!(adapter_binding_policy_from_canonical_json(&json, ConfigStatus::Active).is_err());
+}

@@ -352,10 +352,19 @@ Rules now enforced by the durable catalog:
   diagnostic, never a tie-break by input order).
 - **Immutability.** Republishing the same exact `(ref, content digest)` is
   idempotent; a different digest for an already-published exact revision fails
-  closed as an invariant violation. Reads recompute the digest from the stored
-  document, re-encode the decoded record, and cross-check every duplicated
-  relational column against the canonical document, so a drifted row cannot
-  become a second source of truth.
+  closed as an invariant violation, and an idempotent republish of an existing
+  exact revision MUST first re-run the validated read so a pre-existing corrupt
+  row cannot be reported as published. Reads recompute the digest from the
+  stored document, **re-canonicalize** the decoded record against the catalog
+  (decode -> canonicalize -> re-encode -> byte equality, not merely
+  decode -> re-encode), and cross-check every duplicated relational column
+  against the canonical document, so a self-consistent but non-canonical row
+  still fails closed.
+- **AdapterBindingPolicy invariant.** Its fields are public, so the durable
+  publication and decode boundaries both call `AdapterBindingPolicy::validate`;
+  a blank `adapter_kind` or `binding_ref` can never enter the catalog. The
+  values are stored verbatim, and the schema carries a non-blank CHECK as
+  defense in depth.
 - **Provenance and refinement.** Publishing a derived AgentType verifies that
   its `based_on` base exists and that `is_valid_refinement` holds; a missing
   base or a widening refinement fails closed.

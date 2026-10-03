@@ -3,19 +3,19 @@
 //! refinement, disposition separation/monotonicity, and restart durability.
 
 use agentype_agent_contract::{
-    canonical_json_body_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
-    AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityCatalog,
-    CapabilityDefinition, CapabilityPolarity, CapabilityRef, ConfigDigest, ConfigStatus,
-    ContinuityMode, CredentialRef, LifecycleMode, MatcherKind, NetworkPolicy, PhysicalSafety,
-    SecurityClass, SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource,
-    SpawnSourceRef,
+    canonical_json_body_digest, content_digest, AdapterBindingPolicy, AdapterPolicyRef,
+    AffinityConstraint, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Assurance,
+    Budget, CapabilityCatalog, CapabilityClaim, CapabilityDefinition, CapabilityPolarity,
+    CapabilityRef, CapabilityValue, ConfigDigest, ConfigStatus, ContinuityMode, CredentialRef,
+    LifecycleMode, MatcherKind, NetworkPolicy, PhysicalSafety, SecurityClass, SecurityContract,
+    SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
 };
 use agentype_core::{Clock, Error, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::{
     AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_BYTES: usize = 16_384;
@@ -152,6 +152,79 @@ fn publish_catalog(kernel: &Kernel) -> CapabilityCatalog {
         )
         .unwrap();
     kernel.load_capability_catalog().unwrap()
+}
+
+/// Define two evidence-class (no functional envelope needed) Bool capabilities.
+fn publish_claims_catalog(kernel: &Kernel) {
+    for id in ["terminal.attach", "terminal.network"] {
+        kernel
+            .publish_capability_definition(
+                &cref(id, 1),
+                &definition(
+                    MatcherKind::Bool,
+                    SecurityClass::Authority,
+                    CapabilityPolarity::Ability,
+                ),
+            )
+            .unwrap();
+    }
+}
+
+fn claim(id: &str, value: bool) -> CapabilityClaim {
+    CapabilityClaim {
+        reference: cref(id, 1),
+        value: CapabilityValue::Bool(value),
+        assurance: Assurance::Enforced,
+        declaration_provenance_ref: None,
+    }
+}
+
+fn source_with_two_claims() -> SpawnSource {
+    let mut source = base_source();
+    source.claims = vec![
+        claim("terminal.attach", true),
+        claim("terminal.network", true),
+    ];
+    source
+}
+
+/// Rewrite `content_json` via `mutate` and recompute a matching `content_digest`,
+/// so the row is self-consistent but (deliberately) not canonical.
+fn tamper_json(
+    path: &Path,
+    table: &str,
+    where_clause: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let json: String = conn
+        .query_row(
+            &format!("SELECT content_json FROM {table} WHERE {where_clause}"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    mutate(&mut value);
+    let tampered = serde_json::to_string(&value).unwrap();
+    let digest = content_digest(tampered.as_bytes());
+    conn.execute(
+        &format!("UPDATE {table} SET content_json=?1, content_digest=?2 WHERE {where_clause}"),
+        rusqlite::params![tampered, digest],
+    )
+    .unwrap();
+}
+
+/// Corrupt `content_json` without touching `content_digest`.
+fn corrupt_json_only(path: &Path, table: &str, where_clause: &str, suffix: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET content_json = content_json || '{suffix}' WHERE {where_clause}"
+        ),
+        [],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -717,6 +790,159 @@ fn opaque_payload_drift_fails_closed() {
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     assert!(matches!(
         kernel.get_source_config(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn seed_source(path: &Path) {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(path, clock, 10.0, MAX_BYTES).unwrap();
+    publish_claims_catalog(&kernel);
+    kernel
+        .publish_adapter_binding_policy(&adapter_policy())
+        .unwrap();
+    kernel
+        .publish_spawn_source(&source_with_two_claims())
+        .unwrap();
+}
+
+fn assert_source_read_fails(tag: &str, mutate: impl FnOnce(&mut serde_json::Value)) {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-c-{tag}-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    seed_source(&path);
+    tamper_json(
+        &path,
+        "spawn_sources",
+        "source_id='codex-local' AND revision=2",
+        mutate,
+    );
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    let reference = SpawnSourceRef::new("codex-local", 2).unwrap();
+    assert!(
+        matches!(
+            kernel.get_spawn_source(&reference),
+            Err(Error::InvariantViolation(_))
+        ),
+        "case {tag} must fail closed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_canonical_claim_rows_fail_closed() {
+    // A self-consistent but non-canonical document (matching digest) must still
+    // be rejected: the read authority re-canonicalizes, it does not merely
+    // round-trip the decoder.
+    assert_source_read_fails("duplicate", |value| {
+        let first = value["claims"][0].clone();
+        value["claims"].as_array_mut().unwrap().push(first);
+    });
+    assert_source_read_fails("permutation", |value| {
+        value["claims"].as_array_mut().unwrap().reverse();
+    });
+    assert_source_read_fails("bool-false", |value| {
+        value["claims"][0]["value"] = serde_json::json!({"kind": "BOOL", "value": false});
+    });
+}
+
+#[test]
+fn non_canonical_credential_ref_rows_fail_closed() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-r-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let a = CredentialRef::new("vault://a").unwrap();
+    let b = CredentialRef::new("vault://b").unwrap();
+    let config = base_config(VALID_DIGEST, vec![b, a]);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+        kernel
+            .publish_source_config(
+                &config,
+                &SourceConfigBody::ExternalRef {
+                    locator: "file:///etc/codex/config.toml".into(),
+                },
+            )
+            .unwrap();
+    }
+    tamper_json(
+        &path,
+        "source_configs",
+        "config_id='deep-reasoning' AND config_revision=7",
+        |value| {
+            value["credential_refs"].as_array_mut().unwrap().reverse();
+        },
+    );
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert!(matches!(
+        kernel.get_source_config(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blank_adapter_binding_policy_is_rejected() {
+    let kernel = memory_kernel();
+    let valid_safety = full_safety();
+    let blank_kind = AdapterBindingPolicy {
+        policy_ref: policy_ref("p", 1),
+        adapter_kind: "".into(),
+        binding_ref: "workstation-primary".into(),
+        required_safety: valid_safety.clone(),
+        status: ConfigStatus::Active,
+    };
+    assert!(matches!(
+        kernel.publish_adapter_binding_policy(&blank_kind),
+        Err(Error::InvariantViolation(_))
+    ));
+    let blank_ref = AdapterBindingPolicy {
+        policy_ref: policy_ref("p", 1),
+        adapter_kind: "codex_cli".into(),
+        binding_ref: "   ".into(),
+        required_safety: valid_safety,
+        status: ConfigStatus::Active,
+    };
+    assert!(matches!(
+        kernel.publish_adapter_binding_policy(&blank_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn idempotent_republish_over_corrupt_row_fails_closed() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-q-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    // Corrupt the stored document without changing the recorded digest.
+    corrupt_json_only(
+        &path,
+        "agent_types",
+        "type_id='general-reviewer' AND revision=1",
+        " ",
+    );
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // Idempotent republish of the same content must not report success over a
+    // corrupted existing revision.
+    assert!(matches!(
+        kernel.publish_agent_type(&agent),
         Err(Error::InvariantViolation(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);

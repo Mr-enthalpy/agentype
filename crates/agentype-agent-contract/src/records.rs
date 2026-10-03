@@ -508,9 +508,11 @@ impl PhysicalSafety {
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
 ///
-/// B.1 defines only the value shape; B.2/B.4 own catalogue validation and the
-/// physical binding key. Use [`AdapterBindingPolicy::new`] so the non-empty
-/// invariant holds at construction.
+/// B.1 defines the value shape; B.2 owns durable catalogue validation and B.4
+/// owns the physical binding key. The fields are public, so every durable entry
+/// point (construction and decode) MUST call [`AdapterBindingPolicy::validate`];
+/// a blank `adapter_kind` or `binding_ref` is not a legal physical-binding
+/// intent. The values are stored verbatim, never trimmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterBindingPolicy {
     pub policy_ref: AdapterPolicyRef,
@@ -521,6 +523,21 @@ pub struct AdapterBindingPolicy {
 }
 
 impl AdapterBindingPolicy {
+    /// The whole-record invariant: a non-blank `adapter_kind` and `binding_ref`.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.adapter_kind.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy kind cannot be empty".into(),
+            });
+        }
+        if self.binding_ref.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy binding_ref cannot be empty".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn new(
         policy_ref: AdapterPolicyRef,
         adapter_kind: impl Into<String>,
@@ -528,25 +545,15 @@ impl AdapterBindingPolicy {
         required_safety: PhysicalSafety,
         status: ConfigStatus,
     ) -> Result<Self, ContractError> {
-        let adapter_kind = adapter_kind.into();
-        let binding_ref = binding_ref.into();
-        if adapter_kind.trim().is_empty() {
-            return Err(ContractError::InvalidRef {
-                reason: "adapter binding policy kind cannot be empty".into(),
-            });
-        }
-        if binding_ref.trim().is_empty() {
-            return Err(ContractError::InvalidRef {
-                reason: "adapter binding policy binding_ref cannot be empty".into(),
-            });
-        }
-        Ok(Self {
+        let policy = Self {
             policy_ref,
-            adapter_kind,
-            binding_ref,
+            adapter_kind: adapter_kind.into(),
+            binding_ref: binding_ref.into(),
             required_safety,
             status,
-        })
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 }
 

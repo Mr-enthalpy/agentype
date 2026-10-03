@@ -45,11 +45,16 @@ change never alters a revision content digest:
 
 A published exact revision's content digest is a durability witness: a read at
 the catalog authority boundary MUST recompute the digest from the stored
-canonical document (and MUST NOT accept a document that is not the canonical
-encoding of the record it decodes to). Every duplicated relational column
-(identity, `based_on`, adapter policy, capability semantics, config body/mode/
-locator/digest) MUST be cross-checked against the canonical document, so no
-mirror column becomes a second authority.
+canonical document, re-canonicalize the decoded record (decode -> canonicalize
+against the catalog -> re-encode -> byte equality), and MUST NOT accept a
+document that is not the unique canonical encoding of the record it decodes to.
+Every duplicated relational column (identity, `based_on`, adapter policy,
+capability semantics, config body/mode/locator/digest) MUST be cross-checked
+against the canonical document, so no mirror column becomes a second authority.
+An idempotent republish of an existing exact revision MUST re-run this validated
+read before reporting success, and every aggregate's publication boundary MUST
+enforce that aggregate's own value invariant (for example a non-blank
+`AdapterBindingPolicy` `adapter_kind`/`binding_ref`), storing the value verbatim.
 
 A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`

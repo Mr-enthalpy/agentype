@@ -369,8 +369,8 @@ CREATE TABLE IF NOT EXISTS capability_definitions (
 CREATE TABLE IF NOT EXISTS adapter_binding_policies (
     policy_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision >= 1),
-    adapter_kind TEXT NOT NULL,
-    binding_ref TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL CHECK (length(trim(adapter_kind)) > 0),
+    binding_ref TEXT NOT NULL CHECK (length(trim(binding_ref)) > 0),
     content_json TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     created_at REAL NOT NULL,

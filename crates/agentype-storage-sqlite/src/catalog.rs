@@ -286,6 +286,7 @@ pub fn publish_capability_definition(
          WHERE capability_id=?1 AND revision=?2",
         params![reference.capability_id().as_str(), reference.revision()],
     )?;
+    let had_existing = existing.is_some();
     guard_immutable(existing, &digest, "capability definition")?;
     tx.execute(
         "INSERT OR IGNORE INTO capability_definitions(
@@ -304,6 +305,12 @@ pub fn publish_capability_definition(
         ],
     )
     .map_err(map_sqlite)?;
+    if had_existing {
+        // An idempotent republish of an existing exact revision MUST only succeed
+        // if that stored revision still passes the catalog integrity boundary.
+        get_capability_definition(tx, reference)?
+            .ok_or_else(|| Error::invariant("published capability definition is missing"))?;
+    }
     Ok(digest)
 }
 
@@ -345,6 +352,9 @@ pub fn publish_adapter_binding_policy(
     now: UnixTime,
     policy: &AdapterBindingPolicy,
 ) -> Result<String, Error> {
+    // The value type's fields are public, so the durable boundary MUST re-check
+    // the whole-record invariant rather than trusting the caller's constructor.
+    policy.validate().map_err(contract_fault)?;
     let digest = adapter_binding_policy_content_digest(policy);
     let content_json = canonical_json_string(
         canonical_adapter_binding_policy_bytes(policy),
@@ -359,6 +369,7 @@ pub fn publish_adapter_binding_policy(
             policy.policy_ref.revision()
         ],
     )?;
+    let had_existing = existing.is_some();
     guard_immutable(existing, &digest, "adapter binding policy")?;
     tx.execute(
         "INSERT OR IGNORE INTO adapter_binding_policies(
@@ -389,6 +400,10 @@ pub fn publish_adapter_binding_policy(
         ],
     )
     .map_err(map_sqlite)?;
+    if had_existing {
+        get_adapter_binding_policy(tx, &policy.policy_ref)?
+            .ok_or_else(|| Error::invariant("published adapter binding policy is missing"))?;
+    }
     Ok(digest)
 }
 
@@ -429,6 +444,7 @@ pub fn publish_agent_type(
             canonical.type_ref.revision()
         ],
     )?;
+    let had_existing = existing.is_some();
     if existing.is_none() {
         tx.execute(
             "INSERT INTO agent_types(
@@ -459,6 +475,10 @@ pub fn publish_agent_type(
         ],
     )
     .map_err(map_sqlite)?;
+    if had_existing {
+        load_agent_type(tx, &canonical.type_ref)?
+            .ok_or_else(|| Error::invariant("published agent type is missing"))?;
+    }
     Ok(digest)
 }
 
@@ -486,6 +506,7 @@ pub fn publish_spawn_source(
             canonical.source_ref.revision()
         ],
     )?;
+    let had_existing = existing.is_some();
     if existing.is_none() {
         tx.execute(
             "INSERT INTO spawn_sources(
@@ -520,6 +541,10 @@ pub fn publish_spawn_source(
         ],
     )
     .map_err(map_sqlite)?;
+    if had_existing {
+        load_spawn_source(tx, &canonical.source_ref)?
+            .ok_or_else(|| Error::invariant("published spawn source is missing"))?;
+    }
     Ok(digest)
 }
 
@@ -601,6 +626,7 @@ pub fn publish_source_config(
             config.config_ref.revision()
         ],
     )?;
+    let had_existing = existing.is_some();
     if existing.is_none() {
         tx.execute(
             "INSERT INTO source_configs(
@@ -642,6 +668,10 @@ pub fn publish_source_config(
         ],
     )
     .map_err(map_sqlite)?;
+    if had_existing {
+        load_source_config_revision(tx, &config.config_ref)?
+            .ok_or_else(|| Error::invariant("published source config is missing"))?;
+    }
     Ok(digest)
 }
 
@@ -671,7 +701,7 @@ fn load_agent_type(
         None => Ok(None),
         Some((json, digest, base_id, base_revision)) => {
             verify_content_digest(&json, &digest, "agent type")?;
-            let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            let mut agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
             cross_check(agent.type_ref == *reference, "agent type")?;
             let canonical_base = agent
                 .based_on
@@ -687,6 +717,10 @@ fn load_agent_type(
                 }
             };
             cross_check(canonical_base == row_base, "agent type")?;
+            // The stored document MUST be the unique canonical encoding: decode,
+            // re-canonicalize against the catalog, then require byte equality.
+            let catalog = load_capability_catalog(tx)?;
+            canonicalize_agent_type(&mut agent, &catalog).map_err(contract_fault)?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
             Ok(Some(agent))
         }
@@ -720,7 +754,7 @@ pub fn get_agent_type(
         None => Ok(None),
         Some((json, digest, base_id, base_revision, status)) => {
             verify_content_digest(&json, &digest, "agent type")?;
-            let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            let mut agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
             cross_check(agent.type_ref == *reference, "agent type")?;
             let canonical_base = agent
                 .based_on
@@ -736,6 +770,8 @@ pub fn get_agent_type(
                 }
             };
             cross_check(canonical_base == row_base, "agent type")?;
+            let catalog = load_capability_catalog(tx)?;
+            canonicalize_agent_type(&mut agent, &catalog).map_err(contract_fault)?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
             Ok(Some((agent, AgentTypeStatus::parse_sql(&status)?)))
         }
@@ -776,7 +812,7 @@ fn load_spawn_source(
         None => Ok(None),
         Some((json, digest, policy_id, policy_revision, status)) => {
             verify_content_digest(&json, &digest, "spawn source")?;
-            let source = spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
+            let mut source = spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
                 .map_err(contract_fault)?;
             cross_check(source.source_ref == *reference, "spawn source")?;
             cross_check(
@@ -784,6 +820,10 @@ fn load_spawn_source(
                     && source.adapter_policy.revision() as i64 == policy_revision,
                 "spawn source",
             )?;
+            // Decode, re-canonicalize against the catalog, then require the
+            // stored document to be the unique canonical encoding.
+            let catalog = load_capability_catalog(tx)?;
+            canonicalize_spawn_source(&mut source, &catalog).map_err(contract_fault)?;
             verify_reencoded(
                 &canonical_spawn_source_bytes(&source),
                 &json,
@@ -841,7 +881,7 @@ pub fn load_source_config_revision(
         return Ok(None);
     };
     verify_content_digest(&json, &digest, "source config")?;
-    let (config, canonical_locator) =
+    let (mut config, canonical_locator) =
         source_config_revision_from_canonical_json(&json, config_status_parse(&status)?)
             .map_err(contract_fault)?;
     cross_check(config.config_ref == *reference, "source config")?;
@@ -851,6 +891,13 @@ pub fn load_source_config_revision(
         config.config_digest.as_str() == config_digest,
         "source config",
     )?;
+    // The stored document MUST be the unique canonical encoding: decode against
+    // the exact source, re-canonicalize against the catalog, then compare bytes.
+    let source = load_spawn_source(tx, config.config_ref.source())?.ok_or_else(|| {
+        Error::invariant("catalog source config references a missing source revision")
+    })?;
+    let catalog = load_capability_catalog(tx)?;
+    canonicalize_source_config(&mut config, &source, &catalog).map_err(contract_fault)?;
     verify_reencoded(
         &canonical_source_config_bytes(&config, canonical_locator.as_deref()),
         &json,

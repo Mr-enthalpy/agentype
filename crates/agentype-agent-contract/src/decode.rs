@@ -463,13 +463,15 @@ pub fn adapter_binding_policy_from_canonical_json(
     }
     workspace_modes.sort_by_key(|m| workspace_rank(*m));
     workspace_modes.dedup();
-    Ok(AdapterBindingPolicy {
+    let policy = AdapterBindingPolicy {
         policy_ref,
         adapter_kind: string_of(field(document, "adapter_kind")?, "adapter_kind")?,
         binding_ref: string_of(field(document, "binding_ref")?, "binding_ref")?,
         required_safety: PhysicalSafety::new(attempt_isolation, workspace_modes, network_modes)?,
         status,
-    })
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 
 pub fn capability_definition_from_canonical_json(

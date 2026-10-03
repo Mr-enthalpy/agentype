@@ -173,10 +173,16 @@ revision has a canonical content encoding and a Core-computed content digest:
   persist the caller's initial disposition (never silently substitute
   `ACTIVE`), and dispositions only advance;
 - a read at the catalog boundary MUST verify the stored content digest against
-  the stored canonical document and MUST cross-check every duplicated relational
-  column against that document, so the digest is a durability witness rather
-  than publication-time metadata and no mirror column becomes a second
-  authority;
+  the stored canonical document, **re-canonicalize** the decoded record (decode
+  -> canonicalize against the catalog -> re-encode -> byte equality; a
+  self-consistent but non-canonical row MUST fail), and cross-check every
+  duplicated relational column against that document, so the digest is a
+  durability witness rather than publication-time metadata and no mirror column
+  becomes a second authority;
+- an idempotent republish of an existing exact revision MUST re-run the
+  validated read before reporting success, and the AdapterBindingPolicy durable
+  boundary MUST enforce its own whole-record invariant (non-blank
+  `adapter_kind`/`binding_ref`) on both publication and decode;
 - a SourceConfig `config_digest` MUST have the canonical grammar
   `sha256:<64 lowercase hex>`, and a single validated `SourceConfigRevision` read
   MUST cross-check its body `config_mode`/`config_payload_json`/`config_locator`
