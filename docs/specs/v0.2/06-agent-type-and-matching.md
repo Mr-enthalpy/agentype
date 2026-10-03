@@ -172,7 +172,9 @@ revision has a canonical content encoding and a Core-computed content digest:
   MUST NOT enter the revision content or its digest; a fresh publication MUST
   persist the caller's initial disposition (never silently substitute
   `ACTIVE`), dispositions only advance, and a revision row whose overlay is
-  missing is corruption that MUST fail closed;
+  missing is corruption that MUST fail closed with one meaning everywhere
+  (reads, setters, idempotent republish, and selector resolution). An existing
+  exact revision's overlay MUST NOT be created or repaired by publication;
 - a read at the catalog boundary MUST verify the stored content digest against
   the stored canonical document, **re-canonicalize** the decoded record (decode
   -> canonicalize against the catalog -> re-encode -> byte equality; a
@@ -181,18 +183,23 @@ revision has a canonical content encoding and a Core-computed content digest:
   durability witness rather than publication-time metadata and no mirror column
   becomes a second authority;
 - pre-commit `AgentTypeSelector` resolution MUST use the same validated read for
-  its published set, so a corrupt published revision fails the whole lookup
-  closed rather than remaining selectable through a weaker path;
+  its published set, so a corrupt published revision (including a missing
+  overlay) fails the whole lookup closed rather than remaining selectable or
+  causing `Latest` to fall back through a weaker path;
 - an idempotent republish of an existing exact revision MUST re-run the
   validated read before reporting success, and the AdapterBindingPolicy durable
   boundary MUST enforce its own whole-record invariant (non-blank
   `adapter_kind`/`binding_ref`) on both publication and decode;
+- a SourceConfig's complete durable revision identity is the
+  `SourceConfigRevision` (metadata + body mode + `ExternalRef` locator); a
+  metadata-only relation MUST NOT be used or named as durable revision identity;
 - a SourceConfig `config_digest` MUST have the canonical grammar
   `sha256:<64 lowercase hex>`, and a single validated `SourceConfigRevision` read
   MUST cross-check its body `config_mode`/`config_payload_json`/`config_locator`
   columns. A locator and a digest are distinct fields whose values are
   source-private and may legitimately coincide, so an `ExternalRef` locator MUST
-  NOT be required to differ from its digest.
+  NOT be required to differ from its digest. An `OpaqueJson` body is durable
+  non-secret material; provider/vendor secrets belong behind `ExternalRef`.
 
 ## Refinement monotonicity
 

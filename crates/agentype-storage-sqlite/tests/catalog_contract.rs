@@ -12,7 +12,7 @@ use agentype_agent_contract::{
 };
 use agentype_core::{Clock, Error, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::{
-    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SCHEMA_VERSION,
+    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SourceConfigRevision, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1104,4 +1104,152 @@ fn missing_disposition_overlay_is_corruption() {
         Err(Error::InvariantViolation(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selector_latest_does_not_fall_back_over_missing_overlay() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-lf-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let one = base_agent("general-reviewer", 1, None);
+    let two = base_agent("general-reviewer", 2, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&one).unwrap();
+        kernel.publish_agent_type(&two).unwrap();
+    }
+    // Corruption hides the highest revision's overlay.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=2",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // Neither an exact pin nor Latest may silently drop @2 and resolve @1.
+    assert!(matches!(
+        kernel.resolve_agent_type_selector(&AgentTypeSelector::Exact(type_ref(
+            "general-reviewer",
+            2
+        ))),
+        Err(Error::InvariantViolation(_))
+    ));
+    assert!(matches!(
+        kernel.resolve_agent_type_selector(&AgentTypeSelector::latest("general-reviewer").unwrap()),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn republish_does_not_repair_a_missing_overlay() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-rp-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // An idempotent republish must not resurrect the overlay.
+    assert!(matches!(
+        kernel.publish_agent_type(&agent),
+        Err(Error::InvariantViolation(_))
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let overlays: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlays, 0, "republish must not repair the overlay");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_setter_classifies_missing_overlay_as_corruption() {
+    let kernel = memory_kernel();
+    // Revision absent -> NotFound.
+    assert!(matches!(
+        kernel.set_spawn_source_status(
+            &SpawnSourceRef::new("codex-local", 2).unwrap(),
+            SourceStatus::Draining
+        ),
+        Err(Error::NotFound(_))
+    ));
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-ss-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM spawn_source_dispositions WHERE source_id='codex-local' AND revision=2",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // Revision exists but overlay missing -> corruption (InvariantViolation).
+    assert!(matches!(
+        kernel.set_spawn_source_status(
+            &SpawnSourceRef::new("codex-local", 2).unwrap(),
+            SourceStatus::Draining
+        ),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn source_config_revision_identity_includes_locator() {
+    let a = SourceConfigRevision {
+        config: base_config(VALID_DIGEST, Vec::new()),
+        mode: ConfigMode::ExternalRef,
+        locator: Some("file:///a.toml".into()),
+    };
+    let b = SourceConfigRevision {
+        config: base_config(VALID_DIGEST, Vec::new()),
+        mode: ConfigMode::ExternalRef,
+        locator: Some("file:///b.toml".into()),
+    };
+    let same = SourceConfigRevision {
+        config: base_config(VALID_DIGEST, Vec::new()),
+        mode: ConfigMode::ExternalRef,
+        locator: Some("file:///a.toml".into()),
+    };
+    // The metadata-only relation says equal...
+    assert!(a.config.same_config_contract_content(&b.config));
+    // ...but the complete durable revision identity does not.
+    assert!(!a.same_revision_content(&b));
+    assert!(a.same_revision_content(&same));
 }

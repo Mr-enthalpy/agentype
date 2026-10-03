@@ -55,8 +55,14 @@ An idempotent republish of an existing exact revision MUST re-run this validated
 read before reporting success, and every aggregate's publication boundary MUST
 enforce that aggregate's own value invariant (for example a non-blank
 `AdapterBindingPolicy` `adapter_kind`/`binding_ref`), storing the value verbatim.
-A revision row with a missing disposition overlay is corruption and MUST fail
-closed rather than read as absent.
+A revision row with a missing disposition overlay is corruption that MUST fail
+closed with one meaning everywhere: reads, disposition setters, idempotent
+republish, and selector resolution. A publication MUST NOT create or repair an
+overlay for an existing exact revision; only a fresh immutable publication
+creates one, in the same transaction. A disposition setter MUST distinguish an
+absent revision (`NotFound`) from an existing revision whose overlay is missing
+(corruption). Resolving a selector MUST NOT silently drop such a revision or
+fall back to another revision.
 
 Pre-commit `AgentTypeSelector` resolution MUST build its published set from the
 same validated read, so selector resolution is not a second, weaker authority.
@@ -67,18 +73,28 @@ A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`
 configs, before it enters a durable revision.
 
+The complete durable SourceConfig revision content is the `SourceConfigRevision`
+(`SourceConfig` metadata + body `mode` + `ExternalRef` `locator`); its canonical
+content digest is the only durable revision identity. A metadata-only relation
+(such as `SourceConfig::same_config_contract_content`) MUST NOT be used as, or
+named as, durable revision content identity, because it cannot distinguish two
+configs that differ only by locator.
+
 An opaque SourceConfig body or locator is source-private: Core stores it
 without interpreting it. An `OpaqueJson` body's declared `config_digest` MUST
-equal its canonical body digest. An `ExternalRef` freezes **both** an opaque
-`locator` (where the configuration lives) and the declared `config_digest`
-(which content version is behind it). Location and identity are distinct
-fields/columns; their *values* are source-private and may coincide (for example
-a content-addressed locator), so Core MUST NOT reject a value equality while it
-MUST NOT store one in place of the other. Core MUST reject an all-whitespace
-locator but MUST store a non-empty locator exactly as supplied (it MUST NOT trim
-a source-owned opaque identity). A single validated `SourceConfigRevision` read
-MUST be the only SourceConfig read path; getters MUST NOT read the duplicated
-columns independently.
+equal its canonical body digest, and it is durable **non-secret** configuration
+material: provider/vendor secrets MUST NOT be persisted there but belong behind
+`ExternalRef`/`CredentialRef`, so the Scheduler store never becomes a
+provider-secret store. An `ExternalRef` freezes **both** an opaque `locator`
+(where the configuration lives) and the declared `config_digest` (which content
+version is behind it). Location and identity are distinct fields/columns; their
+*values* are source-private and may coincide (for example a content-addressed
+locator), so Core MUST NOT reject a value equality while it MUST NOT store one in
+place of the other. Core MUST reject an all-whitespace locator but MUST store a
+non-empty locator exactly as supplied (it MUST NOT trim a source-owned opaque
+identity). A single validated `SourceConfigRevision` read MUST be the only
+SourceConfig read path; getters MUST NOT read the duplicated columns
+independently.
 
 ## Kernel unique constraints (MUST)
 

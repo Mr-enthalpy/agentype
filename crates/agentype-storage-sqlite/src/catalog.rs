@@ -88,6 +88,13 @@ impl ConfigMode {
 pub enum SourceConfigBody {
     /// A Core-opaque JSON body. `config_digest` MUST equal
     /// [`canonical_json_body_digest`] of this value; no locator is stored.
+    ///
+    /// This is durable **non-secret** source-private configuration material.
+    /// Provider/vendor secrets (API keys, tokens) MUST NOT be persisted here;
+    /// secret-bearing configuration belongs behind `ExternalRef` /
+    /// `CredentialRef` (B.5), so the Scheduler database never becomes a
+    /// provider-secret store. Core cannot detect vendor secret schemas, so the
+    /// enforcing responsibility stays with the source-specific publisher.
     OpaqueJson(serde_json::Value),
     /// A non-empty opaque locator owned entirely outside Core. `config_digest`
     /// is the caller-declared content digest that the source integration
@@ -286,10 +293,16 @@ pub fn publish_capability_definition(
          WHERE capability_id=?1 AND revision=?2",
         params![reference.capability_id().as_str(), reference.revision()],
     )?;
-    let had_existing = existing.is_some();
-    guard_immutable(existing, &digest, "capability definition")?;
+    if let Some(stored) = existing {
+        // An existing exact revision is never repaired: it MUST already be a
+        // complete, valid catalog record, and the offered content MUST match.
+        guard_immutable(Some(stored), &digest, "capability definition")?;
+        get_capability_definition(tx, reference)?
+            .ok_or_else(|| Error::invariant("published capability definition is missing"))?;
+        return Ok(digest);
+    }
     tx.execute(
-        "INSERT OR IGNORE INTO capability_definitions(
+        "INSERT INTO capability_definitions(
              capability_id, revision, matcher_kind, security_class, polarity,
              content_json, content_digest, created_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -305,12 +318,6 @@ pub fn publish_capability_definition(
         ],
     )
     .map_err(map_sqlite)?;
-    if had_existing {
-        // An idempotent republish of an existing exact revision MUST only succeed
-        // if that stored revision still passes the catalog integrity boundary.
-        get_capability_definition(tx, reference)?
-            .ok_or_else(|| Error::invariant("published capability definition is missing"))?;
-    }
     Ok(digest)
 }
 
@@ -369,10 +376,14 @@ pub fn publish_adapter_binding_policy(
             policy.policy_ref.revision()
         ],
     )?;
-    let had_existing = existing.is_some();
-    guard_immutable(existing, &digest, "adapter binding policy")?;
+    if let Some(stored) = existing {
+        guard_immutable(Some(stored), &digest, "adapter binding policy")?;
+        get_adapter_binding_policy(tx, &policy.policy_ref)?
+            .ok_or_else(|| Error::invariant("published adapter binding policy is missing"))?;
+        return Ok(digest);
+    }
     tx.execute(
-        "INSERT OR IGNORE INTO adapter_binding_policies(
+        "INSERT INTO adapter_binding_policies(
              policy_id, revision, adapter_kind, binding_ref, content_json,
              content_digest, created_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -387,9 +398,10 @@ pub fn publish_adapter_binding_policy(
         ],
     )
     .map_err(map_sqlite)?;
-    // The value type carries an operator disposition; persist it separately.
+    // The value type carries an operator disposition; persist it separately, for
+    // a fresh revision only. An existing revision's overlay is never repaired.
     tx.execute(
-        "INSERT OR IGNORE INTO adapter_binding_policy_dispositions(
+        "INSERT INTO adapter_binding_policy_dispositions(
              policy_id, revision, status, updated_at)
          VALUES(?1,?2,?3,?4)",
         params![
@@ -400,10 +412,6 @@ pub fn publish_adapter_binding_policy(
         ],
     )
     .map_err(map_sqlite)?;
-    if had_existing {
-        get_adapter_binding_policy(tx, &policy.policy_ref)?
-            .ok_or_else(|| Error::invariant("published adapter binding policy is missing"))?;
-    }
     Ok(digest)
 }
 
@@ -444,28 +452,32 @@ pub fn publish_agent_type(
             canonical.type_ref.revision()
         ],
     )?;
-    let had_existing = existing.is_some();
-    if existing.is_none() {
-        tx.execute(
-            "INSERT INTO agent_types(
-                 type_id, revision, based_on_type_id, based_on_revision,
-                 content_json, content_digest, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                canonical.type_ref.id().as_str(),
-                canonical.type_ref.revision(),
-                canonical.based_on.as_ref().map(|b| b.id().as_str()),
-                canonical.based_on.as_ref().map(|b| b.revision()),
-                content_json,
-                digest,
-                now,
-            ],
-        )
-        .map_err(map_sqlite)?;
+    if let Some(stored) = existing {
+        // Never repair an existing revision: validate the complete stored record
+        // (including its disposition overlay) and the offered content identity.
+        guard_immutable(Some(stored), &digest, "agent type")?;
+        get_agent_type(tx, &canonical.type_ref)?
+            .ok_or_else(|| Error::invariant("published agent type is missing"))?;
+        return Ok(digest);
     }
-    guard_immutable(existing, &digest, "agent type")?;
     tx.execute(
-        "INSERT OR IGNORE INTO agent_type_dispositions(
+        "INSERT INTO agent_types(
+             type_id, revision, based_on_type_id, based_on_revision,
+             content_json, content_digest, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            canonical.type_ref.id().as_str(),
+            canonical.type_ref.revision(),
+            canonical.based_on.as_ref().map(|b| b.id().as_str()),
+            canonical.based_on.as_ref().map(|b| b.revision()),
+            content_json,
+            digest,
+            now,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    tx.execute(
+        "INSERT INTO agent_type_dispositions(
              type_id, revision, status, deprecated_at, updated_at)
          VALUES(?1,?2,'PUBLISHED',NULL,?3)",
         params![
@@ -475,10 +487,6 @@ pub fn publish_agent_type(
         ],
     )
     .map_err(map_sqlite)?;
-    if had_existing {
-        load_agent_type(tx, &canonical.type_ref)?
-            .ok_or_else(|| Error::invariant("published agent type is missing"))?;
-    }
     Ok(digest)
 }
 
@@ -506,31 +514,32 @@ pub fn publish_spawn_source(
             canonical.source_ref.revision()
         ],
     )?;
-    let had_existing = existing.is_some();
-    if existing.is_none() {
-        tx.execute(
-            "INSERT INTO spawn_sources(
-                 source_id, revision, adapter_policy_id, adapter_policy_revision,
-                 content_json, content_digest, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                canonical.source_ref.id().as_str(),
-                canonical.source_ref.revision(),
-                canonical.adapter_policy.id().as_str(),
-                canonical.adapter_policy.revision(),
-                content_json,
-                digest,
-                now,
-            ],
-        )
-        .map_err(map_sqlite)?;
+    if let Some(stored) = existing {
+        guard_immutable(Some(stored), &digest, "spawn source")?;
+        get_spawn_source(tx, &canonical.source_ref)?
+            .ok_or_else(|| Error::invariant("published spawn source is missing"))?;
+        return Ok(digest);
     }
-    guard_immutable(existing, &digest, "spawn source")?;
-    // A fresh revision persists the caller's initial disposition; re-publishing
-    // an existing exact revision is content-idempotent and leaves the live
-    // disposition untouched (drive later changes through set_spawn_source_status).
     tx.execute(
-        "INSERT OR IGNORE INTO spawn_source_dispositions(
+        "INSERT INTO spawn_sources(
+             source_id, revision, adapter_policy_id, adapter_policy_revision,
+             content_json, content_digest, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            canonical.source_ref.id().as_str(),
+            canonical.source_ref.revision(),
+            canonical.adapter_policy.id().as_str(),
+            canonical.adapter_policy.revision(),
+            content_json,
+            digest,
+            now,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    // A fresh revision persists the caller's initial disposition; an existing
+    // revision's overlay is never (re)created or repaired here.
+    tx.execute(
+        "INSERT INTO spawn_source_dispositions(
              source_id, revision, status, updated_at)
          VALUES(?1,?2,?3,?4)",
         params![
@@ -541,10 +550,6 @@ pub fn publish_spawn_source(
         ],
     )
     .map_err(map_sqlite)?;
-    if had_existing {
-        load_spawn_source(tx, &canonical.source_ref)?
-            .ok_or_else(|| Error::invariant("published spawn source is missing"))?;
-    }
     Ok(digest)
 }
 
@@ -626,36 +631,37 @@ pub fn publish_source_config(
             config.config_ref.revision()
         ],
     )?;
-    let had_existing = existing.is_some();
-    if existing.is_none() {
-        tx.execute(
-            "INSERT INTO source_configs(
-                 source_id, source_revision, config_id, config_revision,
-                 config_mode, config_payload_json, config_locator, config_digest,
-                 content_json, content_digest, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![
-                config.config_ref.source().id().as_str(),
-                config.config_ref.source().revision(),
-                config.config_ref.config_id().as_str(),
-                config.config_ref.revision(),
-                mode.as_sql(),
-                payload_json,
-                config_locator,
-                canonical.config_digest.as_str(),
-                content_json,
-                digest,
-                now,
-            ],
-        )
-        .map_err(map_sqlite)?;
+    if let Some(stored) = existing {
+        guard_immutable(Some(stored), &digest, "source config")?;
+        load_source_config_revision(tx, &config.config_ref)?
+            .ok_or_else(|| Error::invariant("published source config is missing"))?;
+        return Ok(digest);
     }
-    guard_immutable(existing, &digest, "source config")?;
-    // A fresh revision persists the caller's initial disposition; re-publishing
-    // an existing exact revision is content-idempotent and leaves the live
-    // disposition untouched (drive later changes through set_source_config_status).
     tx.execute(
-        "INSERT OR IGNORE INTO source_config_dispositions(
+        "INSERT INTO source_configs(
+             source_id, source_revision, config_id, config_revision,
+             config_mode, config_payload_json, config_locator, config_digest,
+             content_json, content_digest, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            config.config_ref.source().id().as_str(),
+            config.config_ref.source().revision(),
+            config.config_ref.config_id().as_str(),
+            config.config_ref.revision(),
+            mode.as_sql(),
+            payload_json,
+            config_locator,
+            canonical.config_digest.as_str(),
+            content_json,
+            digest,
+            now,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    // A fresh revision persists the caller's initial disposition; an existing
+    // revision's overlay is never (re)created or repaired here.
+    tx.execute(
+        "INSERT INTO source_config_dispositions(
              source_id, source_revision, config_id, config_revision, status, updated_at)
          VALUES(?1,?2,?3,?4,?5,?6)",
         params![
@@ -668,10 +674,6 @@ pub fn publish_source_config(
         ],
     )
     .map_err(map_sqlite)?;
-    if had_existing {
-        load_source_config_revision(tx, &config.config_ref)?
-            .ok_or_else(|| Error::invariant("published source config is missing"))?;
-    }
     Ok(digest)
 }
 
@@ -852,6 +854,19 @@ pub struct SourceConfigRevision {
     pub config: SourceConfig,
     pub mode: ConfigMode,
     pub locator: Option<String>,
+}
+
+impl SourceConfigRevision {
+    /// The complete immutable revision-content identity: config-selection
+    /// metadata **plus** the opaque body mode and `ExternalRef` locator, which
+    /// are part of the canonical content and its digest. Two revisions that
+    /// agree on `SourceConfig` metadata but differ in locator are different
+    /// revisions.
+    pub fn same_revision_content(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.locator == other.locator
+            && self.config.same_config_contract_content(&other.config)
+    }
 }
 
 pub fn load_source_config_revision(
@@ -1071,19 +1086,22 @@ pub fn set_agent_type_status(
     reference: &AgentTypeRef,
     status: AgentTypeStatus,
 ) -> Result<(), Error> {
-    let current = query_opt(
+    let current = match query_opt(
         tx,
         "SELECT status FROM agent_type_dispositions WHERE type_id=?1 AND revision=?2",
         params![reference.id().as_str(), reference.revision()],
         |row| row.get::<_, String>(0),
-    )?
-    .ok_or_else(|| {
-        Error::not_found(format!(
-            "agent type {}@{} is not published",
-            reference.id().as_str(),
-            reference.revision()
-        ))
-    })?;
+    )? {
+        Some(status) => status,
+        None => {
+            let exists = revision_exists(
+                tx,
+                "SELECT 1 FROM agent_types WHERE type_id=?1 AND revision=?2",
+                params![reference.id().as_str(), reference.revision()],
+            )?;
+            return Err(absent_disposition(exists, "agent type"));
+        }
+    };
     if current == "DEPRECATED" && status == AgentTypeStatus::Published {
         return Err(Error::invalid_transition(
             "a deprecated AgentType revision cannot be republished",
@@ -1115,19 +1133,46 @@ fn check_monotonic(current: &str, status: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Classify a missing disposition overlay: a revision that does not exist is
+/// `NotFound`; a revision that exists without its overlay is corruption.
+fn absent_disposition(revision_exists: bool, what: &str) -> Error {
+    if revision_exists {
+        Error::invariant(format!("catalog {what} is missing its disposition overlay"))
+    } else {
+        Error::not_found(format!("{what} revision does not exist"))
+    }
+}
+
+fn revision_exists(
+    tx: &Transaction<'_>,
+    sql: &str,
+    args: impl rusqlite::Params,
+) -> Result<bool, Error> {
+    Ok(query_opt(tx, sql, args, |row| row.get::<_, i64>(0))?.is_some())
+}
+
 pub fn set_spawn_source_status(
     tx: &Transaction<'_>,
     now: UnixTime,
     reference: &SpawnSourceRef,
     status: SourceStatus,
 ) -> Result<(), Error> {
-    let current = query_opt(
+    let current = match query_opt(
         tx,
         "SELECT status FROM spawn_source_dispositions WHERE source_id=?1 AND revision=?2",
         params![reference.id().as_str(), reference.revision()],
         |row| row.get::<_, String>(0),
-    )?
-    .ok_or_else(|| Error::not_found("spawn source disposition missing"))?;
+    )? {
+        Some(status) => status,
+        None => {
+            let exists = revision_exists(
+                tx,
+                "SELECT 1 FROM spawn_sources WHERE source_id=?1 AND revision=?2",
+                params![reference.id().as_str(), reference.revision()],
+            )?;
+            return Err(absent_disposition(exists, "spawn source"));
+        }
+    };
     let next = source_status_sql(status);
     check_monotonic(&current, next)?;
     tx.execute(
@@ -1149,14 +1194,24 @@ pub fn set_source_config_status(
     let source_revision = reference.source().revision();
     let config_id = reference.config_id().as_str();
     let config_revision = reference.revision();
-    let current = query_opt(
+    let current = match query_opt(
         tx,
         "SELECT status FROM source_config_dispositions
          WHERE source_id=?1 AND source_revision=?2 AND config_id=?3 AND config_revision=?4",
         params![id, source_revision, config_id, config_revision],
         |row| row.get::<_, String>(0),
-    )?
-    .ok_or_else(|| Error::not_found("source config disposition missing"))?;
+    )? {
+        Some(status) => status,
+        None => {
+            let exists = revision_exists(
+                tx,
+                "SELECT 1 FROM source_configs
+                 WHERE source_id=?1 AND source_revision=?2 AND config_id=?3 AND config_revision=?4",
+                params![id, source_revision, config_id, config_revision],
+            )?;
+            return Err(absent_disposition(exists, "source config"));
+        }
+    };
     let next = config_status_sql(status);
     check_monotonic(&current, next)?;
     tx.execute(
@@ -1174,14 +1229,23 @@ pub fn set_adapter_binding_policy_status(
     reference: &AdapterPolicyRef,
     status: ConfigStatus,
 ) -> Result<(), Error> {
-    let current = query_opt(
+    let current = match query_opt(
         tx,
         "SELECT status FROM adapter_binding_policy_dispositions
          WHERE policy_id=?1 AND revision=?2",
         params![reference.id().as_str(), reference.revision()],
         |row| row.get::<_, String>(0),
-    )?
-    .ok_or_else(|| Error::not_found("adapter binding policy disposition missing"))?;
+    )? {
+        Some(status) => status,
+        None => {
+            let exists = revision_exists(
+                tx,
+                "SELECT 1 FROM adapter_binding_policies WHERE policy_id=?1 AND revision=?2",
+                params![reference.id().as_str(), reference.revision()],
+            )?;
+            return Err(absent_disposition(exists, "adapter binding policy"));
+        }
+    };
     let next = config_status_sql(status);
     check_monotonic(&current, next)?;
     tx.execute(
@@ -1218,33 +1282,37 @@ impl AgentTypeLookup for DurableAgentTypeLookup {
 
 /// Build the pre-commit selector lookup from the **validated** canonical read.
 ///
-/// A published ref is only selectable if its exact revision passes the same
-/// durability boundary as `get_agent_type` (digest, canonical re-encoding,
-/// relational mirror). Any corruption fails the whole lookup closed rather than
-/// silently dropping a revision or falling back to an older one, so the lookup
-/// is not a second, weaker authority.
+/// Every immutable AgentType row is validated (digest, canonical re-encoding,
+/// relational mirror) and MUST have a disposition overlay; a missing overlay is
+/// corruption that fails the whole lookup closed. Only then are `PUBLISHED`
+/// revisions admitted. This means a corrupt revision cannot be silently dropped
+/// and cannot cause `Latest` to fall back to an older revision, so the lookup is
+/// not a second, weaker authority.
 pub fn load_agent_type_lookup(tx: &Transaction<'_>) -> Result<DurableAgentTypeLookup, Error> {
-    let mut statement = tx
-        .prepare(
-            "SELECT at.type_id, at.revision
-             FROM agent_types at
-             JOIN agent_type_dispositions d
-               ON d.type_id=at.type_id AND d.revision=at.revision
-             WHERE d.status='PUBLISHED'",
-        )
-        .map_err(map_sqlite)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(map_sqlite)?;
+    let references: Vec<AgentTypeRef> = {
+        let mut statement = tx
+            .prepare("SELECT type_id, revision FROM agent_types")
+            .map_err(map_sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(map_sqlite)?;
+        let mut refs = Vec::new();
+        for row in rows {
+            let (type_id, revision) = row.map_err(map_sqlite)?;
+            refs.push(AgentTypeRef::new(type_id, revision as u64).map_err(contract_fault)?);
+        }
+        refs
+    };
     let mut published = BTreeSet::new();
-    for row in rows {
-        let (type_id, revision) = row.map_err(map_sqlite)?;
-        let reference = AgentTypeRef::new(type_id, revision as u64).map_err(contract_fault)?;
-        load_agent_type(tx, &reference)?
+    for reference in references {
+        // `get_agent_type` validates content, mirror, and requires the overlay.
+        let (_, status) = get_agent_type(tx, &reference)?
             .ok_or_else(|| Error::invariant("published agent type is missing"))?;
-        published.insert(reference);
+        if status == AgentTypeStatus::Published {
+            published.insert(reference);
+        }
     }
     Ok(DurableAgentTypeLookup { published })
 }

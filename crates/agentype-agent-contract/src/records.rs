@@ -396,10 +396,14 @@ impl SpawnSource {
 /// only its identity, digest, credential references, and any config-specific
 /// declarations (which MUST stay within the source envelope) are modeled here.
 ///
-/// Like [`SpawnSource`], this is a resolved view. Ordinary `==` includes the
-/// mutable `status`; revision-content identity (digests, cache keys) MUST use
-/// [`SourceConfig::same_revision_content`], which excludes the disposition and
-/// the opaque `config_digest`-independent operational state.
+/// This type carries the Core-visible **config-selection metadata**, not the
+/// complete durable revision content: a B.2 persisted `SourceConfigRevision`
+/// additionally carries the opaque body `mode` and `ExternalRef` `locator`,
+/// which are part of the immutable revision content and its canonical digest.
+/// Use [`SourceConfig::same_config_contract_content`] only to compare this
+/// metadata; it is **not** the durable revision identity. Durable identity
+/// (digests, cache keys, snapshots) MUST come from the `SourceConfigRevision`
+/// canonical content, never from this method.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
@@ -417,13 +421,15 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    /// Immutable revision-content identity, excluding the mutable disposition.
+    /// Core-visible config-selection metadata equality, excluding the mutable
+    /// disposition **and** the opaque body mode/locator (which this type does
+    /// not model).
     ///
-    /// Precondition: both records are **canonicalized**. `claims` and
-    /// `credential_refs` are compared as ordered `Vec`s, so non-canonical
-    /// orderings of the same set-like content compare unequal. B.2 publication
-    /// MUST sort/dedup them before forming revision content/digests.
-    pub fn same_revision_content(&self, other: &Self) -> bool {
+    /// This is deliberately *not* called "revision content": two configs that
+    /// agree here can still be different durable revisions if their
+    /// `ExternalRef` locators differ. Precondition: both records are
+    /// canonicalized; `claims`/`credential_refs` are compared as ordered `Vec`s.
+    pub fn same_config_contract_content(&self, other: &Self) -> bool {
         self.config_ref == other.config_ref
             && self.config_digest == other.config_digest
             && self.lifecycle_modes == other.lifecycle_modes

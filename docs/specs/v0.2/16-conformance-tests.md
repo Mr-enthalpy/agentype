@@ -115,6 +115,13 @@ M6-B.2 catalog persistence MUST cover:
   revision is corrupt (digest drift, non-canonical content, or a relational
   `based_on` drift), not just `get_agent_type`
 - a revision row with a missing disposition overlay fails closed as corruption
+  in reads, disposition setters, and idempotent republish; publication does not
+  recreate the overlay, and `Latest` does not fall back to an older revision
+- a disposition setter distinguishes an absent revision (`NotFound`) from a
+  revision whose overlay is missing (corruption)
+- the complete durable SourceConfig revision identity includes the body mode and
+  `ExternalRef` locator: two configs with equal metadata but different locators
+  are different revisions
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 
 ## C. Provider/frontend neutrality (M7)
