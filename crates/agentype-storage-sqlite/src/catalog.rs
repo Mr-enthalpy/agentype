@@ -590,16 +590,16 @@ pub fn publish_source_config(
             // Structural validation only: reject an all-whitespace locator, but
             // store the locator exactly as supplied. Trimming is a source-specific
             // normalization Core MUST NOT perform on an opaque identity.
+            //
+            // The locator and the declared content digest are two distinct
+            // fields (`config_locator` vs `config_digest`), which is the whole
+            // structural guarantee. Their *values* are source-private and may
+            // legitimately coincide (e.g. a content-addressed locator that is
+            // both where the content lives and its digest), so Core MUST NOT
+            // interpret a value equality as a conflation.
             if locator.trim().is_empty() {
                 return Err(Error::invariant(
                     "an ExternalRef config locator must not be empty",
-                ));
-            }
-            // Location and content identity are distinct: a locator MUST NOT be
-            // used in place of the declared content digest.
-            if config.config_digest.as_str() == locator.as_str() {
-                return Err(Error::invariant(
-                    "an ExternalRef config locator must not equal its config digest",
                 ));
             }
             (ConfigMode::ExternalRef, None, Some(locator.clone()))
@@ -736,7 +736,7 @@ pub fn get_agent_type(
         "SELECT at.content_json, at.content_digest, at.based_on_type_id, at.based_on_revision,
                 d.status
          FROM agent_types at
-         JOIN agent_type_dispositions d
+         LEFT JOIN agent_type_dispositions d
            ON d.type_id=at.type_id AND d.revision=at.revision
          WHERE at.type_id=?1 AND at.revision=?2",
         params![reference.id().as_str(), reference.revision()],
@@ -746,13 +746,18 @@ pub fn get_agent_type(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
         Some((json, digest, base_id, base_revision, status)) => {
+            // A revision exists but its disposition overlay is missing: that is
+            // durable corruption, not "not found".
+            let status = status.ok_or_else(|| {
+                Error::invariant("catalog agent type is missing its disposition overlay")
+            })?;
             verify_content_digest(&json, &digest, "agent type")?;
             let mut agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
             cross_check(agent.type_ref == *reference, "agent type")?;
@@ -794,7 +799,7 @@ fn load_spawn_source(
         "SELECT s.content_json, s.content_digest, s.adapter_policy_id,
                 s.adapter_policy_revision, d.status
          FROM spawn_sources s
-         JOIN spawn_source_dispositions d
+         LEFT JOIN spawn_source_dispositions d
            ON d.source_id=s.source_id AND d.revision=s.revision
          WHERE s.source_id=?1 AND s.revision=?2",
         params![reference.id().as_str(), reference.revision()],
@@ -804,13 +809,16 @@ fn load_spawn_source(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
         Some((json, digest, policy_id, policy_revision, status)) => {
+            let status = status.ok_or_else(|| {
+                Error::invariant("catalog spawn source is missing its disposition overlay")
+            })?;
             verify_content_digest(&json, &digest, "spawn source")?;
             let mut source = spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
                 .map_err(contract_fault)?;
@@ -855,7 +863,7 @@ pub fn load_source_config_revision(
         "SELECT c.content_json, c.content_digest, c.config_mode, c.config_payload_json,
                 c.config_locator, c.config_digest, d.status
          FROM source_configs c
-         JOIN source_config_dispositions d
+         LEFT JOIN source_config_dispositions d
            ON d.source_id=c.source_id AND d.source_revision=c.source_revision
           AND d.config_id=c.config_id AND d.config_revision=c.config_revision
          WHERE c.source_id=?1 AND c.source_revision=?2 AND c.config_id=?3 AND c.config_revision=?4",
@@ -873,13 +881,16 @@ pub fn load_source_config_revision(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         },
     )?;
     let Some((json, digest, mode, payload_json, locator, config_digest, status)) = row else {
         return Ok(None);
     };
+    let status = status.ok_or_else(|| {
+        Error::invariant("catalog source config is missing its disposition overlay")
+    })?;
     verify_content_digest(&json, &digest, "source config")?;
     let (mut config, canonical_locator) =
         source_config_revision_from_canonical_json(&json, config_status_parse(&status)?)
@@ -962,7 +973,7 @@ pub fn get_adapter_binding_policy(
         tx,
         "SELECT p.content_json, p.content_digest, p.adapter_kind, p.binding_ref, d.status
          FROM adapter_binding_policies p
-         JOIN adapter_binding_policy_dispositions d
+         LEFT JOIN adapter_binding_policy_dispositions d
            ON d.policy_id=p.policy_id AND d.revision=p.revision
          WHERE p.policy_id=?1 AND p.revision=?2",
         params![reference.id().as_str(), reference.revision()],
@@ -972,13 +983,18 @@ pub fn get_adapter_binding_policy(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
         Some((json, digest, adapter_kind, binding_ref, status)) => {
+            let status = status.ok_or_else(|| {
+                Error::invariant(
+                    "catalog adapter binding policy is missing its disposition overlay",
+                )
+            })?;
             verify_content_digest(&json, &digest, "adapter binding policy")?;
             let policy =
                 adapter_binding_policy_from_canonical_json(&json, config_status_parse(&status)?)
@@ -1200,6 +1216,13 @@ impl AgentTypeLookup for DurableAgentTypeLookup {
     }
 }
 
+/// Build the pre-commit selector lookup from the **validated** canonical read.
+///
+/// A published ref is only selectable if its exact revision passes the same
+/// durability boundary as `get_agent_type` (digest, canonical re-encoding,
+/// relational mirror). Any corruption fails the whole lookup closed rather than
+/// silently dropping a revision or falling back to an older one, so the lookup
+/// is not a second, weaker authority.
 pub fn load_agent_type_lookup(tx: &Transaction<'_>) -> Result<DurableAgentTypeLookup, Error> {
     let mut statement = tx
         .prepare(
@@ -1218,7 +1241,10 @@ pub fn load_agent_type_lookup(tx: &Transaction<'_>) -> Result<DurableAgentTypeLo
     let mut published = BTreeSet::new();
     for row in rows {
         let (type_id, revision) = row.map_err(map_sqlite)?;
-        published.insert(AgentTypeRef::new(type_id, revision as u64).map_err(contract_fault)?);
+        let reference = AgentTypeRef::new(type_id, revision as u64).map_err(contract_fault)?;
+        load_agent_type(tx, &reference)?
+            .ok_or_else(|| Error::invariant("published agent type is missing"))?;
+        published.insert(reference);
     }
     Ok(DurableAgentTypeLookup { published })
 }

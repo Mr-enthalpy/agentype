@@ -95,7 +95,8 @@ M6-B.2 catalog persistence MUST cover:
 - disposition changes never alter revision content and are monotonic
 - an opaque `OpaqueJson` config body is validated against its declared
   `config_digest`; an `ExternalRef` stores a locator separately from the digest,
-  and a locator offered as a digest is rejected
+  and a locator whose value equals the digest is accepted (distinct fields) and
+  round-trips distinctly
 - an invalid `config_digest` grammar (not `sha256:<64 lowercase hex>`) is
   rejected for both body modes
 - an `ExternalRef` locator is stored verbatim (whitespace is byte-significant)
@@ -110,6 +111,10 @@ M6-B.2 catalog persistence MUST cover:
   publication and at decode
 - an idempotent republish of an existing exact revision fails closed if that
   stored revision is corrupt
+- `AgentTypeSelector` exact and latest resolution fails closed when a published
+  revision is corrupt (digest drift, non-canonical content, or a relational
+  `based_on` drift), not just `get_agent_type`
+- a revision row with a missing disposition overlay fails closed as corruption
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 
 ## C. Provider/frontend neutrality (M7)

@@ -55,6 +55,13 @@ An idempotent republish of an existing exact revision MUST re-run this validated
 read before reporting success, and every aggregate's publication boundary MUST
 enforce that aggregate's own value invariant (for example a non-blank
 `AdapterBindingPolicy` `adapter_kind`/`binding_ref`), storing the value verbatim.
+A revision row with a missing disposition overlay is corruption and MUST fail
+closed rather than read as absent.
+
+Pre-commit `AgentTypeSelector` resolution MUST build its published set from the
+same validated read, so selector resolution is not a second, weaker authority.
+Any corrupt published revision MUST fail the whole lookup closed (no silent drop
+and no fallback to another revision).
 
 A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`
@@ -64,13 +71,14 @@ An opaque SourceConfig body or locator is source-private: Core stores it
 without interpreting it. An `OpaqueJson` body's declared `config_digest` MUST
 equal its canonical body digest. An `ExternalRef` freezes **both** an opaque
 `locator` (where the configuration lives) and the declared `config_digest`
-(which content version is behind it); a locator MUST NOT be stored as, or
-substituted for, a content digest, and location and digest MUST remain distinct
-columns/fields. Core MUST reject an all-whitespace locator but MUST store a
-non-empty locator exactly as supplied (it MUST NOT trim a source-owned opaque
-identity). A single validated `SourceConfigRevision` read MUST be the only
-SourceConfig read path; getters MUST NOT read the duplicated columns
-independently.
+(which content version is behind it). Location and identity are distinct
+fields/columns; their *values* are source-private and may coincide (for example
+a content-addressed locator), so Core MUST NOT reject a value equality while it
+MUST NOT store one in place of the other. Core MUST reject an all-whitespace
+locator but MUST store a non-empty locator exactly as supplied (it MUST NOT trim
+a source-owned opaque identity). A single validated `SourceConfigRevision` read
+MUST be the only SourceConfig read path; getters MUST NOT read the duplicated
+columns independently.
 
 ## Kernel unique constraints (MUST)
 

@@ -450,17 +450,36 @@ fn external_ref_config_keeps_locator_and_digest_distinct() {
         .unwrap_err();
     assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
 
-    // A locator offered in place of a content digest is rejected.
-    let conflated = base_config(locator, Vec::new());
-    let err = kernel
+    // A locator *value* may legitimately equal the digest value (for example a
+    // content-addressed locator that is both where the content lives and its
+    // digest). They remain two distinct fields; Core must not reject equality.
+    let shared = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut content_addressed = base_config(shared, Vec::new());
+    content_addressed.config_ref =
+        SourceConfigRef::new(base_source().source_ref, "content-addressed", 1).unwrap();
+    kernel
         .publish_source_config(
-            &conflated,
+            &content_addressed,
             &SourceConfigBody::ExternalRef {
-                locator: locator.into(),
+                locator: shared.into(),
             },
         )
-        .unwrap_err();
-    assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
+        .unwrap();
+    assert_eq!(
+        kernel
+            .get_source_config_locator(&content_addressed.config_ref)
+            .unwrap(),
+        Some(shared.to_string())
+    );
+    assert_eq!(
+        kernel
+            .get_source_config(&content_addressed.config_ref)
+            .unwrap()
+            .unwrap()
+            .config_digest
+            .as_str(),
+        shared
+    );
 
     // An empty locator is rejected.
     let err = kernel
@@ -943,6 +962,145 @@ fn idempotent_republish_over_corrupt_row_fails_closed() {
     // corrupted existing revision.
     assert!(matches!(
         kernel.publish_agent_type(&agent),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn assert_selector_lookup_fails(kernel: &Kernel, agent: &AgentType) {
+    assert!(matches!(
+        kernel.resolve_agent_type_selector(&AgentTypeSelector::Exact(agent.type_ref.clone())),
+        Err(Error::InvariantViolation(_))
+    ));
+    assert!(matches!(
+        kernel.resolve_agent_type_selector(
+            &AgentTypeSelector::latest(agent.type_ref.id().as_str()).unwrap()
+        ),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn selector_lookup_rejects_corrupt_digest_revision() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-sd-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    corrupt_json_only(
+        &path,
+        "agent_types",
+        "type_id='general-reviewer' AND revision=1",
+        " ",
+    );
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // The selector path must not be a weaker authority than get_agent_type.
+    assert!(matches!(
+        kernel.get_agent_type(&agent.type_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    assert_selector_lookup_fails(&kernel, &agent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selector_lookup_rejects_non_canonical_revision() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-sn-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let mut agent = base_agent("general-reviewer", 1, None);
+    agent.contract.allowed_information_functions = vec![
+        InformationFunction::CompressPositive,
+        InformationFunction::Expand,
+    ];
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    // Self-consistent but non-canonical: reorder + recompute a matching digest.
+    tamper_json(
+        &path,
+        "agent_types",
+        "type_id='general-reviewer' AND revision=1",
+        |value| {
+            value["contract"]["allowed_information_functions"]
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+        },
+    );
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert_selector_lookup_fails(&kernel, &agent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selector_lookup_rejects_based_on_relational_drift() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-sb-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let base = base_agent("general-reviewer", 1, None);
+    let base_two = base_agent("general-reviewer", 2, None);
+    let mut derived = base_agent("derived-reviewer", 1, Some(type_ref("general-reviewer", 1)));
+    derived.contract.budget_ceiling = Budget::new(50.0).unwrap();
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&base).unwrap();
+        kernel.publish_agent_type(&base_two).unwrap();
+        kernel.publish_agent_type(&derived).unwrap();
+    }
+    // Drift the duplicated based_on mirror column (to another existing revision)
+    // without touching content_json.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE agent_types SET based_on_revision=2 WHERE type_id='derived-reviewer'",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert_selector_lookup_fails(&kernel, &derived);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_disposition_overlay_is_corruption() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-o-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_agent_type(&agent).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    // A present revision with a missing overlay is corruption, not "not found".
+    assert!(matches!(
+        kernel.get_agent_type(&agent.type_ref),
         Err(Error::InvariantViolation(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);

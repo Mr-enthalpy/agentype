@@ -171,7 +171,8 @@ revision has a canonical content encoding and a Core-computed content digest:
 - publication and deprecation status is a mutable **disposition overlay** that
   MUST NOT enter the revision content or its digest; a fresh publication MUST
   persist the caller's initial disposition (never silently substitute
-  `ACTIVE`), and dispositions only advance;
+  `ACTIVE`), dispositions only advance, and a revision row whose overlay is
+  missing is corruption that MUST fail closed;
 - a read at the catalog boundary MUST verify the stored content digest against
   the stored canonical document, **re-canonicalize** the decoded record (decode
   -> canonicalize against the catalog -> re-encode -> byte equality; a
@@ -179,6 +180,9 @@ revision has a canonical content encoding and a Core-computed content digest:
   duplicated relational column against that document, so the digest is a
   durability witness rather than publication-time metadata and no mirror column
   becomes a second authority;
+- pre-commit `AgentTypeSelector` resolution MUST use the same validated read for
+  its published set, so a corrupt published revision fails the whole lookup
+  closed rather than remaining selectable through a weaker path;
 - an idempotent republish of an existing exact revision MUST re-run the
   validated read before reporting success, and the AdapterBindingPolicy durable
   boundary MUST enforce its own whole-record invariant (non-blank
@@ -186,7 +190,9 @@ revision has a canonical content encoding and a Core-computed content digest:
 - a SourceConfig `config_digest` MUST have the canonical grammar
   `sha256:<64 lowercase hex>`, and a single validated `SourceConfigRevision` read
   MUST cross-check its body `config_mode`/`config_payload_json`/`config_locator`
-  columns, so an `ExternalRef` locator and its digest cannot diverge.
+  columns. A locator and a digest are distinct fields whose values are
+  source-private and may legitimately coincide, so an `ExternalRef` locator MUST
+  NOT be required to differ from its digest.
 
 ## Refinement monotonicity
 

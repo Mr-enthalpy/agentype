@@ -373,7 +373,9 @@ Rules now enforced by the durable catalog:
   disposition (an `ACTIVE` source/config is not silently substituted), and
   dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`; others
   `ACTIVE -> DRAINING -> DISABLED`). Re-publishing an existing exact revision is
-  content-idempotent and leaves the live disposition untouched.
+  content-idempotent and leaves the live disposition untouched. A revision row
+  with a missing disposition overlay is durable corruption and fails closed,
+  never a silent "not found".
 - **ConfigDigest grammar.** A config digest has the frozen grammar
   `sha256:<64 lowercase hex>`, validated for both body modes before it enters a
   durable revision. An `OpaqueJson` digest is Core-computed from the body; an
@@ -382,11 +384,19 @@ Rules now enforced by the durable catalog:
 - **SourceConfig authority.** A `SourceConfigBody` is either an `OpaqueJson`
   body, whose declared `config_digest` MUST equal its canonical body digest, or
   an `ExternalRef { locator }` that freezes **both** the opaque `locator` and the
-  declared `config_digest`; the locator is stored exactly as supplied (Core only
-  rejects an all-whitespace locator, it does not trim a source-owned identity),
-  and it MUST NOT be used in place of a digest. All SourceConfig getters derive
-  from one validated `SourceConfigRevision` read that cross-checks the
-  duplicated mode/payload/locator/digest columns against the canonical document.
+  declared `config_digest`. Location and identity are two distinct fields;
+  their *values* are source-private and may legitimately coincide (a
+  content-addressed locator can be both), so Core MUST NOT reject a value
+  equality. The locator is stored exactly as supplied (Core only rejects an
+  all-whitespace locator; it never trims a source-owned identity). All
+  SourceConfig getters derive from one validated `SourceConfigRevision` read
+  that cross-checks the duplicated mode/payload/locator/digest columns against
+  the canonical document.
+- **Selector lookup.** Pre-commit `AgentTypeSelector` resolution builds its
+  published set from the same validated canonical read as `get_agent_type`; a
+  corrupt published revision fails the whole lookup closed (no silent drop, no
+  fallback to an older revision), so selector resolution is not a second, weaker
+  authority.
 - **Schema gate.** v5 and earlier are rejected at open; there is no v5 -> v6
   migration (`D-DB-MIGRATE` remains unresolved).
 
