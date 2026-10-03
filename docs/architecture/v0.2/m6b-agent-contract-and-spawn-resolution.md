@@ -11,7 +11,8 @@ admission remains frozen from M6-A
 ([m6a-result-carried-intent-binding](../../reports/v0.2/m6a-result-carried-intent-binding.md)).
 
 This note grows across the M6-B stages. It currently records **M6-B.1**, the
-pure AgentType ontology and the four matching predicates.
+pure AgentType ontology and the four matching predicates, and **M6-B.2**, the
+durable Agent Contract catalog (schema v6).
 
 ---
 
@@ -280,7 +281,7 @@ resolution.
 M6-B.1 does not implement:
 
 ```text
-catalog persistence or schema v6                (M6-B.2)
+catalog persistence or schema v6                (M6-B.2, now implemented)
 TaskAgentRequirement / typed admission          (M6-B.3)
 LogicalAgent matching / ranking engine          (M6-B.3)
 ProvisioningBinding / BindingSnapshot           (M6-B.4)
@@ -303,9 +304,8 @@ way; the durable encoding MUST normalize `Bool(false)` to omission so absence ha
 exactly one representation; set-like sequences (claims, credential references)
 MUST be sorted/deduped before content or digest formation, with a
 permutation-invariance test; publication MUST verify `based_on` provenance
-(`derived.based_on ==
-base.type_ref`) rather than trusting the field; and schema v6 MUST persist
-immutable revision content separately from the mutable
+(`derived.based_on == base.type_ref`) rather than trusting the field; and schema
+v6 MUST persist immutable revision content separately from the mutable
 `SpawnSourceDisposition`/config-disposition overlay, so status never enters the
 content digest (spec 07 "Revision and disposition ownership").
 
@@ -322,7 +322,113 @@ an authority proof, and B.4 MUST add a stronger conformance test than the
 
 ---
 
-## 6. Inherited invariants relevant here
+## 6. Catalog persistence (M6-B.2)
+
+`schema v6` (Rust-era `SCHEMA_VERSION = 6`) persists the catalog in
+`agentype-storage-sqlite::catalog`, with the pure canonical encoding owned by
+`agentype-agent-contract::canonical`:
+
+```text
+immutable revision content                          mutable disposition overlay
+ capability_definitions                             (none; always usable)
+ adapter_binding_policies                           adapter_binding_policy_dispositions
+ agent_types                                        agent_type_dispositions (PUBLISHED/DEPRECATED)
+ spawn_sources                                      spawn_source_dispositions  (ACTIVE/DRAINING/DISABLED)
+ source_configs                                     source_config_dispositions
+```
+
+Rules now enforced by the durable catalog:
+
+- **Canonical digests.** Every revision is stored as canonical JSON
+  (`agentype-contract/1`) plus a `sha256:` content digest computed by Core. The
+  encoder recursively sorts every object key, so the bytes do not depend on
+  `serde_json`'s `preserve_order` feature configuration; golden digest vectors
+  pin the format. Claims and credential references are sorted/deduped,
+  `Bool(false)` is normalized to omission only after catalog resolution, and at
+  most one claim per exact `CapabilityRef` is kept. The surviving declaration
+  MUST be unique: an `ENFORCED` declaration supersedes `DECLARED` ones, and two
+  claims at the same reference with the same value but a different
+  `declaration_provenance_ref` are ambiguous and fail closed (provenance is
+  diagnostic, never a tie-break by input order).
+- **Immutability.** Republishing the same exact `(ref, content digest)` is
+  idempotent; a different digest for an already-published exact revision fails
+  closed as an invariant violation, and an idempotent republish of an existing
+  exact revision MUST first re-run the validated read so a pre-existing corrupt
+  row cannot be reported as published. Reads recompute the digest from the
+  stored document, **re-canonicalize** the decoded record against the catalog
+  (decode -> canonicalize -> re-encode -> byte equality, not merely
+  decode -> re-encode), and cross-check every duplicated relational column
+  against the canonical document, so a self-consistent but non-canonical row
+  still fails closed. This is enforced mechanically as well as by the Kernel:
+  SQLite `BEFORE UPDATE`/`BEFORE DELETE` triggers reject any mutation of an
+  immutable revision row, and `BEFORE UPDATE OF status` triggers on the
+  disposition overlays reject a status reversal, so direct SQL cannot bypass the
+  boundary.
+- **AdapterBindingPolicy invariant.** Its fields are public, so the durable
+  publication and decode boundaries both call `AdapterBindingPolicy::validate`;
+  a blank `adapter_kind` or `binding_ref` can never enter the catalog. The
+  values are stored verbatim, and the schema carries a non-blank CHECK as
+  defense in depth.
+- **Provenance and refinement.** Publishing a derived AgentType verifies that
+  its `based_on` base is a complete validated record (canonical content, mirror,
+  and present overlay) and that `is_valid_refinement` holds; a missing base, a
+  corrupt base, or a widening refinement fails closed.
+- **Dependent references.** A new immutable revision that references another
+  catalog revision (AgentType `based_on`, SpawnSource `adapter_policy`) MUST
+  resolve it through that revision's validated read, not merely check that the
+  row exists. A corrupt dependency fails closed and cannot propagate into new
+  durable facts. A non-`ACTIVE`/`DEPRECATED` dependency may still be referenced;
+  only corruption is rejected.
+- **Disposition separation and fidelity.** Status is a separate overlay and
+  never enters a digest. A fresh publication persists the caller's initial
+  disposition (an `ACTIVE` source/config is not silently substituted), and
+  dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`; others
+  `ACTIVE -> DRAINING -> DISABLED`). Repeating the current disposition is an
+  idempotent no-op that preserves the transition timestamp. A revision row whose
+  overlay is missing is durable corruption: reads, selector resolution,
+  disposition setters, and idempotent republish all fail closed, and no path may
+  silently drop the revision or recreate its overlay. Only a fresh immutable
+  publication creates an overlay, in the same transaction.
+- **ConfigDigest grammar.** A config digest has the frozen grammar
+  `sha256:<64 lowercase hex>`, validated for both body modes before it enters a
+  durable revision. An `OpaqueJson` digest is Core-computed from the body; an
+  `ExternalRef` digest is declared and later attested by the source integration
+  (B.4), which hashes the resolved content.
+- **SourceConfig identity.** The complete durable revision content is the
+  `SourceConfigRevision` (`SourceConfig` metadata + body `mode` + `ExternalRef`
+  `locator`), and its canonical content digest and
+  `SourceConfigRevision::same_revision_content` are the only durable revision
+  identity. `SourceConfig::same_config_contract_content` compares metadata only
+  and is explicitly not a durable identity, so two configs that agree on
+  metadata but differ in locator are different revisions.
+- **SourceConfig authority.** A `SourceConfigBody` is either an `OpaqueJson`
+  body, whose declared `config_digest` MUST equal its canonical body digest, or
+  an `ExternalRef { locator }` that freezes **both** the opaque `locator` and the
+  declared `config_digest`. Location and identity are two distinct fields;
+  their *values* are source-private and may legitimately coincide (a
+  content-addressed locator can be both), so Core MUST NOT reject a value
+  equality. The locator is stored exactly as supplied (Core only rejects an
+  all-whitespace locator; it never trims a source-owned identity). An
+  `OpaqueJson` body is durable non-secret configuration; provider/vendor secrets
+  belong behind `ExternalRef`/`CredentialRef` (B.5), so the database never
+  becomes a provider-secret store. All SourceConfig getters derive from one
+  validated `SourceConfigRevision` read that cross-checks the duplicated
+  mode/payload/locator/digest columns against the canonical document. A later
+  stage (B.4) MUST read the opaque body through that same validated record
+  (`SourceConfigRevision::body` / `payload`), never with a separate query.
+- **Selector lookup.** Pre-commit `AgentTypeSelector` resolution builds its
+  published set from the same validated canonical read as `get_agent_type`; a
+  corrupt published revision (including a missing overlay) fails the whole
+  lookup closed (no silent drop, no fallback to an older revision), so selector
+  resolution is not a second, weaker authority.
+- **Schema gate.** v5 and earlier are rejected at open; there is no v5 -> v6
+  migration (`D-DB-MIGRATE` remains unresolved).
+
+The storage layer performs no external I/O, mints no enforcement evidence, and
+does not select a SpawnSource. Ranking, `TaskAgentRequirement`, and
+`LogicalAgent` matching remain M6-B.3.
+
+## 7. Inherited invariants relevant here
 
 ```text
 INV-B1  AgentType purity

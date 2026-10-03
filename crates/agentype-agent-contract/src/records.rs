@@ -35,10 +35,15 @@ impl Budget {
     }
 }
 
-/// A non-empty config content digest.
+/// A config content digest with a frozen canonical grammar:
+/// `sha256:` followed by exactly 64 lowercase hexadecimal characters.
 ///
-/// Only non-emptiness is enforced here; the canonical digest representation is a
-/// B.2 publication obligation and MUST NOT be assumed from this type alone.
+/// [`ConfigDigest::new`] only checks non-emptiness so the pure B.1 value type
+/// stays constructible for pre-commit drafts. `validate_canonical` is the
+/// B.2 publication/read obligation: a digest that enters a durable catalog
+/// revision MUST have the canonical grammar, whether it is a Core-computed
+/// `OpaqueJson` body digest or an `ExternalRef` content digest that the source
+/// integration will later verify against the resolved content.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConfigDigest(String);
 
@@ -51,6 +56,25 @@ impl ConfigDigest {
             });
         }
         Ok(Self(digest))
+    }
+
+    /// The frozen B.2 canonical grammar: `sha256:<64 lowercase hex>`.
+    pub fn validate_canonical(&self) -> Result<(), ContractError> {
+        let Some(hex) = self.0.strip_prefix("sha256:") else {
+            return Err(ContractError::InvalidRef {
+                reason: "config digest must have the form sha256:<64 lowercase hex>".into(),
+            });
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ContractError::InvalidRef {
+                reason: "config digest must have the form sha256:<64 lowercase hex>".into(),
+            });
+        }
+        Ok(())
     }
 
     pub fn as_str(&self) -> &str {
@@ -372,10 +396,14 @@ impl SpawnSource {
 /// only its identity, digest, credential references, and any config-specific
 /// declarations (which MUST stay within the source envelope) are modeled here.
 ///
-/// Like [`SpawnSource`], this is a resolved view. Ordinary `==` includes the
-/// mutable `status`; revision-content identity (digests, cache keys) MUST use
-/// [`SourceConfig::same_revision_content`], which excludes the disposition and
-/// the opaque `config_digest`-independent operational state.
+/// This type carries the Core-visible **config-selection metadata**, not the
+/// complete durable revision content: a B.2 persisted `SourceConfigRevision`
+/// additionally carries the opaque body `mode` and `ExternalRef` `locator`,
+/// which are part of the immutable revision content and its canonical digest.
+/// Use [`SourceConfig::same_config_contract_content`] only to compare this
+/// metadata; it is **not** the durable revision identity. Durable identity
+/// (digests, cache keys, snapshots) MUST come from the `SourceConfigRevision`
+/// canonical content, never from this method.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
     pub config_ref: SourceConfigRef,
@@ -393,13 +421,15 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    /// Immutable revision-content identity, excluding the mutable disposition.
+    /// Core-visible config-selection metadata equality, excluding the mutable
+    /// disposition **and** the opaque body mode/locator (which this type does
+    /// not model).
     ///
-    /// Precondition: both records are **canonicalized**. `claims` and
-    /// `credential_refs` are compared as ordered `Vec`s, so non-canonical
-    /// orderings of the same set-like content compare unequal. B.2 publication
-    /// MUST sort/dedup them before forming revision content/digests.
-    pub fn same_revision_content(&self, other: &Self) -> bool {
+    /// This is deliberately *not* called "revision content": two configs that
+    /// agree here can still be different durable revisions if their
+    /// `ExternalRef` locators differ. Precondition: both records are
+    /// canonicalized; `claims`/`credential_refs` are compared as ordered `Vec`s.
+    pub fn same_config_contract_content(&self, other: &Self) -> bool {
         self.config_ref == other.config_ref
             && self.config_digest == other.config_digest
             && self.lifecycle_modes == other.lifecycle_modes
@@ -469,13 +499,26 @@ impl PhysicalSafety {
     pub fn enforces_network(&self, policy: NetworkPolicy) -> bool {
         self.enforceable_network_modes.contains(&policy)
     }
+
+    /// The full enforceable workspace-mode set, in canonical rank order.
+    /// Read-only: a caller cannot use this to mint an enforcement claim.
+    pub fn enforceable_workspace_modes(&self) -> &[WorkspaceMode] {
+        &self.enforceable_workspace_modes
+    }
+
+    /// The full enforceable network-mode set, in canonical order.
+    pub fn enforceable_network_modes(&self) -> &BTreeSet<NetworkPolicy> {
+        &self.enforceable_network_modes
+    }
 }
 
 /// Persisted operator intent connecting a stable alias to a physical binding.
 ///
-/// B.1 defines only the value shape; B.2/B.4 own catalogue validation and the
-/// physical binding key. Use [`AdapterBindingPolicy::new`] so the non-empty
-/// invariant holds at construction.
+/// B.1 defines the value shape; B.2 owns durable catalogue validation and B.4
+/// owns the physical binding key. The fields are public, so every durable entry
+/// point (construction and decode) MUST call [`AdapterBindingPolicy::validate`];
+/// a blank `adapter_kind` or `binding_ref` is not a legal physical-binding
+/// intent. The values are stored verbatim, never trimmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterBindingPolicy {
     pub policy_ref: AdapterPolicyRef,
@@ -486,6 +529,21 @@ pub struct AdapterBindingPolicy {
 }
 
 impl AdapterBindingPolicy {
+    /// The whole-record invariant: a non-blank `adapter_kind` and `binding_ref`.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.adapter_kind.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy kind cannot be empty".into(),
+            });
+        }
+        if self.binding_ref.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "adapter binding policy binding_ref cannot be empty".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn new(
         policy_ref: AdapterPolicyRef,
         adapter_kind: impl Into<String>,
@@ -493,25 +551,15 @@ impl AdapterBindingPolicy {
         required_safety: PhysicalSafety,
         status: ConfigStatus,
     ) -> Result<Self, ContractError> {
-        let adapter_kind = adapter_kind.into();
-        let binding_ref = binding_ref.into();
-        if adapter_kind.trim().is_empty() {
-            return Err(ContractError::InvalidRef {
-                reason: "adapter binding policy kind cannot be empty".into(),
-            });
-        }
-        if binding_ref.trim().is_empty() {
-            return Err(ContractError::InvalidRef {
-                reason: "adapter binding policy binding_ref cannot be empty".into(),
-            });
-        }
-        Ok(Self {
+        let policy = Self {
             policy_ref,
-            adapter_kind,
-            binding_ref,
+            adapter_kind: adapter_kind.into(),
+            binding_ref: binding_ref.into(),
             required_safety,
             status,
-        })
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 }
 

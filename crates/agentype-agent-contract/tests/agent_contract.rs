@@ -2298,7 +2298,9 @@ fn test_disposition_is_separate_from_revision_content() {
     let mut draining_config = base_config();
     draining_config.status = ConfigStatus::Draining;
     assert_ne!(config, draining_config);
-    assert!(config.same_revision_content(&draining_config));
+    // `SourceConfig` only carries config-selection metadata; the complete
+    // durable revision identity lives in the B.2 `SourceConfigRevision`.
+    assert!(config.same_config_contract_content(&draining_config));
 }
 
 #[test]

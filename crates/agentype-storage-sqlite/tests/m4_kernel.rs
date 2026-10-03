@@ -7,7 +7,7 @@ mod common;
 use agentype_core::*;
 use agentype_execution_config::*;
 use agentype_storage_sqlite::txutil;
-use agentype_storage_sqlite::Kernel;
+use agentype_storage_sqlite::{Kernel, SCHEMA_VERSION};
 use common::*;
 use serde_json::json;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ fn wal_full_and_foreign_keys() {
     assert_eq!(journal.to_uppercase(), "WAL");
     assert_eq!(sync, 2, "synchronous=FULL");
     assert_eq!(fk, 1);
-    assert_eq!(env.k.schema_version().unwrap(), 5);
+    assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
 }
 
 /// A database carrying the Rust-era identity survives reopen; a foreign
@@ -44,7 +44,7 @@ fn fresh_database_carries_rust_identity_and_reopens() {
     }
     // Reopen must succeed: same family, version 1.
     let env = file_env(&db);
-    assert_eq!(env.k.schema_version().unwrap(), 5);
+    assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
 }
 
 /// A simulated Python-lineage database (schema_migrations present at version
@@ -1790,7 +1790,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
     let db = FixtureDb::new("schema-v3");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 5);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
     }
     // Downgrade the database to the M5.1-era shape: version 1, no
     // adapter_kind column.
@@ -1807,7 +1807,8 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
         Ok(_) => panic!("schema v1 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 5"),
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
         "the rejection must be the schema-version gate: {err:?}"
     );
 
@@ -1815,7 +1816,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
     let fresh = FixtureDb::new("schema-v3-fresh");
     {
         let env = file_env(&fresh);
-        assert_eq!(env.k.schema_version().unwrap(), 5);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
         let conn = rusqlite::Connection::open(&fresh.path).unwrap();
         let has_kind: i64 = conn
             .query_row(
@@ -1857,7 +1858,7 @@ fn schema_v2_database_is_rejected_after_pending_terminal_envelope() {
     let db = FixtureDb::new("schema-v2-old");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 5);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
     }
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     conn.execute("UPDATE schema_migrations SET version=2", [])
@@ -1877,7 +1878,8 @@ fn schema_v2_database_is_rejected_after_pending_terminal_envelope() {
         Ok(_) => panic!("schema v2 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 5"),
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
         "the rejection must be the schema-version gate: {err:?}"
     );
 }
@@ -1887,7 +1889,7 @@ fn schema_v3_database_is_rejected_after_adapter_binding_key() {
     let db = FixtureDb::new("schema-v3-old");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 5);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
     }
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     conn.execute("UPDATE schema_migrations SET version=3", [])
@@ -1902,7 +1904,8 @@ fn schema_v3_database_is_rejected_after_adapter_binding_key() {
         Ok(_) => panic!("schema v3 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 5"),
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
         "the rejection must be the schema-version gate: {err:?}"
     );
 }
@@ -1912,7 +1915,7 @@ fn schema_v4_database_is_rejected_after_generation_tables() {
     let db = FixtureDb::new("schema-v4-old");
     {
         let env = file_env(&db);
-        assert_eq!(env.k.schema_version().unwrap(), 5);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
     }
     let conn = rusqlite::Connection::open(&db.path).unwrap();
     conn.execute("UPDATE schema_migrations SET version=4", [])
@@ -1930,7 +1933,49 @@ fn schema_v4_database_is_rejected_after_generation_tables() {
         Ok(_) => panic!("schema v4 database must be rejected at open"),
     };
     assert!(
-        err.to_string().contains("does not match expected 5"),
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+}
+
+/// Schema v5 (M6-A frontier only, no M6-B.2 catalog) is rejected at open:
+/// D-DB-MIGRATE is unresolved, so there is deliberately no v5->v6 upgrade.
+#[test]
+fn schema_v5_database_is_rejected_after_catalog_tables() {
+    let db = FixtureDb::new("schema-v5-old");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=5", [])
+        .unwrap();
+    conn.execute("DROP TABLE source_config_dispositions", [])
+        .unwrap();
+    conn.execute("DROP TABLE source_configs", []).unwrap();
+    conn.execute("DROP TABLE spawn_source_dispositions", [])
+        .unwrap();
+    conn.execute("DROP TABLE spawn_sources", []).unwrap();
+    conn.execute("DROP TABLE agent_type_dispositions", [])
+        .unwrap();
+    conn.execute("DROP TABLE agent_types", []).unwrap();
+    conn.execute("DROP TABLE adapter_binding_policy_dispositions", [])
+        .unwrap();
+    conn.execute("DROP TABLE adapter_binding_policies", [])
+        .unwrap();
+    conn.execute("DROP TABLE capability_definitions", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v5 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
         "the rejection must be the schema-version gate: {err:?}"
     );
 }

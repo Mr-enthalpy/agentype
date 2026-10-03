@@ -6,8 +6,13 @@
 /// Version 4 adds `executions.adapter_binding_key` (opaque domain identity
 /// frozen at Execution creation). Version 5 adds M6-A Semantic Frontier Kernel
 /// tables (`generations`, `compiled_work_proposals`, `generation_task_bindings`).
-/// Older files are rejected at open (fail closed); D-DB-MIGRATE is still unresolved.
-pub const SCHEMA_VERSION: i64 = 5;
+/// Version 6 adds the M6-B.2 Agent Contract catalog (`capability_definitions`,
+/// `agent_types`, `spawn_sources`, `source_configs`,
+/// `adapter_binding_policies`) with immutable revision content kept separate
+/// from mutable disposition overlays. Older files are rejected at open (fail
+/// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
+/// v5->v6 in-place upgrade.
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -340,4 +345,226 @@ CREATE TABLE IF NOT EXISTS generation_task_bindings (
     semantic_input_set_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
 );
+
+-- =========================================================================
+-- M6-B.2 Agent Contract catalog (schema v6)
+--
+-- Immutable revision content lives in the primary tables; the mutable
+-- ACTIVE/DRAINING/DISABLED/PUBLISHED/DEPRECATED dispositions live in separate
+-- overlay tables so status never enters a revision content digest.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS capability_definitions (
+    capability_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    matcher_kind TEXT NOT NULL CHECK (matcher_kind IN ('BOOL','SET','ORDERED','QUANTITY','EXACT')),
+    security_class TEXT NOT NULL CHECK (security_class IN ('FUNCTIONAL','AUTHORITY','SANDBOX','CONTINUITY')),
+    polarity TEXT NOT NULL CHECK (polarity IN ('ABILITY','RESTRICTION')),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (capability_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS adapter_binding_policies (
+    policy_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    adapter_kind TEXT NOT NULL CHECK (length(trim(adapter_kind)) > 0),
+    binding_ref TEXT NOT NULL CHECK (length(trim(binding_ref)) > 0),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS adapter_binding_policy_dispositions (
+    policy_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (policy_id, revision),
+    FOREIGN KEY (policy_id, revision) REFERENCES adapter_binding_policies(policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS agent_types (
+    type_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    based_on_type_id TEXT,
+    based_on_revision INTEGER,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (type_id, revision),
+    CHECK ((based_on_type_id IS NULL) = (based_on_revision IS NULL)),
+    FOREIGN KEY (based_on_type_id, based_on_revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS agent_type_dispositions (
+    type_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PUBLISHED','DEPRECATED')),
+    deprecated_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (type_id, revision),
+    FOREIGN KEY (type_id, revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS spawn_sources (
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    adapter_policy_id TEXT NOT NULL,
+    adapter_policy_revision INTEGER NOT NULL,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (source_id, revision),
+    FOREIGN KEY (adapter_policy_id, adapter_policy_revision)
+        REFERENCES adapter_binding_policies(policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS spawn_source_dispositions (
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source_id, revision),
+    FOREIGN KEY (source_id, revision) REFERENCES spawn_sources(source_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS source_configs (
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    config_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL CHECK (config_revision >= 1),
+    config_mode TEXT NOT NULL CHECK (config_mode IN ('OPAQUE_JSON','EXTERNAL_REF')),
+    config_payload_json TEXT,
+    config_locator TEXT,
+    config_digest TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (source_id, source_revision, config_id, config_revision),
+    CHECK ((config_mode = 'OPAQUE_JSON') = (config_payload_json IS NOT NULL)),
+    CHECK ((config_mode = 'EXTERNAL_REF') = (config_locator IS NOT NULL)),
+    FOREIGN KEY (source_id, source_revision) REFERENCES spawn_sources(source_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS source_config_dispositions (
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    config_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE','DRAINING','DISABLED')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source_id, source_revision, config_id, config_revision),
+    FOREIGN KEY (source_id, source_revision, config_id, config_revision)
+        REFERENCES source_configs(source_id, source_revision, config_id, config_revision)
+);
+
+CREATE INDEX IF NOT EXISTS agent_types_based_on_idx
+ON agent_types(based_on_type_id, based_on_revision);
+CREATE INDEX IF NOT EXISTS source_configs_source_idx
+ON source_configs(source_id, source_revision);
+CREATE INDEX IF NOT EXISTS spawn_sources_policy_idx
+ON spawn_sources(adapter_policy_id, adapter_policy_revision);
+
+-- =========================================================================
+-- Mechanical catalog guards
+--
+-- Immutable revision content is frozen by SQLite itself, not only by the
+-- Kernel API: the parent revision row cannot be updated or deleted. Mutable
+-- disposition overlays stay writable but can only advance. Direct mutation
+-- that bypasses the Kernel transaction boundary is therefore rejected here.
+-- =========================================================================
+
+CREATE TRIGGER IF NOT EXISTS capability_definitions_immutable_update
+BEFORE UPDATE ON capability_definitions
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS capability_definitions_immutable_delete
+BEFORE DELETE ON capability_definitions
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policies_immutable_update
+BEFORE UPDATE ON adapter_binding_policies
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policies_immutable_delete
+BEFORE DELETE ON adapter_binding_policies
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_types_immutable_update
+BEFORE UPDATE ON agent_types
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_types_immutable_delete
+BEFORE DELETE ON agent_types
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_sources_immutable_update
+BEFORE UPDATE ON spawn_sources
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_sources_immutable_delete
+BEFORE DELETE ON spawn_sources
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_configs_immutable_update
+BEFORE UPDATE ON source_configs
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_configs_immutable_delete
+BEFORE DELETE ON source_configs
+BEGIN
+    SELECT RAISE(ABORT, 'immutable catalog revision content cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_dispositions_monotonic
+BEFORE UPDATE OF status ON agent_type_dispositions
+WHEN OLD.status = 'DEPRECATED' AND NEW.status = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'a deprecated AgentType revision cannot be republished');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_dispositions_monotonic
+BEFORE UPDATE OF status ON spawn_source_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'spawn source disposition must not reverse');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_config_dispositions_monotonic
+BEFORE UPDATE OF status ON source_config_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'source config disposition must not reverse');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policy_dispositions_monotonic
+BEFORE UPDATE OF status ON adapter_binding_policy_dispositions
+WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+   < (CASE OLD.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED' THEN 2 END)
+BEGIN
+    SELECT RAISE(ABORT, 'adapter binding policy disposition must not reverse');
+END;
 "#;

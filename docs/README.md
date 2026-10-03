@@ -20,10 +20,13 @@ Layout notes and remaining documentation debt: [docs/development/repo-normalizat
 
 V0.2 implementation status: the M5 execution/runtime substrate and the M6-A
 semantic frontier kernel are frozen, with a follow-up re-freeze binding worker
-intents to their carrying Results. See the
+intents to their carrying Results. M6-B is in progress: M6-B.1 froze the pure
+AgentType ontology and the four matching predicates, and M6-B.2 added the
+durable Agent Contract catalog (schema v6). See the
 [M5 runtime freeze and M6 handoff report](reports/v0.2/riir-m5-runtime-freeze.md),
 the [M6-A semantic frontier freeze report](reports/v0.2/m6a-semantic-frontier-freeze.md),
-and the [M6-A result-carried intent re-freeze](reports/v0.2/m6a-result-carried-intent-binding.md).
+the [M6-A result-carried intent re-freeze](reports/v0.2/m6a-result-carried-intent-binding.md),
+and the [M6-B agent contract and spawn resolution note](architecture/v0.2/m6b-agent-contract-and-spawn-resolution.md).
 
 ## Taxonomy (where a new file goes)
 
