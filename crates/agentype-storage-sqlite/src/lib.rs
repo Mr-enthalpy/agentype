@@ -29,7 +29,9 @@ mod schema;
 mod store;
 pub mod txutil;
 
-pub use catalog::{AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody};
+pub use catalog::{
+    AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigRevision,
+};
 pub use kernel::{
     CurrentAuthorityHint, ExecutionReconciliationSnapshot, ExecutionRoutingFacts, Kernel,
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,

@@ -46,7 +46,14 @@ change never alters a revision content digest:
 A published exact revision's content digest is a durability witness: a read at
 the catalog authority boundary MUST recompute the digest from the stored
 canonical document (and MUST NOT accept a document that is not the canonical
-encoding of the record it decodes to).
+encoding of the record it decodes to). Every duplicated relational column
+(identity, `based_on`, adapter policy, capability semantics, config body/mode/
+locator/digest) MUST be cross-checked against the canonical document, so no
+mirror column becomes a second authority.
+
+A config digest MUST have the canonical grammar `sha256:` followed by 64
+lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`
+configs, before it enters a durable revision.
 
 An opaque SourceConfig body or locator is source-private: Core stores it
 without interpreting it. An `OpaqueJson` body's declared `config_digest` MUST
@@ -54,7 +61,11 @@ equal its canonical body digest. An `ExternalRef` freezes **both** an opaque
 `locator` (where the configuration lives) and the declared `config_digest`
 (which content version is behind it); a locator MUST NOT be stored as, or
 substituted for, a content digest, and location and digest MUST remain distinct
-columns/fields.
+columns/fields. Core MUST reject an all-whitespace locator but MUST store a
+non-empty locator exactly as supplied (it MUST NOT trim a source-owned opaque
+identity). A single validated `SourceConfigRevision` read MUST be the only
+SourceConfig read path; getters MUST NOT read the duplicated columns
+independently.
 
 ## Kernel unique constraints (MUST)
 

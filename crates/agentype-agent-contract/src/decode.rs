@@ -474,15 +474,20 @@ pub fn adapter_binding_policy_from_canonical_json(
 
 pub fn capability_definition_from_canonical_json(
     json: &str,
-) -> Result<CapabilityDefinition, ContractError> {
+) -> Result<(CapabilityRef, CapabilityDefinition), ContractError> {
     let value = parse_document(json, "CAPABILITY_DEFINITION")?;
     let object = object(&value, "capability definition")?;
-    Ok(CapabilityDefinition {
+    let reference = CapabilityRef::new(
+        string_of(field(object, "capability_id")?, "capability_id")?,
+        u64_of(field(object, "revision")?, "revision")?,
+    )?;
+    let definition = CapabilityDefinition {
         matcher_kind: matcher_kind(&string_of(field(object, "matcher_kind")?, "matcher_kind")?)?,
         security_class: security_class(&string_of(
             field(object, "security_class")?,
             "security_class",
         )?)?,
         polarity: capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?,
-    })
+    };
+    Ok((reference, definition))
 }

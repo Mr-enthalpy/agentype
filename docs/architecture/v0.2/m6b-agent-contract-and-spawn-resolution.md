@@ -353,8 +353,9 @@ Rules now enforced by the durable catalog:
 - **Immutability.** Republishing the same exact `(ref, content digest)` is
   idempotent; a different digest for an already-published exact revision fails
   closed as an invariant violation. Reads recompute the digest from the stored
-  document and re-encode the decoded record, so a drifted or non-canonical row
-  fails closed.
+  document, re-encode the decoded record, and cross-check every duplicated
+  relational column against the canonical document, so a drifted row cannot
+  become a second source of truth.
 - **Provenance and refinement.** Publishing a derived AgentType verifies that
   its `based_on` base exists and that `is_valid_refinement` holds; a missing
   base or a widening refinement fails closed.
@@ -364,12 +365,19 @@ Rules now enforced by the durable catalog:
   dispositions only advance (AgentType `PUBLISHED -> DEPRECATED`; others
   `ACTIVE -> DRAINING -> DISABLED`). Re-publishing an existing exact revision is
   content-idempotent and leaves the live disposition untouched.
-- **SourceConfig opacity and identity.** A `SourceConfigBody` is either an
-  `OpaqueJson` body, whose content digest MUST equal the config's declared
-  `config_digest`, or an `ExternalRef { locator }` that freezes **both** the
-  opaque `locator` and the declared `config_digest`; the locator MUST NOT be used
-  in place of a digest. Core never interprets either, and performs no external
-  I/O in B.2.
+- **ConfigDigest grammar.** A config digest has the frozen grammar
+  `sha256:<64 lowercase hex>`, validated for both body modes before it enters a
+  durable revision. An `OpaqueJson` digest is Core-computed from the body; an
+  `ExternalRef` digest is declared and later attested by the source integration
+  (B.4), which hashes the resolved content.
+- **SourceConfig authority.** A `SourceConfigBody` is either an `OpaqueJson`
+  body, whose declared `config_digest` MUST equal its canonical body digest, or
+  an `ExternalRef { locator }` that freezes **both** the opaque `locator` and the
+  declared `config_digest`; the locator is stored exactly as supplied (Core only
+  rejects an all-whitespace locator, it does not trim a source-owned identity),
+  and it MUST NOT be used in place of a digest. All SourceConfig getters derive
+  from one validated `SourceConfigRevision` read that cross-checks the
+  duplicated mode/payload/locator/digest columns against the canonical document.
 - **Schema gate.** v5 and earlier are rejected at open; there is no v5 -> v6
   migration (`D-DB-MIGRATE` remains unresolved).
 

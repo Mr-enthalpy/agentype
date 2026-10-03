@@ -173,8 +173,14 @@ revision has a canonical content encoding and a Core-computed content digest:
   persist the caller's initial disposition (never silently substitute
   `ACTIVE`), and dispositions only advance;
 - a read at the catalog boundary MUST verify the stored content digest against
-  the stored canonical document, so the digest is a durability witness rather
-  than publication-time metadata.
+  the stored canonical document and MUST cross-check every duplicated relational
+  column against that document, so the digest is a durability witness rather
+  than publication-time metadata and no mirror column becomes a second
+  authority;
+- a SourceConfig `config_digest` MUST have the canonical grammar
+  `sha256:<64 lowercase hex>`, and a single validated `SourceConfigRevision` read
+  MUST cross-check its body `config_mode`/`config_payload_json`/`config_locator`
+  columns, so an `ExternalRef` locator and its digest cannot diverge.
 
 ## Refinement monotonicity
 

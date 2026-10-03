@@ -35,10 +35,15 @@ impl Budget {
     }
 }
 
-/// A non-empty config content digest.
+/// A config content digest with a frozen canonical grammar:
+/// `sha256:` followed by exactly 64 lowercase hexadecimal characters.
 ///
-/// Only non-emptiness is enforced here; the canonical digest representation is a
-/// B.2 publication obligation and MUST NOT be assumed from this type alone.
+/// [`ConfigDigest::new`] only checks non-emptiness so the pure B.1 value type
+/// stays constructible for pre-commit drafts. `validate_canonical` is the
+/// B.2 publication/read obligation: a digest that enters a durable catalog
+/// revision MUST have the canonical grammar, whether it is a Core-computed
+/// `OpaqueJson` body digest or an `ExternalRef` content digest that the source
+/// integration will later verify against the resolved content.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConfigDigest(String);
 
@@ -51,6 +56,25 @@ impl ConfigDigest {
             });
         }
         Ok(Self(digest))
+    }
+
+    /// The frozen B.2 canonical grammar: `sha256:<64 lowercase hex>`.
+    pub fn validate_canonical(&self) -> Result<(), ContractError> {
+        let Some(hex) = self.0.strip_prefix("sha256:") else {
+            return Err(ContractError::InvalidRef {
+                reason: "config digest must have the form sha256:<64 lowercase hex>".into(),
+            });
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ContractError::InvalidRef {
+                reason: "config digest must have the form sha256:<64 lowercase hex>".into(),
+            });
+        }
+        Ok(())
     }
 
     pub fn as_str(&self) -> &str {

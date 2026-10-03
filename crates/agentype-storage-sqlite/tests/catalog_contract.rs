@@ -20,6 +20,10 @@ use std::sync::Arc;
 
 const MAX_BYTES: usize = 16_384;
 
+/// A syntactically valid `sha256:<64 lowercase hex>` config digest.
+const VALID_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
 fn memory_kernel() -> Kernel {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
     Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap()
@@ -339,7 +343,7 @@ fn external_ref_config_keeps_locator_and_digest_distinct() {
     kernel.publish_spawn_source(&base_source()).unwrap();
 
     let locator = "file:///etc/codex/config.toml";
-    let config = base_config("sha256:external-config-content-digest", Vec::new());
+    let config = base_config(VALID_DIGEST, Vec::new());
     kernel
         .publish_source_config(
             &config,
@@ -361,6 +365,18 @@ fn external_ref_config_keeps_locator_and_digest_distinct() {
     );
     assert_ne!(config.config_digest.as_str(), locator);
 
+    // An invalid content digest grammar is rejected.
+    let invalid = base_config("sha256:abc", Vec::new());
+    let err = kernel
+        .publish_source_config(
+            &invalid,
+            &SourceConfigBody::ExternalRef {
+                locator: locator.into(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)), "got {err:?}");
+
     // A locator offered in place of a content digest is rejected.
     let conflated = base_config(locator, Vec::new());
     let err = kernel
@@ -376,7 +392,7 @@ fn external_ref_config_keeps_locator_and_digest_distinct() {
     // An empty locator is rejected.
     let err = kernel
         .publish_source_config(
-            &base_config("sha256:abc", Vec::new()),
+            &base_config(VALID_DIGEST, Vec::new()),
             &SourceConfigBody::ExternalRef {
                 locator: "  ".into(),
             },
@@ -389,7 +405,7 @@ fn external_ref_config_keeps_locator_and_digest_distinct() {
         SourceConfigRef::new(SpawnSourceRef::new("codex-local", 99).unwrap(), "x", 1).unwrap();
     let orphan_config = SourceConfig {
         config_ref: orphan,
-        config_digest: ConfigDigest::new("sha256:abc").unwrap(),
+        config_digest: ConfigDigest::new(VALID_DIGEST).unwrap(),
         lifecycle_modes: None,
         continuity_modes: None,
         credential_refs: Vec::new(),
@@ -473,7 +489,7 @@ fn publication_persists_caller_initial_disposition() {
         SourceStatus::Disabled
     );
 
-    let mut config = base_config("sha256:abc", Vec::new());
+    let mut config = base_config(VALID_DIGEST, Vec::new());
     config.status = ConfigStatus::Draining;
     kernel
         .publish_source_config(
@@ -556,5 +572,152 @@ fn catalog_is_durable_across_restart() {
     // digest, proving the persisted canonical digest survived the restart.
     reopened.publish_agent_type(&agent).unwrap();
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn external_ref_locator_is_stored_verbatim() {
+    let kernel = memory_kernel();
+    publish_catalog(&kernel);
+    kernel
+        .publish_adapter_binding_policy(&adapter_policy())
+        .unwrap();
+    kernel.publish_spawn_source(&base_source()).unwrap();
+
+    // A locator may be byte-significant to its source; Core must not trim it.
+    let locator = "  file:///etc/codex/config.toml  ";
+    let config = base_config(VALID_DIGEST, Vec::new());
+    kernel
+        .publish_source_config(
+            &config,
+            &SourceConfigBody::ExternalRef {
+                locator: locator.into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        kernel
+            .get_source_config_locator(&config.config_ref)
+            .unwrap(),
+        Some(locator.to_string())
+    );
+}
+
+#[test]
+fn source_config_column_drift_fails_closed() {
+    // Locator column drift.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-l-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let config = base_config(VALID_DIGEST, Vec::new());
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+        kernel
+            .publish_source_config(
+                &config,
+                &SourceConfigBody::ExternalRef {
+                    locator: "file:///etc/codex/config.toml".into(),
+                },
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE source_configs SET config_locator='file:///tampered' WHERE config_id='deep-reasoning'",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert!(matches!(
+        kernel.get_source_config(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    assert!(matches!(
+        kernel.get_source_config_locator(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Digest column drift (different but canonical digest).
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-d-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+        kernel
+            .publish_source_config(
+                &config,
+                &SourceConfigBody::ExternalRef {
+                    locator: "file:///etc/codex/config.toml".into(),
+                },
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let other = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        conn.execute(
+            "UPDATE source_configs SET config_digest=?1 WHERE config_id='deep-reasoning'",
+            rusqlite::params![other],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert!(matches!(
+        kernel.get_source_config(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn opaque_payload_drift_fails_closed() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-p-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let payload = serde_json::json!({"model": "x"});
+    let config = base_config(&canonical_json_body_digest(&payload), Vec::new());
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&base_source()).unwrap();
+        kernel
+            .publish_source_config(&config, &SourceConfigBody::OpaqueJson(payload))
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE source_configs SET config_payload_json='{\"model\":\"tampered\"}' WHERE config_id='deep-reasoning'",
+            [],
+        )
+        .unwrap();
+    }
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert!(matches!(
+        kernel.get_source_config(&config.config_ref),
+        Err(Error::InvariantViolation(_))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }

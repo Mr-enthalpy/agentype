@@ -96,6 +96,12 @@ M6-B.2 catalog persistence MUST cover:
 - an opaque `OpaqueJson` config body is validated against its declared
   `config_digest`; an `ExternalRef` stores a locator separately from the digest,
   and a locator offered as a digest is rejected
+- an invalid `config_digest` grammar (not `sha256:<64 lowercase hex>`) is
+  rejected for both body modes
+- an `ExternalRef` locator is stored verbatim (whitespace is byte-significant)
+- a drifted SourceConfig relational column (locator, digest, or OpaqueJson
+  payload) fails every SourceConfig read closed through the single validated
+  `SourceConfigRevision` path
 - a read recomputes the stored content digest, so a tampered row fails closed
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 

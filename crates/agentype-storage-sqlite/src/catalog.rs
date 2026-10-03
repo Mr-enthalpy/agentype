@@ -21,7 +21,7 @@ use agentype_agent_contract::{
     source_config_content_digest, source_config_revision_from_canonical_json,
     spawn_source_content_digest, spawn_source_from_canonical_json, AdapterBindingPolicy,
     AdapterPolicyRef, AgentType, AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog,
-    CapabilityDefinition, CapabilityRef, ConfigStatus, ContractError, SourceConfig,
+    CapabilityDefinition, CapabilityRef, ConfigDigest, ConfigStatus, ContractError, SourceConfig,
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
 };
 use agentype_core::{Error, UnixTime};
@@ -192,6 +192,25 @@ fn verify_reencoded(reencoded: &[u8], stored_json: &str, what: &str) -> Result<(
     Ok(())
 }
 
+/// The canonical document is the single authority. Any duplicate relational
+/// column that a future code path might trust MUST agree with it, so a drifted
+/// mirror cannot become a second source of truth.
+fn cross_check(condition: bool, what: &str) -> Result<(), Error> {
+    if condition {
+        Ok(())
+    } else {
+        Err(Error::invariant(format!(
+            "catalog {what} relational mirror does not match its canonical document"
+        )))
+    }
+}
+
+fn require_canonical_digest(digest: &ConfigDigest, what: &str) -> Result<(), Error> {
+    digest.validate_canonical().map_err(|error| {
+        Error::invariant(format!("catalog {what} is not a canonical digest: {error}"))
+    })
+}
+
 // =============================================================================
 // CapabilityCatalog
 // =============================================================================
@@ -199,7 +218,8 @@ fn verify_reencoded(reencoded: &[u8], stored_json: &str, what: &str) -> Result<(
 pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog, Error> {
     let mut statement = tx
         .prepare(
-            "SELECT capability_id, revision, content_json, content_digest
+            "SELECT capability_id, revision, matcher_kind, security_class, polarity,
+                    content_json, content_digest
              FROM capability_definitions ORDER BY capability_id, revision",
         )
         .map_err(map_sqlite)?;
@@ -210,19 +230,30 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })
         .map_err(map_sqlite)?;
     let mut catalog = CapabilityCatalog::new();
     for row in rows {
-        let (capability_id, revision, content_json, content_digest) = row.map_err(map_sqlite)?;
+        let (capability_id, revision, matcher, class, polarity, content_json, content_digest) =
+            row.map_err(map_sqlite)?;
         verify_content_digest(&content_json, &content_digest, "capability definition")?;
-        let definition =
+        let (canonical_ref, definition) =
             capability_definition_from_canonical_json(&content_json).map_err(contract_fault)?;
         let reference =
             CapabilityRef::new(capability_id, revision as u64).map_err(contract_fault)?;
+        cross_check(canonical_ref == reference, "capability definition")?;
+        cross_check(
+            matcher == matcher_sql(&definition)
+                && class == class_sql(&definition)
+                && polarity == polarity_sql(&definition),
+            "capability definition",
+        )?;
         verify_reencoded(
-            &canonical_capability_definition_bytes(&reference, &definition),
+            &canonical_capability_definition_bytes(&canonical_ref, &definition),
             &content_json,
             "capability definition",
         )?;
@@ -510,6 +541,10 @@ pub fn publish_source_config(
         ))
     })?;
 
+    // The declared content digest MUST have the frozen canonical grammar before
+    // it enters a durable revision, for both body modes.
+    require_canonical_digest(&config.config_digest, "source config")?;
+
     let (mode, payload_json, config_locator) = match body {
         SourceConfigBody::OpaqueJson(payload) => {
             let expected = canonical_json_body_digest(payload);
@@ -527,20 +562,22 @@ pub fn publish_source_config(
             (ConfigMode::OpaqueJson, Some(payload_json), None)
         }
         SourceConfigBody::ExternalRef { locator } => {
-            let locator = locator.trim();
-            if locator.is_empty() {
+            // Structural validation only: reject an all-whitespace locator, but
+            // store the locator exactly as supplied. Trimming is a source-specific
+            // normalization Core MUST NOT perform on an opaque identity.
+            if locator.trim().is_empty() {
                 return Err(Error::invariant(
                     "an ExternalRef config locator must not be empty",
                 ));
             }
             // Location and content identity are distinct: a locator MUST NOT be
             // used in place of the declared content digest.
-            if config.config_digest.as_str() == locator {
+            if config.config_digest.as_str() == locator.as_str() {
                 return Err(Error::invariant(
                     "an ExternalRef config locator must not equal its config digest",
                 ));
             }
-            (ConfigMode::ExternalRef, None, Some(locator.to_string()))
+            (ConfigMode::ExternalRef, None, Some(locator.clone()))
         }
     };
 
@@ -618,16 +655,38 @@ fn load_agent_type(
 ) -> Result<Option<AgentType>, Error> {
     let row = query_opt(
         tx,
-        "SELECT content_json, content_digest FROM agent_types
-         WHERE type_id=?1 AND revision=?2",
+        "SELECT content_json, content_digest, based_on_type_id, based_on_revision
+         FROM agent_types WHERE type_id=?1 AND revision=?2",
         params![reference.id().as_str(), reference.revision()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, digest)) => {
+        Some((json, digest, base_id, base_revision)) => {
             verify_content_digest(&json, &digest, "agent type")?;
             let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            cross_check(agent.type_ref == *reference, "agent type")?;
+            let canonical_base = agent
+                .based_on
+                .as_ref()
+                .map(|base| (base.id().as_str().to_string(), base.revision() as i64));
+            let row_base = match (base_id, base_revision) {
+                (Some(id), Some(revision)) => Some((id, revision)),
+                (None, None) => None,
+                _ => {
+                    return Err(Error::invariant(
+                        "catalog agent type based_on mirror is half-populated",
+                    ))
+                }
+            };
+            cross_check(canonical_base == row_base, "agent type")?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
             Ok(Some(agent))
         }
@@ -640,7 +699,8 @@ pub fn get_agent_type(
 ) -> Result<Option<(AgentType, AgentTypeStatus)>, Error> {
     let row = query_opt(
         tx,
-        "SELECT at.content_json, at.content_digest, d.status
+        "SELECT at.content_json, at.content_digest, at.based_on_type_id, at.based_on_revision,
+                d.status
          FROM agent_types at
          JOIN agent_type_dispositions d
            ON d.type_id=at.type_id AND d.revision=at.revision
@@ -650,15 +710,32 @@ pub fn get_agent_type(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
-        Some((json, digest, status)) => {
+        Some((json, digest, base_id, base_revision, status)) => {
             verify_content_digest(&json, &digest, "agent type")?;
             let agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
+            cross_check(agent.type_ref == *reference, "agent type")?;
+            let canonical_base = agent
+                .based_on
+                .as_ref()
+                .map(|base| (base.id().as_str().to_string(), base.revision() as i64));
+            let row_base = match (base_id, base_revision) {
+                (Some(id), Some(revision)) => Some((id, revision)),
+                (None, None) => None,
+                _ => {
+                    return Err(Error::invariant(
+                        "catalog agent type based_on mirror is half-populated",
+                    ))
+                }
+            };
+            cross_check(canonical_base == row_base, "agent type")?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
             Ok(Some((agent, AgentTypeStatus::parse_sql(&status)?)))
         }
@@ -678,7 +755,8 @@ fn load_spawn_source(
 ) -> Result<Option<SpawnSource>, Error> {
     let row = query_opt(
         tx,
-        "SELECT s.content_json, s.content_digest, d.status
+        "SELECT s.content_json, s.content_digest, s.adapter_policy_id,
+                s.adapter_policy_revision, d.status
          FROM spawn_sources s
          JOIN spawn_source_dispositions d
            ON d.source_id=s.source_id AND d.revision=s.revision
@@ -689,15 +767,23 @@ fn load_spawn_source(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
-        Some((json, digest, status)) => {
+        Some((json, digest, policy_id, policy_revision, status)) => {
             verify_content_digest(&json, &digest, "spawn source")?;
             let source = spawn_source_from_canonical_json(&json, source_status_parse(&status)?)
                 .map_err(contract_fault)?;
+            cross_check(source.source_ref == *reference, "spawn source")?;
+            cross_check(
+                source.adapter_policy.id().as_str() == policy_id
+                    && source.adapter_policy.revision() as i64 == policy_revision,
+                "spawn source",
+            )?;
             verify_reencoded(
                 &canonical_spawn_source_bytes(&source),
                 &json,
@@ -708,13 +794,26 @@ fn load_spawn_source(
     }
 }
 
-pub fn get_source_config(
+/// The single validated authority for one SourceConfig revision: the decoded
+/// config, its opaque body mode, and its `ExternalRef` locator (if any). Every
+/// SourceConfig getter derives from this record, and the duplicated
+/// body/mode/locator/digest columns MUST agree with the canonical document, so a
+/// drifted column can never become a second source of truth.
+#[derive(Clone, Debug)]
+pub struct SourceConfigRevision {
+    pub config: SourceConfig,
+    pub mode: ConfigMode,
+    pub locator: Option<String>,
+}
+
+pub fn load_source_config_revision(
     tx: &Transaction<'_>,
     reference: &SourceConfigRef,
-) -> Result<Option<SourceConfig>, Error> {
+) -> Result<Option<SourceConfigRevision>, Error> {
     let row = query_opt(
         tx,
-        "SELECT c.content_json, c.content_digest, d.status
+        "SELECT c.content_json, c.content_digest, c.config_mode, c.config_payload_json,
+                c.config_locator, c.config_digest, d.status
          FROM source_configs c
          JOIN source_config_dispositions d
            ON d.source_id=c.source_id AND d.source_revision=c.source_revision
@@ -731,24 +830,64 @@ pub fn get_source_config(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     )?;
-    match row {
-        None => Ok(None),
-        Some((json, digest, status)) => {
-            verify_content_digest(&json, &digest, "source config")?;
-            let (config, locator) =
-                source_config_revision_from_canonical_json(&json, config_status_parse(&status)?)
-                    .map_err(contract_fault)?;
-            verify_reencoded(
-                &canonical_source_config_bytes(&config, locator.as_deref()),
-                &json,
+    let Some((json, digest, mode, payload_json, locator, config_digest, status)) = row else {
+        return Ok(None);
+    };
+    verify_content_digest(&json, &digest, "source config")?;
+    let (config, canonical_locator) =
+        source_config_revision_from_canonical_json(&json, config_status_parse(&status)?)
+            .map_err(contract_fault)?;
+    cross_check(config.config_ref == *reference, "source config")?;
+    require_canonical_digest(&config.config_digest, "source config")?;
+    // The canonical `config_digest` and the duplicated column MUST agree.
+    cross_check(
+        config.config_digest.as_str() == config_digest,
+        "source config",
+    )?;
+    verify_reencoded(
+        &canonical_source_config_bytes(&config, canonical_locator.as_deref()),
+        &json,
+        "source config",
+    )?;
+    let mode = ConfigMode::parse_sql(&mode)?;
+    match mode {
+        ConfigMode::ExternalRef => {
+            cross_check(payload_json.is_none(), "source config")?;
+            cross_check(locator.is_some(), "source config")?;
+            cross_check(locator == canonical_locator, "source config")?;
+        }
+        ConfigMode::OpaqueJson => {
+            cross_check(locator.is_none(), "source config")?;
+            cross_check(canonical_locator.is_none(), "source config")?;
+            let payload_json = payload_json
+                .ok_or_else(|| Error::invariant("catalog source config body is missing"))?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                .map_err(|e| Error::invariant(format!("catalog source config body: {e}")))?;
+            cross_check(
+                canonical_json_body_digest(&payload) == config.config_digest.as_str(),
                 "source config",
             )?;
-            Ok(Some(config))
         }
     }
+    Ok(Some(SourceConfigRevision {
+        config,
+        mode,
+        locator: canonical_locator,
+    }))
+}
+
+pub fn get_source_config(
+    tx: &Transaction<'_>,
+    reference: &SourceConfigRef,
+) -> Result<Option<SourceConfig>, Error> {
+    Ok(load_source_config_revision(tx, reference)?.map(|revision| revision.config))
 }
 
 /// The opaque `ExternalRef` locator a published SourceConfig revision was stored
@@ -757,32 +896,7 @@ pub fn get_source_config_locator(
     tx: &Transaction<'_>,
     reference: &SourceConfigRef,
 ) -> Result<Option<String>, Error> {
-    let row = query_opt(
-        tx,
-        "SELECT content_json, content_digest, config_locator
-         FROM source_configs
-         WHERE source_id=?1 AND source_revision=?2 AND config_id=?3 AND config_revision=?4",
-        params![
-            reference.source().id().as_str(),
-            reference.source().revision(),
-            reference.config_id().as_str(),
-            reference.revision()
-        ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        },
-    )?;
-    match row {
-        None => Ok(None),
-        Some((json, digest, locator)) => {
-            verify_content_digest(&json, &digest, "source config")?;
-            Ok(locator)
-        }
-    }
+    Ok(load_source_config_revision(tx, reference)?.and_then(|revision| revision.locator))
 }
 
 /// The opaque body kind a published SourceConfig revision was stored with.
@@ -790,19 +904,7 @@ pub fn get_source_config_mode(
     tx: &Transaction<'_>,
     reference: &SourceConfigRef,
 ) -> Result<Option<ConfigMode>, Error> {
-    let mode = query_opt(
-        tx,
-        "SELECT config_mode FROM source_configs
-         WHERE source_id=?1 AND source_revision=?2 AND config_id=?3 AND config_revision=?4",
-        params![
-            reference.source().id().as_str(),
-            reference.source().revision(),
-            reference.config_id().as_str(),
-            reference.revision()
-        ],
-        |row| row.get::<_, String>(0),
-    )?;
-    mode.map(|value| ConfigMode::parse_sql(&value)).transpose()
+    Ok(load_source_config_revision(tx, reference)?.map(|revision| revision.mode))
 }
 
 pub fn get_adapter_binding_policy(
@@ -811,7 +913,7 @@ pub fn get_adapter_binding_policy(
 ) -> Result<Option<AdapterBindingPolicy>, Error> {
     let row = query_opt(
         tx,
-        "SELECT p.content_json, p.content_digest, d.status
+        "SELECT p.content_json, p.content_digest, p.adapter_kind, p.binding_ref, d.status
          FROM adapter_binding_policies p
          JOIN adapter_binding_policy_dispositions d
            ON d.policy_id=p.policy_id AND d.revision=p.revision
@@ -822,16 +924,23 @@ pub fn get_adapter_binding_policy(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
-        Some((json, digest, status)) => {
+        Some((json, digest, adapter_kind, binding_ref, status)) => {
             verify_content_digest(&json, &digest, "adapter binding policy")?;
             let policy =
                 adapter_binding_policy_from_canonical_json(&json, config_status_parse(&status)?)
                     .map_err(contract_fault)?;
+            cross_check(policy.policy_ref == *reference, "adapter binding policy")?;
+            cross_check(
+                policy.adapter_kind == adapter_kind && policy.binding_ref == binding_ref,
+                "adapter binding policy",
+            )?;
             verify_reencoded(
                 &canonical_adapter_binding_policy_bytes(&policy),
                 &json,
@@ -848,19 +957,39 @@ pub fn get_capability_definition(
 ) -> Result<Option<CapabilityDefinition>, Error> {
     let row = query_opt(
         tx,
-        "SELECT content_json, content_digest FROM capability_definitions
-         WHERE capability_id=?1 AND revision=?2",
+        "SELECT capability_id, revision, matcher_kind, security_class, polarity,
+                content_json, content_digest
+         FROM capability_definitions WHERE capability_id=?1 AND revision=?2",
         params![reference.capability_id().as_str(), reference.revision()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        },
     )?;
     match row {
         None => Ok(None),
-        Some((json, digest)) => {
+        Some((capability_id, revision, matcher, class, polarity, json, digest)) => {
             verify_content_digest(&json, &digest, "capability definition")?;
-            let definition =
+            let (canonical_ref, definition) =
                 capability_definition_from_canonical_json(&json).map_err(contract_fault)?;
+            let row_ref =
+                CapabilityRef::new(capability_id, revision as u64).map_err(contract_fault)?;
+            cross_check(canonical_ref == row_ref, "capability definition")?;
+            cross_check(
+                matcher == matcher_sql(&definition)
+                    && class == class_sql(&definition)
+                    && polarity == polarity_sql(&definition),
+                "capability definition",
+            )?;
             verify_reencoded(
-                &canonical_capability_definition_bytes(reference, &definition),
+                &canonical_capability_definition_bytes(&canonical_ref, &definition),
                 &json,
                 "capability definition",
             )?;
