@@ -498,6 +498,13 @@ impl RunningSchedulerDaemon {
         crate::IntentIngress::new(&self.kernel)
     }
 
+    /// M6-B.3 operator provisioning surface: bind existing LogicalAgents to
+    /// exact AgentType revisions and read typed requirements / match results.
+    /// Provisioning authority, deliberately separate from semantic admission.
+    pub fn provisioning_admin(&self) -> crate::ProvisioningAdmin<'_> {
+        crate::ProvisioningAdmin::new(&self.kernel)
+    }
+
     /// Test-support: panic the health coordinator on its next tick, so its
     /// own fatal path is reachable from a regression test.
     #[cfg(any(test, feature = "test-support"))]

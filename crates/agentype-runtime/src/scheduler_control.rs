@@ -141,6 +141,13 @@ impl<'a> SchedulerControl<'a> {
         crate::IntentIngress::new(self.kernel)
     }
 
+    /// Borrow the M6-B.3 operator provisioning surface: bind existing
+    /// LogicalAgents to exact AgentType revisions and read typed requirements /
+    /// match results. This is provisioning authority, not semantic admission.
+    pub fn provisioning_admin(&self) -> crate::ProvisioningAdmin<'_> {
+        crate::ProvisioningAdmin::new(self.kernel)
+    }
+
     // ------------------------------------------------------------ submit
 
     /// Accept a Batch of Tasks for durable execution.

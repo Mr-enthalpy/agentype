@@ -265,3 +265,20 @@ Ranking MUST NOT be by nominal inheritance depth.
 
 V0.1 partition matching ([11](11-pool-topology.md)) remains for kernel
 conformance until typed matching is implemented in M6.
+
+## Typed admission and existing-agent matching (M6-B.3)
+
+An admitted Task MAY carry a durable `TaskAgentRequirement` with an optional
+exact AgentType pin. `admit_typed_proposal` creates the Task, its
+`GenerationTaskBinding`, and the requirement atomically; a loose selector MUST
+resolve to an exact revision before commitment, and a Task whose requirement
+would widen its Generation policy MUST fail closed. The requirement never selects
+a `SpawnSource` and never starts physical work.
+
+Existing-agent matching is the semantic-order list above, restricted to
+LogicalAgents that carry an exact `logical_agent_type_bindings` revision. A Task
+with a pinned requirement MUST NOT be served by an unbound LogicalAgent; an
+unbound agent has no contract to prove `can_execute`. Ranking MUST NOT use
+nominal inheritance depth. New-agent provisioning from an eligible SpawnSource,
+full physical eligibility (`can_provision_task`), and credentials remain M6-B.4/
+M6-B.5.

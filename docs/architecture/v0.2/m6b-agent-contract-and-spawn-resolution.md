@@ -11,8 +11,9 @@ admission remains frozen from M6-A
 ([m6a-result-carried-intent-binding](../../reports/v0.2/m6a-result-carried-intent-binding.md)).
 
 This note grows across the M6-B stages. It currently records **M6-B.1**, the
-pure AgentType ontology and the four matching predicates, and **M6-B.2**, the
-durable Agent Contract catalog (schema v6).
+pure AgentType ontology and the four matching predicates, **M6-B.2**, the
+durable Agent Contract catalog (schema v6), and **M6-B.3**, typed Task agent
+requirements and existing-agent matching (schema v7).
 
 ---
 
@@ -440,7 +441,66 @@ The storage layer performs no external I/O, mints no enforcement evidence, and
 does not select a SpawnSource. Ranking, `TaskAgentRequirement`, and
 `LogicalAgent` matching remain M6-B.3.
 
-## 7. Inherited invariants relevant here
+## 7. Typed admission and existing-agent matching (M6-B.3)
+
+M6-B.3 is the pure semantic-to-candidate resolution layer. It never provisions a
+physical agent (that is M6-B.4): it attaches a durable requirement to an admitted
+Task and ranks the **already-bound** LogicalAgents that may execute it.
+
+```text
+TaskAgentRequirement        exact optional AgentType pin + hard TaskRequirement
+                            + soft AgentRequirementPreferences
+AgentRequirementDraft       pre-commit selector + capability/security extras;
+                            TaskSpec-owned dimensions are not duplicated
+GenerationPolicy            immutable, generation-wide hard-requirement ceiling
+fold_generation_policy      join(policy, task requirement) = the stronger of the
+                            two on every dimension; a Task never widens its
+                            Generation
+match_existing_agents       pure filter + spec-06 semantic-order ranking over
+                            already-bound LogicalAgents
+```
+
+Rules now enforced:
+
+- **Atomic typed admission.** `admit_typed_proposal` creates the M5 Task, the
+  `GenerationTaskBinding`, and the immutable `TaskAgentRequirement` in one SQLite
+  transaction. A failure leaves none of the three. It resolves the exact
+  AgentType pin through the validated catalog read, folds the Generation policy,
+  and performs no source selection, credential resolution, or adapter call. The
+  legacy `admit_proposal` path continues with no requirement.
+- **Exact requirement revision.** A durable requirement pins an exact
+  `(type_id, revision)` or is explicitly `NULL`; a loose selector is resolved
+  before commitment. The stored document is canonical (`agentype-contract/1`)
+  with a `sha256:` digest, re-canonicalized on read, and its relational mirror is
+  cross-checked.
+- **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
+  ceiling fixed at `create_generation`. The effective hard requirement is the
+  join of the policy and the Task requirement; a Task that would widen the
+  Generation's information-function set, affinity, anchor, sandbox policy, or
+  capability constraints fails closed. Automated policy-governed admission stays
+  deferred (M6-A).
+- **Generation policy is a floor, not a source config.** The policy is expressed
+  in the same coarse vocabulary as `TaskRequirement`; it never carries model or
+  provider semantics.
+- **Write-once binding.** `logical_agent_type_bindings` mints one exact revision
+  per LogicalAgent. Changing an agent's type is a future Transform, never an
+  in-place update. This is operator provisioning authority, surfaced through
+  `ProvisioningAdmin`, deliberately separate from `RootSemanticControl`
+  (`M6A-B9`).
+- **No untyped substitution.** A Task with a pinned requirement is matched only
+  against bound, compatible agents; an unbound LogicalAgent has no contract to
+  prove `can_execute` and is never returned. Matching is a pure read: it consults
+  no `SpawnSource` and writes nothing.
+- **Semantic ranking, not inheritance depth.** Existing agents are ordered by
+  spec 06: warm before cold, exact type before a more specific compatible type,
+  before an incomparable/equivalent type, before a broader type, with a stable
+  `(type_id, revision, logical_agent_id)` tie-break. Nominal inheritance depth is
+  never consulted.
+
+Full physical eligibility (`can_provision_task`, active adapter policy, exact
+binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.
+
+## 8. Inherited invariants relevant here
 
 ```text
 INV-B1  AgentType purity

@@ -102,6 +102,27 @@ M6-B.2 catalog persistence MUST cover:
   prior disposition, without the Kernel
 - once a disposition is `DEPRECATED`/`DISABLED`, no direct SQL form can make
   the exact revision `PUBLISHED`/`ACTIVE` again
+
+M6-B.3 typed admission and matching MUST cover:
+
+- a typed admission creates the Task, `GenerationTaskBinding`, and immutable
+  `TaskAgentRequirement` in one transaction; a failure leaves none of the three
+- a loose `AgentTypeSelector` resolves to an exact revision before commitment; a
+  missing/unpublished exact revision fails closed and materializes no Task
+- the requirement's TaskSpec-owned dimensions (information function, affinity,
+  workspace, continuity) are derived from the admitted TaskSpec, not duplicated
+  by the caller
+- a Generation policy folds into the requirement as a generation-wide ceiling;
+  a Task that would widen it fails closed
+- exact typed replay returns the same Task; a conflicting requirement is a
+  `Conflict`, and the legacy `admit_proposal` path is unchanged
+- matching returns only bound, compatible agents; an unbound LogicalAgent is
+  never returned and matching writes nothing
+- `logical_agent_type_bindings` is write-once and requires a validated exact
+  revision; `task_agent_requirements` and `generation_policies` are immutable,
+  enforced mechanically by SQLite
+- ranking follows the spec 06 semantic order and never uses nominal inheritance
+  depth
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

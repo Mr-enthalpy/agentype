@@ -9,10 +9,13 @@
 /// Version 6 adds the M6-B.2 Agent Contract catalog (`capability_definitions`,
 /// `agent_types`, `spawn_sources`, `source_configs`,
 /// `adapter_binding_policies`) with immutable revision content kept separate
-/// from mutable disposition overlays. Older files are rejected at open (fail
+/// from mutable disposition overlays. Version 7 adds M6-B.3 typed agent
+/// requirements and bindings (`task_agent_requirements`,
+/// `logical_agent_type_bindings`) and the immutable optional
+/// `generation_policies` ceiling. Older files are rejected at open (fail
 /// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
-/// v5->v6 in-place upgrade.
-pub const SCHEMA_VERSION: i64 = 6;
+/// in-place upgrade.
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -661,5 +664,80 @@ BEFORE UPDATE ON adapter_binding_policy_dispositions
 WHEN OLD.policy_id IS NOT NEW.policy_id OR OLD.revision IS NOT NEW.revision
 BEGIN
     SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
+
+-- =========================================================================
+-- M6-B.3 typed agent requirements, bindings, and Generation policy (schema v7)
+--
+-- All three tables are immutable and write-once: a requirement is created in the
+-- same admission transaction as its Task, a LogicalAgent type binding is minted
+-- once, and a Generation policy is fixed at generation creation. A change is a
+-- new Task / a new binding / a new Generation, never an in-place update.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS generation_policies (
+    generation_id TEXT PRIMARY KEY REFERENCES generations(generation_id) ON DELETE CASCADE,
+    policy_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_agent_requirements (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+    required_type_id TEXT,
+    required_type_revision INTEGER CHECK (required_type_revision IS NULL OR required_type_revision >= 1),
+    requirement_json TEXT NOT NULL,
+    requirement_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    CHECK ((required_type_id IS NULL) = (required_type_revision IS NULL)),
+    FOREIGN KEY (required_type_id, required_type_revision)
+        REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS logical_agent_type_bindings (
+    logical_agent_id TEXT PRIMARY KEY REFERENCES logical_agents(id) ON DELETE RESTRICT,
+    type_id TEXT NOT NULL,
+    type_revision INTEGER NOT NULL CHECK (type_revision >= 1),
+    bound_at REAL NOT NULL,
+    FOREIGN KEY (type_id, type_revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS logical_agent_type_bindings_type_idx
+ON logical_agent_type_bindings(type_id, type_revision);
+
+CREATE TRIGGER IF NOT EXISTS generation_policies_immutable_update
+BEFORE UPDATE ON generation_policies
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generation_policies_immutable_delete
+BEFORE DELETE ON generation_policies
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_update
+BEFORE UPDATE ON task_agent_requirements
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_delete
+BEFORE DELETE ON task_agent_requirements
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_update
+BEFORE UPDATE ON logical_agent_type_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_delete
+BEFORE DELETE ON logical_agent_type_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
 END;
 "#;

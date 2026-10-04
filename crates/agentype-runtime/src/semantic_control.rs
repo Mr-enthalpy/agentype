@@ -53,6 +53,38 @@ impl<'a> RootSemanticControl<'a> {
         )
     }
 
+    /// Admit a proposal with an exact-revision agent requirement (M6-B.3).
+    ///
+    /// The requirement is created atomically with the Task and its
+    /// GenerationTaskBinding. No `SpawnSource` is selected and no physical work
+    /// starts; existing-agent matching is a separate, pure read.
+    pub fn admit_typed_proposal(
+        &self,
+        proposal_id: &ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<TaskSpec>,
+        agent_requirement: agentype_agent_contract::AgentRequirementDraft,
+    ) -> Result<TaskId, Error> {
+        self.kernel.admit_typed_proposal(
+            proposal_id,
+            expected_generation_revision,
+            override_task_spec,
+            agent_requirement,
+        )
+    }
+
+    /// Create a Generation with an immutable policy ceiling (M6-B.3
+    /// `D-GEN-POLICY`). The policy folds into every typed admission as a
+    /// generation-wide hard requirement.
+    pub fn create_generation_with_policy(
+        &self,
+        seed_payload: serde_json::Value,
+        policy: Option<agentype_agent_contract::GenerationPolicy>,
+    ) -> Result<GenerationRecord, Error> {
+        self.kernel
+            .create_generation_with_policy(seed_payload, policy)
+    }
+
     pub fn freeze_generation(
         &self,
         generation_id: &GenerationId,

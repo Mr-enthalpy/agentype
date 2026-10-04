@@ -1980,3 +1980,34 @@ fn schema_v5_database_is_rejected_after_catalog_tables() {
         "the rejection must be the schema-version gate: {err:?}"
     );
 }
+
+/// Schema v6 (M6-B.2 catalog, no M6-B.3 typed tables) is rejected at open:
+/// D-DB-MIGRATE is unresolved, so there is deliberately no v6->v7 upgrade.
+#[test]
+fn schema_v6_database_is_rejected_after_typed_tables() {
+    let db = FixtureDb::new("schema-v6-old");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=6", [])
+        .unwrap();
+    conn.execute("DROP TABLE logical_agent_type_bindings", [])
+        .unwrap();
+    conn.execute("DROP TABLE task_agent_requirements", [])
+        .unwrap();
+    conn.execute("DROP TABLE generation_policies", []).unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v6 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+}

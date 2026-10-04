@@ -25,8 +25,9 @@ use crate::error::ContractError;
 use crate::predicates::{validate_source_config, validate_spawn_source};
 use crate::records::{
     AdapterBindingPolicy, AffinityConstraint, AgentType, AgentTypeContract, ContinuityMode,
-    CredentialRef, LifecycleMode, NetworkPolicy, SourceConfig, SpawnSource,
+    CredentialRef, LifecycleMode, NetworkPolicy, SourceConfig, SpawnSource, TaskRequirement,
 };
+use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -196,6 +197,22 @@ pub fn canonicalize_source_config(
     Ok(())
 }
 
+/// Canonicalize a Task agent requirement (M6-B.3).
+pub fn canonicalize_task_agent_requirement(
+    req: &mut TaskAgentRequirement,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    req.normalize(catalog)
+}
+
+/// Canonicalize a Generation policy (M6-B.3).
+pub fn canonicalize_generation_policy(
+    policy: &mut GenerationPolicy,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    policy.normalize(catalog)
+}
+
 // =============================================================================
 // Canonical value construction
 // =============================================================================
@@ -308,6 +325,63 @@ fn affinity_value(affinity: &AffinityConstraint) -> Value {
             json!({"kind": "ONLY", "tags": tags.iter().collect::<Vec<_>>()})
         }
     }
+}
+
+fn sandbox_policy_value(policy: &Option<crate::records::SandboxPolicyRef>) -> Value {
+    match policy {
+        None => Value::Null,
+        Some(p) => json!({
+            "sandbox_policy_id": p.id().as_str(),
+            "revision": p.revision(),
+        }),
+    }
+}
+
+fn task_requirement_value(req: &TaskRequirement) -> Value {
+    json!({
+        "information_function": req.information_function.as_sql(),
+        "required_capabilities": capability_map_value(&req.required_capabilities),
+        "required_affinity": req.required_affinity.iter().collect::<Vec<_>>(),
+        "required_workspace": req.required_workspace.as_sql(),
+        "required_network": network_str(req.required_network),
+        "required_attempt_isolation": req.required_attempt_isolation,
+        "required_continuity": continuity_str(req.required_continuity),
+        "sandbox_policy": sandbox_policy_value(&req.sandbox_policy),
+        "required_anchor": req.required_anchor,
+        "budget": req.budget.get(),
+    })
+}
+
+fn agent_requirement_preferences_value(
+    preferred: &crate::requirement::AgentRequirementPreferences,
+) -> Value {
+    json!({
+        "preferred_affinity": preferred.preferred_affinity.iter().collect::<Vec<_>>(),
+        "preferred_continuity": preferred.preferred_continuity.map(continuity_str),
+        "prefer_specificity": preferred.prefer_specificity,
+    })
+}
+
+fn generation_policy_value(policy: &GenerationPolicy) -> Value {
+    json!({
+        "allowed_information_functions": policy
+            .allowed_information_functions
+            .iter()
+            .map(|f| f.as_sql())
+            .collect::<Vec<_>>(),
+        "required_capabilities": capability_map_value(&policy.required_capabilities),
+        "min_workspace": policy.min_workspace.as_sql(),
+        "min_network": network_str(policy.min_network),
+        "requires_attempt_isolation": policy.requires_attempt_isolation,
+        "min_continuity": continuity_str(policy.min_continuity),
+        "sandbox_policy": sandbox_policy_value(&policy.sandbox_policy),
+        "budget_ceiling": policy.budget_ceiling.get(),
+        "allowed_affinity": policy
+            .allowed_affinity
+            .as_ref()
+            .map(|tags| tags.iter().collect::<Vec<_>>()),
+        "anchor_constraint": policy.anchor_constraint,
+    })
 }
 
 fn contract_value(contract: &AgentTypeContract) -> Value {
@@ -468,6 +542,31 @@ pub fn canonical_capability_definition_bytes(
     }))
 }
 
+/// Canonical bytes of a Task agent requirement (M6-B.3). The record MUST be
+/// canonicalized first (see [`canonicalize_task_agent_requirement`]).
+pub fn canonical_task_agent_requirement_bytes(req: &TaskAgentRequirement) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "TASK_AGENT_REQUIREMENT",
+        "required_type": req.required_type.as_ref().map(|t| json!({
+            "type_id": t.id().as_str(),
+            "revision": t.revision(),
+        })),
+        "hard": task_requirement_value(&req.hard),
+        "preferred": agent_requirement_preferences_value(&req.preferred),
+    }))
+}
+
+/// Canonical bytes of a Generation policy (M6-B.3). The record MUST be
+/// canonicalized first (see [`canonicalize_generation_policy`]).
+pub fn canonical_generation_policy_bytes(policy: &GenerationPolicy) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "GENERATION_POLICY",
+        "policy": generation_policy_value(policy),
+    }))
+}
+
 // =============================================================================
 // Digests
 // =============================================================================
@@ -516,4 +615,12 @@ pub fn capability_definition_content_digest(
     content_digest(&canonical_capability_definition_bytes(
         reference, definition,
     ))
+}
+
+pub fn task_agent_requirement_content_digest(req: &TaskAgentRequirement) -> String {
+    content_digest(&canonical_task_agent_requirement_bytes(req))
+}
+
+pub fn generation_policy_content_digest(policy: &GenerationPolicy) -> String {
+    content_digest(&canonical_generation_policy_bytes(policy))
 }

@@ -25,7 +25,9 @@ use crate::records::{
     AgentTypeContract, AgentTypeRef, Budget, ConfigDigest, ConfigStatus, ContinuityMode,
     CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, SandboxPolicyRef,
     SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
+    TaskRequirement,
 };
+use crate::requirement::{AgentRequirementPreferences, GenerationPolicy, TaskAgentRequirement};
 use agentype_core::{InformationFunction, WorkspaceMode};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -492,4 +494,133 @@ pub fn capability_definition_from_canonical_json(
         polarity: capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?,
     };
     Ok((reference, definition))
+}
+
+fn string_set_from(value: &Value, what: &str) -> Result<BTreeSet<String>, ContractError> {
+    let mut set = BTreeSet::new();
+    for item in array(value, what)? {
+        set.insert(string_of(item, what)?);
+    }
+    Ok(set)
+}
+
+fn task_requirement_from(value: &Value) -> Result<TaskRequirement, ContractError> {
+    let object = object(value, "task requirement")?;
+    Ok(TaskRequirement {
+        information_function: information_function(&string_of(
+            field(object, "information_function")?,
+            "information_function",
+        )?)?,
+        required_capabilities: capability_map_from(field(object, "required_capabilities")?)?,
+        required_affinity: string_set_from(
+            field(object, "required_affinity")?,
+            "required_affinity",
+        )?,
+        required_workspace: workspace_mode(&string_of(
+            field(object, "required_workspace")?,
+            "required_workspace",
+        )?)?,
+        required_network: network_policy(&string_of(
+            field(object, "required_network")?,
+            "required_network",
+        )?)?,
+        required_attempt_isolation: field(object, "required_attempt_isolation")?
+            .as_bool()
+            .ok_or_else(|| err("required_attempt_isolation must be boolean"))?,
+        required_continuity: continuity_mode(&string_of(
+            field(object, "required_continuity")?,
+            "required_continuity",
+        )?)?,
+        sandbox_policy: sandbox_policy_from(field(object, "sandbox_policy")?)?,
+        required_anchor: opt_string(field(object, "required_anchor")?)?,
+        budget: Budget::new(f64_of(field(object, "budget")?, "budget")?)?,
+    })
+}
+
+fn preferences_from(value: &Value) -> Result<AgentRequirementPreferences, ContractError> {
+    let object = object(value, "agent requirement preferences")?;
+    let preferred_continuity = match field(object, "preferred_continuity")? {
+        Value::Null => None,
+        other => Some(continuity_mode(&string_of(other, "preferred_continuity")?)?),
+    };
+    Ok(AgentRequirementPreferences {
+        preferred_affinity: string_set_from(
+            field(object, "preferred_affinity")?,
+            "preferred_affinity",
+        )?,
+        preferred_continuity,
+        prefer_specificity: field(object, "prefer_specificity")?
+            .as_bool()
+            .ok_or_else(|| err("prefer_specificity must be boolean"))?,
+    })
+}
+
+/// Decode a Task agent requirement. The caller MUST also verify the stored
+/// content digest and canonical byte equality at the durable boundary.
+pub fn task_agent_requirement_from_canonical_json(
+    json: &str,
+) -> Result<TaskAgentRequirement, ContractError> {
+    let value = parse_document(json, "TASK_AGENT_REQUIREMENT")?;
+    let document = object(&value, "task agent requirement")?;
+    let required_type = match field(document, "required_type")? {
+        Value::Null => None,
+        other => {
+            let reference = object(other, "required_type")?;
+            Some(AgentTypeRef::new(
+                string_of(field(reference, "type_id")?, "required type_id")?,
+                u64_of(field(reference, "revision")?, "required revision")?,
+            )?)
+        }
+    };
+    let hard = task_requirement_from(field(document, "hard")?)?;
+    let preferred = preferences_from(field(document, "preferred")?)?;
+    Ok(TaskAgentRequirement {
+        required_type,
+        hard,
+        preferred,
+    })
+}
+
+/// Decode a Generation policy. The caller MUST also verify the stored content
+/// digest and canonical byte equality at the durable boundary.
+pub fn generation_policy_from_canonical_json(
+    json: &str,
+) -> Result<GenerationPolicy, ContractError> {
+    let value = parse_document(json, "GENERATION_POLICY")?;
+    let document = object(&value, "generation policy")?;
+    let policy = object(field(document, "policy")?, "generation policy body")?;
+    let mut allowed_information_functions = Vec::new();
+    for function in array(
+        field(policy, "allowed_information_functions")?,
+        "allowed_information_functions",
+    )? {
+        allowed_information_functions.push(information_function(&string_of(
+            function,
+            "information function",
+        )?)?);
+    }
+    let allowed_affinity = match field(policy, "allowed_affinity")? {
+        Value::Null => None,
+        other => Some(string_set_from(other, "allowed_affinity")?),
+    };
+    Ok(GenerationPolicy {
+        allowed_information_functions,
+        required_capabilities: capability_map_from(field(policy, "required_capabilities")?)?,
+        min_workspace: workspace_mode(&string_of(
+            field(policy, "min_workspace")?,
+            "min_workspace",
+        )?)?,
+        min_network: network_policy(&string_of(field(policy, "min_network")?, "min_network")?)?,
+        requires_attempt_isolation: field(policy, "requires_attempt_isolation")?
+            .as_bool()
+            .ok_or_else(|| err("requires_attempt_isolation must be boolean"))?,
+        min_continuity: continuity_mode(&string_of(
+            field(policy, "min_continuity")?,
+            "min_continuity",
+        )?)?,
+        sandbox_policy: sandbox_policy_from(field(policy, "sandbox_policy")?)?,
+        budget_ceiling: Budget::new(f64_of(field(policy, "budget_ceiling")?, "budget_ceiling")?)?,
+        allowed_affinity,
+        anchor_constraint: opt_string(field(policy, "anchor_constraint")?)?,
+    })
 }

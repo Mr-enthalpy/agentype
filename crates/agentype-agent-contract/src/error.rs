@@ -28,6 +28,12 @@ pub enum ContractError {
     InvalidRef { reason: String },
     /// A capability revision was redefined with different semantics.
     CapabilityDefinitionConflict { capability: String, revision: u64 },
+    /// A Task's hard requirement conflicts with a value that must agree (e.g. a
+    /// Generation policy that the Task would have to widen).
+    RequirementConflict { reason: String },
+    /// A Task requirement cannot be folded into its Generation policy without
+    /// widening the Generation's semantic frontier.
+    GenerationPolicyConflict { reason: String },
     /// A durable relation that must hold does not.
     InvariantViolation(String),
 }
@@ -62,6 +68,12 @@ impl fmt::Display for ContractError {
                 f,
                 "capability {capability}@{revision} redefined with different semantics"
             ),
+            Self::RequirementConflict { reason } => {
+                write!(f, "task requirement conflict: {reason}")
+            }
+            Self::GenerationPolicyConflict { reason } => {
+                write!(f, "generation policy conflict: {reason}")
+            }
             Self::InvariantViolation(msg) => write!(f, "invariant violation: {msg}"),
         }
     }

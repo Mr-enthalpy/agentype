@@ -11,6 +11,7 @@
 
 use crate::store::{json_dump, json_load, map_sqlite, query_opt};
 use crate::txutil::required_partition;
+use agentype_agent_contract::{task_agent_requirement_content_digest, AgentRequirementDraft};
 use agentype_core::{
     generation_allows_admit, is_generation_settled, is_generation_view_settled, ArtifactRef,
     BatchId, ContinuityPreference, Error, FailureClass, GenerationId, GenerationRecord,
@@ -356,6 +357,18 @@ pub fn create_generation(
     now: UnixTime,
     seed_payload: Value,
 ) -> Result<GenerationRecord, Error> {
+    create_generation_with_policy(tx, now, seed_payload, None)
+}
+
+/// Create a new semantic admission frontier with an optional immutable
+/// Generation policy (M6-B.3 `D-GEN-POLICY`). The policy is written in the same
+/// transaction as the Generation; it is never edited afterwards.
+pub fn create_generation_with_policy(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    seed_payload: Value,
+    policy: Option<agentype_agent_contract::GenerationPolicy>,
+) -> Result<GenerationRecord, Error> {
     let generation_id = GenerationId::new();
     let seed_json = json_dump(&seed_payload);
 
@@ -365,6 +378,10 @@ pub fn create_generation(
         params![generation_id.as_str(), seed_json, now],
     )
     .map_err(map_sqlite)?;
+
+    if let Some(policy) = &policy {
+        crate::requirement::insert_generation_policy(tx, now, &generation_id, policy)?;
+    }
 
     Ok(GenerationRecord {
         generation_id,
@@ -964,12 +981,56 @@ pub fn get_proposal(
 /// Atomically admit a CompiledWorkProposal into a Generation.
 ///
 /// Creates M5 Task + GenerationTaskBinding and transitions proposal to ADMITTED.
+/// This legacy path carries no typed agent requirement.
 pub fn admit_proposal(
     tx: &Transaction<'_>,
     now: UnixTime,
     proposal_id: &ProposalId,
     expected_generation_revision: u64,
     override_task_spec: Option<TaskSpec>,
+) -> Result<TaskId, Error> {
+    admit_proposal_core(
+        tx,
+        now,
+        proposal_id,
+        expected_generation_revision,
+        override_task_spec,
+        None,
+    )
+}
+
+/// Atomically admit a CompiledWorkProposal with a typed agent requirement
+/// (M6-B.3).
+///
+/// The requirement is created in the SAME SQLite transaction as the Task and the
+/// GenerationTaskBinding, so a failure leaves none of the three. This resolves
+/// the exact AgentType pin and folds the Generation policy, but it selects no
+/// SpawnSource and performs no external I/O.
+pub fn admit_typed_proposal(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    proposal_id: &ProposalId,
+    expected_generation_revision: u64,
+    override_task_spec: Option<TaskSpec>,
+    agent_requirement: AgentRequirementDraft,
+) -> Result<TaskId, Error> {
+    admit_proposal_core(
+        tx,
+        now,
+        proposal_id,
+        expected_generation_revision,
+        override_task_spec,
+        Some(agent_requirement),
+    )
+}
+
+fn admit_proposal_core(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    proposal_id: &ProposalId,
+    expected_generation_revision: u64,
+    override_task_spec: Option<TaskSpec>,
+    typed_draft: Option<AgentRequirementDraft>,
 ) -> Result<TaskId, Error> {
     // 1. Fetch proposal row
     let proposal_row = query_opt(
@@ -1013,6 +1074,40 @@ pub fn admit_proposal(
                             "override_task_spec conflicts with previously admitted task_spec",
                         ));
                     }
+                }
+            }
+            if let Some(draft) = typed_draft.clone() {
+                // A typed replay must describe the same committed requirement;
+                // otherwise it is a conflicting command, not a replay.
+                let admitted_spec_str: String = tx
+                    .query_row(
+                        "SELECT admitted_task_spec_json FROM generation_task_bindings WHERE proposal_id=?1",
+                        params![proposal_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .map_err(map_sqlite)?;
+                let admitted_spec = task_spec_from_json(&json_load(&admitted_spec_str)?)?;
+                let generation_id = GenerationId::from_string(gid.clone());
+                let expected = crate::requirement::build_task_agent_requirement(
+                    tx,
+                    &generation_id,
+                    draft,
+                    info_fn,
+                    &admitted_spec,
+                )?;
+                let existing_task = TaskId::from_string(existing_tid.clone());
+                let committed = crate::requirement::get_task_agent_requirement(tx, &existing_task)?
+                    .ok_or_else(|| {
+                        Error::conflict(
+                            "typed replay of an admission that has no agent requirement",
+                        )
+                    })?;
+                if task_agent_requirement_content_digest(&committed)
+                    != task_agent_requirement_content_digest(&expected)
+                {
+                    return Err(Error::conflict(
+                        "agent requirement conflicts with previously admitted requirement",
+                    ));
                 }
             }
             return Ok(TaskId::from_string(existing_tid));
@@ -1170,7 +1265,20 @@ pub fn admit_proposal(
     )
     .map_err(map_sqlite)?;
 
-    // 8. Transition proposal to ADMITTED
+    // 8. Create the typed agent requirement, in the same transaction.
+    if let Some(draft) = typed_draft {
+        let generation_id = GenerationId::from_string(gid.clone());
+        let requirement = crate::requirement::build_task_agent_requirement(
+            tx,
+            &generation_id,
+            draft,
+            info_fn,
+            &task_spec,
+        )?;
+        crate::requirement::insert_task_agent_requirement(tx, now, &task_id, &requirement)?;
+    }
+
+    // 9. Transition proposal to ADMITTED
     let updated = tx
         .execute(
             "UPDATE compiled_work_proposals
@@ -1201,7 +1309,7 @@ pub fn admit_proposal(
         )));
     }
 
-    // 9. Increment generation admission_seq
+    // 10. Increment generation admission_seq
     tx.execute(
         "UPDATE generations SET admission_seq=?1 WHERE generation_id=?2",
         params![new_seq, gid],

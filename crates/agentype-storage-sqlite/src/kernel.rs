@@ -689,6 +689,39 @@ impl Kernel {
         })
     }
 
+    /// M6-B.3 typed admission: atomically create the Task, its
+    /// GenerationTaskBinding, and its exact-revision agent requirement. No
+    /// SpawnSource is selected and no external I/O occurs.
+    pub fn admit_typed_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<agentype_core::TaskSpec>,
+        agent_requirement: agentype_agent_contract::AgentRequirementDraft,
+    ) -> Result<agentype_core::TaskId, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::admit_typed_proposal(
+                tx,
+                now,
+                proposal_id,
+                expected_generation_revision,
+                override_task_spec,
+                agent_requirement,
+            )
+        })
+    }
+
+    /// Create a Generation with an immutable policy ceiling (M6-B.3 D-GEN-POLICY).
+    pub fn create_generation_with_policy(
+        &self,
+        seed_payload: serde_json::Value,
+        policy: Option<agentype_agent_contract::GenerationPolicy>,
+    ) -> Result<agentype_core::GenerationRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::create_generation_with_policy(tx, now, seed_payload, policy)
+        })
+    }
+
     pub fn freeze_generation(
         &self,
         generation_id: &agentype_core::GenerationId,
@@ -865,6 +898,50 @@ impl Kernel {
         self.tx(|tx, now| {
             crate::catalog::set_adapter_binding_policy_status(tx, now, reference, status)
         })
+    }
+
+    // =========================================================================
+    // M6-B.3 typed agent requirements, bindings, and generation policy
+    // =========================================================================
+
+    /// Bind an existing LogicalAgent to an exact AgentType revision. Write-once,
+    /// no physical provisioning. This is operator/provisioning authority, not
+    /// semantic admission authority.
+    pub fn bind_logical_agent_type(
+        &self,
+        agent_id: &agentype_core::LogicalAgentId,
+        type_ref: &AgentTypeRef,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::requirement::bind_logical_agent_type(tx, now, agent_id, type_ref))
+    }
+
+    pub fn get_task_agent_requirement(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Option<agentype_agent_contract::TaskAgentRequirement>, Error> {
+        self.tx(|tx, _| crate::requirement::get_task_agent_requirement(tx, task_id))
+    }
+
+    pub fn get_logical_agent_type_binding(
+        &self,
+        agent_id: &agentype_core::LogicalAgentId,
+    ) -> Result<Option<AgentTypeRef>, Error> {
+        self.tx(|tx, _| crate::requirement::get_logical_agent_type_binding(tx, agent_id))
+    }
+
+    pub fn get_generation_policy(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+    ) -> Result<Option<agentype_agent_contract::GenerationPolicy>, Error> {
+        self.tx(|tx, _| crate::requirement::get_generation_policy(tx, generation_id))
+    }
+
+    /// Rank existing, bound LogicalAgents for a Task's requirement (pure read).
+    pub fn match_existing_agents_for_task(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Vec<agentype_agent_contract::ExistingAgentCandidate>, Error> {
+        self.tx(|tx, _| crate::requirement::match_existing_agents_for_task(tx, task_id))
     }
 
     // ------------------------------------------------------------------ topology
