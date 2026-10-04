@@ -1685,3 +1685,124 @@ fn sqlite_rejects_overlay_delete_reinsert_and_reverse() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sqlite_overlay_lifetime_guards_cover_every_family() {
+    // The resurrection hole is closed structurally for all four overlay
+    // families; exercise the full DELETE / INSERT OR REPLACE / reverse /
+    // primary-key-rewrite matrix uniformly instead of only the AgentType and
+    // SpawnSource examples.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-all-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    let source = base_source();
+    let config = base_config(VALID_DIGEST, Vec::new());
+    let policy = adapter_policy();
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel.publish_adapter_binding_policy(&policy).unwrap();
+        kernel.publish_spawn_source(&source).unwrap();
+        kernel
+            .publish_source_config(
+                &config,
+                &SourceConfigBody::ExternalRef {
+                    locator: "file:///x".into(),
+                },
+            )
+            .unwrap();
+        kernel.publish_agent_type(&agent).unwrap();
+        kernel
+            .set_agent_type_status(&agent.type_ref, AgentTypeStatus::Deprecated)
+            .unwrap();
+        kernel
+            .set_spawn_source_status(&source.source_ref, SourceStatus::Disabled)
+            .unwrap();
+        kernel
+            .set_source_config_status(&config.config_ref, ConfigStatus::Disabled)
+            .unwrap();
+        kernel
+            .set_adapter_binding_policy_status(&policy.policy_ref, ConfigStatus::Disabled)
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let deny = |sql: &str| {
+        assert!(conn.execute(sql, []).is_err(), "must reject: {sql}");
+    };
+    // Deletion of any overlay row is rejected.
+    for sql in [
+        "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer'",
+        "DELETE FROM spawn_source_dispositions WHERE source_id='codex-local'",
+        "DELETE FROM source_config_dispositions WHERE config_id='deep-reasoning'",
+        "DELETE FROM adapter_binding_policy_dispositions WHERE policy_id='codex-local-adapter'",
+    ] {
+        deny(sql);
+    }
+    // Re-insertion / INSERT OR REPLACE to an earlier status is rejected.
+    for sql in [
+        "INSERT OR REPLACE INTO agent_type_dispositions(type_id,revision,status,deprecated_at,updated_at) VALUES('general-reviewer',1,'PUBLISHED',NULL,9.0)",
+        "INSERT OR REPLACE INTO spawn_source_dispositions(source_id,revision,status,updated_at) VALUES('codex-local',2,'ACTIVE',9.0)",
+        "INSERT OR REPLACE INTO source_config_dispositions(source_id,source_revision,config_id,config_revision,status,updated_at) VALUES('codex-local',2,'deep-reasoning',7,'ACTIVE',9.0)",
+        "INSERT OR REPLACE INTO adapter_binding_policy_dispositions(policy_id,revision,status,updated_at) VALUES('codex-local-adapter',3,'ACTIVE',9.0)",
+    ] {
+        deny(sql);
+    }
+    // Status reversal by UPDATE is rejected (rank decrease and AgentType
+    // resurrection), including DISABLED -> DRAINING.
+    for sql in [
+        "UPDATE agent_type_dispositions SET status='PUBLISHED' WHERE type_id='general-reviewer'",
+        "UPDATE spawn_source_dispositions SET status='ACTIVE' WHERE source_id='codex-local'",
+        "UPDATE spawn_source_dispositions SET status='DRAINING' WHERE source_id='codex-local'",
+        "UPDATE source_config_dispositions SET status='ACTIVE' WHERE config_id='deep-reasoning'",
+        "UPDATE source_config_dispositions SET status='DRAINING' WHERE config_id='deep-reasoning'",
+        "UPDATE adapter_binding_policy_dispositions SET status='ACTIVE' WHERE policy_id='codex-local-adapter'",
+        "UPDATE adapter_binding_policy_dispositions SET status='DRAINING' WHERE policy_id='codex-local-adapter'",
+    ] {
+        deny(sql);
+    }
+    // Primary-key rewrite is rejected for every family.
+    for sql in [
+        "UPDATE agent_type_dispositions SET revision=99 WHERE type_id='general-reviewer'",
+        "UPDATE spawn_source_dispositions SET revision=99 WHERE source_id='codex-local'",
+        "UPDATE source_config_dispositions SET config_revision=99 WHERE config_id='deep-reasoning'",
+        "UPDATE adapter_binding_policy_dispositions SET revision=99 WHERE policy_id='codex-local-adapter'",
+    ] {
+        deny(sql);
+    }
+    drop(conn);
+
+    // Durable state is unchanged for every family.
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert_eq!(
+        kernel.get_agent_type(&agent.type_ref).unwrap().unwrap().1,
+        AgentTypeStatus::Deprecated
+    );
+    assert_eq!(
+        kernel
+            .get_spawn_source(&source.source_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        SourceStatus::Disabled
+    );
+    assert_eq!(
+        kernel
+            .get_source_config(&config.config_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        ConfigStatus::Disabled
+    );
+    assert_eq!(
+        kernel
+            .get_adapter_binding_policy(&policy.policy_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        ConfigStatus::Disabled
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
