@@ -182,16 +182,14 @@ pub fn build_task_agent_requirement(
     };
 
     let required_affinity: BTreeSet<String> = task_spec.affinity_tags.iter().cloned().collect();
-    let (required_continuity, implied_preference) = match task_spec.continuity {
-        ContinuityPreference::Required => (ContinuityMode::Logical, None),
-        ContinuityPreference::Preferred => (ContinuityMode::None, Some(ContinuityMode::Logical)),
-        ContinuityPreference::None => (ContinuityMode::None, None),
+    // A `Required` continuity preference becomes a hard `Logical` requirement.
+    // `Preferred` is a soft dimension that M6-B.3 does not rank on (it is not
+    // part of the frozen matching order), so it stays out of the requirement.
+    let required_continuity = match task_spec.continuity {
+        ContinuityPreference::Required => ContinuityMode::Logical,
+        ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
     };
 
-    let mut draft = draft;
-    if draft.preferred.preferred_continuity.is_none() {
-        draft.preferred.preferred_continuity = implied_preference;
-    }
     let mut requirement = draft.into_requirement(
         required_type,
         information_function,
@@ -383,9 +381,14 @@ fn lifecycle_from_retention(retention: &str) -> Result<LifecycleMode, Error> {
     }
 }
 
-/// Rank existing, bound LogicalAgents for one Task's requirement. Pure: it reads
-/// only durable bindings and the validated catalog, writes nothing, and never
-/// touches a `SpawnSource`.
+/// Rank existing, bound, immediately usable LogicalAgents for one Task's
+/// requirement. Pure: it reads only durable bindings and the validated catalog,
+/// writes nothing, and never touches a `SpawnSource`.
+///
+/// Only M5 `READY` and unassigned agents are candidates. Non-READY states
+/// (`ASSIGNED`, `DRAINING`, `SUSPENDED`, `RETIRED`, ...) are NOT approximated as
+/// "cold/revivable": M6 revival is a later seam, and returning a retired or busy
+/// agent as an eligible candidate would freeze a false abstraction.
 pub fn match_existing_agents_for_task(
     tx: &Transaction<'_>,
     task_id: &TaskId,
@@ -400,12 +403,13 @@ pub fn match_existing_agents_for_task(
         Error::invariant("a task agent requirement references a missing agent type")
     })?;
 
-    let rows: Vec<(String, String, String, Option<f64>, f64)> = {
+    let rows: Vec<(String, String, Option<f64>, f64)> = {
         let mut statement = tx
             .prepare(
-                "SELECT la.id, la.state, la.retention, la.available_since, la.created_at
+                "SELECT la.id, la.retention, la.available_since, la.created_at
                  FROM logical_agents la
                  JOIN logical_agent_type_bindings b ON b.logical_agent_id = la.id
+                 WHERE la.state='READY' AND la.current_task_id IS NULL
                  ORDER BY la.id",
             )
             .map_err(map_sqlite)?;
@@ -414,9 +418,8 @@ pub fn match_existing_agents_for_task(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<f64>>(3)?,
-                    row.get::<_, f64>(4)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, f64>(3)?,
                 ))
             })
             .map_err(map_sqlite)?;
@@ -428,7 +431,7 @@ pub fn match_existing_agents_for_task(
     };
 
     let mut candidates = Vec::with_capacity(rows.len());
-    for (agent_id, state, retention, available_since, created_at) in rows {
+    for (agent_id, retention, available_since, created_at) in rows {
         let agent = LogicalAgentId::from_string(agent_id);
         let Some(bound_ref) = get_logical_agent_type_binding(tx, &agent)? else {
             continue;
@@ -440,7 +443,6 @@ pub fn match_existing_agents_for_task(
             logical_agent_id: agent,
             agent_type,
             lifecycle: lifecycle_from_retention(&retention)?,
-            warm: state == "READY",
             available_since,
             created_at,
         });

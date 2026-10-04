@@ -42,7 +42,6 @@ pub struct AgentRequirementDraft {
     pub sandbox_policy: Option<SandboxPolicyRef>,
     pub required_anchor: Option<String>,
     pub budget: Budget,
-    pub preferred: AgentRequirementPreferences,
 }
 
 impl AgentRequirementDraft {
@@ -70,57 +69,29 @@ impl AgentRequirementDraft {
                 required_anchor: self.required_anchor,
                 budget: self.budget,
             },
-            preferred: self.preferred,
         }
-    }
-}
-
-/// Soft ranking preferences. Hard constraints live in [`TaskRequirement`]; these
-/// only order already-eligible candidates and MUST NOT make an ineligible
-/// candidate eligible.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentRequirementPreferences {
-    /// Tags a candidate is preferred to advertise (never a hard filter).
-    pub preferred_affinity: BTreeSet<String>,
-    /// A stronger continuity guarantee is preferred when otherwise equal.
-    pub preferred_continuity: Option<ContinuityMode>,
-    /// Prefer the most specific compatible AgentType over a broader one.
-    pub prefer_specificity: bool,
-}
-
-impl Default for AgentRequirementPreferences {
-    fn default() -> Self {
-        Self {
-            preferred_affinity: BTreeSet::new(),
-            preferred_continuity: None,
-            prefer_specificity: true,
-        }
-    }
-}
-
-impl AgentRequirementPreferences {
-    pub fn normalize(&mut self) {
-        self.preferred_affinity = std::mem::take(&mut self.preferred_affinity);
     }
 }
 
 /// A Task's durable agent requirement: an optional exact AgentType pin plus the
-/// hard derived `TaskRequirement` and soft preferences.
+/// hard derived `TaskRequirement`.
 ///
 /// `required_type` is always an exact immutable revision once durable. A loose
-/// selector is resolved before commitment (spec 06 `D-TYPE-REV-PIN`).
+/// selector is resolved before commitment (spec 06 `D-TYPE-REV-PIN`). Its
+/// presence is the authority boundary: a Task with this row is a **typed** Task
+/// and is invisible to the legacy untyped dispatch path, whether or not it has a
+/// nominal pin.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskAgentRequirement {
-    /// Exact AgentType pin, or `None` for a requirement with no type constraint
-    /// (still potentially constraining capabilities/security).
+    /// Exact AgentType pin, or `None` for a requirement with no nominal type
+    /// constraint (still potentially constraining capabilities/security).
     pub required_type: Option<AgentTypeRef>,
     pub hard: TaskRequirement,
-    pub preferred: AgentRequirementPreferences,
 }
 
 impl TaskAgentRequirement {
-    /// Shape-check every required capability and the preference shape. Unknown
-    /// or malformed capabilities fail closed. Does not consult any source.
+    /// Shape-check every required capability. Unknown or malformed capabilities
+    /// fail closed. Does not consult any source.
     pub fn validate(&self, catalog: &CapabilityCatalog) -> Result<(), ContractError> {
         validate_requirement_capabilities(&self.hard.required_capabilities, catalog)
     }
@@ -138,7 +109,6 @@ impl TaskAgentRequirement {
         }
         self.hard.required_capabilities = out;
         self.hard.required_affinity = std::mem::take(&mut self.hard.required_affinity);
-        self.preferred.normalize();
         Ok(())
     }
 }

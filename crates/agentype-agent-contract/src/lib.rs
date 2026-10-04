@@ -69,7 +69,6 @@ pub use records::{
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, TaskRequirement,
 };
 pub use requirement::{
-    fold_generation_policy, AgentRequirementDraft, AgentRequirementPreferences, GenerationPolicy,
-    TaskAgentRequirement,
+    fold_generation_policy, AgentRequirementDraft, GenerationPolicy, TaskAgentRequirement,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

@@ -53,10 +53,6 @@ fn task_requirement() -> TaskRequirement {
     }
 }
 
-fn preference_default() -> AgentRequirementPreferences {
-    AgentRequirementPreferences::default()
-}
-
 fn contract(affinity: AffinityConstraint, budget_ceiling: f64) -> AgentTypeContract {
     AgentTypeContract {
         allowed_information_functions: vec![InformationFunction::Expand],
@@ -86,14 +82,12 @@ fn agent(id: &str, revision: u64, affinity: AffinityConstraint, ceiling: f64) ->
 fn candidate(
     id: &str,
     agent_type: AgentType,
-    warm: bool,
     available_since: Option<f64>,
 ) -> ExistingAgentCandidate {
     ExistingAgentCandidate {
         logical_agent_id: LogicalAgentId::from_string(id),
         agent_type,
         lifecycle: LifecycleMode::Resident,
-        warm,
         available_since,
         created_at: 1.0,
     }
@@ -116,26 +110,22 @@ fn requirement_digest_ignores_affinity_order_and_bool_false() {
     let mut a = TaskAgentRequirement {
         required_type: None,
         hard: with_false,
-        preferred: preference_default(),
     };
     let mut b = TaskAgentRequirement {
         required_type: Some(pinned.clone()),
         hard: omitted.clone(),
-        preferred: preference_default(),
     };
     // `required_type` is part of the identity, so pin both to compare content.
     let mut c = TaskAgentRequirement {
         required_type: Some(pinned),
         hard: omitted,
-        preferred: preference_default(),
     };
 
     canonicalize_task_agent_requirement(&mut a, &catalog).unwrap();
     canonicalize_task_agent_requirement(&mut b, &catalog).unwrap();
     canonicalize_task_agent_requirement(&mut c, &catalog).unwrap();
 
-    // `Bool(false)` normalizes to omission; `c` (pinned, no false) has the same
-    // pinned identity and normalized content as `b`.
+    // `Bool(false)` normalizes to omission; `b` and `c` are the same content.
     assert!(a.hard.required_capabilities.is_empty());
     assert_eq!(
         task_agent_requirement_content_digest(&b),
@@ -248,11 +238,11 @@ fn matching_requires_pin_and_filters_incompatible_contracts() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
 
-    // No pinned type: legacy path owns it, matching returns nothing.
+    // No pinned type: nominal selection is deferred, matching returns nothing,
+    // but this is still a typed (constrained) Task, never a legacy Task.
     let untyped = TaskAgentRequirement {
         required_type: None,
         hard: task_requirement(),
-        preferred: preference_default(),
     };
     assert!(match_existing_agents(&required, &untyped, &[], &catalog)
         .unwrap()
@@ -262,7 +252,6 @@ fn matching_requires_pin_and_filters_incompatible_contracts() {
     let wrong_pin = TaskAgentRequirement {
         required_type: Some(AgentTypeRef::new("other", 1).unwrap()),
         hard: task_requirement(),
-        preferred: preference_default(),
     };
     assert!(matches!(
         match_existing_agents(&required, &wrong_pin, &[], &catalog),
@@ -280,7 +269,6 @@ fn matching_requires_pin_and_filters_incompatible_contracts() {
             contract: incapable_contract,
         },
         lifecycle: LifecycleMode::Resident,
-        warm: true,
         available_since: Some(0.0),
         created_at: 1.0,
     };
@@ -288,31 +276,27 @@ fn matching_requires_pin_and_filters_incompatible_contracts() {
     let req = TaskAgentRequirement {
         required_type: Some(required.type_ref.clone()),
         hard: task_requirement(),
-        preferred: preference_default(),
     };
     let matched = match_existing_agents(&required, &req, &[incapable], &catalog).unwrap();
     assert!(matched.is_empty());
 }
 
 #[test]
-fn matching_orders_exact_then_warm_then_deterministic() {
+fn matching_orders_exact_then_specific_then_deterministic() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
     let req = TaskAgentRequirement {
         required_type: Some(required.type_ref.clone()),
         hard: task_requirement(),
-        preferred: preference_default(),
     };
 
-    // A cold exact-type candidate and a cold narrower (more specific) one: the
-    // exact type wins tier 0.
-    let exact_cold = candidate(
+    // The exact type wins over a narrower (more specific) candidate.
+    let exact = candidate(
         "agent-exact",
         agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        false,
-        None,
+        Some(5.0),
     );
-    let narrower_cold = candidate(
+    let narrower = candidate(
         "agent-narrow",
         agent(
             "rust-reviewer",
@@ -320,44 +304,30 @@ fn matching_orders_exact_then_warm_then_deterministic() {
             AffinityConstraint::Only(set(&["rust"])),
             50.0,
         ),
-        false,
-        None,
-    );
-    // Same exact type, but warm: warm dominates specificity tier.
-    let exact_warm = candidate(
-        "agent-exact-warm",
-        agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        true,
-        Some(5.0),
+        Some(1.0),
     );
 
-    let matched = match_existing_agents(
-        &required,
-        &req,
-        &[exact_cold, narrower_cold, exact_warm],
-        &catalog,
-    )
-    .unwrap();
+    let matched = match_existing_agents(&required, &req, &[narrower, exact], &catalog).unwrap();
     let order: Vec<&str> = matched
         .iter()
         .map(|c| c.logical_agent_id.as_str())
         .collect();
-    assert_eq!(
-        order,
-        vec!["agent-exact-warm", "agent-exact", "agent-narrow"]
-    );
+    assert_eq!(order, vec!["agent-exact", "agent-narrow"]);
+    // Only immediately usable (READY, unassigned) candidates are returned; the
+    // caller never receives a "cold" candidate it did not prove.
+    assert!(matched
+        .iter()
+        .all(|c| c.lifecycle == LifecycleMode::Resident));
 
-    // Two identical-warmth exact candidates order deterministically by id.
+    // Two equivalent exact candidates order deterministically by id.
     let a = candidate(
         "agent-a",
         agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        true,
         Some(1.0),
     );
     let b = candidate(
         "agent-b",
         agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        true,
         Some(1.0),
     );
     let matched = match_existing_agents(&required, &req, &[b, a], &catalog).unwrap();

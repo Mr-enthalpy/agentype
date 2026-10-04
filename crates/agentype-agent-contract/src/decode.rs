@@ -27,7 +27,7 @@ use crate::records::{
     SecurityContract, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
     TaskRequirement,
 };
-use crate::requirement::{AgentRequirementPreferences, GenerationPolicy, TaskAgentRequirement};
+use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
 use agentype_core::{InformationFunction, WorkspaceMode};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -537,24 +537,6 @@ fn task_requirement_from(value: &Value) -> Result<TaskRequirement, ContractError
     })
 }
 
-fn preferences_from(value: &Value) -> Result<AgentRequirementPreferences, ContractError> {
-    let object = object(value, "agent requirement preferences")?;
-    let preferred_continuity = match field(object, "preferred_continuity")? {
-        Value::Null => None,
-        other => Some(continuity_mode(&string_of(other, "preferred_continuity")?)?),
-    };
-    Ok(AgentRequirementPreferences {
-        preferred_affinity: string_set_from(
-            field(object, "preferred_affinity")?,
-            "preferred_affinity",
-        )?,
-        preferred_continuity,
-        prefer_specificity: field(object, "prefer_specificity")?
-            .as_bool()
-            .ok_or_else(|| err("prefer_specificity must be boolean"))?,
-    })
-}
-
 /// Decode a Task agent requirement. The caller MUST also verify the stored
 /// content digest and canonical byte equality at the durable boundary.
 pub fn task_agent_requirement_from_canonical_json(
@@ -573,11 +555,9 @@ pub fn task_agent_requirement_from_canonical_json(
         }
     };
     let hard = task_requirement_from(field(document, "hard")?)?;
-    let preferred = preferences_from(field(document, "preferred")?)?;
     Ok(TaskAgentRequirement {
         required_type,
         hard,
-        preferred,
     })
 }
 

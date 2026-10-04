@@ -445,11 +445,13 @@ does not select a SpawnSource. Ranking, `TaskAgentRequirement`, and
 
 M6-B.3 is the pure semantic-to-candidate resolution layer. It never provisions a
 physical agent (that is M6-B.4): it attaches a durable requirement to an admitted
-Task and ranks the **already-bound** LogicalAgents that may execute it.
+Task and ranks the **already-bound** LogicalAgents that may execute it. Until
+M6-B.4 can prove complete physical eligibility, a typed Task acquires no M5
+authority: it is durable `QUEUED` metadata that the legacy untyped dispatch path
+must ignore.
 
 ```text
 TaskAgentRequirement        exact optional AgentType pin + hard TaskRequirement
-                            + soft AgentRequirementPreferences
 AgentRequirementDraft       pre-commit selector + capability/security extras;
                             TaskSpec-owned dimensions are not duplicated
 GenerationPolicy            immutable, generation-wide hard-requirement ceiling
@@ -457,7 +459,7 @@ fold_generation_policy      join(policy, task requirement) = the stronger of the
                             two on every dimension; a Task never widens its
                             Generation
 match_existing_agents       pure filter + spec-06 semantic-order ranking over
-                            already-bound LogicalAgents
+                            already-bound, immediately usable LogicalAgents
 ```
 
 Rules now enforced:
@@ -468,11 +470,27 @@ Rules now enforced:
   AgentType pin through the validated catalog read, folds the Generation policy,
   and performs no source selection, credential resolution, or adapter call. The
   legacy `admit_proposal` path continues with no requirement.
+- **Typed Tasks are quarantined from legacy dispatch.** The authority boundary is
+  the existence of the `TaskAgentRequirement` row, not the presence of a nominal
+  pin. `ensure_task_consumers` and `claim_next_available` MUST ignore every Task
+  that has a requirement, so an untyped legacy agent can never serve a typed Task
+  and a typed Task can never birth a legacy consumer. A typed Task stays durable
+  `QUEUED` until M6-B.4 introduces the authoritative typed acquisition path. This
+  applies equally to a requirement with `required_type = None`, which is a typed,
+  constrained Task (not a legacy Task) whose nominal selection is deferred.
+- **Generation policy gates admission as well as dispatch.** A Generation that
+  carries a policy MUST NOT be admitted through the legacy untyped
+  `admit_proposal` path: the policy is a generation-wide hard requirement ceiling,
+  so legacy admission would bypass it. Legacy admission is forbidden and fails
+  closed before any write; a policy-bearing Generation requires typed admission.
+  A Generation with no policy preserves M6-A legacy admission unchanged.
 - **Exact requirement revision.** A durable requirement pins an exact
   `(type_id, revision)` or is explicitly `NULL`; a loose selector is resolved
   before commitment. The stored document is canonical (`agentype-contract/1`)
   with a `sha256:` digest, re-canonicalized on read, and its relational mirror is
-  cross-checked.
+  cross-checked. Only an **exact-selector** replay is guaranteed idempotent; a
+  `Latest` retry after the catalog advanced re-resolves to the new revision and
+  fails closed as a Conflict rather than silently re-pinning.
 - **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
   ceiling fixed at `create_generation`. The effective hard requirement is the
   join of the policy and the Task requirement; a Task that would widen the
@@ -487,15 +505,22 @@ Rules now enforced:
   in-place update. This is operator provisioning authority, surfaced through
   `ProvisioningAdmin`, deliberately separate from `RootSemanticControl`
   (`M6A-B9`).
-- **No untyped substitution.** A Task with a pinned requirement is matched only
-  against bound, compatible agents; an unbound LogicalAgent has no contract to
-  prove `can_execute` and is never returned. Matching is a pure read: it consults
-  no `SpawnSource` and writes nothing.
+- **No untyped substitution.** A Task with a requirement is matched only against
+  bound, compatible agents; an unbound LogicalAgent has no contract to prove
+  `can_execute` and is never returned. Matching is a pure read: it consults no
+  `SpawnSource` and writes nothing.
+- **Only immediately usable candidates.** A candidate is an M5 `READY` and
+  unassigned bound LogicalAgent. Non-READY states (`ASSIGNED`, `DRAINING`,
+  `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
+  revival is a later seam. The `Retention`-to-`LifecycleMode` mapping is exact
+  (`resident`/`ephemeral`); `LifecycleMode::Revivable` is not faked.
 - **Semantic ranking, not inheritance depth.** Existing agents are ordered by
-  spec 06: warm before cold, exact type before a more specific compatible type,
-  before an incomparable/equivalent type, before a broader type, with a stable
-  `(type_id, revision, logical_agent_id)` tie-break. Nominal inheritance depth is
-  never consulted.
+  spec 06: exact type before a more specific compatible type, before an
+  incomparable/equivalent type, before a broader type, with a stable
+  `(type_id, revision, logical_agent_id)` tie-break. Stronger continuity is a
+  post-compatibility ranking dimension. Nominal inheritance depth is never
+  consulted. B.3 exposes no caller-controlled soft-preference switch, because
+  spec 06 mandates this order.
 
 Full physical eligibility (`can_provision_task`, active adapter policy, exact
 binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.

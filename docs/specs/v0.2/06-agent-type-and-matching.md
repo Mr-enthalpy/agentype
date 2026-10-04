@@ -275,10 +275,26 @@ resolve to an exact revision before commitment, and a Task whose requirement
 would widen its Generation policy MUST fail closed. The requirement never selects
 a `SpawnSource` and never starts physical work.
 
+The durable `TaskAgentRequirement` row is the authority boundary: any Task that
+has one MUST be invisible to the legacy untyped consumer/claim path, whether or
+not it carries a nominal pin, because an unpinned typed requirement can still
+carry hard capability/security constraints. A
+`TaskAgentRequirement` with `required_type = None` is therefore a typed,
+constrained Task (with selection deferred), never a legacy Task. Until a typed
+authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
+`QUEUED` and acquires no Attempt, Lease, or Execution.
+
+A Generation that carries a policy MUST NOT be admitted through the legacy
+`admit_proposal` path; the policy is a generation-wide hard ceiling and legacy
+admission MUST fail closed. A Generation with no policy preserves legacy
+admission unchanged.
+
 Existing-agent matching is the semantic-order list above, restricted to
-LogicalAgents that carry an exact `logical_agent_type_bindings` revision. A Task
-with a pinned requirement MUST NOT be served by an unbound LogicalAgent; an
+LogicalAgents that carry an exact `logical_agent_type_bindings` revision and are
+M5 `READY` and unassigned. Non-READY states are not treated as cold/revivable.
+A Task with a requirement MUST NOT be served by an unbound LogicalAgent; an
 unbound agent has no contract to prove `can_execute`. Ranking MUST NOT use
-nominal inheritance depth. New-agent provisioning from an eligible SpawnSource,
-full physical eligibility (`can_provision_task`), and credentials remain M6-B.4/
-M6-B.5.
+nominal inheritance depth. Only exact-selector replay is idempotent; a `Latest`
+retry after the catalog advances MUST fail closed rather than re-pin. New-agent
+provisioning from an eligible SpawnSource, full physical eligibility
+(`can_provision_task`), and credentials remain M6-B.4/M6-B.5.

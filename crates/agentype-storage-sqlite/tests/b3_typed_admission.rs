@@ -4,14 +4,15 @@
 //! existing bound agents.
 
 use agentype_agent_contract::{
-    AffinityConstraint, AgentRequirementDraft, AgentRequirementPreferences, AgentType,
-    AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityCatalog,
-    CapabilityDefinition, CapabilityPolarity, CapabilityRef, ContinuityMode, GenerationPolicy,
-    LifecycleMode, MatcherKind, NetworkPolicy, SecurityClass, SecurityContract,
+    AffinityConstraint, AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef,
+    AgentTypeSelector, Budget, CapabilityCatalog, CapabilityDefinition, CapabilityPolarity,
+    CapabilityRef, ContinuityMode, GenerationPolicy, LifecycleMode, MatcherKind, NetworkPolicy,
+    SecurityClass, SecurityContract,
 };
 use agentype_core::{
-    Clock, Error, InformationFunction, ManualClock, PartitionSpec, ProposalStateKind,
-    RawWorkIntent, Retention, SemanticInputSet, TaskSpec, WorkspaceMode,
+    Clock, Error, InformationFunction, LogicalAgentId, LogicalAgentState, ManualClock,
+    PartitionSpec, ProposalStateKind, RawWorkIntent, Retention, SemanticInputSet, TaskSpec,
+    TaskState, WorkspaceMode,
 };
 use agentype_storage_sqlite::Kernel;
 use serde_json::json;
@@ -100,7 +101,6 @@ fn draft(pin: AgentTypeRef) -> AgentRequirementDraft {
         sandbox_policy: None,
         required_anchor: None,
         budget: Budget::new(50.0).unwrap(),
-        preferred: AgentRequirementPreferences::default(),
     }
 }
 
@@ -118,6 +118,37 @@ fn compile_proposal(kernel: &Kernel, spec: TaskSpec) -> agentype_core::ProposalR
     kernel
         .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap()
+}
+
+/// A typed draft with no nominal pin but a hard network restriction.
+fn unpinned_draft() -> AgentRequirementDraft {
+    AgentRequirementDraft {
+        required_type: None,
+        required_capabilities: BTreeMap::new(),
+        required_network: NetworkPolicy::Enabled,
+        required_attempt_isolation: false,
+        sandbox_policy: None,
+        required_anchor: None,
+        budget: Budget::new(50.0).unwrap(),
+    }
+}
+
+fn latest_draft(type_id: &str) -> AgentRequirementDraft {
+    AgentRequirementDraft {
+        required_type: Some(AgentTypeSelector::latest(type_id).unwrap()),
+        required_capabilities: BTreeMap::new(),
+        required_network: NetworkPolicy::Restricted,
+        required_attempt_isolation: false,
+        sandbox_policy: None,
+        required_anchor: None,
+        budget: Budget::new(50.0).unwrap(),
+    }
+}
+
+fn file_path(tag: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{tag}-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("scheduler.db")
 }
 
 #[test]
@@ -163,7 +194,7 @@ fn typed_admission_pins_exact_type_and_derives_spec_dimensions() {
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].logical_agent_id, agent);
     assert_eq!(matched[0].agent_type.type_ref, pin);
-    assert!(matched[0].warm);
+    assert_eq!(matched[0].lifecycle, LifecycleMode::Resident);
 }
 
 #[test]
@@ -374,4 +405,300 @@ fn sqlite_mechanically_rejects_typed_table_mutation() {
         )
         .is_err());
     assert!(conn.execute("DELETE FROM generation_policies", []).is_err());
+}
+
+// =============================================================================
+// P0-1: typed Tasks are invisible to the legacy untyped dispatch path.
+// =============================================================================
+
+#[test]
+fn typed_task_is_quarantined_from_legacy_claim() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    let agent = kernel.ready_agent("general").unwrap();
+
+    // A READY, unbound legacy agent exists, but the typed Task acquires no M5
+    // authority and the agent stays unassigned.
+    assert!(kernel.claim_next_available().unwrap().is_none());
+    let record = kernel.task(&task).unwrap();
+    assert_eq!(record.state, TaskState::Queued);
+    assert!(record.current_attempt_id.is_none());
+    assert_eq!(
+        kernel.logical_agent(&agent).unwrap().state,
+        LogicalAgentState::Ready
+    );
+}
+
+#[test]
+fn typed_task_does_not_birth_a_legacy_consumer() {
+    // A capacity-zero partition with no consumers: a legacy Task births one, a
+    // typed Task must not.
+    let legacy = memory_kernel();
+    legacy
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            0,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    legacy.reconcile_pool().unwrap();
+    legacy
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    legacy.ensure_task_consumers().unwrap();
+    assert!(legacy.ready_agent("general").is_ok());
+
+    let typed = memory_kernel();
+    typed
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            0,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    typed.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&typed, "reviewer", 1);
+    let proposal = compile_proposal(
+        &typed,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    typed
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    typed.ensure_task_consumers().unwrap();
+    assert!(typed.ready_agent("general").is_err());
+}
+
+#[test]
+fn unpinned_typed_task_is_also_quarantined() {
+    let kernel = partitioned_kernel();
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, unpinned_draft())
+        .unwrap();
+
+    let requirement = kernel
+        .get_task_agent_requirement(&task)
+        .unwrap()
+        .expect("requirement row exists");
+    // No nominal pin, but a hard network requirement: still a typed Task.
+    assert!(requirement.required_type.is_none());
+    assert_eq!(requirement.hard.required_network, NetworkPolicy::Enabled);
+    assert!(kernel.claim_next_available().unwrap().is_none());
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+}
+
+#[test]
+fn mixed_queue_dispatches_legacy_work_past_typed_task() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let typed = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+
+    // The only eligible claim is the legacy Task.
+    let claim = kernel
+        .claim_next_available()
+        .unwrap()
+        .expect("legacy claim");
+    assert_eq!(claim.task_id, legacy);
+    assert_ne!(claim.task_id, typed);
+    // The typed Task never becomes claimable.
+    assert!(kernel.claim_next_available().unwrap().is_none());
+    assert_eq!(kernel.task(&typed).unwrap().state, TaskState::Queued);
+}
+
+// =============================================================================
+// P0-2: a policy-bearing Generation forbids legacy admission.
+// =============================================================================
+
+#[test]
+fn policy_generation_rejects_legacy_admission() {
+    let kernel = memory_kernel();
+    let gen = kernel
+        .create_generation_with_policy(json!({}), Some(sample_policy()))
+        .unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "legacy_vs_policy".into(),
+        objective: "legacy admission against a policy".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("audit", json!({}))),
+    };
+    let proposal = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+
+    let err = kernel
+        .admit_proposal(&proposal.proposal_id, 0, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert!(kernel
+        .get_generation_view(&gen.generation_id)
+        .unwrap()
+        .admitted_task_ids
+        .is_empty());
+}
+
+#[test]
+fn no_policy_generation_still_accepts_legacy_admission() {
+    let kernel = partitioned_kernel();
+    let gen = kernel.create_generation(json!({})).unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "legacy_ok".into(),
+        objective: "legacy admission without a policy".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("audit", json!({}))),
+    };
+    let proposal = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    assert!(kernel
+        .admit_proposal(&proposal.proposal_id, 0, None)
+        .is_ok());
+}
+
+// =============================================================================
+// P1-1: only READY, unassigned bound agents are candidates.
+// =============================================================================
+
+#[test]
+fn matching_returns_only_ready_unassigned_agents() {
+    let path = file_path("b3-ready-only");
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                4,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let pin = publish_agent_type(&kernel, "reviewer", 1);
+
+        let ids: Vec<String> = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut statement = conn
+                .prepare("SELECT id FROM logical_agents ORDER BY id")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            kernel
+                .bind_logical_agent_type(&LogicalAgentId::from_string(id.clone()), &pin)
+                .unwrap();
+        }
+
+        let proposal = compile_proposal(
+            &kernel,
+            TaskSpec::new("audit", json!({})).partition("general"),
+        );
+        let task = kernel
+            .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin.clone()))
+            .unwrap();
+
+        // Keep ids[0] READY and drive the others into non-ready M5 states.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE logical_agents SET state='ASSIGNED' WHERE id=?1",
+                [&ids[1]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE logical_agents SET state='RETIRED' WHERE id=?1",
+                [&ids[2]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE logical_agents SET state='SUSPENDED' WHERE id=?1",
+                [&ids[3]],
+            )
+            .unwrap();
+        }
+
+        let matched = kernel.match_existing_agents_for_task(&task).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].logical_agent_id.as_str(), ids[0]);
+    }
+}
+
+// =============================================================================
+// P2-1: loose-selector replay semantics.
+// =============================================================================
+
+#[test]
+fn latest_selector_replay_is_stable_until_catalog_drifts() {
+    let kernel = partitioned_kernel();
+    publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, latest_draft("reviewer"))
+        .unwrap();
+    // Replay before any catalog drift is idempotent.
+    let replay = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, latest_draft("reviewer"))
+        .unwrap();
+    assert_eq!(task, replay);
+
+    // A newer revision is published; a `Latest` retry now resolves to it and is a
+    // fail-closed Conflict, never a silent re-pin.
+    publish_agent_type(&kernel, "reviewer", 2);
+    let err = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, latest_draft("reviewer"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)));
+
+    // An exact replay of the committed revision stays idempotent.
+    let exact = kernel
+        .admit_typed_proposal(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(type_ref("reviewer", 1)),
+        )
+        .unwrap();
+    assert_eq!(task, exact);
 }

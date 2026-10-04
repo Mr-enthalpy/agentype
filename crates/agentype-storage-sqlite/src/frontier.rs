@@ -1149,6 +1149,20 @@ fn admit_proposal_core(
         )));
     }
 
+    // A policy-bearing Generation MUST NOT be admitted through the legacy
+    // untyped path: the policy is a generation-wide hard requirement ceiling, so
+    // legacy admission would bypass it. Typed admission is required. This check
+    // runs before any durable write, so a rejected legacy admission leaves the
+    // proposal PENDING and creates no Task, Batch, binding, or requirement.
+    if typed_draft.is_none() {
+        let generation_id = GenerationId::from_string(gid.clone());
+        if crate::requirement::get_generation_policy(tx, &generation_id)?.is_some() {
+            return Err(Error::invalid_authority(
+                "a generation with a policy requires typed admission; legacy admit_proposal is forbidden",
+            ));
+        }
+    }
+
     // 3. Validate semantic input set provenance
     let gen_id_obj = GenerationId::from_string(gid.clone());
     let semantic_input_set = semantic_input_set_from_json(&json_load(&set_str)?)?;

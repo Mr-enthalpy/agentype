@@ -2,17 +2,23 @@
 //! requirement.
 //!
 //! This stage does not provision anything: a new `LogicalAgent` is materialized
-//! only by M6-B.4. Matching therefore answers "which existing, typed agent may
-//! execute this Task", applying the spec 06 semantic preference order:
+//! only by M6-B.4. Matching therefore answers "which existing, immediately usable
+//! typed agent may execute this Task", applying the spec 06 semantic preference
+//! order:
 //!
 //! 1. exact / most-specific compatible resident agent
 //! 2. compatible narrower anchored type
 //! 3. compatible broader/general type
 //! 4. cold/revivable compatible logical agent
 //!
-//! Ranking MUST NOT use nominal inheritance depth. An unbound LogicalAgent (one
-//! with no exact AgentType binding) can never be returned for a typed
-//! requirement: there is no contract to prove `can_execute`.
+//! Only tier 1-3 are implemented in M6-B.3. A candidate here is necessarily M5
+//! `READY` and unassigned (the storage loader filters to that), so "cold/revivable"
+//! (tier 4) is deliberately **not** approximated from non-READY M5 states: M6
+//! revival/continuity is a later seam. Ranking MUST NOT use nominal inheritance
+//! depth.
+//!
+//! An unbound LogicalAgent (one with no exact AgentType binding) can never be
+//! returned for a typed requirement: there is no contract to prove `can_execute`.
 
 use crate::capability::CapabilityCatalog;
 use crate::error::ContractError;
@@ -22,16 +28,15 @@ use crate::requirement::TaskAgentRequirement;
 use agentype_core::LogicalAgentId;
 use std::cmp::Ordering;
 
-/// One existing LogicalAgent, already resolved to its exact bound AgentType and
-/// its physical lifecycle class. `warm` means a resident/ready incarnation is
-/// currently available; `false` means cold/revivable. `available_since` and
-/// `created_at` are diagnostics used only for deterministic tie-breaking.
+/// One existing, immediately usable (M5 `READY` and unassigned) LogicalAgent,
+/// already resolved to its exact bound AgentType and its physical lifecycle
+/// class. `available_since` and `created_at` are diagnostics used only for
+/// deterministic tie-breaking.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExistingAgentCandidate {
     pub logical_agent_id: LogicalAgentId,
     pub agent_type: AgentType,
     pub lifecycle: LifecycleMode,
-    pub warm: bool,
     pub available_since: Option<f64>,
     pub created_at: f64,
 }
@@ -54,10 +59,15 @@ fn specificity_tier(
     2
 }
 
-/// Filter and rank existing bound agents for one Task requirement, best first.
+/// Filter and rank existing bound, immediately usable agents for one Task
+/// requirement, best first.
 ///
-/// Returns an empty vector when the requirement has no exact AgentType pin (the
-/// legacy/partition path owns that case) or when no candidate is compatible.
+/// A requirement with `required_type == None` is a **typed** Task (it may still
+/// carry hard capability/security constraints); returning no candidate here is a
+/// deliberate B.3 limitation (nominal selection is deferred), never an
+/// instruction to hand the Task back to the legacy partition path. The
+/// distinction is the durable `TaskAgentRequirement` row itself.
+///
 /// Physical eligibility (adapter binding, credentials) is M6-B.4 and is NOT
 /// decided here.
 pub fn match_existing_agents(
@@ -94,15 +104,10 @@ pub fn match_existing_agents(
     }
 
     eligible.sort_by(|a, b| {
-        let key = |c: &ExistingAgentCandidate| {
-            (
-                if c.warm { 0u8 } else { 1u8 },
-                specificity_tier(c, required, req, catalog),
-            )
-        };
-        key(a)
-            .cmp(&key(b))
-            // Stronger continuity guarantee first.
+        specificity_tier(a, required, req, catalog)
+            .cmp(&specificity_tier(b, required, req, catalog))
+            // Stronger continuity guarantee first (a ranking dimension applied
+            // after compatibility, never part of semantic specificity).
             .then_with(|| {
                 b.agent_type
                     .contract

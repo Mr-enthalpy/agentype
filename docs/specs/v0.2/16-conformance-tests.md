@@ -114,15 +114,26 @@ M6-B.3 typed admission and matching MUST cover:
   by the caller
 - a Generation policy folds into the requirement as a generation-wide ceiling;
   a Task that would widen it fails closed
-- exact typed replay returns the same Task; a conflicting requirement is a
-  `Conflict`, and the legacy `admit_proposal` path is unchanged
-- matching returns only bound, compatible agents; an unbound LogicalAgent is
-  never returned and matching writes nothing
+- a policy-bearing Generation rejects legacy `admit_proposal` before any write
+  (proposal PENDING, no Task), while a no-policy Generation keeps M6-A legacy
+  admission working
+- a Task carrying a `TaskAgentRequirement` is invisible to `ensure_task_consumers`
+  and to `claim_next_available`: it births no legacy consumer, acquires no
+  Attempt/Lease/Execution, and stays `QUEUED`; this includes a requirement with
+  `required_type = None`
+- a mixed queue still dispatches the legacy (no-requirement) Task past a
+  quarantined typed Task
+- exact typed replay returns the same Task while a conflicting requirement is a
+  `Conflict`; only exact-selector replay is idempotent, and a `Latest` retry
+  after catalog drift fails closed
+- matching returns only bound, M5 `READY`, unassigned, compatible agents; a
+  non-ready agent is never returned as a "cold" candidate and matching writes
+  nothing
 - `logical_agent_type_bindings` is write-once and requires a validated exact
   revision; `task_agent_requirements` and `generation_policies` are immutable,
   enforced mechanically by SQLite
 - ranking follows the spec 06 semantic order and never uses nominal inheritance
-  depth
+  depth; no caller-controlled soft preference can override it
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

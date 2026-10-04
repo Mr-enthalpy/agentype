@@ -1593,6 +1593,9 @@ impl Kernel {
                      JOIN batches b ON b.id=t.batch_id
                      JOIN pool_partitions p ON p.name=t.partition_name
                      WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+                       )
                      ORDER BY t.priority DESC,t.created_at,t.id",
                 )
                 .map_err(map_sqlite)?;
@@ -1686,7 +1689,10 @@ impl Kernel {
                                 t.priority,t.created_at,p.active,b.state
                          FROM tasks t JOIN batches b ON b.id=t.batch_id
                          JOIN pool_partitions p ON p.name=t.partition_name
-                         WHERE t.state='QUEUED'",
+                         WHERE t.state='QUEUED'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+                           )",
                     )
                     .map_err(map_sqlite)?;
                 let rows = stmt

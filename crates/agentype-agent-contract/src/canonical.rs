@@ -352,16 +352,6 @@ fn task_requirement_value(req: &TaskRequirement) -> Value {
     })
 }
 
-fn agent_requirement_preferences_value(
-    preferred: &crate::requirement::AgentRequirementPreferences,
-) -> Value {
-    json!({
-        "preferred_affinity": preferred.preferred_affinity.iter().collect::<Vec<_>>(),
-        "preferred_continuity": preferred.preferred_continuity.map(continuity_str),
-        "prefer_specificity": preferred.prefer_specificity,
-    })
-}
-
 fn generation_policy_value(policy: &GenerationPolicy) -> Value {
     json!({
         "allowed_information_functions": policy
@@ -553,7 +543,6 @@ pub fn canonical_task_agent_requirement_bytes(req: &TaskAgentRequirement) -> Vec
             "revision": t.revision(),
         })),
         "hard": task_requirement_value(&req.hard),
-        "preferred": agent_requirement_preferences_value(&req.preferred),
     }))
 }
 
