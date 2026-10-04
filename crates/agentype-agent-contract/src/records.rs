@@ -1,4 +1,6 @@
-//! M6-B contract records. Pure value types; persistence is a later milestone.
+//! M6-B contract records. Pure value types; M6-B.2 persists an exact revision
+//! of each as a canonical, content-addressed schema-v6 catalog entry with a
+//! separate mutable disposition overlay.
 //!
 //! Every identity is a private-field newtype with a validated constructor and
 //! every numeric contract value is a validated finite non-negative newtype, so

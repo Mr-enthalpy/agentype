@@ -311,6 +311,56 @@ fn golden_digest_vectors_are_stable() {
     canonicalize_spawn_source(&mut source, &catalog).unwrap();
     let mut config = config_with_credential_refs(vec![CredentialRef::new("vault://a").unwrap()]);
     canonicalize_credential_refs(&mut config.credential_refs);
+
+    let definition = CapabilityDefinition {
+        matcher_kind: MatcherKind::Set,
+        security_class: SecurityClass::Sandbox,
+        polarity: CapabilityPolarity::Restriction,
+    };
+    let mut agent = AgentType {
+        type_ref: AgentTypeRef::new("general-reviewer", 1).unwrap(),
+        based_on: None,
+        contract: AgentTypeContract {
+            allowed_information_functions: vec![InformationFunction::Expand],
+            required_capabilities: BTreeMap::new(),
+            affinity: AffinityConstraint::Any,
+            budget_ceiling: Budget::new(100.0).unwrap(),
+            security: SecurityContract {
+                workspace: WorkspaceMode::ReadOnly,
+                network: NetworkPolicy::Restricted,
+                requires_attempt_isolation: false,
+            },
+            lifecycle: [LifecycleMode::Resident].into_iter().collect(),
+            continuity: ContinuityMode::Logical,
+            sandbox_policy: None,
+            anchor_constraint: None,
+        },
+    };
+    canonicalize_agent_type(&mut agent, &CapabilityCatalog::new()).unwrap();
+    let policy = AdapterBindingPolicy::new(
+        policy_ref("codex-local-adapter", 3),
+        "codex_cli",
+        "workstation-primary",
+        PhysicalSafety::new(
+            false,
+            vec![WorkspaceMode::ReadOnly],
+            [NetworkPolicy::Disabled].into_iter().collect(),
+        )
+        .unwrap(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    // Every canonical document kind has at least one pinned vector, so a
+    // future encoder change cannot silently drift the durable protocol without
+    // bumping `CANONICAL_FORMAT_VERSION`.
+    assert_eq!(
+        capability_definition_content_digest(&cref("tools", 1), &definition),
+        "sha256:81de3142a1a2265ddcfee9331e5a443d774b75bbec1e9cf1cfea62e34f338df1"
+    );
+    assert_eq!(
+        agent_type_content_digest(&agent),
+        "sha256:963a2a17b9910abeb98e376c57af2202c05d625e1ffbf67e114fe93675e4af51"
+    );
     assert_eq!(
         spawn_source_content_digest(&source),
         "sha256:49e88707e0a3d8517c64a7007996a0ba8876380c5d666f2a20906564a594096e"
@@ -322,6 +372,14 @@ fn golden_digest_vectors_are_stable() {
     assert_eq!(
         source_config_content_digest(&config, Some("file:///etc/codex.toml")),
         "sha256:4f47dbd3a52d8c08fec6e1cc792802cc39d4bec76b0b19885480825b8fa58330"
+    );
+    assert_eq!(
+        adapter_binding_policy_content_digest(&policy),
+        "sha256:2e5b9369c5de2e1b5a730b25d14220f2a631b005ed24dcddea3ca8036876e48a"
+    );
+    assert_eq!(
+        canonical_json_body_digest(&serde_json::json!({"model": "x", "provider": "y"})),
+        "sha256:5b7bbbd084793f932fb7916a5f6c1d2adc4d0a49b19c48060eda1d979392568e"
     );
 }
 

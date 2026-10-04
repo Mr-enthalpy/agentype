@@ -343,7 +343,10 @@ Rules now enforced by the durable catalog:
   (`agentype-contract/1`) plus a `sha256:` content digest computed by Core. The
   encoder recursively sorts every object key, so the bytes do not depend on
   `serde_json`'s `preserve_order` feature configuration; golden digest vectors
-  pin the format. Claims and credential references are sorted/deduped,
+  pin the byte format for every canonical document kind (capability definition,
+  AgentType, SpawnSource, SourceConfig with/without locator, AdapterBindingPolicy,
+  and the opaque JSON body digest). Claims and credential references are
+  sorted/deduped,
   `Bool(false)` is normalized to omission only after catalog resolution, and at
   most one claim per exact `CapabilityRef` is kept. The surviving declaration
   MUST be unique: an `ENFORCED` declaration supersedes `DECLARED` ones, and two

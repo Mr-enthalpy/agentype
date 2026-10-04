@@ -1782,9 +1782,10 @@ fn birth_agent_fails_closed_on_unknown_workstream() {
     assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
 }
 
-/// Audit P1 (round 10): a structurally valid rust-v0.2 database at schema
-/// Older schema versions are rejected at open (fail closed). Version 3
-/// adds the pending-terminal envelope columns. Version 5 adds M6 generation tables.
+/// Older schema versions are rejected at open (fail closed). Version 3 added
+/// the pending-terminal envelope columns; version 5 added the M6-A generation
+/// tables; version 6 added the M6-B.2 agent contract catalog. None is migrated
+/// in place (`D-DB-MIGRATE` remains unresolved).
 #[test]
 fn schema_v1_database_is_rejected_after_adapter_kind_column() {
     let db = FixtureDb::new("schema-v3");
@@ -1812,7 +1813,7 @@ fn schema_v1_database_is_rejected_after_adapter_kind_column() {
         "the rejection must be the schema-version gate: {err:?}"
     );
 
-    // A fresh v5 database opens and carries the frozen columns.
+    // A fresh `SCHEMA_VERSION` database opens and carries the frozen columns.
     let fresh = FixtureDb::new("schema-v3-fresh");
     {
         let env = file_env(&fresh);
