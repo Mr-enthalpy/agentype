@@ -401,6 +401,12 @@ Rules now enforced by the durable catalog:
   identity. `SourceConfig::same_config_contract_content` compares metadata only
   and is explicitly not a durable identity, so two configs that agree on
   metadata but differ in locator are different revisions.
+- **SourceConfigRevision is an unforgeable validated fact.** Its fields are
+  private and it has no public constructor; the only production constructor is
+  the validated read. A workspace sibling (a future B.4 resolver) cannot mint
+  one that merely looks validated, and `body()` dispatches on the validated
+  `mode` (`OpaqueJson` => payload, no locator; `ExternalRef` => locator, no
+  payload) rather than guessing from whichever fields happen to be present.
 - **SourceConfig authority.** A `SourceConfigBody` is either an `OpaqueJson`
   body, whose declared `config_digest` MUST equal its canonical body digest, or
   an `ExternalRef { locator }` that freezes **both** the opaque `locator` and the

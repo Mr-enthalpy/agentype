@@ -259,4 +259,19 @@ pub fn result_carried_ingress() {}
 ///     let _ = ResolvedProvisioningEvidence::for_tests;
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 19. A validated SourceConfig revision cannot be forged: its fields are
+/// //     private and it has no public constructor, so a workspace sibling can
+/// //     only obtain one from the validated catalog read.
+/// use agentype_storage_sqlite::SourceConfigRevision;
+/// fn _no_revision_forge() {
+///     let _ = SourceConfigRevision {
+///         config: unreachable!(),
+///         mode: unreachable!(),
+///         locator: unreachable!(),
+///         payload: unreachable!(),
+///     };
+/// }
+/// ```
 pub fn probes() {}

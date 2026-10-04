@@ -99,7 +99,10 @@ M6-B.2 catalog persistence MUST cover:
 - SQLite mechanically rejects a direct `UPDATE`/`DELETE` of an immutable
   revision row and a direct disposition status reversal, without the Kernel
 - a `SourceConfigRevision` exposes its validated opaque body without a second
-  read path
+  read path, is unforgeable outside the validated read (private fields, no
+  public constructor; compile-fail witness), and its `body` always matches the
+  validated mode (`OpaqueJson` => payload/no locator, `ExternalRef` =>
+  locator/no payload)
 - a fresh publication persists the caller's initial disposition (a `Disabled`
   source/config/policy is not silently stored as `Active`)
 - disposition changes never alter revision content and are monotonic

@@ -111,7 +111,10 @@ non-empty locator exactly as supplied (it MUST NOT trim a source-owned opaque
 identity). A single validated `SourceConfigRevision` read MUST be the only
 SourceConfig read path; getters MUST NOT read the duplicated columns
 independently, and a later stage MUST read the opaque body through that validated
-record rather than issuing its own query.
+record rather than issuing its own query. The validated revision type MUST be
+unforgeable: private fields, no public constructor, read-only accessors, and a
+`body` accessor dispatched on the validated body mode, so a workspace sibling
+cannot construct a record that merely looks validated.
 
 ## Kernel unique constraints (MUST)
 

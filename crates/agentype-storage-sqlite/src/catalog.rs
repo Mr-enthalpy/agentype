@@ -812,21 +812,39 @@ fn load_spawn_source(
     }
 }
 
-/// The single validated authority for one SourceConfig revision: the decoded
-/// config, its opaque body mode, and its `ExternalRef` locator (if any). Every
-/// SourceConfig getter derives from this record, and the duplicated
-/// body/mode/locator/digest columns MUST agree with the canonical document, so a
-/// drifted column can never become a second source of truth.
+/// The single validated authority for one SourceConfig revision.
+///
+/// This is an **unforgeable validated fact**: its fields are private and there
+/// is no public constructor, so a workspace sibling crate (a future B.4
+/// resolver) cannot mint one that merely *looks* validated. The only production
+/// constructor is [`load_source_config_revision`], which performs the content
+/// digest check, canonical decode/re-encode, relational-mirror cross-checks,
+/// source/config compatibility validation, and the opaque body digest check.
+///
+/// The `mode`/`body` invariant is fixed by that constructor:
+/// `OpaqueJson` has a payload and no locator; `ExternalRef` has a locator and no
+/// payload. [`SourceConfigRevision::body`] dispatches on `mode`, so a consumer
+/// never guesses the body kind from which fields happen to be present.
+///
+/// # Unforgeable
+///
+/// ```compile_fail
+/// use agentype_storage_sqlite::SourceConfigRevision;
+/// // Private fields and no public constructor: this cannot compile outside the
+/// // validated read path.
+/// let _forged = SourceConfigRevision {
+///     config: unreachable!(),
+///     mode: unreachable!(),
+///     locator: unreachable!(),
+///     payload: unreachable!(),
+/// };
+/// ```
 #[derive(Clone, Debug)]
 pub struct SourceConfigRevision {
-    pub config: SourceConfig,
-    pub mode: ConfigMode,
-    pub locator: Option<String>,
-    /// The validated opaque body, `Some` only for `OpaqueJson`. This is the only
-    /// supported way for a later stage (B.4) to read a config body; it MUST NOT
-    /// be re-read with a separate SQL query, which would bypass this validated
-    /// read path.
-    pub payload: Option<serde_json::Value>,
+    config: SourceConfig,
+    mode: ConfigMode,
+    locator: Option<String>,
+    payload: Option<serde_json::Value>,
 }
 
 /// A borrowed view of a validated `SourceConfigRevision` body.
@@ -837,6 +855,41 @@ pub enum SourceConfigBodyView<'a> {
 }
 
 impl SourceConfigRevision {
+    /// The only constructor. Private: callers obtain a revision exclusively
+    /// through [`load_source_config_revision`].
+    fn validated(
+        config: SourceConfig,
+        mode: ConfigMode,
+        locator: Option<String>,
+        payload: Option<serde_json::Value>,
+    ) -> Self {
+        debug_assert!(
+            matches!(
+                (mode, locator.is_some(), payload.is_some()),
+                (ConfigMode::OpaqueJson, false, true) | (ConfigMode::ExternalRef, true, false)
+            ),
+            "validated SourceConfigRevision must be mode/body consistent"
+        );
+        Self {
+            config,
+            mode,
+            locator,
+            payload,
+        }
+    }
+
+    pub fn config(&self) -> &SourceConfig {
+        &self.config
+    }
+
+    pub fn mode(&self) -> ConfigMode {
+        self.mode
+    }
+
+    pub fn locator(&self) -> Option<&str> {
+        self.locator.as_deref()
+    }
+
     /// The complete immutable revision-content identity: config-selection
     /// metadata **plus** the opaque body mode and `ExternalRef` locator, which
     /// are part of the canonical content and its digest. Two revisions that
@@ -848,12 +901,22 @@ impl SourceConfigRevision {
             && self.config.same_config_contract_content(&other.config)
     }
 
-    /// The validated opaque body, if the record is well-formed.
-    pub fn body(&self) -> Option<SourceConfigBodyView<'_>> {
-        match (&self.payload, &self.locator) {
-            (Some(payload), _) => Some(SourceConfigBodyView::OpaqueJson(payload)),
-            (None, Some(locator)) => Some(SourceConfigBodyView::ExternalRef(locator)),
-            (None, None) => None,
+    /// The validated opaque body, dispatched on the validated `mode`. The
+    /// `OpaqueJson`/`ExternalRef` invariant is guaranteed by the only
+    /// constructor, so an impossible state is a hard failure, never a guess
+    /// based on which fields happen to be present.
+    pub fn body(&self) -> SourceConfigBodyView<'_> {
+        match self.mode {
+            ConfigMode::OpaqueJson => SourceConfigBodyView::OpaqueJson(
+                self.payload
+                    .as_ref()
+                    .expect("validated OpaqueJson revision has a payload"),
+            ),
+            ConfigMode::ExternalRef => SourceConfigBodyView::ExternalRef(
+                self.locator
+                    .as_deref()
+                    .expect("validated ExternalRef revision has a locator"),
+            ),
         }
     }
 }
@@ -940,12 +1003,12 @@ pub fn load_source_config_revision(
             Some(payload)
         }
     };
-    Ok(Some(SourceConfigRevision {
+    Ok(Some(SourceConfigRevision::validated(
         config,
         mode,
-        locator: canonical_locator,
+        canonical_locator,
         payload,
-    }))
+    )))
 }
 
 pub fn get_source_config(
@@ -1317,4 +1380,76 @@ pub fn load_agent_type_lookup(tx: &Transaction<'_>) -> Result<DurableAgentTypeLo
         }
     }
     Ok(DurableAgentTypeLookup { published })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SourceConfig {
+        SourceConfig {
+            config_ref: SourceConfigRef::new(
+                SpawnSourceRef::new("codex-local", 1).unwrap(),
+                "deep",
+                1,
+            )
+            .unwrap(),
+            config_digest: ConfigDigest::new(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: Vec::new(),
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        }
+    }
+
+    #[test]
+    fn revision_identity_includes_locator_and_body_matches_mode() {
+        let a = SourceConfigRevision::validated(
+            config(),
+            ConfigMode::ExternalRef,
+            Some("file:///a".into()),
+            None,
+        );
+        let b = SourceConfigRevision::validated(
+            config(),
+            ConfigMode::ExternalRef,
+            Some("file:///b".into()),
+            None,
+        );
+        let same = SourceConfigRevision::validated(
+            config(),
+            ConfigMode::ExternalRef,
+            Some("file:///a".into()),
+            None,
+        );
+        // The metadata-only relation says equal, but the complete durable
+        // revision identity (which includes the locator) does not.
+        assert!(a.config().same_config_contract_content(b.config()));
+        assert!(!a.same_revision_content(&b));
+        assert!(a.same_revision_content(&same));
+        assert_eq!(a.mode(), ConfigMode::ExternalRef);
+        assert_eq!(a.locator(), Some("file:///a"));
+        match a.body() {
+            SourceConfigBodyView::ExternalRef(locator) => assert_eq!(locator, "file:///a"),
+            SourceConfigBodyView::OpaqueJson(_) => panic!("ExternalRef dispatched as opaque"),
+        }
+
+        let payload = serde_json::json!({"model": "x"});
+        let opaque = SourceConfigRevision::validated(
+            config(),
+            ConfigMode::OpaqueJson,
+            None,
+            Some(payload.clone()),
+        );
+        assert_eq!(opaque.mode(), ConfigMode::OpaqueJson);
+        assert!(opaque.locator().is_none());
+        match opaque.body() {
+            SourceConfigBodyView::OpaqueJson(value) => assert_eq!(*value, payload),
+            SourceConfigBodyView::ExternalRef(_) => panic!("OpaqueJson dispatched as external"),
+        }
+    }
 }

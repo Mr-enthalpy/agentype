@@ -12,8 +12,7 @@ use agentype_agent_contract::{
 };
 use agentype_core::{Clock, Error, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::{
-    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SourceConfigBodyView,
-    SourceConfigRevision, SCHEMA_VERSION,
+    AgentTypeStatus, ConfigMode, Kernel, SourceConfigBody, SourceConfigBodyView, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1250,33 +1249,6 @@ fn status_setter_classifies_missing_overlay_as_corruption() {
 }
 
 #[test]
-fn source_config_revision_identity_includes_locator() {
-    let a = SourceConfigRevision {
-        config: base_config(VALID_DIGEST, Vec::new()),
-        mode: ConfigMode::ExternalRef,
-        locator: Some("file:///a.toml".into()),
-        payload: None,
-    };
-    let b = SourceConfigRevision {
-        config: base_config(VALID_DIGEST, Vec::new()),
-        mode: ConfigMode::ExternalRef,
-        locator: Some("file:///b.toml".into()),
-        payload: None,
-    };
-    let same = SourceConfigRevision {
-        config: base_config(VALID_DIGEST, Vec::new()),
-        mode: ConfigMode::ExternalRef,
-        locator: Some("file:///a.toml".into()),
-        payload: None,
-    };
-    // The metadata-only relation says equal...
-    assert!(a.config.same_config_contract_content(&b.config));
-    // ...but the complete durable revision identity does not.
-    assert!(!a.same_revision_content(&b));
-    assert!(a.same_revision_content(&same));
-}
-
-#[test]
 fn derived_agent_type_rejects_base_with_missing_overlay() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-db-{}", nanos()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1364,7 +1336,7 @@ fn spawn_source_rejects_corrupt_adapter_policy_dependency() {
 }
 
 #[test]
-fn source_config_revision_exposes_validated_body() {
+fn source_config_revision_body_matches_validated_mode() {
     let kernel = memory_kernel();
     publish_catalog(&kernel);
     kernel
@@ -1372,19 +1344,48 @@ fn source_config_revision_exposes_validated_body() {
         .unwrap();
     kernel.publish_spawn_source(&base_source()).unwrap();
 
+    // OpaqueJson: mode OpaqueJson, no locator, body is the validated payload.
     let payload = serde_json::json!({"model": "x", "provider": "y"});
-    let config = base_config(&canonical_json_body_digest(&payload), Vec::new());
+    let opaque = base_config(&canonical_json_body_digest(&payload), Vec::new());
     kernel
-        .publish_source_config(&config, &SourceConfigBody::OpaqueJson(payload.clone()))
+        .publish_source_config(&opaque, &SourceConfigBody::OpaqueJson(payload.clone()))
         .unwrap();
     let revision = kernel
-        .get_source_config_revision(&config.config_ref)
+        .get_source_config_revision(&opaque.config_ref)
         .unwrap()
         .unwrap();
-    assert_eq!(revision.mode, ConfigMode::OpaqueJson);
+    assert_eq!(revision.mode(), ConfigMode::OpaqueJson);
+    assert!(revision.locator().is_none());
     match revision.body() {
-        Some(SourceConfigBodyView::OpaqueJson(value)) => assert_eq!(*value, payload),
-        other => panic!("expected an opaque body, got {other:?}"),
+        SourceConfigBodyView::OpaqueJson(value) => assert_eq!(*value, payload),
+        SourceConfigBodyView::ExternalRef(_) => panic!("OpaqueJson dispatched as external"),
+    }
+
+    // ExternalRef: mode ExternalRef, locator present, body is the locator.
+    let mut external = base_config(
+        VALID_DIGEST,
+        vec![CredentialRef::new("vault://codex-prod").unwrap()],
+    );
+    external.config_ref =
+        SourceConfigRef::new(base_source().source_ref, "external-ref", 1).unwrap();
+    let locator = "file:///etc/codex/config.toml";
+    kernel
+        .publish_source_config(
+            &external,
+            &SourceConfigBody::ExternalRef {
+                locator: locator.into(),
+            },
+        )
+        .unwrap();
+    let revision = kernel
+        .get_source_config_revision(&external.config_ref)
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.mode(), ConfigMode::ExternalRef);
+    assert_eq!(revision.locator(), Some(locator));
+    match revision.body() {
+        SourceConfigBodyView::ExternalRef(value) => assert_eq!(value, locator),
+        SourceConfigBodyView::OpaqueJson(_) => panic!("ExternalRef dispatched as opaque"),
     }
 }
 

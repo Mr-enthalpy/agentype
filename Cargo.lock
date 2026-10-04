@@ -66,6 +66,7 @@ dependencies = [
  "agentype-core",
  "agentype-root-bridge",
  "agentype-runtime",
+ "agentype-storage-sqlite",
  "serde_json",
 ]
 
