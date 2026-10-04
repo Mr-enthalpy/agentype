@@ -4,21 +4,22 @@
 //! This stage does not provision anything: a new `LogicalAgent` is materialized
 //! only by M6-B.4. Matching therefore answers "which existing, immediately usable
 //! typed agent may execute this Task", applying the spec 06 semantic preference
-//! order:
+//! order.
 //!
-//! 1. exact / most-specific compatible resident agent
-//! 2. compatible narrower anchored type
-//! 3. compatible broader/general type
-//! 4. cold/revivable compatible logical agent
+//! A pinned requirement (`required_type = Some`) is satisfied only by the exact
+//! type or a **refinement** of it (`more_specific_for(candidate, required)`). A
+//! broader or semantically incomparable type has more authority than the pinned
+//! contract and is NOT an eligible substitute; broader/general compatibility
+//! belongs to future unpinned selection, not to a pin. Among eligible candidates,
+//! candidate-vs-candidate specificity (`more_specific_for`) MUST dominate soft and
+//! deterministic tie-breaks, so a strictly more-specific agent always ranks before
+//! a less-specific one. This is a partial order, so it is applied as
+//! dominance-count layers rather than a naive comparator. Nominal inheritance
+//! depth is never consulted.
 //!
-//! Only tier 1-3 are implemented in M6-B.3. A candidate here is necessarily M5
-//! `READY` and unassigned (the storage loader filters to that), so "cold/revivable"
-//! (tier 4) is deliberately **not** approximated from non-READY M5 states: M6
-//! revival/continuity is a later seam. Ranking MUST NOT use nominal inheritance
-//! depth.
-//!
-//! An unbound LogicalAgent (one with no exact AgentType binding) can never be
-//! returned for a typed requirement: there is no contract to prove `can_execute`.
+//! Only M5 `READY`, unassigned agents are candidates (the storage loader filters
+//! to that); tier 4 "cold/revivable" is deliberately not approximated from
+//! non-READY M5 states.
 
 use crate::capability::CapabilityCatalog;
 use crate::error::ContractError;
@@ -41,22 +42,15 @@ pub struct ExistingAgentCandidate {
     pub created_at: f64,
 }
 
-fn specificity_tier(
-    candidate: &ExistingAgentCandidate,
-    required: &AgentType,
+fn strictly_more_specific(
+    a: &AgentType,
+    b: &AgentType,
     req: &TaskAgentRequirement,
     catalog: &CapabilityCatalog,
-) -> u8 {
-    if candidate.agent_type.type_ref == required.type_ref {
-        return 0;
-    }
-    if more_specific_for(&candidate.agent_type, required, &req.hard, catalog) {
-        return 1;
-    }
-    if more_specific_for(required, &candidate.agent_type, &req.hard, catalog) {
-        return 3;
-    }
-    2
+) -> bool {
+    a.type_ref != b.type_ref
+        && more_specific_for(a, b, &req.hard, catalog)
+        && !more_specific_for(b, a, &req.hard, catalog)
 }
 
 /// Filter and rank existing bound, immediately usable agents for one Task
@@ -87,25 +81,46 @@ pub fn match_existing_agents(
         )));
     }
 
-    let mut eligible: Vec<ExistingAgentCandidate> = Vec::new();
-    for candidate in candidates {
-        if can_execute(&candidate.agent_type, &req.hard, catalog).is_err() {
-            continue;
-        }
-        if !candidate
-            .agent_type
-            .contract
-            .lifecycle
-            .contains(&candidate.lifecycle)
-        {
-            continue;
-        }
-        eligible.push(candidate.clone());
-    }
+    // Eligible = the exact type or a refinement of it, and able to execute the
+    // Task's hard requirement. Broader/incomparable types are not substitutes.
+    let mut eligible: Vec<ExistingAgentCandidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            can_execute(&candidate.agent_type, &req.hard, catalog).is_ok()
+                && candidate
+                    .agent_type
+                    .contract
+                    .lifecycle
+                    .contains(&candidate.lifecycle)
+                && (candidate.agent_type.type_ref == required.type_ref
+                    || more_specific_for(&candidate.agent_type, required, &req.hard, catalog))
+        })
+        .cloned()
+        .collect();
 
-    eligible.sort_by(|a, b| {
-        specificity_tier(a, required, req, catalog)
-            .cmp(&specificity_tier(b, required, req, catalog))
+    // Dominance layers: how many other eligible candidates are strictly more
+    // specific. Lower is better, and a strictly more-specific candidate always
+    // has a strictly lower count than the candidate it dominates.
+    let domination: Vec<usize> = eligible
+        .iter()
+        .map(|candidate| {
+            eligible
+                .iter()
+                .filter(|other| {
+                    strictly_more_specific(&other.agent_type, &candidate.agent_type, req, catalog)
+                })
+                .count()
+        })
+        .collect();
+
+    let mut indexed: Vec<(usize, ExistingAgentCandidate)> =
+        domination.into_iter().zip(eligible.drain(..)).collect();
+
+    indexed.sort_by(|(a_dom, a), (b_dom, b)| {
+        let exact = |c: &ExistingAgentCandidate| c.agent_type.type_ref == required.type_ref;
+        (if exact(a) { 0u8 } else { 1u8 })
+            .cmp(&if exact(b) { 0u8 } else { 1u8 })
+            .then_with(|| a_dom.cmp(b_dom))
             // Stronger continuity guarantee first (a ranking dimension applied
             // after compatibility, never part of semantic specificity).
             .then_with(|| {
@@ -130,5 +145,8 @@ pub fn match_existing_agents(
             .then_with(|| a.logical_agent_id.cmp(&b.logical_agent_id))
     });
 
-    Ok(eligible)
+    Ok(indexed
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect())
 }

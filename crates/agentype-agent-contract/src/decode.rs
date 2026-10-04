@@ -585,12 +585,11 @@ pub fn generation_policy_from_canonical_json(
     };
     Ok(GenerationPolicy {
         allowed_information_functions,
-        required_capabilities: capability_map_from(field(policy, "required_capabilities")?)?,
-        min_workspace: workspace_mode(&string_of(
-            field(policy, "min_workspace")?,
-            "min_workspace",
+        max_workspace: workspace_mode(&string_of(
+            field(policy, "max_workspace")?,
+            "max_workspace",
         )?)?,
-        min_network: network_policy(&string_of(field(policy, "min_network")?, "min_network")?)?,
+        max_network: network_policy(&string_of(field(policy, "max_network")?, "max_network")?)?,
         requires_attempt_isolation: field(policy, "requires_attempt_isolation")?
             .as_bool()
             .ok_or_else(|| err("requires_attempt_isolation must be boolean"))?,

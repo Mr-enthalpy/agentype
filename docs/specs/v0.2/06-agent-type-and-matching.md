@@ -287,14 +287,24 @@ authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
 A Generation that carries a policy MUST NOT be admitted through the legacy
 `admit_proposal` path; the policy is a generation-wide hard ceiling and legacy
 admission MUST fail closed. A Generation with no policy preserves legacy
-admission unchanged.
+admission unchanged. Folding a Generation policy is the spec 10 intersection: the
+Generation is an authority ceiling, so a Task requiring more workspace/network
+authority than the ceiling MUST fail closed, and a Task requiring less MUST keep
+its stricter value (the Generation never widens a Task). Full capability and
+sandbox ordering/intersection remains B.5.
 
-Existing-agent matching is the semantic-order list above, restricted to
-LogicalAgents that carry an exact `logical_agent_type_bindings` revision and are
-M5 `READY` and unassigned. Non-READY states are not treated as cold/revivable.
-A Task with a requirement MUST NOT be served by an unbound LogicalAgent; an
-unbound agent has no contract to prove `can_execute`. Ranking MUST NOT use
-nominal inheritance depth. Only exact-selector replay is idempotent; a `Latest`
-retry after the catalog advances MUST fail closed rather than re-pin. New-agent
-provisioning from an eligible SpawnSource, full physical eligibility
-(`can_provision_task`), and credentials remain M6-B.4/M6-B.5.
+Existing-agent matching is restricted to LogicalAgents that carry an exact
+`logical_agent_type_bindings` revision and are M5 `READY` and unassigned.
+Non-READY states are not treated as cold/revivable. A Task with a requirement
+MUST NOT be served by an unbound LogicalAgent; an unbound agent has no contract
+to prove `can_execute`. A **pinned** requirement is satisfied only by the exact
+type or a refinement of it (`more_specific_for(candidate, required)`); a broader
+or semantically incomparable type has more authority than the pin and is NOT a
+substitute (broader/general compatibility is for future unpinned selection).
+Among eligible candidates, semantic dominance (`more_specific_for`) MUST be
+applied before continuity/availability/identity tie-breaks, and ranking MUST NOT
+use nominal inheritance depth. Only exact-selector replay is idempotent, and an
+already-committed exact pin remains replayable even after its revision is
+deprecated; a `Latest` retry after the catalog advances MUST fail closed rather
+than re-pin. New-agent provisioning from an eligible SpawnSource, full physical
+eligibility (`can_provision_task`), and credentials remain M6-B.4/M6-B.5.

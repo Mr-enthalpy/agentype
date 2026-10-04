@@ -359,9 +359,8 @@ fn generation_policy_value(policy: &GenerationPolicy) -> Value {
             .iter()
             .map(|f| f.as_sql())
             .collect::<Vec<_>>(),
-        "required_capabilities": capability_map_value(&policy.required_capabilities),
-        "min_workspace": policy.min_workspace.as_sql(),
-        "min_network": network_str(policy.min_network),
+        "max_workspace": policy.max_workspace.as_sql(),
+        "max_network": network_str(policy.max_network),
         "requires_attempt_isolation": policy.requires_attempt_isolation,
         "min_continuity": continuity_str(policy.min_continuity),
         "sandbox_policy": sandbox_policy_value(&policy.sandbox_policy),

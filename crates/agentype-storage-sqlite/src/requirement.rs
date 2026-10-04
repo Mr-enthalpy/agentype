@@ -13,13 +13,13 @@
 use crate::catalog::{get_agent_type, load_capability_catalog};
 use crate::store::{map_sqlite, query_opt};
 use agentype_agent_contract::{
-    canonical_generation_policy_bytes, canonical_task_agent_requirement_bytes,
+    can_execute, canonical_generation_policy_bytes, canonical_task_agent_requirement_bytes,
     canonicalize_generation_policy, canonicalize_task_agent_requirement, content_digest,
     fold_generation_policy, generation_policy_content_digest,
     generation_policy_from_canonical_json, match_existing_agents, resolve_selector,
     task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
-    AgentRequirementDraft, AgentTypeRef, ContinuityMode, ExistingAgentCandidate, GenerationPolicy,
-    LifecycleMode, TaskAgentRequirement,
+    AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, ContinuityMode, ExistingAgentCandidate,
+    GenerationPolicy, LifecycleMode, TaskAgentRequirement,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, TaskId,
@@ -153,11 +153,13 @@ pub fn get_task_agent_requirement(
 /// Resolve a pre-commit `AgentRequirementDraft` into the canonical durable
 /// requirement for one admitted Task, folding its Generation's policy.
 ///
-/// The exact `required_type` is resolved through the validated catalog lookup.
+/// Initial admission only: an exact selector MUST currently be `PUBLISHED`.
+/// Replay uses [`build_task_agent_requirement_replay`], which additionally
+/// accepts an already-committed exact revision even if it was later deprecated.
+///
 /// The dimensions a `TaskSpec` owns are derived from it (single authority), and
 /// a `Required` continuity preference becomes a hard `Logical` requirement. The
-/// result is canonicalized but NOT persisted; the typed admission transaction
-/// inserts it atomically with its Task and binding.
+/// result is canonicalized but NOT persisted.
 pub fn build_task_agent_requirement(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
@@ -165,22 +167,86 @@ pub fn build_task_agent_requirement(
     information_function: InformationFunction,
     task_spec: &TaskSpec,
 ) -> Result<TaskAgentRequirement, Error> {
-    let required_type = match &draft.required_type {
-        None => None,
-        Some(selector) => {
-            let lookup = crate::catalog::load_agent_type_lookup(tx)?;
-            let resolved = resolve_selector(selector, &lookup).map_err(contract_fault)?;
-            get_agent_type(tx, &resolved)?.ok_or_else(|| {
+    let required_type = resolve_draft_selector(tx, &draft, None)?;
+    let requirement = derive_task_agent_requirement(
+        tx,
+        generation_id,
+        draft,
+        information_function,
+        task_spec,
+        required_type,
+    )?;
+    validate_pinned_type_can_execute(tx, &requirement)?;
+    Ok(requirement)
+}
+
+/// Replay of an already-admitted typed proposal. An exact selector that equals
+/// the committed pin is accepted against the exact immutable catalog revision
+/// (validated content, `PUBLISHED` or `DEPRECATED`), because deprecation is
+/// operational disposition drift, not corruption. Any other selector resolves
+/// against the current published catalog, so `Latest` drift still fails closed.
+pub fn build_task_agent_requirement_replay(
+    tx: &Transaction<'_>,
+    generation_id: &GenerationId,
+    draft: AgentRequirementDraft,
+    information_function: InformationFunction,
+    task_spec: &TaskSpec,
+    committed_pin: &Option<AgentTypeRef>,
+) -> Result<TaskAgentRequirement, Error> {
+    let required_type = resolve_draft_selector(tx, &draft, committed_pin.as_ref())?;
+    derive_task_agent_requirement(
+        tx,
+        generation_id,
+        draft,
+        information_function,
+        task_spec,
+        required_type,
+    )
+}
+
+/// Resolve a draft's selector to an exact revision. `committed` is the pin of an
+/// already-admitted requirement being replayed; an exact selector equal to it is
+/// accepted even when deprecated.
+fn resolve_draft_selector(
+    tx: &Transaction<'_>,
+    draft: &AgentRequirementDraft,
+    committed: Option<&AgentTypeRef>,
+) -> Result<Option<AgentTypeRef>, Error> {
+    let Some(selector) = &draft.required_type else {
+        return Ok(None);
+    };
+    if let (AgentTypeSelector::Exact(reference), Some(committed)) = (selector, committed) {
+        if reference == committed {
+            get_agent_type(tx, reference)?.ok_or_else(|| {
                 Error::not_found(format!(
                     "agent type {}@{} does not exist",
-                    resolved.id().as_str(),
-                    resolved.revision()
+                    reference.id().as_str(),
+                    reference.revision()
                 ))
             })?;
-            Some(resolved)
+            return Ok(Some(reference.clone()));
         }
-    };
+    }
+    let lookup = crate::catalog::load_agent_type_lookup(tx)?;
+    let resolved = resolve_selector(selector, &lookup).map_err(contract_fault)?;
+    get_agent_type(tx, &resolved)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "agent type {}@{} does not exist",
+            resolved.id().as_str(),
+            resolved.revision()
+        ))
+    })?;
+    Ok(Some(resolved))
+}
 
+fn derive_task_agent_requirement(
+    tx: &Transaction<'_>,
+    generation_id: &GenerationId,
+    draft: AgentRequirementDraft,
+    information_function: InformationFunction,
+    task_spec: &TaskSpec,
+    required_type: Option<AgentTypeRef>,
+) -> Result<TaskAgentRequirement, Error> {
     let required_affinity: BTreeSet<String> = task_spec.affinity_tags.iter().cloned().collect();
     // A `Required` continuity preference becomes a hard `Logical` requirement.
     // `Preferred` is a soft dimension that M6-B.3 does not rank on (it is not
@@ -191,7 +257,7 @@ pub fn build_task_agent_requirement(
     };
 
     let mut requirement = draft.into_requirement(
-        required_type,
+        required_type.clone(),
         information_function,
         required_affinity,
         task_spec.workspace_mode,
@@ -205,7 +271,30 @@ pub fn build_task_agent_requirement(
             fold_generation_policy(&policy, &requirement.hard).map_err(contract_fault)?;
     }
     requirement.normalize(&catalog).map_err(contract_fault)?;
+
     Ok(requirement)
+}
+
+/// The pinned contract MUST be able to execute its own effective requirement;
+/// otherwise the Task is unsatisfiable and initial admission fails closed. This
+/// is an admission-time check only: a replay compares the incoming requirement
+/// against the committed one and reports a Conflict on any difference.
+fn validate_pinned_type_can_execute(
+    tx: &Transaction<'_>,
+    requirement: &TaskAgentRequirement,
+) -> Result<(), Error> {
+    let Some(reference) = &requirement.required_type else {
+        return Ok(());
+    };
+    let (agent_type, _status) = get_agent_type(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "agent type {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+    let catalog = load_capability_catalog(tx)?;
+    can_execute(&agent_type, &requirement.hard, &catalog).map_err(contract_fault)
 }
 
 // =============================================================================

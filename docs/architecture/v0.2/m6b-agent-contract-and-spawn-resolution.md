@@ -492,35 +492,40 @@ Rules now enforced:
   `Latest` retry after the catalog advanced re-resolves to the new revision and
   fails closed as a Conflict rather than silently re-pinning.
 - **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
-  ceiling fixed at `create_generation`. The effective hard requirement is the
-  join of the policy and the Task requirement; a Task that would widen the
-  Generation's information-function set, affinity, anchor, sandbox policy, or
-  capability constraints fails closed. Automated policy-governed admission stays
-  deferred (M6-A).
-- **Generation policy is a floor, not a source config.** The policy is expressed
-  in the same coarse vocabulary as `TaskRequirement`; it never carries model or
-  provider semantics.
+  ceiling fixed at `create_generation`. It is the frozen spec 10 **intersection**:
+  the Generation is an authority ceiling, so a Task that requires more
+  workspace/network authority than the ceiling fails closed, and a Task that
+  requires less keeps its stricter value. Information-function, affinity, anchor,
+  continuity, sandbox-policy, and budget constraints fold the same way. Automated
+  policy-governed admission stays deferred (M6-A); full capability and sandbox
+  ordering/intersection stays B.5.
+- **Generation policy is an authority ceiling, not a source config.** The policy
+  is expressed in the same coarse vocabulary as `TaskRequirement`; it never
+  carries model or provider semantics.
 - **Write-once binding.** `logical_agent_type_bindings` mints one exact revision
   per LogicalAgent. Changing an agent's type is a future Transform, never an
   in-place update. This is operator provisioning authority, surfaced through
   `ProvisioningAdmin`, deliberately separate from `RootSemanticControl`
   (`M6A-B9`).
-- **No untyped substitution.** A Task with a requirement is matched only against
-  bound, compatible agents; an unbound LogicalAgent has no contract to prove
-  `can_execute` and is never returned. Matching is a pure read: it consults no
-  `SpawnSource` and writes nothing.
+- **No untyped substitution; a pin accepts only exact or refinement.** A Task
+  with a requirement is matched only against bound, compatible agents; an unbound
+  LogicalAgent has no contract to prove `can_execute` and is never returned. A
+  pinned requirement is satisfied only by the exact type or a refinement of it
+  (`more_specific_for(candidate, required)`); a broader or semantically
+  incomparable type has more authority than the pin and is not a substitute.
+  Broader/general compatibility belongs to future unpinned selection. Matching is
+  a pure read: it consults no `SpawnSource` and writes nothing.
 - **Only immediately usable candidates.** A candidate is an M5 `READY` and
   unassigned bound LogicalAgent. Non-READY states (`ASSIGNED`, `DRAINING`,
   `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
   revival is a later seam. The `Retention`-to-`LifecycleMode` mapping is exact
   (`resident`/`ephemeral`); `LifecycleMode::Revivable` is not faked.
-- **Semantic ranking, not inheritance depth.** Existing agents are ordered by
-  spec 06: exact type before a more specific compatible type, before an
-  incomparable/equivalent type, before a broader type, with a stable
-  `(type_id, revision, logical_agent_id)` tie-break. Stronger continuity is a
-  post-compatibility ranking dimension. Nominal inheritance depth is never
-  consulted. B.3 exposes no caller-controlled soft-preference switch, because
-  spec 06 mandates this order.
+- **Semantic dominance before soft tie-breaks.** Candidate-vs-candidate
+  specificity (`more_specific_for`) is applied as dominance-count layers, so a
+  strictly more-specific eligible agent always ranks before a less-specific one;
+  only then do continuity, availability, and stable identity tie-breaks apply.
+  Nominal inheritance depth is never consulted, and B.3 exposes no
+  caller-controlled soft-preference switch.
 
 Full physical eligibility (`can_provision_task`, active adapter policy, exact
 binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.

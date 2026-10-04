@@ -146,9 +146,8 @@ fn requirement_digest_ignores_affinity_order_and_bool_false() {
 fn policy() -> GenerationPolicy {
     GenerationPolicy {
         allowed_information_functions: vec![InformationFunction::Expand],
-        required_capabilities: BTreeMap::new(),
-        min_workspace: WorkspaceMode::Write,
-        min_network: NetworkPolicy::Restricted,
+        max_workspace: WorkspaceMode::Write,
+        max_network: NetworkPolicy::Enabled,
         requires_attempt_isolation: false,
         min_continuity: ContinuityMode::Logical,
         sandbox_policy: None,
@@ -159,12 +158,42 @@ fn policy() -> GenerationPolicy {
 }
 
 #[test]
-fn generation_policy_fold_strengthens_task_dimensions() {
+fn generation_policy_fold_keeps_the_stricter_task_and_caps_authority() {
+    // Generation caps at Write/Enabled; a ReadOnly Task keeps ReadOnly.
     let effective = fold_generation_policy(&policy(), &task_requirement()).unwrap();
-    assert_eq!(effective.required_workspace, WorkspaceMode::Write);
+    assert_eq!(effective.required_workspace, WorkspaceMode::ReadOnly);
+    assert_eq!(effective.required_network, NetworkPolicy::Restricted);
     assert_eq!(effective.required_continuity, ContinuityMode::Logical);
     assert_eq!(effective.budget, budget(10.0));
-    assert_eq!(effective.required_network, NetworkPolicy::Restricted);
+}
+
+#[test]
+fn generation_policy_fold_rejects_a_task_that_exceeds_the_ceiling() {
+    // Generation forbids Write: a Write Task must fail closed.
+    let mut read_only_policy = policy();
+    read_only_policy.max_workspace = WorkspaceMode::ReadOnly;
+    let mut write_task = task_requirement();
+    write_task.required_workspace = WorkspaceMode::Write;
+    assert!(matches!(
+        fold_generation_policy(&read_only_policy, &write_task),
+        Err(ContractError::GenerationPolicyConflict { .. })
+    ));
+
+    // Generation forbids network: an Enabled Task must fail closed.
+    let mut no_network_policy = policy();
+    no_network_policy.max_network = NetworkPolicy::Disabled;
+    let mut networked_task = task_requirement();
+    networked_task.required_network = NetworkPolicy::Enabled;
+    assert!(matches!(
+        fold_generation_policy(&no_network_policy, &networked_task),
+        Err(ContractError::GenerationPolicyConflict { .. })
+    ));
+
+    // A stricter Task under a wider ceiling keeps its own value.
+    let mut disabled_task = task_requirement();
+    disabled_task.required_network = NetworkPolicy::Disabled;
+    let effective = fold_generation_policy(&policy(), &disabled_task).unwrap();
+    assert_eq!(effective.required_network, NetworkPolicy::Disabled);
 }
 
 #[test]
@@ -196,35 +225,9 @@ fn generation_policy_fold_rejects_widening() {
 }
 
 #[test]
-fn generation_policy_incompatible_capability_join_fails_closed() {
-    let mut catalog = catalog();
-    catalog
-        .define(
-            cref("env.name", 1),
-            MatcherKind::Exact,
-            SecurityClass::Functional,
-            CapabilityPolarity::Ability,
-        )
-        .unwrap();
-
-    let mut policy = policy();
-    policy.required_capabilities.insert(
-        cref("env.name", 1),
-        CapabilityValue::Exact(serde_json::json!("prod")),
-    );
-    let mut req = task_requirement();
-    req.required_capabilities.insert(
-        cref("env.name", 1),
-        CapabilityValue::Exact(serde_json::json!("dev")),
-    );
-
-    assert!(matches!(
-        fold_generation_policy(&policy, &req),
-        Err(ContractError::RequirementConflict { .. })
-    ));
-
-    // A digest computed over the policy is stable and decodes back identically.
-    let mut canonical = policy.clone();
+fn generation_policy_round_trips_canonically() {
+    let catalog = catalog();
+    let mut canonical = policy();
     canonicalize_generation_policy(&mut canonical, &catalog).unwrap();
     let json = String::from_utf8(canonical_generation_policy_bytes(&canonical)).unwrap();
     assert_eq!(
@@ -332,4 +335,62 @@ fn matching_orders_exact_then_specific_then_deterministic() {
     );
     let matched = match_existing_agents(&required, &req, &[b, a], &catalog).unwrap();
     assert_eq!(matched[0].logical_agent_id.as_str(), "agent-a");
+}
+
+#[test]
+fn matching_prefers_candidate_specificity_before_availability() {
+    let catalog = catalog();
+    let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
+    let req = TaskAgentRequirement {
+        required_type: Some(required.type_ref.clone()),
+        hard: task_requirement(),
+    };
+
+    // Both A and B are refinements of the required type; A is strictly more
+    // specific (subset affinity, lower budget). B has an earlier available_since.
+    let a = candidate(
+        "agent-a",
+        agent(
+            "rust-reviewer",
+            2,
+            AffinityConstraint::Only(set(&["rust"])),
+            50.0,
+        ),
+        Some(9.0),
+    );
+    let b = candidate(
+        "agent-b",
+        agent(
+            "rust-reviewer",
+            3,
+            AffinityConstraint::Only(set(&["rust"])),
+            80.0,
+        ),
+        Some(1.0),
+    );
+    // A broader type and a semantically incomparable type are NOT substitutes
+    // for a pinned requirement, even though both can execute the Task.
+    let broader = candidate(
+        "agent-broad",
+        agent("generalist", 1, AffinityConstraint::Any, 300.0),
+        Some(0.0),
+    );
+    let incomparable = candidate(
+        "agent-incomparable",
+        agent("odd", 1, AffinityConstraint::Only(set(&["rust"])), 300.0),
+        Some(0.0),
+    );
+
+    let matched = match_existing_agents(
+        &required,
+        &req,
+        &[broader, incomparable, b.clone(), a.clone()],
+        &catalog,
+    )
+    .unwrap();
+    let order: Vec<&str> = matched
+        .iter()
+        .map(|c| c.logical_agent_id.as_str())
+        .collect();
+    assert_eq!(order, vec!["agent-a", "agent-b"]);
 }

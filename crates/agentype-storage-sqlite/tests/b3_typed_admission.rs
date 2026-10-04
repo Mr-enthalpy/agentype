@@ -14,7 +14,7 @@ use agentype_core::{
     PartitionSpec, ProposalStateKind, RawWorkIntent, Retention, SemanticInputSet, TaskSpec,
     TaskState, WorkspaceMode,
 };
-use agentype_storage_sqlite::Kernel;
+use agentype_storage_sqlite::{AgentTypeStatus, Kernel};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,9 +32,8 @@ fn nanos() -> u128 {
 fn sample_policy() -> GenerationPolicy {
     GenerationPolicy {
         allowed_information_functions: vec![InformationFunction::Expand],
-        required_capabilities: BTreeMap::new(),
-        min_workspace: WorkspaceMode::Write,
-        min_network: NetworkPolicy::Restricted,
+        max_workspace: WorkspaceMode::Write,
+        max_network: NetworkPolicy::Enabled,
         requires_attempt_isolation: false,
         min_continuity: ContinuityMode::Logical,
         sandbox_policy: None,
@@ -283,9 +282,45 @@ fn generation_policy_folds_into_typed_requirement() {
         .get_task_agent_requirement(&task_id)
         .unwrap()
         .unwrap();
-    // The generation-wide ceiling/floor strengthens the Task requirement.
-    assert_eq!(requirement.hard.required_workspace, WorkspaceMode::Write);
+    // The generation is an authority ceiling: the ReadOnly Task keeps ReadOnly,
+    // and the ceiling still tightens the budget.
+    assert_eq!(requirement.hard.required_workspace, WorkspaceMode::ReadOnly);
     assert_eq!(requirement.hard.budget, Budget::new(10.0).unwrap());
+}
+
+#[test]
+fn policy_generation_rejects_a_task_that_exceeds_the_ceiling() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let mut policy = sample_policy();
+    policy.max_workspace = WorkspaceMode::ReadOnly;
+    let gen = kernel
+        .create_generation_with_policy(json!({}), Some(policy))
+        .unwrap();
+    let intent = RawWorkIntent {
+        raw_intent_key: "typed_work".into(),
+        objective: "typed work".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        // A Write Task exceeds the generation's ReadOnly ceiling.
+        suggested_task_spec: Some(
+            TaskSpec::new("audit", json!({}))
+                .partition("general")
+                .write(),
+        ),
+    };
+    let proposal = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    let err = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
 }
 
 #[test]
@@ -701,4 +736,38 @@ fn latest_selector_replay_is_stable_until_catalog_drifts() {
         )
         .unwrap();
     assert_eq!(task, exact);
+}
+
+#[test]
+fn exact_replay_survives_deprecation() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin.clone()))
+        .unwrap();
+
+    kernel
+        .set_agent_type_status(&pin, AgentTypeStatus::Deprecated)
+        .unwrap();
+
+    // A fresh pre-commit selection of the deprecated exact revision fails closed.
+    let fresh = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit2", json!({})).partition("general"),
+    );
+    let err = kernel
+        .admit_typed_proposal(&fresh.proposal_id, 0, None, draft(pin.clone()))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+
+    // Replaying the already-committed exact admission still returns the same Task:
+    // deprecation is disposition drift, not loss of committed identity.
+    let replay = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    assert_eq!(task, replay);
 }

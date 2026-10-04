@@ -9,13 +9,13 @@
 //! canonicalization.
 //!
 //! `GenerationPolicy` closes the `D-GEN-POLICY` interface for M6-B.3: a Generation
-//! MAY carry an immutable, generation-wide requirement ceiling, and the effective
-//! hard requirement is the deterministic *join* (stronger of the two) of that
-//! policy with the Task's own requirement. A Task can never widen its Generation.
+//! MAY carry an immutable, generation-wide **authority ceiling** (spec 10
+//! intersection), and the effective hard requirement is the stricter of the
+//! policy ceiling and the Task's own requirement. A Task can never widen its
+//! Generation, and a Task that exceeds the ceiling fails closed. Full
+//! capability/sandbox intersection remains B.5.
 
-use crate::capability::{
-    join_requirement_values, CapabilityCatalog, CapabilityRef, CapabilityValue,
-};
+use crate::capability::{CapabilityCatalog, CapabilityRef, CapabilityValue};
 use crate::error::ContractError;
 use crate::records::{
     network_rank, workspace_rank, AgentTypeRef, Budget, ContinuityMode, NetworkPolicy,
@@ -137,20 +137,28 @@ fn validate_requirement_capabilities(
     Ok(())
 }
 
-/// An immutable, generation-wide hard requirement ceiling.
+/// An immutable, generation-wide **authority ceiling** (spec 10 intersection).
 ///
-/// It uses the same coarse dimensions as [`TaskRequirement`]; the fold keeps the
-/// stronger of the policy and the Task on every dimension. It MUST NOT be edited
-/// after `create_generation`: a change is a new Generation.
+/// The Generation contributes the maximum authority any Task in it may use, not a
+/// floor: a Task whose requirement exceeds the ceiling is rejected, and a Task
+/// that asks for less keeps its stricter value. Full capability/sandbox
+/// intersection is deferred to B.5; this covers the frozen coarse
+/// workspace/network/isolation/continuity dimensions. It MUST NOT be edited after
+/// `create_generation`: a change is a new Generation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationPolicy {
     /// Information functions this Generation admits. MUST be non-empty.
     pub allowed_information_functions: Vec<InformationFunction>,
-    pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
-    pub min_workspace: WorkspaceMode,
-    pub min_network: NetworkPolicy,
+    /// Maximum workspace authority any Task may use (`ReadOnly` < `Write`).
+    pub max_workspace: WorkspaceMode,
+    /// Maximum network authority any Task may use
+    /// (`Disabled` < `Restricted` < `Enabled`).
+    pub max_network: NetworkPolicy,
+    /// Every Task in this Generation requires attempt isolation.
     pub requires_attempt_isolation: bool,
+    /// Minimum continuity guarantee every Task must carry.
     pub min_continuity: ContinuityMode,
+    /// The exact sandbox policy every Task must use, when pinned.
     pub sandbox_policy: Option<SandboxPolicyRef>,
     pub budget_ceiling: Budget,
     /// `None` = any affinity; `Some(S)` = Task affinity tags MUST be a subset.
@@ -160,13 +168,13 @@ pub struct GenerationPolicy {
 }
 
 impl GenerationPolicy {
-    pub fn validate(&self, catalog: &CapabilityCatalog) -> Result<(), ContractError> {
+    pub fn validate(&self, _catalog: &CapabilityCatalog) -> Result<(), ContractError> {
         if self.allowed_information_functions.is_empty() {
             return Err(ContractError::InvariantViolation(
                 "a generation policy must allow at least one information function".into(),
             ));
         }
-        validate_requirement_capabilities(&self.required_capabilities, catalog)
+        Ok(())
     }
 
     pub fn normalize(&mut self, catalog: &CapabilityCatalog) -> Result<(), ContractError> {
@@ -174,14 +182,6 @@ impl GenerationPolicy {
         self.allowed_information_functions
             .sort_by_key(|f| f.as_sql());
         self.allowed_information_functions.dedup();
-        let mut out = BTreeMap::new();
-        for (reference, value) in std::mem::take(&mut self.required_capabilities) {
-            if !value.is_present() {
-                continue;
-            }
-            out.insert(reference, value);
-        }
-        self.required_capabilities = out;
         Ok(())
     }
 }
@@ -200,9 +200,10 @@ fn sandbox_fold(
     }
 }
 
-/// Fold a Generation policy into a Task requirement: the effective hard
-/// requirement is the stronger of the two on every dimension. A Task can never
-/// widen its Generation's authority; a widening attempt fails closed.
+/// Fold a Generation policy into a Task requirement as the frozen spec 10
+/// **intersection**: the Generation is a ceiling on authority, so a Task that
+/// requires more authority than the ceiling fails closed, and a Task that
+/// requires less keeps its stricter value. The Generation never widens a Task.
 pub fn fold_generation_policy(
     policy: &GenerationPolicy,
     task: &TaskRequirement,
@@ -234,61 +235,33 @@ pub fn fold_generation_policy(
         }
     }
 
-    let mut required_capabilities = task.required_capabilities.clone();
-    for (reference, policy_value) in &policy.required_capabilities {
-        if !policy_value.is_present() {
-            continue;
-        }
-        match required_capabilities.get(reference).cloned() {
-            None => {
-                required_capabilities.insert(reference.clone(), policy_value.clone());
-            }
-            Some(task_value) => {
-                let Some(joined) =
-                    join_requirement_values(task_value.matcher_kind(), &task_value, policy_value)
-                else {
-                    return Err(ContractError::RequirementConflict {
-                        reason: format!(
-                            "generation policy value for {}@{} is incompatible with the task requirement",
-                            reference.capability_id().as_str(),
-                            reference.revision()
-                        ),
-                    });
-                };
-                required_capabilities.insert(reference.clone(), joined);
-            }
-        }
+    // The ceiling must not be exceeded; the Task's own (stricter) value survives.
+    if workspace_rank(task.required_workspace) > workspace_rank(policy.max_workspace) {
+        return Err(ContractError::GenerationPolicyConflict {
+            reason: "task workspace authority exceeds the generation ceiling".into(),
+        });
     }
-
-    let workspace =
-        if workspace_rank(policy.min_workspace) >= workspace_rank(task.required_workspace) {
-            policy.min_workspace
-        } else {
-            task.required_workspace
-        };
-    let network = if network_rank(policy.min_network) >= network_rank(task.required_network) {
-        policy.min_network
-    } else {
-        task.required_network
-    };
-    let continuity = policy.min_continuity.max(task.required_continuity);
-    let budget = if policy.budget_ceiling <= task.budget {
-        policy.budget_ceiling
-    } else {
-        task.budget
-    };
+    if network_rank(task.required_network) > network_rank(policy.max_network) {
+        return Err(ContractError::GenerationPolicyConflict {
+            reason: "task network authority exceeds the generation ceiling".into(),
+        });
+    }
 
     Ok(TaskRequirement {
         information_function: task.information_function,
-        required_capabilities,
+        required_capabilities: task.required_capabilities.clone(),
         required_affinity: task.required_affinity.clone(),
-        required_workspace: workspace,
-        required_network: network,
+        required_workspace: task.required_workspace,
+        required_network: task.required_network,
         required_attempt_isolation: policy.requires_attempt_isolation
             || task.required_attempt_isolation,
-        required_continuity: continuity,
+        required_continuity: policy.min_continuity.max(task.required_continuity),
         sandbox_policy: sandbox_fold(&policy.sandbox_policy, &task.sandbox_policy)?,
         required_anchor: task.required_anchor.clone(),
-        budget,
+        budget: if policy.budget_ceiling <= task.budget {
+            policy.budget_ceiling
+        } else {
+            task.budget
+        },
     })
 }

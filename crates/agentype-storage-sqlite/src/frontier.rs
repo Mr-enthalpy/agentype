@@ -1087,14 +1087,6 @@ fn admit_proposal_core(
                     )
                     .map_err(map_sqlite)?;
                 let admitted_spec = task_spec_from_json(&json_load(&admitted_spec_str)?)?;
-                let generation_id = GenerationId::from_string(gid.clone());
-                let expected = crate::requirement::build_task_agent_requirement(
-                    tx,
-                    &generation_id,
-                    draft,
-                    info_fn,
-                    &admitted_spec,
-                )?;
                 let existing_task = TaskId::from_string(existing_tid.clone());
                 let committed = crate::requirement::get_task_agent_requirement(tx, &existing_task)?
                     .ok_or_else(|| {
@@ -1102,6 +1094,18 @@ fn admit_proposal_core(
                             "typed replay of an admission that has no agent requirement",
                         )
                     })?;
+                let generation_id = GenerationId::from_string(gid.clone());
+                // Replay accepts the committed exact pin even if the revision was
+                // later deprecated; a `Latest` selector still resolves against the
+                // current published catalog and fails closed on drift.
+                let expected = crate::requirement::build_task_agent_requirement_replay(
+                    tx,
+                    &generation_id,
+                    draft,
+                    info_fn,
+                    &admitted_spec,
+                    &committed.required_type,
+                )?;
                 if task_agent_requirement_content_digest(&committed)
                     != task_agent_requirement_content_digest(&expected)
                 {

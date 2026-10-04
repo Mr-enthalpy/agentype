@@ -112,8 +112,9 @@ M6-B.3 typed admission and matching MUST cover:
 - the requirement's TaskSpec-owned dimensions (information function, affinity,
   workspace, continuity) are derived from the admitted TaskSpec, not duplicated
   by the caller
-- a Generation policy folds into the requirement as a generation-wide ceiling;
-  a Task that would widen it fails closed
+- a Generation policy folds into the requirement as a spec 10 authority ceiling:
+  a Task exceeding the workspace/network ceiling fails closed, and a stricter
+  Task under a wider ceiling keeps its own value
 - a policy-bearing Generation rejects legacy `admit_proposal` before any write
   (proposal PENDING, no Task), while a no-policy Generation keeps M6-A legacy
   admission working
@@ -124,16 +125,18 @@ M6-B.3 typed admission and matching MUST cover:
 - a mixed queue still dispatches the legacy (no-requirement) Task past a
   quarantined typed Task
 - exact typed replay returns the same Task while a conflicting requirement is a
-  `Conflict`; only exact-selector replay is idempotent, and a `Latest` retry
-  after catalog drift fails closed
-- matching returns only bound, M5 `READY`, unassigned, compatible agents; a
-  non-ready agent is never returned as a "cold" candidate and matching writes
-  nothing
+  `Conflict`; only exact-selector replay is idempotent, an already-committed exact
+  pin stays replayable after deprecation, and a `Latest` retry after catalog drift
+  fails closed
+- matching returns only bound, M5 `READY`, unassigned, compatible agents
+  satisfying the exact pin or a refinement of it; broader/incomparable agents and
+  non-ready states are never returned, and matching writes nothing
+- ranking applies candidate-vs-candidate semantic dominance before
+  continuity/availability/identity tie-breaks and never uses nominal inheritance
+  depth; no caller-controlled soft preference can override it
 - `logical_agent_type_bindings` is write-once and requires a validated exact
   revision; `task_agent_requirements` and `generation_policies` are immutable,
   enforced mechanically by SQLite
-- ranking follows the spec 06 semantic order and never uses nominal inheritance
-  depth; no caller-controlled soft preference can override it
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

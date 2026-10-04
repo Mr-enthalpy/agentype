@@ -42,8 +42,9 @@ catalog:
 - `logical_agent_type_bindings` is immutable and write-once: one exact
   `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
   change is a new binding, never an in-place type mutation.
-- `generation_policies` is immutable: a generation-wide requirement ceiling is
-  fixed at generation creation and folded into each typed admission.
+- `generation_policies` is immutable: a generation-wide authority ceiling is
+  fixed at generation creation and applied as the spec 10 intersection on each
+  typed admission (a Task exceeding it fails closed).
 - all three tables MUST reject `UPDATE`/`DELETE` mechanically (SQLite triggers),
   so direct SQL cannot rewrite a requirement, rebind an agent, or mutate a
   policy.
