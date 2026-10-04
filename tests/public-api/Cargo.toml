@@ -29,3 +29,9 @@ agentype-root-bridge = { path = "../../crates/agentype-root-bridge" }
 # enforcement evidence must have no constructor on the default surface.
 agentype-agent-contract = { path = "../../crates/agentype-agent-contract" }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The internal storage crate is not a supported production dependency, but the
+# boundary fixture uses it (in a `compile_fail` probe only) to prove that the
+# validated SourceConfig revision type has no externally reachable constructor.
+agentype-storage-sqlite = { path = "../../crates/agentype-storage-sqlite" }

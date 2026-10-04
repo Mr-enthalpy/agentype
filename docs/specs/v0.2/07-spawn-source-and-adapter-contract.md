@@ -33,7 +33,10 @@ A published SpawnSource revision is immutable content:
 
 Similarly, a SourceConfig's exact revision is immutable content; a config
 disposition is a separate mutable overlay. B.2 MUST persist these as distinct
-tables so immutability and digest stability are not blurred.
+tables so immutability and digest stability are not blurred. A fresh revision
+MUST persist the caller's initial disposition; it MUST NOT silently substitute
+`ACTIVE`, and re-publishing an existing exact revision MUST NOT mutate the live
+disposition.
 
 A resolved view that composes revision content with the live disposition MUST
 NOT hide the disposition behind a non-intuitive equality: ordinary `==` includes

@@ -149,6 +149,65 @@ locator (model/provider/CLI/config-file semantics) belongs to the source
 integration and is not part of AgentType semantics; Core MUST NOT interpret it,
 and it need not be stored in `agentype-agent-contract`.
 
+## Catalog persistence (M6-B.2)
+
+AgentType, SpawnSource, SourceConfig, capability definitions, and
+AdapterBindingPolicy revisions MUST be persisted immutably. Each published exact
+revision has a canonical content encoding and a Core-computed content digest:
+
+- republishing the same exact `(ref, content digest)` is idempotent; a different
+  canonical content for an already-published exact revision MUST fail closed;
+- the canonical encoding MUST be permutation-stable (set-like sequences sorted
+  and deduped), MUST recursively sort object keys so the bytes are independent
+  of the JSON library's map feature configuration, and MUST encode `Bool(false)`
+  as omission, so one logical revision has exactly one digest;
+- at most one claim per exact `CapabilityRef` may survive; an `ENFORCED`
+  declaration supersedes `DECLARED` ones, and two surviving declarations with
+  the same value but a different `declaration_provenance_ref` are ambiguous and
+  MUST fail closed (provenance is diagnostic, never an input-order tie-break);
+- a derived AgentType's `based_on` provenance MUST be verified against the base
+  loaded through its validated read (canonical content, mirror, and present
+  overlay), and the derived contract MUST pass `is_valid_refinement` before it is
+  published; a corrupt base MUST fail closed and MUST NOT authorize a new
+  immutable revision. A new revision that references another catalog revision
+  (AgentType `based_on`, SpawnSource `adapter_policy`) MUST likewise resolve that
+  dependency through its validated read, not merely check that the row exists;
+- publication and deprecation status is a mutable **disposition overlay** that
+  MUST NOT enter the revision content or its digest; a fresh publication MUST
+  persist the caller's initial disposition (never silently substitute
+  `ACTIVE`), dispositions only advance, repeating the current disposition MUST be
+  an idempotent no-op that preserves the transition timestamp, and a revision row
+  whose overlay is missing is corruption that MUST fail closed with one meaning
+  everywhere (reads, setters, idempotent republish, and selector resolution). An
+  existing exact revision's overlay MUST NOT be created or repaired by
+  publication. The immutable-content and monotonic-disposition boundary MUST
+  also be enforced mechanically by SQLite triggers, not only by the Kernel API;
+- a read at the catalog boundary MUST verify the stored content digest against
+  the stored canonical document, **re-canonicalize** the decoded record (decode
+  -> canonicalize against the catalog -> re-encode -> byte equality; a
+  self-consistent but non-canonical row MUST fail), and cross-check every
+  duplicated relational column against that document, so the digest is a
+  durability witness rather than publication-time metadata and no mirror column
+  becomes a second authority;
+- pre-commit `AgentTypeSelector` resolution MUST use the same validated read for
+  its published set, so a corrupt published revision (including a missing
+  overlay) fails the whole lookup closed rather than remaining selectable or
+  causing `Latest` to fall back through a weaker path;
+- an idempotent republish of an existing exact revision MUST re-run the
+  validated read before reporting success, and the AdapterBindingPolicy durable
+  boundary MUST enforce its own whole-record invariant (non-blank
+  `adapter_kind`/`binding_ref`) on both publication and decode;
+- a SourceConfig's complete durable revision identity is the
+  `SourceConfigRevision` (metadata + body mode + `ExternalRef` locator); a
+  metadata-only relation MUST NOT be used or named as durable revision identity;
+- a SourceConfig `config_digest` MUST have the canonical grammar
+  `sha256:<64 lowercase hex>`, and a single validated `SourceConfigRevision` read
+  MUST cross-check its body `config_mode`/`config_payload_json`/`config_locator`
+  columns. A locator and a digest are distinct fields whose values are
+  source-private and may legitimately coincide, so an `ExternalRef` locator MUST
+  NOT be required to differ from its digest. An `OpaqueJson` body is durable
+  non-secret material; provider/vendor secrets belong behind `ExternalRef`.
+
 ## Refinement monotonicity
 
 A Root-created derived type MUST NOT enlarge authority.

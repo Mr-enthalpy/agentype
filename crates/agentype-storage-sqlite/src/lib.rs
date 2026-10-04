@@ -1,8 +1,11 @@
 //! SQLite WAL authority for the Agentype M4 correctness kernel.
 //!
 //! Schema and transaction boundaries are derived from
-//! docs/specs/v0.2/13-storage-and-transactions.md. This crate MUST NOT
-//! introduce Generation, AgentType, or vendor semantics.
+//! docs/specs/v0.2/13-storage-and-transactions.md. This crate persists M6-A
+//! Generation/proposal commitments and the M6-B.2 Agent Contract catalog, but
+//! it MUST NOT introduce vendor/model semantics: AgentType, SpawnSource, and
+//! SourceConfig content is stored as canonical M6-B JSON with Core-computed
+//! content digests, and opaque SourceConfig bodies are never interpreted.
 //!
 //! # Internal implementation crate
 //!
@@ -19,12 +22,17 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod catalog;
 pub mod frontier;
 mod kernel;
 mod schema;
 mod store;
 pub mod txutil;
 
+pub use catalog::{
+    AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigBodyView,
+    SourceConfigRevision,
+};
 pub use kernel::{
     CurrentAuthorityHint, ExecutionReconciliationSnapshot, ExecutionRoutingFacts, Kernel,
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,

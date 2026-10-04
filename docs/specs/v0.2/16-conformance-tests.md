@@ -78,6 +78,69 @@ MUST cover:
 - mechanical retry does not create a new Generation
 - worker `validated_delta` does not auto-write MemoryCapsule
 
+M6-B.2 catalog persistence MUST cover:
+
+- a published exact `(ref, content digest)` is immutable; a different canonical
+  content for the same exact revision fails closed
+- canonical content is permutation-stable (claims/credential refs sorted and
+  deduped) and `Bool(false)` is one canonical absence
+- two claims at one exact reference with the same value but different
+  `declaration_provenance_ref` fail closed, and an `ENFORCED` declaration
+  supersedes `DECLARED` deterministically
+- golden digest vectors pin the canonical byte format
+- a derived AgentType `based_on` provenance is verified and a widening
+  refinement is rejected at publication
+- a dependent immutable publication (AgentType `based_on`, SpawnSource
+  `adapter_policy`) fails closed when the referenced revision is corrupt
+  (missing overlay or invalid canonical content), and creates no new row
+- a repeated disposition command is an idempotent no-op that preserves the
+  transition timestamp, for AgentType, SpawnSource, SourceConfig, and
+  AdapterBindingPolicy (including an initial `ACTIVE -> ACTIVE`)
+- SQLite mechanically rejects a direct `UPDATE`/`DELETE` of an immutable
+  revision row, a direct disposition status reversal, and an overlay
+  delete / `INSERT OR REPLACE` / primary-key rewrite that would resurrect a
+  prior disposition, without the Kernel
+- once a disposition is `DEPRECATED`/`DISABLED`, no direct SQL form can make
+  the exact revision `PUBLISHED`/`ACTIVE` again
+- a `SourceConfigRevision` exposes its validated opaque body without a second
+  read path, is unforgeable outside the validated read (private fields, no
+  public constructor; compile-fail witness), and its `body` always matches the
+  validated mode (`OpaqueJson` => payload/no locator, `ExternalRef` =>
+  locator/no payload)
+- a fresh publication persists the caller's initial disposition (a `Disabled`
+  source/config/policy is not silently stored as `Active`)
+- disposition changes never alter revision content and are monotonic
+- an opaque `OpaqueJson` config body is validated against its declared
+  `config_digest`; an `ExternalRef` stores a locator separately from the digest,
+  and a locator whose value equals the digest is accepted (distinct fields) and
+  round-trips distinctly
+- an invalid `config_digest` grammar (not `sha256:<64 lowercase hex>`) is
+  rejected for both body modes
+- an `ExternalRef` locator is stored verbatim (whitespace is byte-significant)
+- a drifted SourceConfig relational column (locator, digest, or OpaqueJson
+  payload) fails every SourceConfig read closed through the single validated
+  `SourceConfigRevision` path
+- a read recomputes the stored content digest, so a tampered row fails closed
+- a self-consistent but non-canonical row (duplicate/permuted claims, an
+  explicit `Bool(false)`, duplicated/permuted credential refs) fails closed
+  because the read re-canonicalizes before re-encoding
+- a blank `AdapterBindingPolicy` `adapter_kind`/`binding_ref` is rejected at
+  publication and at decode
+- an idempotent republish of an existing exact revision fails closed if that
+  stored revision is corrupt
+- `AgentTypeSelector` exact and latest resolution fails closed when a published
+  revision is corrupt (digest drift, non-canonical content, or a relational
+  `based_on` drift), not just `get_agent_type`
+- a revision row with a missing disposition overlay fails closed as corruption
+  in reads, disposition setters, and idempotent republish; publication does not
+  recreate the overlay, and `Latest` does not fall back to an older revision
+- a disposition setter distinguishes an absent revision (`NotFound`) from a
+  revision whose overlay is missing (corruption)
+- the complete durable SourceConfig revision identity includes the body mode and
+  `ExternalRef` locator: two configs with equal metadata but different locators
+  are different revisions
+- an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
+
 ## C. Provider/frontend neutrality (M7)
 
 A **second independent** adapter MUST be addable without Core state-machine
