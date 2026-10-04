@@ -567,4 +567,99 @@ WHEN (CASE NEW.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAINING' THEN 1 WHEN 'DISABLED
 BEGIN
     SELECT RAISE(ABORT, 'adapter binding policy disposition must not reverse');
 END;
+
+-- An overlay row has an immutable identity and must live as long as its
+-- revision: it cannot be deleted, re-inserted (including INSERT OR REPLACE,
+-- which resolves the conflict before this BEFORE INSERT trigger would otherwise
+-- see a duplicate), or have its primary key rewritten. Together with the
+-- monotonic-status triggers this makes "dispositions only advance" a SQLite
+-- invariant, not merely a Kernel convention.
+
+CREATE TRIGGER IF NOT EXISTS agent_type_dispositions_no_delete
+BEFORE DELETE ON agent_type_dispositions
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_dispositions_no_reinsert
+BEFORE INSERT ON agent_type_dispositions
+WHEN EXISTS(SELECT 1 FROM agent_type_dispositions
+            WHERE type_id=NEW.type_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay already exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_dispositions_identity
+BEFORE UPDATE ON agent_type_dispositions
+WHEN OLD.type_id IS NOT NEW.type_id OR OLD.revision IS NOT NEW.revision
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_dispositions_no_delete
+BEFORE DELETE ON spawn_source_dispositions
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_dispositions_no_reinsert
+BEFORE INSERT ON spawn_source_dispositions
+WHEN EXISTS(SELECT 1 FROM spawn_source_dispositions
+            WHERE source_id=NEW.source_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay already exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_dispositions_identity
+BEFORE UPDATE ON spawn_source_dispositions
+WHEN OLD.source_id IS NOT NEW.source_id OR OLD.revision IS NOT NEW.revision
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_config_dispositions_no_delete
+BEFORE DELETE ON source_config_dispositions
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_config_dispositions_no_reinsert
+BEFORE INSERT ON source_config_dispositions
+WHEN EXISTS(SELECT 1 FROM source_config_dispositions
+            WHERE source_id=NEW.source_id AND source_revision=NEW.source_revision
+              AND config_id=NEW.config_id AND config_revision=NEW.config_revision)
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay already exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_config_dispositions_identity
+BEFORE UPDATE ON source_config_dispositions
+WHEN OLD.source_id IS NOT NEW.source_id
+  OR OLD.source_revision IS NOT NEW.source_revision
+  OR OLD.config_id IS NOT NEW.config_id
+  OR OLD.config_revision IS NOT NEW.config_revision
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policy_dispositions_no_delete
+BEFORE DELETE ON adapter_binding_policy_dispositions
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policy_dispositions_no_reinsert
+BEFORE INSERT ON adapter_binding_policy_dispositions
+WHEN EXISTS(SELECT 1 FROM adapter_binding_policy_dispositions
+            WHERE policy_id=NEW.policy_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay already exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS adapter_binding_policy_dispositions_identity
+BEFORE UPDATE ON adapter_binding_policy_dispositions
+WHEN OLD.policy_id IS NOT NEW.policy_id OR OLD.revision IS NOT NEW.revision
+BEGIN
+    SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
 "#;

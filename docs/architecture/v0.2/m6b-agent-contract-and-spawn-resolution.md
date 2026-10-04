@@ -364,9 +364,12 @@ Rules now enforced by the durable catalog:
   against the canonical document, so a self-consistent but non-canonical row
   still fails closed. This is enforced mechanically as well as by the Kernel:
   SQLite `BEFORE UPDATE`/`BEFORE DELETE` triggers reject any mutation of an
-  immutable revision row, and `BEFORE UPDATE OF status` triggers on the
-  disposition overlays reject a status reversal, so direct SQL cannot bypass the
-  boundary.
+  immutable revision row; a disposition overlay row has immutable identity and
+  lifetime (SQLite rejects its deletion, its re-insertion including the
+  `INSERT OR REPLACE` path, and any primary-key rewrite); and
+  `BEFORE UPDATE OF status` triggers reject a status reversal. Direct SQL
+  therefore cannot bypass the boundary by mutating content, reversing a
+  disposition, or deleting and recreating an overlay.
 - **AdapterBindingPolicy invariant.** Its fields are public, so the durable
   publication and decode boundaries both call `AdapterBindingPolicy::validate`;
   a blank `adapter_kind` or `binding_ref` can never enter the catalog. The

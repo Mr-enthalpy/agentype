@@ -97,7 +97,11 @@ M6-B.2 catalog persistence MUST cover:
   transition timestamp, for AgentType, SpawnSource, SourceConfig, and
   AdapterBindingPolicy (including an initial `ACTIVE -> ACTIVE`)
 - SQLite mechanically rejects a direct `UPDATE`/`DELETE` of an immutable
-  revision row and a direct disposition status reversal, without the Kernel
+  revision row, a direct disposition status reversal, and an overlay
+  delete / `INSERT OR REPLACE` / primary-key rewrite that would resurrect a
+  prior disposition, without the Kernel
+- once a disposition is `DEPRECATED`/`DISABLED`, no direct SQL form can make
+  the exact revision `PUBLISHED`/`ACTIVE` again
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

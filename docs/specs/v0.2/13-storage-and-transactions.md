@@ -80,10 +80,15 @@ SpawnSource, SourceConfig, AdapterBindingPolicy).
 
 The immutable-revision / monotonic-disposition boundary MUST also be enforced by
 SQLite itself, not only by the Kernel API: `BEFORE UPDATE` and `BEFORE DELETE`
-triggers MUST reject any mutation of an immutable revision row, and
-`BEFORE UPDATE OF status` triggers on the disposition overlays MUST reject a
-status reversal, so a direct SQL statement that bypasses the Kernel transaction
-cannot mutate frozen content or reverse a disposition.
+triggers MUST reject any mutation of an immutable revision row; a disposition
+overlay row MUST have immutable identity and lifetime, so SQLite MUST reject its
+deletion, its re-insertion (including the `INSERT OR REPLACE` conflict path,
+which resolves before a delete trigger fires while `recursive_triggers` is off),
+and any rewrite of its primary-key columns; and `BEFORE UPDATE OF status`
+triggers on the overlays MUST reject a status reversal. A direct SQL statement
+that bypasses the Kernel transaction therefore cannot mutate frozen content,
+reverse a disposition, or delete-and-recreate an overlay to resurrect a prior
+state.
 
 A config digest MUST have the canonical grammar `sha256:` followed by 64
 lowercase hexadecimal characters, for both `OpaqueJson` and `ExternalRef`

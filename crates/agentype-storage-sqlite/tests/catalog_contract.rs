@@ -188,18 +188,32 @@ fn source_with_two_claims() -> SpawnSource {
     source
 }
 
-/// Rewrite `content_json` via `mutate` and recompute a matching `content_digest`,
-/// Drop the mechanical immutable-content guards for a table so a test can
-/// simulate storage-level corruption (an attacker or bit rot bypasses the
-/// triggers the same way). Reopening the Kernel recreates them.
-fn drop_immutable_guards(conn: &rusqlite::Connection, table: &str) {
-    conn.execute_batch(&format!(
-        "DROP TRIGGER IF EXISTS {table}_immutable_update;
-         DROP TRIGGER IF EXISTS {table}_immutable_delete;"
-    ))
-    .unwrap();
+/// Drop every mechanical schema guard so a test can simulate storage-level
+/// corruption or a bypassing direct-SQL writer (bit rot or an attacker who can
+/// drop the triggers the same way). Reopening the Kernel recreates them.
+fn drop_schema_guards(conn: &rusqlite::Connection) {
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='trigger'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    for name in names {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))
+            .unwrap();
+    }
 }
 
+/// Drop the schema guards and delete an overlay row, simulating the corruption
+/// path (an overlay that vanished). The next Kernel open recreates the guards.
+fn delete_overlay(path: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    drop_schema_guards(&conn);
+    conn.execute(sql, []).unwrap();
+}
+
+/// Rewrite `content_json` via `mutate` and recompute a matching `content_digest`,
 /// so the row is self-consistent but (deliberately) not canonical.
 fn tamper_json(
     path: &Path,
@@ -208,7 +222,7 @@ fn tamper_json(
     mutate: impl FnOnce(&mut serde_json::Value),
 ) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    drop_immutable_guards(&conn, table);
+    drop_schema_guards(&conn);
     let json: String = conn
         .query_row(
             &format!("SELECT content_json FROM {table} WHERE {where_clause}"),
@@ -230,7 +244,7 @@ fn tamper_json(
 /// Corrupt `content_json` without touching `content_digest`.
 fn corrupt_json_only(path: &Path, table: &str, where_clause: &str, suffix: &str) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    drop_immutable_guards(&conn, table);
+    drop_schema_guards(&conn);
     conn.execute(
         &format!(
             "UPDATE {table} SET content_json = content_json || '{suffix}' WHERE {where_clause}"
@@ -629,7 +643,7 @@ fn read_verifies_stored_content_integrity() {
     // Tamper with the stored document without updating its content digest.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        drop_immutable_guards(&conn, "agent_types");
+        drop_schema_guards(&conn);
         conn.execute(
             "UPDATE agent_types SET content_json = content_json || ' ' WHERE type_id='general-reviewer'",
             [],
@@ -735,7 +749,7 @@ fn source_config_column_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        drop_immutable_guards(&conn, "source_configs");
+        drop_schema_guards(&conn);
         conn.execute(
             "UPDATE source_configs SET config_locator='file:///tampered' WHERE config_id='deep-reasoning'",
             [],
@@ -777,7 +791,7 @@ fn source_config_column_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        drop_immutable_guards(&conn, "source_configs");
+        drop_schema_guards(&conn);
         let other = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         conn.execute(
             "UPDATE source_configs SET config_digest=?1 WHERE config_id='deep-reasoning'",
@@ -815,7 +829,7 @@ fn opaque_payload_drift_fails_closed() {
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        drop_immutable_guards(&conn, "source_configs");
+        drop_schema_guards(&conn);
         conn.execute(
             "UPDATE source_configs SET config_payload_json='{\"model\":\"tampered\"}' WHERE config_id='deep-reasoning'",
             [],
@@ -1081,7 +1095,7 @@ fn selector_lookup_rejects_based_on_relational_drift() {
     // without touching content_json.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        drop_immutable_guards(&conn, "agent_types");
+        drop_schema_guards(&conn);
         conn.execute(
             "UPDATE agent_types SET based_on_revision=2 WHERE type_id='derived-reviewer'",
             [],
@@ -1106,14 +1120,10 @@ fn missing_disposition_overlay_is_corruption() {
         publish_catalog(&kernel);
         kernel.publish_agent_type(&agent).unwrap();
     }
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(
+        &path,
+        "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+    );
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // A present revision with a missing overlay is corruption, not "not found".
@@ -1139,14 +1149,10 @@ fn selector_latest_does_not_fall_back_over_missing_overlay() {
         kernel.publish_agent_type(&two).unwrap();
     }
     // Corruption hides the highest revision's overlay.
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=2",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(
+        &path,
+        "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=2",
+    );
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // Neither an exact pin nor Latest may silently drop @2 and resolve @1.
@@ -1176,14 +1182,10 @@ fn republish_does_not_repair_a_missing_overlay() {
         publish_catalog(&kernel);
         kernel.publish_agent_type(&agent).unwrap();
     }
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(
+        &path,
+        "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+    );
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // An idempotent republish must not resurrect the overlay.
@@ -1227,14 +1229,10 @@ fn status_setter_classifies_missing_overlay_as_corruption() {
             .unwrap();
         kernel.publish_spawn_source(&base_source()).unwrap();
     }
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM spawn_source_dispositions WHERE source_id='codex-local' AND revision=2",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(
+        &path,
+        "DELETE FROM spawn_source_dispositions WHERE source_id='codex-local' AND revision=2",
+    );
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // Revision exists but overlay missing -> corruption (InvariantViolation).
@@ -1262,14 +1260,10 @@ fn derived_agent_type_rejects_base_with_missing_overlay() {
         publish_catalog(&kernel);
         kernel.publish_agent_type(&base).unwrap();
     }
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(
+        &path,
+        "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer' AND revision=1",
+    );
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // A base the catalog already treats as corrupt cannot authorize a new
@@ -1311,14 +1305,7 @@ fn spawn_source_rejects_corrupt_adapter_policy_dependency() {
             .publish_adapter_binding_policy(&adapter_policy())
             .unwrap();
     }
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "DELETE FROM adapter_binding_policy_dispositions WHERE policy_id='codex-local-adapter' AND revision=3",
-            [],
-        )
-        .unwrap();
-    }
+    delete_overlay(&path, "DELETE FROM adapter_binding_policy_dispositions WHERE policy_id='codex-local-adapter' AND revision=3");
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
     let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
     // The FK proves the row exists, but a corrupt dependency must not be
@@ -1596,5 +1583,105 @@ fn sqlite_mechanically_rejects_immutable_catalog_mutation() {
         )
         .is_err());
     drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sqlite_rejects_overlay_delete_reinsert_and_reverse() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("m6b2-od-{}", nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scheduler.db");
+    let agent = base_agent("general-reviewer", 1, None);
+    let source = base_source();
+    {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+        publish_catalog(&kernel);
+        kernel
+            .publish_adapter_binding_policy(&adapter_policy())
+            .unwrap();
+        kernel.publish_spawn_source(&source).unwrap();
+        kernel.publish_agent_type(&agent).unwrap();
+        kernel
+            .set_agent_type_status(&agent.type_ref, AgentTypeStatus::Deprecated)
+            .unwrap();
+        kernel
+            .set_spawn_source_status(&source.source_ref, SourceStatus::Disabled)
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // The overlay row cannot be deleted...
+    assert!(conn
+        .execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "DELETE FROM spawn_source_dispositions WHERE source_id='codex-local'",
+            [],
+        )
+        .is_err());
+    // ...nor re-inserted/replaced to resurrect a prior state (covers the
+    // INSERT OR REPLACE conflict path, which resolves before the delete trigger
+    // would fire when recursive_triggers is off)...
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO agent_type_dispositions(type_id,revision,status,deprecated_at,updated_at)
+             VALUES('general-reviewer',1,'PUBLISHED',NULL,5.0)",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO spawn_source_dispositions(source_id,revision,status,updated_at)
+             VALUES('codex-local',2,'ACTIVE',5.0)",
+            [],
+        )
+        .is_err());
+    // ...nor can the status reverse by UPDATE...
+    assert!(conn
+        .execute(
+            "UPDATE agent_type_dispositions SET status='PUBLISHED' WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE spawn_source_dispositions SET status='ACTIVE' WHERE source_id='codex-local'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE spawn_source_dispositions SET status='DRAINING' WHERE source_id='codex-local'",
+            [],
+        )
+        .is_err());
+    // ...nor can the overlay primary key be rewritten.
+    assert!(conn
+        .execute(
+            "UPDATE agent_type_dispositions SET revision=99 WHERE type_id='general-reviewer'",
+            [],
+        )
+        .is_err());
+    drop(conn);
+
+    // The durable state is unchanged: no direct-SQL form made it PUBLISHED/ACTIVE.
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(2_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    assert_eq!(
+        kernel.get_agent_type(&agent.type_ref).unwrap().unwrap().1,
+        AgentTypeStatus::Deprecated
+    );
+    assert_eq!(
+        kernel
+            .get_spawn_source(&source.source_ref)
+            .unwrap()
+            .unwrap()
+            .status,
+        SourceStatus::Disabled
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
