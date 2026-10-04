@@ -19,7 +19,7 @@ use agentype_agent_contract::{
     generation_policy_from_canonical_json, match_existing_agents, resolve_selector,
     task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
     AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, ContinuityMode, ExistingAgentCandidate,
-    GenerationPolicy, LifecycleMode, TaskAgentRequirement, TaskPlacement,
+    GenerationPolicy, TaskAgentRequirement, TaskPlacement,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -96,10 +96,16 @@ pub fn insert_task_agent_requirement(
     Ok(digest)
 }
 
+/// The single authoritative read of a Task's agent requirement.
+///
+/// The parent Task's `agent_requirement_mode` and the child row are one
+/// invariant. A `TYPED` Task without its requirement row, or a `LEGACY` Task that
+/// unexpectedly has one, is corruption and fails closed, never a silent `None`.
 pub fn get_task_agent_requirement(
     tx: &Transaction<'_>,
     task_id: &TaskId,
 ) -> Result<Option<TaskAgentRequirement>, Error> {
+    let mode = task_agent_requirement_mode(tx, task_id)?;
     let row = query_opt(
         tx,
         "SELECT requirement_json, requirement_digest, required_type_id, required_type_revision
@@ -114,8 +120,27 @@ pub fn get_task_agent_requirement(
             ))
         },
     )?;
-    let Some((json, digest, type_id, type_revision)) = row else {
-        return Ok(None);
+    let (json, digest, type_id, type_revision) = match (mode.as_str(), row) {
+        ("LEGACY", None) => return Ok(None),
+        ("TYPED", None) => {
+            return Err(Error::invariant(format!(
+                "typed task {} is missing its agent requirement row",
+                task_id.as_str()
+            )))
+        }
+        ("LEGACY", Some(_)) => {
+            return Err(Error::invariant(format!(
+                "legacy task {} unexpectedly has an agent requirement row",
+                task_id.as_str()
+            )))
+        }
+        ("TYPED", Some(row)) => row,
+        (other, _) => {
+            return Err(Error::invariant(format!(
+                "unknown agent_requirement_mode {other} for task {}",
+                task_id.as_str()
+            )))
+        }
     };
     let recomputed = content_digest(json.as_bytes());
     if recomputed != digest {
@@ -145,6 +170,16 @@ pub fn get_task_agent_requirement(
         ));
     }
     Ok(Some(requirement))
+}
+
+fn task_agent_requirement_mode(tx: &Transaction<'_>, task_id: &TaskId) -> Result<String, Error> {
+    query_opt(
+        tx,
+        "SELECT agent_requirement_mode FROM tasks WHERE id=?1",
+        params![task_id.as_str()],
+        |row| row.get::<_, String>(0),
+    )?
+    .ok_or_else(|| Error::not_found(format!("task {}", task_id.as_str())))
 }
 
 /// Resolve a pre-commit `AgentRequirementDraft` into the canonical durable
@@ -350,18 +385,43 @@ pub fn insert_generation_policy(
     Ok(digest)
 }
 
+/// The single authoritative read of a Generation's policy.
+///
+/// The parent Generation's `policy_mode` and the child row are one invariant. A
+/// `POLICY` Generation without its row, or a `NONE` Generation that unexpectedly
+/// has one, is corruption and fails closed, never a silent `None`.
 pub fn get_generation_policy(
     tx: &Transaction<'_>,
     generation_id: &agentype_core::GenerationId,
 ) -> Result<Option<GenerationPolicy>, Error> {
+    let mode = generation_policy_mode(tx, generation_id)?;
     let row = query_opt(
         tx,
         "SELECT policy_json, policy_digest FROM generation_policies WHERE generation_id=?1",
         params![generation_id.as_str()],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
-    let Some((json, digest)) = row else {
-        return Ok(None);
+    let (json, digest) = match (mode.as_str(), row) {
+        ("NONE", None) => return Ok(None),
+        ("POLICY", None) => {
+            return Err(Error::invariant(format!(
+                "policy-bearing generation {} is missing its policy row",
+                generation_id.as_str()
+            )))
+        }
+        ("NONE", Some(_)) => {
+            return Err(Error::invariant(format!(
+                "generation {} is not policy-bearing but has a policy row",
+                generation_id.as_str()
+            )))
+        }
+        ("POLICY", Some(row)) => row,
+        (other, _) => {
+            return Err(Error::invariant(format!(
+                "unknown policy_mode {other} for generation {}",
+                generation_id.as_str()
+            )))
+        }
     };
     let recomputed = content_digest(json.as_bytes());
     if recomputed != digest {
@@ -490,14 +550,6 @@ pub fn get_logical_agent_type_binding(
 // Matching (pure)
 // =============================================================================
 
-fn lifecycle_from_retention(retention: &str) -> Result<LifecycleMode, Error> {
-    match retention {
-        "resident" => Ok(LifecycleMode::Resident),
-        "ephemeral" => Ok(LifecycleMode::Ephemeral),
-        other => Err(Error::invariant(format!("unknown retention {other}"))),
-    }
-}
-
 fn parse_tags(json: &str) -> Result<BTreeSet<String>, Error> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| Error::invariant(format!("tags json: {e}")))?;
@@ -563,19 +615,11 @@ pub fn match_existing_agents_for_task(
         continuity: ContinuityPreference::parse_sql(&continuity)?,
     };
 
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<f64>,
-        f64,
-        String,
-    )> = {
+    let rows: Vec<(String, String, String, Option<String>, Option<f64>, f64)> = {
         let mut statement = tx
             .prepare(
                 "SELECT la.id, la.partition_name, la.tags_json, la.workstream_id,
-                        la.available_since, la.created_at, la.retention
+                        la.available_since, la.created_at
                  FROM logical_agents la
                  JOIN logical_agent_type_bindings b ON b.logical_agent_id = la.id
                  WHERE la.state='READY' AND la.current_task_id IS NULL
@@ -591,7 +635,6 @@ pub fn match_existing_agents_for_task(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<f64>>(4)?,
                     row.get::<_, f64>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(map_sqlite)?;
@@ -603,8 +646,7 @@ pub fn match_existing_agents_for_task(
     };
 
     let mut candidates = Vec::with_capacity(rows.len());
-    for (agent_id, partition, tags_json, workstream, available_since, created_at, retention) in rows
-    {
+    for (agent_id, partition, tags_json, workstream, available_since, created_at) in rows {
         let agent = LogicalAgentId::from_string(agent_id);
         let Some(bound_ref) = get_logical_agent_type_binding(tx, &agent)? else {
             continue;
@@ -615,7 +657,6 @@ pub fn match_existing_agents_for_task(
         candidates.push(ExistingAgentCandidate {
             logical_agent_id: agent,
             agent_type,
-            lifecycle: lifecycle_from_retention(&retention)?,
             partition: PartitionId::new(partition),
             tags: parse_tags(&tags_json)?,
             workstream_id: workstream.map(WorkstreamId::from_string),

@@ -519,8 +519,11 @@ Rules now enforced:
 - **Only immediately usable candidates.** A candidate is an M5 `READY` and
   unassigned bound LogicalAgent. Non-READY states (`ASSIGNED`, `DRAINING`,
   `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
-  revival is a later seam. The `Retention`-to-`LifecycleMode` mapping is exact
-  (`resident`/`ephemeral`); `LifecycleMode::Revivable` is not faked.
+  revival is a later seam. A candidate's realized M5 retention is deliberately
+  NOT interpreted against the AgentType `lifecycle` set: that set is a required
+  **source envelope** (spec 06), not a per-instance mode whitelist, so matching it
+  against a realized retention would add an unfrozen eligibility relation. Any
+  realized-lifecycle eligibility is a B.4 provisioning concern.
 - **One ranking order, matching spec 06.** The exact pin is the matching anchor,
   not a ceiling. Among eligible candidates the relation to the pin orders as:
   exact, then compatible narrower/refinement types, then equivalent/incomparable

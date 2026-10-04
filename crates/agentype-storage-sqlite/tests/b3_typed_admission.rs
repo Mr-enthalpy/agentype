@@ -180,7 +180,7 @@ fn typed_admission_pins_exact_type_and_derives_spec_dimensions() {
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].logical_agent_id, agent);
     assert_eq!(matched[0].agent_type.type_ref, pin);
-    assert_eq!(matched[0].lifecycle, LifecycleMode::Resident);
+    assert_eq!(matched[0].partition, PartitionId::new("general"));
 }
 
 #[test]
@@ -537,7 +537,11 @@ fn typed_mode_marker_quarantines_even_if_requirement_row_is_lost() {
         )
         .unwrap();
     }
-    assert!(kernel.get_task_agent_requirement(&task).unwrap().is_none());
+    // The authoritative read fails closed on the parent/child mismatch.
+    assert!(matches!(
+        kernel.get_task_agent_requirement(&task),
+        Err(Error::InvariantViolation(_))
+    ));
 
     // The positive parent marker keeps the Task out of the legacy path; it never
     // silently downgrades to a legacy Task.
@@ -574,10 +578,11 @@ fn lost_generation_policy_still_blocks_legacy_admission() {
         )
         .unwrap();
     }
-    assert!(kernel
-        .get_generation_policy(&gen.generation_id)
-        .unwrap()
-        .is_none());
+    // The authoritative read fails closed on the parent/child mismatch.
+    assert!(matches!(
+        kernel.get_generation_policy(&gen.generation_id),
+        Err(Error::InvariantViolation(_))
+    ));
 
     let intent = RawWorkIntent {
         raw_intent_key: "legacy_after_policy_loss".into(),
@@ -595,6 +600,99 @@ fn lost_generation_policy_still_blocks_legacy_admission() {
         .admit_proposal(&proposal.proposal_id, 0, None)
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)));
+}
+
+#[test]
+fn requirement_marker_and_row_are_one_invariant() {
+    let path = file_path("b3-requirement-coherence");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+
+    // LEGACY + absent -> None.
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+    assert!(kernel
+        .get_task_agent_requirement(&legacy)
+        .unwrap()
+        .is_none());
+
+    // TYPED + present -> Some.
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let typed = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    assert!(kernel.get_task_agent_requirement(&typed).unwrap().is_some());
+
+    // LEGACY + present -> InvariantViolation.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER tasks_agent_requirement_mode_no_downgrade", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET agent_requirement_mode='LEGACY' WHERE id=?1",
+            [typed.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_task_agent_requirement(&typed),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn policy_marker_and_row_are_one_invariant() {
+    let path = file_path("b3-policy-coherence");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+
+    // NONE + absent -> None.
+    let plain = kernel.create_generation(json!({})).unwrap();
+    assert!(kernel
+        .get_generation_policy(&plain.generation_id)
+        .unwrap()
+        .is_none());
+
+    // POLICY + present -> Some.
+    let policy_gen = kernel
+        .create_generation_with_policy(json!({}), Some(sample_policy()))
+        .unwrap();
+    assert!(kernel
+        .get_generation_policy(&policy_gen.generation_id)
+        .unwrap()
+        .is_some());
+
+    // NONE + present -> InvariantViolation.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER generations_policy_mode_immutable", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE generations SET policy_mode='NONE' WHERE generation_id=?1",
+            [policy_gen.generation_id.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_generation_policy(&policy_gen.generation_id),
+        Err(Error::InvariantViolation(_))
+    ));
 }
 
 #[test]

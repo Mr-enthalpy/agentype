@@ -35,10 +35,12 @@ catalog:
 
 - `task_agent_requirements` is immutable and write-once, created only inside the
   same transaction as its M6-A `Task` and `GenerationTaskBinding`. It stores the
-  canonical requirement document, its Core-computed digest, and the exact
-  `(type_id, revision)` pin (or `NULL`); the pin MUST resolve through the
-  catalog's validated read, and the relational mirror MUST be cross-checked
-  against the canonical document on every read.
+  canonical requirement document, its Core-computed digest, and a **mandatory**
+  exact `(type_id, revision)` pin; the pin MUST resolve through the catalog's
+  validated read, and the relational mirror MUST be cross-checked against the
+  canonical document on every read. The parent `tasks.agent_requirement_mode` and
+  this row are one invariant: a `TYPED` Task without its row, or a `LEGACY` Task
+  with one, is corruption that MUST fail closed.
 - `logical_agent_type_bindings` is immutable and write-once: one exact
   `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
   change is a new binding, never an in-place type mutation.

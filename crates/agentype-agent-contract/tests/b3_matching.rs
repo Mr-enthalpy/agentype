@@ -99,7 +99,6 @@ fn candidate(id: &str, agent_type: AgentType) -> ExistingAgentCandidate {
     ExistingAgentCandidate {
         logical_agent_id: LogicalAgentId::from_string(id),
         agent_type,
-        lifecycle: LifecycleMode::Resident,
         partition: PartitionId::new("p1"),
         tags: BTreeSet::new(),
         workstream_id: None,
@@ -255,7 +254,6 @@ fn matching_filters_incompatible_contracts_and_pins() {
             based_on: None,
             contract: incapable_contract,
         },
-        lifecycle: LifecycleMode::Resident,
         partition: PartitionId::new("p1"),
         tags: BTreeSet::new(),
         workstream_id: None,
@@ -428,4 +426,28 @@ fn matching_enforces_m5_placement_and_prefers_workstream() {
     .unwrap();
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].logical_agent_id.as_str(), "agent-w1");
+}
+
+#[test]
+fn matching_does_not_conflate_agent_type_lifecycle_with_realized_mode() {
+    let catalog = catalog();
+    // The AgentType `lifecycle` set is a required source envelope (spec 06), not
+    // a realized-instance mode whitelist. A candidate must not be rejected merely
+    // because its M5 retention is not a member of the envelope.
+    let mut ephemeral_contract = contract(AffinityConstraint::Any, 100.0);
+    ephemeral_contract.lifecycle = [LifecycleMode::Ephemeral].into_iter().collect();
+    let required = AgentType {
+        type_ref: type_ref("reviewer", 1),
+        based_on: None,
+        contract: ephemeral_contract,
+    };
+    let matched = match_existing_agents(
+        &required,
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[candidate("agent-resident", required.clone())],
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(matched.len(), 1);
 }

@@ -9,7 +9,12 @@
 //!    `Required` continuity workstream gate), and
 //! 2. the M6-B AgentType contract (`can_execute`).
 //!
-//! Both are hard gates. A candidate that fails either is not returned.
+//! Both are hard gates. A candidate that fails either is not returned. A
+//! candidate's realized M5 retention is deliberately NOT interpreted against the
+//! AgentType `lifecycle` set: that set is a **required source envelope** (spec
+//! 06), not a per-instance mode whitelist, so matching it against a realized
+//! retention would be both unnecessary and insufficient. Realized-lifecycle
+//! eligibility, if ever needed, is a B.4 provisioning concern.
 //!
 //! Ranking follows the frozen spec 06 matching preference: an exact pin is
 //! preferred, then compatible narrower/refinement types, then equivalent or
@@ -26,7 +31,7 @@
 use crate::capability::CapabilityCatalog;
 use crate::error::ContractError;
 use crate::predicates::{can_execute, more_specific_for};
-use crate::records::{AgentType, LifecycleMode};
+use crate::records::AgentType;
 use crate::requirement::TaskAgentRequirement;
 use agentype_core::{ContinuityPreference, LogicalAgentId, PartitionId, WorkstreamId};
 use std::cmp::Ordering;
@@ -38,7 +43,6 @@ use std::collections::BTreeSet;
 pub struct ExistingAgentCandidate {
     pub logical_agent_id: LogicalAgentId,
     pub agent_type: AgentType,
-    pub lifecycle: LifecycleMode,
     pub partition: PartitionId,
     pub tags: BTreeSet<String>,
     pub workstream_id: Option<WorkstreamId>,
@@ -134,11 +138,6 @@ pub fn match_existing_agents(
         .iter()
         .filter(|candidate| {
             placement_eligible(candidate, placement)
-                && candidate
-                    .agent_type
-                    .contract
-                    .lifecycle
-                    .contains(&candidate.lifecycle)
                 && can_execute(&candidate.agent_type, &req.hard, catalog).is_ok()
         })
         .cloned()
