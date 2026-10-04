@@ -371,11 +371,12 @@ pub fn create_generation_with_policy(
 ) -> Result<GenerationRecord, Error> {
     let generation_id = GenerationId::new();
     let seed_json = json_dump(&seed_payload);
+    let policy_mode = if policy.is_some() { "POLICY" } else { "NONE" };
 
     tx.execute(
-        "INSERT INTO generations(generation_id, state, revision, admission_seq, seed_payload_json, created_at)
-         VALUES(?1, 'OPEN', 0, 0, ?2, ?3)",
-        params![generation_id.as_str(), seed_json, now],
+        "INSERT INTO generations(generation_id, state, revision, admission_seq, policy_mode, seed_payload_json, created_at)
+         VALUES(?1, 'OPEN', 0, 0, ?2, ?3, ?4)",
+        params![generation_id.as_str(), policy_mode, seed_json, now],
     )
     .map_err(map_sqlite)?;
 
@@ -1160,7 +1161,8 @@ fn admit_proposal_core(
     // proposal PENDING and creates no Task, Batch, binding, or requirement.
     if typed_draft.is_none() {
         let generation_id = GenerationId::from_string(gid.clone());
-        if crate::requirement::get_generation_policy(tx, &generation_id)?.is_some() {
+        let policy_mode = crate::requirement::generation_policy_mode(tx, &generation_id)?;
+        if policy_mode != "NONE" {
             return Err(Error::invalid_authority(
                 "a generation with a policy requires typed admission; legacy admit_proposal is forbidden",
             ));

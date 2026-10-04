@@ -537,10 +537,10 @@ pub fn canonical_task_agent_requirement_bytes(req: &TaskAgentRequirement) -> Vec
     to_bytes(json!({
         "canonical": CANONICAL_FORMAT_VERSION,
         "kind": "TASK_AGENT_REQUIREMENT",
-        "required_type": req.required_type.as_ref().map(|t| json!({
-            "type_id": t.id().as_str(),
-            "revision": t.revision(),
-        })),
+        "required_type": {
+            "type_id": req.required_type.id().as_str(),
+            "revision": req.required_type.revision(),
+        },
         "hard": task_requirement_value(&req.hard),
     }))
 }

@@ -107,36 +107,38 @@ M6-B.3 typed admission and matching MUST cover:
 
 - a typed admission creates the Task, `GenerationTaskBinding`, and immutable
   `TaskAgentRequirement` in one transaction; a failure leaves none of the three
-- a loose `AgentTypeSelector` resolves to an exact revision before commitment; a
-  missing/unpublished exact revision fails closed and materializes no Task
+- a typed admission MUST pin an exact AgentType revision resolved before commit;
+  there is no durable unpinned typed requirement
 - the requirement's TaskSpec-owned dimensions (information function, affinity,
   workspace, continuity) are derived from the admitted TaskSpec, not duplicated
   by the caller
 - a Generation policy folds into the requirement as a spec 10 authority ceiling:
   a Task exceeding the workspace/network ceiling fails closed, and a stricter
   Task under a wider ceiling keeps its own value
-- a policy-bearing Generation rejects legacy `admit_proposal` before any write
-  (proposal PENDING, no Task), while a no-policy Generation keeps M6-A legacy
-  admission working
-- a Task carrying a `TaskAgentRequirement` is invisible to `ensure_task_consumers`
-  and to `claim_next_available`: it births no legacy consumer, acquires no
-  Attempt/Lease/Execution, and stays `QUEUED`; this includes a requirement with
-  `required_type = None`
-- a mixed queue still dispatches the legacy (no-requirement) Task past a
-  quarantined typed Task
+- a `POLICY` Generation rejects legacy `admit_proposal` before any write, while a
+  `NONE` Generation keeps M6-A legacy admission working, and each marker is a
+  positive durable fact
+- a `TYPED` Task is invisible to `ensure_task_consumers` and
+  `claim_next_available`: it births no legacy consumer, acquires no
+  Attempt/Lease/Execution, and stays `QUEUED`; losing the requirement row for a
+  `TYPED` marker MUST NOT downgrade it to a legacy Task, and losing a `POLICY`
+  row MUST NOT make the Generation unconstrained
+- a mixed queue still dispatches the legacy Task past a quarantined typed Task
 - exact typed replay returns the same Task while a conflicting requirement is a
-  `Conflict`; only exact-selector replay is idempotent, an already-committed exact
-  pin stays replayable after deprecation, and a `Latest` retry after catalog drift
-  fails closed
-- matching returns only bound, M5 `READY`, unassigned, compatible agents
-  satisfying the exact pin or a refinement of it; broader/incomparable agents and
-  non-ready states are never returned, and matching writes nothing
-- ranking applies candidate-vs-candidate semantic dominance before
-  continuity/availability/identity tie-breaks and never uses nominal inheritance
-  depth; no caller-controlled soft preference can override it
-- `logical_agent_type_bindings` is write-once and requires a validated exact
-  revision; `task_agent_requirements` and `generation_policies` are immutable,
-  enforced mechanically by SQLite
+  `Conflict`; an exact pin stays replayable after deprecation, and a `Latest`
+  retry after catalog drift fails closed
+- matching composes the frozen M5 placement gates (exact partition, tag superset,
+  `Required` workstream) with `can_execute`, and returns only bound, M5 `READY`,
+  unassigned agents; broader/general and non-ready candidates are ordered or
+  filtered per the spec 06 preference, and matching writes nothing
+- ranking orders exact, narrower, equivalent/incomparable, then broader, applies
+  candidate-vs-candidate dominance before continuity/availability/identity, and
+  never uses nominal inheritance depth
+- `logical_agent_type_bindings` is write-once and a fresh binding requires a
+  `PUBLISHED` revision; `task_agent_requirements` and `generation_policies` are
+  immutable, enforced mechanically by SQLite
+- the canonical `TASK_AGENT_REQUIREMENT` and `GENERATION_POLICY` document kinds
+  have pinned golden digest vectors
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

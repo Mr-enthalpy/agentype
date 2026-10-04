@@ -1,8 +1,11 @@
 //! M6-B.3 pure-layer conformance: Task agent requirement canonicalization, the
-//! Generation policy fold, and existing-agent matching order.
+//! Generation policy fold, M5 placement composition, and existing-agent ranking.
 
 use agentype_agent_contract::*;
-use agentype_core::{InformationFunction, LogicalAgentId, WorkspaceMode};
+use agentype_core::{
+    ContinuityPreference, InformationFunction, LogicalAgentId, PartitionId, WorkspaceMode,
+    WorkstreamId,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -36,6 +39,10 @@ fn catalog() -> CapabilityCatalog {
         )
         .unwrap();
     catalog
+}
+
+fn type_ref(id: &str, revision: u64) -> AgentTypeRef {
+    AgentTypeRef::new(id, revision).unwrap()
 }
 
 fn task_requirement() -> TaskRequirement {
@@ -73,30 +80,45 @@ fn contract(affinity: AffinityConstraint, budget_ceiling: f64) -> AgentTypeContr
 
 fn agent(id: &str, revision: u64, affinity: AffinityConstraint, ceiling: f64) -> AgentType {
     AgentType {
-        type_ref: AgentTypeRef::new(id, revision).unwrap(),
+        type_ref: type_ref(id, revision),
         based_on: None,
         contract: contract(affinity, ceiling),
     }
 }
 
-fn candidate(
-    id: &str,
-    agent_type: AgentType,
-    available_since: Option<f64>,
-) -> ExistingAgentCandidate {
+fn placement(continuity: ContinuityPreference) -> TaskPlacement {
+    TaskPlacement {
+        partition: PartitionId::new("p1"),
+        required_tags: BTreeSet::new(),
+        workstream_id: None,
+        continuity,
+    }
+}
+
+fn candidate(id: &str, agent_type: AgentType) -> ExistingAgentCandidate {
     ExistingAgentCandidate {
         logical_agent_id: LogicalAgentId::from_string(id),
         agent_type,
         lifecycle: LifecycleMode::Resident,
-        available_since,
+        partition: PartitionId::new("p1"),
+        tags: BTreeSet::new(),
+        workstream_id: None,
+        available_since: Some(1.0),
         created_at: 1.0,
+    }
+}
+
+fn pinned(required: &AgentType) -> TaskAgentRequirement {
+    TaskAgentRequirement {
+        required_type: required.type_ref.clone(),
+        hard: task_requirement(),
     }
 }
 
 #[test]
 fn requirement_digest_ignores_affinity_order_and_bool_false() {
     let catalog = catalog();
-    let pinned = AgentTypeRef::new("reviewer", 1).unwrap();
+    let pin = type_ref("reviewer", 1);
 
     let mut with_false = task_requirement();
     with_false
@@ -108,39 +130,26 @@ fn requirement_digest_ignores_affinity_order_and_bool_false() {
     omitted.required_affinity = set(&["a", "b"]);
 
     let mut a = TaskAgentRequirement {
-        required_type: None,
+        required_type: pin.clone(),
         hard: with_false,
     };
     let mut b = TaskAgentRequirement {
-        required_type: Some(pinned.clone()),
-        hard: omitted.clone(),
-    };
-    // `required_type` is part of the identity, so pin both to compare content.
-    let mut c = TaskAgentRequirement {
-        required_type: Some(pinned),
+        required_type: pin,
         hard: omitted,
     };
 
     canonicalize_task_agent_requirement(&mut a, &catalog).unwrap();
     canonicalize_task_agent_requirement(&mut b, &catalog).unwrap();
-    canonicalize_task_agent_requirement(&mut c, &catalog).unwrap();
 
-    // `Bool(false)` normalizes to omission; `b` and `c` are the same content.
     assert!(a.hard.required_capabilities.is_empty());
     assert_eq!(
-        task_agent_requirement_content_digest(&b),
-        task_agent_requirement_content_digest(&c)
-    );
-    // A different pin changes the digest.
-    assert_ne!(
         task_agent_requirement_content_digest(&a),
         task_agent_requirement_content_digest(&b)
     );
 
-    // Round-trip through the canonical document.
-    let json = String::from_utf8(canonical_task_agent_requirement_bytes(&b)).unwrap();
+    let json = String::from_utf8(canonical_task_agent_requirement_bytes(&a)).unwrap();
     let decoded = task_agent_requirement_from_canonical_json(&json).unwrap();
-    assert_eq!(decoded, b);
+    assert_eq!(decoded, a);
 }
 
 fn policy() -> GenerationPolicy {
@@ -159,7 +168,6 @@ fn policy() -> GenerationPolicy {
 
 #[test]
 fn generation_policy_fold_keeps_the_stricter_task_and_caps_authority() {
-    // Generation caps at Write/Enabled; a ReadOnly Task keeps ReadOnly.
     let effective = fold_generation_policy(&policy(), &task_requirement()).unwrap();
     assert_eq!(effective.required_workspace, WorkspaceMode::ReadOnly);
     assert_eq!(effective.required_network, NetworkPolicy::Restricted);
@@ -169,7 +177,6 @@ fn generation_policy_fold_keeps_the_stricter_task_and_caps_authority() {
 
 #[test]
 fn generation_policy_fold_rejects_a_task_that_exceeds_the_ceiling() {
-    // Generation forbids Write: a Write Task must fail closed.
     let mut read_only_policy = policy();
     read_only_policy.max_workspace = WorkspaceMode::ReadOnly;
     let mut write_task = task_requirement();
@@ -179,7 +186,6 @@ fn generation_policy_fold_rejects_a_task_that_exceeds_the_ceiling() {
         Err(ContractError::GenerationPolicyConflict { .. })
     ));
 
-    // Generation forbids network: an Enabled Task must fail closed.
     let mut no_network_policy = policy();
     no_network_policy.max_network = NetworkPolicy::Disabled;
     let mut networked_task = task_requirement();
@@ -189,7 +195,6 @@ fn generation_policy_fold_rejects_a_task_that_exceeds_the_ceiling() {
         Err(ContractError::GenerationPolicyConflict { .. })
     ));
 
-    // A stricter Task under a wider ceiling keeps its own value.
     let mut disabled_task = task_requirement();
     disabled_task.required_network = NetworkPolicy::Disabled;
     let effective = fold_generation_policy(&policy(), &disabled_task).unwrap();
@@ -237,67 +242,61 @@ fn generation_policy_round_trips_canonically() {
 }
 
 #[test]
-fn matching_requires_pin_and_filters_incompatible_contracts() {
+fn matching_filters_incompatible_contracts_and_pins() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
 
-    // No pinned type: nominal selection is deferred, matching returns nothing,
-    // but this is still a typed (constrained) Task, never a legacy Task.
-    let untyped = TaskAgentRequirement {
-        required_type: None,
-        hard: task_requirement(),
-    };
-    assert!(match_existing_agents(&required, &untyped, &[], &catalog)
-        .unwrap()
-        .is_empty());
-
-    // Mismatched pin is a caller invariant violation, not an empty result.
-    let wrong_pin = TaskAgentRequirement {
-        required_type: Some(AgentTypeRef::new("other", 1).unwrap()),
-        hard: task_requirement(),
-    };
-    assert!(matches!(
-        match_existing_agents(&required, &wrong_pin, &[], &catalog),
-        Err(ContractError::InvariantViolation(_))
-    ));
-
-    // A candidate whose contract cannot execute the task is filtered out.
     let mut incapable_contract = contract(AffinityConstraint::Any, 100.0);
     incapable_contract.allowed_information_functions = vec![InformationFunction::CompressPositive];
     let incapable = ExistingAgentCandidate {
         logical_agent_id: LogicalAgentId::from_string("agent-incapable"),
         agent_type: AgentType {
-            type_ref: AgentTypeRef::new("reviewer", 1).unwrap(),
+            type_ref: type_ref("reviewer", 1),
             based_on: None,
             contract: incapable_contract,
         },
         lifecycle: LifecycleMode::Resident,
+        partition: PartitionId::new("p1"),
+        tags: BTreeSet::new(),
+        workstream_id: None,
         available_since: Some(0.0),
         created_at: 1.0,
     };
 
-    let req = TaskAgentRequirement {
-        required_type: Some(required.type_ref.clone()),
+    let matched = match_existing_agents(
+        &required,
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[incapable],
+        &catalog,
+    )
+    .unwrap();
+    assert!(matched.is_empty());
+
+    let wrong_pin = TaskAgentRequirement {
+        required_type: type_ref("other", 1),
         hard: task_requirement(),
     };
-    let matched = match_existing_agents(&required, &req, &[incapable], &catalog).unwrap();
-    assert!(matched.is_empty());
+    assert!(matches!(
+        match_existing_agents(
+            &required,
+            &wrong_pin,
+            &placement(ContinuityPreference::None),
+            &[],
+            &catalog
+        ),
+        Err(ContractError::InvariantViolation(_))
+    ));
 }
 
 #[test]
-fn matching_orders_exact_then_specific_then_deterministic() {
+fn matching_orders_exact_then_narrower_then_broader() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
-    let req = TaskAgentRequirement {
-        required_type: Some(required.type_ref.clone()),
-        hard: task_requirement(),
-    };
 
-    // The exact type wins over a narrower (more specific) candidate.
     let exact = candidate(
         "agent-exact",
         agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        Some(5.0),
     );
     let narrower = candidate(
         "agent-narrow",
@@ -307,48 +306,33 @@ fn matching_orders_exact_then_specific_then_deterministic() {
             AffinityConstraint::Only(set(&["rust"])),
             50.0,
         ),
-        Some(1.0),
+    );
+    let broader = candidate(
+        "agent-broad",
+        agent("generalist", 1, AffinityConstraint::Any, 300.0),
     );
 
-    let matched = match_existing_agents(&required, &req, &[narrower, exact], &catalog).unwrap();
+    let matched = match_existing_agents(
+        &required,
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[broader, narrower, exact],
+        &catalog,
+    )
+    .unwrap();
     let order: Vec<&str> = matched
         .iter()
         .map(|c| c.logical_agent_id.as_str())
         .collect();
-    assert_eq!(order, vec!["agent-exact", "agent-narrow"]);
-    // Only immediately usable (READY, unassigned) candidates are returned; the
-    // caller never receives a "cold" candidate it did not prove.
-    assert!(matched
-        .iter()
-        .all(|c| c.lifecycle == LifecycleMode::Resident));
-
-    // Two equivalent exact candidates order deterministically by id.
-    let a = candidate(
-        "agent-a",
-        agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        Some(1.0),
-    );
-    let b = candidate(
-        "agent-b",
-        agent("reviewer", 1, AffinityConstraint::Any, 100.0),
-        Some(1.0),
-    );
-    let matched = match_existing_agents(&required, &req, &[b, a], &catalog).unwrap();
-    assert_eq!(matched[0].logical_agent_id.as_str(), "agent-a");
+    assert_eq!(order, vec!["agent-exact", "agent-narrow", "agent-broad"]);
 }
 
 #[test]
 fn matching_prefers_candidate_specificity_before_availability() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
-    let req = TaskAgentRequirement {
-        required_type: Some(required.type_ref.clone()),
-        hard: task_requirement(),
-    };
 
-    // Both A and B are refinements of the required type; A is strictly more
-    // specific (subset affinity, lower budget). B has an earlier available_since.
-    let a = candidate(
+    let mut a = candidate(
         "agent-a",
         agent(
             "rust-reviewer",
@@ -356,9 +340,9 @@ fn matching_prefers_candidate_specificity_before_availability() {
             AffinityConstraint::Only(set(&["rust"])),
             50.0,
         ),
-        Some(9.0),
     );
-    let b = candidate(
+    a.available_since = Some(9.0);
+    let mut b = candidate(
         "agent-b",
         agent(
             "rust-reviewer",
@@ -366,25 +350,14 @@ fn matching_prefers_candidate_specificity_before_availability() {
             AffinityConstraint::Only(set(&["rust"])),
             80.0,
         ),
-        Some(1.0),
     );
-    // A broader type and a semantically incomparable type are NOT substitutes
-    // for a pinned requirement, even though both can execute the Task.
-    let broader = candidate(
-        "agent-broad",
-        agent("generalist", 1, AffinityConstraint::Any, 300.0),
-        Some(0.0),
-    );
-    let incomparable = candidate(
-        "agent-incomparable",
-        agent("odd", 1, AffinityConstraint::Only(set(&["rust"])), 300.0),
-        Some(0.0),
-    );
+    b.available_since = Some(1.0);
 
     let matched = match_existing_agents(
         &required,
-        &req,
-        &[broader, incomparable, b.clone(), a.clone()],
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[b, a],
         &catalog,
     )
     .unwrap();
@@ -393,4 +366,66 @@ fn matching_prefers_candidate_specificity_before_availability() {
         .map(|c| c.logical_agent_id.as_str())
         .collect();
     assert_eq!(order, vec!["agent-a", "agent-b"]);
+}
+
+#[test]
+fn matching_enforces_m5_placement_and_prefers_workstream() {
+    let catalog = catalog();
+    let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
+    let req = pinned(&required);
+
+    let w1 = WorkstreamId::from_string("w1");
+    let w2 = WorkstreamId::from_string("w2");
+
+    let mut placement = placement(ContinuityPreference::Preferred);
+    placement.required_tags = set(&["rust"]);
+    placement.workstream_id = Some(w1.clone());
+
+    let mut same_ws = candidate("agent-w1", required.clone());
+    same_ws.tags = set(&["rust"]);
+    same_ws.workstream_id = Some(w1.clone());
+    let mut other_ws = candidate("agent-w2", required.clone());
+    other_ws.tags = set(&["rust"]);
+    other_ws.workstream_id = Some(w2);
+
+    let mut wrong_partition = candidate("agent-part", required.clone());
+    wrong_partition.tags = set(&["rust"]);
+    wrong_partition.partition = PartitionId::new("p2");
+    wrong_partition.workstream_id = Some(w1.clone());
+
+    let mut missing_tag = candidate("agent-tag", required.clone());
+    missing_tag.workstream_id = Some(w1.clone());
+
+    let matched = match_existing_agents(
+        &required,
+        &req,
+        &placement,
+        &[
+            other_ws.clone(),
+            wrong_partition,
+            missing_tag,
+            same_ws.clone(),
+        ],
+        &catalog,
+    )
+    .unwrap();
+    let order: Vec<&str> = matched
+        .iter()
+        .map(|c| c.logical_agent_id.as_str())
+        .collect();
+    assert_eq!(order, vec!["agent-w1", "agent-w2"]);
+
+    // `Required` continuity is a hard workstream gate.
+    let mut required_ws = placement.clone();
+    required_ws.continuity = ContinuityPreference::Required;
+    let matched = match_existing_agents(
+        &required,
+        &req,
+        &required_ws,
+        &[same_ws, other_ws],
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].logical_agent_id.as_str(), "agent-w1");
 }

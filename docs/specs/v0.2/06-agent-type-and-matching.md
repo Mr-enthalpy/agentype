@@ -268,43 +268,46 @@ conformance until typed matching is implemented in M6.
 
 ## Typed admission and existing-agent matching (M6-B.3)
 
-An admitted Task MAY carry a durable `TaskAgentRequirement` with an optional
-exact AgentType pin. `admit_typed_proposal` creates the Task, its
-`GenerationTaskBinding`, and the requirement atomically; a loose selector MUST
-resolve to an exact revision before commitment, and a Task whose requirement
+An admitted Task MAY carry a durable `TaskAgentRequirement`. Its `required_type`
+is a **mandatory exact immutable `AgentTypeRef`**: `admit_typed_proposal` resolves
+a pre-commit selector to an exact revision before commitment, and there is no
+durable unpinned typed requirement (`D-TYPE-REV-PIN`). It creates the Task, its
+`GenerationTaskBinding`, and the requirement atomically; a Task whose requirement
 would widen its Generation policy MUST fail closed. The requirement never selects
 a `SpawnSource` and never starts physical work.
 
-The durable `TaskAgentRequirement` row is the authority boundary: any Task that
-has one MUST be invisible to the legacy untyped consumer/claim path, whether or
-not it carries a nominal pin, because an unpinned typed requirement can still
-carry hard capability/security constraints. A
-`TaskAgentRequirement` with `required_type = None` is therefore a typed,
-constrained Task (with selection deferred), never a legacy Task. Until a typed
-authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
-`QUEUED` and acquires no Attempt, Lease, or Execution.
+Typedness is a positive durable fact: the Task carries an
+`agent_requirement_mode` (`LEGACY`/`TYPED`) fixed at admission, and any Task that
+is not `LEGACY` MUST be invisible to the legacy untyped consumer/claim path. A
+lost requirement row is therefore corruption, never a silent downgrade to a
+legacy Task. Until a typed authority-bearing acquisition path exists (M6-B.4), a
+typed Task stays durable `QUEUED` and acquires no Attempt, Lease, or Execution.
 
-A Generation that carries a policy MUST NOT be admitted through the legacy
-`admit_proposal` path; the policy is a generation-wide hard ceiling and legacy
-admission MUST fail closed. A Generation with no policy preserves legacy
-admission unchanged. Folding a Generation policy is the spec 10 intersection: the
-Generation is an authority ceiling, so a Task requiring more workspace/network
-authority than the ceiling MUST fail closed, and a Task requiring less MUST keep
-its stricter value (the Generation never widens a Task). Full capability and
-sandbox ordering/intersection remains B.5.
+A Generation carries a `policy_mode` (`NONE`/`POLICY`) fixed at creation. A
+`POLICY` Generation MUST NOT be admitted through the legacy `admit_proposal` path
+(fail closed), and a missing policy row for a `POLICY` marker is corruption, never
+an unconstrained Generation. A `NONE` Generation preserves legacy admission
+unchanged. Folding a Generation policy is the spec 10 intersection: the Generation
+is an authority ceiling, so a Task requiring more workspace/network authority than
+the ceiling MUST fail closed, and a Task requiring less MUST keep its stricter
+value (the Generation never widens a Task). Full capability and sandbox
+ordering/intersection remains B.5.
 
-Existing-agent matching is restricted to LogicalAgents that carry an exact
-`logical_agent_type_bindings` revision and are M5 `READY` and unassigned.
-Non-READY states are not treated as cold/revivable. A Task with a requirement
-MUST NOT be served by an unbound LogicalAgent; an unbound agent has no contract
-to prove `can_execute`. A **pinned** requirement is satisfied only by the exact
-type or a refinement of it (`more_specific_for(candidate, required)`); a broader
-or semantically incomparable type has more authority than the pin and is NOT a
-substitute (broader/general compatibility is for future unpinned selection).
-Among eligible candidates, semantic dominance (`more_specific_for`) MUST be
-applied before continuity/availability/identity tie-breaks, and ranking MUST NOT
-use nominal inheritance depth. Only exact-selector replay is idempotent, and an
-already-committed exact pin remains replayable even after its revision is
-deprecated; a `Latest` retry after the catalog advances MUST fail closed rather
-than re-pin. New-agent provisioning from an eligible SpawnSource, full physical
-eligibility (`can_provision_task`), and credentials remain M6-B.4/M6-B.5.
+Existing-agent matching composes two hard gates: the frozen M5 placement rules
+(exact partition, task tags subset of the agent's concrete tags, and the same
+workstream for `Required` continuity) **and** the AgentType contract
+(`can_execute`). Only M5 `READY`, unassigned, bound agents are candidates;
+non-READY states are not treated as cold/revivable; an unbound agent is never
+returned. A `Preferred` continuity ranks the same workstream first. The exact pin
+is a matching anchor, not a ceiling: among eligible candidates the relation to the
+pin orders as exact, then compatible narrower/refinement types, then
+equivalent/incomparable compatible types, then compatible broader/general types;
+within a relation class, candidate-vs-candidate `more_specific_for` dominates
+before the `Preferred` workstream, continuity strength, availability, and stable
+identity tie-breaks. Ranking MUST NOT use nominal inheritance depth. Only
+exact-selector replay is idempotent; an already-committed exact pin remains
+replayable after deprecation, while a `Latest` retry after the catalog advances
+MUST fail closed. A fresh `logical_agent_type_bindings` row requires a currently
+`PUBLISHED` revision. New-agent provisioning from an eligible SpawnSource, full
+physical eligibility (`can_provision_task`), and credentials remain
+M6-B.4/M6-B.5.

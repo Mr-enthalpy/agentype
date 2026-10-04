@@ -32,10 +32,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// the admitted TaskSpec and resolves `required_type` from a loose selector to an
 /// exact revision before anything is written. This keeps the TaskSpec the single
 /// authority for those dimensions.
+///
+/// `required_type` is mandatory: an admitted Task agent requirement MUST pin an
+/// exact immutable `AgentTypeRef` (spec 06 `D-TYPE-REV-PIN`). A caller that wants
+/// to express only constraints without committing a semantic type must not use
+/// typed admission; that is a separate pre-commit selection concern.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRequirementDraft {
-    /// A pre-commit selector; `None` means no type pin.
-    pub required_type: Option<AgentTypeSelector>,
+    /// A pre-commit selector, resolved to an exact revision before commitment.
+    pub required_type: AgentTypeSelector,
     pub required_capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
     pub required_network: NetworkPolicy,
     pub required_attempt_isolation: bool,
@@ -49,7 +54,7 @@ impl AgentRequirementDraft {
     /// dimensions are known.
     pub fn into_requirement(
         self,
-        required_type: Option<AgentTypeRef>,
+        required_type: AgentTypeRef,
         information_function: InformationFunction,
         required_affinity: BTreeSet<String>,
         required_workspace: WorkspaceMode,
@@ -73,19 +78,19 @@ impl AgentRequirementDraft {
     }
 }
 
-/// A Task's durable agent requirement: an optional exact AgentType pin plus the
-/// hard derived `TaskRequirement`.
+/// A Task's durable agent requirement: an exact AgentType pin plus the hard
+/// derived `TaskRequirement`.
 ///
-/// `required_type` is always an exact immutable revision once durable. A loose
-/// selector is resolved before commitment (spec 06 `D-TYPE-REV-PIN`). Its
-/// presence is the authority boundary: a Task with this row is a **typed** Task
-/// and is invisible to the legacy untyped dispatch path, whether or not it has a
-/// nominal pin.
+/// `required_type` is always an exact immutable revision once durable; a loose
+/// selector is resolved before commitment (spec 06 `D-TYPE-REV-PIN`). The
+/// requirement's existence is the authority boundary: a Task with this row is a
+/// **typed** Task and is invisible to the legacy untyped dispatch path. The pin is
+/// a matching anchor, not a ceiling: compatible broader/general types remain
+/// eligible per the frozen spec 06 matching preference.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskAgentRequirement {
-    /// Exact AgentType pin, or `None` for a requirement with no nominal type
-    /// constraint (still potentially constraining capabilities/security).
-    pub required_type: Option<AgentTypeRef>,
+    /// Exact AgentType pin.
+    pub required_type: AgentTypeRef,
     pub hard: TaskRequirement,
 }
 
@@ -227,13 +232,21 @@ pub fn fold_generation_policy(
             });
         }
     }
-    if let Some(constraint) = &policy.anchor_constraint {
-        if task.required_anchor.as_ref() != Some(constraint) {
+    // An anchor is an equality constraint. A Generation anchor tightens a Task
+    // that has none; a Task anchor that disagrees with the Generation's fails
+    // closed.
+    let effective_anchor = match (&policy.anchor_constraint, &task.required_anchor) {
+        (None, task_anchor) => task_anchor.clone(),
+        (Some(policy_anchor), None) => Some(policy_anchor.clone()),
+        (Some(policy_anchor), Some(task_anchor)) if policy_anchor == task_anchor => {
+            Some(task_anchor.clone())
+        }
+        (Some(_), Some(_)) => {
             return Err(ContractError::GenerationPolicyConflict {
                 reason: "task anchor does not satisfy the generation anchor constraint".into(),
-            });
+            })
         }
-    }
+    };
 
     // The ceiling must not be exceeded; the Task's own (stricter) value survives.
     if workspace_rank(task.required_workspace) > workspace_rank(policy.max_workspace) {
@@ -257,7 +270,7 @@ pub fn fold_generation_policy(
             || task.required_attempt_isolation,
         required_continuity: policy.min_continuity.max(task.required_continuity),
         sandbox_policy: sandbox_fold(&policy.sandbox_policy, &task.sandbox_policy)?,
-        required_anchor: task.required_anchor.clone(),
+        required_anchor: effective_anchor,
         budget: if policy.budget_ceiling <= task.budget {
             policy.budget_ceiling
         } else {

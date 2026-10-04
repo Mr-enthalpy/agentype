@@ -10,7 +10,7 @@ use agentype_agent_contract::{
     SecurityClass, SecurityContract,
 };
 use agentype_core::{
-    Clock, Error, InformationFunction, LogicalAgentId, LogicalAgentState, ManualClock,
+    Clock, Error, InformationFunction, LogicalAgentId, LogicalAgentState, ManualClock, PartitionId,
     PartitionSpec, ProposalStateKind, RawWorkIntent, Retention, SemanticInputSet, TaskSpec,
     TaskState, WorkspaceMode,
 };
@@ -93,7 +93,7 @@ fn publish_agent_type(kernel: &Kernel, id: &str, revision: u64) -> AgentTypeRef 
 
 fn draft(pin: AgentTypeRef) -> AgentRequirementDraft {
     AgentRequirementDraft {
-        required_type: Some(AgentTypeSelector::Exact(pin)),
+        required_type: AgentTypeSelector::Exact(pin),
         required_capabilities: BTreeMap::new(),
         required_network: NetworkPolicy::Restricted,
         required_attempt_isolation: false,
@@ -119,22 +119,9 @@ fn compile_proposal(kernel: &Kernel, spec: TaskSpec) -> agentype_core::ProposalR
         .unwrap()
 }
 
-/// A typed draft with no nominal pin but a hard network restriction.
-fn unpinned_draft() -> AgentRequirementDraft {
-    AgentRequirementDraft {
-        required_type: None,
-        required_capabilities: BTreeMap::new(),
-        required_network: NetworkPolicy::Enabled,
-        required_attempt_isolation: false,
-        sandbox_policy: None,
-        required_anchor: None,
-        budget: Budget::new(50.0).unwrap(),
-    }
-}
-
 fn latest_draft(type_id: &str) -> AgentRequirementDraft {
     AgentRequirementDraft {
-        required_type: Some(AgentTypeSelector::latest(type_id).unwrap()),
+        required_type: AgentTypeSelector::latest(type_id).unwrap(),
         required_capabilities: BTreeMap::new(),
         required_network: NetworkPolicy::Restricted,
         required_attempt_isolation: false,
@@ -167,7 +154,7 @@ fn typed_admission_pins_exact_type_and_derives_spec_dimensions() {
         .get_task_agent_requirement(&task_id)
         .unwrap()
         .expect("typed requirement exists");
-    assert_eq!(requirement.required_type, Some(pin.clone()));
+    assert_eq!(requirement.required_type, pin.clone());
     assert_eq!(
         requirement.hard.information_function,
         InformationFunction::Expand
@@ -516,25 +503,140 @@ fn typed_task_does_not_birth_a_legacy_consumer() {
 }
 
 #[test]
-fn unpinned_typed_task_is_also_quarantined() {
-    let kernel = partitioned_kernel();
+fn typed_mode_marker_quarantines_even_if_requirement_row_is_lost() {
+    let path = file_path("b3-typed-marker");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
     let proposal = compile_proposal(
         &kernel,
         TaskSpec::new("audit", json!({})).partition("general"),
     );
     let task = kernel
-        .admit_typed_proposal(&proposal.proposal_id, 0, None, unpinned_draft())
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
         .unwrap();
 
-    let requirement = kernel
-        .get_task_agent_requirement(&task)
-        .unwrap()
-        .expect("requirement row exists");
-    // No nominal pin, but a hard network requirement: still a typed Task.
-    assert!(requirement.required_type.is_none());
-    assert_eq!(requirement.hard.required_network, NetworkPolicy::Enabled);
+    // Simulate corruption: remove the requirement row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER task_agent_requirements_immutable_delete", [])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM task_agent_requirements WHERE task_id=?1",
+            [task.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(kernel.get_task_agent_requirement(&task).unwrap().is_none());
+
+    // The positive parent marker keeps the Task out of the legacy path; it never
+    // silently downgrades to a legacy Task.
     assert!(kernel.claim_next_available().unwrap().is_none());
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+}
+
+#[test]
+fn lost_generation_policy_still_blocks_legacy_admission() {
+    let path = file_path("b3-policy-marker");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let gen = kernel
+        .create_generation_with_policy(json!({}), Some(sample_policy()))
+        .unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER generation_policies_immutable_delete", [])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM generation_policies WHERE generation_id=?1",
+            [gen.generation_id.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(kernel
+        .get_generation_policy(&gen.generation_id)
+        .unwrap()
+        .is_none());
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "legacy_after_policy_loss".into(),
+        objective: "legacy admission".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("audit", json!({}))),
+    };
+    let proposal = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    // The `POLICY` marker forbids legacy admission even without the row.
+    let err = kernel
+        .admit_proposal(&proposal.proposal_id, 0, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+}
+
+#[test]
+fn fresh_binding_requires_a_published_type() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    kernel
+        .set_agent_type_status(&pin, AgentTypeStatus::Deprecated)
+        .unwrap();
+    let agent = kernel.ready_agent("general").unwrap();
+    let err = kernel.bind_logical_agent_type(&agent, &pin).unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+}
+
+#[test]
+fn matching_respects_task_partition() {
+    let kernel = memory_kernel();
+    for name in ["p1", "p2"] {
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                name,
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+    }
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    for name in ["p1", "p2"] {
+        let agent = kernel.ready_agent(name).unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    }
+
+    let proposal = compile_proposal(&kernel, TaskSpec::new("audit", json!({})).partition("p1"));
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    let matched = kernel.match_existing_agents_for_task(&task).unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].partition, PartitionId::new("p1"));
 }
 
 #[test]

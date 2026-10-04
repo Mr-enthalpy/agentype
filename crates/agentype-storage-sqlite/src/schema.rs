@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     required INTEGER NOT NULL CHECK (required = 1),
     priority INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL CHECK (state IN ('BLOCKED','QUEUED','LEASED','RUNNING','RETRY_WAIT','SUSPENDED','COMPLETED','CANCELLED')),
+    agent_requirement_mode TEXT NOT NULL DEFAULT 'LEGACY' CHECK (agent_requirement_mode IN ('LEGACY','TYPED')),
     max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
     retry_classes_json TEXT NOT NULL,
     base_backoff_seconds REAL NOT NULL CHECK (base_backoff_seconds >= 0),
@@ -306,6 +307,7 @@ CREATE TABLE IF NOT EXISTS generations (
     state TEXT NOT NULL CHECK (state IN ('OPEN','FROZEN','CLOSED')),
     revision INTEGER NOT NULL DEFAULT 0,
     admission_seq INTEGER NOT NULL DEFAULT 0,
+    policy_mode TEXT NOT NULL DEFAULT 'NONE' CHECK (policy_mode IN ('NONE','POLICY')),
     seed_payload_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     frozen_at REAL,
@@ -684,12 +686,11 @@ CREATE TABLE IF NOT EXISTS generation_policies (
 
 CREATE TABLE IF NOT EXISTS task_agent_requirements (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
-    required_type_id TEXT,
-    required_type_revision INTEGER CHECK (required_type_revision IS NULL OR required_type_revision >= 1),
+    required_type_id TEXT NOT NULL,
+    required_type_revision INTEGER NOT NULL CHECK (required_type_revision >= 1),
     requirement_json TEXT NOT NULL,
     requirement_digest TEXT NOT NULL,
     created_at REAL NOT NULL,
-    CHECK ((required_type_id IS NULL) = (required_type_revision IS NULL)),
     FOREIGN KEY (required_type_id, required_type_revision)
         REFERENCES agent_types(type_id, revision)
 );
@@ -739,5 +740,23 @@ CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_delete
 BEFORE DELETE ON logical_agent_type_bindings
 BEGIN
     SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+-- Parent-side presence markers make "typed" and "policy-bearing" positive
+-- durable facts, so losing the child row is corruption rather than a silent
+-- downgrade to legacy/unconstrained. A typed Task cannot be downgraded, and a
+-- Generation's policy mode is fixed at creation.
+CREATE TRIGGER IF NOT EXISTS tasks_agent_requirement_mode_no_downgrade
+BEFORE UPDATE OF agent_requirement_mode ON tasks
+WHEN OLD.agent_requirement_mode = 'TYPED' AND NEW.agent_requirement_mode = 'LEGACY'
+BEGIN
+    SELECT RAISE(ABORT, 'a typed task cannot be downgraded to the legacy path');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generations_policy_mode_immutable
+BEFORE UPDATE OF policy_mode ON generations
+WHEN OLD.policy_mode IS NOT NEW.policy_mode
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy mode is immutable');
 END;
 "#;

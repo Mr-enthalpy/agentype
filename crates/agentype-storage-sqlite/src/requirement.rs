@@ -10,7 +10,7 @@
 //! selects a `SpawnSource`; the pure matching engine only orders already-bound
 //! LogicalAgents.
 
-use crate::catalog::{get_agent_type, load_capability_catalog};
+use crate::catalog::{get_agent_type, load_capability_catalog, AgentTypeStatus};
 use crate::store::{map_sqlite, query_opt};
 use agentype_agent_contract::{
     can_execute, canonical_generation_policy_bytes, canonical_task_agent_requirement_bytes,
@@ -19,11 +19,11 @@ use agentype_agent_contract::{
     generation_policy_from_canonical_json, match_existing_agents, resolve_selector,
     task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
     AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, ContinuityMode, ExistingAgentCandidate,
-    GenerationPolicy, LifecycleMode, TaskAgentRequirement,
+    GenerationPolicy, LifecycleMode, TaskAgentRequirement, TaskPlacement,
 };
 use agentype_core::{
-    ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, TaskId,
-    TaskSpec, UnixTime,
+    ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
+    TaskId, TaskSpec, UnixTime, WorkstreamId,
 };
 use rusqlite::{params, Transaction};
 use std::collections::BTreeSet;
@@ -70,13 +70,7 @@ pub fn insert_task_agent_requirement(
         canonical_task_agent_requirement_bytes(&canonical),
         "task agent requirement",
     )?;
-    let (type_id, type_revision) = match &canonical.required_type {
-        Some(reference) => (
-            Some(reference.id().as_str().to_string()),
-            Some(reference.revision() as i64),
-        ),
-        None => (None, None),
-    };
+    let reference = &canonical.required_type;
     tx.execute(
         "INSERT INTO task_agent_requirements(
              task_id, required_type_id, required_type_revision,
@@ -84,12 +78,19 @@ pub fn insert_task_agent_requirement(
          VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             task_id.as_str(),
-            type_id,
-            type_revision,
+            reference.id().as_str(),
+            reference.revision() as i64,
             content_json,
             digest,
             now
         ],
+    )
+    .map_err(map_sqlite)?;
+    // The durable parent marker makes "typed" a positive fact, so a lost
+    // requirement row is corruption rather than a silent legacy Task.
+    tx.execute(
+        "UPDATE tasks SET agent_requirement_mode='TYPED', updated_at=?1 WHERE id=?2",
+        params![now, task_id.as_str()],
     )
     .map_err(map_sqlite)?;
     Ok(digest)
@@ -108,8 +109,8 @@ pub fn get_task_agent_requirement(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         },
     )?;
@@ -124,13 +125,9 @@ pub fn get_task_agent_requirement(
     }
     let mut requirement =
         task_agent_requirement_from_canonical_json(&json).map_err(contract_fault)?;
-    let mirror = match (&requirement.required_type, type_id, type_revision) {
-        (Some(reference), Some(id), Some(revision)) => {
-            reference.id().as_str() == id && reference.revision() as i64 == revision
-        }
-        (None, None, None) => true,
-        _ => false,
-    };
+    let reference = &requirement.required_type;
+    let mirror =
+        reference.id().as_str() == type_id.as_str() && type_revision == reference.revision() as i64;
     if !mirror {
         return Err(Error::invariant(
             "task agent requirement required_type mirror does not match its canonical document",
@@ -167,7 +164,7 @@ pub fn build_task_agent_requirement(
     information_function: InformationFunction,
     task_spec: &TaskSpec,
 ) -> Result<TaskAgentRequirement, Error> {
-    let required_type = resolve_draft_selector(tx, &draft, None)?;
+    let required_type = resolve_draft_selector(tx, &draft.required_type, None)?;
     let requirement = derive_task_agent_requirement(
         tx,
         generation_id,
@@ -191,9 +188,9 @@ pub fn build_task_agent_requirement_replay(
     draft: AgentRequirementDraft,
     information_function: InformationFunction,
     task_spec: &TaskSpec,
-    committed_pin: &Option<AgentTypeRef>,
+    committed_pin: &AgentTypeRef,
 ) -> Result<TaskAgentRequirement, Error> {
-    let required_type = resolve_draft_selector(tx, &draft, committed_pin.as_ref())?;
+    let required_type = resolve_draft_selector(tx, &draft.required_type, Some(committed_pin))?;
     derive_task_agent_requirement(
         tx,
         generation_id,
@@ -209,12 +206,9 @@ pub fn build_task_agent_requirement_replay(
 /// accepted even when deprecated.
 fn resolve_draft_selector(
     tx: &Transaction<'_>,
-    draft: &AgentRequirementDraft,
+    selector: &AgentTypeSelector,
     committed: Option<&AgentTypeRef>,
-) -> Result<Option<AgentTypeRef>, Error> {
-    let Some(selector) = &draft.required_type else {
-        return Ok(None);
-    };
+) -> Result<AgentTypeRef, Error> {
     if let (AgentTypeSelector::Exact(reference), Some(committed)) = (selector, committed) {
         if reference == committed {
             get_agent_type(tx, reference)?.ok_or_else(|| {
@@ -224,7 +218,7 @@ fn resolve_draft_selector(
                     reference.revision()
                 ))
             })?;
-            return Ok(Some(reference.clone()));
+            return Ok(reference.clone());
         }
     }
     let lookup = crate::catalog::load_agent_type_lookup(tx)?;
@@ -236,7 +230,7 @@ fn resolve_draft_selector(
             resolved.revision()
         ))
     })?;
-    Ok(Some(resolved))
+    Ok(resolved)
 }
 
 fn derive_task_agent_requirement(
@@ -245,19 +239,20 @@ fn derive_task_agent_requirement(
     draft: AgentRequirementDraft,
     information_function: InformationFunction,
     task_spec: &TaskSpec,
-    required_type: Option<AgentTypeRef>,
+    required_type: AgentTypeRef,
 ) -> Result<TaskAgentRequirement, Error> {
     let required_affinity: BTreeSet<String> = task_spec.affinity_tags.iter().cloned().collect();
-    // A `Required` continuity preference becomes a hard `Logical` requirement.
-    // `Preferred` is a soft dimension that M6-B.3 does not rank on (it is not
-    // part of the frozen matching order), so it stays out of the requirement.
+    // Only a `Required` continuity preference becomes a hard `Logical`
+    // requirement. `Preferred`/`None` stay out of the hard requirement; the
+    // `Preferred` placement preference is applied by the matcher from the Task's
+    // M5 row.
     let required_continuity = match task_spec.continuity {
         ContinuityPreference::Required => ContinuityMode::Logical,
         ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
     };
 
     let mut requirement = draft.into_requirement(
-        required_type.clone(),
+        required_type,
         information_function,
         required_affinity,
         task_spec.workspace_mode,
@@ -266,7 +261,12 @@ fn derive_task_agent_requirement(
 
     let catalog = load_capability_catalog(tx)?;
     requirement.normalize(&catalog).map_err(contract_fault)?;
-    if let Some(policy) = get_generation_policy(tx, generation_id)? {
+    // A policy-bearing Generation MUST have its policy row; a missing row is
+    // corruption, never an unconstrained Generation.
+    if generation_policy_mode(tx, generation_id)? == "POLICY" {
+        let policy = get_generation_policy(tx, generation_id)?.ok_or_else(|| {
+            Error::invariant("a policy-bearing generation is missing its policy row")
+        })?;
         requirement.hard =
             fold_generation_policy(&policy, &requirement.hard).map_err(contract_fault)?;
     }
@@ -283,9 +283,7 @@ fn validate_pinned_type_can_execute(
     tx: &Transaction<'_>,
     requirement: &TaskAgentRequirement,
 ) -> Result<(), Error> {
-    let Some(reference) = &requirement.required_type else {
-        return Ok(());
-    };
+    let reference = &requirement.required_type;
     let (agent_type, _status) = get_agent_type(tx, reference)?.ok_or_else(|| {
         Error::not_found(format!(
             "agent type {}@{} does not exist",
@@ -295,6 +293,21 @@ fn validate_pinned_type_can_execute(
     })?;
     let catalog = load_capability_catalog(tx)?;
     can_execute(&agent_type, &requirement.hard, &catalog).map_err(contract_fault)
+}
+
+/// The durable generation policy presence marker. A missing row for a
+/// `POLICY` marker is corruption, never an unconstrained Generation.
+pub fn generation_policy_mode(
+    tx: &Transaction<'_>,
+    generation_id: &GenerationId,
+) -> Result<String, Error> {
+    query_opt(
+        tx,
+        "SELECT policy_mode FROM generations WHERE generation_id=?1",
+        params![generation_id.as_str()],
+        |row| row.get::<_, String>(0),
+    )?
+    .ok_or_else(|| Error::not_found(format!("generation {}", generation_id.as_str())))
 }
 
 // =============================================================================
@@ -401,14 +414,29 @@ pub fn bind_logical_agent_type(
         )));
     }
     // Validate the exact revision through the canonical read, not merely its FK
-    // row existence: a corrupt dependency must not become a new binding.
-    get_agent_type(tx, type_ref)?.ok_or_else(|| {
+    // row existence: a corrupt dependency must not become a new binding. A fresh
+    // binding requires a currently `PUBLISHED` revision, matching pre-commit
+    // selector semantics; an existing committed pin survives deprecation, but an
+    // operator cannot mint a new commitment to a deprecated identity.
+    let (_, status) = get_agent_type(tx, type_ref)?.ok_or_else(|| {
         Error::not_found(format!(
             "agent type {}@{} does not exist",
             type_ref.id().as_str(),
             type_ref.revision()
         ))
     })?;
+    if status != AgentTypeStatus::Published {
+        return Err(Error::invalid_authority(format!(
+            "a fresh LogicalAgent type binding requires a PUBLISHED agent type; {}@{} is {}",
+            type_ref.id().as_str(),
+            type_ref.revision(),
+            if status == AgentTypeStatus::Deprecated {
+                "DEPRECATED"
+            } else {
+                "not published"
+            }
+        )));
+    }
     let already: bool = query_opt(
         tx,
         "SELECT 1 FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
@@ -470,14 +498,30 @@ fn lifecycle_from_retention(retention: &str) -> Result<LifecycleMode, Error> {
     }
 }
 
+fn parse_tags(json: &str) -> Result<BTreeSet<String>, Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| Error::invariant(format!("tags json: {e}")))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| Error::invariant("tags json must be an array"))?;
+    let mut tags = BTreeSet::new();
+    for item in array {
+        let tag = item
+            .as_str()
+            .ok_or_else(|| Error::invariant("tags json element must be a string"))?;
+        tags.insert(tag.to_string());
+    }
+    Ok(tags)
+}
+
 /// Rank existing, bound, immediately usable LogicalAgents for one Task's
-/// requirement. Pure: it reads only durable bindings and the validated catalog,
-/// writes nothing, and never touches a `SpawnSource`.
+/// requirement. Pure: it reads durable bindings, the Task's M5 placement row, and
+/// the validated catalog, writes nothing, and never touches a `SpawnSource`.
 ///
-/// Only M5 `READY` and unassigned agents are candidates. Non-READY states
-/// (`ASSIGNED`, `DRAINING`, `SUSPENDED`, `RETIRED`, ...) are NOT approximated as
-/// "cold/revivable": M6 revival is a later seam, and returning a retired or busy
-/// agent as an eligible candidate would freeze a false abstraction.
+/// Eligibility composes the frozen M5 placement rules (exact partition, tag
+/// superset, `Required` workstream gate) with the AgentType contract
+/// (`can_execute`). Only M5 `READY` and unassigned agents are candidates;
+/// non-READY states are not approximated as "cold/revivable".
 pub fn match_existing_agents_for_task(
     tx: &Transaction<'_>,
     task_id: &TaskId,
@@ -485,17 +529,53 @@ pub fn match_existing_agents_for_task(
     let Some(requirement) = get_task_agent_requirement(tx, task_id)? else {
         return Ok(Vec::new());
     };
-    let Some(required_ref) = requirement.required_type.clone() else {
-        return Ok(Vec::new());
-    };
+    let required_ref = requirement.required_type.clone();
     let (required, _status) = get_agent_type(tx, &required_ref)?.ok_or_else(|| {
         Error::invariant("a task agent requirement references a missing agent type")
     })?;
 
-    let rows: Vec<(String, String, Option<f64>, f64)> = {
+    let task_row = query_opt(
+        tx,
+        "SELECT partition_name, affinity_tags_json, workstream_id, continuity, agent_requirement_mode
+         FROM tasks WHERE id=?1",
+        params![task_id.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )?
+    .ok_or_else(|| Error::not_found(format!("task {}", task_id.as_str())))?;
+    let (partition, tags_json, workstream, continuity, mode) = task_row;
+    if mode != "TYPED" {
+        return Err(Error::invariant(
+            "a task agent requirement exists but the task is not marked TYPED",
+        ));
+    }
+    let placement = TaskPlacement {
+        partition: PartitionId::new(partition),
+        required_tags: parse_tags(&tags_json)?,
+        workstream_id: workstream.map(WorkstreamId::from_string),
+        continuity: ContinuityPreference::parse_sql(&continuity)?,
+    };
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        f64,
+        String,
+    )> = {
         let mut statement = tx
             .prepare(
-                "SELECT la.id, la.retention, la.available_since, la.created_at
+                "SELECT la.id, la.partition_name, la.tags_json, la.workstream_id,
+                        la.available_since, la.created_at, la.retention
                  FROM logical_agents la
                  JOIN logical_agent_type_bindings b ON b.logical_agent_id = la.id
                  WHERE la.state='READY' AND la.current_task_id IS NULL
@@ -507,8 +587,11 @@ pub fn match_existing_agents_for_task(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(map_sqlite)?;
@@ -520,7 +603,8 @@ pub fn match_existing_agents_for_task(
     };
 
     let mut candidates = Vec::with_capacity(rows.len());
-    for (agent_id, retention, available_since, created_at) in rows {
+    for (agent_id, partition, tags_json, workstream, available_since, created_at, retention) in rows
+    {
         let agent = LogicalAgentId::from_string(agent_id);
         let Some(bound_ref) = get_logical_agent_type_binding(tx, &agent)? else {
             continue;
@@ -532,11 +616,15 @@ pub fn match_existing_agents_for_task(
             logical_agent_id: agent,
             agent_type,
             lifecycle: lifecycle_from_retention(&retention)?,
+            partition: PartitionId::new(partition),
+            tags: parse_tags(&tags_json)?,
+            workstream_id: workstream.map(WorkstreamId::from_string),
             available_since,
             created_at,
         });
     }
 
     let catalog = load_capability_catalog(tx)?;
-    match_existing_agents(&required, &requirement, &candidates, &catalog).map_err(contract_fault)
+    match_existing_agents(&required, &requirement, &placement, &candidates, &catalog)
+        .map_err(contract_fault)
 }

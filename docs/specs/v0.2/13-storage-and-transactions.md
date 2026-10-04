@@ -45,6 +45,12 @@ catalog:
 - `generation_policies` is immutable: a generation-wide authority ceiling is
   fixed at generation creation and applied as the spec 10 intersection on each
   typed admission (a Task exceeding it fails closed).
+- `tasks.agent_requirement_mode` (`LEGACY`/`TYPED`) and
+  `generations.policy_mode` (`NONE`/`POLICY`) are positive parent-side presence
+  markers fixed at creation/admission. A missing child row for a positive marker
+  is corruption, never a silent downgrade to legacy or an unconstrained
+  Generation; SQLite triggers forbid downgrading a typed Task and mutating a
+  generation's policy mode.
 - all three tables MUST reject `UPDATE`/`DELETE` mechanically (SQLite triggers),
   so direct SQL cannot rewrite a requirement, rebind an agent, or mutate a
   policy.

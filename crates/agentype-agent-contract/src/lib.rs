@@ -56,7 +56,7 @@ pub use evidence::ResolvedProvisioningEvidence;
 pub use ids::{
     AdapterPolicyId, AgentTypeId, CapabilityId, SandboxPolicyId, SourceConfigId, SpawnSourceId,
 };
-pub use matching::{match_existing_agents, ExistingAgentCandidate};
+pub use matching::{match_existing_agents, ExistingAgentCandidate, TaskPlacement};
 pub use predicates::{
     can_execute, can_provision, can_provision_task, is_valid_refinement, more_specific_for,
     validate_source_config, validate_spawn_source,

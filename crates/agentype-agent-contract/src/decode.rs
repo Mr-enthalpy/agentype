@@ -544,16 +544,11 @@ pub fn task_agent_requirement_from_canonical_json(
 ) -> Result<TaskAgentRequirement, ContractError> {
     let value = parse_document(json, "TASK_AGENT_REQUIREMENT")?;
     let document = object(&value, "task agent requirement")?;
-    let required_type = match field(document, "required_type")? {
-        Value::Null => None,
-        other => {
-            let reference = object(other, "required_type")?;
-            Some(AgentTypeRef::new(
-                string_of(field(reference, "type_id")?, "required type_id")?,
-                u64_of(field(reference, "revision")?, "required revision")?,
-            )?)
-        }
-    };
+    let reference = object(field(document, "required_type")?, "required_type")?;
+    let required_type = AgentTypeRef::new(
+        string_of(field(reference, "type_id")?, "required type_id")?,
+        u64_of(field(reference, "revision")?, "required revision")?,
+    )?;
     let hard = task_requirement_from(field(document, "hard")?)?;
     Ok(TaskAgentRequirement {
         required_type,

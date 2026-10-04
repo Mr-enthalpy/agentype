@@ -1593,6 +1593,7 @@ impl Kernel {
                      JOIN batches b ON b.id=t.batch_id
                      JOIN pool_partitions p ON p.name=t.partition_name
                      WHERE t.state='QUEUED' AND b.state='ACTIVE' AND p.active=1
+                       AND t.agent_requirement_mode='LEGACY'
                        AND NOT EXISTS (
                            SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
                        )
@@ -1690,6 +1691,7 @@ impl Kernel {
                          FROM tasks t JOIN batches b ON b.id=t.batch_id
                          JOIN pool_partitions p ON p.name=t.partition_name
                          WHERE t.state='QUEUED'
+                           AND t.agent_requirement_mode='LEGACY'
                            AND NOT EXISTS (
                                SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
                            )",
