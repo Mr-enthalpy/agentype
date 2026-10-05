@@ -304,7 +304,7 @@ fn policy_generation_rejects_a_task_that_exceeds_the_ceiling() {
     let err = kernel
         .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
         .unwrap_err();
-    assert!(matches!(err, Error::InvariantViolation(_)));
+    assert!(matches!(err, Error::InvalidAuthority(_)));
     assert_eq!(
         kernel.get_proposal(&proposal.proposal_id).unwrap().state,
         ProposalStateKind::Pending
@@ -428,6 +428,42 @@ fn sqlite_mechanically_rejects_typed_table_mutation() {
         )
         .is_err());
     assert!(conn.execute("DELETE FROM generation_policies", []).is_err());
+
+    // `INSERT OR REPLACE` cannot resurrect or rewrite an existing identity.
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO task_agent_requirements(
+                 task_id, required_type_id, required_type_revision,
+                 requirement_json, requirement_digest, created_at)
+             SELECT task_id, 'evil', 1, '{}', 'sha256:00', 0 FROM task_agent_requirements",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO logical_agent_type_bindings(
+                 logical_agent_id, type_id, type_revision, bound_at)
+             SELECT logical_agent_id, 'evil', 1, 0 FROM logical_agent_type_bindings",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO generation_policies(
+                 generation_id, policy_json, policy_digest, created_at)
+             SELECT generation_id, '{}', 'sha256:00', 0 FROM generation_policies",
+            [],
+        )
+        .is_err());
+
+    // The original rows are untouched.
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("task_agent_requirements"), 1);
+    assert_eq!(count("logical_agent_type_bindings"), 1);
+    assert_eq!(count("generation_policies"), 1);
 }
 
 // =============================================================================
@@ -1005,7 +1041,7 @@ fn matching_returns_only_ready_unassigned_agents() {
 // =============================================================================
 
 #[test]
-fn latest_selector_replay_is_stable_until_catalog_drifts() {
+fn latest_selector_replay_is_stable_across_catalog_drift() {
     let kernel = partitioned_kernel();
     publish_agent_type(&kernel, "reviewer", 1);
     let proposal = compile_proposal(
@@ -1022,24 +1058,39 @@ fn latest_selector_replay_is_stable_until_catalog_drifts() {
         .unwrap();
     assert_eq!(task, replay);
 
-    // A newer revision is published; a `Latest` retry now resolves to it and is a
-    // fail-closed Conflict, never a silent re-pin.
+    // A newer revision is published. Replaying the already-admitted command still
+    // returns the committed Task and keeps reviewer@1: a mutable catalog view must
+    // not change a past commitment.
     publish_agent_type(&kernel, "reviewer", 2);
-    let err = kernel
+    let replay_after_drift = kernel
         .admit_typed_proposal(&proposal.proposal_id, 0, None, latest_draft("reviewer"))
-        .unwrap_err();
-    assert!(matches!(err, Error::Conflict(_)));
-
-    // An exact replay of the committed revision stays idempotent.
-    let exact = kernel
-        .admit_typed_proposal(
-            &proposal.proposal_id,
-            0,
-            None,
-            draft(type_ref("reviewer", 1)),
-        )
         .unwrap();
-    assert_eq!(task, exact);
+    assert_eq!(task, replay_after_drift);
+    assert_eq!(
+        kernel
+            .get_task_agent_requirement(&task)
+            .unwrap()
+            .unwrap()
+            .required_type,
+        type_ref("reviewer", 1)
+    );
+
+    // A genuinely new proposal using `Latest` resolves to the current revision.
+    let fresh = compile_proposal(
+        &kernel,
+        TaskSpec::new("fresh", json!({})).partition("general"),
+    );
+    let fresh_task = kernel
+        .admit_typed_proposal(&fresh.proposal_id, 0, None, latest_draft("reviewer"))
+        .unwrap();
+    assert_eq!(
+        kernel
+            .get_task_agent_requirement(&fresh_task)
+            .unwrap()
+            .unwrap()
+            .required_type,
+        type_ref("reviewer", 2)
+    );
 }
 
 #[test]
@@ -1066,7 +1117,7 @@ fn exact_replay_survives_deprecation() {
     let err = kernel
         .admit_typed_proposal(&fresh.proposal_id, 0, None, draft(pin.clone()))
         .unwrap_err();
-    assert!(matches!(err, Error::InvariantViolation(_)));
+    assert!(matches!(err, Error::NotFound(_)));
 
     // Replaying the already-committed exact admission still returns the same Task:
     // deprecation is disposition drift, not loss of committed identity.

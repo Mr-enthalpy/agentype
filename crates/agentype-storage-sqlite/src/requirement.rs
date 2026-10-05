@@ -32,6 +32,28 @@ fn contract_fault(error: agentype_agent_contract::ContractError) -> Error {
     Error::invariant(error.to_string())
 }
 
+/// Classify a contract error raised while building an admission command, so an
+/// ordinary command/config rejection is not reported as durable corruption.
+/// Read-side integrity failures keep `contract_fault` (`InvariantViolation`).
+fn contract_rejection(error: agentype_agent_contract::ContractError) -> Error {
+    use agentype_agent_contract::ContractError as C;
+    match &error {
+        C::AgentTypeNotFound { .. } => Error::not_found(error.to_string()),
+        C::CapabilityMismatch { .. }
+        | C::SecurityUnenforceable { .. }
+        | C::GenerationPolicyConflict { .. }
+        | C::RequirementConflict { .. }
+        | C::InvalidRefinement { .. }
+        | C::SourceConfigInvalid { .. } => Error::invalid_authority(error.to_string()),
+        C::EvidencePolicyMismatch { .. }
+        | C::EvidenceSubjectMismatch { .. }
+        | C::InvalidNumber { .. }
+        | C::InvalidRef { .. }
+        | C::CapabilityDefinitionConflict { .. }
+        | C::InvariantViolation(_) => Error::invariant(error.to_string()),
+    }
+}
+
 fn canonical_utf8(bytes: Vec<u8>, what: &str) -> Result<String, Error> {
     String::from_utf8(bytes)
         .map_err(|_| Error::invariant(format!("{what} canonical bytes are not UTF-8")))
@@ -232,14 +254,37 @@ fn verify_requirement_mirrors(
         ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
     };
     let generation_id = GenerationId::from_string(generation_id);
-    let effective = match get_generation_policy(tx, &generation_id)? {
-        Some(policy) => policy.min_continuity.max(base),
-        None => base,
-    };
-    if effective != requirement.hard.required_continuity {
-        return Err(Error::invariant(
-            "task agent requirement required_continuity does not match the folded Task/Generation continuity",
-        ));
+    match get_generation_policy(tx, &generation_id)? {
+        Some(policy) => {
+            let effective = policy.min_continuity.max(base);
+            if effective != requirement.hard.required_continuity {
+                return Err(Error::invariant(
+                    "task agent requirement required_continuity does not match the folded Task/Generation continuity",
+                ));
+            }
+            // Re-fold the whole policy and require the stored requirement to be
+            // the exact fixed point. This revalidates every policy-owned
+            // dimension (workspace, network, isolation, sandbox, budget, anchor,
+            // information function, affinity, continuity) rather than a
+            // hand-picked subset, and keeps future policy fields covered.
+            let refolded = fold_generation_policy(&policy, &requirement.hard).map_err(|error| {
+                Error::invariant(format!(
+                    "task agent requirement violates its Generation policy: {error}"
+                ))
+            })?;
+            if refolded != requirement.hard {
+                return Err(Error::invariant(
+                    "task agent requirement is not the fixed point of its Generation policy",
+                ));
+            }
+        }
+        None => {
+            if base != requirement.hard.required_continuity {
+                return Err(Error::invariant(
+                    "task agent requirement required_continuity does not match the Task continuity",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -319,20 +364,33 @@ fn resolve_draft_selector(
     selector: &AgentTypeSelector,
     committed: Option<&AgentTypeRef>,
 ) -> Result<AgentTypeRef, Error> {
-    if let (AgentTypeSelector::Exact(reference), Some(committed)) = (selector, committed) {
-        if reference == committed {
-            get_agent_type(tx, reference)?.ok_or_else(|| {
-                Error::not_found(format!(
-                    "agent type {}@{} does not exist",
-                    reference.id().as_str(),
-                    reference.revision()
-                ))
-            })?;
-            return Ok(reference.clone());
+    // A replay must not let a mutable catalog view change a past commitment: an
+    // exact selector equal to the committed pin, or a `Latest` selector for the
+    // committed pin's `type_id`, is answered from the committed pin (validated
+    // content, `PUBLISHED` or `DEPRECATED`). Any other selector resolves against
+    // the current published catalog, so a genuinely new commitment picks up new
+    // revisions.
+    let replay_pin = match (selector, committed) {
+        (AgentTypeSelector::Exact(reference), Some(committed)) if reference == committed => {
+            Some(committed)
         }
+        (AgentTypeSelector::Latest(type_id), Some(committed)) if type_id == committed.id() => {
+            Some(committed)
+        }
+        _ => None,
+    };
+    if let Some(committed) = replay_pin {
+        get_agent_type(tx, committed)?.ok_or_else(|| {
+            Error::not_found(format!(
+                "agent type {}@{} does not exist",
+                committed.id().as_str(),
+                committed.revision()
+            ))
+        })?;
+        return Ok(committed.clone());
     }
     let lookup = crate::catalog::load_agent_type_lookup(tx)?;
-    let resolved = resolve_selector(selector, &lookup).map_err(contract_fault)?;
+    let resolved = resolve_selector(selector, &lookup).map_err(contract_rejection)?;
     get_agent_type(tx, &resolved)?.ok_or_else(|| {
         Error::not_found(format!(
             "agent type {}@{} does not exist",
@@ -370,15 +428,19 @@ fn derive_task_agent_requirement(
     );
 
     let catalog = load_capability_catalog(tx)?;
-    requirement.normalize(&catalog).map_err(contract_fault)?;
+    requirement
+        .normalize(&catalog)
+        .map_err(contract_rejection)?;
     // The authoritative policy read is the single presence authority: a `NONE`
     // generation with an unexpected row, or a `POLICY` generation with a missing
     // row, fails closed rather than being treated as unconstrained.
     if let Some(policy) = get_generation_policy(tx, generation_id)? {
         requirement.hard =
-            fold_generation_policy(&policy, &requirement.hard).map_err(contract_fault)?;
+            fold_generation_policy(&policy, &requirement.hard).map_err(contract_rejection)?;
     }
-    requirement.normalize(&catalog).map_err(contract_fault)?;
+    requirement
+        .normalize(&catalog)
+        .map_err(contract_rejection)?;
 
     Ok(requirement)
 }
@@ -400,7 +462,7 @@ fn validate_pinned_type_can_execute(
         ))
     })?;
     let catalog = load_capability_catalog(tx)?;
-    can_execute(&agent_type, &requirement.hard, &catalog).map_err(contract_fault)
+    can_execute(&agent_type, &requirement.hard, &catalog).map_err(contract_rejection)
 }
 
 /// The durable generation policy presence marker. A missing row for a

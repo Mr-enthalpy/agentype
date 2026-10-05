@@ -106,6 +106,33 @@ pub fn supported_composition() {}
 /// ```
 pub fn result_carried_ingress() {}
 
+/// The supported M6-B.3 provisioning (operator) surface, as a `no_run` doctest.
+///
+/// It binds an existing LogicalAgent to an exact AgentType revision and reads
+/// typed requirements / match results. It carries no semantic admission and no
+/// M5 mechanical authority.
+///
+/// ```no_run
+/// use agentype_agent_contract::AgentTypeRef;
+/// use agentype_core::{LogicalAgentId, TaskId};
+/// use agentype_runtime::ProvisioningAdmin;
+///
+/// fn use_admin(
+///     admin: &ProvisioningAdmin<'_>,
+///     agent: &LogicalAgentId,
+///     task: &TaskId,
+///     type_ref: &AgentTypeRef,
+/// ) {
+///     admin
+///         .bind_logical_agent_type(agent, type_ref)
+///         .expect("bind exact type");
+///     let _ = admin.task_agent_requirement(task);
+///     let _ = admin.logical_agent_type_binding(agent);
+///     let _ = admin.match_existing_agents_for_task(task);
+/// }
+/// ```
+pub fn provisioning_admin_surface() {}
+
 /// Boundary probes: one `compile_fail` doctest per unreachable item.
 ///
 /// The numbering is the boundary list this milestone was audited against.
@@ -272,6 +299,32 @@ pub fn result_carried_ingress() {}
 ///         locator: unreachable!(),
 ///         payload: unreachable!(),
 ///     };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 20. ProvisioningAdmin has no semantic admission authority.
+/// use agentype_core::ProposalId;
+/// use agentype_runtime::ProvisioningAdmin;
+/// fn _admin_cannot_admit(admin: &ProvisioningAdmin<'_>, proposal: &ProposalId) {
+///     let _ = admin.admit_proposal(proposal, 0, None);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 21. ProvisioningAdmin cannot freeze a generation.
+/// use agentype_core::GenerationId;
+/// use agentype_runtime::ProvisioningAdmin;
+/// fn _admin_cannot_freeze(admin: &ProvisioningAdmin<'_>, generation: &GenerationId) {
+///     let _ = admin.freeze_generation(generation, 0);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 22. ProvisioningAdmin has no mechanical claim authority.
+/// use agentype_runtime::ProvisioningAdmin;
+/// fn _admin_cannot_claim(admin: &ProvisioningAdmin<'_>) {
+///     let _ = admin.claim_next_available();
 /// }
 /// ```
 pub fn probes() {}

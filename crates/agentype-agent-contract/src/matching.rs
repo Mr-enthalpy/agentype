@@ -35,7 +35,9 @@ use crate::error::ContractError;
 use crate::predicates::{can_execute, more_specific_for};
 use crate::records::AgentType;
 use crate::requirement::TaskAgentRequirement;
-use agentype_core::{ContinuityPreference, LogicalAgentId, PartitionId, WorkstreamId};
+use agentype_core::{
+    claim_tiebreak, ContinuityPreference, LogicalAgentId, PartitionId, WorkstreamId,
+};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
@@ -206,19 +208,19 @@ pub fn match_existing_agents(
                     .continuity
                     .cmp(&a.agent_type.contract.continuity)
             })
-            .then_with(|| match (a.available_since, b.available_since) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            })
+            // Frozen M5 availability/identity tie-break parity: effective
+            // availability (`available_since` else `created_at`) then lowest
+            // LogicalAgent id. Reused directly, not re-derived.
             .then_with(|| {
-                a.created_at
-                    .partial_cmp(&b.created_at)
+                let (a_avail, a_id) =
+                    claim_tiebreak(a.available_since, a.created_at, a.logical_agent_id.as_str());
+                let (b_avail, b_id) =
+                    claim_tiebreak(b.available_since, b.created_at, b.logical_agent_id.as_str());
+                a_avail
+                    .partial_cmp(&b_avail)
                     .unwrap_or(Ordering::Equal)
+                    .then_with(|| a_id.cmp(b_id))
             })
-            .then_with(|| a.agent_type.type_ref.cmp(&b.agent_type.type_ref))
-            .then_with(|| a.logical_agent_id.cmp(&b.logical_agent_id))
     });
 
     Ok(indexed

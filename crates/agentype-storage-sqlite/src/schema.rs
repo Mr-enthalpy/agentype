@@ -727,6 +727,13 @@ BEGIN
     SELECT RAISE(ABORT, 'a generation policy row requires a POLICY generation');
 END;
 
+CREATE TRIGGER IF NOT EXISTS generation_policies_no_reinsert
+BEFORE INSERT ON generation_policies
+WHEN EXISTS(SELECT 1 FROM generation_policies WHERE generation_id=NEW.generation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is write-once');
+END;
+
 CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_update
 BEFORE UPDATE ON task_agent_requirements
 BEGIN
@@ -739,6 +746,13 @@ BEGIN
     SELECT RAISE(ABORT, 'a task agent requirement is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_no_reinsert
+BEFORE INSERT ON task_agent_requirements
+WHEN EXISTS(SELECT 1 FROM task_agent_requirements WHERE task_id=NEW.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is write-once');
+END;
+
 CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_update
 BEFORE UPDATE ON logical_agent_type_bindings
 BEGIN
@@ -747,6 +761,15 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_delete
 BEFORE DELETE ON logical_agent_type_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_no_reinsert
+BEFORE INSERT ON logical_agent_type_bindings
+WHEN EXISTS(
+    SELECT 1 FROM logical_agent_type_bindings WHERE logical_agent_id=NEW.logical_agent_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
 END;

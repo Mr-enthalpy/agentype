@@ -63,9 +63,14 @@ catalog:
   corruption, never a silent downgrade to legacy or an unconstrained Generation;
   SQLite triggers forbid mutating a Task's typedness and a generation's policy
   mode.
-- all three tables MUST reject `UPDATE`/`DELETE` mechanically (SQLite triggers),
-  so direct SQL cannot rewrite a requirement, rebind an agent, or mutate a
-  policy.
+- all three tables MUST be physically write-once: SQLite triggers reject
+  `UPDATE`, `DELETE`, and a duplicate/`INSERT OR REPLACE` that would rewrite an
+  existing exact identity, so direct SQL cannot rewrite a requirement, rebind an
+  agent, or mutate a policy.
+- typed/legacy scheduling eligibility MUST be a pure Core decision
+  (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound`), not a storage
+  query convention: coarse SQL filtering is a performance optimization only and
+  MUST NOT change scheduler behavior.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition

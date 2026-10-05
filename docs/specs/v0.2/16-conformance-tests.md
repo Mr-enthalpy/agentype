@@ -118,27 +118,16 @@ M6-B.3 typed admission and matching MUST cover:
 - a `POLICY` Generation rejects legacy `admit_proposal` before any write, while a
   `NONE` Generation keeps M6-A legacy admission working, and each marker is a
   positive durable fact
-- a `TYPED` Task is invisible to `ensure_task_consumers` and
-  `claim_next_available`: it births no legacy consumer, acquires no
-  Attempt/Lease/Execution, and stays `QUEUED`; a legacy Task cannot be retrofitted
-  to `TYPED` (marker immutable, child insert requires a `TYPED` parent), losing
-  the requirement row for a `TYPED` marker MUST NOT downgrade it, and a
-  `NONE`/`POLICY` marker/row mismatch MUST fail both legacy and typed admission
-  closed together
-- a type-bound LogicalAgent is excluded from the legacy consumer/claim pool, so a
-  legacy Task cannot acquire it without `can_execute`; when only bound agents
-  remain the legacy path births a fresh unbound consumer, and a binding requires
-  a `READY`, unassigned agent
-- a mixed queue still dispatches the legacy Task past a quarantined typed Task
-- the authoritative requirement read resolves its exact pin through the validated
-  catalog read (a corrupt pinned revision fails closed, a deprecated one does not)
-  and cross-checks its duplicated Task/Generation dimensions (information
-  function, affinity, workspace, folded continuity); a self-consistent copy that
-  disagrees fails closed
+- a `TYPED` Task / type-bound LogicalAgent is excluded from the legacy claim
+  path by the pure Core decision (`ClaimTaskSnapshot.typed`,
+  `ClaimAgentSnapshot.type_bound`), not merely by the storage query; a typed Task
+  births no legacy consumer, acquires no Attempt/Lease/Execution, and stays
+  `QUEUED`, and a legacy Task cannot be retrofitted to `TYPED`
 - exact typed replay returns the same Task while a conflicting requirement is a
-  `Conflict`; an exact pin stays replayable after deprecation, a `Latest` retry
-  after catalog drift fails closed, and a legacy replay of a typed Task (or vice
-  versa) is a `Conflict`
+  `Conflict`; an exact pin stays replayable after deprecation, an already-admitted
+  `Latest` command replays against its committed pin even after new revisions are
+  published, a genuinely new `Latest` commitment resolves to the current revision,
+  and a legacy replay of a typed Task (or vice versa) is a `Conflict`
 - a different revision of the same `type_id` is not a substitute, and a type that
   is neither a strict refinement nor strictly broader is ineligible
 - matching composes the frozen M5 placement gates (exact partition, tag superset,
@@ -146,11 +135,17 @@ M6-B.3 typed admission and matching MUST cover:
   unassigned agents; broader/general candidates are ordered per the spec 06
   preference, and matching writes nothing
 - ranking orders exact, narrower, then broader, applies candidate-vs-candidate
-  dominance before continuity/availability/identity, and never uses nominal
-  inheritance depth
+  dominance before the `Preferred` workstream and the frozen M5
+  availability/identity tie-break, and never uses nominal inheritance depth
+- the authoritative requirement read resolves its exact pin through the validated
+  catalog read (a corrupt pin fails closed, a deprecated one does not) and, when
+  the generation carries a policy, requires the stored requirement to be the
+  exact fixed point of re-folding that policy (covering network, isolation,
+  sandbox, budget, and anchor, not just the Task-owned mirrors)
 - `logical_agent_type_bindings` is write-once and a fresh binding requires a
-  `PUBLISHED` revision; `task_agent_requirements` and `generation_policies` are
-  immutable, enforced mechanically by SQLite
+  `PUBLISHED` revision and a `READY`, unassigned agent; `task_agent_requirements`
+  and `generation_policies` are immutable and write-once, enforced mechanically by
+  SQLite including the `INSERT OR REPLACE` path
 - the canonical `TASK_AGENT_REQUIREMENT` and `GENERATION_POLICY` document kinds
   have pinned golden digest vectors
 - a `SourceConfigRevision` exposes its validated opaque body without a second

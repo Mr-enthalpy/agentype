@@ -475,26 +475,21 @@ Rules now enforced:
   selector is resolved before commitment. There is no durable unpinned typed
   requirement. Constraints without a committed semantic type are a separate
   pre-commit selection concern, not a Task agent requirement.
-- **Typed Tasks are quarantined from legacy dispatch by a positive marker.** An
+- **Typed Tasks are quarantined from legacy dispatch by a Core decision.** An
   admitted Task carries a durable `agent_requirement_mode` (`LEGACY`/`TYPED`)
   written with the Task at creation and fixed for its lifetime (never retrofitted,
-  SQLite-enforced). `ensure_task_consumers` and `claim_next_available` ignore
-  every non-`LEGACY` Task, so losing the requirement row is corruption rather
-  than a silent downgrade to a legacy Task, and a legacy Task cannot be
-  retroactively given a requirement row (the child insert requires a `TYPED`
-  parent). A typed Task stays durable `QUEUED` until M6-B.4 introduces the
-  authoritative typed acquisition path.
-- **Type-bound agents are symmetrically quarantined from legacy dispatch.** A
-  LogicalAgent that carries a `logical_agent_type_bindings` row is excluded from
-  the legacy consumer/claim pool by both `ensure_task_consumers` and
-  `claim_next_available`, so a legacy Task can never acquire a type-bound agent
-  without passing `can_execute`. When the only READY agents are bound, a fresh
-  unbound legacy consumer is born. The binding therefore becomes a real contract
-  on the agent, not just a matching annotation.
-- **A type binding is minted only at a safe assignment boundary.**
-  `bind_logical_agent_type` requires a `READY`, unassigned LogicalAgent; binding
-  an `ASSIGNED` (or otherwise non-ready) agent fails closed, because it would
-  commit a contract contradicting in-flight authority.
+  SQLite-enforced, including `INSERT OR REPLACE`). The legacy task/agent queries
+  are coarse prefilters only; the authoritative eligibility re-check lives in the
+  pure decisions (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound` in
+  `agentype-core`), so query text alone cannot change scheduler behavior. Losing
+  the requirement row is corruption rather than a silent downgrade, and a legacy
+  Task cannot be retroactively given a requirement row.
+- **Type-bound agents are symmetrically quarantined by the same Core decision.** A
+  LogicalAgent with a `logical_agent_type_bindings` row is rejected by the pure
+  legacy consumer/claim selection, so a legacy Task can never acquire a
+  type-bound agent without `can_execute`. When only bound READY agents remain, the
+  legacy path births a fresh unbound consumer. A binding may only be minted for a
+  `READY`, unassigned agent.
 - **Generation policy has the same positive marker.** A Generation carries a
   `policy_mode` (`NONE`/`POLICY`) fixed at creation. Both legacy and typed
   admission read the policy through the authoritative `get_generation_policy`, so
@@ -508,12 +503,15 @@ Rules now enforced:
   requirement document is canonical (`agentype-contract/1`) with a `sha256:`
   digest, re-canonicalized on read, its relational pin mirror and its exact pin
   resolved through the validated B.2 catalog read, and its duplicated
-  TaskSpec-owned dimensions (information function, affinity, workspace, folded
-  continuity) cross-checked against the authoritative Task and
-  `GenerationTaskBinding`/Generation policy. A self-consistent copy that
-  disagrees with those authorities fails closed. Only an **exact-selector** replay
-  is guaranteed idempotent, and replay MUST use the same command shape: a legacy
-  retry of a typed Task (or the reverse) is a Conflict.
+  TaskSpec-owned dimensions cross-checked against the authoritative Task and
+  `GenerationTaskBinding`. When the generation carries a policy, the read
+  re-folds the whole policy onto the stored requirement and requires it to be the
+  exact fixed point, covering every policy-owned dimension at once. Only an
+  **exact-selector** replay is guaranteed idempotent, and a replay never lets a
+  mutable catalog view change a past commitment: an already-admitted `Latest`
+  command replays against its committed exact pin even after new revisions are
+  published, while a genuinely new `Latest` commitment resolves to the current
+  revision. A legacy replay of a typed Task (or the reverse) is a Conflict.
 - **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
   ceiling fixed at `create_generation`. It is the frozen spec 10 **intersection**:
   the Generation is an authority ceiling, so a Task that requires more
@@ -543,21 +541,19 @@ Rules now enforced:
   `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
   revival is a later seam. A candidate's realized M5 retention is deliberately
   NOT interpreted against the AgentType `lifecycle` set: that set is a required
-  **source envelope** (spec 06), not a per-instance mode whitelist, so matching it
-  against a realized retention would add an unfrozen eligibility relation. Any
+  **source envelope** (spec 06), not a per-instance mode whitelist. Any
   realized-lifecycle eligibility is a B.4 provisioning concern.
 - **One ranking order, exact revisions only.** The exact pin is the matching
   anchor, not a ceiling. Among eligible candidates the relation to the pin orders
   as: exact, then compatible narrower/refinement types, then compatible
   broader/general types. A different revision of the same `type_id` is never a
   substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a
-  strict refinement nor strictly broader is not eligible — equivalent and
-  genuinely incomparable types are not collapsed into an invented tier. Within a
-  class, candidate-vs-candidate specificity (`more_specific_for`) is applied as
+  strict refinement nor strictly broader is not eligible. Within a class,
+  candidate-vs-candidate specificity (`more_specific_for`) is applied as
   dominance-count layers, then the `Preferred` workstream placement, continuity
-  strength, availability, and a stable identity tie-break. Nominal inheritance
-  depth is never consulted, and B.3 exposes no caller-controlled
-  soft-preference switch.
+  strength, and finally the frozen M5 availability/identity tie-break
+  (`agentype_core::claim_tiebreak`: effective availability then lowest
+  LogicalAgent id). Nominal inheritance depth is never consulted.
 
 Full physical eligibility (`can_provision_task`, active adapter policy, exact
 binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.

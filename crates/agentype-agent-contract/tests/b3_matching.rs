@@ -505,3 +505,38 @@ fn matching_does_not_conflate_agent_type_lifecycle_with_realized_mode() {
     .unwrap();
     assert_eq!(matched.len(), 1);
 }
+
+#[test]
+fn matching_uses_the_frozen_m5_availability_tiebreak() {
+    let catalog = catalog();
+    let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
+    let req = pinned(&required);
+    let placement = placement(ContinuityPreference::None);
+    let ids = |matched: &[ExistingAgentCandidate]| -> Vec<String> {
+        matched
+            .iter()
+            .map(|c| c.logical_agent_id.as_str().to_string())
+            .collect()
+    };
+
+    // Effective availability is `available_since` else `created_at`, so a `None`
+    // available_since with an older created_at beats a `Some` later one.
+    let mut a = candidate("agent-a", required.clone());
+    a.available_since = None;
+    a.created_at = 1.0;
+    let mut b = candidate("agent-b", required.clone());
+    b.available_since = Some(100.0);
+    b.created_at = 100.0;
+    let matched = match_existing_agents(&required, &req, &placement, &[b, a], &catalog).unwrap();
+    assert_eq!(ids(&matched), vec!["agent-a", "agent-b"]);
+
+    // Equal effective availability falls back to the lowest LogicalAgent id.
+    let mut c = candidate("agent-c", required.clone());
+    c.available_since = Some(5.0);
+    c.created_at = 500.0;
+    let mut d = candidate("agent-d", required.clone());
+    d.available_since = None;
+    d.created_at = 5.0;
+    let matched = match_existing_agents(&required, &req, &placement, &[d, c], &catalog).unwrap();
+    assert_eq!(ids(&matched), vec!["agent-c", "agent-d"]);
+}
