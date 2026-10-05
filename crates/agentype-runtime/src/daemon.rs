@@ -505,6 +505,12 @@ impl RunningSchedulerDaemon {
         crate::ProvisioningAdmin::new(&self.kernel)
     }
 
+    /// M6-B operator catalog administration: publish the immutable B.2
+    /// capability / AgentType revisions that typed admission and binding require.
+    pub fn catalog_admin(&self) -> crate::CatalogAdmin<'_> {
+        crate::CatalogAdmin::new(&self.kernel)
+    }
+
     /// Test-support: panic the health coordinator on its next tick, so its
     /// own fatal path is reachable from a regression test.
     #[cfg(any(test, feature = "test-support"))]

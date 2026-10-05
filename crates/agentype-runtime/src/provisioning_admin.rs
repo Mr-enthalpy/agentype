@@ -6,10 +6,8 @@
 //! (`M6A-B9`). It cannot create a Task, admit a proposal, or expand a Generation,
 //! and it never starts physical work.
 
-use agentype_agent_contract::{
-    AgentTypeRef, ExistingAgentCandidate, GenerationPolicy, TaskAgentRequirement,
-};
-use agentype_core::{Error, GenerationId, LogicalAgentId, TaskId};
+use agentype_agent_contract::{AgentTypeRef, ExistingAgentCandidate, TaskAgentRequirement};
+use agentype_core::{Error, LogicalAgentId, TaskId};
 use agentype_storage_sqlite::Kernel;
 
 /// Operator authority over durable agent-type bindings and typed reads.
@@ -52,13 +50,6 @@ impl<'a> ProvisioningAdmin<'a> {
         agent_id: &LogicalAgentId,
     ) -> Result<Option<AgentTypeRef>, Error> {
         self.kernel.get_logical_agent_type_binding(agent_id)
-    }
-
-    pub fn generation_policy(
-        &self,
-        generation_id: &GenerationId,
-    ) -> Result<Option<GenerationPolicy>, Error> {
-        self.kernel.get_generation_policy(generation_id)
     }
 
     /// Rank existing, bound LogicalAgents for a Task's requirement.

@@ -291,7 +291,11 @@ legacy Task. Symmetrically, a LogicalAgent that carries a
 consumer/claim pool, so a legacy Task can never acquire a type-bound agent
 without passing `can_execute`; when only bound READY agents remain, the legacy
 path births a fresh unbound consumer. A binding is minted only for a `READY`,
-unassigned agent and requires a currently `PUBLISHED` revision. Until a typed
+unassigned `UNBOUND` agent and requires a currently `PUBLISHED` revision; minting
+an `UNBOUND` agent's first binding is an explicit semantic adoption, so an agent
+that previously executed legacy work becomes that exact AgentType with its
+existing continuity/history remaining part of the same LogicalAgent (changing an
+already-bound agent's type remains a future Transform). Until a typed
 authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
 `QUEUED` and acquires no Attempt, Lease, or Execution.
 

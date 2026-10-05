@@ -133,6 +133,29 @@ pub fn result_carried_ingress() {}
 /// ```
 pub fn provisioning_admin_surface() {}
 
+/// The supported M6-B catalog administration surface, as a `no_run` doctest.
+///
+/// It publishes the immutable B.2 capability / AgentType revisions that typed
+/// admission and binding require, so a supported consumer does not have to reach
+/// into the internal storage crate to establish those durable preconditions.
+///
+/// ```no_run
+/// use agentype_agent_contract::{AgentType, AgentTypeRef, CapabilityDefinition, CapabilityRef};
+/// use agentype_runtime::CatalogAdmin;
+///
+/// fn use_catalog(
+///     admin: &CatalogAdmin<'_>,
+///     definition: &CapabilityDefinition,
+///     agent: &AgentType,
+///     reference: &AgentTypeRef,
+/// ) {
+///     let _ = admin.publish_capability_definition(&CapabilityRef::new("tools", 1).unwrap(), definition);
+///     let _ = admin.publish_agent_type(agent);
+///     let _ = admin.deprecate_agent_type(reference);
+/// }
+/// ```
+pub fn catalog_admin_surface() {}
+
 /// Boundary probes: one `compile_fail` doctest per unreachable item.
 ///
 /// The numbering is the boundary list this milestone was audited against.
@@ -333,6 +356,23 @@ pub fn provisioning_admin_surface() {}
 /// //     capability-intersection API is not frozen until B.5.
 /// fn _no_join_requirement_values() {
 ///     let _ = agentype_agent_contract::join_requirement_values;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 24. CatalogAdmin has no semantic admission authority.
+/// use agentype_core::ProposalId;
+/// use agentype_runtime::CatalogAdmin;
+/// fn _catalog_cannot_admit(admin: &CatalogAdmin<'_>, proposal: &ProposalId) {
+///     let _ = admin.admit_proposal(proposal, 0, None);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 25. CatalogAdmin has no mechanical claim authority.
+/// use agentype_runtime::CatalogAdmin;
+/// fn _catalog_cannot_claim(admin: &CatalogAdmin<'_>) {
+///     let _ = admin.claim_next_available();
 /// }
 /// ```
 pub fn probes() {}

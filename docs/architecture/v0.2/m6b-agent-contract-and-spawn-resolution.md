@@ -532,12 +532,18 @@ Rules now enforced:
 - **Write-once binding.** `logical_agent_type_bindings` mints one exact revision
   per LogicalAgent; a fresh binding requires a currently `PUBLISHED` revision
   (matching pre-commit selector semantics), while an existing committed pin
-  survives deprecation. Changing an agent's type is a future Transform. This is
-  operator provisioning authority, surfaced through `ProvisioningAdmin`,
-  deliberately separate from `RootSemanticControl` (`M6A-B9`). **INV-B3/B4:** a
-  `LogicalAgentTypeBinding` is semantic identity only — it is never physical
-  eligibility evidence for an existing Incarnation. M6-B.4 MUST obtain
-  trustworthy provisioning evidence/binding provenance, or require a
+  survives deprecation. Changing an already-bound agent's type is a future
+  Transform. Minting an `UNBOUND` agent's first binding is an explicit **semantic
+  adoption**: an agent that previously executed legacy work (and may carry
+  workstream association, continuity state, and history) becomes that exact
+  AgentType by definition, with its existing continuity/history remaining part of
+  the same LogicalAgent. A production bind does not require a pristine agent; if
+  a future policy wants that, it is a separate operator rule, not a binding
+  invariant. This is operator provisioning authority, surfaced through
+  `ProvisioningAdmin`, deliberately separate from `RootSemanticControl`
+  (`M6A-B9`). **INV-B3/B4:** a `LogicalAgentTypeBinding` is semantic identity only
+  — it is never physical eligibility evidence for an existing Incarnation. M6-B.4
+  MUST obtain trustworthy provisioning evidence/binding provenance, or require a
   new/requalified Incarnation, before any authority-bearing typed acquisition of
   an agent bound by M6-B.3.
 - **Matching is non-authoritative semantic candidate preselection.** A candidate

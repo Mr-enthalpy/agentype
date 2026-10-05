@@ -9,6 +9,7 @@
 
 pub use agentype_execution_config::*;
 
+pub mod catalog_admin;
 pub mod control;
 pub mod daemon;
 pub mod deadlines;
@@ -41,6 +42,9 @@ pub use semantic_control::RootSemanticControl;
 // AgentType revisions and read typed requirements / match results. Deliberately
 // separate from `RootSemanticControl`.
 pub use provisioning_admin::ProvisioningAdmin;
+// M6-B operator catalog administration: publish the immutable B.2 capability /
+// AgentType revisions that typed admission and binding require.
+pub use catalog_admin::CatalogAdmin;
 // `DaemonError::Control` carries it, so a production host can inspect why the
 // daemon's control worker failed.
 pub use control::ControlError;

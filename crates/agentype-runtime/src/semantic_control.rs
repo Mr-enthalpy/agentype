@@ -85,6 +85,17 @@ impl<'a> RootSemanticControl<'a> {
             .create_generation_with_policy(seed_payload, policy)
     }
 
+    /// Read the immutable policy a Generation was created with, if any.
+    ///
+    /// A Generation policy is semantic-frontier state owned by Root, so its read
+    /// lives here rather than on the provisioning surface.
+    pub fn read_generation_policy(
+        &self,
+        generation_id: &GenerationId,
+    ) -> Result<Option<agentype_agent_contract::GenerationPolicy>, Error> {
+        self.kernel.get_generation_policy(generation_id)
+    }
+
     pub fn freeze_generation(
         &self,
         generation_id: &GenerationId,
