@@ -132,11 +132,11 @@ fn validate_requirement_capabilities(
                     capability: reference.capability_id().as_str().to_string(),
                 })?;
         if definition.matcher_kind != value.matcher_kind() {
-            return Err(ContractError::InvariantViolation(format!(
-                "requirement value shape does not match the definition for {}@{}",
-                reference.capability_id().as_str(),
-                reference.revision()
-            )));
+            // A known capability supplied with the wrong value shape is a
+            // malformed caller requirement, not durable corruption.
+            return Err(ContractError::CapabilityMismatch {
+                capability: reference.capability_id().as_str().to_string(),
+            });
         }
     }
     Ok(())
@@ -175,9 +175,11 @@ pub struct GenerationPolicy {
 impl GenerationPolicy {
     pub fn validate(&self, _catalog: &CapabilityCatalog) -> Result<(), ContractError> {
         if self.allowed_information_functions.is_empty() {
-            return Err(ContractError::InvariantViolation(
-                "a generation policy must allow at least one information function".into(),
-            ));
+            // An empty admission set is an invalid caller policy, not durable
+            // corruption.
+            return Err(ContractError::GenerationPolicyConflict {
+                reason: "a generation policy must allow at least one information function".into(),
+            });
         }
         Ok(())
     }

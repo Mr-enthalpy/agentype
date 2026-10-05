@@ -71,7 +71,7 @@ pub fn insert_task_agent_requirement(
 ) -> Result<String, Error> {
     let catalog = load_capability_catalog(tx)?;
     let mut canonical = requirement.clone();
-    canonicalize_task_agent_requirement(&mut canonical, &catalog).map_err(contract_fault)?;
+    canonicalize_task_agent_requirement(&mut canonical, &catalog).map_err(contract_rejection)?;
 
     let exists: bool = query_opt(
         tx,
@@ -491,7 +491,7 @@ pub fn insert_generation_policy(
 ) -> Result<String, Error> {
     let catalog = load_capability_catalog(tx)?;
     let mut canonical = policy.clone();
-    canonicalize_generation_policy(&mut canonical, &catalog).map_err(contract_fault)?;
+    canonicalize_generation_policy(&mut canonical, &catalog).map_err(contract_rejection)?;
 
     let exists: bool = query_opt(
         tx,

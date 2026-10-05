@@ -7,8 +7,8 @@ use agentype_agent_contract::{
     canonical_task_agent_requirement_bytes, task_agent_requirement_content_digest,
     AffinityConstraint, AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef,
     AgentTypeSelector, Budget, CapabilityCatalog, CapabilityDefinition, CapabilityPolarity,
-    CapabilityRef, ContinuityMode, GenerationPolicy, LifecycleMode, MatcherKind, NetworkPolicy,
-    SecurityClass, SecurityContract,
+    CapabilityRef, CapabilityValue, ContinuityMode, GenerationPolicy, LifecycleMode, MatcherKind,
+    NetworkPolicy, SecurityClass, SecurityContract,
 };
 use agentype_core::{
     Clock, Error, InformationFunction, LogicalAgentId, LogicalAgentState, ManualClock, PartitionId,
@@ -17,7 +17,7 @@ use agentype_core::{
 };
 use agentype_storage_sqlite::{AgentTypeStatus, Kernel};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1513,4 +1513,60 @@ fn a_bound_agent_cannot_be_unbound_by_direct_sql() {
             [agent.as_str()],
         )
         .is_err());
+}
+
+// =============================================================================
+// P1-1: caller-controlled typed input is a command rejection, not corruption.
+// =============================================================================
+
+#[test]
+fn malformed_requirement_capability_is_a_command_rejection() {
+    let kernel = partitioned_kernel();
+    let reference = CapabilityRef::new("attempt.isolation", 1).unwrap();
+    kernel
+        .publish_capability_definition(
+            &reference,
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Bool,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Restriction,
+            },
+        )
+        .unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let mut bad = draft(pin);
+    // A Bool capability supplied with a Set value is malformed caller input.
+    bad.required_capabilities.insert(
+        reference,
+        CapabilityValue::Set(BTreeSet::from(["x".to_string()])),
+    );
+
+    let err = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, bad)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)), "{err:?}");
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert!(kernel
+        .get_generation_view(&proposal.generation_id)
+        .unwrap()
+        .admitted_task_ids
+        .is_empty());
+}
+
+#[test]
+fn empty_generation_policy_is_a_command_rejection() {
+    let kernel = memory_kernel();
+    let mut policy = sample_policy();
+    policy.allowed_information_functions = Vec::new();
+    let err = kernel
+        .create_generation_with_policy(json!({}), Some(policy))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)), "{err:?}");
 }

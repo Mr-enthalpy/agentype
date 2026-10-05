@@ -81,8 +81,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
   be inferred from a stronger capability.
 - `can_provision_task` is the contract/sandbox eligibility predicate and a
-  **mandatory eligibility conjunct**; it is NOT the complete physical candidate
-  eligibility decision. The conjunction
+  **mandatory conjunct of any authority-bearing typed acquisition/provisioning
+  decision** (M6-B.4/M6-B.5); it is NOT part of M6-B.3 pure candidate discovery,
+  and it is NOT the complete physical candidate eligibility decision. The
+  conjunction
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
@@ -112,9 +114,11 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   value otherwise — `SecurityClass` keeps
   controlling proof authority independently of polarity. Every Task capability
   value MUST match its catalog definition shape and fail closed otherwise, even
-  for `Restriction` capabilities the AgentType does not pre-advertise. B.3/B.4
-  MUST include `can_provision_task` as a mandatory conjunct, not the bare
-  conjunction.
+  for `Restriction` capabilities the AgentType does not pre-advertise. Any
+  authority-bearing typed acquisition/provisioning decision (M6-B.4/M6-B.5) MUST
+  include `can_provision_task` as a mandatory conjunct, not the bare conjunction;
+  M6-B.3 existing-agent matching is candidate discovery only and grants no
+  Task/Attempt/Lease/Execution authority.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information
   functions, workspace/network, isolation, sandbox policy, anchor, and capability
@@ -326,4 +330,8 @@ replays against its committed exact pin even after new revisions are published,
 while a genuinely new `Latest` commitment resolves to the current revision; an
 already-committed exact pin remains replayable after deprecation. New-agent
 provisioning from an eligible SpawnSource, full physical eligibility
-(`can_provision_task`), and credentials remain M6-B.4/M6-B.5.
+(`can_provision_task`), and credentials remain M6-B.4/M6-B.5. A
+`LogicalAgentTypeBinding` established in M6-B.3 is semantic identity only, never
+physical eligibility evidence for an existing Incarnation; M6-B.4 MUST obtain
+trustworthy provisioning evidence/binding provenance, or require a
+new/requalified Incarnation, before any authority-bearing typed acquisition.
