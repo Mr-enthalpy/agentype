@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS logical_agents (
     partition_name TEXT NOT NULL REFERENCES pool_partitions(name) ON DELETE RESTRICT,
     retention TEXT NOT NULL CHECK (retention IN ('resident','ephemeral')),
     state TEXT NOT NULL CHECK (state IN ('INITIALIZING','READY','ASSIGNED','REVIVING','DRAINING','SUSPENDED','RETIRED')),
+    agent_type_binding_mode TEXT NOT NULL DEFAULT 'UNBOUND' CHECK (agent_type_binding_mode IN ('UNBOUND','BOUND')),
     workstream_id TEXT REFERENCES workstreams(id) ON DELETE SET NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     current_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
@@ -772,6 +773,20 @@ WHEN EXISTS(
 )
 BEGIN
     SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agents_binding_mode_no_downgrade
+BEFORE UPDATE OF agent_type_binding_mode ON logical_agents
+WHEN OLD.agent_type_binding_mode = 'BOUND' AND NEW.agent_type_binding_mode = 'UNBOUND'
+BEGIN
+    SELECT RAISE(ABORT, 'a bound LogicalAgent cannot be unbound');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_require_bound_parent
+BEFORE INSERT ON logical_agent_type_bindings
+WHEN (SELECT agent_type_binding_mode FROM logical_agents WHERE id=NEW.logical_agent_id) IS NOT 'BOUND'
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding requires a BOUND agent');
 END;
 
 -- Parent-side presence markers make "typed" and "policy-bearing" positive

@@ -320,11 +320,10 @@ substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a stric
 refinement nor strictly broader is not eligible; within a relation class,
 candidate-vs-candidate `more_specific_for` dominates before the `Preferred`
 workstream, continuity strength, availability, and stable identity tie-breaks.
-Ranking MUST NOT use nominal inheritance depth. Only exact-selector replay is
-idempotent, and a replay never lets a mutable catalog view change a past
-commitment: an already-admitted `Latest` command replays against its committed
-exact pin even after new revisions are published, while a genuinely new `Latest`
-commitment resolves to the current revision; an already-committed exact pin
-remains replayable after deprecation. New-agent provisioning from an eligible
-SpawnSource, full physical eligibility (`can_provision_task`), and credentials
-remain M6-B.4/M6-B.5.
+Ranking MUST NOT use nominal inheritance depth. A replay never lets a mutable
+catalog view change a past commitment: an already-admitted `Latest` command
+replays against its committed exact pin even after new revisions are published,
+while a genuinely new `Latest` commitment resolves to the current revision; an
+already-committed exact pin remains replayable after deprecation. New-agent
+provisioning from an eligible SpawnSource, full physical eligibility
+(`can_provision_task`), and credentials remain M6-B.4/M6-B.5.

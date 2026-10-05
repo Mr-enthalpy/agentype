@@ -485,11 +485,14 @@ Rules now enforced:
   the requirement row is corruption rather than a silent downgrade, and a legacy
   Task cannot be retroactively given a requirement row.
 - **Type-bound agents are symmetrically quarantined by the same Core decision.** A
-  LogicalAgent with a `logical_agent_type_bindings` row is rejected by the pure
-  legacy consumer/claim selection, so a legacy Task can never acquire a
-  type-bound agent without `can_execute`. When only bound READY agents remain, the
-  legacy path births a fresh unbound consumer. A binding may only be minted for a
-  `READY`, unassigned agent.
+  LogicalAgent carries a positive `agent_type_binding_mode` (`UNBOUND`/`BOUND`)
+  fixed at binding, alongside the immutable `logical_agent_type_bindings` row;
+  losing the row is corruption, never a silent unbinding. The pure legacy
+  consumer/claim selection rejects an agent whose marker is `BOUND` or that has
+  the row, so a legacy Task can never acquire a type-bound agent without
+  `can_execute`. When only bound READY agents remain, the legacy path births a
+  fresh unbound consumer. A binding may only be minted for a `READY`, unassigned,
+  currently-`UNBOUND` agent.
 - **Generation policy has the same positive marker.** A Generation carries a
   `policy_mode` (`NONE`/`POLICY`) fixed at creation. Both legacy and typed
   admission read the policy through the authoritative `get_generation_policy`, so
@@ -506,12 +509,12 @@ Rules now enforced:
   TaskSpec-owned dimensions cross-checked against the authoritative Task and
   `GenerationTaskBinding`. When the generation carries a policy, the read
   re-folds the whole policy onto the stored requirement and requires it to be the
-  exact fixed point, covering every policy-owned dimension at once. Only an
-  **exact-selector** replay is guaranteed idempotent, and a replay never lets a
-  mutable catalog view change a past commitment: an already-admitted `Latest`
-  command replays against its committed exact pin even after new revisions are
-  published, while a genuinely new `Latest` commitment resolves to the current
-  revision. A legacy replay of a typed Task (or the reverse) is a Conflict.
+  exact fixed point, covering every policy-owned dimension at once. A replay never
+  lets a mutable catalog view change a past commitment: an already-admitted
+  `Latest` command replays against its committed exact pin even after new
+  revisions are published, while a genuinely new `Latest` commitment resolves to
+  the current revision. A legacy replay of a typed Task (or the reverse) is a
+  Conflict.
 - **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
   ceiling fixed at `create_generation`. It is the frozen spec 10 **intersection**:
   the Generation is an authority ceiling, so a Task that requires more

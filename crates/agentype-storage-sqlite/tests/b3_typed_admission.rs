@@ -314,6 +314,16 @@ fn policy_generation_rejects_a_task_that_exceeds_the_ceiling() {
 #[test]
 fn bindings_are_write_once_and_require_a_valid_exact_revision() {
     let kernel = partitioned_kernel();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "extra",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
     let pin = publish_agent_type(&kernel, "reviewer", 1);
     let agent = kernel.ready_agent("general").unwrap();
 
@@ -321,15 +331,13 @@ fn bindings_are_write_once_and_require_a_valid_exact_revision() {
     let err = kernel.bind_logical_agent_type(&agent, &pin).unwrap_err();
     assert!(matches!(err, Error::Conflict(_)));
 
-    // Binding a missing revision fails closed.
-    let other = kernel.ready_agent("general");
-    if let Ok(other_agent) = other {
-        let missing = type_ref("missing", 3);
-        let err = kernel
-            .bind_logical_agent_type(&other_agent, &missing)
-            .unwrap_err();
-        assert!(matches!(err, Error::NotFound(_)));
-    }
+    // Binding a fresh, unbound agent to a missing revision fails closed.
+    let other = kernel.ready_agent("extra").unwrap();
+    let missing = type_ref("missing", 3);
+    let err = kernel
+        .bind_logical_agent_type(&other, &missing)
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)));
 
     // A missing LogicalAgent fails closed.
     let ghost = agentype_core::LogicalAgentId::from_string("agent-ghost");
@@ -1384,6 +1392,125 @@ fn a_legacy_task_cannot_be_retrofitted_to_typed() {
         .execute(
             "UPDATE tasks SET agent_requirement_mode='TYPED' WHERE id=?1",
             [legacy.as_str()],
+        )
+        .is_err());
+}
+
+// =============================================================================
+// P1-1: LogicalAgent binding has a positive parent-side marker.
+// =============================================================================
+
+#[test]
+fn binding_row_loss_fails_closed_and_keeps_the_agent_quarantined() {
+    let path = file_path("b3-binding-marker");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    // Simulate loss of the sole binding row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DROP TRIGGER logical_agent_type_bindings_immutable_delete",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
+            [agent.as_str()],
+        )
+        .unwrap();
+    }
+    // The positive marker makes this corruption, never a silent unbound agent.
+    assert!(matches!(
+        kernel.get_logical_agent_type_binding(&agent),
+        Err(Error::InvariantViolation(_))
+    ));
+
+    // Legacy work still cannot use the agent; a fresh unbound consumer is born.
+    let (_batch, _) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    assert!(kernel.claim_next_available().unwrap().is_none());
+    kernel.ensure_task_consumers().unwrap();
+    let claim = kernel.claim_next_available().unwrap().expect("fresh claim");
+    assert_ne!(claim.logical_agent_id, agent);
+}
+
+#[test]
+fn forged_binding_under_an_unbound_agent_is_corruption() {
+    let path = file_path("b3-forged-binding");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let agent = kernel.ready_agent("general").unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DROP TRIGGER logical_agent_type_bindings_require_bound_parent",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO logical_agent_type_bindings(logical_agent_id, type_id, type_revision, bound_at)
+             VALUES(?1,?2,?3,0)",
+            rusqlite::params![agent.as_str(), pin.id().as_str(), pin.revision() as i64],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_logical_agent_type_binding(&agent),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn a_bound_agent_cannot_be_unbound_by_direct_sql() {
+    let path = file_path("b3-no-unbind");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(conn
+        .execute(
+            "UPDATE logical_agents SET agent_type_binding_mode='UNBOUND' WHERE id=?1",
+            [agent.as_str()],
         )
         .is_err());
 }

@@ -50,7 +50,12 @@ catalog:
 - `logical_agent_type_bindings` is immutable and write-once: one exact
   `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
   change is a new binding, never an in-place type mutation. A binding may only be
-  minted for a `READY`, unassigned LogicalAgent.
+  minted for a `READY`, unassigned, currently-`UNBOUND` LogicalAgent, and it is
+  paired with the parent `logical_agents.agent_type_binding_mode`
+  (`UNBOUND`/`BOUND`): the authoritative read treats a `BOUND` marker without its
+  row, or an `UNBOUND` marker with a row, as corruption that fails closed, and the
+  marker cannot be reversed. Legacy eligibility is computed from the marker or the
+  row, so losing the row quarantines the agent rather than widening authority.
 - `generation_policies` is immutable: a generation-wide authority ceiling is
   fixed at generation creation and applied as the spec 10 intersection on each
   typed admission (a Task exceeding it fails closed). A policy row may only be

@@ -597,25 +597,37 @@ pub fn bind_logical_agent_type(
 ) -> Result<(), Error> {
     let agent = query_opt(
         tx,
-        "SELECT state, current_task_id FROM logical_agents WHERE id=?1",
+        "SELECT state, current_task_id, agent_type_binding_mode FROM logical_agents WHERE id=?1",
         params![agent_id.as_str()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
-    let Some((state, current_task)) = agent else {
+    let Some((state, current_task, binding_mode)) = agent else {
         return Err(Error::not_found(format!(
             "logical agent {} does not exist",
             agent_id.as_str()
         )));
     };
     // A type binding is a semantic identity commitment, so it may only be minted
-    // at a safe assignment boundary: a READY, unassigned agent. Binding an agent
-    // that is already executing legacy work would commit a contract that
-    // contradicts its in-flight authority.
+    // at a safe assignment boundary: a READY, unassigned, currently-unbound agent.
+    // Binding an agent that is already executing legacy work, or already bound,
+    // would commit a contract that contradicts its current identity.
     if state != "READY" || current_task.is_some() {
         return Err(Error::invalid_authority(format!(
             "a LogicalAgent type binding requires a READY, unassigned agent; {} is {}",
             agent_id.as_str(),
             state
+        )));
+    }
+    if binding_mode != "UNBOUND" {
+        return Err(Error::conflict(format!(
+            "logical agent {} is already type-bound",
+            agent_id.as_str()
         )));
     }
     // Validate the exact revision through the canonical read, not merely its FK
@@ -642,19 +654,13 @@ pub fn bind_logical_agent_type(
             }
         )));
     }
-    let already: bool = query_opt(
-        tx,
-        "SELECT 1 FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
-        params![agent_id.as_str()],
-        |row| row.get::<_, i64>(0),
-    )?
-    .is_some();
-    if already {
-        return Err(Error::conflict(format!(
-            "logical agent {} already has a type binding",
-            agent_id.as_str()
-        )));
-    }
+    // Flip the positive parent marker first (the child insert requires a `BOUND`
+    // parent), then write the immutable child row, all in one transaction.
+    tx.execute(
+        "UPDATE logical_agents SET agent_type_binding_mode='BOUND', updated_at=?1 WHERE id=?2",
+        params![now, agent_id.as_str()],
+    )
+    .map_err(map_sqlite)?;
     tx.execute(
         "INSERT INTO logical_agent_type_bindings(logical_agent_id, type_id, type_revision, bound_at)
          VALUES(?1,?2,?3,?4)",
@@ -673,14 +679,40 @@ pub fn get_logical_agent_type_binding(
     tx: &Transaction<'_>,
     agent_id: &LogicalAgentId,
 ) -> Result<Option<AgentTypeRef>, Error> {
+    let mode = query_opt(
+        tx,
+        "SELECT agent_type_binding_mode FROM logical_agents WHERE id=?1",
+        params![agent_id.as_str()],
+        |row| row.get::<_, String>(0),
+    )?
+    .ok_or_else(|| Error::not_found(format!("logical agent {}", agent_id.as_str())))?;
     let row = query_opt(
         tx,
         "SELECT type_id, type_revision FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
         params![agent_id.as_str()],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )?;
-    let Some((type_id, revision)) = row else {
-        return Ok(None);
+    let (type_id, revision) = match (mode.as_str(), row) {
+        ("UNBOUND", None) => return Ok(None),
+        ("BOUND", None) => {
+            return Err(Error::invariant(format!(
+                "bound LogicalAgent {} is missing its type binding row",
+                agent_id.as_str()
+            )))
+        }
+        ("UNBOUND", Some(_)) => {
+            return Err(Error::invariant(format!(
+                "unbound LogicalAgent {} unexpectedly has a type binding row",
+                agent_id.as_str()
+            )))
+        }
+        ("BOUND", Some(row)) => row,
+        (other, _) => {
+            return Err(Error::invariant(format!(
+                "unknown agent_type_binding_mode {other} for LogicalAgent {}",
+                agent_id.as_str()
+            )))
+        }
     };
     let reference = AgentTypeRef::new(type_id, revision as u64).map_err(contract_fault)?;
     if get_agent_type(tx, &reference)?.is_none() {
