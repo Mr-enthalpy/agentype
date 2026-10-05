@@ -61,8 +61,14 @@ impl<'a> ProvisioningAdmin<'a> {
         self.kernel.get_generation_policy(generation_id)
     }
 
-    /// Rank existing, bound LogicalAgents for a Task's requirement. Pure read:
-    /// it provably cannot provision a new agent (no SpawnSource is consulted).
+    /// Rank existing, bound LogicalAgents for a Task's requirement.
+    ///
+    /// This is **non-authoritative semantic candidate preselection**: it proves
+    /// only semantic compatibility (`can_execute`) and M5 placement, never that an
+    /// agent's current Incarnation, source, config, credentials, or adapter binding
+    /// can physically execute the Task. It provably cannot provision a new agent
+    /// (no `SpawnSource` is consulted) and grants no Task/Attempt/Lease/Execution
+    /// authority.
     pub fn match_existing_agents_for_task(
         &self,
         task_id: &TaskId,

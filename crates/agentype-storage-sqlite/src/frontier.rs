@@ -1119,9 +1119,11 @@ fn admit_proposal_core(
                         )
                     })?;
                 let generation_id = GenerationId::from_string(gid.clone());
-                // Replay accepts the committed exact pin even if the revision was
-                // later deprecated; a `Latest` selector still resolves against the
-                // current published catalog and fails closed on drift.
+                // A replay must not let mutable catalog state rewrite a past
+                // commitment: an `Exact` selector equal to the committed pin, or a
+                // `Latest` selector for the committed pin's `type_id`, replays
+                // against the committed exact pin even after new revisions are
+                // published or the revision is deprecated.
                 let expected = crate::requirement::build_task_agent_requirement_replay(
                     tx,
                     &generation_id,

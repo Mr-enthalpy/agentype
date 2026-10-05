@@ -461,12 +461,14 @@ fn matching_rejects_cross_revision_same_type() {
 }
 
 #[test]
-fn matching_rejects_incomparable_types() {
+fn matching_keeps_incomparable_but_compatible_types_eligible() {
     let catalog = catalog();
     let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
 
-    // Narrower affinity but a higher ceiling: neither a refinement nor strictly
-    // broader, so not a defined substitute in v1.
+    // Narrower affinity but a higher ceiling: `more_specific_for` is undefined in
+    // both directions, but the candidate still `can_execute` the Task, so it is a
+    // valid (lowest-ranked) candidate. `more_specific_for` is preference, not
+    // eligibility.
     let incomparable = candidate(
         "agent-odd",
         agent("odd", 1, AffinityConstraint::Only(set(&["rust"])), 300.0),
@@ -479,7 +481,8 @@ fn matching_rejects_incomparable_types() {
         &catalog,
     )
     .unwrap();
-    assert!(matched.is_empty());
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].logical_agent_id.as_str(), "agent-odd");
 }
 
 #[test]

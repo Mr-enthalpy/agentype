@@ -540,14 +540,21 @@ Rules now enforced:
   trustworthy provisioning evidence/binding provenance, or require a
   new/requalified Incarnation, before any authority-bearing typed acquisition of
   an agent bound by M6-B.3.
-- **M5 placement and the AgentType contract are BOTH hard gates.** A candidate
+- **Matching is non-authoritative semantic candidate preselection.** A candidate
   must satisfy the frozen M5 placement rules (exact partition, task tags subset
   of the agent's concrete tags, and for `Required` continuity the same
-  workstream) *and* `can_execute(type, task)`. A `Preferred` continuity ranks the
-  same workstream first. An unbound LogicalAgent has no contract and is never
-  returned. Matching is a pure read: it consults no `SpawnSource` and writes
-  nothing.
-- **Only immediately usable candidates.** A candidate is an M5 `READY` and
+  workstream) *and* `can_execute(type, task)`, and must not be a different
+  revision of the pinned `type_id`. `more_specific_for` is a **preference
+  relation only** — it orders candidates and never decides eligibility, so a
+  compatible type that is neither a strict refinement nor strictly broader
+  remains a candidate (ranked last). A `Preferred` continuity ranks the same
+  workstream first. An unbound LogicalAgent has no contract and is never
+  returned. The result proves only semantic and M5-placement compatibility, never
+  that an agent is runnable: matching consults no `SpawnSource`, writes nothing,
+  and grants no Task/Attempt/Lease/Execution authority. A `B3Candidate` is NOT an
+  `EligibleExecutionCandidate`; only M6-B.4/M6-B.5 authority-bearing acquisition
+  may reach that.
+- **Only `READY`, unassigned candidates.** A candidate is an M5 `READY` and
   unassigned bound LogicalAgent. Non-READY states (`ASSIGNED`, `DRAINING`,
   `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
   revival is a later seam. A candidate's realized M5 retention is deliberately
@@ -557,14 +564,19 @@ Rules now enforced:
 - **One ranking order, exact revisions only.** The exact pin is the matching
   anchor, not a ceiling. Among eligible candidates the relation to the pin orders
   as: exact, then compatible narrower/refinement types, then compatible
-  broader/general types. A different revision of the same `type_id` is never a
-  substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a
-  strict refinement nor strictly broader is not eligible. Within a class,
-  candidate-vs-candidate specificity (`more_specific_for`) is applied as
+  broader/general types, then other compatible types. A different revision of the
+  same `type_id` is never a substitute (`D-TYPE-REV-COMPAT` is deferred). Within a
+  class, candidate-vs-candidate specificity (`more_specific_for`) is applied as
   dominance-count layers, then the `Preferred` workstream placement, continuity
   strength, and finally the frozen M5 availability/identity tie-break
   (`agentype_core::claim_tiebreak`: effective availability then lowest
   LogicalAgent id). Nominal inheritance depth is never consulted.
+- **V0.1 capacity accounting is unchanged for B.3.** Type-bound agents are
+  excluded from legacy *claim/consumer eligibility*, but they still count toward
+  V0.1 `PoolPartition` capacity during `reconcile_pool`, which is unaware of
+  `agent_type_binding_mode` and may retire a bound agent as excess. Reconciling
+  typed semantic population with V0.1 partition capacity belongs to `D-TOPOLOGY`
+  / M6-B.4, not B.3.
 
 Full physical eligibility (`can_provision_task`, active adapter policy, exact
 binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.

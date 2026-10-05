@@ -311,22 +311,28 @@ self-consistent copy that disagrees MUST fail closed. Admission replay MUST use
 the same command shape: a legacy retry of a typed Task, or a typed retry of a
 legacy Task, is a Conflict, not an idempotent success.
 
-Existing-agent matching composes two hard gates: the frozen M5 placement rules
-(exact partition, task tags subset of the agent's concrete tags, and the same
-workstream for `Required` continuity) **and** the AgentType contract
-(`can_execute`). Only M5 `READY`, unassigned, bound agents are candidates;
-non-READY states are not treated as cold/revivable; an unbound agent is never
-returned. A `Preferred` continuity ranks the same workstream first. The exact pin
-is a matching anchor, not a ceiling: among eligible candidates the relation to the
-pin orders as exact, then compatible narrower/refinement types, then compatible
-broader/general types. A different revision of the same `type_id` is never a
-substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a strict
-refinement nor strictly broader is not eligible; within a relation class,
-candidate-vs-candidate `more_specific_for` dominates before the `Preferred`
-workstream, continuity strength, availability, and stable identity tie-breaks.
-Ranking MUST NOT use nominal inheritance depth. A replay never lets a mutable
-catalog view change a past commitment: an already-admitted `Latest` command
-replays against its committed exact pin even after new revisions are published,
+Existing-agent matching is **non-authoritative semantic candidate
+preselection**: it proves semantic compatibility and M5 placement, never physical
+eligibility. Eligibility composes the frozen M5 placement rules (exact partition,
+task tags subset of the agent's concrete tags, and the same workstream for
+`Required` continuity), the AgentType contract (`can_execute`), and one explicit
+rule that a different revision of the pinned `type_id` is never a substitute
+(`D-TYPE-REV-COMPAT` is deferred). Only M5 `READY`, unassigned, bound agents are
+candidates; non-READY states are not treated as cold/revivable; an unbound agent
+is never returned. `more_specific_for` is a **preference relation only**: it orders
+candidates and never decides eligibility, so a compatible type that is neither a
+strict refinement nor strictly broader remains a candidate, ranked after broader
+ones. A `Preferred` continuity ranks the same workstream first. The exact pin is a
+matching anchor, not a ceiling: within a relation class, candidate-vs-candidate
+`more_specific_for` dominates before the `Preferred` workstream, continuity
+strength, availability, and stable identity tie-breaks. Ranking MUST NOT use
+nominal inheritance depth. Matching grants no Task/Attempt/Lease/Execution
+authority and MUST NOT be consumed as "runnable": any authority-bearing typed
+acquisition (M6-B.4/M6-B.5) MUST additionally prove `can_provision_task`, active
+adapter policy, exact binding resolution, enforcement evidence, and credentials.
+A replay never lets a mutable catalog view change a past commitment: an
+already-admitted `Latest` command replays against its committed exact pin even
+after new revisions are published,
 while a genuinely new `Latest` commitment resolves to the current revision; an
 already-committed exact pin remains replayable after deprecation. New-agent
 provisioning from an eligible SpawnSource, full physical eligibility

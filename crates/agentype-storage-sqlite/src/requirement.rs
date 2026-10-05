@@ -743,14 +743,18 @@ fn parse_tags(json: &str) -> Result<BTreeSet<String>, Error> {
     Ok(tags)
 }
 
-/// Rank existing, bound, immediately usable LogicalAgents for one Task's
-/// requirement. Pure: it reads durable bindings, the Task's M5 placement row, and
-/// the validated catalog, writes nothing, and never touches a `SpawnSource`.
+/// Rank existing, bound, `READY`, unassigned LogicalAgents for one Task's
+/// requirement. Pure, non-authoritative **semantic candidate preselection**: it
+/// reads durable bindings, the Task's M5 placement row, and the validated
+/// catalog, writes nothing, and never touches a `SpawnSource`. A result proves
+/// only semantic compatibility and M5 placement, never physical eligibility —
+/// M6-B.4/M6-B.5 must still prove `can_provision_task` and the remaining physical
+/// conjuncts before any authority-bearing acquisition.
 ///
-/// Eligibility composes the frozen M5 placement rules (exact partition, tag
-/// superset, `Required` workstream gate) with the AgentType contract
-/// (`can_execute`). Only M5 `READY` and unassigned agents are candidates;
-/// non-READY states are not approximated as "cold/revivable".
+/// Every usable agent is loaded and resolved through the authoritative binding
+/// coherence read, so a `BOUND` agent whose row was lost fails the whole
+/// discovery closed instead of being silently skipped. Only non-READY states are
+/// excluded; they are not approximated as "cold/revivable".
 pub fn match_existing_agents_for_task(
     tx: &Transaction<'_>,
     task_id: &TaskId,

@@ -128,8 +128,10 @@ M6-B.3 typed admission and matching MUST cover:
   `Latest` command replays against its committed pin even after new revisions are
   published, a genuinely new `Latest` commitment resolves to the current revision,
   and a legacy replay of a typed Task (or vice versa) is a `Conflict`
-- a different revision of the same `type_id` is not a substitute, and a type that
-  is neither a strict refinement nor strictly broader is ineligible
+- a different revision of the same `type_id` is not a substitute; a compatible
+  type that is neither a strict refinement nor strictly broader remains a
+  candidate (ranked after broader ones), because `more_specific_for` is a
+  preference relation and never an eligibility gate
 - typed candidate discovery loads every usable agent and runs the authoritative
   binding coherence read, so a `BOUND` agent whose row was lost fails the whole
   discovery closed instead of being silently skipped or falling back to another
@@ -138,9 +140,10 @@ M6-B.3 typed admission and matching MUST cover:
   `Required` workstream) with `can_execute`, and returns only bound, M5 `READY`,
   unassigned agents; broader/general candidates are ordered per the spec 06
   preference, and matching writes nothing
-- ranking orders exact, narrower, then broader, applies candidate-vs-candidate
-  dominance before the `Preferred` workstream and the frozen M5
-  availability/identity tie-break, and never uses nominal inheritance depth
+- ranking orders exact, narrower, broader, then other compatible, applies
+  candidate-vs-candidate dominance before the `Preferred` workstream and the
+  frozen M5 availability/identity tie-break, and never uses nominal inheritance
+  depth
 - the authoritative requirement read resolves its exact pin through the validated
   catalog read (a corrupt pin fails closed, a deprecated one does not) and, when
   the generation carries a policy, requires the stored requirement to be the
