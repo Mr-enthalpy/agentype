@@ -792,13 +792,16 @@ pub fn match_existing_agents_for_task(
         continuity: ContinuityPreference::parse_sql(&continuity)?,
     };
 
+    // Load every immediately usable agent and let the authoritative marker/row
+    // coherence read decide: an inner join on the binding table would silently
+    // drop a `BOUND` agent whose row is corrupt before the coherence check runs,
+    // turning durable corruption into a weaker candidate-enumeration bypass.
     let rows: Vec<(String, String, String, Option<String>, Option<f64>, f64)> = {
         let mut statement = tx
             .prepare(
                 "SELECT la.id, la.partition_name, la.tags_json, la.workstream_id,
                         la.available_since, la.created_at
                  FROM logical_agents la
-                 JOIN logical_agent_type_bindings b ON b.logical_agent_id = la.id
                  WHERE la.state='READY' AND la.current_task_id IS NULL
                  ORDER BY la.id",
             )

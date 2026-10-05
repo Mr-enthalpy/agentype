@@ -130,6 +130,10 @@ M6-B.3 typed admission and matching MUST cover:
   and a legacy replay of a typed Task (or vice versa) is a `Conflict`
 - a different revision of the same `type_id` is not a substitute, and a type that
   is neither a strict refinement nor strictly broader is ineligible
+- typed candidate discovery loads every usable agent and runs the authoritative
+  binding coherence read, so a `BOUND` agent whose row was lost fails the whole
+  discovery closed instead of being silently skipped or falling back to another
+  candidate
 - matching composes the frozen M5 placement gates (exact partition, tag superset,
   `Required` workstream) with `can_execute`, and returns only bound, M5 `READY`,
   unassigned agents; broader/general candidates are ordered per the spec 06

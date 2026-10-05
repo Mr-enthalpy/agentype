@@ -1570,3 +1570,138 @@ fn empty_generation_policy_is_a_command_rejection() {
         .unwrap_err();
     assert!(matches!(err, Error::InvalidAuthority(_)), "{err:?}");
 }
+
+// =============================================================================
+// P1: typed candidate discovery fails closed on marker/row corruption.
+// =============================================================================
+
+#[test]
+fn matching_fails_closed_on_a_bound_agent_missing_its_row() {
+    let path = file_path("b3-match-bound-missing");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin.clone()))
+        .unwrap();
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DROP TRIGGER logical_agent_type_bindings_immutable_delete",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
+            [agent.as_str()],
+        )
+        .unwrap();
+    }
+    // Candidate discovery MUST NOT silently drop the corrupt agent.
+    assert!(matches!(
+        kernel.match_existing_agents_for_task(&task),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn matching_does_not_fall_back_over_a_corrupt_candidate() {
+    let path = file_path("b3-match-no-fallback");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            2,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let narrow = publish_agent_type(&kernel, "reviewer", 1);
+    kernel
+        .publish_agent_type(&AgentType {
+            type_ref: AgentTypeRef::new("generalist", 1).unwrap(),
+            based_on: None,
+            contract: AgentTypeContract {
+                allowed_information_functions: vec![InformationFunction::Expand],
+                required_capabilities: BTreeMap::new(),
+                affinity: AffinityConstraint::Any,
+                budget_ceiling: Budget::new(300.0).unwrap(),
+                security: SecurityContract {
+                    workspace: WorkspaceMode::ReadOnly,
+                    network: NetworkPolicy::Restricted,
+                    requires_attempt_isolation: false,
+                },
+                lifecycle: [LifecycleMode::Resident].into_iter().collect(),
+                continuity: ContinuityMode::Logical,
+                sandbox_policy: None,
+                anchor_constraint: None,
+            },
+        })
+        .unwrap();
+
+    let agent_ids: Vec<String> = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut statement = conn
+            .prepare("SELECT id FROM logical_agents ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(agent_ids.len(), 2);
+    let corrupt = LogicalAgentId::from_string(agent_ids[0].clone());
+    let valid_broader = LogicalAgentId::from_string(agent_ids[1].clone());
+    kernel.bind_logical_agent_type(&corrupt, &narrow).unwrap();
+    kernel
+        .bind_logical_agent_type(&valid_broader, &AgentTypeRef::new("generalist", 1).unwrap())
+        .unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DROP TRIGGER logical_agent_type_bindings_immutable_delete",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM logical_agent_type_bindings WHERE logical_agent_id=?1",
+            [corrupt.as_str()],
+        )
+        .unwrap();
+    }
+
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(narrow))
+        .unwrap();
+    // A valid broader candidate exists, but the corrupt one must fail the whole
+    // discovery closed rather than fall back.
+    assert!(matches!(
+        kernel.match_existing_agents_for_task(&task),
+        Err(Error::InvariantViolation(_))
+    ));
+}

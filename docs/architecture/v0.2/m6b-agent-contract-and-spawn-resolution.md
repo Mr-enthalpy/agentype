@@ -492,7 +492,10 @@ Rules now enforced:
   the row, so a legacy Task can never acquire a type-bound agent without
   `can_execute`. When only bound READY agents remain, the legacy path births a
   fresh unbound consumer. A binding may only be minted for a `READY`, unassigned,
-  currently-`UNBOUND` agent.
+  currently-`UNBOUND` agent. Typed candidate discovery loads every usable agent
+  and runs this coherence read per agent, so a corrupt (`BOUND` + missing row)
+  agent fails the whole discovery closed rather than being silently skipped or
+  causing a fallback to another candidate.
 - **Generation policy has the same positive marker.** A Generation carries a
   `policy_mode` (`NONE`/`POLICY`) fixed at creation. Both legacy and typed
   admission read the policy through the authoritative `get_generation_policy`, so
