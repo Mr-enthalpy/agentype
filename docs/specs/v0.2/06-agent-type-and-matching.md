@@ -82,9 +82,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   be inferred from a stronger capability.
 - `can_provision_task` is the contract/sandbox eligibility predicate and a
   **mandatory conjunct of any authority-bearing typed acquisition/provisioning
-  decision** (M6-B.4/M6-B.5); it is NOT part of M6-B.3 pure candidate discovery,
-  and it is NOT the complete physical candidate eligibility decision. The
-  conjunction
+  decision** (M6-B.4/M6-B.5; see
+  [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md)); it is NOT
+  part of M6-B.3 pure candidate discovery, and it is NOT the complete physical
+  candidate eligibility decision. The conjunction
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
@@ -115,9 +116,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   controlling proof authority independently of polarity. Every Task capability
   value MUST match its catalog definition shape and fail closed otherwise, even
   for `Restriction` capabilities the AgentType does not pre-advertise. Any
-  authority-bearing typed acquisition/provisioning decision (M6-B.4/M6-B.5) MUST
-  include `can_provision_task` as a mandatory conjunct, not the bare conjunction;
-  M6-B.3 existing-agent matching is candidate discovery only and grants no
+  authority-bearing typed acquisition/provisioning decision (M6-B.4/M6-B.5; see
+  [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md)) MUST include
+  `can_provision_task` as a mandatory conjunct, not the bare conjunction; M6-B.3
+  existing-agent matching is candidate discovery only and grants no
   Task/Attempt/Lease/Execution authority.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information

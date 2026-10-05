@@ -41,9 +41,9 @@ pub use canonical::{
     task_agent_requirement_content_digest, CANONICAL_FORMAT_VERSION,
 };
 pub use capability::{
-    join_requirement_values, value_satisfies, value_within, Assurance, CapabilityCatalog,
-    CapabilityClaim, CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue,
-    MatcherKind, Quantity, SecurityClass,
+    value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
+    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
+    Quantity, SecurityClass,
 };
 pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,

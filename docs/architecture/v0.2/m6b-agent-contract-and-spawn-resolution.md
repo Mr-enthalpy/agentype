@@ -579,7 +579,10 @@ Rules now enforced:
   / M6-B.4, not B.3.
 
 Full physical eligibility (`can_provision_task`, active adapter policy, exact
-binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here.
+binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here. The staging
+of `can_provision_task` to the first authority-bearing acquisition path is fixed
+by [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md), not by an
+in-place edit of frozen spec 06.
 
 ## 8. Inherited invariants relevant here
 

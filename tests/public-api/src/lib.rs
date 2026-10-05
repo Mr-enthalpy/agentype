@@ -327,4 +327,12 @@ pub fn provisioning_admin_surface() {}
 ///     let _ = admin.claim_next_available();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 23. The internal capability join primitive is not exported; the public
+/// //     capability-intersection API is not frozen until B.5.
+/// fn _no_join_requirement_values() {
+///     let _ = agentype_agent_contract::join_requirement_values;
+/// }
+/// ```
 pub fn probes() {}

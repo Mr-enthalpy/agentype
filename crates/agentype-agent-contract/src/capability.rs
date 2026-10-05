@@ -280,12 +280,10 @@ pub fn value_within(ceiling: &CapabilityValue, value: &CapabilityValue) -> bool 
 /// values are incompatible (e.g. disjoint `Exact` values or differing `Ordered`
 /// classes).
 ///
-/// This is used both to compose a Task restriction with an AgentType envelope
-/// (M6-B.1) and to fold a Generation policy into a Task requirement (M6-B.3).
-/// It is deliberately independent of the catalog-owned polarity: polarity decides
-/// which direction *narrows* in refinement, while "the stronger requirement" is
-/// always the set-union / max-rank / max-quantity / OR-presence / equality join.
-pub fn join_requirement_values(
+/// This is an internal primitive shared by the B.1 restriction composition and
+/// later folds. It is deliberately **not** exported: the public capability
+/// intersection API is not frozen until B.5 (`D-SANDBOX-INTERSECTION`).
+pub(crate) fn join_requirement_values(
     matcher: MatcherKind,
     a: &CapabilityValue,
     b: &CapabilityValue,
