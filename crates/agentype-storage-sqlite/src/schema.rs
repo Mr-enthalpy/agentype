@@ -793,6 +793,30 @@ END;
 -- durable facts, so losing the child row is corruption rather than a silent
 -- downgrade to legacy/unconstrained. A Task's typedness is fixed at creation
 -- (never retrofitted), and a Generation's policy mode is fixed at creation.
+-- Identity replacement must not bypass the UPDATE guards: `INSERT OR REPLACE`
+-- deletes the row rather than updating it, so each durable parent identity also
+-- gets a same-id insert guard.
+CREATE TRIGGER IF NOT EXISTS tasks_no_identity_replace
+BEFORE INSERT ON tasks
+WHEN EXISTS(SELECT 1 FROM tasks WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable task identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generations_no_identity_replace
+BEFORE INSERT ON generations
+WHEN EXISTS(SELECT 1 FROM generations WHERE generation_id=NEW.generation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable generation identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agents_no_identity_replace
+BEFORE INSERT ON logical_agents
+WHEN EXISTS(SELECT 1 FROM logical_agents WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable LogicalAgent identity cannot be replaced');
+END;
+
 CREATE TRIGGER IF NOT EXISTS tasks_agent_requirement_mode_immutable
 BEFORE UPDATE OF agent_requirement_mode ON tasks
 WHEN OLD.agent_requirement_mode IS NOT NEW.agent_requirement_mode

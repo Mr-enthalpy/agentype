@@ -66,8 +66,11 @@ catalog:
   markers fixed at creation/admission and immutable thereafter. A missing child
   row for a positive marker, or an unexpected child row for a negative marker, is
   corruption, never a silent downgrade to legacy or an unconstrained Generation;
-  SQLite triggers forbid mutating a Task's typedness and a generation's policy
-  mode.
+  SQLite triggers forbid mutating a Task's typedness, a generation's policy mode,
+  or a LogicalAgent's binding mode, and also reject a same-identity `INSERT` /
+  `INSERT OR REPLACE` on `tasks`, `generations`, or `logical_agents`, so a
+  durable parent identity cannot be replaced to inject a different presence
+  marker.
 - all three tables MUST be physically write-once: SQLite triggers reject
   `UPDATE`, `DELETE`, and a duplicate/`INSERT OR REPLACE` that would rewrite an
   existing exact identity, so direct SQL cannot rewrite a requirement, rebind an

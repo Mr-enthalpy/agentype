@@ -477,8 +477,9 @@ Rules now enforced:
   pre-commit selection concern, not a Task agent requirement.
 - **Typed Tasks are quarantined from legacy dispatch by a Core decision.** An
   admitted Task carries a durable `agent_requirement_mode` (`LEGACY`/`TYPED`)
-  written with the Task at creation and fixed for its lifetime (never retrofitted,
-  SQLite-enforced, including `INSERT OR REPLACE`). The legacy task/agent queries
+  written with the Task at creation and fixed for its lifetime (never retrofitted:
+  SQLite rejects a modifying `UPDATE` and a same-identity `INSERT`/`INSERT OR
+  REPLACE` on `tasks`). The legacy task/agent queries
   are coarse prefilters only; the authoritative eligibility re-check lives in the
   pure decisions (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound` in
   `agentype-core`), so query text alone cannot change scheduler behavior. Losing

@@ -1705,3 +1705,120 @@ fn matching_does_not_fall_back_over_a_corrupt_candidate() {
         Err(Error::InvariantViolation(_))
     ));
 }
+
+// =============================================================================
+// P1-1: durable parent identities cannot be replaced to inject markers.
+// =============================================================================
+
+#[test]
+fn parent_identity_replace_cannot_inject_presence_markers() {
+    let path = file_path("b3-parent-identity");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+    let gen = kernel.create_generation(json!({})).unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+
+    // Replace a LEGACY Task as TYPED: rejected, and the marker stays LEGACY.
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO tasks(
+                 id, batch_id, name, payload_json, acceptance_json, partition_name,
+                 workstream_id, continuity, affinity_tags_json, workspace_mode, required,
+                 priority, state, agent_requirement_mode, max_attempts, retry_classes_json,
+                 base_backoff_seconds, max_backoff_seconds, next_eligible_at,
+                 current_attempt_id, fencing_epoch, supersedes_task_id, created_at, updated_at)
+             SELECT id, batch_id, name, payload_json, acceptance_json, partition_name,
+                 workstream_id, continuity, affinity_tags_json, workspace_mode, required,
+                 priority, state, 'TYPED', max_attempts, retry_classes_json,
+                 base_backoff_seconds, max_backoff_seconds, next_eligible_at,
+                 current_attempt_id, fencing_epoch, supersedes_task_id, created_at, updated_at
+             FROM tasks WHERE id=?1",
+            [legacy.as_str()],
+        )
+        .is_err());
+    let task_mode: String = conn
+        .query_row(
+            "SELECT agent_requirement_mode FROM tasks WHERE id=?1",
+            [legacy.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(task_mode, "LEGACY");
+
+    // Replace a NONE Generation as POLICY: rejected, marker stays NONE.
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO generations(
+                 generation_id, state, revision, admission_seq, policy_mode,
+                 seed_payload_json, created_at, frozen_at, closed_at)
+             SELECT generation_id, state, revision, admission_seq, 'POLICY',
+                 seed_payload_json, created_at, frozen_at, closed_at
+             FROM generations WHERE generation_id=?1",
+            [gen.generation_id.as_str()],
+        )
+        .is_err());
+    let policy_mode: String = conn
+        .query_row(
+            "SELECT policy_mode FROM generations WHERE generation_id=?1",
+            [gen.generation_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(policy_mode, "NONE");
+
+    // Replace a BOUND LogicalAgent as UNBOUND: rejected, marker stays BOUND.
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO logical_agents(
+                 id, partition_name, retention, state, agent_type_binding_mode,
+                 workstream_id, tags_json, current_task_id, pending_partition_name,
+                 retirement_requested, continuity_json, continuity_version,
+                 current_checkpoint_id, available_since, created_at, updated_at)
+             SELECT id, partition_name, retention, state, 'UNBOUND',
+                 workstream_id, tags_json, current_task_id, pending_partition_name,
+                 retirement_requested, continuity_json, continuity_version,
+                 current_checkpoint_id, available_since, created_at, updated_at
+             FROM logical_agents WHERE id=?1",
+            [agent.as_str()],
+        )
+        .is_err());
+    let binding_mode: String = conn
+        .query_row(
+            "SELECT agent_type_binding_mode FROM logical_agents WHERE id=?1",
+            [agent.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding_mode, "BOUND");
+
+    // No child rows were injected by the rejected replacements.
+    let requirements: i64 = conn
+        .query_row("SELECT COUNT(*) FROM task_agent_requirements", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let policies: i64 = conn
+        .query_row("SELECT COUNT(*) FROM generation_policies", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(requirements, 0);
+    assert_eq!(policies, 0);
+}
