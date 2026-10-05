@@ -23,7 +23,7 @@ use agentype_agent_contract::{
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
-    TaskId, TaskSpec, UnixTime, WorkstreamId,
+    TaskId, TaskSpec, UnixTime, WorkspaceMode, WorkstreamId,
 };
 use rusqlite::{params, Transaction};
 use std::collections::BTreeSet;
@@ -180,10 +180,81 @@ pub fn get_task_agent_requirement(
             "task agent requirement is not the canonical encoding; refusing to read",
         ));
     }
+    verify_requirement_mirrors(tx, task_id, &requirement)?;
     Ok(Some(requirement))
 }
 
-fn task_agent_requirement_mode(tx: &Transaction<'_>, task_id: &TaskId) -> Result<String, Error> {
+/// Cross-check the duplicated TaskSpec-owned dimensions against their
+/// authoritative sources. The Task, the GenerationTaskBinding, and the folded
+/// Generation policy remain the single authority; a self-consistent corruption of
+/// the requirement copy that disagrees with them MUST fail closed.
+fn verify_requirement_mirrors(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+    requirement: &TaskAgentRequirement,
+) -> Result<(), Error> {
+    let task = query_opt(
+        tx,
+        "SELECT affinity_tags_json, workspace_mode, continuity FROM tasks WHERE id=?1",
+        params![task_id.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?
+    .ok_or_else(|| Error::not_found(format!("task {}", task_id.as_str())))?;
+    let (tags_json, workspace, continuity) = task;
+    if parse_tags(&tags_json)? != requirement.hard.required_affinity {
+        return Err(Error::invariant(
+            "task agent requirement required_affinity does not match the Task affinity tags",
+        ));
+    }
+    if WorkspaceMode::parse_sql(&workspace)? != requirement.hard.required_workspace {
+        return Err(Error::invariant(
+            "task agent requirement required_workspace does not match the Task workspace mode",
+        ));
+    }
+
+    let binding = query_opt(
+        tx,
+        "SELECT generation_id, information_function FROM generation_task_bindings WHERE task_id=?1",
+        params![task_id.as_str()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?
+    .ok_or_else(|| Error::invariant("typed task is missing its GenerationTaskBinding"))?;
+    let (generation_id, information_function) = binding;
+    if InformationFunction::parse_sql(&information_function)?
+        != requirement.hard.information_function
+    {
+        return Err(Error::invariant(
+            "task agent requirement information_function does not match the GenerationTaskBinding",
+        ));
+    }
+
+    let base = match ContinuityPreference::parse_sql(&continuity)? {
+        ContinuityPreference::Required => ContinuityMode::Logical,
+        ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
+    };
+    let generation_id = GenerationId::from_string(generation_id);
+    let effective = match get_generation_policy(tx, &generation_id)? {
+        Some(policy) => policy.min_continuity.max(base),
+        None => base,
+    };
+    if effective != requirement.hard.required_continuity {
+        return Err(Error::invariant(
+            "task agent requirement required_continuity does not match the folded Task/Generation continuity",
+        ));
+    }
+    Ok(())
+}
+
+pub fn task_agent_requirement_mode(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<String, Error> {
     query_opt(
         tx,
         "SELECT agent_requirement_mode FROM tasks WHERE id=?1",
@@ -471,17 +542,27 @@ pub fn bind_logical_agent_type(
     agent_id: &LogicalAgentId,
     type_ref: &AgentTypeRef,
 ) -> Result<(), Error> {
-    let agent_exists: bool = query_opt(
+    let agent = query_opt(
         tx,
-        "SELECT 1 FROM logical_agents WHERE id=?1",
+        "SELECT state, current_task_id FROM logical_agents WHERE id=?1",
         params![agent_id.as_str()],
-        |row| row.get::<_, i64>(0),
-    )?
-    .is_some();
-    if !agent_exists {
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    let Some((state, current_task)) = agent else {
         return Err(Error::not_found(format!(
             "logical agent {} does not exist",
             agent_id.as_str()
+        )));
+    };
+    // A type binding is a semantic identity commitment, so it may only be minted
+    // at a safe assignment boundary: a READY, unassigned agent. Binding an agent
+    // that is already executing legacy work would commit a contract that
+    // contradicts its in-flight authority.
+    if state != "READY" || current_task.is_some() {
+        return Err(Error::invalid_authority(format!(
+            "a LogicalAgent type binding requires a READY, unassigned agent; {} is {}",
+            agent_id.as_str(),
+            state
         )));
     }
     // Validate the exact revision through the canonical read, not merely its FK

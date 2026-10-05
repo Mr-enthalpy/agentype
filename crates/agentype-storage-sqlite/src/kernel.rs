@@ -1621,7 +1621,11 @@ impl Kernel {
                 let mut agent_stmt = tx
                     .prepare(
                         "SELECT id,state,workstream_id,tags_json,current_task_id,available_since,created_at
-                         FROM logical_agents WHERE partition_name=?1 AND state='READY'",
+                         FROM logical_agents WHERE partition_name=?1 AND state='READY'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM logical_agent_type_bindings b
+                               WHERE b.logical_agent_id=logical_agents.id
+                           )",
                     )
                     .map_err(map_sqlite)?;
                 let raw_agents = agent_stmt
@@ -1742,7 +1746,11 @@ impl Kernel {
                                     pending_partition_name,retirement_requested,continuity_json,continuity_version,
                                     available_since,created_at
                              FROM logical_agents WHERE partition_name=?1 AND state='READY'
-                             AND current_task_id IS NULL",
+                             AND current_task_id IS NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM logical_agent_type_bindings b
+                                 WHERE b.logical_agent_id=logical_agents.id
+                             )",
                         )
                         .map_err(map_sqlite)?;
                     let rows = stmt

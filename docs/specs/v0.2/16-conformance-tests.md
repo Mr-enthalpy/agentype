@@ -123,17 +123,29 @@ M6-B.3 typed admission and matching MUST cover:
   Attempt/Lease/Execution, and stays `QUEUED`; losing the requirement row for a
   `TYPED` marker MUST NOT downgrade it to a legacy Task, and losing a `POLICY`
   row MUST NOT make the Generation unconstrained
+- a type-bound LogicalAgent is excluded from the legacy consumer/claim pool, so a
+  legacy Task cannot acquire it without `can_execute`; when only bound agents
+  remain the legacy path births a fresh unbound consumer, and a binding requires
+  a `READY`, unassigned agent
 - a mixed queue still dispatches the legacy Task past a quarantined typed Task
+- the authoritative requirement read resolves its exact pin through the validated
+  catalog read (a corrupt pinned revision fails closed, a deprecated one does not)
+  and cross-checks its duplicated Task/Generation dimensions (information
+  function, affinity, workspace, folded continuity); a self-consistent copy that
+  disagrees fails closed
 - exact typed replay returns the same Task while a conflicting requirement is a
-  `Conflict`; an exact pin stays replayable after deprecation, and a `Latest`
-  retry after catalog drift fails closed
+  `Conflict`; an exact pin stays replayable after deprecation, a `Latest` retry
+  after catalog drift fails closed, and a legacy replay of a typed Task (or vice
+  versa) is a `Conflict`
+- a different revision of the same `type_id` is not a substitute, and a type that
+  is neither a strict refinement nor strictly broader is ineligible
 - matching composes the frozen M5 placement gates (exact partition, tag superset,
   `Required` workstream) with `can_execute`, and returns only bound, M5 `READY`,
-  unassigned agents; broader/general and non-ready candidates are ordered or
-  filtered per the spec 06 preference, and matching writes nothing
-- ranking orders exact, narrower, equivalent/incomparable, then broader, applies
-  candidate-vs-candidate dominance before continuity/availability/identity, and
-  never uses nominal inheritance depth
+  unassigned agents; broader/general candidates are ordered per the spec 06
+  preference, and matching writes nothing
+- ranking orders exact, narrower, then broader, applies candidate-vs-candidate
+  dominance before continuity/availability/identity, and never uses nominal
+  inheritance depth
 - `logical_agent_type_bindings` is write-once and a fresh binding requires a
   `PUBLISHED` revision; `task_agent_requirements` and `generation_policies` are
   immutable, enforced mechanically by SQLite

@@ -40,7 +40,10 @@ catalog:
   validated read, and the relational mirror MUST be cross-checked against the
   canonical document on every read. The parent `tasks.agent_requirement_mode` and
   this row are one invariant: a `TYPED` Task without its row, or a `LEGACY` Task
-  with one, is corruption that MUST fail closed.
+  with one, is corruption that MUST fail closed. The read MUST also resolve the
+  pin through the catalog's validated read and cross-check the duplicated
+  TaskSpec-owned dimensions (information function, affinity, workspace, folded
+  continuity) against the authoritative Task and `GenerationTaskBinding`.
 - `logical_agent_type_bindings` is immutable and write-once: one exact
   `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
   change is a new binding, never an in-place type mutation.

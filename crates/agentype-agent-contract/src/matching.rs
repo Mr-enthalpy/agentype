@@ -17,9 +17,11 @@
 //! eligibility, if ever needed, is a B.4 provisioning concern.
 //!
 //! Ranking follows the frozen spec 06 matching preference: an exact pin is
-//! preferred, then compatible narrower/refinement types, then equivalent or
-//! incomparable compatible types, then compatible broader/general types. Within a
-//! class, candidate-vs-candidate specificity (`more_specific_for`) is applied as
+//! preferred, then compatible narrower/refinement types, then compatible
+//! broader/general types. A different revision of the same `type_id` is never a
+//! substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a
+//! strict refinement nor strictly broader is not eligible. Within a class,
+//! candidate-vs-candidate specificity (`more_specific_for`) is applied as
 //! dominance-count layers, then the `Preferred` workstream placement, continuity
 //! strength, availability, and a stable identity tie-break. Nominal inheritance
 //! depth is never consulted.
@@ -60,11 +62,17 @@ pub struct TaskPlacement {
 }
 
 /// Relation of a candidate's type to the requirement's exact pin.
+///
+/// `None` means the candidate is not a valid substitute: a different revision of
+/// the pinned `type_id` (`D-TYPE-REV-COMPAT` is deferred, so there is no
+/// automatic cross-revision compatibility), or a type that is neither a strict
+/// refinement nor strictly broader. Only strict dominance or the exact pin is a
+/// defined direction; genuinely incomparable/equivalent types are not eligible in
+/// v1 rather than collapsed into an invented ranking tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Relation {
     Exact,
     Narrower,
-    EquivalentOrIncomparable,
     Broader,
 }
 
@@ -73,17 +81,20 @@ fn relation(
     required: &AgentType,
     req: &TaskAgentRequirement,
     catalog: &CapabilityCatalog,
-) -> Relation {
+) -> Option<Relation> {
     if candidate.type_ref == required.type_ref {
-        return Relation::Exact;
+        return Some(Relation::Exact);
+    }
+    if candidate.type_ref.id() == required.type_ref.id() {
+        return None;
     }
     if more_specific_for(candidate, required, &req.hard, catalog) {
-        return Relation::Narrower;
+        return Some(Relation::Narrower);
     }
     if more_specific_for(required, candidate, &req.hard, catalog) {
-        return Relation::Broader;
+        return Some(Relation::Broader);
     }
-    Relation::EquivalentOrIncomparable
+    None
 }
 
 fn strictly_more_specific(
@@ -134,29 +145,25 @@ pub fn match_existing_agents(
         )));
     }
 
-    let eligible: Vec<ExistingAgentCandidate> = candidates
+    let eligible: Vec<(Relation, ExistingAgentCandidate)> = candidates
         .iter()
         .filter(|candidate| {
             placement_eligible(candidate, placement)
                 && can_execute(&candidate.agent_type, &req.hard, catalog).is_ok()
         })
-        .cloned()
-        .collect();
-
-    let relations: Vec<Relation> = eligible
-        .iter()
-        .map(|candidate| relation(&candidate.agent_type, required, req, catalog))
+        .filter_map(|candidate| {
+            relation(&candidate.agent_type, required, req, catalog)
+                .map(|relation| (relation, candidate.clone()))
+        })
         .collect();
 
     let domination: Vec<usize> = eligible
         .iter()
-        .enumerate()
-        .map(|(i, candidate)| {
+        .map(|(relation, candidate)| {
             eligible
                 .iter()
-                .enumerate()
-                .filter(|(j, other)| {
-                    relations[*j] == relations[i]
+                .filter(|(other_relation, other)| {
+                    other_relation == relation
                         && strictly_more_specific(
                             &other.agent_type,
                             &candidate.agent_type,
@@ -168,11 +175,10 @@ pub fn match_existing_agents(
         })
         .collect();
 
-    let mut indexed: Vec<(Relation, usize, ExistingAgentCandidate)> = relations
+    let mut indexed: Vec<(Relation, usize, ExistingAgentCandidate)> = eligible
         .into_iter()
         .zip(domination)
-        .zip(eligible)
-        .map(|((relation, domination), candidate)| (relation, domination, candidate))
+        .map(|((relation, candidate), domination)| (relation, domination, candidate))
         .collect();
 
     indexed.sort_by(|(a_rel, a_dom, a), (b_rel, b_dom, b)| {

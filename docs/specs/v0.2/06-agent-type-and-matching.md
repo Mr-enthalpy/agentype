@@ -280,8 +280,14 @@ Typedness is a positive durable fact: the Task carries an
 `agent_requirement_mode` (`LEGACY`/`TYPED`) fixed at admission, and any Task that
 is not `LEGACY` MUST be invisible to the legacy untyped consumer/claim path. A
 lost requirement row is therefore corruption, never a silent downgrade to a
-legacy Task. Until a typed authority-bearing acquisition path exists (M6-B.4), a
-typed Task stays durable `QUEUED` and acquires no Attempt, Lease, or Execution.
+legacy Task. Symmetrically, a LogicalAgent that carries a
+`logical_agent_type_bindings` row MUST be excluded from the legacy
+consumer/claim pool, so a legacy Task can never acquire a type-bound agent
+without passing `can_execute`; when only bound READY agents remain, the legacy
+path births a fresh unbound consumer. A binding is minted only for a `READY`,
+unassigned agent and requires a currently `PUBLISHED` revision. Until a typed
+authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
+`QUEUED` and acquires no Attempt, Lease, or Execution.
 
 A Generation carries a `policy_mode` (`NONE`/`POLICY`) fixed at creation. A
 `POLICY` Generation MUST NOT be admitted through the legacy `admit_proposal` path
@@ -293,6 +299,14 @@ the ceiling MUST fail closed, and a Task requiring less MUST keep its stricter
 value (the Generation never widens a Task). Full capability and sandbox
 ordering/intersection remains B.5.
 
+The authoritative requirement read MUST resolve its exact pin through the
+validated catalog read and cross-check its duplicated TaskSpec-owned dimensions
+(information function, affinity, workspace, folded continuity) against the
+authoritative Task and `GenerationTaskBinding`/Generation policy; a
+self-consistent copy that disagrees MUST fail closed. Admission replay MUST use
+the same command shape: a legacy retry of a typed Task, or a typed retry of a
+legacy Task, is a Conflict, not an idempotent success.
+
 Existing-agent matching composes two hard gates: the frozen M5 placement rules
 (exact partition, task tags subset of the agent's concrete tags, and the same
 workstream for `Required` continuity) **and** the AgentType contract
@@ -300,14 +314,14 @@ workstream for `Required` continuity) **and** the AgentType contract
 non-READY states are not treated as cold/revivable; an unbound agent is never
 returned. A `Preferred` continuity ranks the same workstream first. The exact pin
 is a matching anchor, not a ceiling: among eligible candidates the relation to the
-pin orders as exact, then compatible narrower/refinement types, then
-equivalent/incomparable compatible types, then compatible broader/general types;
-within a relation class, candidate-vs-candidate `more_specific_for` dominates
-before the `Preferred` workstream, continuity strength, availability, and stable
-identity tie-breaks. Ranking MUST NOT use nominal inheritance depth. Only
-exact-selector replay is idempotent; an already-committed exact pin remains
-replayable after deprecation, while a `Latest` retry after the catalog advances
-MUST fail closed. A fresh `logical_agent_type_bindings` row requires a currently
-`PUBLISHED` revision. New-agent provisioning from an eligible SpawnSource, full
-physical eligibility (`can_provision_task`), and credentials remain
-M6-B.4/M6-B.5.
+pin orders as exact, then compatible narrower/refinement types, then compatible
+broader/general types. A different revision of the same `type_id` is never a
+substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a strict
+refinement nor strictly broader is not eligible; within a relation class,
+candidate-vs-candidate `more_specific_for` dominates before the `Preferred`
+workstream, continuity strength, availability, and stable identity tie-breaks.
+Ranking MUST NOT use nominal inheritance depth. Only exact-selector replay is
+idempotent; an already-committed exact pin remains replayable after deprecation,
+while a `Latest` retry after the catalog advances MUST fail closed. New-agent
+provisioning from an eligible SpawnSource, full physical eligibility
+(`can_provision_task`), and credentials remain M6-B.4/M6-B.5.

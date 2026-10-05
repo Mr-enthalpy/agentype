@@ -481,17 +481,32 @@ Rules now enforced:
   every non-`LEGACY` Task, so losing the requirement row is corruption rather
   than a silent downgrade to a legacy Task. A typed Task stays durable `QUEUED`
   until M6-B.4 introduces the authoritative typed acquisition path.
+- **Type-bound agents are symmetrically quarantined from legacy dispatch.** A
+  LogicalAgent that carries a `logical_agent_type_bindings` row is excluded from
+  the legacy consumer/claim pool by both `ensure_task_consumers` and
+  `claim_next_available`, so a legacy Task can never acquire a type-bound agent
+  without passing `can_execute`. When the only READY agents are bound, a fresh
+  unbound legacy consumer is born. The binding therefore becomes a real contract
+  on the agent, not just a matching annotation.
+- **A type binding is minted only at a safe assignment boundary.**
+  `bind_logical_agent_type` requires a `READY`, unassigned LogicalAgent; binding
+  an `ASSIGNED` (or otherwise non-ready) agent fails closed, because it would
+  commit a contract contradicting in-flight authority.
 - **Generation policy has the same positive marker.** A Generation carries a
   `policy_mode` (`NONE`/`POLICY`) fixed at creation. A `POLICY` Generation MUST
   NOT be admitted through legacy `admit_proposal` (fail closed before any write),
   and a missing policy row for a `POLICY` marker is corruption, never an
   unconstrained Generation. A `NONE` Generation preserves M6-A legacy admission.
-- **Canonical durability.** The stored requirement document is canonical
-  (`agentype-contract/1`) with a `sha256:` digest, re-canonicalized on read, and
-  its relational pin mirror is cross-checked. Only an **exact-selector** replay is
-  guaranteed idempotent: an already-committed exact pin stays replayable even
-  after its revision is deprecated, while a `Latest` retry after the catalog
-  advanced re-resolves and fails closed as a Conflict.
+- **Canonical durability with authoritative cross-checks.** The stored
+  requirement document is canonical (`agentype-contract/1`) with a `sha256:`
+  digest, re-canonicalized on read, its relational pin mirror and its exact pin
+  resolved through the validated B.2 catalog read, and its duplicated
+  TaskSpec-owned dimensions (information function, affinity, workspace, folded
+  continuity) cross-checked against the authoritative Task and
+  `GenerationTaskBinding`/Generation policy. A self-consistent copy that
+  disagrees with those authorities fails closed. Only an **exact-selector** replay
+  is guaranteed idempotent, and replay MUST use the same command shape: a legacy
+  retry of a typed Task (or the reverse) is a Conflict.
 - **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
   ceiling fixed at `create_generation`. It is the frozen spec 10 **intersection**:
   the Generation is an authority ceiling, so a Task that requires more
@@ -524,10 +539,13 @@ Rules now enforced:
   **source envelope** (spec 06), not a per-instance mode whitelist, so matching it
   against a realized retention would add an unfrozen eligibility relation. Any
   realized-lifecycle eligibility is a B.4 provisioning concern.
-- **One ranking order, matching spec 06.** The exact pin is the matching anchor,
-  not a ceiling. Among eligible candidates the relation to the pin orders as:
-  exact, then compatible narrower/refinement types, then equivalent/incomparable
-  compatible types, then compatible broader/general types. Within a relation
+- **One ranking order, exact revisions only.** The exact pin is the matching
+  anchor, not a ceiling. Among eligible candidates the relation to the pin orders
+  as: exact, then compatible narrower/refinement types, then compatible
+  broader/general types. A different revision of the same `type_id` is never a
+  substitute (`D-TYPE-REV-COMPAT` is deferred), and a type that is neither a
+  strict refinement nor strictly broader is not eligible — equivalent and
+  genuinely incomparable types are not collapsed into an invented tier. Within a
   class, candidate-vs-candidate specificity (`more_specific_for`) is applied as
   dominance-count layers, then the `Preferred` workstream placement, continuity
   strength, availability, and a stable identity tie-break. Nominal inheritance

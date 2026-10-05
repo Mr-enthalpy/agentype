@@ -1059,6 +1059,30 @@ fn admit_proposal_core(
     // Crash-retry idempotency (P1-3): if already ADMITTED, return existing admitted TaskId.
     if prop_state == ProposalStateKind::Admitted {
         if let Some(existing_tid) = admitted_tid {
+            let existing_task = TaskId::from_string(existing_tid.clone());
+            // A replay must be the same command shape that was admitted; a
+            // legacy retry of a typed Task (or the reverse) is a Conflict, not an
+            // idempotent success.
+            let committed_mode =
+                crate::requirement::task_agent_requirement_mode(tx, &existing_task)?;
+            match (typed_draft.as_ref(), committed_mode.as_str()) {
+                (None, "LEGACY") | (Some(_), "TYPED") => {}
+                (None, "TYPED") => {
+                    return Err(Error::conflict(
+                        "legacy admission replay of an already-typed task",
+                    ))
+                }
+                (Some(_), "LEGACY") => {
+                    return Err(Error::conflict(
+                        "typed admission replay of an already-legacy task",
+                    ))
+                }
+                (_, other) => {
+                    return Err(Error::invariant(format!(
+                        "unknown agent_requirement_mode {other}"
+                    )))
+                }
+            }
             if let Some(override_spec) = override_task_spec {
                 let admitted_spec_json: Option<String> = tx
                     .query_row(
@@ -1088,7 +1112,6 @@ fn admit_proposal_core(
                     )
                     .map_err(map_sqlite)?;
                 let admitted_spec = task_spec_from_json(&json_load(&admitted_spec_str)?)?;
-                let existing_task = TaskId::from_string(existing_tid.clone());
                 let committed = crate::requirement::get_task_agent_requirement(tx, &existing_task)?
                     .ok_or_else(|| {
                         Error::conflict(

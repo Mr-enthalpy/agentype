@@ -4,6 +4,7 @@
 //! existing bound agents.
 
 use agentype_agent_contract::{
+    canonical_task_agent_requirement_bytes, task_agent_requirement_content_digest,
     AffinityConstraint, AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef,
     AgentTypeSelector, Budget, CapabilityCatalog, CapabilityDefinition, CapabilityPolarity,
     CapabilityRef, ContinuityMode, GenerationPolicy, LifecycleMode, MatcherKind, NetworkPolicy,
@@ -1072,4 +1073,153 @@ fn exact_replay_survives_deprecation() {
         .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
         .unwrap();
     assert_eq!(task, replay);
+}
+
+// =============================================================================
+// P0-1: type-bound LogicalAgents are quarantined from the legacy claim path.
+// =============================================================================
+
+#[test]
+fn type_bound_agent_is_quarantined_from_legacy_claim() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "readonly-reviewer", 1);
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    // A legacy Write task in the same partition would otherwise claim the READY
+    // agent; the binding excludes it from the legacy pool.
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy-write", json!({}))
+            .partition("general")
+            .write()])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+    assert!(kernel.claim_next_available().unwrap().is_none());
+    assert_eq!(kernel.task(&legacy).unwrap().state, TaskState::Queued);
+}
+
+#[test]
+fn binding_requires_a_ready_unassigned_agent() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+
+    // Claim a legacy task first: its agent becomes ASSIGNED.
+    let (_batch, _) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let claim = kernel
+        .claim_next_available()
+        .unwrap()
+        .expect("legacy claim");
+
+    let err = kernel
+        .bind_logical_agent_type(&claim.logical_agent_id, &pin)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidAuthority(_)));
+}
+
+#[test]
+fn legacy_queue_gets_an_unbound_consumer_when_only_bound_agents_exist() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let bound = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&bound, &pin).unwrap();
+
+    let (_batch, _) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    // The only READY agent is type-bound, so a fresh unbound consumer is born.
+    kernel.ensure_task_consumers().unwrap();
+    let claim = kernel
+        .claim_next_available()
+        .unwrap()
+        .expect("legacy claim");
+    assert_ne!(claim.logical_agent_id, bound);
+}
+
+// =============================================================================
+// P1-2: the requirement copy must cross-check its Task/Generation authorities.
+// =============================================================================
+
+#[test]
+fn requirement_read_fails_closed_on_self_consistent_mirror_corruption() {
+    let path = file_path("b3-requirement-mirror");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+
+    // Rewrite the requirement copy to a Write workspace while the Task stays
+    // ReadOnly, and recompute the digest so the row is self-consistent. The
+    // authoritative read must still detect the disagreement with the Task.
+    let mut corrupted = kernel.get_task_agent_requirement(&task).unwrap().unwrap();
+    corrupted.hard.required_workspace = WorkspaceMode::Write;
+    let json = String::from_utf8(canonical_task_agent_requirement_bytes(&corrupted)).unwrap();
+    let digest = task_agent_requirement_content_digest(&corrupted);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER task_agent_requirements_immutable_update", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_agent_requirements SET requirement_json=?1, requirement_digest=?2 WHERE task_id=?3",
+            rusqlite::params![json, digest, task.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_task_agent_requirement(&task),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+// =============================================================================
+// P2-1: admission replay is symmetric across command shapes.
+// =============================================================================
+
+#[test]
+fn replay_rejects_a_different_admission_command_shape() {
+    // Typed first, legacy replay -> Conflict.
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let typed_proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    kernel
+        .admit_typed_proposal(&typed_proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+    let err = kernel
+        .admit_proposal(&typed_proposal.proposal_id, 0, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)));
+
+    // Legacy first, typed replay -> Conflict.
+    let legacy_proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("legacy-audit", json!({})).partition("general"),
+    );
+    kernel
+        .admit_proposal(&legacy_proposal.proposal_id, 0, None)
+        .unwrap();
+    let pin2 = publish_agent_type(&kernel, "reviewer", 2);
+    let err = kernel
+        .admit_typed_proposal(&legacy_proposal.proposal_id, 0, None, draft(pin2))
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)));
 }

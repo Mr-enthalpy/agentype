@@ -429,6 +429,60 @@ fn matching_enforces_m5_placement_and_prefers_workstream() {
 }
 
 #[test]
+fn matching_rejects_cross_revision_same_type() {
+    let catalog = catalog();
+    let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
+
+    // Same type_id, different revision: no automatic cross-revision
+    // compatibility (D-TYPE-REV-COMPAT is deferred), even with an identical or a
+    // narrower contract.
+    let identical_rev2 = candidate(
+        "agent-r2",
+        agent("reviewer", 2, AffinityConstraint::Any, 100.0),
+    );
+    let narrower_rev2 = candidate(
+        "agent-r2-narrow",
+        agent(
+            "reviewer",
+            2,
+            AffinityConstraint::Only(set(&["rust"])),
+            50.0,
+        ),
+    );
+    let matched = match_existing_agents(
+        &required,
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[identical_rev2, narrower_rev2],
+        &catalog,
+    )
+    .unwrap();
+    assert!(matched.is_empty());
+}
+
+#[test]
+fn matching_rejects_incomparable_types() {
+    let catalog = catalog();
+    let required = agent("reviewer", 1, AffinityConstraint::Any, 100.0);
+
+    // Narrower affinity but a higher ceiling: neither a refinement nor strictly
+    // broader, so not a defined substitute in v1.
+    let incomparable = candidate(
+        "agent-odd",
+        agent("odd", 1, AffinityConstraint::Only(set(&["rust"])), 300.0),
+    );
+    let matched = match_existing_agents(
+        &required,
+        &pinned(&required),
+        &placement(ContinuityPreference::None),
+        &[incomparable],
+        &catalog,
+    )
+    .unwrap();
+    assert!(matched.is_empty());
+}
+
+#[test]
 fn matching_does_not_conflate_agent_type_lifecycle_with_realized_mode() {
     let catalog = catalog();
     // The AgentType `lifecycle` set is a required source envelope (spec 06), not
