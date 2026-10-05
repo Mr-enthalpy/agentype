@@ -86,13 +86,6 @@ pub fn insert_task_agent_requirement(
         ],
     )
     .map_err(map_sqlite)?;
-    // The durable parent marker makes "typed" a positive fact, so a lost
-    // requirement row is corruption rather than a silent legacy Task.
-    tx.execute(
-        "UPDATE tasks SET agent_requirement_mode='TYPED', updated_at=?1 WHERE id=?2",
-        params![now, task_id.as_str()],
-    )
-    .map_err(map_sqlite)?;
     Ok(digest)
 }
 
@@ -378,12 +371,10 @@ fn derive_task_agent_requirement(
 
     let catalog = load_capability_catalog(tx)?;
     requirement.normalize(&catalog).map_err(contract_fault)?;
-    // A policy-bearing Generation MUST have its policy row; a missing row is
-    // corruption, never an unconstrained Generation.
-    if generation_policy_mode(tx, generation_id)? == "POLICY" {
-        let policy = get_generation_policy(tx, generation_id)?.ok_or_else(|| {
-            Error::invariant("a policy-bearing generation is missing its policy row")
-        })?;
+    // The authoritative policy read is the single presence authority: a `NONE`
+    // generation with an unexpected row, or a `POLICY` generation with a missing
+    // row, fails closed rather than being treated as unconstrained.
+    if let Some(policy) = get_generation_policy(tx, generation_id)? {
         requirement.hard =
             fold_generation_policy(&policy, &requirement.hard).map_err(contract_fault)?;
     }
@@ -414,7 +405,7 @@ fn validate_pinned_type_can_execute(
 
 /// The durable generation policy presence marker. A missing row for a
 /// `POLICY` marker is corruption, never an unconstrained Generation.
-pub fn generation_policy_mode(
+fn generation_policy_mode(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
 ) -> Result<String, Error> {

@@ -596,11 +596,12 @@ fn lost_generation_policy_still_blocks_legacy_admission() {
     let proposal = kernel
         .compile_root_intent(&gen.generation_id, intent, "session", 1)
         .unwrap();
-    // The `POLICY` marker forbids legacy admission even without the row.
+    // A `POLICY` marker with a missing row is corruption: legacy admission fails
+    // closed rather than proceeding as if the Generation were unconstrained.
     let err = kernel
         .admit_proposal(&proposal.proposal_id, 0, None)
         .unwrap_err();
-    assert!(matches!(err, Error::InvalidAuthority(_)));
+    assert!(matches!(err, Error::InvariantViolation(_)));
 }
 
 #[test]
@@ -643,7 +644,7 @@ fn requirement_marker_and_row_are_one_invariant() {
     // LEGACY + present -> InvariantViolation.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("DROP TRIGGER tasks_agent_requirement_mode_no_downgrade", [])
+        conn.execute("DROP TRIGGER tasks_agent_requirement_mode_immutable", [])
             .unwrap();
         conn.execute(
             "UPDATE tasks SET agent_requirement_mode='LEGACY' WHERE id=?1",
@@ -1222,4 +1223,116 @@ fn replay_rejects_a_different_admission_command_shape() {
         .admit_typed_proposal(&legacy_proposal.proposal_id, 0, None, draft(pin2))
         .unwrap_err();
     assert!(matches!(err, Error::Conflict(_)));
+}
+
+#[test]
+fn none_marker_with_policy_row_fails_admission_closed() {
+    let path = file_path("b3-none-policy-row");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let gen = kernel
+        .create_generation_with_policy(json!({}), Some(sample_policy()))
+        .unwrap();
+    // Corrupt the marker to NONE while the policy row remains.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER generations_policy_mode_immutable", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE generations SET policy_mode='NONE' WHERE generation_id=?1",
+            [gen.generation_id.as_str()],
+        )
+        .unwrap();
+    }
+
+    let intent = RawWorkIntent {
+        raw_intent_key: "legacy".into(),
+        objective: "legacy".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("audit", json!({})).partition("general")),
+    };
+    let legacy = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    let err = kernel
+        .admit_proposal(&legacy.proposal_id, 0, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let intent = RawWorkIntent {
+        raw_intent_key: "typed".into(),
+        objective: "typed".into(),
+        information_function: InformationFunction::Expand,
+        semantic_input_set: SemanticInputSet::new(),
+        rationale: None,
+        suggested_task_spec: Some(TaskSpec::new("typed-audit", json!({})).partition("general")),
+    };
+    let typed = kernel
+        .compile_root_intent(&gen.generation_id, intent, "session", 1)
+        .unwrap();
+    let err = kernel
+        .admit_typed_proposal(&typed.proposal_id, 0, None, draft(pin))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvariantViolation(_)));
+
+    assert!(kernel
+        .get_generation_view(&gen.generation_id)
+        .unwrap()
+        .admitted_task_ids
+        .is_empty());
+}
+
+#[test]
+fn a_legacy_task_cannot_be_retrofitted_to_typed() {
+    let path = file_path("b3-no-retrofit");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+
+    // A child requirement row cannot be inserted under a legacy parent, and the
+    // parent marker cannot be flipped to TYPED: typedness is fixed at admission.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO task_agent_requirements(
+                 task_id, required_type_id, required_type_revision,
+                 requirement_json, requirement_digest, created_at)
+             VALUES(?1,?2,?3,'{}','sha256:00',0)",
+            rusqlite::params![legacy.as_str(), pin.id().as_str(), pin.revision() as i64],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE tasks SET agent_requirement_mode='TYPED' WHERE id=?1",
+            [legacy.as_str()],
+        )
+        .is_err());
 }

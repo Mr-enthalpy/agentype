@@ -1179,13 +1179,15 @@ fn admit_proposal_core(
 
     // A policy-bearing Generation MUST NOT be admitted through the legacy
     // untyped path: the policy is a generation-wide hard requirement ceiling, so
-    // legacy admission would bypass it. Typed admission is required. This check
-    // runs before any durable write, so a rejected legacy admission leaves the
-    // proposal PENDING and creates no Task, Batch, binding, or requirement.
+    // legacy admission would bypass it. Typed admission is required. The
+    // authoritative policy read is used so a `NONE` marker with an unexpected row
+    // (or a `POLICY` marker with a missing row) fails closed as corruption rather
+    // than being treated as an unconstrained Generation. This check runs before
+    // any durable write, so a rejected legacy admission leaves the proposal
+    // PENDING and creates no Task, Batch, binding, or requirement.
     if typed_draft.is_none() {
         let generation_id = GenerationId::from_string(gid.clone());
-        let policy_mode = crate::requirement::generation_policy_mode(tx, &generation_id)?;
-        if policy_mode != "NONE" {
+        if crate::requirement::get_generation_policy(tx, &generation_id)?.is_some() {
             return Err(Error::invalid_authority(
                 "a generation with a policy requires typed admission; legacy admit_proposal is forbidden",
             ));
@@ -1244,7 +1246,13 @@ fn admit_proposal_core(
     )
     .map_err(map_sqlite)?;
 
-    // 6. Create M5 Task
+    // 6. Create M5 Task. Typedness is fixed at creation: the marker is written
+    // with the Task, never retrofitted by a later UPDATE.
+    let agent_requirement_mode = if typed_draft.is_some() {
+        "TYPED"
+    } else {
+        "LEGACY"
+    };
     let retry_json = Value::Array(
         task_spec
             .retry_policy
@@ -1258,10 +1266,11 @@ fn admit_proposal_core(
         "INSERT INTO tasks(
             id, batch_id, name, payload_json, acceptance_json, partition_name,
             workstream_id, continuity, affinity_tags_json, workspace_mode, required, priority, state,
+            agent_requirement_mode,
             max_attempts, retry_classes_json, base_backoff_seconds, max_backoff_seconds,
             supersedes_task_id, created_at, updated_at
          )
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 'QUEUED', ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 'QUEUED', ?18, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
         params![
             task_id.as_str(),
             batch_id.as_str(),
@@ -1281,7 +1290,8 @@ fn admit_proposal_core(
             task_spec.retry_policy.base_backoff_seconds,
             task_spec.retry_policy.max_backoff_seconds,
             task_spec.supersedes_task_id.as_ref().map(|s| s.as_str().to_string()),
-            now
+            now,
+            agent_requirement_mode
         ],
     )
     .map_err(map_sqlite)?;

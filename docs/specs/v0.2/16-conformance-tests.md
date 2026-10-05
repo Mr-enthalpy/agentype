@@ -120,9 +120,11 @@ M6-B.3 typed admission and matching MUST cover:
   positive durable fact
 - a `TYPED` Task is invisible to `ensure_task_consumers` and
   `claim_next_available`: it births no legacy consumer, acquires no
-  Attempt/Lease/Execution, and stays `QUEUED`; losing the requirement row for a
-  `TYPED` marker MUST NOT downgrade it to a legacy Task, and losing a `POLICY`
-  row MUST NOT make the Generation unconstrained
+  Attempt/Lease/Execution, and stays `QUEUED`; a legacy Task cannot be retrofitted
+  to `TYPED` (marker immutable, child insert requires a `TYPED` parent), losing
+  the requirement row for a `TYPED` marker MUST NOT downgrade it, and a
+  `NONE`/`POLICY` marker/row mismatch MUST fail both legacy and typed admission
+  closed together
 - a type-bound LogicalAgent is excluded from the legacy consumer/claim pool, so a
   legacy Task cannot acquire it without `can_execute`; when only bound agents
   remain the legacy path births a fresh unbound consumer, and a binding requires

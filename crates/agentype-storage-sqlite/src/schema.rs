@@ -718,6 +718,15 @@ BEGIN
     SELECT RAISE(ABORT, 'a generation policy is immutable');
 END;
 
+-- A policy row may only exist under a `POLICY` generation, so `NONE + row`
+-- cannot be manufactured by direct SQL.
+CREATE TRIGGER IF NOT EXISTS generation_policies_require_policy_mode
+BEFORE INSERT ON generation_policies
+WHEN (SELECT policy_mode FROM generations WHERE generation_id=NEW.generation_id) IS NOT 'POLICY'
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy row requires a POLICY generation');
+END;
+
 CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_update
 BEFORE UPDATE ON task_agent_requirements
 BEGIN
@@ -744,13 +753,20 @@ END;
 
 -- Parent-side presence markers make "typed" and "policy-bearing" positive
 -- durable facts, so losing the child row is corruption rather than a silent
--- downgrade to legacy/unconstrained. A typed Task cannot be downgraded, and a
--- Generation's policy mode is fixed at creation.
-CREATE TRIGGER IF NOT EXISTS tasks_agent_requirement_mode_no_downgrade
+-- downgrade to legacy/unconstrained. A Task's typedness is fixed at creation
+-- (never retrofitted), and a Generation's policy mode is fixed at creation.
+CREATE TRIGGER IF NOT EXISTS tasks_agent_requirement_mode_immutable
 BEFORE UPDATE OF agent_requirement_mode ON tasks
-WHEN OLD.agent_requirement_mode = 'TYPED' AND NEW.agent_requirement_mode = 'LEGACY'
+WHEN OLD.agent_requirement_mode IS NOT NEW.agent_requirement_mode
 BEGIN
-    SELECT RAISE(ABORT, 'a typed task cannot be downgraded to the legacy path');
+    SELECT RAISE(ABORT, 'task typedness is fixed at admission');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_require_typed_parent
+BEFORE INSERT ON task_agent_requirements
+WHEN (SELECT agent_requirement_mode FROM tasks WHERE id=NEW.task_id) IS NOT 'TYPED'
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement requires a TYPED task');
 END;
 
 CREATE TRIGGER IF NOT EXISTS generations_policy_mode_immutable

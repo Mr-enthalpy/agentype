@@ -43,19 +43,26 @@ catalog:
   with one, is corruption that MUST fail closed. The read MUST also resolve the
   pin through the catalog's validated read and cross-check the duplicated
   TaskSpec-owned dimensions (information function, affinity, workspace, folded
-  continuity) against the authoritative Task and `GenerationTaskBinding`.
+  continuity) against the authoritative Task and `GenerationTaskBinding`. A
+  requirement row may only be inserted under a parent Task whose
+  `agent_requirement_mode` is already `TYPED`, so a legacy Task cannot be
+  retrofitted.
 - `logical_agent_type_bindings` is immutable and write-once: one exact
   `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
-  change is a new binding, never an in-place type mutation.
+  change is a new binding, never an in-place type mutation. A binding may only be
+  minted for a `READY`, unassigned LogicalAgent.
 - `generation_policies` is immutable: a generation-wide authority ceiling is
   fixed at generation creation and applied as the spec 10 intersection on each
-  typed admission (a Task exceeding it fails closed).
+  typed admission (a Task exceeding it fails closed). A policy row may only be
+  inserted under a `POLICY` generation, and admission reads policy presence only
+  through the authoritative `get_generation_policy`.
 - `tasks.agent_requirement_mode` (`LEGACY`/`TYPED`) and
   `generations.policy_mode` (`NONE`/`POLICY`) are positive parent-side presence
-  markers fixed at creation/admission. A missing child row for a positive marker
-  is corruption, never a silent downgrade to legacy or an unconstrained
-  Generation; SQLite triggers forbid downgrading a typed Task and mutating a
-  generation's policy mode.
+  markers fixed at creation/admission and immutable thereafter. A missing child
+  row for a positive marker, or an unexpected child row for a negative marker, is
+  corruption, never a silent downgrade to legacy or an unconstrained Generation;
+  SQLite triggers forbid mutating a Task's typedness and a generation's policy
+  mode.
 - all three tables MUST reject `UPDATE`/`DELETE` mechanically (SQLite triggers),
   so direct SQL cannot rewrite a requirement, rebind an agent, or mutate a
   policy.

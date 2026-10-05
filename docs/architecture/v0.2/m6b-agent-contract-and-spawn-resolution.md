@@ -477,10 +477,13 @@ Rules now enforced:
   pre-commit selection concern, not a Task agent requirement.
 - **Typed Tasks are quarantined from legacy dispatch by a positive marker.** An
   admitted Task carries a durable `agent_requirement_mode` (`LEGACY`/`TYPED`)
-  fixed by admission. `ensure_task_consumers` and `claim_next_available` ignore
+  written with the Task at creation and fixed for its lifetime (never retrofitted,
+  SQLite-enforced). `ensure_task_consumers` and `claim_next_available` ignore
   every non-`LEGACY` Task, so losing the requirement row is corruption rather
-  than a silent downgrade to a legacy Task. A typed Task stays durable `QUEUED`
-  until M6-B.4 introduces the authoritative typed acquisition path.
+  than a silent downgrade to a legacy Task, and a legacy Task cannot be
+  retroactively given a requirement row (the child insert requires a `TYPED`
+  parent). A typed Task stays durable `QUEUED` until M6-B.4 introduces the
+  authoritative typed acquisition path.
 - **Type-bound agents are symmetrically quarantined from legacy dispatch.** A
   LogicalAgent that carries a `logical_agent_type_bindings` row is excluded from
   the legacy consumer/claim pool by both `ensure_task_consumers` and
@@ -493,10 +496,14 @@ Rules now enforced:
   an `ASSIGNED` (or otherwise non-ready) agent fails closed, because it would
   commit a contract contradicting in-flight authority.
 - **Generation policy has the same positive marker.** A Generation carries a
-  `policy_mode` (`NONE`/`POLICY`) fixed at creation. A `POLICY` Generation MUST
-  NOT be admitted through legacy `admit_proposal` (fail closed before any write),
-  and a missing policy row for a `POLICY` marker is corruption, never an
-  unconstrained Generation. A `NONE` Generation preserves M6-A legacy admission.
+  `policy_mode` (`NONE`/`POLICY`) fixed at creation. Both legacy and typed
+  admission read the policy through the authoritative `get_generation_policy`, so
+  a `NONE` marker with an unexpected row (or a `POLICY` marker with a missing
+  row) fails closed as corruption rather than being treated as an unconstrained
+  Generation. A `POLICY` Generation MUST NOT be admitted through legacy
+  `admit_proposal` (fail closed before any write), and the schema prevents a
+  policy row from existing under a `NONE` generation. A `NONE` Generation
+  preserves M6-A legacy admission.
 - **Canonical durability with authoritative cross-checks.** The stored
   requirement document is canonical (`agentype-contract/1`) with a `sha256:`
   digest, re-canonicalized on read, its relational pin mirror and its exact pin
