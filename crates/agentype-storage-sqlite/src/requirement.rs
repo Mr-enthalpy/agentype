@@ -158,6 +158,17 @@ pub fn get_task_agent_requirement(
             "task agent requirement required_type mirror does not match its canonical document",
         ));
     }
+    // The exact pin MUST resolve through the B.2 validated catalog read, not
+    // merely its FK row: a corrupt revision (missing overlay, non-canonical
+    // content) must fail this authoritative read closed. Deprecation is NOT
+    // corruption, so a `DEPRECATED` revision remains a valid committed pin.
+    get_agent_type(tx, reference)?.ok_or_else(|| {
+        Error::invariant(format!(
+            "task agent requirement pins a missing agent type {}@{}",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
     let catalog = load_capability_catalog(tx)?;
     canonicalize_task_agent_requirement(&mut requirement, &catalog).map_err(contract_fault)?;
     let reencoded = canonical_utf8(

@@ -657,6 +657,108 @@ fn requirement_marker_and_row_are_one_invariant() {
 }
 
 #[test]
+fn requirement_read_fails_closed_on_missing_catalog_overlay() {
+    let path = file_path("b3-requirement-corrupt-overlay");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+
+    // Simulate catalog corruption: remove the disposition overlay for the pin.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER agent_type_dispositions_no_delete", [])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM agent_type_dispositions WHERE type_id='reviewer' AND revision=1",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_task_agent_requirement(&task),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn requirement_read_fails_closed_on_corrupt_catalog_content() {
+    let path = file_path("b3-requirement-corrupt-content");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    kernel.reconcile_pool().unwrap();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin))
+        .unwrap();
+
+    // Simulate catalog corruption: break the immutable canonical content.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TRIGGER agent_types_immutable_update", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE agent_types SET content_json='{}' WHERE type_id='reviewer' AND revision=1",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        kernel.get_task_agent_requirement(&task),
+        Err(Error::InvariantViolation(_))
+    ));
+}
+
+#[test]
+fn requirement_read_accepts_a_deprecated_pin() {
+    let kernel = partitioned_kernel();
+    let pin = publish_agent_type(&kernel, "reviewer", 1);
+    let proposal = compile_proposal(
+        &kernel,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    );
+    let task = kernel
+        .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin.clone()))
+        .unwrap();
+
+    kernel
+        .set_agent_type_status(&pin, AgentTypeStatus::Deprecated)
+        .unwrap();
+    // Deprecation is disposition drift, not corruption: the committed pin stays
+    // readable through the B.2 validated catalog read.
+    assert!(kernel.get_task_agent_requirement(&task).unwrap().is_some());
+}
+
+#[test]
 fn policy_marker_and_row_are_one_invariant() {
     let path = file_path("b3-policy-coherence");
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
