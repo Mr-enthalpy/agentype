@@ -689,6 +689,39 @@ impl Kernel {
         })
     }
 
+    /// M6-B.3 typed admission: atomically create the Task, its
+    /// GenerationTaskBinding, and its exact-revision agent requirement. No
+    /// SpawnSource is selected and no external I/O occurs.
+    pub fn admit_typed_proposal(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<agentype_core::TaskSpec>,
+        agent_requirement: agentype_agent_contract::AgentRequirementDraft,
+    ) -> Result<agentype_core::TaskId, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::admit_typed_proposal(
+                tx,
+                now,
+                proposal_id,
+                expected_generation_revision,
+                override_task_spec,
+                agent_requirement,
+            )
+        })
+    }
+
+    /// Create a Generation with an immutable policy ceiling (M6-B.3 D-GEN-POLICY).
+    pub fn create_generation_with_policy(
+        &self,
+        seed_payload: serde_json::Value,
+        policy: Option<agentype_agent_contract::GenerationPolicy>,
+    ) -> Result<agentype_core::GenerationRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::create_generation_with_policy(tx, now, seed_payload, policy)
+        })
+    }
+
     pub fn freeze_generation(
         &self,
         generation_id: &agentype_core::GenerationId,
@@ -865,6 +898,50 @@ impl Kernel {
         self.tx(|tx, now| {
             crate::catalog::set_adapter_binding_policy_status(tx, now, reference, status)
         })
+    }
+
+    // =========================================================================
+    // M6-B.3 typed agent requirements, bindings, and generation policy
+    // =========================================================================
+
+    /// Bind an existing LogicalAgent to an exact AgentType revision. Write-once,
+    /// no physical provisioning. This is operator/provisioning authority, not
+    /// semantic admission authority.
+    pub fn bind_logical_agent_type(
+        &self,
+        agent_id: &agentype_core::LogicalAgentId,
+        type_ref: &AgentTypeRef,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::requirement::bind_logical_agent_type(tx, now, agent_id, type_ref))
+    }
+
+    pub fn get_task_agent_requirement(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Option<agentype_agent_contract::TaskAgentRequirement>, Error> {
+        self.tx(|tx, _| crate::requirement::get_task_agent_requirement(tx, task_id))
+    }
+
+    pub fn get_logical_agent_type_binding(
+        &self,
+        agent_id: &agentype_core::LogicalAgentId,
+    ) -> Result<Option<AgentTypeRef>, Error> {
+        self.tx(|tx, _| crate::requirement::get_logical_agent_type_binding(tx, agent_id))
+    }
+
+    pub fn get_generation_policy(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+    ) -> Result<Option<agentype_agent_contract::GenerationPolicy>, Error> {
+        self.tx(|tx, _| crate::requirement::get_generation_policy(tx, generation_id))
+    }
+
+    /// Rank existing, bound LogicalAgents for a Task's requirement (pure read).
+    pub fn match_existing_agents_for_task(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Vec<agentype_agent_contract::ExistingAgentCandidate>, Error> {
+        self.tx(|tx, _| crate::requirement::match_existing_agents_for_task(tx, task_id))
     }
 
     // ------------------------------------------------------------------ topology
@@ -1511,7 +1588,10 @@ impl Kernel {
             let mut stmt = tx
                 .prepare(
                     "SELECT t.id,t.partition_name,t.workstream_id,t.continuity,t.affinity_tags_json,
-                            p.tags_json
+                            p.tags_json,
+                            (t.agent_requirement_mode <> 'LEGACY' OR EXISTS (
+                                SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+                            )) AS typed
                      FROM tasks t
                      JOIN batches b ON b.id=t.batch_id
                      JOIN pool_partitions p ON p.name=t.partition_name
@@ -1528,18 +1608,39 @@ impl Kernel {
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)? != 0,
                     ))
                 })
                 .map_err(map_sqlite)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_sqlite)?;
             drop(stmt);
-            for (_id, partition, workstream, continuity, tags_json, partition_tags_json) in tasks {
+            for (id, partition, workstream, continuity, tags_json, partition_tags_json, typed) in tasks
+            {
+                // Core decides legacy claimability: a typed Task is never eligible,
+                // so no legacy consumer is birthed for it.
+                let task_snapshot = ClaimTaskSnapshot {
+                    id: id.clone(),
+                    state: TaskState::Queued,
+                    batch_state: BatchState::Active,
+                    partition_active: true,
+                    next_eligible_at: None,
+                    priority: 0,
+                    created_at: 0.0,
+                    typed,
+                };
+                if !claim_task_eligible(&task_snapshot, now) {
+                    continue;
+                }
                 let required = parse_str_list(&tags_json)?;
                 let continuity = ContinuityPreference::parse_sql(&continuity)?;
                 let mut agent_stmt = tx
                     .prepare(
-                        "SELECT id,state,workstream_id,tags_json,current_task_id,available_since,created_at
+                        "SELECT id,state,workstream_id,tags_json,current_task_id,available_since,created_at,
+                                (logical_agents.agent_type_binding_mode <> 'UNBOUND' OR EXISTS (
+                                    SELECT 1 FROM logical_agent_type_bindings b
+                                    WHERE b.logical_agent_id=logical_agents.id
+                                )) AS type_bound
                          FROM logical_agents WHERE partition_name=?1 AND state='READY'",
                     )
                     .map_err(map_sqlite)?;
@@ -1552,6 +1653,7 @@ impl Kernel {
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, Option<f64>>(5)?,
                             r.get::<_, f64>(6)?,
+                            r.get::<_, i64>(7)? != 0,
                         ))
                     })
                     .map_err(map_sqlite)?
@@ -1559,8 +1661,15 @@ impl Kernel {
                     .map_err(map_sqlite)?;
                 drop(agent_stmt);
                 let mut agents = Vec::with_capacity(raw_agents.len());
-                for (id, workstream_id, tags_json, current_task, available_since, created_at) in
-                    raw_agents
+                for (
+                    id,
+                    workstream_id,
+                    tags_json,
+                    current_task,
+                    available_since,
+                    created_at,
+                    type_bound,
+                ) in raw_agents
                 {
                     agents.push(ClaimAgentSnapshot {
                         id,
@@ -1571,6 +1680,7 @@ impl Kernel {
                         tags: parse_str_list(&tags_json)?,
                         available_since,
                         created_at,
+                        type_bound,
                     });
                 }
                 let intent = ClaimIntent {
@@ -1600,13 +1710,16 @@ impl Kernel {
             // Coarse pre-filter only (performance); semantic eligibility and
             // ordering are re-decided by core::decisions below so that query
             // text alone can never change scheduler behavior (spec 15).
-            let tasks: Vec<(TaskRow, i64, f64, bool, String)> = {
+            let tasks: Vec<(TaskRow, i64, f64, bool, String, bool)> = {
                 let mut stmt = tx
                     .prepare(
                         "SELECT t.id,t.batch_id,t.name,t.payload_json,t.acceptance_json,t.partition_name,t.workstream_id,
                                 t.continuity,t.affinity_tags_json,t.workspace_mode,t.state,t.max_attempts,t.retry_classes_json,
                                 t.base_backoff_seconds,t.max_backoff_seconds,t.next_eligible_at,t.current_attempt_id,t.fencing_epoch,
-                                t.priority,t.created_at,p.active,b.state
+                                t.priority,t.created_at,p.active,b.state,
+                                (t.agent_requirement_mode <> 'LEGACY' OR EXISTS (
+                                    SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+                                )) AS typed
                          FROM tasks t JOIN batches b ON b.id=t.batch_id
                          JOIN pool_partitions p ON p.name=t.partition_name
                          WHERE t.state='QUEUED'",
@@ -1620,6 +1733,7 @@ impl Kernel {
                             r.get::<_, f64>(19)?,
                             r.get::<_, i64>(20)? != 0,
                             r.get::<_, String>(21)?,
+                            r.get::<_, i64>(22)? != 0,
                         ))
                     })
                     .map_err(map_sqlite)?;
@@ -1631,7 +1745,7 @@ impl Kernel {
             };
             // Core decides which queued tasks are claimable and in what order.
             let mut snapshots: Vec<ClaimTaskSnapshot> = Vec::with_capacity(tasks.len());
-            for (t, priority, created_at, active, batch_state) in &tasks {
+            for (t, priority, created_at, active, batch_state, typed) in &tasks {
                 snapshots.push(ClaimTaskSnapshot {
                     id: t.id.clone(),
                     state: TaskState::parse_sql(&t.state)?,
@@ -1640,22 +1754,28 @@ impl Kernel {
                     next_eligible_at: t.next_eligible_at,
                     priority: *priority,
                     created_at: *created_at,
+                    typed: *typed,
                 });
             }
             for task_id in order_claim_tasks(&snapshots, now) {
-                let (task, _, _, _, _) =
-                    match tasks.iter().find(|(t, _, _, _, _)| t.id == task_id) {
+                let (task, _, _, _, _, _) =
+                    match tasks.iter().find(|(t, _, _, _, _, _)| t.id == task_id) {
                         Some(found) => found,
                         None => continue,
                     };
                 // Coarse pre-filter (partition + cheap readiness predicate);
-                // selection semantics live in core::select_claim_agent.
-                let agents: Vec<(AgentRow, Option<f64>, f64)> = {
+                // selection semantics live in core::select_claim_agent, which
+                // rejects a type-bound agent.
+                let agents: Vec<(AgentRow, Option<f64>, f64, bool)> = {
                     let mut stmt = tx
                         .prepare(
                             "SELECT id,partition_name,retention,state,workstream_id,tags_json,current_task_id,
                                     pending_partition_name,retirement_requested,continuity_json,continuity_version,
-                                    available_since,created_at
+                                    available_since,created_at,
+                                    (logical_agents.agent_type_binding_mode <> 'UNBOUND' OR EXISTS (
+                                        SELECT 1 FROM logical_agent_type_bindings b
+                                        WHERE b.logical_agent_id=logical_agents.id
+                                    )) AS type_bound
                              FROM logical_agents WHERE partition_name=?1 AND state='READY'
                              AND current_task_id IS NULL",
                         )
@@ -1665,7 +1785,8 @@ impl Kernel {
                             let agent = AgentRow::from_query(r)?;
                             let available_since = r.get::<_, Option<f64>>(11)?;
                             let created_at = r.get::<_, f64>(12)?;
-                            Ok((agent, available_since, created_at))
+                            let type_bound = r.get::<_, i64>(13)? != 0;
+                            Ok((agent, available_since, created_at, type_bound))
                         })
                         .map_err(map_sqlite)?;
                     let mut out = Vec::new();
@@ -1683,7 +1804,7 @@ impl Kernel {
                     continuity,
                 };
                 let mut agent_snaps: Vec<ClaimAgentSnapshot> = Vec::with_capacity(agents.len());
-                for (a, available_since, created_at) in &agents {
+                for (a, available_since, created_at, type_bound) in &agents {
                     agent_snaps.push(ClaimAgentSnapshot {
                         id: a.id.clone(),
                         state: LogicalAgentState::parse_sql(&a.state)?,
@@ -1693,11 +1814,12 @@ impl Kernel {
                         tags: parse_str_list(&a.tags_json)?,
                         available_since: *available_since,
                         created_at: *created_at,
+                        type_bound: *type_bound,
                     });
                 }
                 if let Some(picked) = select_claim_agent(&agent_snaps, &intent) {
-                    let (agent, _, _) =
-                        agents.iter().find(|(a, _, _)| a.id == picked.id).expect("picked from loaded set");
+                    let (agent, _, _, _) =
+                        agents.iter().find(|(a, _, _, _)| a.id == picked.id).expect("picked from loaded set");
                     let partition = required_partition(tx, &task.partition, true)?;
                     return Ok(Some(claim_selected(
                         tx,

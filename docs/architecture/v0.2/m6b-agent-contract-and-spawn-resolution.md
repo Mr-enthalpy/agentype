@@ -11,8 +11,9 @@ admission remains frozen from M6-A
 ([m6a-result-carried-intent-binding](../../reports/v0.2/m6a-result-carried-intent-binding.md)).
 
 This note grows across the M6-B stages. It currently records **M6-B.1**, the
-pure AgentType ontology and the four matching predicates, and **M6-B.2**, the
-durable Agent Contract catalog (schema v6).
+pure AgentType ontology and the four matching predicates, **M6-B.2**, the
+durable Agent Contract catalog (schema v6), and **M6-B.3**, typed Task agent
+requirements and existing-agent matching (schema v7).
 
 ---
 
@@ -440,7 +441,157 @@ The storage layer performs no external I/O, mints no enforcement evidence, and
 does not select a SpawnSource. Ranking, `TaskAgentRequirement`, and
 `LogicalAgent` matching remain M6-B.3.
 
-## 7. Inherited invariants relevant here
+## 7. Typed admission and existing-agent matching (M6-B.3)
+
+M6-B.3 is the pure semantic-to-candidate resolution layer. It never provisions a
+physical agent (that is M6-B.4): it attaches a durable requirement to an admitted
+Task and ranks the **already-bound** LogicalAgents that may execute it. Until
+M6-B.4 can prove complete physical eligibility, a typed Task acquires no M5
+authority: it is durable `QUEUED` metadata that the legacy untyped dispatch path
+must ignore.
+
+```text
+TaskAgentRequirement        exact AgentType pin + hard TaskRequirement
+AgentRequirementDraft       pre-commit selector + capability/security extras;
+                            TaskSpec-owned dimensions are not duplicated
+GenerationPolicy            immutable, generation-wide authority ceiling
+fold_generation_policy      spec 10 intersection: a Task exceeding the ceiling
+                            fails closed; a stricter Task keeps its value
+match_existing_agents       pure M5-placement + type-contract filter, then
+                            spec-06 semantic-order ranking over already-bound,
+                            immediately usable LogicalAgents
+```
+
+Rules now enforced:
+
+- **Atomic typed admission.** `admit_typed_proposal` creates the M5 Task, the
+  `GenerationTaskBinding`, and the immutable `TaskAgentRequirement` in one SQLite
+  transaction. A failure leaves none of the three. It resolves the exact
+  AgentType pin through the validated catalog read, folds the Generation policy,
+  and performs no source selection, credential resolution, or adapter call. The
+  legacy `admit_proposal` path continues with no requirement.
+- **A committed requirement MUST pin an exact revision.** `required_type` is a
+  mandatory exact immutable `AgentTypeRef` (spec 06 `D-TYPE-REV-PIN`); a loose
+  selector is resolved before commitment. There is no durable unpinned typed
+  requirement. Constraints without a committed semantic type are a separate
+  pre-commit selection concern, not a Task agent requirement.
+- **Typed Tasks are quarantined from legacy dispatch by a Core decision.** An
+  admitted Task carries a durable `agent_requirement_mode` (`LEGACY`/`TYPED`)
+  written with the Task at creation and fixed for its lifetime (never retrofitted:
+  SQLite rejects a modifying `UPDATE` and a same-identity `INSERT`/`INSERT OR
+  REPLACE` on `tasks`). The legacy task/agent queries
+  are coarse prefilters only; the authoritative eligibility re-check lives in the
+  pure decisions (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound` in
+  `agentype-core`), so query text alone cannot change scheduler behavior. Losing
+  the requirement row is corruption rather than a silent downgrade, and a legacy
+  Task cannot be retroactively given a requirement row.
+- **Type-bound agents are symmetrically quarantined by the same Core decision.** A
+  LogicalAgent carries a positive `agent_type_binding_mode` (`UNBOUND`/`BOUND`)
+  fixed at binding, alongside the immutable `logical_agent_type_bindings` row;
+  losing the row is corruption, never a silent unbinding. The pure legacy
+  consumer/claim selection rejects an agent whose marker is `BOUND` or that has
+  the row, so a legacy Task can never acquire a type-bound agent without
+  `can_execute`. When only bound READY agents remain, the legacy path births a
+  fresh unbound consumer. A binding may only be minted for a `READY`, unassigned,
+  currently-`UNBOUND` agent. Typed candidate discovery loads every usable agent
+  and runs this coherence read per agent, so a corrupt (`BOUND` + missing row)
+  agent fails the whole discovery closed rather than being silently skipped or
+  causing a fallback to another candidate.
+- **Generation policy has the same positive marker.** A Generation carries a
+  `policy_mode` (`NONE`/`POLICY`) fixed at creation. Both legacy and typed
+  admission read the policy through the authoritative `get_generation_policy`, so
+  a `NONE` marker with an unexpected row (or a `POLICY` marker with a missing
+  row) fails closed as corruption rather than being treated as an unconstrained
+  Generation. A `POLICY` Generation MUST NOT be admitted through legacy
+  `admit_proposal` (fail closed before any write), and the schema prevents a
+  policy row from existing under a `NONE` generation. A `NONE` Generation
+  preserves M6-A legacy admission.
+- **Canonical durability with authoritative cross-checks.** The stored
+  requirement document is canonical (`agentype-contract/1`) with a `sha256:`
+  digest, re-canonicalized on read, its relational pin mirror and its exact pin
+  resolved through the validated B.2 catalog read, and its duplicated
+  TaskSpec-owned dimensions cross-checked against the authoritative Task and
+  `GenerationTaskBinding`. When the generation carries a policy, the read
+  re-folds the whole policy onto the stored requirement and requires it to be the
+  exact fixed point, covering every policy-owned dimension at once. A replay never
+  lets a mutable catalog view change a past commitment: an already-admitted
+  `Latest` command replays against its committed exact pin even after new
+  revisions are published, while a genuinely new `Latest` commitment resolves to
+  the current revision. A legacy replay of a typed Task (or the reverse) is a
+  Conflict.
+- **D-GEN-POLICY closed for B.3.** A Generation MAY carry an immutable policy
+  ceiling fixed at `create_generation`. It is the frozen spec 10 **intersection**:
+  the Generation is an authority ceiling, so a Task that requires more
+  workspace/network authority than the ceiling fails closed, and a Task that
+  requires less keeps its stricter value. Information-function, affinity, anchor,
+  continuity, sandbox-policy, and budget constraints fold the same way. Automated
+  policy-governed admission stays deferred (M6-A); full capability and sandbox
+  ordering/intersection stays B.5.
+- **Generation policy is an authority ceiling, not a source config.** The policy
+  is expressed in the same coarse vocabulary as `TaskRequirement`; it never
+  carries model or provider semantics.
+- **Write-once binding.** `logical_agent_type_bindings` mints one exact revision
+  per LogicalAgent; a fresh binding requires a currently `PUBLISHED` revision
+  (matching pre-commit selector semantics), while an existing committed pin
+  survives deprecation. Changing an already-bound agent's type is a future
+  Transform. Minting an `UNBOUND` agent's first binding is an explicit **semantic
+  adoption**: an agent that previously executed legacy work (and may carry
+  workstream association, continuity state, and history) becomes that exact
+  AgentType by definition, with its existing continuity/history remaining part of
+  the same LogicalAgent. A production bind does not require a pristine agent; if
+  a future policy wants that, it is a separate operator rule, not a binding
+  invariant. This is operator provisioning authority, surfaced through
+  `ProvisioningAdmin`, deliberately separate from `RootSemanticControl`
+  (`M6A-B9`). **INV-B3/B4:** a `LogicalAgentTypeBinding` is semantic identity only
+  — it is never physical eligibility evidence for an existing Incarnation. M6-B.4
+  MUST obtain trustworthy provisioning evidence/binding provenance, or require a
+  new/requalified Incarnation, before any authority-bearing typed acquisition of
+  an agent bound by M6-B.3.
+- **Matching is non-authoritative semantic candidate preselection.** A candidate
+  must satisfy the frozen M5 placement rules (exact partition, task tags subset
+  of the agent's concrete tags, and for `Required` continuity the same
+  workstream) *and* `can_execute(type, task)`, and must not be a different
+  revision of the pinned `type_id`. `more_specific_for` is a **preference
+  relation only** — it orders candidates and never decides eligibility, so a
+  compatible type that is neither a strict refinement nor strictly broader
+  remains a candidate (ranked last). A `Preferred` continuity ranks the same
+  workstream first. An unbound LogicalAgent has no contract and is never
+  returned. The result proves only semantic and M5-placement compatibility, never
+  that an agent is runnable: matching consults no `SpawnSource`, writes nothing,
+  and grants no Task/Attempt/Lease/Execution authority. A `B3Candidate` is NOT an
+  `EligibleExecutionCandidate`; only M6-B.4/M6-B.5 authority-bearing acquisition
+  may reach that.
+- **Only `READY`, unassigned candidates.** A candidate is an M5 `READY` and
+  unassigned bound LogicalAgent. Non-READY states (`ASSIGNED`, `DRAINING`,
+  `SUSPENDED`, `RETIRED`, ...) are not approximated as "cold/revivable"; M6
+  revival is a later seam. A candidate's realized M5 retention is deliberately
+  NOT interpreted against the AgentType `lifecycle` set: that set is a required
+  **source envelope** (spec 06), not a per-instance mode whitelist. Any
+  realized-lifecycle eligibility is a B.4 provisioning concern.
+- **One ranking order, exact revisions only.** The exact pin is the matching
+  anchor, not a ceiling. Among eligible candidates the relation to the pin orders
+  as: exact, then compatible narrower/refinement types, then compatible
+  broader/general types, then other compatible types. A different revision of the
+  same `type_id` is never a substitute (`D-TYPE-REV-COMPAT` is deferred). Within a
+  class, candidate-vs-candidate specificity (`more_specific_for`) is applied as
+  dominance-count layers, then the `Preferred` workstream placement, continuity
+  strength, and finally the frozen M5 availability/identity tie-break
+  (`agentype_core::claim_tiebreak`: effective availability then lowest
+  LogicalAgent id). Nominal inheritance depth is never consulted.
+- **V0.1 capacity accounting is unchanged for B.3.** Type-bound agents are
+  excluded from legacy *claim/consumer eligibility*, but they still count toward
+  V0.1 `PoolPartition` capacity during `reconcile_pool`, which is unaware of
+  `agent_type_binding_mode` and may retire a bound agent as excess. Reconciling
+  typed semantic population with V0.1 partition capacity belongs to `D-TOPOLOGY`
+  / M6-B.4, not B.3.
+
+Full physical eligibility (`can_provision_task`, active adapter policy, exact
+binding, credentials) remains M6-B.4/M6-B.5 and is NOT decided here. The staging
+of `can_provision_task` to the first authority-bearing acquisition path is fixed
+by [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md), not by an
+in-place edit of frozen spec 06.
+
+## 8. Inherited invariants relevant here
 
 ```text
 INV-B1  AgentType purity

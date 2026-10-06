@@ -9,10 +9,13 @@
 /// Version 6 adds the M6-B.2 Agent Contract catalog (`capability_definitions`,
 /// `agent_types`, `spawn_sources`, `source_configs`,
 /// `adapter_binding_policies`) with immutable revision content kept separate
-/// from mutable disposition overlays. Older files are rejected at open (fail
+/// from mutable disposition overlays. Version 7 adds M6-B.3 typed agent
+/// requirements and bindings (`task_agent_requirements`,
+/// `logical_agent_type_bindings`) and the immutable optional
+/// `generation_policies` ceiling. Older files are rejected at open (fail
 /// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
-/// v5->v6 in-place upgrade.
-pub const SCHEMA_VERSION: i64 = 6;
+/// in-place upgrade.
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -77,6 +80,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     required INTEGER NOT NULL CHECK (required = 1),
     priority INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL CHECK (state IN ('BLOCKED','QUEUED','LEASED','RUNNING','RETRY_WAIT','SUSPENDED','COMPLETED','CANCELLED')),
+    agent_requirement_mode TEXT NOT NULL DEFAULT 'LEGACY' CHECK (agent_requirement_mode IN ('LEGACY','TYPED')),
     max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
     retry_classes_json TEXT NOT NULL,
     base_backoff_seconds REAL NOT NULL CHECK (base_backoff_seconds >= 0),
@@ -101,6 +105,7 @@ CREATE TABLE IF NOT EXISTS logical_agents (
     partition_name TEXT NOT NULL REFERENCES pool_partitions(name) ON DELETE RESTRICT,
     retention TEXT NOT NULL CHECK (retention IN ('resident','ephemeral')),
     state TEXT NOT NULL CHECK (state IN ('INITIALIZING','READY','ASSIGNED','REVIVING','DRAINING','SUSPENDED','RETIRED')),
+    agent_type_binding_mode TEXT NOT NULL DEFAULT 'UNBOUND' CHECK (agent_type_binding_mode IN ('UNBOUND','BOUND')),
     workstream_id TEXT REFERENCES workstreams(id) ON DELETE SET NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     current_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
@@ -303,6 +308,7 @@ CREATE TABLE IF NOT EXISTS generations (
     state TEXT NOT NULL CHECK (state IN ('OPEN','FROZEN','CLOSED')),
     revision INTEGER NOT NULL DEFAULT 0,
     admission_seq INTEGER NOT NULL DEFAULT 0,
+    policy_mode TEXT NOT NULL DEFAULT 'NONE' CHECK (policy_mode IN ('NONE','POLICY')),
     seed_payload_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     frozen_at REAL,
@@ -661,5 +667,174 @@ BEFORE UPDATE ON adapter_binding_policy_dispositions
 WHEN OLD.policy_id IS NOT NEW.policy_id OR OLD.revision IS NOT NEW.revision
 BEGIN
     SELECT RAISE(ABORT, 'disposition overlay identity is immutable');
+END;
+
+-- =========================================================================
+-- M6-B.3 typed agent requirements, bindings, and Generation policy (schema v7)
+--
+-- All three tables are immutable and write-once: a requirement is created in the
+-- same admission transaction as its Task, a LogicalAgent type binding is minted
+-- once, and a Generation policy is fixed at generation creation. A change is a
+-- new Task / a new binding / a new Generation, never an in-place update.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS generation_policies (
+    generation_id TEXT PRIMARY KEY REFERENCES generations(generation_id) ON DELETE CASCADE,
+    policy_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_agent_requirements (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+    required_type_id TEXT NOT NULL,
+    required_type_revision INTEGER NOT NULL CHECK (required_type_revision >= 1),
+    requirement_json TEXT NOT NULL,
+    requirement_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (required_type_id, required_type_revision)
+        REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS logical_agent_type_bindings (
+    logical_agent_id TEXT PRIMARY KEY REFERENCES logical_agents(id) ON DELETE RESTRICT,
+    type_id TEXT NOT NULL,
+    type_revision INTEGER NOT NULL CHECK (type_revision >= 1),
+    bound_at REAL NOT NULL,
+    FOREIGN KEY (type_id, type_revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS logical_agent_type_bindings_type_idx
+ON logical_agent_type_bindings(type_id, type_revision);
+
+CREATE TRIGGER IF NOT EXISTS generation_policies_immutable_update
+BEFORE UPDATE ON generation_policies
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generation_policies_immutable_delete
+BEFORE DELETE ON generation_policies
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is immutable');
+END;
+
+-- A policy row may only exist under a `POLICY` generation, so `NONE + row`
+-- cannot be manufactured by direct SQL.
+CREATE TRIGGER IF NOT EXISTS generation_policies_require_policy_mode
+BEFORE INSERT ON generation_policies
+WHEN (SELECT policy_mode FROM generations WHERE generation_id=NEW.generation_id) IS NOT 'POLICY'
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy row requires a POLICY generation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generation_policies_no_reinsert
+BEFORE INSERT ON generation_policies
+WHEN EXISTS(SELECT 1 FROM generation_policies WHERE generation_id=NEW.generation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_update
+BEFORE UPDATE ON task_agent_requirements
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_immutable_delete
+BEFORE DELETE ON task_agent_requirements
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_no_reinsert
+BEFORE INSERT ON task_agent_requirements
+WHEN EXISTS(SELECT 1 FROM task_agent_requirements WHERE task_id=NEW.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_update
+BEFORE UPDATE ON logical_agent_type_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_immutable_delete
+BEFORE DELETE ON logical_agent_type_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_no_reinsert
+BEFORE INSERT ON logical_agent_type_bindings
+WHEN EXISTS(
+    SELECT 1 FROM logical_agent_type_bindings WHERE logical_agent_id=NEW.logical_agent_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agents_binding_mode_no_downgrade
+BEFORE UPDATE OF agent_type_binding_mode ON logical_agents
+WHEN OLD.agent_type_binding_mode = 'BOUND' AND NEW.agent_type_binding_mode = 'UNBOUND'
+BEGIN
+    SELECT RAISE(ABORT, 'a bound LogicalAgent cannot be unbound');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agent_type_bindings_require_bound_parent
+BEFORE INSERT ON logical_agent_type_bindings
+WHEN (SELECT agent_type_binding_mode FROM logical_agents WHERE id=NEW.logical_agent_id) IS NOT 'BOUND'
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent type binding requires a BOUND agent');
+END;
+
+-- Parent-side presence markers make "typed" and "policy-bearing" positive
+-- durable facts, so losing the child row is corruption rather than a silent
+-- downgrade to legacy/unconstrained. A Task's typedness is fixed at creation
+-- (never retrofitted), and a Generation's policy mode is fixed at creation.
+-- Identity replacement must not bypass the UPDATE guards: `INSERT OR REPLACE`
+-- deletes the row rather than updating it, so each durable parent identity also
+-- gets a same-id insert guard.
+CREATE TRIGGER IF NOT EXISTS tasks_no_identity_replace
+BEFORE INSERT ON tasks
+WHEN EXISTS(SELECT 1 FROM tasks WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable task identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generations_no_identity_replace
+BEFORE INSERT ON generations
+WHEN EXISTS(SELECT 1 FROM generations WHERE generation_id=NEW.generation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable generation identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_agents_no_identity_replace
+BEFORE INSERT ON logical_agents
+WHEN EXISTS(SELECT 1 FROM logical_agents WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable LogicalAgent identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_agent_requirement_mode_immutable
+BEFORE UPDATE OF agent_requirement_mode ON tasks
+WHEN OLD.agent_requirement_mode IS NOT NEW.agent_requirement_mode
+BEGIN
+    SELECT RAISE(ABORT, 'task typedness is fixed at admission');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_agent_requirements_require_typed_parent
+BEFORE INSERT ON task_agent_requirements
+WHEN (SELECT agent_requirement_mode FROM tasks WHERE id=NEW.task_id) IS NOT 'TYPED'
+BEGIN
+    SELECT RAISE(ABORT, 'a task agent requirement requires a TYPED task');
+END;
+
+CREATE TRIGGER IF NOT EXISTS generations_policy_mode_immutable
+BEFORE UPDATE OF policy_mode ON generations
+WHEN OLD.policy_mode IS NOT NEW.policy_mode
+BEGIN
+    SELECT RAISE(ABORT, 'a generation policy mode is immutable');
 END;
 "#;

@@ -10,6 +10,7 @@ test-support = ["agentype-execution-config/test-support"]
 
 [dependencies]
 agentype-core.workspace = true
+agentype-agent-contract.workspace = true
 agentype-execution-config.workspace = true
 agentype-adapter-api.workspace = true
 agentype-root-bridge.workspace = true

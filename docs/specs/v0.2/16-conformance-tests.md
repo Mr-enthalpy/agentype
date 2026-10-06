@@ -102,6 +102,59 @@ M6-B.2 catalog persistence MUST cover:
   prior disposition, without the Kernel
 - once a disposition is `DEPRECATED`/`DISABLED`, no direct SQL form can make
   the exact revision `PUBLISHED`/`ACTIVE` again
+
+M6-B.3 typed admission and matching MUST cover:
+
+- a typed admission creates the Task, `GenerationTaskBinding`, and immutable
+  `TaskAgentRequirement` in one transaction; a failure leaves none of the three
+- a typed admission MUST pin an exact AgentType revision resolved before commit;
+  there is no durable unpinned typed requirement
+- the requirement's TaskSpec-owned dimensions (information function, affinity,
+  workspace, continuity) are derived from the admitted TaskSpec, not duplicated
+  by the caller
+- a Generation policy folds into the requirement as a spec 10 authority ceiling:
+  a Task exceeding the workspace/network ceiling fails closed, and a stricter
+  Task under a wider ceiling keeps its own value
+- a `POLICY` Generation rejects legacy `admit_proposal` before any write, while a
+  `NONE` Generation keeps M6-A legacy admission working, and each marker is a
+  positive durable fact
+- a `TYPED` Task / type-bound LogicalAgent is excluded from the legacy claim
+  path by the pure Core decision (`ClaimTaskSnapshot.typed`,
+  `ClaimAgentSnapshot.type_bound`), not merely by the storage query; a typed Task
+  births no legacy consumer, acquires no Attempt/Lease/Execution, and stays
+  `QUEUED`, and a legacy Task cannot be retrofitted to `TYPED`
+- exact typed replay returns the same Task while a conflicting requirement is a
+  `Conflict`; an exact pin stays replayable after deprecation, an already-admitted
+  `Latest` command replays against its committed pin even after new revisions are
+  published, a genuinely new `Latest` commitment resolves to the current revision,
+  and a legacy replay of a typed Task (or vice versa) is a `Conflict`
+- a different revision of the same `type_id` is not a substitute; a compatible
+  type that is neither a strict refinement nor strictly broader remains a
+  candidate (ranked after broader ones), because `more_specific_for` is a
+  preference relation and never an eligibility gate
+- typed candidate discovery loads every usable agent and runs the authoritative
+  binding coherence read, so a `BOUND` agent whose row was lost fails the whole
+  discovery closed instead of being silently skipped or falling back to another
+  candidate
+- matching composes the frozen M5 placement gates (exact partition, tag superset,
+  `Required` workstream) with `can_execute`, and returns only bound, M5 `READY`,
+  unassigned agents; broader/general candidates are ordered per the spec 06
+  preference, and matching writes nothing
+- ranking orders exact, narrower, broader, then other compatible, applies
+  candidate-vs-candidate dominance before the `Preferred` workstream and the
+  frozen M5 availability/identity tie-break, and never uses nominal inheritance
+  depth
+- the authoritative requirement read resolves its exact pin through the validated
+  catalog read (a corrupt pin fails closed, a deprecated one does not) and, when
+  the generation carries a policy, requires the stored requirement to be the
+  exact fixed point of re-folding that policy (covering network, isolation,
+  sandbox, budget, and anchor, not just the Task-owned mirrors)
+- `logical_agent_type_bindings` is write-once and a fresh binding requires a
+  `PUBLISHED` revision and a `READY`, unassigned agent; `task_agent_requirements`
+  and `generation_policies` are immutable and write-once, enforced mechanically by
+  SQLite including the `INSERT OR REPLACE` path
+- the canonical `TASK_AGENT_REQUIREMENT` and `GENERATION_POLICY` document kinds
+  have pinned golden digest vectors
 - a `SourceConfigRevision` exposes its validated opaque body without a second
   read path, is unforgeable outside the validated read (private fields, no
   public constructor; compile-fail witness), and its `body` always matches the

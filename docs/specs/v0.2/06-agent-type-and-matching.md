@@ -81,8 +81,11 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
   be inferred from a stronger capability.
 - `can_provision_task` is the contract/sandbox eligibility predicate and a
-  **mandatory eligibility conjunct**; it is NOT the complete physical candidate
-  eligibility decision. The conjunction
+  **mandatory conjunct of any authority-bearing typed acquisition/provisioning
+  decision** (M6-B.4/M6-B.5; see
+  [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md)); it is NOT
+  part of M6-B.3 pure candidate discovery, and it is NOT the complete physical
+  candidate eligibility decision. The conjunction
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
@@ -112,9 +115,12 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   value otherwise — `SecurityClass` keeps
   controlling proof authority independently of polarity. Every Task capability
   value MUST match its catalog definition shape and fail closed otherwise, even
-  for `Restriction` capabilities the AgentType does not pre-advertise. B.3/B.4
-  MUST include `can_provision_task` as a mandatory conjunct, not the bare
-  conjunction.
+  for `Restriction` capabilities the AgentType does not pre-advertise. Any
+  authority-bearing typed acquisition/provisioning decision (M6-B.4/M6-B.5; see
+  [ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md)) MUST include
+  `can_provision_task` as a mandatory conjunct, not the bare conjunction; M6-B.3
+  existing-agent matching is candidate discovery only and grants no
+  Task/Attempt/Lease/Execution authority.
 - `more_specific_for` is defined only once both types are executable, over the
   semantic/authority/scope dimensions (affinity, budget, lifecycle, information
   functions, workspace/network, isolation, sandbox policy, anchor, and capability
@@ -265,3 +271,79 @@ Ranking MUST NOT be by nominal inheritance depth.
 
 V0.1 partition matching ([11](11-pool-topology.md)) remains for kernel
 conformance until typed matching is implemented in M6.
+
+## Typed admission and existing-agent matching (M6-B.3)
+
+An admitted Task MAY carry a durable `TaskAgentRequirement`. Its `required_type`
+is a **mandatory exact immutable `AgentTypeRef`**: `admit_typed_proposal` resolves
+a pre-commit selector to an exact revision before commitment, and there is no
+durable unpinned typed requirement (`D-TYPE-REV-PIN`). It creates the Task, its
+`GenerationTaskBinding`, and the requirement atomically; a Task whose requirement
+would widen its Generation policy MUST fail closed. The requirement never selects
+a `SpawnSource` and never starts physical work.
+
+Typedness is a positive durable fact: the Task carries an
+`agent_requirement_mode` (`LEGACY`/`TYPED`) fixed at admission, and any Task that
+is not `LEGACY` MUST be invisible to the legacy untyped consumer/claim path. A
+lost requirement row is therefore corruption, never a silent downgrade to a
+legacy Task. Symmetrically, a LogicalAgent that carries a
+`logical_agent_type_bindings` row MUST be excluded from the legacy
+consumer/claim pool, so a legacy Task can never acquire a type-bound agent
+without passing `can_execute`; when only bound READY agents remain, the legacy
+path births a fresh unbound consumer. A binding is minted only for a `READY`,
+unassigned `UNBOUND` agent and requires a currently `PUBLISHED` revision; minting
+an `UNBOUND` agent's first binding is an explicit semantic adoption, so an agent
+that previously executed legacy work becomes that exact AgentType with its
+existing continuity/history remaining part of the same LogicalAgent (changing an
+already-bound agent's type remains a future Transform). Until a typed
+authority-bearing acquisition path exists (M6-B.4), a typed Task stays durable
+`QUEUED` and acquires no Attempt, Lease, or Execution.
+
+A Generation carries a `policy_mode` (`NONE`/`POLICY`) fixed at creation. A
+`POLICY` Generation MUST NOT be admitted through the legacy `admit_proposal` path
+(fail closed), and a missing policy row for a `POLICY` marker is corruption, never
+an unconstrained Generation. A `NONE` Generation preserves legacy admission
+unchanged. Folding a Generation policy is the spec 10 intersection: the Generation
+is an authority ceiling, so a Task requiring more workspace/network authority than
+the ceiling MUST fail closed, and a Task requiring less MUST keep its stricter
+value (the Generation never widens a Task). Full capability and sandbox
+ordering/intersection remains B.5.
+
+The authoritative requirement read MUST resolve its exact pin through the
+validated catalog read and cross-check its duplicated TaskSpec-owned dimensions
+(information function, affinity, workspace, folded continuity) against the
+authoritative Task and `GenerationTaskBinding`/Generation policy; a
+self-consistent copy that disagrees MUST fail closed. Admission replay MUST use
+the same command shape: a legacy retry of a typed Task, or a typed retry of a
+legacy Task, is a Conflict, not an idempotent success.
+
+Existing-agent matching is **non-authoritative semantic candidate
+preselection**: it proves semantic compatibility and M5 placement, never physical
+eligibility. Eligibility composes the frozen M5 placement rules (exact partition,
+task tags subset of the agent's concrete tags, and the same workstream for
+`Required` continuity), the AgentType contract (`can_execute`), and one explicit
+rule that a different revision of the pinned `type_id` is never a substitute
+(`D-TYPE-REV-COMPAT` is deferred). Only M5 `READY`, unassigned, bound agents are
+candidates; non-READY states are not treated as cold/revivable; an unbound agent
+is never returned. `more_specific_for` is a **preference relation only**: it orders
+candidates and never decides eligibility, so a compatible type that is neither a
+strict refinement nor strictly broader remains a candidate, ranked after broader
+ones. A `Preferred` continuity ranks the same workstream first. The exact pin is a
+matching anchor, not a ceiling: within a relation class, candidate-vs-candidate
+`more_specific_for` dominates before the `Preferred` workstream, continuity
+strength, availability, and stable identity tie-breaks. Ranking MUST NOT use
+nominal inheritance depth. Matching grants no Task/Attempt/Lease/Execution
+authority and MUST NOT be consumed as "runnable": any authority-bearing typed
+acquisition (M6-B.4/M6-B.5) MUST additionally prove `can_provision_task`, active
+adapter policy, exact binding resolution, enforcement evidence, and credentials.
+A replay never lets a mutable catalog view change a past commitment: an
+already-admitted `Latest` command replays against its committed exact pin even
+after new revisions are published,
+while a genuinely new `Latest` commitment resolves to the current revision; an
+already-committed exact pin remains replayable after deprecation. New-agent
+provisioning from an eligible SpawnSource, full physical eligibility
+(`can_provision_task`), and credentials remain M6-B.4/M6-B.5. A
+`LogicalAgentTypeBinding` established in M6-B.3 is semantic identity only, never
+physical eligibility evidence for an existing Incarnation; M6-B.4 MUST obtain
+trustworthy provisioning evidence/binding provenance, or require a
+new/requalified Incarnation, before any authority-bearing typed acquisition.

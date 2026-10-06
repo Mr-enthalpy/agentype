@@ -234,6 +234,7 @@ mod tests {
             next_eligible_at: None,
             priority,
             created_at,
+            typed: false,
         }
     }
 
@@ -291,6 +292,7 @@ mod tests {
             tags: vec![],
             available_since: Some(avail),
             created_at: 0.0,
+            type_bound: false,
         };
         // Oldest availability wins even when its id sorts larger.
         let agents = vec![agent("zzz-older", 10.0), agent("aaa-newer", 20.0)];
@@ -352,6 +354,43 @@ mod tests {
             continuity: ContinuityPreference::Required,
         };
         assert!(select_claim_agent(std::slice::from_ref(&ws_agent), &strict).is_none());
+    }
+
+    #[test]
+    fn typed_task_and_type_bound_agent_are_not_legacy_eligible() {
+        use decisions::*;
+        let mut task = task_snap("t", 0, 0.0);
+        assert!(claim_task_eligible(&task, 100.0));
+        task.typed = true;
+        assert!(!claim_task_eligible(&task, 100.0));
+
+        let intent = ClaimIntent {
+            partition: "general",
+            required_tags: &[],
+            workstream_id: None,
+            continuity: ContinuityPreference::None,
+        };
+        let bound = ClaimAgentSnapshot {
+            id: "bound".to_string(),
+            state: LogicalAgentState::Ready,
+            assigned_to_task: false,
+            partition: "general".to_string(),
+            workstream_id: None,
+            tags: vec![],
+            available_since: Some(0.0),
+            created_at: 0.0,
+            type_bound: true,
+        };
+        assert!(select_claim_agent(std::slice::from_ref(&bound), &intent).is_none());
+        let mut unbound = bound.clone();
+        unbound.id = "unbound".to_string();
+        unbound.type_bound = false;
+        assert_eq!(
+            select_claim_agent(std::slice::from_ref(&unbound), &intent)
+                .unwrap()
+                .id,
+            "unbound"
+        );
     }
 
     #[test]

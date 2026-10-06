@@ -2,10 +2,12 @@
 //!
 //! Schema and transaction boundaries are derived from
 //! docs/specs/v0.2/13-storage-and-transactions.md. This crate persists M6-A
-//! Generation/proposal commitments and the M6-B.2 Agent Contract catalog, but
-//! it MUST NOT introduce vendor/model semantics: AgentType, SpawnSource, and
-//! SourceConfig content is stored as canonical M6-B JSON with Core-computed
-//! content digests, and opaque SourceConfig bodies are never interpreted.
+//! Generation/proposal commitments, the M6-B.2 Agent Contract catalog, and the
+//! M6-B.3 typed Task agent requirements / LogicalAgent type bindings /
+//! Generation policies, but it MUST NOT introduce vendor/model semantics:
+//! AgentType, SpawnSource, and SourceConfig content is stored as canonical M6-B
+//! JSON with Core-computed content digests, and opaque SourceConfig bodies are
+//! never interpreted.
 //!
 //! # Internal implementation crate
 //!
@@ -25,6 +27,7 @@
 pub mod catalog;
 pub mod frontier;
 mod kernel;
+pub mod requirement;
 mod schema;
 mod store;
 pub mod txutil;

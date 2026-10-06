@@ -47,12 +47,17 @@ pub struct ClaimTaskSnapshot {
     pub next_eligible_at: Option<f64>,
     pub priority: i64,
     pub created_at: f64,
+    /// A typed Task (`task_agent_requirements`) is never eligible for the legacy
+    /// untyped claim path. Storage may pre-filter cheaply; this is the
+    /// authoritative re-check.
+    pub typed: bool,
 }
 
 /// Semantic claimability of a Task. Storage may pre-filter cheaply; this is
 /// the authoritative re-check so that query text alone cannot change behavior.
 pub fn claim_task_eligible(s: &ClaimTaskSnapshot, now: f64) -> bool {
-    s.state == TaskState::Queued
+    !s.typed
+        && s.state == TaskState::Queued
         && s.batch_state == BatchState::Active
         && s.partition_active
         && s.next_eligible_at.is_none_or(|t| t <= now)
@@ -89,6 +94,9 @@ pub struct ClaimAgentSnapshot {
     pub tags: Vec<String>,
     pub available_since: Option<f64>,
     pub created_at: f64,
+    /// A LogicalAgent bound to an exact AgentType is never eligible for the
+    /// legacy untyped claim path: a legacy Task cannot prove `can_execute`.
+    pub type_bound: bool,
 }
 
 /// What a claimable Task demands from its consumer at selection time.
@@ -110,7 +118,8 @@ pub fn select_claim_agent<'a>(
     agents
         .iter()
         .filter(|a| {
-            a.state == LogicalAgentState::Ready
+            !a.type_bound
+                && a.state == LogicalAgentState::Ready
                 && !a.assigned_to_task
                 && a.partition == intent.partition
                 && crate::authority::tags_match(intent.required_tags, &a.tags)

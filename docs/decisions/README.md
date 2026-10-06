@@ -28,6 +28,12 @@ normative text.
 New ADRs start at `docs/decisions/0007-short-title.md` when a **new** durable
 choice is made (expected during V0.2 design, not this layout change).
 
+## Extracted ADRs
+
+| ID | Decision |
+|---|---|
+| [ADR-0007](0007-m6b-can-provision-task-staging.md) | `can_provision_task` is required at the first authority-bearing typed acquisition (M6-B.4/B.5), not at M6-B.3 non-authoritative semantic preselection. |
+
 Template for a new ADR:
 
 - title

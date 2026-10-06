@@ -83,6 +83,7 @@ name = "agentype-runtime"
 version = "0.2.0"
 dependencies = [
  "agentype-adapter-api",
+ "agentype-agent-contract",
  "agentype-core",
  "agentype-execution-config",
  "agentype-nlink",

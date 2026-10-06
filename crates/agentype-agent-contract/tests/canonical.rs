@@ -479,3 +479,45 @@ fn adapter_binding_policy_blank_fields_fail_closed() {
     let json = String::from_utf8(canonical_adapter_binding_policy_bytes(&blank_ref)).unwrap();
     assert!(adapter_binding_policy_from_canonical_json(&json, ConfigStatus::Active).is_err());
 }
+
+#[test]
+fn b3_golden_digest_vectors_are_stable() {
+    let catalog = CapabilityCatalog::new();
+    let mut requirement = TaskAgentRequirement {
+        required_type: AgentTypeRef::new("reviewer", 1).unwrap(),
+        hard: TaskRequirement {
+            information_function: InformationFunction::Expand,
+            required_capabilities: BTreeMap::new(),
+            required_affinity: BTreeSet::new(),
+            required_workspace: WorkspaceMode::ReadOnly,
+            required_network: NetworkPolicy::Restricted,
+            required_attempt_isolation: false,
+            required_continuity: ContinuityMode::Logical,
+            sandbox_policy: None,
+            required_anchor: Some("anchor-1".into()),
+            budget: Budget::new(50.0).unwrap(),
+        },
+    };
+    canonicalize_task_agent_requirement(&mut requirement, &catalog).unwrap();
+    assert_eq!(
+        task_agent_requirement_content_digest(&requirement),
+        "sha256:1ebb0040fcb7bbabe7a420d8e62daa0c522ed9de78afb0de929511c2bc34cf6e"
+    );
+
+    let mut policy = GenerationPolicy {
+        allowed_information_functions: vec![InformationFunction::Expand],
+        max_workspace: WorkspaceMode::Write,
+        max_network: NetworkPolicy::Enabled,
+        requires_attempt_isolation: true,
+        min_continuity: ContinuityMode::Logical,
+        sandbox_policy: None,
+        budget_ceiling: Budget::new(10.0).unwrap(),
+        allowed_affinity: Some(BTreeSet::from(["rust".to_string()])),
+        anchor_constraint: Some("anchor-1".into()),
+    };
+    canonicalize_generation_policy(&mut policy, &catalog).unwrap();
+    assert_eq!(
+        generation_policy_content_digest(&policy),
+        "sha256:edac6e142420b01e96005a57403ddc5205ab561b7c9394f81d72aa06ac8ea225"
+    );
+}

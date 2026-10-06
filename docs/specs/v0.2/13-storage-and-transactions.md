@@ -26,8 +26,59 @@ IDs MUST be unique durable strings (UUID recommended, IMPLEMENTATION-DEFINED).
 The Rust-era store carries an exact schema version in `schema_migrations`.
 A database whose version is newer **or** older than the running binary's
 supported `SCHEMA_VERSION` MUST be rejected at open, fail closed. There is
-**no** in-place upgrade while `D-DB-MIGRATE` is unresolved, so v5 -> v6 is
-deliberately **not** a migration; M6-B.2 uses a fresh v6 database.
+**no** in-place upgrade while `D-DB-MIGRATE` is unresolved, so v5 -> v6 (and
+v6 -> v7) is deliberately **not** a migration; each stage uses a fresh database
+at its own version.
+
+M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
+catalog:
+
+- `task_agent_requirements` is immutable and write-once, created only inside the
+  same transaction as its M6-A `Task` and `GenerationTaskBinding`. It stores the
+  canonical requirement document, its Core-computed digest, and a **mandatory**
+  exact `(type_id, revision)` pin; the pin MUST resolve through the catalog's
+  validated read, and the relational mirror MUST be cross-checked against the
+  canonical document on every read. The parent `tasks.agent_requirement_mode` and
+  this row are one invariant: a `TYPED` Task without its row, or a `LEGACY` Task
+  with one, is corruption that MUST fail closed. The read MUST also resolve the
+  pin through the catalog's validated read and cross-check the duplicated
+  TaskSpec-owned dimensions (information function, affinity, workspace, folded
+  continuity) against the authoritative Task and `GenerationTaskBinding`. A
+  requirement row may only be inserted under a parent Task whose
+  `agent_requirement_mode` is already `TYPED`, so a legacy Task cannot be
+  retrofitted.
+- `logical_agent_type_bindings` is immutable and write-once: one exact
+  `(type_id, revision)` per LogicalAgent, resolved through the validated read. A
+  change is a new binding, never an in-place type mutation. A binding may only be
+  minted for a `READY`, unassigned, currently-`UNBOUND` LogicalAgent, and it is
+  paired with the parent `logical_agents.agent_type_binding_mode`
+  (`UNBOUND`/`BOUND`): the authoritative read treats a `BOUND` marker without its
+  row, or an `UNBOUND` marker with a row, as corruption that fails closed, and the
+  marker cannot be reversed. Legacy eligibility is computed from the marker or the
+  row, so losing the row quarantines the agent rather than widening authority.
+- `generation_policies` is immutable: a generation-wide authority ceiling is
+  fixed at generation creation and applied as the spec 10 intersection on each
+  typed admission (a Task exceeding it fails closed). A policy row may only be
+  inserted under a `POLICY` generation, and admission reads policy presence only
+  through the authoritative `get_generation_policy`.
+- `tasks.agent_requirement_mode` (`LEGACY`/`TYPED`) and
+  `generations.policy_mode` (`NONE`/`POLICY`) are positive parent-side presence
+  markers fixed at creation/admission and immutable thereafter. A missing child
+  row for a positive marker, or an unexpected child row for a negative marker, is
+  corruption, never a silent downgrade to legacy or an unconstrained Generation;
+  SQLite triggers forbid mutating a Task's typedness, a generation's policy mode,
+  or a LogicalAgent's binding mode, and also reject a same-identity `INSERT` /
+  `INSERT OR REPLACE` on `tasks`, `generations`, or `logical_agents`, so a
+  durable parent identity cannot be replaced to inject a different presence
+  marker.
+- all three tables MUST be physically write-once: SQLite triggers reject
+  `UPDATE`, `DELETE`, and a duplicate/`INSERT OR REPLACE` that would rewrite an
+  existing exact identity, so direct SQL cannot rewrite a requirement, rebind an
+  agent, or mutate a policy.
+- typed/legacy scheduling eligibility MUST be a pure Core decision
+  (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound`), not a storage
+  query convention: coarse SQL filtering is a performance optimization only and
+  MUST NOT change scheduler behavior.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
@@ -153,6 +204,9 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs |
+| Generation policy | generation row + immutable `generation_policies` row in one transaction |
+| Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 
 Stale writes MUST fail closed (no canonical mutation). Physical-only history
 MAY still record on the old Execution/Incarnation.

@@ -275,6 +275,52 @@ pub fn value_within(ceiling: &CapabilityValue, value: &CapabilityValue) -> bool 
     }
 }
 
+/// Deterministic join of two *requirements* on the same exact capability
+/// revision: the result is the stronger requirement, and `None` means the two
+/// values are incompatible (e.g. disjoint `Exact` values or differing `Ordered`
+/// classes).
+///
+/// This is an internal primitive shared by the B.1 restriction composition and
+/// later folds. It is deliberately **not** exported: the public capability
+/// intersection API is not frozen until B.5 (`D-SANDBOX-INTERSECTION`).
+pub(crate) fn join_requirement_values(
+    matcher: MatcherKind,
+    a: &CapabilityValue,
+    b: &CapabilityValue,
+) -> Option<CapabilityValue> {
+    match (matcher, a, b) {
+        (MatcherKind::Bool, CapabilityValue::Bool(x), CapabilityValue::Bool(y)) => {
+            Some(CapabilityValue::Bool(*x || *y))
+        }
+        (MatcherKind::Set, CapabilityValue::Set(x), CapabilityValue::Set(y)) => {
+            Some(CapabilityValue::Set(x.union(y).cloned().collect()))
+        }
+        (
+            MatcherKind::Ordered,
+            CapabilityValue::Ordered {
+                class: ac,
+                rank: ar,
+            },
+            CapabilityValue::Ordered {
+                class: bc,
+                rank: br,
+            },
+        ) if ac == bc => Some(CapabilityValue::Ordered {
+            class: ac.clone(),
+            rank: (*ar).max(*br),
+        }),
+        (MatcherKind::Quantity, CapabilityValue::Quantity(x), CapabilityValue::Quantity(y)) => {
+            Some(CapabilityValue::Quantity(if x.get() >= y.get() {
+                *x
+            } else {
+                *y
+            }))
+        }
+        (MatcherKind::Exact, x, y) if x == y => Some(x.clone()),
+        _ => None,
+    }
+}
+
 // NOTE: there is deliberately no `assurance_satisfies` helper. `Assurance` is
 // declaration metadata only; no public API may express "a claim label satisfies
 // a security class". Only imported `ResolvedProvisioningEvidence` does.

@@ -11,8 +11,8 @@
 //! AgentType.
 
 use crate::capability::{
-    value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
-    CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
+    join_requirement_values, value_satisfies, value_within, Assurance, CapabilityCatalog,
+    CapabilityClaim, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
 };
 use crate::error::ContractError;
 use crate::evidence::ResolvedProvisioningEvidence;
@@ -625,37 +625,7 @@ fn restriction_join(
     a: &CapabilityValue,
     b: &CapabilityValue,
 ) -> Option<CapabilityValue> {
-    match (matcher, a, b) {
-        (MatcherKind::Bool, CapabilityValue::Bool(x), CapabilityValue::Bool(y)) => {
-            Some(CapabilityValue::Bool(*x || *y))
-        }
-        (MatcherKind::Set, CapabilityValue::Set(x), CapabilityValue::Set(y)) => {
-            Some(CapabilityValue::Set(x.union(y).cloned().collect()))
-        }
-        (
-            MatcherKind::Ordered,
-            CapabilityValue::Ordered {
-                class: ac,
-                rank: ar,
-            },
-            CapabilityValue::Ordered {
-                class: bc,
-                rank: br,
-            },
-        ) if ac == bc => Some(CapabilityValue::Ordered {
-            class: ac.clone(),
-            rank: (*ar).max(*br),
-        }),
-        (MatcherKind::Quantity, CapabilityValue::Quantity(x), CapabilityValue::Quantity(y)) => {
-            Some(CapabilityValue::Quantity(if x.get() >= y.get() {
-                *x
-            } else {
-                *y
-            }))
-        }
-        (MatcherKind::Exact, x, y) if x == y => Some(x.clone()),
-        _ => None,
-    }
+    join_requirement_values(matcher, a, b)
 }
 
 /// `Ability` order: `derived` advertises no more than `base`. A smaller/equal
