@@ -158,17 +158,35 @@ pub struct EnvironmentStartRequest {
     request_id: RequestId,
     execution_id: ExecutionId,
     workspace_mode: WorkspaceMode,
+    network_policy: NetworkEnforcement,
     incarnation_runtime_handle: RuntimeHandle,
     target_options: Value,
     profile_options: Value,
     profile_timeout_seconds: Option<f64>,
     attempt_isolation: bool,
+    /// Opaque, secret-free launch descriptor for the environment this Execution
+    /// must physically materialize and start (empty for the legacy path). Core
+    /// never interprets it; the exact adapter consumes it during
+    /// `start_execution`, so M5 owns the physical lifecycle.
+    launch_descriptor: String,
 }
 
 impl EnvironmentStartRequest {
     pub fn from_launch(
         launch: &ExecutionLaunchSnapshot,
         environment: &ResolvedExecutionEnvironment,
+    ) -> Result<Self, LaunchEnvironmentMismatch> {
+        Self::from_launch_with_descriptor(launch, environment, String::new())
+    }
+
+    /// Build the physical start request carrying the opaque launch descriptor
+    /// resolved for the exact committed source config, so the adapter physically
+    /// materializes the environment the Execution's provenance names rather than
+    /// an ambient/default one.
+    pub fn from_launch_with_descriptor(
+        launch: &ExecutionLaunchSnapshot,
+        environment: &ResolvedExecutionEnvironment,
+        launch_descriptor: String,
     ) -> Result<Self, LaunchEnvironmentMismatch> {
         let safety = environment.safety();
         let mut mismatched: Vec<&'static str> = Vec::new();
@@ -198,12 +216,20 @@ impl EnvironmentStartRequest {
             request_id: launch.request_id().clone(),
             execution_id: launch.execution_id().clone(),
             workspace_mode: launch.workspace_mode(),
+            network_policy: launch.required_network(),
             incarnation_runtime_handle: RuntimeHandle(launch.incarnation_runtime_handle().clone()),
             target_options: environment.target().options.clone(),
             profile_options: environment.profile().options.clone(),
             profile_timeout_seconds: environment.profile().timeout_seconds,
             attempt_isolation: safety.attempt_isolation(),
+            launch_descriptor,
         })
+    }
+
+    /// The opaque launch descriptor, if any (legacy requests carry an empty
+    /// string).
+    pub fn launch_descriptor(&self) -> &str {
+        &self.launch_descriptor
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -216,6 +242,12 @@ impl EnvironmentStartRequest {
 
     pub fn workspace_mode(&self) -> WorkspaceMode {
         self.workspace_mode
+    }
+
+    /// The effective network policy the physical layer MUST enforce for this
+    /// execution; no layer may widen it.
+    pub fn network_policy(&self) -> NetworkEnforcement {
+        self.network_policy
     }
 
     pub fn incarnation_runtime_handle(&self) -> &RuntimeHandle {
@@ -341,13 +373,48 @@ pub trait ExecutionAdapter: Send + Sync {
     ) -> AdapterResult<StartObservation>;
 }
 
+/// Network enforcement vocabulary, shared with `agentype-execution-config` so
+/// the imported-safety envelope, the effective execution request, and the
+/// durable launch snapshot all use one type. Neutral vocabulary: it MUST NOT be
+/// interpreted as a provider or sandbox-vendor enum.
+pub use agentype_execution_config::NetworkEnforcement;
+
 /// An adapter that can import itself as a physical execution source.
-/// Kind, domain key, and enforceable isolation come from the adapter, not
-/// the composition caller.
+/// Kind, domain key, and enforceable safety come from the adapter, not the
+/// composition caller.
+///
+/// `import_enforceable_workspace`/`import_enforceable_network` are M6-B.4
+/// additive extensions with conservative (empty = unenforceable) defaults, so an
+/// existing M5.7 adapter keeps compiling and fails closed rather than silently
+/// claiming enforcement. Only imported facts satisfy a security requirement;
+/// `DECLARED` is never a proof.
 pub trait ImportableAdapter: ExecutionAdapter {
     fn import_kind(&self) -> &str;
     fn import_binding_key(&self) -> AdapterBindingKey;
     fn import_attempt_isolation(&self) -> bool;
+
+    /// The source-integration **protocol identity** this adapter binding accepts:
+    /// the exact descriptor grammar it consumes and physically materializes
+    /// during `start_execution`. A descriptor produced under a different protocol
+    /// MUST NOT be launched here. Default `None`: an ordinary M5 physical adapter
+    /// (which does not consume typed provisioning descriptors) is not
+    /// provisioning-capable and is therefore ineligible for typed acquisition.
+    fn import_provisioning_protocol(&self) -> Option<&str> {
+        None
+    }
+
+    /// Workspace modes this domain can mechanically enforce, as an exact set.
+    /// There is no implication between modes: a domain that can enforce `Write`
+    /// does not thereby claim `ReadOnly`. An importer that can enforce both MUST
+    /// report both. Default: none enforceable.
+    fn import_enforceable_workspace(&self) -> Vec<WorkspaceMode> {
+        Vec::new()
+    }
+
+    /// Network policies this domain can mechanically enforce. Default: none.
+    fn import_enforceable_network(&self) -> Vec<NetworkEnforcement> {
+        Vec::new()
+    }
 }
 
 /// In-memory fake used by M4 tests and M5.2 dispatch tests. No process, no
@@ -753,6 +820,7 @@ mod tests {
                 binding.execution_target.clone(),
                 binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
+                NetworkEnforcement::Enabled,
                 "hi".to_string(),
                 Value::Null,
                 Value::Null,
@@ -853,6 +921,7 @@ mod tests {
                 binding.execution_target.clone(),
                 binding.execution_profile.clone(),
                 WorkspaceMode::ReadOnly,
+                NetworkEnforcement::Enabled,
                 "my-task".to_string(),
                 serde_json::json!({"key": "val"}),
                 serde_json::json!({"criterion": "pass"}),

@@ -2,8 +2,21 @@
 //! evidence that a restarted Scheduler on the same boot recomputes the
 //! same domain key.
 
+use agentype_adapter_api::ImportableAdapter;
 use agentype_adapter_local_process::LocalProcessAgentAdapter;
 use std::process::Command;
+
+#[test]
+fn unsandboxed_local_process_imports_no_enforcement() {
+    let adapter = LocalProcessAgentAdapter::new();
+    // `start_execution` launches a plain OS process and does not confine the
+    // filesystem or network, so it MUST NOT claim any enforceable workspace mode
+    // or network policy. Claiming `Write` would be an enforcement proof a
+    // required_workspace=Write Task must not be able to consume.
+    assert!(adapter.import_enforceable_workspace().is_empty());
+    assert!(adapter.import_enforceable_network().is_empty());
+    assert!(!adapter.import_attempt_isolation());
+}
 
 #[test]
 fn domain_key_is_stable_across_processes() {

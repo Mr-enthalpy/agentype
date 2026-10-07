@@ -87,6 +87,10 @@ impl ImportableAdapter for TestImportableAdapter {
     fn import_attempt_isolation(&self) -> bool {
         false
     }
+
+    fn import_provisioning_protocol(&self) -> Option<&str> {
+        None
+    }
 }
 
 fn test_store(name: &str) -> PathBuf {

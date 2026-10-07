@@ -6,7 +6,14 @@ license.workspace = true
 description = "Pure M6-B agent contract ontology and the four matching predicates (no I/O)"
 
 [features]
-test-support = []
+# Supported-surface fence: the production `ResolvedProvisioningEvidence`
+# producer (`from_imported_binding`) is compiled only for the internal runtime
+# resolver, which enables this feature. The default surface keeps no evidence
+# constructor, so an ordinary consumer cannot mint imported enforcement facts.
+# This is a supported-surface boundary, not an unforgeable capability.
+provisioning-producer = []
+# Test support implies the producer so `for_tests` can delegate to it.
+test-support = ["provisioning-producer"]
 
 [dependencies]
 agentype-core.workspace = true

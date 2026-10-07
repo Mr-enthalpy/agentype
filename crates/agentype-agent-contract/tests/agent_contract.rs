@@ -89,6 +89,7 @@ fn evidence_for(
     ResolvedProvisioningEvidence::for_tests(
         policy,
         "codex_cli",
+        "local-install-1",
         base_source().source_ref,
         base_config().config_ref,
         base_config().config_digest,
@@ -1492,6 +1493,7 @@ fn test_provisioning_evidence_for_config_a_must_not_authorize_config_b() {
     let evidence_b = ResolvedProvisioningEvidence::for_tests(
         policy_ref("codex-local-adapter", 3),
         "codex_cli",
+        "local-install-1",
         base_source().source_ref,
         config_b.config_ref.clone(),
         config_b.config_digest.clone(),

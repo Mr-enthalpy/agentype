@@ -65,6 +65,14 @@ defined only over canonicalized records.
 Cost MUST NOT override correctness or security eligibility.
 A source that cannot enforce the required sandbox MUST be ineligible.
 
+M6-B.4 implements the hard filters (1-3) as eligibility and the continuity
+dimension (4). Availability (5) and cost/resource (6) have no durable model yet,
+so when more than one candidate is tied on continuity the selection is
+**unresolved and fails closed** (`RESOURCE_UNAVAILABLE`) rather than via an
+invented tie-break; this order is unchanged and the gap is recorded in
+[ADR-0010](../../decisions/0010-m6b-selection-order-scope.md). Selection is part
+of the authority path.
+
 ## ExecutionAdapter (correctness required)
 
 Narrow interface, UNCHANGED from V0.1:
@@ -128,14 +136,36 @@ An Execution MUST atomically freeze `adapter_kind` and
 `adapter_binding_key` at creation. Recovery MUST `resolve_exact(kind, key)`
 and MUST NOT fall back to another source of the same kind.
 
-Until the M6 source-resolved exact-binding launch path is implemented, launch
-MUST `resolve_unique(kind)`. Ambiguous installations of the same kind MUST fail
-closed.
+A legacy (untyped) launch uses `resolve_unique(kind)`; ambiguous installations
+of the same kind MUST fail closed. M6-B.4 DEFINES a source-resolved exact-binding
+launch path: it resolves the exact installed binding from the
+`AdapterBindingPolicy`'s stable `binding_ref` (within the policy's
+`adapter_kind`), freezes `(adapter_kind, adapter_binding_key)` at Execution
+creation, and MUST NOT use `resolve_unique`. **That typed path is not yet wired
+into the production dispatch composition**, which continues to use
+`resolve_unique` until the daemon integration lands; the typed library path
+already carries the exact binding into the `ProvisioningBinding` and
+`BindingSnapshot`. Recovery for either path MUST `resolve_exact(kind, key)`.
 
 An imported source owns its kind, binding key, and enforceable physical
-capabilities. Effective safety is the intersection of the ExecutionTarget
-requirement and the imported source's enforceability. A composition caller
-MUST NOT mint durable isolation or a binding key without that intersection.
+capabilities. It MAY optionally declare a **provisioning protocol identity**
+(`ImportableAdapter::import_provisioning_protocol`, default `None`): the
+descriptor grammar its `start_execution` consumes. An adapter that declares none
+is not provisioning-capable and is ineligible for typed acquisition; it MUST NOT
+claim a grammar it ignores. A provisioning-capable adapter is routed by the
+composition root to a source-local `SourceConfigIntegration` that prepares
+descriptors in the same protocol; M6-B.4 requires them to match when the
+candidate is resolved and re-checks the frozen protocol at the Execution handoff,
+so a descriptor produced for one adapter can never be launched against another.
+The physical materialization of the descriptor happens inside
+`start_execution` (M6-B never creates a physical environment). Effective safety
+is the intersection of the ExecutionTarget requirement and the imported source's
+enforceability. A composition caller MUST NOT mint durable isolation or a binding
+key without that intersection.
+`attempt_isolation` is authoritative from the ExecutionTarget/`ExecutionRegistry`
+(M4), never from adapter self-assertion; a domain that merely claims isolation
+does not grant it. The effective network policy is carried provider-neutrally on
+`EnvironmentStartRequest` so no layer widens a stricter upstream policy.
 
 ## ExecutionProfile registry (**M5**)
 

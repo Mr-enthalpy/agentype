@@ -166,6 +166,7 @@ fn request(spec: AgentSpec) -> EnvironmentStartRequest {
             binding.execution_target.clone(),
             binding.execution_profile.clone(),
             WorkspaceMode::ReadOnly,
+            agentype_adapter_api::NetworkEnforcement::Enabled,
             "fixture".to_string(),
             spec.payload,
             json!({"ok": true}),

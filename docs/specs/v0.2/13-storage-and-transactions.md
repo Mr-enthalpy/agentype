@@ -80,6 +80,70 @@ catalog:
   query convention: coarse SQL filtering is a performance optimization only and
   MUST NOT change scheduler behavior.
 
+M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
+
+- `provisioning_bindings` is immutable and write-once, scoped to one
+  Incarnation: it freezes the exact `(agent_type_id/revision, spawn_source_id/
+  revision, source_config_id/revision, adapter_policy_id/revision)`, the exact
+  `adapter_kind` + opaque   `adapter_binding_key` the Incarnation was qualified
+  against, the source-integration materialization digest of the exact
+  `SourceConfig`, and the resolved enforceability chosen for that Incarnation. It
+  does NOT store a per-Task requirement (that lives on the Execution's
+  `BindingSnapshot`). Freezing the exact physical domain means the binding proven
+  before authority survives the acquisition transaction, so restart/recovery
+  never has to re-derive it from a transient resolver candidate. A
+  source/config/domain/safety change is a new Incarnation, never an in-place
+  rebind: an active Incarnation's binding is reused only when its frozen
+  provenance still qualifies; otherwise the idle Incarnation is fenced and a
+  fresh one is created. A legacy Incarnation is adopted only when it has no
+  execution history at all; M5 physical history proves only the domain, never the
+  Core-opaque SourceConfig, so it is never promoted to a provisioning
+  provenance. The parent `incarnations.provisioning_mode`
+  (`LEGACY`/`PROVISIONED`) is a positive marker: a `PROVISIONED` Incarnation
+  without its row, or a `LEGACY` Incarnation with one, is corruption that MUST
+  fail closed. The authoritative read also cross-checks the Incarnation's
+  logical agent, requires the binding `agent_type` to equal the LogicalAgent's
+  frozen `LogicalAgentTypeBinding`, and re-resolves the frozen catalogue
+  provenance through the validated reads.
+- `binding_snapshots` is immutable, one per Execution, created in the **same
+  transaction** as the `Execution` row: it freezes `adapter_kind`,
+  `adapter_binding_key`, the source/config provenance, `execution_target`,
+  `execution_profile`, the admitted requirement's capability values, the imported
+  enforceability **capability**, the per-execution **effective** isolation /
+  workspace / network, a secret-free `credential_refs_digest`, and a
+  `resolver_version`. The capability and the effective policy are distinct
+  fields: a `PhysicalSafety` is a capability set, never a hybrid of capability
+  and per-execution choice. The
+  parent `executions.binding_snapshot_mode` (`NONE`/`SNAPSHOT`) is the matching
+  positive marker. The commitment MUST be coherent: the snapshot's adapter
+  key/kind, target/profile, provisioning-binding provenance (same Incarnation and
+  same source/config), and validated config digest MUST all agree with the
+  Execution and its ProvisioningBinding, or the transaction fails. The
+  effective attempt-isolation requirement (`AgentType.requires OR Task.required`)
+  MUST be enforced by the frozen Execution, re-proved at commitment. The M5
+  reconciliation-candidate read MUST also validate this marker/child coherence,
+  so restart recovery never reconciles a `SNAPSHOT` Execution without its
+  provenance. Recovery MUST continue to `resolve_exact(kind, key)`; a missing
+  exact binding is a configuration/recovery failure, never a silent
+  re-selection.
+- both tables MUST be physically write-once keyed by **both** identities: a
+  same-primary-key `INSERT`/`INSERT OR REPLACE` and a new-primary-key
+  `INSERT OR REPLACE` that reuses the durable unique identity
+  (`provisioning_bindings.incarnation_id`, `binding_snapshots.execution_id`) are
+  both rejected, because SQLite resolves a `UNIQUE` conflict before a delete
+  trigger fires while `recursive_triggers` is off. Every other durable UNIQUE
+  identity of the parent tables (`executions.request_id`, the active-execution-
+  per-Incarnation partial unique, the active-Incarnation-per-agent partial
+  unique, `incarnations.id`/`(logical_agent_id, generation)`,
+  `executions.id`/`attempt_id`) MUST likewise have a same-identity `BEFORE
+  INSERT` guard, so no `INSERT OR REPLACE` can delete a frozen parent to inject
+  a marker. Direct SQL can never replace a frozen binding or resurrect a prior
+  marker, and the durable provenance MUST never contain provider secret material.
+- `reconcile_pool` MUST resolve every live LogicalAgent through the
+  authoritative binding-coherence read before excluding typed population from
+  V0.1 capacity; a marker/child mismatch is corruption that aborts the whole
+  reconcile transaction, never a silent exclusion.
+
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
 change never alters a revision content digest:

@@ -255,6 +255,17 @@ impl FrozenExecutionSafety {
     }
 }
 
+/// Provider-neutral effective network policy carried to the physical execution
+/// request. Neutral M5 vocabulary: it MUST NOT be interpreted as a vendor enum.
+/// Defined in this crate so the ExecutionLaunchSnapshot and the adapter request
+/// share one type without adapter-api depending on agent-contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetworkEnforcement {
+    Disabled,
+    Restricted,
+    Enabled,
+}
+
 /// Opaque, provider-neutral identity of one concrete execution domain
 /// (host/boot/pid-namespace/installation). Core MUST NOT interpret it.
 /// `adapter_kind` is the driver family; this key is the installed instance.
@@ -450,25 +461,11 @@ pub fn resolve_execution_environment(
     let profile_name = binding.execution_profile.as_str();
     match mode {
         ExecutionResolutionMode::Authoritative(reg) => {
-            let target = reg
-                .get_target(target_name)
-                .ok_or_else(|| ResolutionError::TargetNotFound(target_name.to_string()))?;
-            let profile = reg
-                .get_profile(profile_name)
-                .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?;
-
-            if let Some(allowed) = &profile.allowed_targets {
-                if !allowed.contains(target_name) {
-                    return Err(ResolutionError::Incompatible(format!(
-                        "profile '{profile_name}' is not compatible with target '{target_name}'"
-                    )));
-                }
-            }
-
+            let (target, profile) = resolve_target_profile(reg, target_name, profile_name)?;
             let attempt_isolation = target.attempt_isolation;
             Ok(ResolvedExecutionEnvironment::new(
-                target.clone(),
-                profile.clone(),
+                target,
+                profile,
                 attempt_isolation,
                 binding.clone(),
             ))
@@ -480,6 +477,38 @@ pub fn resolve_execution_environment(
             binding.clone(),
         )),
     }
+}
+
+/// Pure target/profile validation against the authoritative registry.
+///
+/// Missing target/profile, or a profile whose `allowed_targets` excludes the
+/// target, is an authoritative configuration failure (`RESOURCE_UNAVAILABLE` in
+/// M5 terms). Unlike [`resolve_execution_environment`] this needs no Attempt
+/// identity, so a caller can reject a purely static misconfiguration BEFORE it
+/// commits authority or performs any physical work (used by the M6-B.4 typed
+/// acquisition, whose side-effectful materialization must not begin against an
+/// environment the M5 composition would reject).
+pub fn resolve_target_profile(
+    registry: &ExecutionRegistry,
+    target_name: &str,
+    profile_name: &str,
+) -> Result<(ExecutionTargetConfig, ExecutionProfileConfig), ResolutionError> {
+    let target = registry
+        .get_target(target_name)
+        .ok_or_else(|| ResolutionError::TargetNotFound(target_name.to_string()))?
+        .clone();
+    let profile = registry
+        .get_profile(profile_name)
+        .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?
+        .clone();
+    if let Some(allowed) = &profile.allowed_targets {
+        if !allowed.contains(target_name) {
+            return Err(ResolutionError::Incompatible(format!(
+                "profile '{profile_name}' is not compatible with target '{target_name}'"
+            )));
+        }
+    }
+    Ok((target, profile))
 }
 
 /// Authoritative launch snapshot reconstructed from durable Scheduler state.
@@ -511,6 +540,7 @@ pub struct ExecutionLaunchSnapshot {
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
+    required_network: NetworkEnforcement,
     task_name: String,
     payload: Value,
     acceptance: Value,
@@ -553,6 +583,7 @@ impl ExecutionLaunchSnapshot {
         execution_target: String,
         execution_profile: String,
         workspace_mode: WorkspaceMode,
+        required_network: NetworkEnforcement,
         task_name: String,
         payload: Value,
         acceptance: Value,
@@ -576,6 +607,7 @@ impl ExecutionLaunchSnapshot {
             execution_target,
             execution_profile,
             workspace_mode,
+            required_network,
             task_name,
             payload,
             acceptance,
@@ -643,6 +675,12 @@ impl ExecutionLaunchSnapshot {
 
     pub fn workspace_mode(&self) -> WorkspaceMode {
         self.workspace_mode
+    }
+
+    /// The effective (stricter) network policy the Task requires, carried to the
+    /// physical execution request so no layer widens it.
+    pub fn required_network(&self) -> NetworkEnforcement {
+        self.required_network
     }
 
     /// Durable human-readable Task label. Never send this to a worker as the

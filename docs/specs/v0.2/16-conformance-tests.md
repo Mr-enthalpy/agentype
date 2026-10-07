@@ -194,6 +194,227 @@ M6-B.3 typed admission and matching MUST cover:
   are different revisions
 - an old schema version (v5 and earlier) is rejected at open (D-DB-MIGRATE)
 
+M6-B.4 provisioning binding and exact launch MUST cover:
+
+- a typed Task stays `QUEUED` and acquires no Attempt/Lease/Execution until the
+  single authority-bearing typed acquisition re-proves every mandatory conjunct
+  (`can_execute`, `can_provision_task`, active `AdapterBindingPolicy` with
+  satisfied `required_safety`, exact binding) over the current catalog
+- acquisition proves `can_execute`/`can_provision_task` over the agent's actual
+  bound type (a refinement, broader, or otherwise compatible B.3 candidate is
+  accepted; a different revision of the same `type_id` is not), re-checks M5
+  placement (partition, tag superset, `Required` workstream), and rejects a
+  caller-assembled selection that does not satisfy the predicates
+- imported `ResolvedProvisioningEvidence` is produced only by the internal
+  resolver behind the `provisioning-producer` feature, is never injected through
+  a control surface, and a `DECLARED` label never satisfies a security class
+- the physical `execution_target`/`execution_profile` come from the
+  partition/anchor; the exact `(adapter_kind, adapter_binding_key)` the resolver
+  proved is carried into the acquisition and the snapshot, not re-supplied by a
+  caller, and a target/policy `adapter_kind` mismatch is ineligible
+- the `binding_ref` resolves to exactly one installed binding; a missing or
+  ambiguous `binding_ref` fails closed and never falls back to another source of
+  the same kind; a candidate-local ineligibility skips only that candidate while
+  catalog corruption fails the whole resolution
+- `provisioning_bindings` is write-once and per Incarnation; a B.3 semantic
+  binding alone is never physical eligibility; a source/config change mints a new
+  Incarnation rather than rebinding in place; a `PROVISIONED` Incarnation without
+  its row, or a `LEGACY` Incarnation with one, fails closed
+- `binding_snapshots` is created atomically with its `Execution` and must be
+  coherent with it (adapter key, target/profile, provisioning-binding provenance,
+  and validated config digest); a crash before the transaction leaves neither, a
+  crash after leaves both; a `SNAPSHOT` execution without its row, or a `NONE`
+  execution with one, fails closed
+- the write-once guards reject `INSERT OR REPLACE` keyed by the durable unique
+  identity (a new binding id with the same incarnation, or a new snapshot id with
+  the same execution), and durable parent identities cannot be replaced to inject
+  a marker
+- after `BindingSnapshot` commits, an adapter start failure follows M5
+  retry/recovery and MUST NOT start a second source; a missing exact binding
+  during recovery is `RESOURCE_UNAVAILABLE`, not a fallback
+- active source/config enumeration loads every immutable revision through the
+  validated catalog read, so a missing disposition overlay fails closed rather
+  than silently disappearing
+- `reconcile_pool` does not count or retire typed (`BOUND`) agents, while untyped
+  capacity behavior, MOVE/MERGE, and retirement fencing are unchanged
+- the durable store and logs contain no provider secret material; only a
+  `credential_refs_digest` is snapshotted, and credential availability is a B.5
+  conjunct
+- the authority transaction re-loads the `AdapterBindingPolicy` and rejects a
+  policy that is no longer `ACTIVE`, a kind that disagrees with the resolved
+  selection, or a `required_safety` the imported enforceability does not satisfy
+- the partition target's `adapter_kind` is compared with the policy's before any
+  Attempt/Lease is created, not deferred to Execution creation
+- `ProvisioningBinding` freezes the exact `(adapter_kind, adapter_binding_key)`,
+  so after a restart between acquisition and Execution the proven physical
+  domain is reconstructable and never silently re-derived
+- a resident Incarnation with a matching `ProvisioningBinding` is reused; a
+  differing source/config or exact domain rolls over to a fresh Incarnation; a
+  legacy Incarnation is adopted only when its prior physical hosting matches
+- `BindingSnapshot` semantic/security fields are cross-checked against durable
+  authority (the admitted requirement, the provisioning binding, the validated
+  config credential digest), so the snapshot cannot carry a fabricated payload
+- authoritative reads of the two objects cross-check the parent Incarnation/
+  Execution and re-resolve the catalogue provenance, failing closed on incoherence
+- the B.4 selection rule is the deterministically first eligible candidate; a
+  richer operator policy is a deferred seam
+- the imported evidence subject includes the exact `adapter_kind` and opaque
+  `adapter_binding_key`, and the authority transaction rejects evidence whose
+  domain disagrees with the selected binding
+- a legacy Incarnation with any execution history is never requalified into a new
+  SourceConfig provenance; it rolls over to a fresh Incarnation, and such a
+  legacy Incarnation is fenced
+- `ProvisioningBinding` is stable provisioning provenance (no per-Task
+  requirement digest); a changed resolved enforceability rolls over
+- the cross-record authority validators used at commitment are the same ones
+  used by the authoritative reads, so a self-consistent but incoherent row fails
+- `AdapterSafetyEnvelope::enforces_workspace` is exact-set membership (no
+  `Write⇒ReadOnly` inference)
+- a config with credential references gets no Attempt/Lease in B.4 (credential
+  availability is B.5; no caller-supplied fact can grant authority)
+- the authority facade commits the freshly resolved winner; more than one
+  candidate tied on continuity (with no availability/cost model) fails closed as
+  ambiguous
+- a selected SourceConfig is eligible only when the source integration attests a
+  materialization digest for the exact physical domain; the digest is frozen and
+  required, and an unattested `ExternalRef` config is ineligible
+- the single `acquire_typed_task` applies the spec 06 existing-first order and
+  provisions a new agent only when no existing candidate can be acquired
+- the unsandboxed local-process adapter imports no enforceable workspace/network
+  mode, so it is never a `required_workspace=Write` enforcement proof
+- a changed materialization attestation for the same source/config/domain rolls
+  over to a new Incarnation
+- the active-candidate frontier digest includes adapter-policy disposition and
+  uses the canonical structured encoding
+- eligibility uses a pure `attest`; the selected winner is resolved by a pure
+  `prepare` (no physical side effect — the exact adapter materializes the
+  descriptor during `start_execution`)
+- an empty materialization attestation is ineligible before selection
+- fallback to the next candidate/route happens only on the narrow explicit
+  candidate-local `ContractError` set; an `InvariantViolation` surfaced through
+  evidence, a storage failure, or a recovery-required error terminates the
+  acquisition
+- an ambiguous selection is task-terminal (it never falls through to a
+  lower-ranked agent or a new agent)
+- the selected winner is prepared only AFTER its claim/binding is durably
+  committed; losers are never prepared, and neither `attest` nor `prepare` creates
+  a physical resource (no side effect precedes the Execution)
+- `attest` and `prepare` each receive one absolute `AdapterDeadline`; the
+  enumeration deadline and the winner-preparation deadline are distinct, so
+  candidate probes cannot consume the preparation budget
+- `acquire_typed_task` and the resolution mechanics are not reachable through the
+  supported runtime surface (compile-fail witness)
+- a global authority-snapshot invalidation (`StaleAuthority`, e.g. a changed
+  catalog frontier) re-resolves the whole acquisition and never falls through to
+  a lower-ranked agent, while a per-candidate storage rejection may fall through
+- the prepared descriptor's re-derived digest must exact-match the durably
+  committed `attested_materialization_digest`, so an attest/prepare TOCTOU cannot
+  produce an Execution; the digest is a canonical `sha256:<64 lowercase hex>`
+  value (a source integration cannot inject an arbitrary string), and the
+  mismatch error never echoes a source-produced value
+- a pure `prepare` failure or handoff failure is provably side-effect-free: a
+  static/liveness failure settles the committed Attempt/Lease/assignment as
+  `RESOURCE_UNAVAILABLE`, an authority loss is left to recovery (no Task-level
+  nack), and a durable persistence/corruption fault is fatal and propagated,
+  never surfaced as a Task-level `RESOURCE_UNAVAILABLE`
+- a `SourceConfigIntegration` result obtained after the absolute `AdapterDeadline`
+  yields a non-candidate-local `ProvisioningDeadlineExceeded` for both `attest`
+  and `prepare`
+- a process death after the authority COMMIT but before the Execution commitment
+  (there is no pre-Execution side effect) is recovered by frozen M5
+  `recover_authority` as an ordinary interrupted acquisition
+  (`CLAIM_ORPHANED`/`ExecutionLost`); `materialize` creates no environment
+- authority is re-qualified (`claim_authority_is_current`) both BEFORE and after
+  the pure `prepare`; a stale claim is settled as authority loss, not a reported
+  success
+- the same operator `binding_ref` may resolve within two different
+  `adapter_kind`s without collision, while remaining unique within one kind
+- the acquisition carries its winner candidate out, and the Execution handoff
+  commits a snapshot-bearing Execution (`create_execution_with_snapshot`) whose
+  `BindingSnapshot` carries the acquisition's exact `adapter_kind`/
+  `adapter_binding_key`/`attested_materialization_digest` and the resolved environment's
+  isolation; a candidate that disagrees with the authoritative partition target
+  fails closed rather than committing an Execution
+- a binding whose capability does not satisfy its policy `required_safety`, or a
+  snapshot whose effective workspace/network is not enforceable by the binding
+  capability, fails the authoritative read
+- the effective `attempt_isolation` is authoritative from the ExecutionRegistry
+  target; a Task requiring isolation on a non-isolating target is ineligible, and
+  the snapshot isolation equals the frozen Execution isolation
+- the effective network policy is carried on the provider-neutral
+  `EnvironmentStartRequest`
+- an `OpaqueJson` config is eligible once its body digest validates; an
+  `ExternalRef` config is eligible only when a source integration attests the
+  declared content identity under the exact physical domain, and is ineligible
+  until then
+- a credential-bearing config is filtered before deterministic selection, so a
+  stronger credential-bearing candidate can never shadow a credential-free one;
+  likewise a wrong-target-kind candidate is filtered before selection
+- the partition's full target+profile is validated (missing profile, or
+  incompatible `allowed_targets`) before the authority transaction, so the Task
+  stays `QUEUED` with no Attempt/Lease/ProvisioningBinding and `prepare` is
+  never invoked
+- `MOVE_CAPACITY` moves only `UNBOUND` LogicalAgents; a `BOUND` typed agent is
+  never relocated by a legacy capacity command (ADR-0009)
+- cancelling a prepared-but-not-started typed claim simply releases the agent
+  (there is no pre-Execution side effect and therefore no writer-quiescence
+  obligation)
+- the descriptor is causally bound to the launch: the opaque launch descriptor
+  returned by `prepare` is frozen in the `BindingSnapshot` and carried on the
+  `EnvironmentStartRequest` delivered to the exact adapter, which physically
+  materializes it during `start_execution`
+- the descriptor protocol is a proven composition relation: eligibility requires
+  the source-local integration's protocol to equal the exact adapter binding's
+  `import_provisioning_protocol`, the protocol is frozen in the
+  `ProvisioningBinding`, and the handoff re-checks the current adapter's protocol
+  against it
+- provisioning capability is optional: an adapter that does not declare a
+  non-blank `import_provisioning_protocol` is not provisioning-capable and is
+  ineligible for typed acquisition (the reference local-process adapter declares
+  none, because its `start_execution` ignores a descriptor)
+- the candidate universe is source-local: an active source whose
+  `SpawnSourceRef` is not routed to an integration by the composition root is
+  ineligible, so one source's opaque config is never interpreted by another
+  source's integration
+- a typed-handoff failure is classified: only a pre-start availability failure
+  settles as `RESOURCE_UNAVAILABLE`; authority loss is left to recovery; durable
+  corruption/persistence is fatal; and every fallible composition check runs
+  before the Execution is committed
+- the source/config effective lifecycle must contain the member's realized M4
+  `Retention` (`Resident`/`Ephemeral`), proved in the resolver and the authority
+  transaction
+- the prepare fence is the full committed-claim authority check
+  (`AuthoritySnapshot` + Claim-identity coherence)
+- the handoff re-qualifies the currently installed enforceability against the
+  committed capability: an importer that keeps the exact `(kind, key)` but
+  weakens workspace/network/isolation must not produce an Execution (settled as a
+  pre-start `RESOURCE_UNAVAILABLE`)
+- the typed handoff error exposes no Task failure class; a settlement failure
+  that is not a confirmed authority loss is surfaced as fatal, never normalized
+  to `RESOURCE_UNAVAILABLE`
+- `ProvisioningBinding.agent_type` must equal the agent's frozen
+  `LogicalAgentTypeBinding`
+- the authoritative read accepts any `agentype-resolver/*` resolver version
+- the effective attempt-isolation requirement is the OR of the AgentType and Task
+  flags, checked against the authoritative target before authority AND re-proved
+  at Execution commitment, so an `unisolated` safety that lowers it fails
+- restart reconciliation validates each Execution's snapshot marker/child
+  coherence; a `SNAPSHOT` execution with a missing/incoherent snapshot aborts
+- the authority transaction rejects a selection whose active-candidate frontier
+  changed since resolution (concurrent publish)
+- a domain that can isolate but does not use it is representable: the
+  ProvisioningBinding capability and the BindingSnapshot effective isolation are
+  distinct and both valid
+- a TYPED Task cannot commit through the legacy `create_execution`
+- the authority facade commits the deterministic selection, not a caller-chosen
+  eligible candidate
+- `reconcile_pool` aborts on a marker/child binding mismatch rather than
+  silently excluding the agent from capacity
+- `INSERT OR REPLACE` is rejected for every durable UNIQUE identity
+  (`request_id`, active execution per Incarnation, active Incarnation per agent,
+  ...)
+- an old schema version (v7 and earlier) is rejected at open (`D-DB-MIGRATE`)
+
 ## C. Provider/frontend neutrality (M7)
 
 A **second independent** adapter MUST be addable without Core state-machine

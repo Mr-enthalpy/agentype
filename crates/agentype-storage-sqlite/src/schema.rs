@@ -12,10 +12,13 @@
 /// from mutable disposition overlays. Version 7 adds M6-B.3 typed agent
 /// requirements and bindings (`task_agent_requirements`,
 /// `logical_agent_type_bindings`) and the immutable optional
-/// `generation_policies` ceiling. Older files are rejected at open (fail
+/// `generation_policies` ceiling. Version 8 adds M6-B.4 provisioning bindings
+/// (`provisioning_bindings`, `binding_snapshots`) with the parent presence
+/// markers (`incarnations.provisioning_mode`,
+/// `executions.binding_snapshot_mode`). Older files are rejected at open (fail
 /// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
 /// in-place upgrade.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -129,6 +132,7 @@ CREATE TABLE IF NOT EXISTS incarnations (
     generation INTEGER NOT NULL CHECK (generation >= 1),
     execution_target TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('STARTING','WARM','COLD','LOST','TERMINATED')),
+    provisioning_mode TEXT NOT NULL DEFAULT 'LEGACY' CHECK (provisioning_mode IN ('LEGACY','PROVISIONED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -188,6 +192,7 @@ CREATE TABLE IF NOT EXISTS executions (
     adapter_kind TEXT NOT NULL,
     adapter_binding_key TEXT NOT NULL,
     attempt_isolation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_isolation IN (0,1)),
+    binding_snapshot_mode TEXT NOT NULL DEFAULT 'NONE' CHECK (binding_snapshot_mode IN ('NONE','SNAPSHOT')),
     state TEXT NOT NULL CHECK (state IN ('STARTING','RUNNING','SUCCEEDED','FAILED','LOST','UNKNOWN','TERMINATED')),
     runtime_handle_json TEXT NOT NULL DEFAULT '{}',
     outcome_json TEXT,
@@ -836,5 +841,192 @@ BEFORE UPDATE OF policy_mode ON generations
 WHEN OLD.policy_mode IS NOT NEW.policy_mode
 BEGIN
     SELECT RAISE(ABORT, 'a generation policy mode is immutable');
+END;
+
+-- =========================================================================
+-- M6-B.4 provisioning bindings and binding snapshots (schema v8)
+--
+-- A provisioning binding freezes one Incarnation's exact source/config/policy
+-- choice; a binding snapshot freezes one Execution's exact physical choice. Both
+-- are immutable and write-once. The parent presence markers
+-- (incarnations.provisioning_mode, executions.binding_snapshot_mode) make a
+-- missing child row corruption rather than a silent downgrade.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS provisioning_bindings (
+    provisioning_binding_id TEXT PRIMARY KEY,
+    logical_agent_id TEXT NOT NULL REFERENCES logical_agents(id) ON DELETE RESTRICT,
+    incarnation_id TEXT NOT NULL UNIQUE REFERENCES incarnations(id) ON DELETE RESTRICT,
+    agent_type_id TEXT NOT NULL,
+    agent_type_revision INTEGER NOT NULL CHECK (agent_type_revision >= 1),
+    record_json TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (agent_type_id, agent_type_revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS binding_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id) ON DELETE RESTRICT,
+    provisioning_binding_id TEXT NOT NULL REFERENCES provisioning_bindings(provisioning_binding_id) ON DELETE RESTRICT,
+    adapter_kind TEXT NOT NULL CHECK (length(trim(adapter_kind)) > 0),
+    adapter_binding_key TEXT NOT NULL CHECK (length(trim(adapter_binding_key)) > 0),
+    execution_target TEXT NOT NULL,
+    execution_profile TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS binding_snapshots_binding_idx
+ON binding_snapshots(provisioning_binding_id);
+
+CREATE TRIGGER IF NOT EXISTS provisioning_bindings_immutable_update
+BEFORE UPDATE ON provisioning_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a provisioning binding is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS provisioning_bindings_immutable_delete
+BEFORE DELETE ON provisioning_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a provisioning binding is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS provisioning_bindings_no_reinsert
+BEFORE INSERT ON provisioning_bindings
+WHEN EXISTS(SELECT 1 FROM provisioning_bindings WHERE provisioning_binding_id=NEW.provisioning_binding_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a provisioning binding is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS binding_snapshots_immutable_update
+BEFORE UPDATE ON binding_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'a binding snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS binding_snapshots_immutable_delete
+BEFORE DELETE ON binding_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'a binding snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS binding_snapshots_no_reinsert
+BEFORE INSERT ON binding_snapshots
+WHEN EXISTS(SELECT 1 FROM binding_snapshots WHERE snapshot_id=NEW.snapshot_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a binding snapshot is write-once');
+END;
+
+-- A provisioning binding may only exist under a PROVISIONED incarnation, and a
+-- binding snapshot only under a SNAPSHOT execution, so the parent marker and the
+-- child row cannot be manufactured independently by direct SQL.
+CREATE TRIGGER IF NOT EXISTS provisioning_bindings_require_provisioned_parent
+BEFORE INSERT ON provisioning_bindings
+WHEN (SELECT provisioning_mode FROM incarnations WHERE id=NEW.incarnation_id) IS NOT 'PROVISIONED'
+BEGIN
+    SELECT RAISE(ABORT, 'a provisioning binding requires a PROVISIONED incarnation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS binding_snapshots_require_snapshot_parent
+BEFORE INSERT ON binding_snapshots
+WHEN (SELECT binding_snapshot_mode FROM executions WHERE id=NEW.execution_id) IS NOT 'SNAPSHOT'
+BEGIN
+    SELECT RAISE(ABORT, 'a binding snapshot requires a SNAPSHOT execution');
+END;
+
+CREATE TRIGGER IF NOT EXISTS incarnations_provisioning_mode_no_downgrade
+BEFORE UPDATE OF provisioning_mode ON incarnations
+WHEN OLD.provisioning_mode = 'PROVISIONED' AND NEW.provisioning_mode = 'LEGACY'
+BEGIN
+    SELECT RAISE(ABORT, 'a provisioned incarnation cannot become legacy');
+END;
+
+CREATE TRIGGER IF NOT EXISTS executions_binding_snapshot_mode_no_downgrade
+BEFORE UPDATE OF binding_snapshot_mode ON executions
+WHEN OLD.binding_snapshot_mode = 'SNAPSHOT' AND NEW.binding_snapshot_mode = 'NONE'
+BEGIN
+    SELECT RAISE(ABORT, 'a snapshotted execution cannot lose its snapshot marker');
+END;
+
+-- The durable unique identities are the real write-once keys. A same-id
+-- `INSERT` guard alone is insufficient: `INSERT OR REPLACE` with a *new*
+-- primary key but the same `incarnation_id` (or `execution_id`) resolves the
+-- UNIQUE conflict before any delete trigger fires while `recursive_triggers` is
+-- off, silently replacing the frozen row. Guard both identities explicitly.
+CREATE TRIGGER IF NOT EXISTS provisioning_bindings_no_incarnation_reinsert
+BEFORE INSERT ON provisioning_bindings
+WHEN EXISTS(SELECT 1 FROM provisioning_bindings WHERE incarnation_id=NEW.incarnation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'an incarnation already has a provisioning binding');
+END;
+
+CREATE TRIGGER IF NOT EXISTS binding_snapshots_no_execution_reinsert
+BEFORE INSERT ON binding_snapshots
+WHEN EXISTS(SELECT 1 FROM binding_snapshots WHERE execution_id=NEW.execution_id)
+BEGIN
+    SELECT RAISE(ABORT, 'an execution already has a binding snapshot');
+END;
+
+-- Incarnations and executions are durable parent identities whose markers must
+-- not be replaced to inject a different provisioning/snapshot state.
+CREATE TRIGGER IF NOT EXISTS incarnations_no_identity_replace
+BEFORE INSERT ON incarnations
+WHEN EXISTS(SELECT 1 FROM incarnations WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable incarnation identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS incarnations_no_generation_replace
+BEFORE INSERT ON incarnations
+WHEN EXISTS(SELECT 1 FROM incarnations
+            WHERE logical_agent_id=NEW.logical_agent_id AND generation=NEW.generation)
+BEGIN
+    SELECT RAISE(ABORT, 'an incarnation generation cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS executions_no_identity_replace
+BEFORE INSERT ON executions
+WHEN EXISTS(SELECT 1 FROM executions WHERE id=NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable execution identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS executions_no_attempt_replace
+BEFORE INSERT ON executions
+WHEN EXISTS(SELECT 1 FROM executions WHERE attempt_id=NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'an attempt already has an execution history row');
+END;
+
+-- The remaining UNIQUE/partial-UNIQUE identities are also durable identities:
+-- `INSERT OR REPLACE` can resolve any of them by deleting the conflicting row, so
+-- each needs its own BEFORE INSERT guard.
+CREATE TRIGGER IF NOT EXISTS executions_no_request_replace
+BEFORE INSERT ON executions
+WHEN EXISTS(SELECT 1 FROM executions WHERE request_id=NEW.request_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a durable request identity cannot be replaced');
+END;
+
+CREATE TRIGGER IF NOT EXISTS executions_no_active_incarnation_replace
+BEFORE INSERT ON executions
+WHEN NEW.state IN ('STARTING','RUNNING','UNKNOWN')
+ AND EXISTS(SELECT 1 FROM executions
+            WHERE incarnation_id=NEW.incarnation_id
+              AND state IN ('STARTING','RUNNING','UNKNOWN'))
+BEGIN
+    SELECT RAISE(ABORT, 'an incarnation already owns an active execution');
+END;
+
+CREATE TRIGGER IF NOT EXISTS incarnations_no_active_agent_replace
+BEFORE INSERT ON incarnations
+WHEN NEW.state IN ('STARTING','WARM','COLD')
+ AND EXISTS(SELECT 1 FROM incarnations
+            WHERE logical_agent_id=NEW.logical_agent_id
+              AND state IN ('STARTING','WARM','COLD'))
+BEGIN
+    SELECT RAISE(ABORT, 'a LogicalAgent already has an active incarnation');
 END;
 "#;

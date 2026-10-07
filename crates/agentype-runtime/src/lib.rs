@@ -19,6 +19,7 @@ pub mod observation;
 pub mod observer;
 pub mod process_lock;
 pub mod provisioning_admin;
+pub mod provisioning_resolver;
 pub mod recovery;
 pub mod scheduler_control;
 pub mod semantic_control;
@@ -42,6 +43,13 @@ pub use semantic_control::RootSemanticControl;
 // AgentType revisions and read typed requirements / match results. Deliberately
 // separate from `RootSemanticControl`.
 pub use provisioning_admin::ProvisioningAdmin;
+// The authority-bearing typed acquisition (`acquire_typed_task`) and the
+// candidate resolution mechanics are daemon-internal: they accept the mechanical
+// `Kernel` and are owned by the (not-yet-wired) ControlLoopService. Only the
+// source-integration SPI and the diagnostic candidate value are public here.
+pub use provisioning_resolver::{
+    ProvisioningResolutionError, SourceConfigIntegration, SourceProvisioningCandidate,
+};
 // M6-B operator catalog administration: publish the immutable B.2 capability /
 // AgentType revisions that typed admission and binding require.
 pub use catalog_admin::CatalogAdmin;
@@ -95,6 +103,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Source-integration protocol identity used by test/composition helpers that
+/// assemble a binding without a real `ImportableAdapter`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const TEST_PROVISIONING_PROTOCOL: &str = "agentype-test-source/1";
+
 /// Preparation failure of the canonical launch façade.
 ///
 /// Configuration-resolution failures are frozen at this boundary to the
@@ -145,6 +158,76 @@ impl std::fmt::Display for ExecutionPreparationError {
 }
 
 impl std::error::Error for ExecutionPreparationError {}
+
+/// Failure of the typed provisioning handoff ([`prepare_typed_execution_launch`]).
+///
+/// Provisioning is prepare-only (no physical side effect before the Execution),
+/// so the only Task-level settlement is a pre-start availability failure
+/// (`RESOURCE_UNAVAILABLE`); authority loss is left to recovery and durable
+/// corruption/persistence is fatal. There is deliberately no
+/// `standard_failure_class`, so a future caller cannot mechanically re-classify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypedLaunchError {
+    Configuration(ResolutionError),
+    InvalidBinding(ConfigurationError),
+    Adapter(AdapterUnavailable),
+    /// The installed adapter no longer accepts the committed descriptor protocol
+    /// or no longer enforces the committed capability — a pre-start availability
+    /// failure (`RESOURCE_UNAVAILABLE`).
+    Weakened(String),
+    /// The acquired candidate disagrees with the authoritative partition target
+    /// or the committed binding — durable inconsistency, never a candidate choice.
+    Inconsistent(String),
+    Kernel(Error),
+    /// The pre-start settlement itself failed with a persistence/invariant fault:
+    /// fatal control-plane fault, surfaced rather than swallowed.
+    SettlementFailed(Error),
+}
+
+/// How a typed-handoff failure must be treated. Only a pre-start availability
+/// failure is settled as the Task-level `RESOURCE_UNAVAILABLE`; everything else
+/// is left to recovery (authority loss) or propagated fatally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedLaunchDisposition {
+    PreStartUnavailable,
+    AuthorityLoss,
+    Fatal,
+}
+
+impl TypedLaunchError {
+    pub(crate) fn disposition(&self) -> TypedLaunchDisposition {
+        match self {
+            Self::Configuration(_)
+            | Self::InvalidBinding(_)
+            | Self::Adapter(_)
+            | Self::Weakened(_) => TypedLaunchDisposition::PreStartUnavailable,
+            Self::Kernel(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                TypedLaunchDisposition::AuthorityLoss
+            }
+            Self::Inconsistent(_) | Self::Kernel(_) | Self::SettlementFailed(_) => {
+                TypedLaunchDisposition::Fatal
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TypedLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(e) => write!(f, "typed execution configuration unavailable: {e}"),
+            Self::InvalidBinding(e) => write!(f, "typed execution binding invalid: {e}"),
+            Self::Adapter(e) => write!(f, "typed execution adapter unavailable: {e}"),
+            Self::Weakened(m) => write!(f, "typed execution adapter weakened: {m}"),
+            Self::Inconsistent(m) => write!(f, "typed execution inconsistent: {m}"),
+            Self::Kernel(e) => write!(f, "typed execution launch rejected: {e}"),
+            Self::SettlementFailed(e) => {
+                write!(f, "typed execution pre-start settlement failed: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TypedLaunchError {}
 
 /// Authoritative launch snapshot, the runtime-assembled worker request, and
 /// the resolved environment that minted the persisted safety proof — bound to
@@ -245,10 +328,12 @@ pub fn prepare_execution_launch(
 pub enum AdapterRegistryError {
     InvalidKind(String),
     InvalidBindingKey(String),
+    InvalidBindingRef(String),
     DuplicateBinding {
         adapter_kind: String,
         adapter_binding_key: String,
     },
+    DuplicateBindingRef(String),
 }
 
 impl std::fmt::Display for AdapterRegistryError {
@@ -256,12 +341,17 @@ impl std::fmt::Display for AdapterRegistryError {
         match self {
             Self::InvalidKind(m) => write!(f, "invalid adapter kind: {m}"),
             Self::InvalidBindingKey(m) => write!(f, "invalid adapter binding key: {m}"),
+            Self::InvalidBindingRef(m) => write!(f, "invalid adapter binding_ref: {m}"),
             Self::DuplicateBinding {
                 adapter_kind,
                 adapter_binding_key,
             } => write!(
                 f,
                 "duplicate adapter binding registration: kind '{adapter_kind}' key '{adapter_binding_key}'"
+            ),
+            Self::DuplicateBindingRef(binding_ref) => write!(
+                f,
+                "duplicate adapter binding_ref registration: '{binding_ref}'"
             ),
         }
     }
@@ -276,9 +366,19 @@ impl std::error::Error for AdapterRegistryError {}
 /// same driver family fail closed until the caller uses `resolve_exact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterUnavailable {
-    Missing { adapter_kind: String },
-    Ambiguous { adapter_kind: String },
-    IsolationNotEnforceable { adapter_kind: String },
+    Missing {
+        adapter_kind: String,
+    },
+    Ambiguous {
+        adapter_kind: String,
+    },
+    IsolationNotEnforceable {
+        adapter_kind: String,
+    },
+    BindingRefUnresolved {
+        adapter_kind: String,
+        binding_ref: String,
+    },
 }
 
 impl AdapterUnavailable {
@@ -286,7 +386,8 @@ impl AdapterUnavailable {
         match self {
             Self::Missing { adapter_kind }
             | Self::Ambiguous { adapter_kind }
-            | Self::IsolationNotEnforceable { adapter_kind } => adapter_kind,
+            | Self::IsolationNotEnforceable { adapter_kind }
+            | Self::BindingRefUnresolved { adapter_kind, .. } => adapter_kind,
         }
     }
 }
@@ -306,6 +407,13 @@ impl std::fmt::Display for AdapterUnavailable {
                 f,
                 "installed adapter for kind '{adapter_kind}' cannot enforce attempt_isolation"
             ),
+            Self::BindingRefUnresolved {
+                adapter_kind,
+                binding_ref,
+            } => write!(
+                f,
+                "binding_ref '{binding_ref}' does not resolve to an installed '{adapter_kind}' binding"
+            ),
         }
     }
 }
@@ -322,14 +430,28 @@ impl std::error::Error for AdapterUnavailable {}
 #[derive(Clone, Default)]
 pub struct AdapterRegistry {
     adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
+    /// Stable operator alias -> exact imported binding key, scoped by
+    /// `adapter_kind` (the frozen contract resolves `binding_ref` *within* the
+    /// policy's `adapter_kind`). Populated only from `ImportedExecutionBinding`s
+    /// that declare an alias, so the same alias may name distinct bindings of
+    /// different kinds without collision.
+    binding_refs: HashMap<(String, String), AdapterBindingKey>,
 }
 
 /// Kind, domain key, and enforceable safety produced together by an importer.
 /// Composition cannot assemble a mismatched key or isolation claim.
+///
+/// `binding_ref` is the optional stable operator alias (the
+/// `AdapterBindingPolicy.binding_ref`). When present it resolves to exactly one
+/// imported `(adapter_kind, adapter_binding_key)`. It is composition intent, not
+/// adapter vocabulary, so it is supplied explicitly rather than derived from the
+/// adapter.
 pub struct ImportedExecutionBinding {
     adapter_kind: String,
     adapter_binding_key: AdapterBindingKey,
+    binding_ref: Option<String>,
     safety: AdapterSafetyEnvelope,
+    provisioning_protocol: Option<String>,
     adapter: Arc<dyn ExecutionAdapter>,
 }
 
@@ -338,13 +460,30 @@ impl ImportedExecutionBinding {
         let adapter_kind = adapter.import_kind().to_string();
         let adapter_binding_key = adapter.import_binding_key();
         let safety = AdapterSafetyEnvelope::unenforceable()
-            .with_attempt_isolation(adapter.import_attempt_isolation());
+            .with_attempt_isolation(adapter.import_attempt_isolation())
+            .with_enforceable_workspace(adapter.import_enforceable_workspace())
+            .with_enforceable_network(adapter.import_enforceable_network());
+        let provisioning_protocol = adapter.import_provisioning_protocol().map(str::to_string);
         let exec: Arc<dyn ExecutionAdapter> = adapter.clone();
         Self {
             adapter_kind,
             adapter_binding_key,
+            binding_ref: None,
             safety,
+            provisioning_protocol,
             adapter: exec,
+        }
+    }
+
+    /// Import an adapter with a stable operator alias. The alias resolves to
+    /// exactly one imported binding; a blank alias is rejected at registration.
+    pub fn from_importable_with_binding_ref(
+        adapter: Arc<dyn ImportableAdapter>,
+        binding_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            binding_ref: Some(binding_ref.into()),
+            ..Self::from_importable(adapter)
         }
     }
 
@@ -357,9 +496,17 @@ impl ImportedExecutionBinding {
         Self {
             adapter_kind: adapter_kind.into(),
             adapter_binding_key: AdapterBindingKey::for_tests(),
+            binding_ref: None,
             safety,
+            provisioning_protocol: Some(TEST_PROVISIONING_PROTOCOL.to_string()),
             adapter,
         }
+    }
+
+    /// The source-integration protocol this imported binding accepts, if it is
+    /// provisioning-capable.
+    pub fn provisioning_protocol(&self) -> Option<&str> {
+        self.provisioning_protocol.as_deref()
     }
 
     pub fn adapter_kind(&self) -> &str {
@@ -368,6 +515,10 @@ impl ImportedExecutionBinding {
 
     pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
         &self.adapter_binding_key
+    }
+
+    pub fn binding_ref(&self) -> Option<&str> {
+        self.binding_ref.as_deref()
     }
 }
 
@@ -384,9 +535,11 @@ impl AdapterRegistry {
         self.insert_binding(
             binding.adapter_kind,
             binding.adapter_binding_key,
+            binding.binding_ref,
             binding.adapter,
             deadlines,
             binding.safety,
+            binding.provisioning_protocol,
         )
     }
 
@@ -397,6 +550,20 @@ impl AdapterRegistry {
     ) -> Result<(), AdapterRegistryError> {
         self.import(
             ImportedExecutionBinding::from_importable(adapter),
+            deadlines,
+        )
+    }
+
+    /// Import an adapter under a stable operator alias so an
+    /// `AdapterBindingPolicy.binding_ref` resolves to it.
+    pub fn import_source_with_binding_ref(
+        &mut self,
+        adapter: Arc<dyn ImportableAdapter>,
+        binding_ref: impl Into<String>,
+        deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.import(
+            ImportedExecutionBinding::from_importable_with_binding_ref(adapter, binding_ref),
             deadlines,
         )
     }
@@ -439,21 +606,54 @@ impl AdapterRegistry {
                 "adapter binding key cannot be empty".into(),
             ));
         }
-        self.insert_binding(kind, adapter_binding_key, adapter, deadlines, safety)
+        self.insert_binding(
+            kind,
+            adapter_binding_key,
+            None,
+            adapter,
+            deadlines,
+            safety,
+            Some(TEST_PROVISIONING_PROTOCOL.to_string()),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_binding(
         &mut self,
         kind: String,
         adapter_binding_key: AdapterBindingKey,
+        binding_ref: Option<String>,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
         safety: AdapterSafetyEnvelope,
+        provisioning_protocol: Option<String>,
     ) -> Result<(), AdapterRegistryError> {
         if kind.trim().is_empty() {
             return Err(AdapterRegistryError::InvalidKind(
                 "adapter kind cannot be empty".into(),
             ));
+        }
+        if let Some(protocol) = &provisioning_protocol {
+            if protocol.trim().is_empty() {
+                return Err(AdapterRegistryError::InvalidBindingRef(
+                    "adapter provisioning protocol cannot be blank".into(),
+                ));
+            }
+        }
+        if let Some(alias) = &binding_ref {
+            if alias.trim().is_empty() {
+                return Err(AdapterRegistryError::InvalidBindingRef(
+                    "adapter binding_ref cannot be empty".into(),
+                ));
+            }
+        }
+        if let Some(alias) = &binding_ref {
+            if self
+                .binding_refs
+                .contains_key(&(kind.clone(), alias.clone()))
+            {
+                return Err(AdapterRegistryError::DuplicateBindingRef(alias.clone()));
+            }
         }
         let by_key = self.adapters.entry(kind.clone()).or_default();
         if by_key.contains_key(&adapter_binding_key) {
@@ -464,9 +664,43 @@ impl AdapterRegistry {
         }
         by_key.insert(
             adapter_binding_key.clone(),
-            ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines, safety),
+            ResolvedAdapterBinding::new(
+                kind.clone(),
+                adapter_binding_key.clone(),
+                adapter,
+                deadlines,
+                safety,
+                provisioning_protocol,
+            ),
         );
+        if let Some(alias) = binding_ref {
+            self.binding_refs.insert((kind, alias), adapter_binding_key);
+        }
         Ok(())
+    }
+
+    /// Test helper: register an installed binding under a stable operator alias
+    /// so `resolve_binding_ref` can be exercised without a real importer.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_safety_and_ref(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        binding_ref: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
+    ) -> Result<(), AdapterRegistryError> {
+        self.insert_binding(
+            adapter_kind.into(),
+            adapter_binding_key,
+            Some(binding_ref.into()),
+            adapter,
+            deadlines,
+            safety,
+            Some(TEST_PROVISIONING_PROTOCOL.to_string()),
+        )
     }
 
     /// Test helper: register with `AdapterBindingKey::for_tests()`.
@@ -518,6 +752,28 @@ impl AdapterRegistry {
             .ok_or_else(|| AdapterUnavailable::Missing {
                 adapter_kind: adapter_kind.to_string(),
             })
+    }
+
+    /// M6-B.4 typed launch lookup: resolve the stable operator `binding_ref`
+    /// (the `AdapterBindingPolicy.binding_ref`) to the exact imported binding of
+    /// the policy's `adapter_kind`. The alias is scoped to `adapter_kind`, so the
+    /// same alias names distinct bindings of different kinds; an alias missing
+    /// within this kind fails closed with no fallback to another source.
+    pub fn resolve_binding_ref(
+        &self,
+        adapter_kind: &str,
+        binding_ref: &str,
+    ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
+        match self
+            .binding_refs
+            .get(&(adapter_kind.to_string(), binding_ref.to_string()))
+        {
+            Some(key) => self.resolve_exact(adapter_kind, key),
+            None => Err(AdapterUnavailable::BindingRefUnresolved {
+                adapter_kind: adapter_kind.to_string(),
+                binding_ref: binding_ref.to_string(),
+            }),
+        }
     }
 }
 
@@ -684,6 +940,213 @@ pub fn resolve_physical_execution_environment(
         binding,
         environment,
         adapter_binding,
+    })
+}
+
+/// Typed provisioning handoff: commit the snapshot-bearing Execution for a
+/// durably committed typed acquisition and assemble the physical start request.
+///
+/// Daemon-internal. This closes the otherwise-missing data-flow between the
+/// acquisition facade (`acquire_typed_task`, which commits the
+/// Attempt/Lease/ProvisioningBinding) and the Execution commitment, using the
+/// exact winner candidate the authority transaction proved. It deliberately does
+/// NOT start the adapter: the physical `start_execution` plus the immediate
+/// observation commit belong to the daemon dispatch step (not yet wired), so this
+/// stops at the assembled `EnvironmentStartRequest`. The exact physical domain
+/// (`adapter_kind`/`adapter_binding_key`) comes from the acquisition, never from
+/// `resolve_unique` or a caller-supplied key.
+#[allow(dead_code)]
+pub(crate) fn prepare_typed_execution_launch(
+    kernel: &Kernel,
+    outcome: crate::provisioning_resolver::TypedAcquisitionOutcome,
+    execution_registry: &ExecutionRegistry,
+    adapters: &AdapterRegistry,
+) -> Result<PreparedExecutionLaunch, TypedLaunchError> {
+    let claim = outcome.acquisition.claim.clone();
+    // PHASE 1 — all fallible pre-start composition checks, BEFORE any Execution
+    // is committed. Only a pre-start availability failure is a Task-level
+    // `RESOURCE_UNAVAILABLE`; authority loss is left to recovery and a durable
+    // corruption/persistence fault is fatal (never disguised as a Task failure).
+    let plan = match plan_typed_execution_launch(kernel, &outcome, execution_registry, adapters) {
+        Ok(plan) => plan,
+        Err(err) => {
+            if matches!(
+                err.disposition(),
+                TypedLaunchDisposition::PreStartUnavailable
+            ) {
+                match kernel.report_configuration_unavailable(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    &err.to_string(),
+                ) {
+                    Ok(_) => {}
+                    Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {}
+                    Err(e) => return Err(TypedLaunchError::SettlementFailed(e)),
+                }
+            }
+            return Err(err);
+        }
+    };
+    // PHASE 2 — commit the snapshot-bearing Execution. A failure here is an
+    // authority loss or a fatal persistence fault, NEVER a Task-level
+    // configuration failure; recovery reconciles the (absent) Execution.
+    let snapshot = kernel
+        .create_execution_with_snapshot(&claim, plan.physical_binding, &plan.snapshot_record)
+        .map_err(TypedLaunchError::Kernel)?;
+    // PHASE 3 — assemble the physical start request. This is infallible by
+    // construction (the environment matches the committed binding), and even if
+    // it failed here the Execution already exists and recovery reconciles it, so
+    // no Task-level nack is fabricated.
+    let request = EnvironmentStartRequest::from_launch_with_descriptor(
+        &snapshot,
+        &plan.environment,
+        plan.descriptor,
+    )
+    .map_err(|m| TypedLaunchError::Kernel(Error::invalid_authority(m.detail)))?;
+    Ok(PreparedExecutionLaunch {
+        snapshot,
+        request,
+        resolved_environment: plan.environment,
+    })
+}
+
+/// The fully validated, still-uncommitted typed launch plan.
+struct TypedLaunchPlan {
+    environment: ResolvedExecutionEnvironment,
+    physical_binding: FrozenPhysicalExecutionBinding,
+    snapshot_record: agentype_agent_contract::BindingSnapshot,
+    descriptor: String,
+}
+
+/// Map the agent-contract `NetworkPolicy` to the provider-neutral
+/// `NetworkEnforcement` (identical variants).
+fn network_enforcement(policy: agentype_agent_contract::NetworkPolicy) -> NetworkEnforcement {
+    match policy {
+        agentype_agent_contract::NetworkPolicy::Disabled => NetworkEnforcement::Disabled,
+        agentype_agent_contract::NetworkPolicy::Restricted => NetworkEnforcement::Restricted,
+        agentype_agent_contract::NetworkPolicy::Enabled => NetworkEnforcement::Enabled,
+    }
+}
+
+fn plan_typed_execution_launch(
+    kernel: &Kernel,
+    outcome: &crate::provisioning_resolver::TypedAcquisitionOutcome,
+    execution_registry: &ExecutionRegistry,
+    adapters: &AdapterRegistry,
+) -> Result<TypedLaunchPlan, TypedLaunchError> {
+    let claim = &outcome.acquisition.claim;
+    let candidate = &outcome.candidate;
+    let binding = kernel
+        .resolve_execution_binding(claim)
+        .map_err(TypedLaunchError::Kernel)?;
+    let environment = resolve_execution_environment(
+        ExecutionResolutionMode::Authoritative(execution_registry),
+        &binding,
+    )
+    .map_err(TypedLaunchError::Configuration)?;
+    // The acquisition froze one exact physical domain; the resolved partition
+    // target must run the same adapter kind. A mismatch is durable
+    // inconsistency, never a candidate choice, so it is not candidate-local.
+    if environment.target().adapter_kind != candidate.adapter_kind {
+        return Err(TypedLaunchError::Inconsistent(format!(
+            "partition target adapter kind '{}' does not match the acquired candidate '{}'",
+            environment.target().adapter_kind,
+            candidate.adapter_kind
+        )));
+    }
+    let adapter_binding_key = AdapterBindingKey::new(candidate.adapter_binding_key.clone())
+        .map_err(TypedLaunchError::InvalidBinding)?;
+    let adapter_binding = adapters
+        .resolve_exact(&candidate.adapter_kind, &adapter_binding_key)
+        .map_err(TypedLaunchError::Adapter)?;
+    // The current adapter binding must accept the exact provisioning protocol the
+    // acquisition froze, so a descriptor produced for one adapter can never be
+    // launched here.
+    if adapter_binding.provisioning_protocol()
+        != Some(
+            outcome
+                .acquisition
+                .provisioning_binding
+                .provisioning_protocol
+                .as_str(),
+        )
+    {
+        return Err(TypedLaunchError::Weakened(format!(
+            "the installed adapter {}:{} does not accept the committed provisioning protocol '{}'",
+            candidate.adapter_kind,
+            candidate.adapter_binding_key,
+            outcome
+                .acquisition
+                .provisioning_binding
+                .provisioning_protocol
+        )));
+    }
+    // Re-qualify the CURRENT imported enforceability against the capability the
+    // acquisition froze. Exact `(kind, key)` identity is not enough: an importer
+    // that kept the key but weakened its workspace/network/isolation capability
+    // must not launch (frozen M5.1: a stale safety proof cannot authorize a
+    // later launch after registry reconfiguration). Any weakening is a pre-start
+    // handoff failure, never committed as an Execution.
+    let frozen = &outcome.acquisition.provisioning_binding.effective_security;
+    let envelope = adapter_binding.safety_envelope();
+    let mut weakened: Vec<&'static str> = Vec::new();
+    if (frozen.attempt_isolation() || environment.attempt_isolation())
+        && !envelope.attempt_isolation()
+    {
+        weakened.push("attempt_isolation");
+    }
+    if frozen
+        .enforceable_workspace_modes()
+        .iter()
+        .any(|mode| !envelope.enforces_workspace(*mode))
+    {
+        weakened.push("workspace");
+    }
+    if frozen
+        .enforceable_network_modes()
+        .iter()
+        .any(|policy| !envelope.enforces_network(network_enforcement(*policy)))
+    {
+        weakened.push("network");
+    }
+    if !weakened.is_empty() {
+        return Err(TypedLaunchError::Weakened(format!(
+            "the installed adapter {}:{} no longer enforces the committed capability ({weakened:?})",
+            candidate.adapter_kind, candidate.adapter_binding_key
+        )));
+    }
+    let physical_binding = environment
+        .physical_binding(adapter_binding_key)
+        .map_err(TypedLaunchError::InvalidBinding)?;
+    // Freeze the provenance snapshot from the SAME evidence the authority
+    // transaction proved; only the Execution id is newly minted here. The
+    // durable `ProvisioningBinding` is authority here, so the transient candidate
+    // is cross-checked against it (a drift is durable inconsistency, never a
+    // silent physical choice).
+    let pb = &outcome.acquisition.provisioning_binding;
+    if candidate.adapter_kind != pb.adapter_kind
+        || candidate.adapter_binding_key != pb.adapter_binding_key
+        || candidate.provisioning_protocol != pb.provisioning_protocol
+    {
+        return Err(TypedLaunchError::Inconsistent(
+            "resolver candidate disagrees with the committed provisioning binding".into(),
+        ));
+    }
+    let execution_id = ExecutionId::new();
+    let snapshot_record = candidate.binding_snapshot(
+        &execution_id,
+        &outcome.acquisition.provisioning_binding,
+        &claim.execution_target,
+        &claim.execution_profile,
+        environment.attempt_isolation(),
+        None,
+        &outcome.launch_descriptor,
+    );
+    Ok(TypedLaunchPlan {
+        environment,
+        physical_binding,
+        snapshot_record,
+        descriptor: outcome.launch_descriptor.clone(),
     })
 }
 
@@ -1407,6 +1870,62 @@ mod tests {
         let report = recover_authority(&kernel).unwrap();
         assert_eq!(report.retried, 0);
         assert_eq!(report.suspended, 0);
+    }
+
+    #[test]
+    fn binding_ref_is_scoped_by_adapter_kind() {
+        let mut registry = AdapterRegistry::new();
+        let deadlines = m56_policy();
+        registry
+            .register_with_safety_and_ref(
+                "local_process",
+                "primary",
+                AdapterBindingKey::new("local-domain").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                deadlines,
+                AdapterSafetyEnvelope::unenforceable(),
+            )
+            .unwrap();
+        // A different kind may reuse the same operator alias without collision;
+        // the frozen contract resolves `binding_ref` within the policy's kind.
+        let container_key = AdapterBindingKey::new("container-domain").unwrap();
+        registry
+            .register_with_safety_and_ref(
+                "container",
+                "primary",
+                container_key.clone(),
+                Arc::new(FakeAdapter::new()),
+                deadlines,
+                AdapterSafetyEnvelope::unenforceable(),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .resolve_binding_ref("container", "primary")
+                .unwrap()
+                .adapter_binding_key(),
+            &container_key
+        );
+        assert_eq!(
+            registry
+                .resolve_binding_ref("local_process", "primary")
+                .unwrap()
+                .adapter_binding_key(),
+            &AdapterBindingKey::new("local-domain").unwrap()
+        );
+        // Within one kind the alias remains unique: a second registration of the
+        // same alias under the same kind still fails closed.
+        let dup = registry.register_with_safety_and_ref(
+            "container",
+            "primary",
+            AdapterBindingKey::new("container-domain-2").unwrap(),
+            Arc::new(FakeAdapter::new()),
+            deadlines,
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        assert!(
+            matches!(dup, Err(AdapterRegistryError::DuplicateBindingRef(ref a)) if a == "primary")
+        );
     }
 
     #[test]
