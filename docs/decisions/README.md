@@ -36,6 +36,7 @@ choice is made (expected during V0.2 design, not this layout change).
 | [ADR-0008](0008-m6b-typed-provisioning-acquisition.md) | M6-B.4 owns the first authority-bearing typed acquisition and the internal `ResolvedProvisioningEvidence` producer; target/profile come from partition/anchor and source selects the exact binding. |
 | [ADR-0009](0009-m6b-topology-capacity-seam.md) | V0.1 `reconcile_pool` capacity excludes typed (`BOUND`) population; typed population is not V0.1 excess. |
 | [ADR-0010](0010-m6b-selection-order-scope.md) | M6-B.4 applies spec 07's hard filters and continuity ranking, and defers availability/cost ranking (no durable model yet); selection is part of the authority path. |
+| [ADR-0011](0011-m6b-acquisition-contract-parity.md) | Shared frozen placement/isolation decisions; provisioning reservation stays separate from the M5 Attempt→Incarnation execution association; known hard filters precede attestation. |
 
 Template for a new ADR:
 

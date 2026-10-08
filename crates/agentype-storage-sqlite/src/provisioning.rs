@@ -20,12 +20,10 @@ use agentype_agent_contract::{
     MaterializationDigest, ProvisioningBinding, ResolvedProvisioningEvidence, SourceConfigRef,
     SourceStatus, SpawnSourceRef,
 };
+#[cfg(any(test, feature = "runtime-internal"))]
+use agentype_core::{claim_placement_eligible, ClaimIntent, ContinuityPreference, LogicalAgentId};
 use agentype_core::{Claim, Error, ExecutionId, IncarnationId, TaskId, UnixTime};
-#[cfg(any(test, feature = "runtime-internal"))]
-use agentype_core::{ContinuityPreference, LogicalAgentId};
 use rusqlite::{params, Transaction};
-#[cfg(any(test, feature = "runtime-internal"))]
-use std::collections::BTreeSet;
 #[cfg(any(test, feature = "runtime-internal"))]
 use uuid::Uuid;
 
@@ -502,11 +500,12 @@ pub(crate) fn validate_binding_snapshot_authority(
         .ok_or_else(|| Error::invariant("binding snapshot's agent type is missing"))?;
     let required_isolation = agent_type.contract.security.requires_attempt_isolation
         || requirement.hard.required_attempt_isolation;
-    if required_isolation && execution.6 == 0 {
-        return Err(Error::invariant(
-            "the frozen execution does not enforce the effective attempt isolation requirement",
-        ));
-    }
+    agentype_execution_config::validate_attempt_isolation(
+        execution.6 != 0,
+        required_isolation,
+        binding.effective_security.attempt_isolation(),
+    )
+    .map_err(|err| Error::invariant(err.to_string()))?;
     if snapshot.credential_refs_digest != credential_refs_digest(&revision.config().credential_refs)
     {
         return Err(Error::invariant(
@@ -703,22 +702,21 @@ fn placement_matches(
     task: &crate::txutil::TaskRow,
     agent: &crate::txutil::AgentRow,
 ) -> Result<bool, Error> {
-    if agent.partition != task.partition {
-        return Ok(false);
-    }
-    let required: BTreeSet<String> = serde_json::from_str(&task.affinity_tags_json)
+    let required: Vec<String> = serde_json::from_str(&task.affinity_tags_json)
         .map_err(|e| Error::invariant(format!("task affinity tags: {e}")))?;
-    let actual: BTreeSet<String> = serde_json::from_str(&agent.tags_json)
+    let actual: Vec<String> = serde_json::from_str(&agent.tags_json)
         .map_err(|e| Error::invariant(format!("agent tags: {e}")))?;
-    if !required.is_subset(&actual) {
-        return Ok(false);
-    }
-    if ContinuityPreference::parse_sql(&task.continuity)? == ContinuityPreference::Required
-        && agent.workstream_id != task.workstream_id
-    {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(claim_placement_eligible(
+        &ClaimIntent {
+            partition: &task.partition,
+            required_tags: &required,
+            workstream_id: task.workstream_id.as_deref(),
+            continuity: ContinuityPreference::parse_sql(&task.continuity)?,
+        },
+        &agent.partition,
+        &actual,
+        agent.workstream_id.as_deref(),
+    ))
 }
 
 fn safety_satisfies(
@@ -1041,10 +1039,8 @@ fn finish_acquisition(
 
     // The partition target/profile must be a valid authoritative environment and
     // the target must agree with the policy on the adapter kind before any
-    // Attempt/Lease is created; discovering a static target/profile
-    // misconfiguration at Execution creation (after the side-effectful
-    // materialize) is too late and would promote a config error into a
-    // physical-quiescence incident.
+    // Attempt/Lease is created. A static configuration error must not consume
+    // claim authority or retry budget and only then be discovered at handoff.
     let partition = required_partition(tx, &task.partition, true)?;
     // Realized-lifecycle conjunct (B.3 deferred this to B.4): the source/config
     // must be able to realize the member's actual M4 retention before any
@@ -1076,11 +1072,12 @@ fn finish_acquisition(
     // both sides are checked before authority is granted.
     let effective_isolation = actual.contract.security.requires_attempt_isolation
         || requirement.hard.required_attempt_isolation;
-    if effective_isolation && !target.attempt_isolation {
-        return Err(Error::invalid_authority(
-            "partition execution target cannot enforce the effective attempt isolation",
-        ));
-    }
+    agentype_execution_config::validate_attempt_isolation(
+        target.attempt_isolation,
+        effective_isolation,
+        selection.evidence.enforceable_safety().attempt_isolation(),
+    )
+    .map_err(|err| Error::invalid_authority(err.to_string()))?;
 
     let (incarnation, reused) = resolve_incarnation(
         tx,
@@ -1117,11 +1114,12 @@ fn finish_acquisition(
     };
 
     let claim = crate::kernel::claim_selected(tx, &agent, &partition, &task, now, lease_seconds)?;
-    tx.execute(
-        "UPDATE attempts SET incarnation_id=?1 WHERE id=?2 AND incarnation_id IS NULL",
-        params![incarnation.as_str(), claim.attempt_id.as_str()],
-    )
-    .map_err(map_sqlite)?;
+    // This is a provisioning reservation, not an Execution. Keep the frozen
+    // M5 Attempt->Incarnation association at Execution commitment, where the
+    // snapshot transaction proves this exact ProvisioningBinding. Linking it
+    // here would let pre-Execution NACK/cancel/expiry invent physical facts about
+    // a reused WARM host. The PB remains durable and agent assignment fences
+    // concurrent acquisition; a fresh STARTING reservation can be reused.
 
     Ok(TypedAcquisition {
         claim,

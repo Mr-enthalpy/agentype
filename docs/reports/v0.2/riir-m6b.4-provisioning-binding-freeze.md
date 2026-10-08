@@ -1,307 +1,114 @@
 # RIIR M6-B.4 — Provisioning Binding and Exact Launch Implementation Record
 
 Status: Historical Report
-Applies to: V0.2 / M6-B.4
+Implementation status: M6-B.4 implemented, not frozen
+Date: 2026-10-08
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
-Not a specification.
+Not a specification. The retained filename does not assert milestone freeze.
 
-This records the M6-B.4 implementation of the first authority-bearing typed
-acquisition on top of the frozen M6-B.3 schema v7. It is a boundary record, not
-a specification; it does not supersede
-[spec 06](../../specs/v0.2/06-agent-type-and-matching.md),
-[spec 07](../../specs/v0.2/07-spawn-source-and-adapter-contract.md), or
-[spec 13](../../specs/v0.2/13-storage-and-transactions.md).
+## Scope and acceptance baseline
 
-## Status
+PR #24 implements the first authority-bearing typed acquisition above frozen
+M4–M6-B.3 (`cbd5a7518395247dc7abfef996eb307e7a526f25`, schema v7). It introduces
+schema v8 provisioning provenance, pure source preparation and a snapshot-bearing
+Execution handoff. Typed daemon dispatch and production source integration remain
+pending; this is a library/composition boundary, not an end-to-end production
+typed dispatch claim.
 
-```text
-M5 execution/runtime substrate           FROZEN
-M6-A semantic frontier kernel            FROZEN
-M6-B.1 AgentType ontology                FROZEN
-M6-B.2 durable catalog (schema v6)       FROZEN
-M6-B.3 typed admission (schema v7)       FROZEN
-M6-B.4 provisioning binding (schema v8)  IMPLEMENTED, NOT FROZEN
-                                         (locally verified; daemon typed-dispatch
-                                         wiring pending; the independent freeze
-                                         audit is the remaining gate)
-```
+The frozen specs govern acceptance. Interface amendments are justified in
+[ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) and
+[ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md).
+[ADR-0009](../../decisions/0009-m6b-topology-capacity-seam.md) records the explicit
+legacy/typed capacity seam; [ADR-0010](../../decisions/0010-m6b-selection-order-scope.md)
+records unresolved availability/cost ranking. This report consolidates the final
+implementation and evidence; superseded audit narratives remain in Git history.
 
-The running daemon's control loop still dispatches the legacy claim path; the
-typed acquisition primitives are landed and tested at the storage/runtime
-library level, and wiring them into the daemon loop is the remaining integration
-step before the freeze gate can be declared closed.
+## Implemented path
 
-## Frozen surface
+| Phase | Committed facts and checks |
+|---|---|
+| Resolve | Validate partition target/profile; apply known hard filters before bounded, read-only source-local attestation; rank eligible candidates and capture the catalog frontier |
+| Acquire | Transactionally reload and re-prove Task, actual bound AgentType, placement, source/config/policy, realized retention and exact imported safety; commit Attempt/Lease/assignment and per-Incarnation ProvisioningBinding; leave Attempt.incarnation_id unset |
+| Prepare | Re-resolve the committed source-local integration; fence full claim authority before/after pure preparation; require the exact protocol and attested digest; return a secret-free descriptor |
+| Commit Execution | Requalify target and current exact adapter; perform fallible composition checks; atomically create Execution, Attempt→Incarnation association and immutable BindingSnapshot against the reserved provenance |
+| Physical start | The exact ExecutionAdapter consumes the frozen descriptor inside start_execution; existing M5 recovery, observation, deadlines and writer safety own its physical lifecycle |
 
-```text
-SCHEMA_VERSION = 8
+The implemented handoff assembles the exact start request. Wiring that request
+into running typed daemon dispatch is a remaining step.
 
-ProvisioningBinding        per-Incarnation immutable exact source/config/policy
-BindingSnapshot            per-Execution immutable exact physical choice
-ResolvedProvisioningSelection
-                           durable acquisition input (re-proved in-transaction)
-SourceProvisioningCandidate
-                           one eligible source/config candidate carrying the
-                           exact resolved (adapter_kind, adapter_binding_key)
-ImportedEnforcementFacts   (neutral) adapter-imported enforceability
+## Structural guarantees
 
-agent-contract
-    ResolvedProvisioningEvidence::from_imported_binding   (behind
-        `provisioning-producer`; a default-surface narrowing, not an authority
-        proof under Cargo feature unification)
-    credential_refs_digest
-    canonical_provisioning_binding_bytes / provisioning_binding_content_digest
-    canonical_binding_snapshot_bytes / binding_snapshot_content_digest
-    provisioning_binding_from_canonical_json / binding_snapshot_from_canonical_json
-    BindingSnapshot / ProvisioningBinding / RESOLVER_VERSION
+- One Core placement predicate is shared by legacy selection, B.3 matching and
+  both B.4 acquisition paths. Required continuity needs a concrete matching
+  workstream, including newborn agents.
+- One pure isolation decision separates semantic requirement, authoritative
+  target policy and imported enforceability. A target that enables isolation
+  cannot launch through an incapable domain, even when Task/Type do not require it.
+- Acquisition reserves provenance. Execution commitment establishes physical
+  association. Pure preparation failure, cancellation, expiry or recovery before
+  a new Execution cannot mark an older resident WARM host dead.
+- Per-Incarnation bindings are immutable exact provenance; per-Execution
+  snapshots freeze the admitted requirement and effective launch policy. Reuse
+  requires exact qualification; changed provenance rolls to a new Incarnation.
+- Parent markers, write-once/replacement guards and coherent authoritative reads
+  protect both records. Execution/recovery cannot bypass required snapshots.
+- The authority transaction re-proves imported facts and the catalog frontier.
+  No public control API accepts caller-supplied enforcement evidence. Default
+  producer visibility is a supported-surface fence, not an authority token.
+- Known hard filters precede source-private I/O. Credentials fail closed for
+  B.5; ambiguous continuity ties fail closed while availability/cost ranking is
+  deferred. Corruption is fatal, never silently skipped.
+- Attest/prepare are read-only, have separate absolute budgets and bind the
+  descriptor to an exact protocol/domain/digest. Post-commit recovery resolves
+  the exact physical binding and cannot choose a different source.
 
-adapter-api
-    NetworkEnforcement
-    ImportableAdapter::import_enforceable_workspace / import_enforceable_network
-        (additive, conservative empty defaults)
+The M4–M5 authority/writer-safety/recovery contracts, M6-A admission and B.1–B.3
+semantic relations/catalog/matching remain the baseline. The documented V0.1
+capacity seam excludes BOUND agents from legacy desired-capacity math; untyped
+capacity and retirement fencing retain their behavior.
 
-runtime
-    AdapterSafetyEnvelope::enforceable_workspace / enforceable_network
-    AdapterRegistry::{import_source_with_binding_ref, resolve_binding_ref}
-    provisioning_resolver::{resolve_source_candidates,
-                            resolve_source_candidates_for_agent, select_candidate,
-                            SourceProvisioningCandidate, ProvisioningResolutionError}
-        (acquisition consumes the ExecutionRegistry to check the partition target
-         kind; the AdapterBindingPolicy is re-loaded in the transaction)
-    acquire_typed_task -> TypedAcquisitionOutcome{acquisition, candidate}
-    prepare_typed_execution_launch (daemon-internal Execution handoff)
-    CatalogAdmin::{publish_adapter_binding_policy, publish_spawn_source,
-                   publish_source_config, set_*_status}
-    ProvisioningAdmin::{provisioning_binding, binding_snapshot}
+## Interface adjustment reasons
 
-storage / kernel
-    provisioning_bindings / binding_snapshots (+ parent presence markers)
-    acquire_typed_task_existing / acquire_typed_task_new_agent
-    create_execution_with_snapshot
-    get_provisioning_binding / get_binding_snapshot
-    list_active_spawn_source_refs / list_active_source_config_refs
-```
+| Adjustment | Reason and compatibility boundary |
+|---|---|
+| Adapter workspace/network and optional provisioning-protocol import | Typed eligibility requires actual enforcement and descriptor support. Conservative defaults preserve ordinary M5 adapters and make unsupported typed acquisition ineligible |
+| Pure source-local attest/prepare, separate deadlines | Opaque config interpretation belongs to its source integration. Physical creation remains inside M5 adapter start; candidate probes cannot consume the winner's preparation budget |
+| Descriptor/effective network on start request; attested digest on durable records | Persist and deliver the environment identity/policy that the exact adapter must consume; the digest describes expected identity, not prior physical creation |
+| Resolver requires ExecutionRegistry | Authoritative target/profile are needed before attestation, so irrelevant candidates cannot spend the shared budget or hide eligible sources |
+| Shared placement/isolation decisions | Preserve frozen gates across preselection, authority, snapshot and handoff instead of maintaining inconsistent copies |
+| Attempt association deferred to Execution | Restore frozen M5 physical-phase assumptions and preserve earlier WARM hosts across every pre-Execution closure; settlement APIs and schema need no additional amendment |
+| Typed population excluded from legacy capacity | Legacy desired population cannot retire semantically bound agents; full typed topology remains deferred (ADR-0009) |
 
-## Frozen invariants
+## Verification
 
-```text
-a typed Task acquires no Attempt/Lease/Execution without the mandatory conjuncts,
-    re-proved inside the authority transaction over the current catalog
-acquisition proves can_execute/can_provision_task over the ACTUAL bound AgentType
-    (a refinement/broader/compatible candidate is accepted; cross-revision is not)
-the frozen M5 placement gates are re-checked, not assumed from B.3 preselection
-the AdapterBindingPolicy is re-loaded in the transaction (ACTIVE, kind match,
-    required_safety satisfied) and the partition target kind must match the policy
-the partition's full authoritative target+profile is validated (missing profile,
-    or incompatible allowed_targets) in the pure pre-commit resolver and re-proved
-    in the authority transaction, BEFORE any authority commit or materialization
-ResolvedProvisioningEvidence is produced only by the internal resolver; the
-    provisioning-producer feature narrows the default surface (not a proof)
-a DECLARED label never satisfies a security class
-a B3Candidate / LogicalAgentTypeBinding is never physical eligibility
-a ProvisioningBinding is write-once, scoped to one Incarnation, and freezes the
-    exact (adapter_kind, adapter_binding_key) so recovery never re-derives it
-a resident Incarnation + matching ProvisioningBinding is reused; a differing
-    source/config/domain rolls over to a fresh Incarnation
-a legacy Incarnation is adopted only if it has NO Execution history; otherwise it
-    rolls over to a fresh Incarnation (physical hosting alone never proves the
-    Core-opaque SourceConfig provenance)
-a BindingSnapshot is created atomically with its Execution and is coherent with
-    it (key, target/profile, provenance, config digest, requirement, capability,
-    effective isolation/workspace/network), and never rewritten
-a ProvisioningBinding records an enforceability capability; a BindingSnapshot
-    records the per-execution effective policy separately (no hybrid PhysicalSafety)
-the effective isolation is AgentType.requires OR Task.required, checked against
-    the authoritative target before authority and re-proved at commitment
-a typed Task cannot commit through the legacy create_execution path
-the authority facade commits the deterministic selection, not a caller's pick
-the selected SourceConfig carries a required source-integration materialization
-    digest bound to the exact physical domain (also the ExternalRef attestation)
-the existing-vs-new acquisition decision is Scheduler-owned (spec 06 order)
-the authoritative reads re-prove the safety relation between the policy, the
-    binding capability, and the snapshot effective policy
-the materialization digest is part of Incarnation qualification and the frontier
-    digest is canonical and disposition-complete
-eligibility uses a pure attest; the winner's claim/binding commits first and then
-    the winner is prepared under that durable identity; losers are never prepared
-attest and prepare are PURE/read-only: no physical side effect before the
-    Execution (M6-B never creates a physical environment; the exact adapter
-    materializes the descriptor inside start_execution, so M5 owns the lifecycle)
-the prepared descriptor's re-derived digest must exact-match the committed
-    attested_materialization_digest; attested_materialization_digest is a canonical
-    sha256:<64 lowercase hex> value and the mismatch error is redacted
-the descriptor is causally bound to the launch and to the exact adapter by an
-    OPTIONAL provisioning protocol identity proven at eligibility and re-checked at
-    handoff; an adapter that declares none is not provisioning-capable
-the source integration is source-local: an active source unrouted by the
-    composition root is ineligible, so one source's config is never interpreted by
-    another's integration
-a typed-handoff failure is classified (pre-start availability -> RESOURCE_UNAVAILABLE,
-    authority loss -> recovery, durable corruption/persistence -> fatal), and every
-    fallible composition check precedes the Execution commit
-the realized M4 retention must be contained in the source/config effective
-    lifecycle (proved in the resolver and the authority transaction)
-the enumeration (attest) deadline and the winner (prepare) deadline are distinct
-    absolute endpoints; each integration call is bounded and re-qualified
-claim authority is re-qualified before and after prepare using the full
-    AuthoritySnapshot + Claim-identity check (not a lease-only read)
-a pure prepare/handoff failure is classified pre-start: static/liveness ->
-    RESOURCE_UNAVAILABLE, authority loss -> left to recovery, fatal persistence ->
-    propagated; the typed handoff error carries no Task failure class
-the handoff re-qualifies the current installed enforceability against the committed
-    capability (weakening -> no Execution)
-fallback happens only on explicit candidate-local ineligibility (narrow
-    ContractError set); an ambiguous selection is task-terminal and a global
-    authority-snapshot failure (StaleAuthority) re-resolves the whole acquisition
-deterministic selection runs on the fully hard-eligible set: credential-bearing
-    configs and wrong-partition-target adapter_kind candidates are filtered before
-    ranking
-a config that declares credential_refs is ineligible (no credential authority)
-binding_ref resolves within the policy's adapter_kind
-the authority acquisition stays daemon-internal (pub(crate)) until wired
-the acquisition carries its winner candidate out; the daemon-internal handoff
-    freezes the snapshot-bearing Execution and stops at the assembled start request
-restart recovery validates the Execution snapshot marker/child coherence
-selection is fenced by an active-candidate-frontier digest checked at commitment
-reconcile_pool validates binding coherence and aborts on marker/child mismatch
-every durable UNIQUE identity is guarded against INSERT OR REPLACE
-after the BindingSnapshot commits there is no source fallback
-a missing exact binding is a recovery/configuration failure
-a candidate-local ineligibility skips only that candidate; catalog corruption
-    fails the whole resolution
-the durable store and logs carry no provider secret material
-V0.1 capacity counts and retires only untyped LogicalAgents; MOVE_CAPACITY moves
-    only UNBOUND agents, so a BOUND typed agent is never relocated by a legacy
-    capacity command (ADR-0009)
-```
+Local checks on 2026-10-08:
 
-## Mechanical enforcement
+| Check | Result |
+|---|---|
+| Storage with test-support | 297 tests and 1 doc probe passed, including B.4 39, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 26 passed, including poisoned ineligible attestations and actual pure preparation failure on a previously committed WARM host |
+| Default-feature public API boundary | 33 compile-fail probes passed |
+| Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
+| Formatting and whitespace | cargo fmt --all --check and git diff --check passed |
+| Full Windows workspace runtime gate | Not passed locally: ProcessLock setup returns PermissionDenied in four test targets; runtime unit target reports 262 passed and 10 failed |
 
-```text
-provisioning_bindings / binding_snapshots
-    BEFORE UPDATE -> abort
-    BEFORE DELETE -> abort
-    BEFORE INSERT -> abort on duplicate primary key
-    BEFORE INSERT -> abort on duplicate incarnation_id / execution_id
-                     (covers the INSERT OR REPLACE unique-conflict path)
-    require a PROVISIONED incarnation / SNAPSHOT execution parent
-incarnations / executions
-    BEFORE INSERT -> abort on same-id and same-unique-identity replacement
-    incarnations.provisioning_mode cannot downgrade
-    executions.binding_snapshot_mode cannot downgrade
-reads read the parent marker first, so a PROVISIONED/SNAPSHOT parent without its
-    child row is corruption (never None) and a LEGACY/NONE parent with one fails
-reads re-encode the canonical document and cross-check every relational column
-```
+The five new B.4 storage regressions also fail against the original provisioning
+implementation while its 34 existing tests pass, then pass with the correction.
+The focused [counterexample witness](riir-m6b.4-contract-parity.md) records the
+discriminating cases. Passing test counts alone are not the acceptance argument.
 
-## Reused unchanged
+The four locally blocked targets are runtime unit tests, runtime process_lock,
+runtime semantic_control_contract and adapter-local-process daemon_acceptance.
+The observed failures occur at process-lock setup before the changed acquisition
+path. This records the environmental limit and does not count those targets as
+passing. Remote CI status must be checked against the pushed PR head; an earlier
+head's green result is not evidence for these changes.
 
-M6-B.4 adds no semantics to, and does not redefine, the frozen substrate:
+## Remaining acceptance and scope
 
-```text
-M5   Task / Attempt / Lease / Result authority, claim fencing, Execution
-     commitment, AdapterKind / AdapterBindingKey freezing, resolve_exact
-     recovery, ExecutionAdapter physical-only contract, deadlines, supervision,
-     writer safety, process singleton, recover-before-dispatch
-M6-A Generation, RawWorkIntent, CompiledWorkProposal, GenerationTaskBinding,
-     RootSemanticControl, IntentIngress, atomic admission
-M6-B.1 the four relations, AgentType purity
-M6-B.2 immutable exact-revision catalog; validated reads; disposition overlays
-M6-B.3 typed admission, requirement/binding durability, matching semantics
-```
-
-## Negative space
-
-M6-B.4 deliberately does not implement:
-
-```text
-credential resolution / availability / brokering              (B.5; B.4 fails
-    closed for any config that declares credential_refs)
-enforced sandbox-policy / security-class capability import     (B.5)
-concrete source-specific SourceConfigIntegration                (interface
-    provided; a deployment supplies the real integration)
-typed cold/revivable matching, MemoryCapsule, Transform
-typed dispatch wiring into the running ControlLoopService
-full typed-population targets                              (D-TOPOLOGY remainder)
-v7 -> v8 in-place migration                                (D-DB-MIGRATE)
-```
-
-## Audit and resolution
-
-M6-B.4 was hardened through twenty-one independent freeze-audit rounds (every one
-`P0=0`; each `REQUEST_CHANGES` was closed in place), followed by a deliberate
-post-audit handoff-contract step. All findings are resolved. The durable
-decisions are recorded in
-[ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) (items
-1–70) and reflected in the invariants above. The corrections with the most
-architectural weight were:
-
-- Credentials are not a caller-minted authority fact: B.4 fails closed for any
-  config that declares `credential_refs` (resolution/availability/brokering are
-  B.5), and the public credential seam was removed.
-- Selection follows the frozen spec 06/07 order with hard filters + continuity; a
-  tie on the unmodelled availability/cost dimensions fails closed as
-  `SelectionAmbiguous` (no lexical tie-break), and ranking runs on the fully
-  hard-eligible set.
-- SourceConfig body eligibility is `OpaqueJson` (Core validates the body digest)
-  or an `ExternalRef` attested by the source integration under the exact physical
-  domain; an unattested `ExternalRef` is ineligible.
-- `attest` is pure and used for eligibility; the side-effectful, idempotent
-  `materialize` runs only for the durably committed winner under the exact frozen
-  identity and must return the committed digest. One absolute `AdapterDeadline`
-  bounds every call and is re-qualified after it.
-- The acquisition returns its winner candidate; the daemon-internal handoff
-  freezes the snapshot-bearing Execution and stops at the assembled start
-  request.
-- Materialization settlement splits on whether the side-effectful invocation was
-  entered: a provably side-effect-free pre-invocation failure is
-  `RESOURCE_UNAVAILABLE`; any failure after the invocation began is
-  physical-writer-unknown and is suspended as `WRITER_QUIESCENCE_UNKNOWN`
-  (ADR-0008 item 51).
-- `materialization_digest` is a constrained canonical `sha256:<64 hex>` value
-  (`MaterializationDigest`), and the mismatch error is redacted (ADR-0008 item
-  52).
-- The full target+profile is validated before any authority commit or
-  materialization, so a static profile misconfiguration cannot be promoted into a
-  physical-quiescence incident (ADR-0008 item 53).
-- Legacy `MOVE_CAPACITY` moves only `UNBOUND` agents, matching ADR-0009, so a
-  typed agent is never relocated across its frozen B.3 placement gate (ADR-0008
-  item 54).
-- The realized M4 retention is re-proved against the source/config lifecycle
-  (ADR-0008 item 57); the handoff re-qualifies the current installed enforceability
-  (item 62). Round 20 replaced the side-effectful materialization with a pure
-  `prepare` and moved the physical work into `ExecutionAdapter::start_execution`
-  (ADR-0008 items 63–67): the descriptor is bound to the exact adapter by a proven
-  protocol identity, the digest is renamed `attested_materialization_digest`, the
-  attest/prepare deadlines are separate, and pre-start failures are classified
-  (static → `RESOURCE_UNAVAILABLE`, authority loss → recovery, persistence →
-  fatal). The pre-Execution `WRITER_QUIESCENCE_UNKNOWN` machinery (items 55, 60,
-  61 as originally written) is withdrawn. Round 21 added source-local integration
-  routing (ADR-0008 item 68), classified the typed-handoff failure and moved every
-  fallible check before the Execution commit (item 69), and made
-  provisioning-capability optional and honest (item 70).
-
-## Verification (local)
-
-```text
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p agentype-storage-sqlite --features test-support  # b3 40 / b4 34 / catalog 32 / frontier 49 / store 4 / m4_kernel 71 / topology 16 / recovery 11 / reconciliation 5 / supervision 12 / outbox 17
-cargo test -p agentype-runtime --lib             # provisioning_resolver 23; 258 passed
-cargo test --doc -p agentype-public-api-boundary # 33 probes
-```
-
-The storage integration targets run locally with `--features test-support` (with
-`TEMP` redirected onto the workspace). The only local failures are the daemon /
-process-lock runtime unit tests, which need OS-temp and process-lock facilities
-unavailable in the session sandbox; they are environment-only and pass in CI.
-
-## Baselines
-
-```text
-M6-B.3 frozen base (main):
-cbd5a7518395247dc7abfef996eb307e7a526f25
-
-SCHEMA_VERSION = 8 at M6-B.4 implementation.
-```
+M6-B.4 remains IMPLEMENTED, NOT FROZEN. Full runtime/CI acceptance and independent
+freeze review remain separate gates. Remaining implementation includes typed
+ControlLoopService dispatch, a concrete production SourceConfigIntegration,
+B.5 credentials/security import, cold/revivable matching, full typed topology
+and v7→v8 migration. The reference local-process adapter has no provisioning
+protocol and cannot launch typed descriptors.

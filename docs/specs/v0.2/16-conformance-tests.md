@@ -415,6 +415,27 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   ...)
 - an old schema version (v7 and earlier) is rejected at open (`D-DB-MIGRATE`)
 
+The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
+
+- B.3/existing/new parity for Required continuity with no workstream and with a
+  concrete matching workstream; rejection creates no Attempt/Lease/binding or
+  newborn agent;
+- configured target isolation independently of semantic requirements and
+  imported isolation capability; an incapable source is excluded before
+  attestation/selection/authority, and a capable alternative remains selectable;
+- Execution/snapshot isolation cannot exceed the committed binding capability;
+  rejection atomically rolls back Execution and Attempt physical association;
+- a resident host made WARM by a real committed Execution and valid ACK keeps
+  its identity, state and immutable binding after a second pre-Execution claim's
+  config failure, Task/Batch cancel, expiry, restart, NACK or ACK;
+- a fresh STARTING reservation never fabricates WARM/terminal physical evidence
+  on pre-Execution cancellation and can be reused;
+- an earlier credential-bearing config and a wrong-kind source whose attestation
+  would fail the whole search are skipped without invoking that attestation.
+
+These supplement, rather than replace, M4 writer-safety/recovery, M6-A frontier,
+B.3 admission/matching and default-feature API-boundary tests (ADR-0011).
+
 ## C. Provider/frontend neutrality (M7)
 
 A **second independent** adapter MUST be addable without Core state-machine

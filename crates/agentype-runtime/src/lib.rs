@@ -1090,8 +1090,13 @@ fn plan_typed_execution_launch(
     let frozen = &outcome.acquisition.provisioning_binding.effective_security;
     let envelope = adapter_binding.safety_envelope();
     let mut weakened: Vec<&'static str> = Vec::new();
-    if (frozen.attempt_isolation() || environment.attempt_isolation())
-        && !envelope.attempt_isolation()
+    if (frozen.attempt_isolation() && !envelope.attempt_isolation())
+        || validate_attempt_isolation(
+            environment.attempt_isolation(),
+            false,
+            envelope.attempt_isolation(),
+        )
+        .is_err()
     {
         weakened.push("attempt_isolation");
     }

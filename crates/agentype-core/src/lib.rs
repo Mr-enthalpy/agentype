@@ -18,13 +18,13 @@ pub use authority::{
 };
 pub use clock::{Clock, ManualClock, SystemClock, UnixTime};
 pub use decisions::{
-    agent_release_disposition, batch_next_state, claim_selection_rank, claim_task_eligible,
-    claim_tiebreak, cross_target_cutover_safety, dependency_release_decision, durable_quiescence,
-    excess_disposition, excess_rank_key, incarnation_presence, is_cross_target_execution_safe,
-    move_candidate_eligible, move_rank_key, order_claim_tasks, partition_cutover_plan,
-    plan_dependency_releases, plan_escalation_resolution, plan_move_cutover,
-    post_safety_agent_disposition, retry_allowed, retry_backoff_seconds, select_claim_agent,
-    sort_excess_candidates, sort_move_candidates, suspension_failure_class,
+    agent_release_disposition, batch_next_state, claim_placement_eligible, claim_selection_rank,
+    claim_task_eligible, claim_tiebreak, cross_target_cutover_safety, dependency_release_decision,
+    durable_quiescence, excess_disposition, excess_rank_key, incarnation_presence,
+    is_cross_target_execution_safe, move_candidate_eligible, move_rank_key, order_claim_tasks,
+    partition_cutover_plan, plan_dependency_releases, plan_escalation_resolution,
+    plan_move_cutover, post_safety_agent_disposition, retry_allowed, retry_backoff_seconds,
+    select_claim_agent, sort_excess_candidates, sort_move_candidates, suspension_failure_class,
     AgentReleaseDisposition, BlockedTaskSnapshot, ClaimAgentSnapshot, ClaimIntent,
     ClaimTaskSnapshot, CrossTargetExecutionSnapshot, EscalatedWriterPresenceAction,
     EscalationOperation, EscalationResolutionPlan, EscalationResolutionSnapshot, ExcessDisposition,

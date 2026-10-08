@@ -486,8 +486,8 @@ pub fn resolve_execution_environment(
 /// M5 terms). Unlike [`resolve_execution_environment`] this needs no Attempt
 /// identity, so a caller can reject a purely static misconfiguration BEFORE it
 /// commits authority or performs any physical work (used by the M6-B.4 typed
-/// acquisition, whose side-effectful materialization must not begin against an
-/// environment the M5 composition would reject).
+/// acquisition, whose pure preparation and authority commitment must not begin
+/// against an environment the M5 composition would reject).
 pub fn resolve_target_profile(
     registry: &ExecutionRegistry,
     target_name: &str,
@@ -509,6 +509,28 @@ pub fn resolve_target_profile(
         }
     }
     Ok((target, profile))
+}
+
+/// Check both sides of the M4 isolation contract before granting authority:
+/// semantic requirements must fit the configured target, and every isolation
+/// guarantee configured on that target must be enforceable by the exact adapter.
+/// Imported capability alone never changes the effective target policy.
+pub fn validate_attempt_isolation(
+    target_isolation: bool,
+    contract_requires_isolation: bool,
+    adapter_enforces_isolation: bool,
+) -> Result<(), ResolutionError> {
+    if contract_requires_isolation && !target_isolation {
+        return Err(ResolutionError::Incompatible(
+            "execution target cannot satisfy the required attempt isolation".into(),
+        ));
+    }
+    if target_isolation && !adapter_enforces_isolation {
+        return Err(ResolutionError::Incompatible(
+            "adapter cannot enforce the execution target's attempt isolation".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Authoritative launch snapshot reconstructed from durable Scheduler state.

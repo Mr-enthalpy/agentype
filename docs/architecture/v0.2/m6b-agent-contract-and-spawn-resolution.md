@@ -464,6 +464,17 @@ match_existing_agents       pure M5-placement + type-contract filter, then
 
 Rules now enforced:
 
+- **Frozen-contract parity.** Legacy claim selection, B.3 preselection and B.4
+  acquisition share the Core placement decision; Required continuity needs a
+  concrete matching workstream. Target isolation must satisfy semantic demands
+  and be enforceable by the exact adapter, before attestation and authority.
+  Acquisition reserves the Incarnation through its immutable ProvisioningBinding
+  but leaves `Attempt.incarnation_id` unset until Execution + BindingSnapshot
+  commitment. Pre-Execution closure therefore preserves an earlier WARM host;
+  a fresh STARTING reservation can be reused. Existing M5 settlement and writer
+  safety apply unchanged after execution commitment. See
+  [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md).
+
 - **Atomic typed admission.** `admit_typed_proposal` creates the M5 Task, the
   `GenerationTaskBinding`, and the immutable `TaskAgentRequirement` in one SQLite
   transaction. A failure leaves none of the three. It resolves the exact

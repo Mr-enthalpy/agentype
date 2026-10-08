@@ -351,6 +351,12 @@ new/requalified Incarnation, before any authority-bearing typed acquisition.
 
 ## Typed provisioning acquisition (M6-B.4)
 
+Both existing-agent and newborn acquisition MUST apply the frozen M5 placement
+decision. `Required` continuity MUST have a concrete Task workstream equal to
+the agent's workstream; two absent workstreams MUST NOT satisfy it. B.3
+preselection and authoritative acquisition MUST agree on this gate
+([ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md)).
+
 The first authority-bearing typed acquisition is M6-B.4. It consumes the frozen
 B.2 catalogue and B.3 requirement/binding as semantic authority and produces a
 physical commitment. A `B3Candidate` and a `LogicalAgentTypeBinding` are NEVER

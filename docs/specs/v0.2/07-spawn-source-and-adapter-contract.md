@@ -167,6 +167,23 @@ key without that intersection.
 does not grant it. The effective network policy is carried provider-neutrally on
 `EnvironmentStartRequest` so no layer widens a stricter upstream policy.
 
+## Typed acquisition qualification (M6-B.4)
+
+For typed acquisition, semantic isolation requirements MUST fit the configured
+ExecutionTarget, and any isolation configured on that target MUST be enforceable
+by the exact imported adapter even when AgentType and Task do not request it.
+These gates MUST hold before Attempt/Lease commitment and be independently
+requalified at launch; snapshot commitment/read MUST reject effective isolation
+outside the frozen binding's capability.
+
+Known static ineligibility (credentials unsupported by B.4, inactive policy,
+wrong target kind, isolation mismatch, realized retention or static contract
+failure) MUST be filtered before source-private `attest` I/O. Such candidates
+MUST NOT spend the attestation deadline or prevent later eligible candidates
+from being considered. Unknown availability and config identity still require
+bounded attestation. See
+[ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md).
+
 ## ExecutionProfile registry (**M5**)
 
 An Execution profile registry supplied by the composition root is

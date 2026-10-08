@@ -509,6 +509,7 @@ pub(crate) fn resolve_source_candidates(
     kernel: &Kernel,
     task_id: &TaskId,
     adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
@@ -522,9 +523,11 @@ pub(crate) fn resolve_source_candidates(
         })?;
     enumerate_candidates(
         kernel,
+        task_id,
         &requirement,
         &agent_type,
         adapters,
+        execution_registry,
         integrations,
         deadline,
     )
@@ -538,6 +541,7 @@ pub(crate) fn resolve_source_candidates_for_agent(
     task_id: &TaskId,
     agent_id: &agentype_core::LogicalAgentId,
     adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
@@ -552,22 +556,42 @@ pub(crate) fn resolve_source_candidates_for_agent(
         .ok_or_else(|| ProvisioningResolutionError::AgentTypeMissing(bound.clone()))?;
     enumerate_candidates(
         kernel,
+        task_id,
         &requirement,
         &agent_type,
         adapters,
+        execution_registry,
         integrations,
         deadline,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_candidates(
     kernel: &Kernel,
+    task_id: &TaskId,
     requirement: &agentype_agent_contract::TaskAgentRequirement,
     agent_type: &agentype_agent_contract::AgentType,
     adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    let task = kernel.task(task_id)?;
+    let partition = kernel.partition(task.partition.as_str())?;
+    let (target, _profile) = agentype_execution_config::resolve_target_profile(
+        execution_registry,
+        &partition.execution_target,
+        &partition.execution_profile,
+    )
+    .map_err(|err| {
+        ProvisioningResolutionError::Storage(agentype_core::Error::invalid_authority(
+            err.to_string(),
+        ))
+    })?;
+    let required_lifecycle = agentype_agent_contract::required_lifecycle(partition.retention);
+    let required_isolation = agent_type.contract.security.requires_attempt_isolation
+        || requirement.hard.required_attempt_isolation;
     let catalog = kernel.load_capability_catalog()?;
     let mut out: Vec<SourceProvisioningCandidate> = Vec::new();
     for source_ref in kernel.list_active_spawn_source_refs()? {
@@ -579,6 +603,12 @@ fn enumerate_candidates(
             .ok_or_else(|| {
                 ProvisioningResolutionError::MissingRevision("adapter_binding_policy".into())
             })?;
+        // Reject known static ineligibility before any source-private I/O.
+        // These filters are re-proved by the authority transaction, not deferred
+        // until ranking or handoff after an attestation budget has been spent.
+        if policy.status != ConfigStatus::Active || policy.adapter_kind != target.adapter_kind {
+            continue;
+        }
         // Source-local routing: this exact source must be bound (by the
         // composition root) to the one integration that understands its
         // source-private config grammar. An unrouted source is ineligible; its
@@ -602,12 +632,51 @@ fn enumerate_candidates(
         if imported.provisioning_protocol() != Some(integration.protocol()) {
             continue;
         }
+        if agentype_execution_config::validate_attempt_isolation(
+            target.attempt_isolation,
+            required_isolation,
+            imported.safety_envelope().attempt_isolation(),
+        )
+        .is_err()
+        {
+            continue;
+        }
         for config_ref in kernel.list_active_source_config_refs(&source_ref)? {
             let revision = kernel
                 .get_source_config_revision(&config_ref)?
                 .ok_or_else(|| {
                     ProvisioningResolutionError::MissingRevision("source_config".into())
                 })?;
+            let config = revision.config().clone();
+            if !config.credential_refs.is_empty()
+                || !config
+                    .effective_lifecycle(&source)
+                    .contains(&required_lifecycle)
+            {
+                continue;
+            }
+            let evidence = match produce_evidence(&imported, &policy, &source, &config) {
+                Ok(evidence) => evidence,
+                Err(err) if err.is_candidate_ineligible() => continue,
+                Err(err) => return Err(err),
+            };
+            match can_provision_task(
+                agent_type,
+                &source,
+                &config,
+                &evidence,
+                &catalog,
+                &requirement.hard,
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    let err = ProvisioningResolutionError::Evidence(err);
+                    if err.is_candidate_ineligible() {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
             // Pure, side-effect-free attestation during eligibility. The source
             // integration verifies the exact revision is materializable for this
             // exact physical domain (resolving/hashing an ExternalRef, or
@@ -641,36 +710,6 @@ fn enumerate_candidates(
                 Err(err) if err.is_candidate_ineligible() => continue,
                 Err(err) => return Err(err),
             };
-            let config = revision.config().clone();
-            // B.4 has no credential authority: a config that declares credential
-            // refs is INELIGIBLE, so it must be filtered here — before
-            // deterministic selection — and never enter the ranking input set.
-            // (Availability/attestation/brokering are B.5.)
-            if !config.credential_refs.is_empty() {
-                continue;
-            }
-            let evidence = match produce_evidence(&imported, &policy, &source, &config) {
-                Ok(evidence) => evidence,
-                Err(err) if err.is_candidate_ineligible() => continue,
-                Err(err) => return Err(err),
-            };
-            match can_provision_task(
-                agent_type,
-                &source,
-                &config,
-                &evidence,
-                &catalog,
-                &requirement.hard,
-            ) {
-                Ok(()) => {}
-                Err(err) => {
-                    let err = ProvisioningResolutionError::Evidence(err);
-                    if err.is_candidate_ineligible() {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
             let effective_security = evidence.enforceable_safety().clone();
             out.push(SourceProvisioningCandidate {
                 agent_type: agent_type.type_ref.clone(),
@@ -768,26 +807,6 @@ fn prepare_selection(
     ),
     ProvisioningResolutionError,
 > {
-    // Pure, Attempt-independent target/profile validation FIRST. A static
-    // misconfiguration (missing profile, or a profile whose `allowed_targets`
-    // excludes the partition target) is an authoritative configuration failure
-    // that MUST be rejected BEFORE any authority commit or physical
-    // materialization — the frozen M5 composition boundary. Doing this after the
-    // side-effectful materialize would promote a static config error into a
-    // physical-quiescence incident.
-    let task = kernel.task(task_id)?;
-    let partition = kernel.partition(task.partition.as_str())?;
-    let (target, _profile) = agentype_execution_config::resolve_target_profile(
-        execution_registry,
-        &partition.execution_target,
-        &partition.execution_profile,
-    )
-    .map_err(|err| {
-        ProvisioningResolutionError::Storage(agentype_core::Error::invalid_authority(
-            err.to_string(),
-        ))
-    })?;
-
     // Capture the active candidate frontier the winner is selected against; the
     // authority transaction recomputes it and rejects a concurrent publish.
     let frontier = kernel.catalog_frontier_digest()?;
@@ -797,29 +816,21 @@ fn prepare_selection(
             task_id,
             agent,
             adapters,
+            execution_registry,
             integrations,
             deadline,
         )?,
-        None => resolve_source_candidates(kernel, task_id, adapters, integrations, deadline)?,
+        None => resolve_source_candidates(
+            kernel,
+            task_id,
+            adapters,
+            execution_registry,
+            integrations,
+            deadline,
+        )?,
     };
-    // Deterministic ranking MUST operate on the fully eligible set. Filter out
-    // candidates whose adapter kind the partition's authoritative execution
-    // target cannot run BEFORE `select_candidate`, so a wrong-kind, higher-ranked
-    // source cannot shadow a correct-kind candidate (the transaction re-proves
-    // this as defense in depth).
-    // Realized-lifecycle conjunct: the source/config must be able to realize the
-    // member's actual M4 retention (B.3 deliberately deferred this to B.4).
-    let required_lifecycle = agentype_agent_contract::required_lifecycle(partition.retention);
-    let eligible: Vec<SourceProvisioningCandidate> = eligible
-        .into_iter()
-        .filter(|candidate| candidate.adapter_kind == target.adapter_kind)
-        .filter(|candidate| {
-            candidate
-                .source_config
-                .effective_lifecycle(&candidate.spawn_source)
-                .contains(&required_lifecycle)
-        })
-        .collect();
+    // Enumeration completes all known hard filters before attestation and
+    // returns only physically eligible candidates. Ranking adds no eligibility.
     let winner = select_candidate(&eligible)?;
 
     // The winner's exact binding must still be resolvable in the live runtime.
@@ -1236,6 +1247,280 @@ mod tests {
 
     const MAX_BYTES: usize = 16_384;
 
+    // A fatal attestation error makes accidental evaluation visible: known
+    // ineligibility must never spend a deadline or abort later valid candidates.
+    struct StaticFilterProbe;
+
+    impl SourceConfigIntegration for StaticFilterProbe {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<String, ProvisioningResolutionError> {
+            if !revision.config().credential_refs.is_empty()
+                || kind == "other"
+                || key == "k1"
+                    && revision.config().config_ref.source().id().as_str() == "unisolated"
+            {
+                return Err(ProvisioningResolutionError::MissingRevision(
+                    "statically ineligible candidate reached attest".into(),
+                ));
+            }
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, kind, key, deadline)
+        }
+    }
+
+    #[test]
+    fn credential_config_is_filtered_before_attestation_and_cannot_hide_valid_config() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        let body = json!({"model": "credential-first"});
+        let config = SourceConfig {
+            config_ref: SourceConfigRef::new(
+                SpawnSourceRef::new("source", 1).unwrap(),
+                "000-credential",
+                1,
+            )
+            .unwrap(),
+            config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: vec![CredentialRef::new("secret").unwrap()],
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        };
+        kernel
+            .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+            .unwrap();
+        let task = typed_task(&kernel, pin);
+        let result = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(StaticFilterProbe),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidate
+                .source_config
+                .config_ref
+                .config_id()
+                .as_str(),
+            "config"
+        );
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+    }
+
+    #[test]
+    fn wrong_target_kind_is_filtered_before_attestation() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        publish_wrong_kind_logical_source(&kernel);
+        let task = typed_task(&kernel, pin);
+        let result = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding_and_other(),
+            &execution_registry(),
+            &si(StaticFilterProbe),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(result.candidate.adapter_kind, "default");
+    }
+
+    #[test]
+    fn target_isolation_filters_incapable_source_before_attest_and_selection() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        // Disable the original source; add an incapable and a capable source
+        // sharing the target kind and continuity rank. Without the target gate
+        // the resolver would call the incapable source and/or report ambiguity.
+        kernel
+            .set_spawn_source_status(
+                &SpawnSourceRef::new("source", 1).unwrap(),
+                SourceStatus::Disabled,
+            )
+            .unwrap();
+        for (name, binding_ref) in [("unisolated", "primary"), ("isolated", "isolated")] {
+            let policy = AdapterBindingPolicy {
+                policy_ref: AdapterPolicyRef::new(name, 1).unwrap(),
+                adapter_kind: "default".into(),
+                binding_ref: binding_ref.into(),
+                required_safety: safety(),
+                status: ConfigStatus::Active,
+            };
+            kernel.publish_adapter_binding_policy(&policy).unwrap();
+            let source = SpawnSource {
+                source_ref: SpawnSourceRef::new(name, 1).unwrap(),
+                adapter_policy: policy.policy_ref,
+                lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
+                continuity_modes: [ContinuityMode::None].into_iter().collect(),
+                functional_envelope: BTreeMap::new(),
+                claims: Vec::new(),
+                status: SourceStatus::Active,
+            };
+            kernel.publish_spawn_source(&source).unwrap();
+            let body = json!({"model": name});
+            let config = SourceConfig {
+                config_ref: SourceConfigRef::new(source.source_ref, "config", 1).unwrap(),
+                config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+                lifecycle_modes: None,
+                continuity_modes: None,
+                credential_refs: Vec::new(),
+                claims: Vec::new(),
+                status: ConfigStatus::Active,
+            };
+            kernel
+                .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+                .unwrap();
+        }
+        let mut adapters = adapters_with_binding();
+        adapters
+            .register_with_safety_and_ref(
+                "default",
+                "isolated",
+                AdapterBindingKey::new("k2").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                AdapterDeadlinePolicy::uniform(Duration::from_secs(1)).unwrap(),
+                AdapterSafetyEnvelope::unenforceable()
+                    .with_attempt_isolation(true)
+                    .with_enforceable_workspace([WorkspaceMode::ReadOnly])
+                    .with_enforceable_network([NetworkEnforcement::Disabled]),
+            )
+            .unwrap();
+        let mut registry = ExecutionRegistry::new();
+        registry
+            .register_target(ExecutionTargetConfig::new("local", "default", true))
+            .unwrap();
+        registry
+            .register_profile(ExecutionProfileConfig::new("default"))
+            .unwrap();
+        let task = typed_task(&kernel, pin);
+        let result = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &si(StaticFilterProbe),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(result.candidate.adapter_binding_key, "k2");
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+        let launch =
+            crate::prepare_typed_execution_launch(&kernel, result, &registry, &adapters).unwrap();
+        assert!(launch.snapshot().attempt_isolation());
+    }
+
+    struct PrepareUnavailable;
+
+    impl SourceConfigIntegration for PrepareUnavailable {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<String, ProvisioningResolutionError> {
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            FailingMaterializeMaterializer.prepare(revision, kind, key, deadline)
+        }
+    }
+
+    #[test]
+    fn pure_prepare_failure_cannot_invalidate_the_previous_warm_host() {
+        let kernel = partitioned_kernel_with_retention(Retention::Resident);
+        let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let task_a = typed_task(&kernel, pin.clone());
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let first = acquire_typed_task(
+            &kernel,
+            &task_a,
+            &adapters,
+            &registry,
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let pb = first.acquisition.provisioning_binding.clone();
+        let claim = first.acquisition.claim.clone();
+        let launch =
+            crate::prepare_typed_execution_launch(&kernel, first, &registry, &adapters).unwrap();
+        kernel
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(launch.snapshot().execution_id()),
+                &json!({}),
+                None,
+                true,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let task_b = typed_task(&kernel, pin);
+        assert!(acquire_typed_task(
+            &kernel,
+            &task_b,
+            &adapters,
+            &registry,
+            &si(PrepareUnavailable),
+            &deadline(),
+            &deadline()
+        )
+        .is_err());
+        assert_eq!(
+            kernel.incarnation(&pb.incarnation_id).unwrap().state,
+            agentype_core::IncarnationState::Warm
+        );
+        assert_eq!(
+            kernel.logical_agent(&agent).unwrap().state,
+            LogicalAgentState::Ready
+        );
+        assert_eq!(
+            kernel.get_provisioning_binding(&pb.incarnation_id).unwrap(),
+            Some(pb)
+        );
+    }
+
     /// A canonical `sha256:<64 hex>` materialization digest for test doubles
     /// whose attestation does not come from a real config digest.
     const TEST_DIGEST: &str =
@@ -1311,6 +1596,10 @@ mod tests {
     }
 
     fn publish(kernel: &Kernel) -> AgentTypeRef {
+        publish_with_lifecycle(kernel, LifecycleMode::Ephemeral)
+    }
+
+    fn publish_with_lifecycle(kernel: &Kernel, lifecycle: LifecycleMode) -> AgentTypeRef {
         let agent = AgentType {
             type_ref: AgentTypeRef::new("reviewer", 1).unwrap(),
             based_on: None,
@@ -1324,7 +1613,7 @@ mod tests {
                     network: NetworkPolicy::Disabled,
                     requires_attempt_isolation: false,
                 },
-                lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+                lifecycle: [lifecycle].into_iter().collect(),
                 continuity: ContinuityMode::None,
                 sandbox_policy: None,
                 anchor_constraint: None,
@@ -1344,7 +1633,7 @@ mod tests {
         let source = SpawnSource {
             source_ref: SpawnSourceRef::new("source", 1).unwrap(),
             adapter_policy: policy.policy_ref.clone(),
-            lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
+            lifecycle_modes: [lifecycle].into_iter().collect(),
             continuity_modes: [ContinuityMode::None].into_iter().collect(),
             functional_envelope: BTreeMap::new(),
             claims: Vec::new(),
@@ -1430,15 +1719,15 @@ mod tests {
 
     /// Kernel with a capacity-1 population so a READY agent can be bound.
     fn partitioned_kernel() -> Kernel {
+        partitioned_kernel_with_retention(Retention::Ephemeral)
+    }
+
+    fn partitioned_kernel_with_retention(retention: Retention) -> Kernel {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
         let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
         kernel
             .upsert_partition(&PartitionSpec::new(
-                "general",
-                1,
-                Retention::Ephemeral,
-                "local",
-                "default",
+                "general", 1, retention, "local", "default",
             ))
             .unwrap();
         kernel.reconcile_pool().unwrap();
@@ -2232,8 +2521,15 @@ mod tests {
                 Arc::new(EchoMaterializer),
             )
             .unwrap();
-        let candidates =
-            resolve_source_candidates(&kernel, &task, &adapters, &routed, &deadline()).unwrap();
+        let candidates = resolve_source_candidates(
+            &kernel,
+            &task,
+            &adapters,
+            &execution_registry(),
+            &routed,
+            &deadline(),
+        )
+        .unwrap();
         assert!(candidates.is_empty());
 
         // The uniform registry routes every source and yields the candidate.
@@ -2241,6 +2537,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(EchoMaterializer),
             &deadline(),
         )
@@ -2259,6 +2556,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(EchoMaterializer),
             &deadline(),
         )
@@ -2412,6 +2710,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(EmptyMaterializer),
             &deadline(),
         )
@@ -2431,6 +2730,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(RejectingMaterializer),
             &deadline(),
         )
@@ -2465,6 +2765,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(EchoMaterializer),
             &deadline(),
         )
@@ -2498,6 +2799,7 @@ mod tests {
             &kernel,
             &task,
             &adapters,
+            &execution_registry(),
             &si(EchoMaterializer),
             &deadline(),
         )

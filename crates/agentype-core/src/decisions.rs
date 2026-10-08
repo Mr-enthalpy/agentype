@@ -108,6 +108,21 @@ pub struct ClaimIntent<'a> {
     pub continuity: ContinuityPreference,
 }
 
+/// Shared frozen M5 placement gate for legacy claims, typed preselection and
+/// typed acquisition. Required continuity needs a concrete Task workstream;
+/// two absent workstreams never establish continuity.
+pub fn claim_placement_eligible(
+    intent: &ClaimIntent<'_>,
+    agent_partition: &str,
+    agent_tags: &[String],
+    agent_workstream: Option<&str>,
+) -> bool {
+    agent_partition == intent.partition
+        && crate::authority::tags_match(intent.required_tags, agent_tags)
+        && (intent.continuity != ContinuityPreference::Required
+            || (intent.workstream_id.is_some() && intent.workstream_id == agent_workstream))
+}
+
 /// Select the single best consumer for a task per the frozen matching rules:
 /// exact partition, READY + unassigned, tag subset, continuity gate, then
 /// rank (workstream-aware placement) with availability/id tiebreaks.
@@ -121,13 +136,12 @@ pub fn select_claim_agent<'a>(
             !a.type_bound
                 && a.state == LogicalAgentState::Ready
                 && !a.assigned_to_task
-                && a.partition == intent.partition
-                && crate::authority::tags_match(intent.required_tags, &a.tags)
-        })
-        .filter(|a| {
-            let same_ws = intent.workstream_id.is_some()
-                && Some(intent.workstream_id.unwrap()) == a.workstream_id.as_deref();
-            intent.continuity != ContinuityPreference::Required || same_ws
+                && claim_placement_eligible(
+                    intent,
+                    &a.partition,
+                    &a.tags,
+                    a.workstream_id.as_deref(),
+                )
         })
         .min_by(|a, b| {
             let same_a = intent.workstream_id.is_some()

@@ -32,6 +32,396 @@ use std::sync::Arc;
 
 const MAX_BYTES: usize = 16_384;
 
+#[test]
+fn required_continuity_has_the_same_gate_for_existing_and_new_acquisition() {
+    for existing in [true, false] {
+        for concrete_workstream in [false, true] {
+            let env = Env::new("required-placement", 1);
+            let kernel = &env.kernel;
+            let pin = publish_agent_contract(
+                kernel,
+                "continuity",
+                false,
+                LifecycleMode::Ephemeral,
+                ContinuityMode::Logical,
+            );
+            let catalog = publish_source_contract(
+                kernel,
+                "continuity",
+                LifecycleMode::Ephemeral,
+                ContinuityMode::Logical,
+            );
+            let workstream = concrete_workstream
+                .then(|| kernel.create_workstream("project", None, None).unwrap());
+            let mut spec = TaskSpec::new("continuous", json!({}))
+                .continuity(agentype_core::ContinuityPreference::Required);
+            spec.workstream_id = workstream.clone();
+            let task = admit_typed_spec(kernel, pin.clone(), spec);
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            env.raw()
+                .execute(
+                    "UPDATE logical_agents SET workstream_id=?1 WHERE id=?2",
+                    rusqlite::params![workstream.as_ref().map(|id| id.as_str()), agent.as_str()],
+                )
+                .unwrap();
+            assert_eq!(
+                !kernel
+                    .match_existing_agents_for_task(&task)
+                    .unwrap()
+                    .is_empty(),
+                concrete_workstream
+            );
+            let population: i64 = env
+                .raw()
+                .query_row("SELECT COUNT(*) FROM logical_agents", [], |r| r.get(0))
+                .unwrap();
+            let result = if existing {
+                kernel.acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+            } else {
+                kernel.acquire_typed_task_new_agent(&task, &catalog.selection, &registry())
+            };
+            assert_eq!(
+                result.is_ok(),
+                concrete_workstream,
+                "existing={existing}, concrete={concrete_workstream}"
+            );
+            if !concrete_workstream {
+                assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+                assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+                assert_eq!(count_provisioning_bindings(&env), 0);
+                assert_eq!(
+                    env.raw()
+                        .query_row("SELECT COUNT(*) FROM logical_agents", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    population
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn target_isolation_is_reproved_before_both_acquisition_paths() {
+    // Task and AgentType require no isolation. The target independently promises
+    // it: an incapable adapter must not consume an Attempt or create a binding.
+    for existing in [true, false] {
+        for target_isolation in [false, true] {
+            for imported_isolation in [false, true] {
+                let env = Env::new("target-import-intersection", 1);
+                let kernel = &env.kernel;
+                let pin = publish_agent_type(kernel, "reviewer");
+                let mut catalog = publish_catalog(kernel, "intersection");
+                let source = kernel
+                    .get_spawn_source(&catalog.selection.spawn_source)
+                    .unwrap()
+                    .unwrap();
+                let config = kernel
+                    .get_source_config_revision(&catalog.selection.source_config)
+                    .unwrap()
+                    .unwrap();
+                catalog.selection.evidence = ResolvedProvisioningEvidence::from_imported_binding(
+                    source.adapter_policy.clone(),
+                    "default",
+                    "k1",
+                    source.source_ref.clone(),
+                    config.config().config_ref.clone(),
+                    config.config().config_digest.clone(),
+                    PhysicalSafety::new(
+                        imported_isolation,
+                        vec![WorkspaceMode::ReadOnly],
+                        [NetworkPolicy::Disabled].into_iter().collect(),
+                    )
+                    .unwrap(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+                let task = admit_typed_task(kernel, pin.clone());
+                let agent = kernel.ready_agent("general").unwrap();
+                kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+                let execution_registry = if target_isolation {
+                    registry_isolated()
+                } else {
+                    registry()
+                };
+                let result = if existing {
+                    kernel.acquire_typed_task_existing(
+                        &task,
+                        &agent,
+                        &catalog.selection,
+                        &execution_registry,
+                    )
+                } else {
+                    kernel.acquire_typed_task_new_agent(
+                        &task,
+                        &catalog.selection,
+                        &execution_registry,
+                    )
+                };
+                assert_eq!(result.is_ok(), !target_isolation || imported_isolation);
+                if result.is_err() {
+                    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+                    assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+                    assert_eq!(count_provisioning_bindings(&env), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn execution_cannot_freeze_target_isolation_beyond_the_committed_capability() {
+    let env = Env::new("snapshot-target-intersection", 1);
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "reviewer");
+    let catalog = publish_catalog(kernel, "snapshot-target");
+    let task = admit_typed_task(kernel, pin.clone());
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquired = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    // A target changes to isolated after acquisition; neither semantic contract
+    // requires isolation, but the PB never proved that physical capability.
+    let physical = resolve_execution_environment(
+        ExecutionResolutionMode::Authoritative(&registry_isolated()),
+        &kernel.resolve_execution_binding(&acquired.claim).unwrap(),
+    )
+    .unwrap()
+    .physical_binding(AdapterBindingKey::new("k1").unwrap())
+    .unwrap();
+    let mut record = snapshot(
+        &agentype_core::ExecutionId::new(),
+        &acquired.provisioning_binding,
+        &catalog,
+        &acquired.claim,
+        &physical,
+    );
+    record.effective_isolation = true;
+    assert!(kernel
+        .create_execution_with_snapshot(&acquired.claim, physical, &record)
+        .is_err());
+    assert!(kernel
+        .attempt(&acquired.claim.attempt_id)
+        .unwrap()
+        .incarnation_id
+        .is_none());
+    assert_eq!(
+        env.raw()
+            .query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+/// Build a genuinely reusable resident host via a committed Execution and a
+/// valid success ACK, rather than manufacturing WARM with a fixture SQL update.
+fn resident_host(
+    env: &Env,
+) -> (
+    AgentTypeRef,
+    Catalog,
+    agentype_core::LogicalAgentId,
+    agentype_core::IncarnationId,
+) {
+    let kernel = &env.kernel;
+    let pin = publish_agent_contract(
+        kernel,
+        "resident",
+        false,
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let catalog = publish_source_contract(
+        kernel,
+        "resident",
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let task = admit_typed_task(kernel, pin.clone());
+    let acquired = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    let physical = physical_binding(&acquired.claim);
+    let record = snapshot(
+        &agentype_core::ExecutionId::new(),
+        &acquired.provisioning_binding,
+        &catalog,
+        &acquired.claim,
+        &physical,
+    );
+    let launch = kernel
+        .create_execution_with_snapshot(&acquired.claim, physical, &record)
+        .unwrap();
+    let incarnation = acquired.provisioning_binding.incarnation_id;
+    assert_eq!(
+        kernel
+            .attempt(&acquired.claim.attempt_id)
+            .unwrap()
+            .incarnation_id,
+        Some(incarnation.clone())
+    );
+    kernel
+        .ack_success(
+            &acquired.claim.attempt_id,
+            acquired.claim.lease_epoch,
+            Some(launch.execution_id()),
+            &json!({"done": true}),
+            None,
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        kernel.incarnation(&incarnation).unwrap().state,
+        agentype_core::IncarnationState::Warm
+    );
+    (pin, catalog, agent, incarnation)
+}
+
+#[test]
+fn pre_execution_settlement_preserves_a_reused_resident_host_across_all_closures() {
+    for action in [
+        "configuration",
+        "cancel-task",
+        "cancel-batch",
+        "expiry",
+        "restart",
+        "nack-history",
+        "ack",
+    ] {
+        let env = Env::with_retention(action, 1, Retention::Resident);
+        let (pin, catalog, agent, incarnation) = resident_host(&env);
+        let task = admit_typed_task(&env.kernel, pin);
+        let acquired = env
+            .kernel
+            .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+            .unwrap();
+        assert_eq!(acquired.provisioning_binding.incarnation_id, incarnation);
+        let claim = &acquired.claim;
+        match action {
+            "configuration" => {
+                env.kernel
+                    .report_configuration_unavailable(
+                        &claim.attempt_id,
+                        claim.lease_epoch,
+                        "pure preparation unavailable",
+                    )
+                    .unwrap();
+            }
+            "cancel-task" => {
+                env.kernel.cancel_task(&task, false).unwrap();
+            }
+            "cancel-batch" => {
+                env.kernel.cancel_batch(&claim.batch_id).unwrap();
+            }
+            "expiry" | "restart" => {
+                let now = if action == "expiry" {
+                    claim.lease_expires_at + 1.0
+                } else {
+                    1_000.0
+                };
+                let reopened =
+                    Kernel::open(&env.path, Arc::new(ManualClock::new(now)), 10.0, MAX_BYTES)
+                        .unwrap();
+                reopened.expire_leases(action == "restart").unwrap();
+            }
+            "nack-history" => {
+                env.kernel
+                    .nack_preserving_physical_history(
+                        &claim.attempt_id,
+                        claim.lease_epoch,
+                        agentype_core::FailureClass::ResourceUnavailable,
+                        None,
+                    )
+                    .unwrap();
+            }
+            "ack" => {
+                env.kernel
+                    .ack_success(
+                        &claim.attempt_id,
+                        claim.lease_epoch,
+                        None,
+                        &json!({}),
+                        None,
+                        true,
+                        false,
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            env.kernel.incarnation(&incarnation).unwrap().state,
+            agentype_core::IncarnationState::Warm,
+            "{action}"
+        );
+        assert!(env
+            .kernel
+            .logical_agent(&agent)
+            .unwrap()
+            .current_task_id
+            .is_none());
+        assert_eq!(
+            env.kernel.get_provisioning_binding(&incarnation).unwrap(),
+            Some(acquired.provisioning_binding)
+        );
+        assert_eq!(
+            env.raw()
+                .query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(env.raw().query_row("SELECT COUNT(*) FROM escalations WHERE failure_class='WRITER_QUIESCENCE_UNKNOWN'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+}
+
+#[test]
+fn fresh_pre_execution_reservation_remains_starting_and_can_be_reused() {
+    let env = Env::with_retention("fresh-reservation", 1, Retention::Resident);
+    let kernel = &env.kernel;
+    let pin = publish_agent_contract(
+        kernel,
+        "resident",
+        false,
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let catalog = publish_source_contract(
+        kernel,
+        "resident",
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let first_task = admit_typed_task(kernel, pin.clone());
+    let first = kernel
+        .acquire_typed_task_existing(&first_task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    kernel.cancel_task(&first_task, false).unwrap();
+    assert_eq!(
+        kernel
+            .incarnation(&first.provisioning_binding.incarnation_id)
+            .unwrap()
+            .state,
+        agentype_core::IncarnationState::Starting
+    );
+    let second_task = admit_typed_task(kernel, pin);
+    let second = kernel
+        .acquire_typed_task_existing(&second_task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    assert_eq!(second.provisioning_binding, first.provisioning_binding);
+    assert_eq!(count_provisioning_bindings(&env), 1);
+}
+
 /// A canonical `sha256:<64 hex>` materialization digest for fixtures.
 fn mat_digest() -> MaterializationDigest {
     MaterializationDigest::new(
@@ -54,6 +444,10 @@ struct Env {
 
 impl Env {
     fn new(tag: &str, capacity: i64) -> Self {
+        Self::with_retention(tag, capacity, Retention::Ephemeral)
+    }
+
+    fn with_retention(tag: &str, capacity: i64, retention: Retention) -> Self {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("b4-{tag}-{}", nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scheduler.db");
@@ -61,11 +455,7 @@ impl Env {
         let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
         kernel
             .upsert_partition(&PartitionSpec::new(
-                "general",
-                capacity,
-                Retention::Ephemeral,
-                "local",
-                "default",
+                "general", capacity, retention, "local", "default",
             ))
             .unwrap();
         kernel.reconcile_pool().unwrap();
@@ -125,6 +515,22 @@ fn publish_agent_type_isolation(
     id: &str,
     requires_attempt_isolation: bool,
 ) -> AgentTypeRef {
+    publish_agent_contract(
+        kernel,
+        id,
+        requires_attempt_isolation,
+        LifecycleMode::Ephemeral,
+        ContinuityMode::None,
+    )
+}
+
+fn publish_agent_contract(
+    kernel: &Kernel,
+    id: &str,
+    requires_attempt_isolation: bool,
+    lifecycle: LifecycleMode,
+    continuity: ContinuityMode,
+) -> AgentTypeRef {
     let agent = AgentType {
         type_ref: type_ref(id, 1),
         based_on: None,
@@ -138,8 +544,8 @@ fn publish_agent_type_isolation(
                 network: NetworkPolicy::Disabled,
                 requires_attempt_isolation,
             },
-            lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
-            continuity: ContinuityMode::None,
+            lifecycle: [lifecycle].into_iter().collect(),
+            continuity,
             sandbox_policy: None,
             anchor_constraint: None,
         },
@@ -154,6 +560,15 @@ struct Catalog {
 }
 
 fn publish_catalog(kernel: &Kernel, tag: &str) -> Catalog {
+    publish_source_contract(kernel, tag, LifecycleMode::Ephemeral, ContinuityMode::None)
+}
+
+fn publish_source_contract(
+    kernel: &Kernel,
+    tag: &str,
+    lifecycle: LifecycleMode,
+    continuity: ContinuityMode,
+) -> Catalog {
     let policy = AdapterBindingPolicy {
         policy_ref: AdapterPolicyRef::new(format!("policy-{tag}"), 1).unwrap(),
         adapter_kind: "default".into(),
@@ -166,8 +581,8 @@ fn publish_catalog(kernel: &Kernel, tag: &str) -> Catalog {
     let source = SpawnSource {
         source_ref: SpawnSourceRef::new(format!("source-{tag}"), 1).unwrap(),
         adapter_policy: policy.policy_ref.clone(),
-        lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
-        continuity_modes: [ContinuityMode::None].into_iter().collect(),
+        lifecycle_modes: [lifecycle].into_iter().collect(),
+        continuity_modes: [continuity].into_iter().collect(),
         functional_envelope: BTreeMap::new(),
         claims: Vec::new(),
         status: SourceStatus::Active,
@@ -232,6 +647,14 @@ fn draft(pin: AgentTypeRef) -> AgentRequirementDraft {
 }
 
 fn admit_typed_task(kernel: &Kernel, pin: AgentTypeRef) -> agentype_core::TaskId {
+    admit_typed_spec(
+        kernel,
+        pin,
+        TaskSpec::new("audit", json!({})).partition("general"),
+    )
+}
+
+fn admit_typed_spec(kernel: &Kernel, pin: AgentTypeRef, spec: TaskSpec) -> agentype_core::TaskId {
     let gen = kernel.create_generation(json!({})).unwrap();
     let intent = RawWorkIntent {
         raw_intent_key: "typed_work".into(),
@@ -239,7 +662,7 @@ fn admit_typed_task(kernel: &Kernel, pin: AgentTypeRef) -> agentype_core::TaskId
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
         rationale: None,
-        suggested_task_spec: Some(TaskSpec::new("audit", json!({})).partition("general")),
+        suggested_task_spec: Some(spec),
     };
     let proposal = kernel
         .compile_root_intent(&gen.generation_id, intent, "session", 1)
