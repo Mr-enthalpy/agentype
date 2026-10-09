@@ -2,6 +2,7 @@
 
 Status: Accepted (M6-B.4 correction; not a milestone freeze)
 Date: 2026-10-08
+Updated: 2026-10-09
 Canonical path: `docs/decisions/0011-m6b-acquisition-contract-parity.md`
 
 ## Context
@@ -60,6 +61,15 @@ materialized STARTING reservation remains reusable. After Execution commitment,
 the unchanged M5 physical presence and writer-safety rules apply. Semantic
 retirement still fences an agent's reusable Incarnations in its own transaction.
 
+Reuse and replacement obey the same phase boundary. A validated STARTING
+provisioning reservation with no Execution history may be fenced and rolled to
+new provenance once its claim closes. The transaction checks ACTIVE claims by
+LogicalAgent, because a pre-Execution Attempt deliberately has no Incarnation
+association. A STARTING Incarnation with any Execution history, or one whose
+agent still has an ACTIVE claim, is not such a reservation. Active physical
+Executions remain protected. This permits legal source/config replacement
+without reopening a physical-start or concurrent-writer exception.
+
 No settlement API or database schema changes are required. In particular, there
 is no new physical provisioning lifecycle and no generic `execution.is_none()`
 exception to the writer-safety gate.
@@ -83,6 +93,16 @@ registry. Its former signature could enumerate candidates without the target
 policy and only filter them after source-private I/O; that is the reason for
 the interface change. This grants no new public control-plane authority.
 
+### Preserve fault kinds across the integration boundary
+
+The prepare Result includes control-plane failures as well as source
+availability failures. Runtime classifies errors by kind regardless of which
+component returned them. Only explicit availability errors settle as
+RESOURCE_UNAVAILABLE; authority loss remains recovery-owned. Durable/storage
+faults, missing revisions and unsupported errors default to Fatal and leave the
+committed claim intact for control-plane handling/recovery, without a Task NACK.
+The existing Result signature is retained; its fault semantics are honored.
+
 ## Acceptance and consequences
 
 The acceptance matrix covers behavior across boundaries, not only the newest
@@ -91,6 +111,13 @@ combinations; reservation versus committed Execution; configuration failure,
 Task/Batch cancellation, expiry, restart, physical-history-preserving NACK and
 ACK; immutable binding identity; and statically ineligible candidates whose
 attestation would otherwise fail the entire search.
+
+It also covers source/config rollover after pure prepare failure and cancellation,
+same-Task mechanical retry, ACTIVE claims with no Incarnation association,
+STARTING with physical history, and integration-returned availability versus
+authority-loss versus fatal faults. Assertions include immutable old provenance,
+one active reservation, zero adapter starts, and failure-row absence for fatal
+and authority-loss cases.
 
 Tests must include valid counterparts and assert authoritative consequences
 (Attempt/Lease absence, atomic rollback, unchanged host identity/state), not

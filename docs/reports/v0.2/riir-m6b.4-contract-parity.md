@@ -1,8 +1,8 @@
 # M6-B.4 — Frozen-contract counterexample witness
 
 Status: Historical Report
-Date: 2026-10-08
-Applies to: PR #24 correction after `515a25ca`
+Date: 2026-10-09
+Applies to: PR #24 corrections after `515a25ca` and `ecc2990`
 Canonical path: `docs/reports/v0.2/riir-m6b.4-contract-parity.md`
 Not a specification.
 
@@ -33,12 +33,28 @@ state. They do not infer correctness from an error return alone.
 
 ## Source-private I/O and integration evidence
 
-The resolver suite passes 26 tests. Added cases place a credential config ahead
+The resolver suite passes 30 tests. Added cases place a credential config ahead
 of a valid one and install poisoned attestations for credential/wrong-kind
 candidates; those integrations are never called. An isolated target rejects an
 incapable domain before attestation while admitting a capable source. An actual
 pure preparation failure after a prior committed resident Execution preserves
 the WARM host.
+
+Reservation and fault regressions retained against `ecc2990` reproduce the next
+uncovered phase boundaries: storage reports 41 passed / 1 failed and resolver
+reports 27 passed / 3 failed. The failures are source replacement after closure,
+fatal integration errors being settled as availability, and authority-loss
+errors producing Task failure. The availability counterpart and physical-history
+guards pass on both implementations. After correction, B.4 passes all 42 tests
+and resolver passes all 30.
+
+The replacement matrix covers pure preparation failure and cancellation, a new
+config on the same source and a new source, same-Task retry, immutable old
+provenance, one active reservation and zero physical starts. Guard cases retain
+the restriction for an ACTIVE claim with NULL Incarnation association and a
+STARTING Incarnation with Execution history. Fault matrices assert exact fatal
+propagation, unchanged claim/Lease and no failure rows, alongside an actual
+RESOURCE_UNAVAILABLE settlement for availability errors.
 
 Together these cases exercise placement, target/importer qualification,
 reservation/Execution separation and source-private I/O ordering. Full daemon

@@ -430,6 +430,18 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   config failure, Task/Batch cancel, expiry, restart, NACK or ACK;
 - a fresh STARTING reservation never fabricates WARM/terminal physical evidence
   on pre-Execution cancellation and can be reused;
+- after pure prepare failure or cancellation, a STARTING reservation with a
+  validated ProvisioningBinding and no Execution history can transactionally
+  roll to another config/source once its claim closes; tests MUST cover
+  same-Task retry, one active reservation, immutable old provenance and zero
+  physical adapter starts;
+- rollover MUST reject ACTIVE claims on the hosting LogicalAgent even when
+  Attempt.incarnation_id is NULL, and MUST reject STARTING with any Execution
+  history; rejection leaves existing provenance and Task authority intact;
+- integration-returned availability errors settle as RESOURCE_UNAVAILABLE,
+  while authority loss and fatal/control-plane faults produce no Task failure
+  row; StorageFailure, InvariantViolation, RecoveryRequired and missing revisions
+  propagate without closing the committed claim;
 - an earlier credential-bearing config and a wrong-kind source whose attestation
   would fail the whole search are skipped without invoking that attestation.
 

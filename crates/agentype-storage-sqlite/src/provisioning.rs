@@ -781,12 +781,28 @@ fn incarnation_is_fresh(tx: &Transaction<'_>, incarnation_id: &str) -> Result<bo
 
 #[cfg(any(test, feature = "runtime-internal"))]
 /// Fence an idle Incarnation so a new provenance can be rolled over onto a fresh
-/// one. An Incarnation with an active execution may not be rolled over.
+/// one. Active claims and executions prevent rollover. A STARTING Incarnation
+/// is replaceable only with positive proof that it is a provisioning reservation
+/// with no Execution history, rather than an M5 physical start.
 fn fence_idle_incarnation(
     tx: &Transaction<'_>,
     incarnation_id: &str,
     now: UnixTime,
 ) -> Result<(), Error> {
+    // Before Execution commitment the Attempt has no incarnation_id. Fence
+    // against the hosting agent's claims, not only claims linked to this row.
+    let active_claim: Option<i64> = query_opt(
+        tx,
+        "SELECT 1 FROM attempts a JOIN incarnations i ON i.logical_agent_id=a.logical_agent_id
+         WHERE i.id=?1 AND a.state='ACTIVE' LIMIT 1",
+        params![incarnation_id],
+        |row| row.get(0),
+    )?;
+    if active_claim.is_some() {
+        return Err(Error::invalid_transition(
+            "cannot roll over an incarnation while its agent has an active claim",
+        ));
+    }
     let busy: Option<i64> = query_opt(
         tx,
         "SELECT 1 FROM executions WHERE incarnation_id=?1
@@ -806,9 +822,12 @@ fn fence_idle_incarnation(
         |row| row.get(0),
     )?
     .ok_or_else(|| Error::not_found(format!("incarnation {incarnation_id} not found")))?;
-    if state == "STARTING" {
+    if state == "STARTING"
+        && (!incarnation_is_fresh(tx, incarnation_id)?
+            || get_provisioning_binding(tx, &IncarnationId::from_string(incarnation_id))?.is_none())
+    {
         return Err(Error::invalid_transition(
-            "cannot roll over a starting incarnation",
+            "cannot roll over a starting incarnation without proof of an unstarted provisioning reservation",
         ));
     }
     tx.execute(
@@ -847,7 +866,8 @@ fn create_new_incarnation(
 /// lifecycle rules: reuse the active Incarnation and its `ProvisioningBinding`
 /// when the provenance and exact physical domain still match; roll over to a
 /// fresh Incarnation when they differ; adopt a fresh/legacy Incarnation only
-/// when its prior physical hosting matches the selection.
+/// when it has no Execution history. Pure reservations may change provenance
+/// after authority closes; an M5 physical STARTING state remains protected.
 #[cfg(any(test, feature = "runtime-internal"))]
 fn resolve_incarnation(
     tx: &Transaction<'_>,

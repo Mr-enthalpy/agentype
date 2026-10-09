@@ -326,6 +326,9 @@ pub trait SourceConfigIntegration: Send + Sync {
     /// physical materialization happens in the exact adapter's
     /// `start_execution` under M5. Called once, after the provisioning
     /// binding/claim is committed; never during eligibility.
+    /// Explicit availability failures settle as RESOURCE_UNAVAILABLE; authority
+    /// loss is left to recovery. Storage/corruption and all unrecognized errors
+    /// propagate as control-plane faults without a Task-level NACK.
     fn prepare(
         &self,
         revision: &agentype_storage_sqlite::SourceConfigRevision,
@@ -994,6 +997,34 @@ enum PreparationFailure {
     Fatal(ProvisioningResolutionError),
 }
 
+impl PreparationFailure {
+    /// Classify the integration boundary by fault kind, not by where the error
+    /// originated. Unknown/control-plane errors fail closed; candidate skipping
+    /// is no longer applicable after authority committed.
+    fn from_integration(error: ProvisioningResolutionError) -> Self {
+        use agentype_core::Error;
+        use ProvisioningResolutionError as P;
+        match &error {
+            P::ProvisioningAuthorityExpired(_)
+            | P::Storage(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                Self::AuthorityLost(error)
+            }
+            P::ExternalReferenceNotAttested(_)
+            | P::CredentialUnavailable(_)
+            | P::SourceOrConfigInactive
+            | P::ExactBindingUnresolved(_)
+            | P::ExactBindingChanged(_)
+            | P::ProvisioningDeadlineExceeded(_)
+            | P::MaterializationMismatch(_)
+            | P::Storage(Error::ConfigurationUnavailable(_)) => Self::Unavailable(error),
+            P::Evidence(contract_error) if evidence_is_candidate_local(contract_error) => {
+                Self::Unavailable(error)
+            }
+            _ => Self::Fatal(error),
+        }
+    }
+}
+
 fn prepare_winner(
     kernel: &Kernel,
     integrations: &SourceIntegrationRegistry,
@@ -1057,7 +1088,7 @@ fn prepare_winner(
             &binding.adapter_binding_key,
             deadline,
         )
-        .map_err(PreparationFailure::Unavailable)?;
+        .map_err(PreparationFailure::from_integration)?;
     if deadline.is_expired() {
         return Err(PreparationFailure::Unavailable(
             ProvisioningResolutionError::ProvisioningDeadlineExceeded(
@@ -1113,9 +1144,9 @@ fn settle_configuration_unavailable(
 }
 
 /// The source-integration attested digest MUST match the committed one. A
-/// mismatch (e.g. external state changed between `attest` and `prepare`) is
-/// fatal and MUST NOT produce an Execution. The message is redacted: it never
-/// echoes a source-produced value.
+/// mismatch (e.g. external state changed between `attest` and `prepare`) rejects
+/// preparation and MUST NOT produce an Execution. The message is redacted:
+/// it never echoes a source-produced value.
 fn require_materialization_receipt(
     committed: &MaterializationDigest,
     actual: &MaterializationDigest,
@@ -1435,6 +1466,347 @@ mod tests {
         assert!(launch.snapshot().attempt_isolation());
     }
 
+    struct PrepareError(ProvisioningResolutionError);
+
+    impl SourceConfigIntegration for PrepareError {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<String, ProvisioningResolutionError> {
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            _revision: &agentype_storage_sqlite::SourceConfigRevision,
+            _kind: &str,
+            _key: &str,
+            _deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            Err(self.0.clone())
+        }
+    }
+
+    fn preparation_kernel() -> (Kernel, rusqlite::Connection) {
+        let path = std::env::temp_dir().join(format!("b4-preparation-{}.db", Uuid::new_v4()));
+        let kernel =
+            Kernel::open(&path, Arc::new(ManualClock::new(1_000.0)), 10.0, MAX_BYTES).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        kernel.reconcile_pool().unwrap();
+        let raw = rusqlite::Connection::open(path).unwrap();
+        (kernel, raw)
+    }
+
+    #[test]
+    fn integration_fatal_preparation_errors_preserve_authority_and_fail_closed() {
+        use agentype_core::Error;
+        for err in [
+            ProvisioningResolutionError::Storage(Error::invariant("integration invariant")),
+            ProvisioningResolutionError::Storage(Error::storage_failure("integration storage")),
+            ProvisioningResolutionError::Storage(Error::recovery_required("integration recovery")),
+            ProvisioningResolutionError::Storage(Error::not_found("integration missing row")),
+            ProvisioningResolutionError::Storage(Error::invalid_transition(
+                "integration transition",
+            )),
+            ProvisioningResolutionError::Storage(Error::conflict("integration conflict")),
+            ProvisioningResolutionError::MissingRevision("source_config".into()),
+            ProvisioningResolutionError::NotTypedTask,
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, start_probe) = adapters_with_start_probe();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let binding = outcome.acquisition.provisioning_binding.clone();
+            let result = finalize_preparation(
+                &kernel,
+                &si(PrepareError(err.clone())),
+                outcome,
+                &deadline(),
+            )
+            .unwrap_err();
+            assert_eq!(result, err);
+            assert!(kernel.claim_authority_is_current(&claim).unwrap());
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+            assert_eq!(
+                kernel.attempt(&claim.attempt_id).unwrap().state,
+                agentype_core::AttemptState::Active
+            );
+            assert_eq!(
+                kernel.lease_for_attempt(&claim.attempt_id).unwrap().state,
+                agentype_core::LeaseState::Active
+            );
+            assert_eq!(
+                kernel
+                    .get_provisioning_binding(&binding.incarnation_id)
+                    .unwrap(),
+                Some(binding)
+            );
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(start_probe.start_call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn integration_availability_preparation_errors_settle_resource_unavailable() {
+        for err in [
+            ProvisioningResolutionError::ExternalReferenceNotAttested("config unavailable".into()),
+            ProvisioningResolutionError::ProvisioningDeadlineExceeded("read deadline".into()),
+            ProvisioningResolutionError::Storage(agentype_core::Error::configuration_unavailable(
+                "integration unavailable",
+            )),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, start_probe) = adapters_with_start_probe();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let result =
+                finalize_preparation(&kernel, &si(PrepareError(err)), outcome, &deadline())
+                    .unwrap_err();
+            assert!(matches!(
+                result,
+                ProvisioningResolutionError::PostCommitPreparationFailed(_)
+            ));
+            assert!(!kernel.claim_authority_is_current(&claim).unwrap());
+            assert_eq!(
+                kernel.attempt(&claim.attempt_id).unwrap().state,
+                agentype_core::AttemptState::Failed
+            );
+            assert_eq!(
+                kernel.logical_agent(&agent).unwrap().state,
+                LogicalAgentState::Ready
+            );
+            assert_eq!(
+                raw.query_row(
+                    "SELECT failure_class FROM failures WHERE attempt_id=?1",
+                    [claim.attempt_id.as_str()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "RESOURCE_UNAVAILABLE"
+            );
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(start_probe.start_call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn integration_authority_loss_does_not_nack_the_task() {
+        for err in [
+            ProvisioningResolutionError::ProvisioningAuthorityExpired("lost".into()),
+            ProvisioningResolutionError::Storage(agentype_core::Error::stale("lost")),
+            ProvisioningResolutionError::Storage(agentype_core::Error::invalid_authority("lost")),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters_with_binding(),
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            assert!(
+                finalize_preparation(&kernel, &si(PrepareError(err)), outcome, &deadline())
+                    .is_err()
+            );
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn pure_preparation_closure_can_roll_over_to_a_new_config_or_source() {
+        for cancel in [false, true] {
+            for same_source in [false, true] {
+                let (kernel, raw) = preparation_kernel();
+                let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+                let agent = kernel.ready_agent("general").unwrap();
+                kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+                let task = typed_task_with_retry(
+                    &kernel,
+                    pin.clone(),
+                    agentype_core::RetryPolicy {
+                        max_attempts: 3,
+                        retry_classes: vec![FailureClass::ResourceUnavailable],
+                        base_backoff_seconds: 0.0,
+                        max_backoff_seconds: 0.0,
+                    },
+                );
+                let (adapters, start_probe) = adapters_with_start_probe();
+                let registry = execution_registry();
+                let outcome = try_acquire_existing(
+                    &kernel,
+                    &task,
+                    &agent,
+                    &adapters,
+                    &registry,
+                    &si(EchoMaterializer),
+                    &deadline(),
+                )
+                .unwrap();
+                let old = outcome.acquisition.provisioning_binding.clone();
+                let next_task = if cancel {
+                    finalize_preparation(&kernel, &si(EchoMaterializer), outcome, &deadline())
+                        .unwrap();
+                    kernel.cancel_task(&task, false).unwrap();
+                    typed_task(&kernel, pin)
+                } else {
+                    assert!(finalize_preparation(
+                        &kernel,
+                        &si(PrepareError(
+                            ProvisioningResolutionError::ExternalReferenceNotAttested(
+                                "A unavailable".into()
+                            )
+                        )),
+                        outcome,
+                        &deadline()
+                    )
+                    .is_err());
+                    assert_eq!(kernel.task(&task).unwrap().state, TaskState::RetryWait);
+                    assert_eq!(kernel.promote_retry_wait().unwrap(), 1);
+                    task
+                };
+                kernel
+                    .set_source_config_status(&old.source_config, ConfigStatus::Disabled)
+                    .unwrap();
+                let mut source = kernel.get_spawn_source(&old.spawn_source).unwrap().unwrap();
+                if !same_source {
+                    kernel
+                        .set_spawn_source_status(&old.spawn_source, SourceStatus::Disabled)
+                        .unwrap();
+                    source.source_ref = SpawnSourceRef::new("source-b", 1).unwrap();
+                    kernel.publish_spawn_source(&source).unwrap();
+                }
+                let body = json!({"model": "opaque-b"});
+                let config = SourceConfig {
+                    config_ref: SourceConfigRef::new(source.source_ref.clone(), "config-b", 1)
+                        .unwrap(),
+                    config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+                    lifecycle_modes: None,
+                    continuity_modes: None,
+                    credential_refs: Vec::new(),
+                    claims: Vec::new(),
+                    status: ConfigStatus::Active,
+                };
+                kernel
+                    .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+                    .unwrap();
+                let next = acquire_typed_task(
+                    &kernel,
+                    &next_task,
+                    &adapters,
+                    &registry,
+                    &si(EchoMaterializer),
+                    &deadline(),
+                    &deadline(),
+                )
+                .unwrap();
+                assert_eq!(next.acquisition.claim.logical_agent_id, agent);
+                assert_ne!(
+                    next.acquisition.provisioning_binding.incarnation_id,
+                    old.incarnation_id
+                );
+                assert_eq!(
+                    next.acquisition.provisioning_binding.source_config,
+                    config.config_ref
+                );
+                assert_eq!(
+                    kernel.incarnation(&old.incarnation_id).unwrap().state,
+                    agentype_core::IncarnationState::Lost
+                );
+                assert_eq!(
+                    kernel
+                        .get_provisioning_binding(&old.incarnation_id)
+                        .unwrap(),
+                    Some(old)
+                );
+                assert_eq!(
+                    raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    raw.query_row(
+                        "SELECT COUNT(*) FROM attempts WHERE state='ACTIVE'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                crate::prepare_typed_execution_launch(&kernel, next, &registry, &adapters).unwrap();
+                assert_eq!(start_probe.start_call_count(), 0);
+            }
+        }
+    }
+
     struct PrepareUnavailable;
 
     impl SourceConfigIntegration for PrepareUnavailable {
@@ -1701,20 +2073,25 @@ mod tests {
     }
 
     fn adapters_with_binding() -> AdapterRegistry {
+        adapters_with_start_probe().0
+    }
+
+    fn adapters_with_start_probe() -> (AdapterRegistry, Arc<FakeAdapter>) {
+        let probe = Arc::new(FakeAdapter::new());
         let mut adapters = AdapterRegistry::new();
         adapters
             .register_with_safety_and_ref(
                 "default",
                 "primary",
                 AdapterBindingKey::new("k1").unwrap(),
-                Arc::new(FakeAdapter::new()),
+                probe.clone(),
                 AdapterDeadlinePolicy::uniform(Duration::from_secs(1)).unwrap(),
                 AdapterSafetyEnvelope::unenforceable()
                     .with_enforceable_workspace([WorkspaceMode::ReadOnly])
                     .with_enforceable_network([NetworkEnforcement::Disabled]),
             )
             .unwrap();
-        adapters
+        (adapters, probe)
     }
 
     /// Kernel with a capacity-1 population so a READY agent can be bound.

@@ -2,7 +2,7 @@
 
 Status: Historical Report
 Implementation status: M6-B.4 implemented, not frozen
-Date: 2026-10-08
+Date: 2026-10-09
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert milestone freeze.
 
@@ -47,6 +47,10 @@ into running typed daemon dispatch is a remaining step.
 - Acquisition reserves provenance. Execution commitment establishes physical
   association. Pure preparation failure, cancellation, expiry or recovery before
   a new Execution cannot mark an older resident WARM host dead.
+- An idle STARTING reservation with validated provenance and no Execution
+  history can roll to another source/config. ACTIVE claims on its LogicalAgent,
+  any Execution history on STARTING, and active physical Executions prevent that
+  rollover. A durable LOST fence does not assert physical resource termination.
 - Per-Incarnation bindings are immutable exact provenance; per-Execution
   snapshots freeze the admitted requirement and effective launch policy. Reuse
   requires exact qualification; changed provenance rolls to a new Incarnation.
@@ -58,6 +62,10 @@ into running typed daemon dispatch is a remaining step.
 - Known hard filters precede source-private I/O. Credentials fail closed for
   B.5; ambiguous continuity ties fail closed while availability/cost ranking is
   deferred. Corruption is fatal, never silently skipped.
+- Preparation preserves integration-returned fault kinds. Explicit availability
+  settles as RESOURCE_UNAVAILABLE; authority loss produces no Task NACK; storage,
+  invariant, recovery-required, missing-revision and unknown faults propagate
+  without writing a Task failure or closing the committed claim.
 - Attest/prepare are read-only, have separate absolute budgets and bind the
   descriptor to an exact protocol/domain/digest. Post-commit recovery resolves
   the exact physical binding and cannot choose a different source.
@@ -81,16 +89,16 @@ capacity and retirement fencing retain their behavior.
 
 ## Verification
 
-Local checks on 2026-10-08:
+Local checks on 2026-10-09:
 
 | Check | Result |
 |---|---|
-| Storage with test-support | 297 tests and 1 doc probe passed, including B.4 39, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 26 passed, including poisoned ineligible attestations and actual pure preparation failure on a previously committed WARM host |
+| Storage with test-support | 300 tests and 1 doc probe passed, including B.4 42, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 30 passed, including source/config rollover, integration fault matrices, poisoned ineligible attestations and pure preparation failure on a previously committed WARM host |
 | Default-feature public API boundary | 33 compile-fail probes passed |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
 | Formatting and whitespace | cargo fmt --all --check and git diff --check passed |
-| Full Windows workspace runtime gate | Not passed locally: ProcessLock setup returns PermissionDenied in four test targets; runtime unit target reports 262 passed and 10 failed |
+| Full Windows workspace runtime gate | Local ProcessLock setup is restricted; full runtime acceptance is checked against the pushed head's remote CI |
 
 The five new B.4 storage regressions also fail against the original provisioning
 implementation while its 34 existing tests pass, then pass with the correction.
@@ -99,10 +107,11 @@ discriminating cases. Passing test counts alone are not the acceptance argument.
 
 The four locally blocked targets are runtime unit tests, runtime process_lock,
 runtime semantic_control_contract and adapter-local-process daemon_acceptance.
-The observed failures occur at process-lock setup before the changed acquisition
-path. This records the environmental limit and does not count those targets as
-passing. Remote CI status must be checked against the pushed PR head; an earlier
-head's green result is not evidence for these changes.
+The prior `ecc2990` local full run reported 262 passed / 10 failed in the runtime
+unit target, with failures at process-lock setup before the acquisition path.
+This records the environmental limit and does not count those targets as locally
+passing. Its remote CI passed; remote status for subsequent changes must be
+checked against their pushed head, not that earlier green result.
 
 ## Remaining acceptance and scope
 
@@ -112,3 +121,11 @@ ControlLoopService dispatch, a concrete production SourceConfigIntegration,
 B.5 credentials/security import, cold/revivable matching, full typed topology
 and v7→v8 migration. The reference local-process adapter has no provisioning
 protocol and cannot launch typed descriptors.
+
+Before typed daemon wiring, the prepared plan must retain and pass its resolved
+exact adapter instance to start; returning to legacy resolve_unique lookup is
+not permitted. Before compatibility release, deployment must either supply a
+v7→v8 migration or be explicitly limited to new schema-v8 databases. Production
+Resident WARM source replacement requires real-adapter conformance for stopping,
+isolating or safely retaining old resources; durable fencing alone is not a
+physical termination witness.

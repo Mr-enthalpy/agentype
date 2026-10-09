@@ -2,7 +2,7 @@
 
 Status: Accepted (M6-B.4; not a milestone freeze)
 Date: 2026-10-06
-Consolidated: 2026-10-08
+Consolidated: 2026-10-09
 Canonical path: `docs/decisions/0008-m6b-typed-provisioning-acquisition.md`
 
 ## Context
@@ -82,6 +82,14 @@ requires a new Incarnation. A legacy Incarnation can be adopted only if it has
 no Execution history, because legacy physical history cannot prove opaque
 SourceConfig provenance.
 
+A STARTING provisioning reservation may roll to different source/config
+provenance after its claim closes. The rollover transaction must positively
+validate its ProvisioningBinding, prove that it has no Execution history and
+exclude any ACTIVE claim on its LogicalAgent (including one with no Incarnation
+association). STARTING with Execution history and every active physical
+Execution remain protected. Durable LOST is a provenance fence, not a claim of
+physical resource termination.
+
 `BindingSnapshot` is the per-Execution commitment. It records exact binding
 provenance, target/profile, admitted capabilities, imported capability and
 effective execution policy separately, credential-reference digest and the
@@ -135,6 +143,12 @@ reusable. After Execution commitment, frozen M5 physical presence and writer
 safety govern settlement. Semantic retirement retains its own fencing.
 Committed snapshots/recovery always use the exact binding; missing bindings
 cannot cause source fallback.
+
+Integration-returned errors preserve their fault kind: explicitly enumerated
+availability errors may settle as RESOURCE_UNAVAILABLE; authority loss is left
+to recovery; StorageFailure, InvariantViolation, RecoveryRequired, missing
+revisions and all unrecognized errors propagate without writing a Task failure.
+The broad prepare Result type does not imply that every error is availability.
 
 ## Capability and effective policy
 

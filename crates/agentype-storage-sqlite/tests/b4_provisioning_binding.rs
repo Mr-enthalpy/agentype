@@ -422,6 +422,168 @@ fn fresh_pre_execution_reservation_remains_starting_and_can_be_reused() {
     assert_eq!(count_provisioning_bindings(&env), 1);
 }
 
+#[test]
+fn unstarted_reservation_rolls_over_after_closure_and_source_change() {
+    for cancel in [false, true] {
+        let env = Env::with_retention("reservation-rollover", 1, Retention::Resident);
+        let kernel = &env.kernel;
+        let pin = publish_agent_contract(
+            kernel,
+            "resident",
+            false,
+            LifecycleMode::Resident,
+            ContinuityMode::None,
+        );
+        let catalog_a =
+            publish_source_contract(kernel, "a", LifecycleMode::Resident, ContinuityMode::None);
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let first_task = admit_typed_task(kernel, pin.clone());
+        let first = kernel
+            .acquire_typed_task_existing(&first_task, &agent, &catalog_a.selection, &registry())
+            .unwrap();
+        if cancel {
+            kernel.cancel_task(&first_task, false).unwrap();
+        } else {
+            kernel
+                .report_configuration_unavailable(
+                    &first.claim.attempt_id,
+                    first.claim.lease_epoch,
+                    "pure prepare unavailable",
+                )
+                .unwrap();
+        }
+        kernel
+            .set_spawn_source_status(&catalog_a.selection.spawn_source, SourceStatus::Disabled)
+            .unwrap();
+        let catalog_b =
+            publish_source_contract(kernel, "b", LifecycleMode::Resident, ContinuityMode::None);
+        let next_task = admit_typed_task(kernel, pin);
+        let second = kernel
+            .acquire_typed_task_existing(&next_task, &agent, &catalog_b.selection, &registry())
+            .unwrap();
+        let old_id = &first.provisioning_binding.incarnation_id;
+        let new_id = &second.provisioning_binding.incarnation_id;
+        assert_ne!(old_id, new_id);
+        assert_eq!(second.provisioning_binding.logical_agent_id, agent);
+        assert_eq!(
+            second.provisioning_binding.source_config,
+            catalog_b.selection.source_config
+        );
+        assert_eq!(
+            kernel.incarnation(old_id).unwrap().state,
+            agentype_core::IncarnationState::Lost
+        );
+        assert_eq!(
+            kernel.incarnation(new_id).unwrap().state,
+            agentype_core::IncarnationState::Starting
+        );
+        assert_eq!(
+            kernel.get_provisioning_binding(old_id).unwrap(),
+            Some(first.provisioning_binding)
+        );
+        assert!(kernel
+            .attempt(&second.claim.attempt_id)
+            .unwrap()
+            .incarnation_id
+            .is_none());
+        assert_eq!(
+            env.raw()
+                .query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            env.raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM incarnations WHERE state IN ('STARTING','WARM','COLD')",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn reservation_rollover_rejects_an_active_claim_even_without_incarnation_association() {
+    let env = Env::with_retention("reservation-active-claim", 1, Retention::Resident);
+    let kernel = &env.kernel;
+    let pin = publish_agent_contract(
+        kernel,
+        "resident",
+        false,
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let mut catalog_a =
+        publish_source_contract(kernel, "a", LifecycleMode::Resident, ContinuityMode::None);
+    let catalog_b =
+        publish_source_contract(kernel, "b", LifecycleMode::Resident, ContinuityMode::None);
+    catalog_a.selection.catalog_frontier_digest = kernel.catalog_frontier_digest().unwrap();
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let first_task = admit_typed_task(kernel, pin.clone());
+    let first = kernel
+        .acquire_typed_task_existing(&first_task, &agent, &catalog_a.selection, &registry())
+        .unwrap();
+    // A damaged agent assignment must not hide an ACTIVE Attempt whose
+    // incarnation_id is deliberately still NULL during pure preparation.
+    env.raw()
+        .execute(
+            "UPDATE logical_agents SET state='READY',current_task_id=NULL WHERE id=?1",
+            [agent.as_str()],
+        )
+        .unwrap();
+    let next_task = admit_typed_task(kernel, pin);
+    assert!(kernel
+        .acquire_typed_task_existing(&next_task, &agent, &catalog_b.selection, &registry())
+        .is_err());
+    assert!(kernel.claim_authority_is_current(&first.claim).unwrap());
+    assert_eq!(
+        kernel
+            .incarnation(&first.provisioning_binding.incarnation_id)
+            .unwrap()
+            .state,
+        agentype_core::IncarnationState::Starting
+    );
+    assert_eq!(kernel.attempt_count_for_task(&next_task).unwrap(), 0);
+    assert_eq!(count_provisioning_bindings(&env), 1);
+}
+
+#[test]
+fn starting_incarnation_with_execution_history_cannot_roll_over() {
+    let env = Env::with_retention("starting-history", 1, Retention::Resident);
+    let (pin, _, agent, old_id) = resident_host(&env);
+    // Even terminal physical history cannot be reinterpreted as an unstarted
+    // reservation if the Incarnation is observed as STARTING again.
+    env.raw()
+        .execute(
+            "UPDATE incarnations SET state='STARTING' WHERE id=?1",
+            [old_id.as_str()],
+        )
+        .unwrap();
+    let other = publish_source_contract(
+        &env.kernel,
+        "other",
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let task = admit_typed_task(&env.kernel, pin);
+    assert!(env
+        .kernel
+        .acquire_typed_task_existing(&task, &agent, &other.selection, &registry())
+        .is_err());
+    assert_eq!(env.kernel.attempt_count_for_task(&task).unwrap(), 0);
+    assert_eq!(count_provisioning_bindings(&env), 1);
+    assert_eq!(
+        env.kernel.incarnation(&old_id).unwrap().state,
+        agentype_core::IncarnationState::Starting
+    );
+}
+
 /// A canonical `sha256:<64 hex>` materialization digest for fixtures.
 fn mat_digest() -> MaterializationDigest {
     MaterializationDigest::new(
