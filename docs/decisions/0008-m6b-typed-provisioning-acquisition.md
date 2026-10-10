@@ -2,7 +2,7 @@
 
 Status: Accepted (M6-B.4; not a milestone freeze)
 Date: 2026-10-06
-Consolidated: 2026-10-09
+Consolidated: 2026-10-10
 Canonical path: `docs/decisions/0008-m6b-typed-provisioning-acquisition.md`
 
 ## Context
@@ -90,6 +90,14 @@ association). STARTING with Execution history and every active physical
 Execution remain protected. Durable LOST is a provenance fence, not a claim of
 physical resource termination.
 
+A WARM Incarnation with any Execution history cannot change provenance merely
+because all its Executions are terminal. B.4 has no durable stop/isolation/safe
+retention witness, so that replacement fails closed as pre-acquisition
+ConfigurationUnavailable, preserving the old host and creating no new claim.
+Same-provenance reuse remains valid. Enabling replacement requires the actual
+M5 lifecycle to close the host or a separately specified and conformant physical
+safety witness; a SQL LOST update supplies neither.
+
 `BindingSnapshot` is the per-Execution commitment. It records exact binding
 provenance, target/profile, admitted capabilities, imported capability and
 effective execution policy separately, credential-reference digest and the
@@ -110,6 +118,10 @@ The composition root routes each exact `SpawnSourceRef` through a
 `SourceIntegrationRegistry` to the integration that understands its config.
 Unrouted sources are ineligible. Core persists and forwards opaque config
 identity and descriptors without interpreting provider/model/config grammar.
+Every source revision must be registered explicitly, even when several sources
+share an integration. There is no production wildcard route; `uniform` is a
+private unit-test fixture only. Publishing a new revision cannot implicitly
+grant it access to an existing integration.
 
 `SourceConfigIntegration::attest` and `prepare` are pure/read-only. Attestation
 checks an exact validated revision and physical domain; an `ExternalRef` must be
@@ -123,7 +135,12 @@ renews its endpoint. The full committed-claim authority fence is checked before
 and after preparation, and deadlines/digests are checked on return.
 
 The integration's protocol must equal the exact adapter's imported provisioning
-protocol at eligibility and handoff. `import_provisioning_protocol` defaults to
+protocol at eligibility and handoff. Preparation checks the integration against
+the committed protocol before and after the call, including error returns.
+Observed drift is a fatal producer invariant violation, with redacted diagnostics
+and no Task NACK. Integrations must keep their protocol stable throughout every
+call, including concurrent calls; endpoint checks do not prove unobservable
+transient drift. `import_provisioning_protocol` defaults to
 `None`; an ordinary adapter remains usable for M5 but is ineligible for typed
 provisioning until it consumes the descriptor. The reference local-process
 adapter declares `None`.
@@ -134,6 +151,12 @@ prepared descriptor then reaches the exact adapter through
 physical environment inside `start_execution`. M5 Execution/RequestId,
 `reconcile_start`, observation and termination own the complete physical
 lifecycle; M6-B introduces no pre-Execution physical operation.
+
+`TypedLaunchPlan` retains the resolved `ResolvedAdapterBinding` alongside the
+validated environment. The internal `PreparedTypedExecutionLaunch` keeps that
+same instance and its operation deadlines with the committed launch request;
+dispatch consumes them together instead of resolving from a mutable registry
+again. The public legacy `PreparedExecutionLaunch` contract is unchanged.
 
 Pure pre-Execution configuration/liveness failures settle as
 `RESOURCE_UNAVAILABLE`. Authority loss is left to recovery; corruption,
@@ -149,6 +172,11 @@ availability errors may settle as RESOURCE_UNAVAILABLE; authority loss is left
 to recovery; StorageFailure, InvariantViolation, RecoveryRequired, missing
 revisions and all unrecognized errors propagate without writing a Task failure.
 The broad prepare Result type does not imply that every error is availability.
+Successful output is also a producer boundary: a malformed canonical digest or
+blank descriptor propagates as fatal, preserving Attempt/Lease/provenance and
+writing no failure or retry. Output grammar is checked before post-call deadline
+and digest-equality availability checks. A valid digest whose content no longer
+matches attestation remains a distinct availability/TOCTOU rejection.
 
 ## Capability and effective policy
 
@@ -178,6 +206,11 @@ mode. Effective workspace and network policy are carried to the start request.
 - Shared pure placement/isolation decisions remove duplicated eligibility rules.
   Moving Attempt association to Execution restores M5 settlement assumptions
   without changing settlement APIs or adding a physical lifecycle.
+- Exact-source registration replaces the production wildcard helper to preserve
+  source-local config ownership across new catalog revisions. The internal typed
+  handoff gains an owned exact adapter binding to preserve the validated instance
+  through dispatch; this does not widen the legacy launch API or grant new
+  Scheduler authority.
 - The internal `provisioning-producer` feature narrows the default contract-crate
   surface. Cargo feature unification means it is not an unforgeable authority
   token; transactional re-proof and control APIs that accept no caller-supplied
@@ -193,3 +226,6 @@ source integration, B.5 credential/security import, cold/revivable matching,
 full typed topology and database migration remain pending. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)
 owns scope and verification evidence.
+This PR's deployment scope is explicitly fresh schema-v8 databases only, plus
+reopening databases already created at v8. Existing v7 databases are rejected;
+no upgrade compatibility is claimed until migration is implemented and verified.

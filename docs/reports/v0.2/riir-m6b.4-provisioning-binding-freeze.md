@@ -2,7 +2,7 @@
 
 Status: Historical Report
 Implementation status: M6-B.4 implemented, not frozen
-Date: 2026-10-09
+Date: 2026-10-10
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert milestone freeze.
 
@@ -14,6 +14,8 @@ schema v8 provisioning provenance, pure source preparation and a snapshot-bearin
 Execution handoff. Typed daemon dispatch and production source integration remain
 pending; this is a library/composition boundary, not an end-to-end production
 typed dispatch claim.
+Deployment is restricted to fresh schema-v8 databases and reopening existing
+v8 databases. Existing v7 databases are rejected; this PR offers no upgrade path.
 
 The frozen specs govern acceptance. Interface amendments are justified in
 [ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) and
@@ -29,8 +31,8 @@ implementation and evidence; superseded audit narratives remain in Git history.
 |---|---|
 | Resolve | Validate partition target/profile; apply known hard filters before bounded, read-only source-local attestation; rank eligible candidates and capture the catalog frontier |
 | Acquire | Transactionally reload and re-prove Task, actual bound AgentType, placement, source/config/policy, realized retention and exact imported safety; commit Attempt/Lease/assignment and per-Incarnation ProvisioningBinding; leave Attempt.incarnation_id unset |
-| Prepare | Re-resolve the committed source-local integration; fence full claim authority before/after pure preparation; require the exact protocol and attested digest; return a secret-free descriptor |
-| Commit Execution | Requalify target and current exact adapter; perform fallible composition checks; atomically create Execution, Attempt→Incarnation association and immutable BindingSnapshot against the reserved provenance |
+| Prepare | Re-resolve the explicitly registered exact source; fence claim authority and integration protocol before/after pure preparation; treat malformed output as fatal, require the attested digest and return a secret-free descriptor |
+| Commit Execution | Requalify target and current exact adapter; retain that adapter instance/deadlines; perform composition checks; atomically create Execution, Attempt→Incarnation association and immutable BindingSnapshot; carry the binding with the request |
 | Physical start | The exact ExecutionAdapter consumes the frozen descriptor inside start_execution; existing M5 recovery, observation, deadlines and writer safety own its physical lifecycle |
 
 The implemented handoff assembles the exact start request. Wiring that request
@@ -51,9 +53,12 @@ into running typed daemon dispatch is a remaining step.
   history can roll to another source/config. ACTIVE claims on its LogicalAgent,
   any Execution history on STARTING, and active physical Executions prevent that
   rollover. A durable LOST fence does not assert physical resource termination.
+  WARM hosts with Execution history reject provenance replacement before a new
+  claim; SQL-only fencing cannot supply missing physical cleanup evidence.
 - Per-Incarnation bindings are immutable exact provenance; per-Execution
   snapshots freeze the admitted requirement and effective launch policy. Reuse
-  requires exact qualification; changed provenance rolls to a new Incarnation.
+  requires exact qualification; changed provenance requires a new Incarnation
+  and cannot replace an executed WARM host without physical lifecycle closure.
 - Parent markers, write-once/replacement guards and coherent authoritative reads
   protect both records. Execution/recovery cannot bypass required snapshots.
 - The authority transaction re-proves imported facts and the catalog frontier.
@@ -66,6 +71,12 @@ into running typed daemon dispatch is a remaining step.
   settles as RESOURCE_UNAVAILABLE; authority loss produces no Task NACK; storage,
   invariant, recovery-required, missing-revision and unknown faults propagate
   without writing a Task failure or closing the committed claim.
+- Malformed successful producer output and observed integration-protocol drift
+  are fatal too. They preserve authority and produce no failure, retry,
+  Execution or snapshot. Grammar checks precede post-call availability checks.
+- Production routing has no wildcard API; each source revision needs an explicit
+  registration. Typed dispatch handoff keeps the same validated adapter instance
+  and operation policy even if a new registry reuses its kind/key.
 - Attest/prepare are read-only, have separate absolute budgets and bind the
   descriptor to an exact protocol/domain/digest. Post-commit recovery resolves
   the exact physical binding and cannot choose a different source.
@@ -85,17 +96,20 @@ capacity and retirement fencing retain their behavior.
 | Resolver requires ExecutionRegistry | Authoritative target/profile are needed before attestation, so irrelevant candidates cannot spend the shared budget or hide eligible sources |
 | Shared placement/isolation decisions | Preserve frozen gates across preselection, authority, snapshot and handoff instead of maintaining inconsistent copies |
 | Attempt association deferred to Execution | Restore frozen M5 physical-phase assumptions and preserve earlier WARM hosts across every pre-Execution closure; settlement APIs and schema need no additional amendment |
+| Source registry wildcard restricted to private unit tests | A new source revision must not inherit opaque-config interpretation without an explicit composition-root routing decision; shared integrations use multiple registrations |
+| Internal PreparedTypedExecutionLaunch owns exact binding | Retain the validated instance and deadlines through dispatch, preventing stale-binding re-selection; public legacy PreparedExecutionLaunch remains unchanged |
+| Executed WARM provenance replacement fails closed | Terminal Execution rows cannot prove cleanup of external resources; preserve the host until M5 lifecycle closure or a future verified safety witness |
 | Typed population excluded from legacy capacity | Legacy desired population cannot retire semantically bound agents; full typed topology remains deferred (ADR-0009) |
 
 ## Verification
 
-Local checks on 2026-10-09:
+Local checks on 2026-10-10:
 
 | Check | Result |
 |---|---|
-| Storage with test-support | 300 tests and 1 doc probe passed, including B.4 42, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 30 passed, including source/config rollover, integration fault matrices, poisoned ineligible attestations and pure preparation failure on a previously committed WARM host |
-| Default-feature public API boundary | 33 compile-fail probes passed |
+| Storage with test-support | 301 tests and 1 doc probe passed, including B.4 43, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 34 passed, including producer-output/protocol/fault matrices, exact-instance handoff, explicit revision routing, source rollover and WARM preservation |
+| Default-feature public API boundary | 34 probes passed, including the production wildcard-constructor compile-fail probe |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
 | Formatting and whitespace | cargo fmt --all --check and git diff --check passed |
 | Full Windows workspace runtime gate | Local ProcessLock setup is restricted; full runtime acceptance is checked against the pushed head's remote CI |
@@ -122,10 +136,11 @@ B.5 credentials/security import, cold/revivable matching, full typed topology
 and v7→v8 migration. The reference local-process adapter has no provisioning
 protocol and cannot launch typed descriptors.
 
-Before typed daemon wiring, the prepared plan must retain and pass its resolved
-exact adapter instance to start; returning to legacy resolve_unique lookup is
-not permitted. Before compatibility release, deployment must either supply a
-v7→v8 migration or be explicitly limited to new schema-v8 databases. Production
-Resident WARM source replacement requires real-adapter conformance for stopping,
-isolating or safely retaining old resources; durable fencing alone is not a
-physical termination witness.
+The internal handoff now retains the exact adapter instance, but running typed
+daemon wiring must actually consume it without registry re-selection and prove
+start/recovery conformance. Deployment is explicitly limited to new schema-v8
+databases and reopening those v8 databases; v7 upgrade compatibility requires a
+verified migration. Resident WARM source replacement is currently blocked when
+there is Execution history. Enabling it requires real-adapter conformance for
+stopping, isolating or safely retaining old resources and an explicit lifecycle
+witness; durable fencing alone is not physical termination.

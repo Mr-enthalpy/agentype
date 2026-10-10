@@ -284,13 +284,8 @@ pub struct SourceProvisioningCandidate {
 /// secret-free attested digest plus an opaque launch descriptor. Both operations
 /// are pure/read-only: the physical environment is created by the exact adapter's
 /// `start_execution` under M5.
-/// the secret-free attested content digest (which must match the committed one)
-/// and an **opaque, secret-free launch descriptor** describing the environment
-/// to materialize. This is a pure, read-only resolution: it performs NO physical
-/// side effect. Core persists the descriptor and forwards it to the physical
-/// start request; the exact adapter physically materializes the described
-/// environment as part of `start_execution`, so M5 owns the physical lifecycle
-/// (no second, unmodelled provisioning lifecycle before the Execution).
+/// Core persists the descriptor and forwards it to the physical start request;
+/// there is no second, unmodelled lifecycle before Execution commitment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedSource {
     pub digest: String,
@@ -301,7 +296,10 @@ pub trait SourceConfigIntegration: Send + Sync {
     /// The source-integration **protocol identity** this integration prepares
     /// descriptors under. It must equal the exact adapter binding's
     /// `import_provisioning_protocol`, so a descriptor can only ever be launched
-    /// against an adapter that accepts its grammar.
+    /// against an adapter that accepts its grammar. The identity must remain
+    /// stable throughout attest/prepare, including concurrent calls. Runtime
+    /// checks before/after prepare detect observable drift; they do not replace
+    /// this implementation obligation.
     fn protocol(&self) -> &str;
 
     /// Pure, side-effect-free attestation used during candidate eligibility:
@@ -329,6 +327,9 @@ pub trait SourceConfigIntegration: Send + Sync {
     /// Explicit availability failures settle as RESOURCE_UNAVAILABLE; authority
     /// loss is left to recovery. Storage/corruption and all unrecognized errors
     /// propagate as control-plane faults without a Task-level NACK.
+    /// A successful return must contain a canonical digest and a nonblank
+    /// descriptor. Malformed output or protocol drift is a producer fault,
+    /// never a resource-availability failure or an automatic Task retry.
     fn prepare(
         &self,
         revision: &agentype_storage_sqlite::SourceConfigRevision,
@@ -349,6 +350,7 @@ pub trait SourceConfigIntegration: Send + Sync {
 #[derive(Default)]
 pub struct SourceIntegrationRegistry {
     by_source: Vec<(SpawnSourceRef, Arc<dyn SourceConfigIntegration>)>,
+    #[cfg(test)]
     uniform: Option<Arc<dyn SourceConfigIntegration>>,
 }
 
@@ -357,8 +359,10 @@ impl SourceIntegrationRegistry {
         Self::default()
     }
 
-    /// A registry that routes any source to one integration (test/legacy use).
-    pub fn uniform(integration: Arc<dyn SourceConfigIntegration>) -> Self {
+    /// Unit-test fixture only. Production requires an explicit exact-source
+    /// registration, including when one integration supports several sources.
+    #[cfg(test)]
+    fn uniform(integration: Arc<dyn SourceConfigIntegration>) -> Self {
         Self {
             by_source: Vec::new(),
             uniform: Some(integration),
@@ -382,11 +386,19 @@ impl SourceIntegrationRegistry {
     }
 
     pub fn resolve(&self, source: &SpawnSourceRef) -> Option<&dyn SourceConfigIntegration> {
-        self.by_source
+        let exact = self
+            .by_source
             .iter()
             .find(|(s, _)| s == source)
-            .map(|(_, i)| i.as_ref())
-            .or(self.uniform.as_deref())
+            .map(|(_, i)| i.as_ref());
+        #[cfg(test)]
+        {
+            exact.or(self.uniform.as_deref())
+        }
+        #[cfg(not(test))]
+        {
+            exact
+        }
     }
 }
 
@@ -1065,6 +1077,7 @@ fn prepare_winner(
             "source integration".into(),
         ))
     })?;
+    require_preparation_protocol(integration, binding)?;
     let revision = match kernel.get_source_config_revision(&binding.source_config) {
         Ok(Some(revision)) => revision,
         // A committed immutable revision that has vanished is durable
@@ -1081,31 +1094,19 @@ fn prepare_winner(
         }
     };
     // Pure, read-only preparation: no physical side effect.
-    let prepared = integration
-        .prepare(
-            &revision,
-            &binding.adapter_kind,
-            &binding.adapter_binding_key,
-            deadline,
-        )
-        .map_err(PreparationFailure::from_integration)?;
-    if deadline.is_expired() {
-        return Err(PreparationFailure::Unavailable(
-            ProvisioningResolutionError::ProvisioningDeadlineExceeded(
-                "deadline expired after prepare".into(),
-            ),
-        ));
-    }
-    let actual = MaterializationDigest::new(prepared.digest).map_err(|err| {
-        PreparationFailure::Unavailable(ProvisioningResolutionError::Evidence(err))
-    })?;
-    if let Err(err) =
-        require_materialization_receipt(&binding.attested_materialization_digest, &actual)
-    {
-        return Err(PreparationFailure::Unavailable(err));
-    }
+    let result = integration.prepare(
+        &revision,
+        &binding.adapter_kind,
+        &binding.adapter_binding_key,
+        deadline,
+    );
+    // A protocol fault must not be hidden by an availability error/deadline.
+    require_preparation_protocol(integration, binding)?;
+    let prepared = result.map_err(PreparationFailure::from_integration)?;
+    let actual = MaterializationDigest::new(prepared.digest)
+        .map_err(|err| PreparationFailure::Fatal(ProvisioningResolutionError::Evidence(err)))?;
     if prepared.descriptor.trim().is_empty() {
-        return Err(PreparationFailure::Unavailable(
+        return Err(PreparationFailure::Fatal(
             ProvisioningResolutionError::Evidence(
                 agentype_agent_contract::ContractError::InvalidRef {
                     reason: "prepare returned an empty launch descriptor".into(),
@@ -1113,6 +1114,17 @@ fn prepare_winner(
             ),
         ));
     }
+    // Successful output grammar is checked first so a spent budget cannot turn
+    // a producer contract violation into a retryable Task failure.
+    if deadline.is_expired() {
+        return Err(PreparationFailure::Unavailable(
+            ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                "deadline expired after prepare".into(),
+            ),
+        ));
+    }
+    require_materialization_receipt(&binding.attested_materialization_digest, &actual)
+        .map_err(PreparationFailure::Unavailable)?;
     // Re-validate the full committed-claim authority before reporting success.
     match kernel.claim_authority_is_current(&acquisition.claim) {
         Ok(true) => Ok(prepared.descriptor),
@@ -1125,6 +1137,23 @@ fn prepare_winner(
             ProvisioningResolutionError::Storage(err),
         )),
     }
+}
+
+fn require_preparation_protocol(
+    integration: &dyn SourceConfigIntegration,
+    binding: &ProvisioningBinding,
+) -> Result<(), PreparationFailure> {
+    if integration.protocol() != binding.provisioning_protocol {
+        return Err(PreparationFailure::Fatal(
+            ProvisioningResolutionError::Evidence(
+                agentype_agent_contract::ContractError::InvariantViolation(
+                    "source integration protocol differs from the committed provisioning binding"
+                        .into(),
+                ),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Deterministically settle a durably committed acquisition as
@@ -1510,6 +1539,216 @@ mod tests {
         kernel.reconcile_pool().unwrap();
         let raw = rusqlite::Connection::open(path).unwrap();
         (kernel, raw)
+    }
+
+    struct PrepareBoundaryProbe {
+        digest: Option<&'static str>,
+        descriptor: Option<&'static str>,
+        drift_during_prepare: bool,
+        unavailable: bool,
+        drifted: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SourceConfigIntegration for PrepareBoundaryProbe {
+        fn protocol(&self) -> &str {
+            if self.drifted.load(std::sync::atomic::Ordering::SeqCst) {
+                "unexpected-producer-protocol"
+            } else {
+                crate::TEST_PROVISIONING_PROTOCOL
+            }
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<String, ProvisioningResolutionError> {
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut prepared = EchoMaterializer.prepare(revision, kind, key, deadline)?;
+            if let Some(digest) = self.digest {
+                prepared.digest = digest.into();
+            }
+            if let Some(descriptor) = self.descriptor {
+                prepared.descriptor = descriptor.into();
+            }
+            if self.drift_during_prepare {
+                self.drifted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.unavailable {
+                return Err(ProvisioningResolutionError::ExternalReferenceNotAttested(
+                    "source unavailable".into(),
+                ));
+            }
+            Ok(prepared)
+        }
+    }
+
+    fn assert_preparation_fault_preserves_claim(
+        kernel: &Kernel,
+        raw: &rusqlite::Connection,
+        claim: &agentype_core::Claim,
+        binding: &ProvisioningBinding,
+    ) {
+        assert!(kernel.claim_authority_is_current(claim).unwrap());
+        assert_eq!(
+            kernel.task(&claim.task_id).unwrap().state,
+            TaskState::Leased
+        );
+        let attempt = kernel.attempt(&claim.attempt_id).unwrap();
+        assert_eq!(attempt.state, agentype_core::AttemptState::Active);
+        assert!(attempt.incarnation_id.is_none());
+        assert_eq!(kernel.attempt_count_for_task(&claim.task_id).unwrap(), 1);
+        assert_eq!(
+            kernel.lease_for_attempt(&claim.attempt_id).unwrap().state,
+            agentype_core::LeaseState::Active
+        );
+        assert_eq!(
+            kernel
+                .get_provisioning_binding(&binding.incarnation_id)
+                .unwrap()
+                .as_ref(),
+            Some(binding)
+        );
+        for table in ["failures", "executions", "binding_snapshots"] {
+            assert_eq!(
+                raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "unexpected row in {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_successful_prepare_is_fatal_without_nack_or_retry() {
+        for (digest, descriptor) in [
+            (Some("private-invalid-digest"), None),
+            (None, Some("")),
+            (None, Some(" \t\n")),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task_with_retry(
+                &kernel,
+                pin.clone(),
+                agentype_core::RetryPolicy {
+                    max_attempts: 3,
+                    retry_classes: vec![FailureClass::ResourceUnavailable],
+                    base_backoff_seconds: 0.0,
+                    max_backoff_seconds: 0.0,
+                },
+            );
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, start_probe) = adapters_with_start_probe();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let binding = outcome.acquisition.provisioning_binding.clone();
+            let probe = PrepareBoundaryProbe {
+                digest,
+                descriptor,
+                drift_during_prepare: false,
+                unavailable: false,
+                drifted: false.into(),
+                calls: 0.into(),
+            };
+            let err = finalize_preparation(&kernel, &si(probe), outcome, &deadline()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProvisioningResolutionError::Evidence(
+                        agentype_agent_contract::ContractError::InvalidRef { .. }
+                    )
+                ),
+                "unexpected disposition: {err:?}"
+            );
+            assert!(!err.to_string().contains("private-invalid-digest"));
+            assert_preparation_fault_preserves_claim(&kernel, &raw, &claim, &binding);
+            assert_eq!(start_probe.start_call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn prepare_protocol_drift_is_fatal_before_and_after_the_call() {
+        for (drift_during_prepare, unavailable) in [(false, false), (true, false), (true, true)] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, start_probe) = adapters_with_start_probe();
+            let probe = Arc::new(PrepareBoundaryProbe {
+                digest: None,
+                descriptor: None,
+                drift_during_prepare,
+                unavailable,
+                drifted: false.into(),
+                calls: 0.into(),
+            });
+            let mut integrations = SourceIntegrationRegistry::new();
+            integrations
+                .register(SpawnSourceRef::new("source", 1).unwrap(), probe.clone())
+                .unwrap();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &integrations,
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let binding = outcome.acquisition.provisioning_binding.clone();
+            if !drift_during_prepare {
+                probe
+                    .drifted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let err =
+                finalize_preparation(&kernel, &integrations, outcome, &deadline()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProvisioningResolutionError::Evidence(
+                        agentype_agent_contract::ContractError::InvariantViolation(_)
+                    )
+                ),
+                "unexpected disposition: {err:?}"
+            );
+            assert!(!err.to_string().contains("unexpected-producer-protocol"));
+            assert_eq!(
+                probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(drift_during_prepare)
+            );
+            assert_preparation_fault_preserves_claim(&kernel, &raw, &claim, &binding);
+            assert_eq!(start_probe.start_call_count(), 0);
+        }
     }
 
     #[test]
@@ -2626,6 +2865,79 @@ mod tests {
             NetworkEnforcement::Disabled
         );
         assert!(!prepared.request().attempt_isolation());
+    }
+
+    #[test]
+    fn typed_handoff_retains_the_verified_adapter_instance_and_deadlines() {
+        let kernel = partitioned_kernel();
+        let pin = publish(&kernel);
+        let task = typed_task(&kernel, pin.clone());
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let (adapters, original) = adapters_with_start_probe();
+        let registry = execution_registry();
+        let outcome = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let prepared =
+            crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters).unwrap();
+        assert_eq!(original.start_call_count(), 0);
+        let expected_execution = prepared.snapshot().execution_id().clone();
+        let expected_request = prepared.request().request_id().clone();
+        // A newly installed registry reuses the exact kind/key for a different
+        // instance. The already validated dispatch handoff must remain pinned
+        // to the old instance and its operation policy, even after registry drop.
+        drop(adapters);
+        let (replacement_registry, replacement) = adapters_with_start_probe();
+        let (launch, binding) = prepared.into_dispatch();
+        assert_eq!(binding.adapter_kind(), "default");
+        assert_eq!(binding.adapter_binding_key().as_str(), "k1");
+        assert_eq!(
+            binding
+                .policy()
+                .budget(agentype_adapter_api::AdapterOperation::StartExecution),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            kernel.execution(&expected_execution).unwrap().state,
+            agentype_core::ExecutionState::Starting
+        );
+        binding.start_execution(launch.request()).unwrap();
+        assert_eq!(original.start_call_count(), 1);
+        assert_eq!(replacement.start_call_count(), 0);
+        assert_eq!(
+            original.last_request().unwrap().request_id(),
+            &expected_request
+        );
+        drop(replacement_registry);
+    }
+
+    #[test]
+    fn source_revision_routing_requires_an_explicit_registration() {
+        let mut integrations = SourceIntegrationRegistry::new();
+        let first = SpawnSourceRef::new("source", 1).unwrap();
+        let next = SpawnSourceRef::new("source", 2).unwrap();
+        let shared: Arc<dyn SourceConfigIntegration> = Arc::new(EchoMaterializer);
+        integrations
+            .register(first.clone(), shared.clone())
+            .unwrap();
+        assert!(integrations.resolve(&first).is_some());
+        assert!(integrations.resolve(&next).is_none());
+        assert!(integrations
+            .resolve(&SpawnSourceRef::new("other", 1).unwrap())
+            .is_none());
+        assert!(integrations.register(first, shared.clone()).is_err());
+        // Supporting several sources is allowed, but each routing decision is
+        // explicit. Publishing a new catalog revision grants no implicit route.
+        integrations.register(next.clone(), shared).unwrap();
+        assert!(integrations.resolve(&next).is_some());
     }
 
     /// A source whose lifecycle cannot realize the member's actual M4 retention

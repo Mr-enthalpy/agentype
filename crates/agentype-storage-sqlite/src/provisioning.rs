@@ -822,6 +822,15 @@ fn fence_idle_incarnation(
         |row| row.get(0),
     )?
     .ok_or_else(|| Error::not_found(format!("incarnation {incarnation_id} not found")))?;
+    // A terminal Execution does not prove its WARM host's external resources
+    // were stopped or isolated. B.4 has no durable physical cleanup witness;
+    // preserve the host until the M5 lifecycle actually closes it. This is a
+    // pre-acquisition eligibility rejection, not a Task NACK or SQL-only LOST.
+    if state == "WARM" && !incarnation_is_fresh(tx, incarnation_id)? {
+        return Err(Error::configuration_unavailable(
+            "warm incarnation provenance replacement requires physical lifecycle evidence",
+        ));
+    }
     if state == "STARTING"
         && (!incarnation_is_fresh(tx, incarnation_id)?
             || get_provisioning_binding(tx, &IncarnationId::from_string(incarnation_id))?.is_none())
@@ -864,10 +873,11 @@ fn create_new_incarnation(
 
 /// Pick the Incarnation the acquisition commits to, applying the frozen
 /// lifecycle rules: reuse the active Incarnation and its `ProvisioningBinding`
-/// when the provenance and exact physical domain still match; roll over to a
-/// fresh Incarnation when they differ; adopt a fresh/legacy Incarnation only
+/// when the provenance and exact physical domain still match; roll over an
+/// unstarted reservation when they differ; adopt a fresh/legacy Incarnation only
 /// when it has no Execution history. Pure reservations may change provenance
-/// after authority closes; an M5 physical STARTING state remains protected.
+/// after authority closes; physical STARTING and previously executed WARM hosts
+/// remain protected until their M5 lifecycle closes them.
 #[cfg(any(test, feature = "runtime-internal"))]
 fn resolve_incarnation(
     tx: &Transaction<'_>,

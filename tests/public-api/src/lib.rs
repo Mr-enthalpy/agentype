@@ -419,4 +419,13 @@ pub fn catalog_admin_surface() {}
 /// // 29. The candidate resolution mechanics are not on the supported surface.
 /// use agentype_runtime::resolve_source_candidates;
 /// ```
+///
+/// ```compile_fail
+/// // 30. Production source routing has no wildcard constructor. A new source
+/// //     revision needs an explicit registration, even for a shared integration.
+/// use agentype_runtime::provisioning_resolver::SourceIntegrationRegistry;
+/// fn _no_uniform_source_route() {
+///     let _ = SourceIntegrationRegistry::uniform;
+/// }
+/// ```
 pub fn probes() {}

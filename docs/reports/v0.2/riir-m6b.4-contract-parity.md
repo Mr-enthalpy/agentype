@@ -1,8 +1,8 @@
 # M6-B.4 — Frozen-contract counterexample witness
 
 Status: Historical Report
-Date: 2026-10-09
-Applies to: PR #24 corrections after `515a25ca` and `ecc2990`
+Date: 2026-10-10
+Applies to: PR #24 against frozen M4–M6-B.3
 Canonical path: `docs/reports/v0.2/riir-m6b.4-contract-parity.md`
 Not a specification.
 
@@ -33,7 +33,7 @@ state. They do not infer correctness from an error return alone.
 
 ## Source-private I/O and integration evidence
 
-The resolver suite passes 30 tests. Added cases place a credential config ahead
+The resolver suite passes 34 tests. Added cases place a credential config ahead
 of a valid one and install poisoned attestations for credential/wrong-kind
 candidates; those integrations are never called. An isolated target rejects an
 incapable domain before attestation while admitting a capable source. An actual
@@ -47,6 +47,22 @@ fatal integration errors being settled as availability, and authority-loss
 errors producing Task failure. The availability counterpart and physical-history
 guards pass on both implementations. After correction, B.4 passes all 42 tests
 and resolver passes all 30.
+
+Against audited `149edce`, the producer-boundary tests report resolver 30 passed
+/ 2 failed: malformed successful output is downgraded to retryable failure, and
+protocol drift is accepted. A separate resident Execution/ACK WARM replacement
+counterexample also fails because SQL fencing permits provenance change without
+physical lifecycle evidence. The corrected implementation passes resolver 34,
+B.4 storage 43, complete storage 301 plus 1 doc probe, and production API 34
+probes. These are retained witnesses, not additional audit-round acceptance rules.
+
+| Producer/physical boundary | Authoritative consequence asserted |
+|---|---|
+| Successful output grammar | Malformed digest, empty and whitespace descriptors propagate fatal InvalidRef with redacted messages; explicit retry policy produces no failure/retry, Execution or snapshot |
+| Protocol drift | Drift before prepare prevents the call; drift during prepare is fatal on success and availability-error returns; claim/Lease/provenance survive and no adapter starts |
+| Executed WARM replacement | A real stored resident Execution/ACK produces WARM; different provenance is rejected before a claim, preserving host state and immutable binding; same-provenance reuse and pure-reservation rollover still pass |
+| Exact adapter instance | Drop the original registry after commitment and install another instance at the same kind/key; the consumed handoff starts only the original instance with its retained deadlines/request identity |
+| Exact source routing | A new source revision has no inherited route; shared integrations require explicit registration for both; production API cannot call the wildcard constructor |
 
 The replacement matrix covers pure preparation failure and cancellation, a new
 config on the same source and a new source, same-Task retry, immutable old

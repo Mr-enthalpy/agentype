@@ -155,8 +155,15 @@ is not provisioning-capable and is ineligible for typed acquisition; it MUST NOT
 claim a grammar it ignores. A provisioning-capable adapter is routed by the
 composition root to a source-local `SourceConfigIntegration` that prepares
 descriptors in the same protocol; M6-B.4 requires them to match when the
-candidate is resolved and re-checks the frozen protocol at the Execution handoff,
+candidate is resolved, checks the committed protocol before/after preparation,
+and re-checks the frozen protocol at the Execution handoff,
 so a descriptor produced for one adapter can never be launched against another.
+Integration protocol identity MUST remain stable during and between those calls,
+including concurrent calls; observed drift MUST fail closed as a producer fault.
+Each exact SpawnSourceRef MUST be explicitly registered to its integration;
+production wildcard routing is unsupported. The typed handoff MUST retain the
+same resolved adapter instance and operation policy for dispatch rather than
+selecting it again from a mutable registry.
 The physical materialization of the descriptor happens inside
 `start_execution` (M6-B never creates a physical environment). Effective safety
 is the intersection of the ExecutionTarget requirement and the imported source's

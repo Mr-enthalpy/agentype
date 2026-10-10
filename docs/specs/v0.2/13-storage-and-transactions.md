@@ -27,8 +27,12 @@ The Rust-era store carries an exact schema version in `schema_migrations`.
 A database whose version is newer **or** older than the running binary's
 supported `SCHEMA_VERSION` MUST be rejected at open, fail closed. There is
 **no** in-place upgrade while `D-DB-MIGRATE` is unresolved, so v5 -> v6 (and
-v6 -> v7) is deliberately **not** a migration; each stage uses a fresh database
+v6 -> v7 and v7 -> v8) is deliberately **not** a migration; each stage uses a fresh database
 at its own version.
+
+M6-B.4 deployment is restricted to fresh schema-v8 databases and reopening
+existing v8 databases. An existing v7 database MUST be rejected; passing v8
+conformance does not claim safe upgrade of frozen B.3 data.
 
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:

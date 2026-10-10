@@ -2,7 +2,7 @@
 
 Status: Accepted (M6-B.4 correction; not a milestone freeze)
 Date: 2026-10-08
-Updated: 2026-10-09
+Updated: 2026-10-10
 Canonical path: `docs/decisions/0011-m6b-acquisition-contract-parity.md`
 
 ## Context
@@ -70,6 +70,12 @@ agent still has an ACTIVE claim, is not such a reservation. Active physical
 Executions remain protected. This permits legal source/config replacement
 without reopening a physical-start or concurrent-writer exception.
 
+Previously executed WARM hosts are a different phase: terminal Execution rows
+do not prove external-resource cleanup. Provenance replacement now fails closed
+before acquisition and leaves the host WARM. This narrows the B.4 replacement
+path because SQL fencing cannot satisfy M5 physical safety; same-provenance reuse
+and the frozen settlement/termination APIs retain their behavior.
+
 No settlement API or database schema changes are required. In particular, there
 is no new physical provisioning lifecycle and no generic `execution.is_none()`
 exception to the writer-safety gate.
@@ -103,6 +109,25 @@ faults, missing revisions and unsupported errors default to Fatal and leave the
 committed claim intact for control-plane handling/recovery, without a Task NACK.
 The existing Result signature is retained; its fault semantics are honored.
 
+The same rule applies to successful producer output: malformed digests and blank
+descriptors are fatal contract faults, not Task availability. Integration protocol
+is checked against the committed binding before/after prepare, including failed
+calls; observed drift is fatal. Integrity faults cannot be hidden by an
+availability error or post-call deadline. Valid but changed content remains an
+availability failure. Diagnostics never echo malformed producer content.
+
+Production source routing requires an explicit registration for each exact
+SpawnSourceRef; the wildcard helper is private and unit-test-only. This prevents
+a new revision from gaining config interpretation without a composition-root
+routing decision. Shared integration implementations remain supported through
+multiple explicit registrations.
+
+The internal typed launch result now owns the resolved adapter instance and its
+deadline policy alongside the request. Dispatch consumes this pair without
+registry re-selection, so keeping kind/key while swapping an instance cannot
+change a previously validated launch. The public legacy launch interface is
+unchanged; actual typed daemon dispatch remains pending.
+
 ## Acceptance and consequences
 
 The acceptance matrix covers behavior across boundaries, not only the newest
@@ -118,6 +143,13 @@ STARTING with physical history, and integration-returned availability versus
 authority-loss versus fatal faults. Assertions include immutable old provenance,
 one active reservation, zero adapter starts, and failure-row absence for fatal
 and authority-loss cases.
+
+Producer-output and protocol-drift matrices also assert unchanged claim/Lease,
+no Execution/snapshot/failure and no automatic retry. A real stored resident
+Execution/ACK proves the WARM replacement guard; a dispatch-handoff test replaces
+the registry with a different instance at the same kind/key and proves only the
+captured instance receives start. Exact source revisions and the production
+wildcard API boundary are checked separately.
 
 Tests must include valid counterparts and assert authoritative consequences
 (Attempt/Lease absence, atomic rollback, unchanged host identity/state), not

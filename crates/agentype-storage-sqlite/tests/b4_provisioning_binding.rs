@@ -584,6 +584,58 @@ fn starting_incarnation_with_execution_history_cannot_roll_over() {
     );
 }
 
+#[test]
+fn warm_resident_provenance_change_requires_physical_lifecycle_evidence() {
+    let env = Env::with_retention("warm-provenance", 1, Retention::Resident);
+    let (pin, _, agent, old_id) = resident_host(&env);
+    let original = env
+        .kernel
+        .get_provisioning_binding(&old_id)
+        .unwrap()
+        .unwrap();
+    let other = publish_source_contract(
+        &env.kernel,
+        "other",
+        LifecycleMode::Resident,
+        ContinuityMode::None,
+    );
+    let task = admit_typed_task(&env.kernel, pin);
+    let err = env
+        .kernel
+        .acquire_typed_task_existing(&task, &agent, &other.selection, &registry())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        agentype_core::Error::ConfigurationUnavailable(_)
+    ));
+    assert_eq!(
+        env.kernel.incarnation(&old_id).unwrap().state,
+        agentype_core::IncarnationState::Warm
+    );
+    assert_eq!(
+        env.kernel.get_provisioning_binding(&old_id).unwrap(),
+        Some(original)
+    );
+    assert_eq!(env.kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_eq!(env.kernel.attempt_count_for_task(&task).unwrap(), 0);
+    assert_eq!(count_provisioning_bindings(&env), 1);
+    for table in ["incarnations", "executions", "binding_snapshots"] {
+        assert_eq!(
+            env.raw()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        env.raw()
+            .query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 /// A canonical `sha256:<64 hex>` materialization digest for fixtures.
 fn mat_digest() -> MaterializationDigest {
     MaterializationDigest::new(
@@ -1945,13 +1997,16 @@ fn legacy_incarnation_with_physical_history_is_not_requalified() {
     .unwrap();
 
     let task_id = admit_typed_task(kernel, pin.clone());
-    let acquisition = kernel
+    let err = kernel
         .acquire_typed_task_existing(&task_id, &agent, &catalog.selection, &registry())
-        .unwrap();
-    assert_ne!(
-        acquisition.provisioning_binding.incarnation_id.as_str(),
-        legacy
-    );
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        agentype_core::Error::ConfigurationUnavailable(_)
+    ));
+    assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Queued);
+    assert_eq!(kernel.attempt_count_for_task(&task_id).unwrap(), 0);
+    assert_eq!(count_provisioning_bindings(&env), 0);
     let legacy_state: String = env
         .raw()
         .query_row(
@@ -1960,7 +2015,7 @@ fn legacy_incarnation_with_physical_history_is_not_requalified() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(legacy_state, "LOST");
+    assert_eq!(legacy_state, "WARM");
 }
 
 #[test]

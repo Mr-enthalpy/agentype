@@ -961,7 +961,7 @@ pub(crate) fn prepare_typed_execution_launch(
     outcome: crate::provisioning_resolver::TypedAcquisitionOutcome,
     execution_registry: &ExecutionRegistry,
     adapters: &AdapterRegistry,
-) -> Result<PreparedExecutionLaunch, TypedLaunchError> {
+) -> Result<PreparedTypedExecutionLaunch, TypedLaunchError> {
     let claim = outcome.acquisition.claim.clone();
     // PHASE 1 — all fallible pre-start composition checks, BEFORE any Execution
     // is committed. Only a pre-start availability failure is a Task-level
@@ -1003,16 +1003,57 @@ pub(crate) fn prepare_typed_execution_launch(
         plan.descriptor,
     )
     .map_err(|m| TypedLaunchError::Kernel(Error::invalid_authority(m.detail)))?;
-    Ok(PreparedExecutionLaunch {
-        snapshot,
-        request,
-        resolved_environment: plan.environment,
+    Ok(PreparedTypedExecutionLaunch {
+        launch: PreparedExecutionLaunch {
+            snapshot,
+            request,
+            resolved_environment: plan.environment,
+        },
+        adapter_binding: plan.adapter_binding,
     })
+}
+
+/// Internal typed dispatch handoff. It retains the exact adapter instance and
+/// operation policy validated before Execution commitment. Dispatch consumes
+/// these parts together and must never select an adapter again from a registry.
+#[allow(dead_code)] // Typed daemon wiring remains a separate acceptance gate.
+pub(crate) struct PreparedTypedExecutionLaunch {
+    launch: PreparedExecutionLaunch,
+    adapter_binding: ResolvedAdapterBinding,
+}
+
+impl std::fmt::Debug for PreparedTypedExecutionLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTypedExecutionLaunch")
+            .field("launch", &self.launch)
+            .field("adapter_kind", &self.adapter_binding.adapter_kind())
+            .field(
+                "adapter_binding_key",
+                &self.adapter_binding.adapter_binding_key(),
+            )
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl PreparedTypedExecutionLaunch {
+    pub(crate) fn snapshot(&self) -> &ExecutionLaunchSnapshot {
+        self.launch.snapshot()
+    }
+
+    pub(crate) fn request(&self) -> &EnvironmentStartRequest {
+        self.launch.request()
+    }
+
+    pub(crate) fn into_dispatch(self) -> (PreparedExecutionLaunch, ResolvedAdapterBinding) {
+        (self.launch, self.adapter_binding)
+    }
 }
 
 /// The fully validated, still-uncommitted typed launch plan.
 struct TypedLaunchPlan {
     environment: ResolvedExecutionEnvironment,
+    adapter_binding: ResolvedAdapterBinding,
     physical_binding: FrozenPhysicalExecutionBinding,
     snapshot_record: agentype_agent_contract::BindingSnapshot,
     descriptor: String,
@@ -1149,6 +1190,7 @@ fn plan_typed_execution_launch(
     );
     Ok(TypedLaunchPlan {
         environment,
+        adapter_binding,
         physical_binding,
         snapshot_record,
         descriptor: outcome.launch_descriptor.clone(),

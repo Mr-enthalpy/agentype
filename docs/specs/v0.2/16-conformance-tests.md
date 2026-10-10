@@ -366,8 +366,9 @@ M6-B.4 provisioning binding and exact launch MUST cover:
 - the descriptor protocol is a proven composition relation: eligibility requires
   the source-local integration's protocol to equal the exact adapter binding's
   `import_provisioning_protocol`, the protocol is frozen in the
-  `ProvisioningBinding`, and the handoff re-checks the current adapter's protocol
-  against it
+  `ProvisioningBinding`, preparation re-checks the integration before/after the
+  call (including failed calls), and handoff re-checks the current adapter;
+  observed protocol drift is fatal, invokes no Task NACK and preserves authority
 - provisioning capability is optional: an adapter that does not declare a
   non-blank `import_provisioning_protocol` is not provisioning-capable and is
   ineligible for typed acquisition (the reference local-process adapter declares
@@ -376,6 +377,16 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   `SpawnSourceRef` is not routed to an integration by the composition root is
   ineligible, so one source's opaque config is never interpreted by another
   source's integration
+- production source routing has no wildcard constructor; a new revision remains
+  unrouted until explicitly registered, even when an integration supports both
+- successful prepare output with malformed digest or blank/whitespace descriptor
+  is fatal and preserves Attempt/Lease/provenance; it creates no failure, retry,
+  Execution or snapshot. Valid changed content remains an availability rejection
+- the typed dispatch handoff retains the verified adapter instance and deadlines;
+  replacing a registry entry at the same kind/key cannot redirect that request
+- provenance change on a previously executed WARM host fails closed before a
+  new claim, preserving its state and immutable provenance; terminal Execution
+  rows alone cannot authorize SQL-only resource replacement
 - a typed-handoff failure is classified: only a pre-start availability failure
   settles as `RESOURCE_UNAVAILABLE`; authority loss is left to recovery; durable
   corruption/persistence is fatal; and every fallible composition check runs
