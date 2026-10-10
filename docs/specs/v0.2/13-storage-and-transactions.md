@@ -27,8 +27,14 @@ The Rust-era store carries an exact schema version in `schema_migrations`.
 A database whose version is newer **or** older than the running binary's
 supported `SCHEMA_VERSION` MUST be rejected at open, fail closed. There is
 **no** in-place upgrade while `D-DB-MIGRATE` is unresolved, so v5 -> v6 (and
-v6 -> v7) is deliberately **not** a migration; each stage uses a fresh database
+v6 -> v7 and v7 -> v8) is deliberately **not** a migration; each stage uses a fresh database
 at its own version.
+
+M6-B.4 deployment is restricted to fresh schema-v8 databases and reopening
+existing v8 databases. An existing v7 database MUST be rejected; passing v8
+conformance does not claim safe upgrade of frozen B.3 data. During this unfrozen
+PR, additive v8 preparation-fault DDL is installed by idempotent initialization
+when reopening earlier PR-era v8 stores; existing record formats do not change.
 
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:
@@ -79,6 +85,85 @@ catalog:
   (`ClaimTaskSnapshot.typed`, `ClaimAgentSnapshot.type_bound`), not a storage
   query convention: coarse SQL filtering is a performance optimization only and
   MUST NOT change scheduler behavior.
+
+M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
+
+- `preparation_faults` stores one immutable, payload-free fatal control-plane
+  category per pre-Execution Attempt. Exact ACTIVE ownership/epoch is required;
+  elapsed time alone does not discard a confirmed fact. It grants no activity
+  authority. Activity/settlement requires the unchanged unexpired authority
+  fence and absence of such a fault. Update/delete/replace and conflicting
+  Execution commitment are forbidden. Recovery closes a faulted claim and
+  suspends the Task without worker failure, ExecutionLost retry or quiescence
+  escalation; an unobserved pre-prepare crash keeps ordinary orphan recovery.
+  A fault write error propagates; unsuccessful persistence cannot establish a
+  durable fence. No automatic fault-resume API is part of this slice.
+- Kernel-produced `ExecutionLaunchSnapshot` carries the exact descriptor from
+  its coherent BindingSnapshot transaction (None for legacy). Typed start
+  construction MUST consume it or reject unequal/empty caller text; legacy
+  start construction MUST reject snapshot-bearing typed Executions.
+
+- `provisioning_bindings` is immutable and write-once, scoped to one
+  Incarnation: it freezes the exact `(agent_type_id/revision, spawn_source_id/
+  revision, source_config_id/revision, adapter_policy_id/revision)`, the exact
+  `adapter_kind` + opaque   `adapter_binding_key` the Incarnation was qualified
+  against, the source-integration materialization digest of the exact
+  `SourceConfig`, and the resolved enforceability chosen for that Incarnation. It
+  does NOT store a per-Task requirement (that lives on the Execution's
+  `BindingSnapshot`). Freezing the exact physical domain means the binding proven
+  before authority survives the acquisition transaction, so restart/recovery
+  never has to re-derive it from a transient resolver candidate. A
+  source/config/domain/safety change is a new Incarnation, never an in-place
+  rebind: an active Incarnation's binding is reused only when its frozen
+  provenance still qualifies; otherwise the idle Incarnation is fenced and a
+  fresh one is created. A legacy Incarnation is adopted only when it has no
+  execution history at all; M5 physical history proves only the domain, never the
+  Core-opaque SourceConfig, so it is never promoted to a provisioning
+  provenance. The parent `incarnations.provisioning_mode`
+  (`LEGACY`/`PROVISIONED`) is a positive marker: a `PROVISIONED` Incarnation
+  without its row, or a `LEGACY` Incarnation with one, is corruption that MUST
+  fail closed. The authoritative read also cross-checks the Incarnation's
+  logical agent, requires the binding `agent_type` to equal the LogicalAgent's
+  frozen `LogicalAgentTypeBinding`, and re-resolves the frozen catalogue
+  provenance through the validated reads.
+- `binding_snapshots` is immutable, one per Execution, created in the **same
+  transaction** as the `Execution` row: it freezes `adapter_kind`,
+  `adapter_binding_key`, the source/config provenance, `execution_target`,
+  `execution_profile`, the admitted requirement's capability values, the imported
+  enforceability **capability**, the per-execution **effective** isolation /
+  workspace / network, a secret-free `credential_refs_digest`, and a
+  `resolver_version`. The capability and the effective policy are distinct
+  fields: a `PhysicalSafety` is a capability set, never a hybrid of capability
+  and per-execution choice. The
+  parent `executions.binding_snapshot_mode` (`NONE`/`SNAPSHOT`) is the matching
+  positive marker. The commitment MUST be coherent: the snapshot's adapter
+  key/kind, target/profile, provisioning-binding provenance (same Incarnation and
+  same source/config), and validated config digest MUST all agree with the
+  Execution and its ProvisioningBinding, or the transaction fails. The
+  effective attempt-isolation requirement (`AgentType.requires OR Task.required`)
+  MUST be enforced by the frozen Execution, re-proved at commitment. The M5
+  reconciliation-candidate read MUST also validate this marker/child coherence,
+  so restart recovery never reconciles a `SNAPSHOT` Execution without its
+  provenance. Recovery MUST continue to `resolve_exact(kind, key)`; a missing
+  exact binding is a configuration/recovery failure, never a silent
+  re-selection.
+- both tables MUST be physically write-once keyed by **both** identities: a
+  same-primary-key `INSERT`/`INSERT OR REPLACE` and a new-primary-key
+  `INSERT OR REPLACE` that reuses the durable unique identity
+  (`provisioning_bindings.incarnation_id`, `binding_snapshots.execution_id`) are
+  both rejected, because SQLite resolves a `UNIQUE` conflict before a delete
+  trigger fires while `recursive_triggers` is off. Every other durable UNIQUE
+  identity of the parent tables (`executions.request_id`, the active-execution-
+  per-Incarnation partial unique, the active-Incarnation-per-agent partial
+  unique, `incarnations.id`/`(logical_agent_id, generation)`,
+  `executions.id`/`attempt_id`) MUST likewise have a same-identity `BEFORE
+  INSERT` guard, so no `INSERT OR REPLACE` can delete a frozen parent to inject
+  a marker. Direct SQL can never replace a frozen binding or resurrect a prior
+  marker, and the durable provenance MUST never contain provider secret material.
+- `reconcile_pool` MUST resolve every live LogicalAgent through the
+  authoritative binding-coherence read before excluding typed population from
+  V0.1 capacity; a marker/child mismatch is corruption that aborts the whole
+  reconcile transaction, never a silent exclusion.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
@@ -191,6 +276,7 @@ cannot construct a record that merely looks validated.
 | Batch submit | Batch + Task graph + dependencies + initial BLOCKED/QUEUED |
 | Claim | fencing epoch increment + Attempt + Lease + LogicalAgent ASSIGNED |
 | Execution create | Execution associated with Attempt and Incarnation |
+| Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
 | Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |

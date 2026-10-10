@@ -98,6 +98,20 @@ impl ImportableAdapter for LocalProcessAgentAdapter {
     fn import_attempt_isolation(&self) -> bool {
         false
     }
+
+    fn import_provisioning_protocol(&self) -> Option<&str> {
+        // This adapter launches a plain OS process from `target_options`; it does
+        // NOT consume a typed provisioning descriptor, so it is not
+        // provisioning-capable. It MUST NOT claim a descriptor grammar it ignores.
+        None
+    }
+
+    // This adapter does not sandbox: `start_execution` launches a plain OS
+    // process and does not confine the filesystem or network. It therefore
+    // declares NO enforceable workspace mode or network policy (the conservative
+    // `ImportableAdapter` default), rather than claiming an enforcement it does
+    // not provide. A typed Task requiring any workspace/network mode is
+    // ineligible for this source until a real sandboxed adapter exists.
 }
 
 fn capture_domain_key() -> AdapterResult<AdapterBindingKey> {

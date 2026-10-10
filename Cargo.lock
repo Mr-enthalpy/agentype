@@ -92,6 +92,7 @@ dependencies = [
  "fs4",
  "rusqlite",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

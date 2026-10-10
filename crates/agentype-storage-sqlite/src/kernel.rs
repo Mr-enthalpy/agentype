@@ -944,6 +944,88 @@ impl Kernel {
         self.tx(|tx, _| crate::requirement::match_existing_agents_for_task(tx, task_id))
     }
 
+    // =========================================================================
+    // M6-B.4 provisioning bindings, snapshots, and typed acquisition
+    // =========================================================================
+
+    /// Deterministic fingerprint of the active source/config candidate frontier.
+    pub fn catalog_frontier_digest(&self) -> Result<String, Error> {
+        self.tx(|tx, _| crate::provisioning::active_catalog_frontier_digest(tx))
+    }
+
+    /// Active SpawnSource revision refs (M6-B.4 enumeration).
+    pub fn list_active_spawn_source_refs(
+        &self,
+    ) -> Result<Vec<agentype_agent_contract::SpawnSourceRef>, Error> {
+        self.tx(|tx, _| crate::provisioning::list_active_spawn_source_refs(tx))
+    }
+
+    /// Active SourceConfig revision refs for one exact source revision.
+    pub fn list_active_source_config_refs(
+        &self,
+        source: &agentype_agent_contract::SpawnSourceRef,
+    ) -> Result<Vec<agentype_agent_contract::SourceConfigRef>, Error> {
+        self.tx(|tx, _| crate::provisioning::list_active_source_config_refs(tx, source))
+    }
+
+    pub fn get_provisioning_binding(
+        &self,
+        incarnation_id: &agentype_core::IncarnationId,
+    ) -> Result<Option<agentype_agent_contract::ProvisioningBinding>, Error> {
+        self.tx(|tx, _| crate::provisioning::get_provisioning_binding(tx, incarnation_id))
+    }
+
+    pub fn get_binding_snapshot(
+        &self,
+        execution_id: &agentype_core::ExecutionId,
+    ) -> Result<Option<agentype_agent_contract::BindingSnapshot>, Error> {
+        self.tx(|tx, _| crate::provisioning::get_binding_snapshot(tx, execution_id))
+    }
+
+    /// Acquire a typed Task for an existing bound agent (authority-bearing).
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn acquire_typed_task_existing(
+        &self,
+        task_id: &agentype_core::TaskId,
+        agent_id: &agentype_core::LogicalAgentId,
+        chosen: &crate::provisioning::ResolvedProvisioningSelection,
+        execution_registry: &agentype_execution_config::ExecutionRegistry,
+    ) -> Result<crate::provisioning::TypedAcquisition, Error> {
+        let lease_seconds = self.lease_seconds;
+        self.tx(|tx, now| {
+            crate::provisioning::acquire_typed_task_existing(
+                tx,
+                now,
+                lease_seconds,
+                task_id,
+                agent_id,
+                chosen,
+                execution_registry,
+            )
+        })
+    }
+
+    /// Acquire a typed Task by provisioning a new bound agent (authority-bearing).
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn acquire_typed_task_new_agent(
+        &self,
+        task_id: &agentype_core::TaskId,
+        chosen: &crate::provisioning::ResolvedProvisioningSelection,
+        execution_registry: &agentype_execution_config::ExecutionRegistry,
+    ) -> Result<crate::provisioning::TypedAcquisition, Error> {
+        let lease_seconds = self.lease_seconds;
+        self.tx(|tx, now| {
+            crate::provisioning::acquire_typed_task_new_agent(
+                tx,
+                now,
+                lease_seconds,
+                task_id,
+                chosen,
+                execution_registry,
+            )
+        })
+    }
+
     // ------------------------------------------------------------------ topology
 
     pub fn upsert_partition(&self, spec: &PartitionSpec) -> Result<i64, Error> {
@@ -1112,10 +1194,14 @@ impl Kernel {
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
             };
             for partition in partitions {
-                // Coarse pre-filter; shrink ordering is a core decision
-                // (unassigned first, READY first, lowest id) revalidated over
-                // the snapshot so SQL text cannot change the outcome.
-                let members: Vec<(AgentRow, Option<f64>, f64)> = {
+                // ADR-0009: V0.1 capacity counts only coherent untyped
+                // (`UNBOUND`) LogicalAgents. The binding-mode exclusion is a
+                // Core-authoritative decision, not a SQL convention: every live
+                // agent is loaded and resolved through the authoritative
+                // binding-coherence read, so a marker/child mismatch fails the
+                // whole reconcile transaction closed instead of being silently
+                // excluded (which would birth a replacement onto corrupt state).
+                let live: Vec<(AgentRow, Option<f64>, f64)> = {
                     let mut stmt = tx
                         .prepare(
                             "SELECT id,partition_name,retention,state,workstream_id,tags_json,current_task_id,
@@ -1141,6 +1227,16 @@ impl Kernel {
                     }
                     out
                 };
+                let mut members: Vec<(AgentRow, Option<f64>, f64)> = Vec::new();
+                for (agent, available_since, created_at) in live {
+                    let agent_id = LogicalAgentId::from_string(agent.id.clone());
+                    // Validated coherence read: marker/child mismatch is
+                    // corruption and aborts the transaction.
+                    match crate::requirement::get_logical_agent_type_binding(tx, &agent_id)? {
+                        Some(_) => {} // coherent BOUND: not V0.1 capacity
+                        None => members.push((agent, available_since, created_at)),
+                    }
+                }
                 let deficit = partition.desired_capacity - members.len() as i64;
                 for _ in 0..deficit.max(0) {
                     birth_agent(tx, &partition.name, None, None, now)?;
@@ -1243,6 +1339,19 @@ impl Kernel {
                 }
                 out
             };
+            // ADR-0009: V0.1 operator capacity counts only untyped (`UNBOUND`)
+            // LogicalAgents. A typed (`BOUND`) agent is governed by typed
+            // provisioning, not by this legacy capacity command, so it MUST NOT
+            // be moved here; an incoherent marker/child aborts the transaction.
+            let mut unbound_members: Vec<(AgentRow, Option<f64>, f64)> =
+                Vec::with_capacity(members.len());
+            for (agent, available_since, created_at) in members {
+                let agent_id = LogicalAgentId::from_string(agent.id.clone());
+                if crate::requirement::get_logical_agent_type_binding(tx, &agent_id)?.is_none() {
+                    unbound_members.push((agent, available_since, created_at));
+                }
+            }
+            let members = unbound_members;
             let mut candidates: Vec<(PoolMemberSnapshot, usize)> = Vec::with_capacity(members.len());
             for (i, (a, available_since, created_at)) in members.iter().enumerate() {
                 candidates.push((
@@ -1888,6 +1997,63 @@ impl Kernel {
         claim: &Claim,
         physical_binding: FrozenPhysicalExecutionBinding,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
+        self.tx(|tx, now| {
+            Self::create_execution_in_tx(
+                tx,
+                now,
+                claim,
+                &physical_binding,
+                ExecutionId::new(),
+                None,
+            )
+        })
+    }
+
+    /// M6-B.4 typed commitment: create the Execution and freeze its immutable
+    /// `BindingSnapshot` in one transaction. The snapshot's `execution_id` must
+    /// match the created Execution, and its `adapter_kind` must match the frozen
+    /// physical binding. A failure leaves neither row.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn create_execution_with_snapshot(
+        &self,
+        claim: &Claim,
+        physical_binding: FrozenPhysicalExecutionBinding,
+        binding_snapshot: &agentype_agent_contract::BindingSnapshot,
+    ) -> Result<ExecutionLaunchSnapshot, Error> {
+        self.tx(|tx, now| {
+            let snapshot = Self::create_execution_in_tx(
+                tx,
+                now,
+                claim,
+                &physical_binding,
+                binding_snapshot.execution_id.clone(),
+                Some(&binding_snapshot.launch_descriptor),
+            )?;
+            // Full cross-record authority proof (shared with the authoritative
+            // read), executed before the snapshot is frozen.
+            crate::provisioning::validate_binding_snapshot_authority(tx, binding_snapshot)?;
+            tx.execute(
+                "UPDATE executions SET binding_snapshot_mode='SNAPSHOT' WHERE id=?1",
+                params![snapshot.execution_id().as_str()],
+            )
+            .map_err(map_sqlite)?;
+            crate::provisioning::insert_binding_snapshot(tx, now, binding_snapshot)?;
+            Ok(snapshot)
+        })
+    }
+
+    /// Shared execution-creation transaction body. Reconstructs the launch
+    /// snapshot from durable authority only; the caller supplies the already
+    /// frozen physical binding.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    fn create_execution_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        now: UnixTime,
+        claim: &Claim,
+        physical_binding: &FrozenPhysicalExecutionBinding,
+        execution_id: ExecutionId,
+        committed_launch_descriptor: Option<&str>,
+    ) -> Result<ExecutionLaunchSnapshot, Error> {
         let safety = physical_binding.safety();
         // Kernel invariant check (M5.3 §36): the frozen adapter routing
         // identity is required for every execution commitment — defense in
@@ -1907,110 +2073,122 @@ impl Kernel {
                 "execution commitment requires a non-blank adapter binding key",
             ));
         }
-        self.tx(|tx, now| {
-            let (attempt, lease, task) =
-                validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
-            if claim.task_id.as_str() != attempt.task_id {
-                return Err(Error::invalid_authority(
-                    "claim task_id does not match authoritative attempt",
-                ));
+        let (attempt, lease, task) =
+            validate_authority_tx(tx, claim.attempt_id.as_str(), claim.lease_epoch.get(), now)?;
+        if claim.task_id.as_str() != attempt.task_id {
+            return Err(Error::invalid_authority(
+                "claim task_id does not match authoritative attempt",
+            ));
+        }
+        if claim.logical_agent_id.as_str() != attempt.logical_agent_id {
+            return Err(Error::invalid_authority(
+                "claim logical_agent_id does not match authoritative attempt",
+            ));
+        }
+        if claim.execution_target != attempt.execution_target {
+            return Err(Error::invalid_authority(
+                "claim execution_target does not match authoritative attempt",
+            ));
+        }
+        if claim.execution_profile != attempt.execution_profile {
+            return Err(Error::invalid_authority(
+                "claim execution_profile does not match authoritative attempt",
+            ));
+        }
+        // A TYPED Task MUST commit through the snapshot-bearing path; the legacy
+        // path fails closed so every typed Execution freezes its provenance
+        // atomically. Checked after authority validation, against the
+        // authoritative Attempt, so a tampered Claim cannot steer the error.
+        if committed_launch_descriptor.is_none()
+            && crate::requirement::task_agent_requirement_mode(
+                tx,
+                &TaskId::from_string(&attempt.task_id),
+            )? == "TYPED"
+        {
+            return Err(Error::invalid_authority(
+                "a typed Task must commit through create_execution_with_snapshot",
+            ));
+        }
+        // Attempt-bound proof: a safety fact minted for a different
+        // attempt (or a different lease epoch) is rejected even when the
+        // target and profile names coincide, closing cross-attempt
+        // replay of a stale isolated proof.
+        if safety.attempt_id().as_str() != attempt.id {
+            return Err(Error::invalid_authority(format!(
+                "safety proof is bound to attempt {} but the authoritative attempt is {}",
+                safety.attempt_id().as_str(),
+                attempt.id
+            )));
+        }
+        if safety.lease_epoch() != claim.lease_epoch {
+            return Err(Error::invalid_authority(
+                "safety proof is bound to a different lease epoch",
+            ));
+        }
+        if safety.execution_target() != attempt.execution_target {
+            return Err(Error::invalid_authority(format!(
+                "safety proof target '{}' does not match authoritative attempt target '{}'",
+                safety.execution_target(),
+                attempt.execution_target
+            )));
+        }
+        if safety.execution_profile() != attempt.execution_profile {
+            return Err(Error::invalid_authority(format!(
+                "safety proof profile '{}' does not match authoritative attempt profile '{}'",
+                safety.execution_profile(),
+                attempt.execution_profile
+            )));
+        }
+        let (incarnation_id, incarnation_handle_json) = match attempt.incarnation_id {
+            Some(id) => {
+                let handle: String = tx
+                    .query_row(
+                        "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .map_err(map_sqlite)?;
+                (id, handle)
             }
-            if claim.logical_agent_id.as_str() != attempt.logical_agent_id {
-                return Err(Error::invalid_authority(
-                    "claim logical_agent_id does not match authoritative attempt",
-                ));
+            None => {
+                let id = ensure_incarnation(
+                    tx,
+                    &attempt.logical_agent_id,
+                    &attempt.execution_target,
+                    now,
+                )?;
+                let handle: String = tx
+                    .query_row(
+                        "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .map_err(map_sqlite)?;
+                (id, handle)
             }
-            if claim.execution_target != attempt.execution_target {
-                return Err(Error::invalid_authority(
-                    "claim execution_target does not match authoritative attempt",
-                ));
-            }
-            if claim.execution_profile != attempt.execution_profile {
-                return Err(Error::invalid_authority(
-                    "claim execution_profile does not match authoritative attempt",
-                ));
-            }
-            // Attempt-bound proof: a safety fact minted for a different
-            // attempt (or a different lease epoch) is rejected even when the
-            // target and profile names coincide, closing cross-attempt
-            // replay of a stale isolated proof.
-            if safety.attempt_id().as_str() != attempt.id {
-                return Err(Error::invalid_authority(format!(
-                    "safety proof is bound to attempt {} but the authoritative attempt is {}",
-                    safety.attempt_id().as_str(),
-                    attempt.id
-                )));
-            }
-            if safety.lease_epoch() != claim.lease_epoch {
-                return Err(Error::invalid_authority(
-                    "safety proof is bound to a different lease epoch",
-                ));
-            }
-            if safety.execution_target() != attempt.execution_target {
-                return Err(Error::invalid_authority(format!(
-                    "safety proof target '{}' does not match authoritative attempt target '{}'",
-                    safety.execution_target(),
-                    attempt.execution_target
-                )));
-            }
-            if safety.execution_profile() != attempt.execution_profile {
-                return Err(Error::invalid_authority(format!(
-                    "safety proof profile '{}' does not match authoritative attempt profile '{}'",
-                    safety.execution_profile(),
-                    attempt.execution_profile
-                )));
-            }
-            let (incarnation_id, incarnation_handle_json) = match attempt.incarnation_id {
-                Some(id) => {
-                    let handle: String = tx
-                        .query_row(
-                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
-                            params![id],
-                            |r| r.get(0),
-                        )
-                        .map_err(map_sqlite)?;
-                    (id, handle)
-                }
-                None => {
-                    let id = ensure_incarnation(
-                        tx,
-                        &attempt.logical_agent_id,
-                        &attempt.execution_target,
-                        now,
-                    )?;
-                    let handle: String = tx
-                        .query_row(
-                            "SELECT runtime_handle_json FROM incarnations WHERE id=?1",
-                            params![id],
-                            |r| r.get(0),
-                        )
-                        .map_err(map_sqlite)?;
-                    (id, handle)
-                }
-            };
-            let busy: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM executions WHERE incarnation_id=?1
+        };
+        let busy: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM executions WHERE incarnation_id=?1
                      AND state IN ('STARTING','RUNNING','UNKNOWN') LIMIT 1",
-                    params![incarnation_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_sqlite)?;
-            if busy.is_some() {
-                return Err(Error::invalid_transition(format!(
-                    "incarnation {incarnation_id} already owns an active Execution"
-                )));
-            }
-            tx.execute(
-                "UPDATE attempts SET incarnation_id=?1 WHERE id=?2 AND incarnation_id IS NULL",
-                params![incarnation_id, attempt.id],
+                params![incarnation_id],
+                |r| r.get(0),
             )
+            .optional()
             .map_err(map_sqlite)?;
-            let execution_id = ExecutionId::new();
-            let request_id = RequestId::new();
-            let attempt_isolation = safety.attempt_isolation();
-            tx.execute(
+        if busy.is_some() {
+            return Err(Error::invalid_transition(format!(
+                "incarnation {incarnation_id} already owns an active Execution"
+            )));
+        }
+        tx.execute(
+            "UPDATE attempts SET incarnation_id=?1 WHERE id=?2 AND incarnation_id IS NULL",
+            params![incarnation_id, attempt.id],
+        )
+        .map_err(map_sqlite)?;
+        let request_id = RequestId::new();
+        let attempt_isolation = safety.attempt_isolation();
+        tx.execute(
                 "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,execution_target,
                  execution_profile,adapter_kind,adapter_binding_key,attempt_isolation,state,started_at,updated_at)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'STARTING',?11,?11)",
@@ -2030,47 +2208,58 @@ impl Kernel {
             )
             .map_err(map_sqlite)?;
 
-            let payload = json_load(&task.payload_json)?;
-            let acceptance = json_load(&task.acceptance_json)?;
-            let workspace_mode = WorkspaceMode::parse_sql(&task.workspace_mode)?;
+        let payload = json_load(&task.payload_json)?;
+        let acceptance = json_load(&task.acceptance_json)?;
+        let workspace_mode = WorkspaceMode::parse_sql(&task.workspace_mode)?;
 
-            let agent = required_agent(tx, &attempt.logical_agent_id)?;
-            let continuity_capsule = json_load(&agent.continuity_json)?;
-            let continuity_pref = ContinuityPreference::parse_sql(&task.continuity)?;
-            let continuity = CommittedContinuitySnapshot::new(
-                continuity_pref,
-                agent.continuity_version,
-                continuity_capsule,
-            );
-            let incarnation_runtime_handle = json_load(&incarnation_handle_json)?;
+        let agent = required_agent(tx, &attempt.logical_agent_id)?;
+        let continuity_capsule = json_load(&agent.continuity_json)?;
+        let continuity_pref = ContinuityPreference::parse_sql(&task.continuity)?;
+        let continuity = CommittedContinuitySnapshot::new(
+            continuity_pref,
+            agent.continuity_version,
+            continuity_capsule,
+        );
+        let incarnation_runtime_handle = json_load(&incarnation_handle_json)?;
 
-            // SAFETY: Atomically validated and reconstructed from durable storage within the
-            // Kernel execution creation transaction.
-            Ok(unsafe {
-                ExecutionLaunchSnapshot::from_persisted_kernel_authority(
-                    execution_id,
-                    request_id,
-                    TaskId::from_string(&attempt.task_id),
-                    BatchId::from_string(&task.batch_id),
-                    AttemptId::from_string(&attempt.id),
-                    attempt.attempt_number as u32,
-                    LeaseId::from_string(&lease.id),
-                    LeaseEpoch(lease.epoch),
-                    lease.expires_at,
-                    LogicalAgentId::from_string(&attempt.logical_agent_id),
-                    IncarnationId::from_string(&incarnation_id),
-                    incarnation_runtime_handle,
-                    attempt.execution_target,
-                    attempt.execution_profile,
-                    workspace_mode,
-                    task.name,
-                    payload,
-                    acceptance,
-                    task.workstream_id.map(WorkstreamId::from_string),
-                    continuity,
-                    safety.clone(),
-                )
-            })
+        // Carry the effective (stricter) network policy of a typed Task to the
+        // physical request; a legacy Task has no requirement and stays Enabled.
+        let required_network = match crate::requirement::get_task_agent_requirement(
+            tx,
+            &TaskId::from_string(&attempt.task_id),
+        )? {
+            Some(requirement) => network_enforcement(requirement.hard.required_network),
+            None => agentype_execution_config::NetworkEnforcement::Enabled,
+        };
+
+        // SAFETY: Atomically validated and reconstructed from durable storage within the
+        // Kernel execution creation transaction.
+        Ok(unsafe {
+            ExecutionLaunchSnapshot::from_persisted_kernel_authority(
+                execution_id,
+                request_id,
+                TaskId::from_string(&attempt.task_id),
+                BatchId::from_string(&task.batch_id),
+                AttemptId::from_string(&attempt.id),
+                attempt.attempt_number as u32,
+                LeaseId::from_string(&lease.id),
+                LeaseEpoch(lease.epoch),
+                lease.expires_at,
+                LogicalAgentId::from_string(&attempt.logical_agent_id),
+                IncarnationId::from_string(&incarnation_id),
+                incarnation_runtime_handle,
+                attempt.execution_target,
+                attempt.execution_profile,
+                workspace_mode,
+                required_network,
+                task.name,
+                payload,
+                acceptance,
+                task.workstream_id.map(WorkstreamId::from_string),
+                continuity,
+                safety.clone(),
+                committed_launch_descriptor.map(str::to_owned),
+            )
         })
     }
 
@@ -2959,6 +3148,14 @@ impl Kernel {
                 if !seen.insert(row.attempt_id.clone()) {
                     continue;
                 }
+                let preparation_fault = crate::preparation::get_fault(
+                    tx, &AttemptId::from_string(&row.attempt_id),
+                )?;
+                if preparation_fault.is_some()
+                    && (row.execution_id.is_some() || row.incarnation_id.is_some())
+                {
+                    return Err(Error::invariant("preparation fault has physical execution authority"));
+                }
                 tx.execute(
                     "UPDATE leases SET state='EXPIRED',ended_at=?1 WHERE id=?2 AND state='ACTIVE'",
                     params![now, row.lease_id],
@@ -2969,6 +3166,19 @@ impl Kernel {
                     params![now, row.attempt_id],
                 )
                 .map_err(map_sqlite)?;
+                if preparation_fault.is_some() {
+                    // A confirmed producer/control-plane fact is not an
+                    // ordinary orphan, a worker NACK, or a quiescence witness.
+                    // Close only this claim and suspend without retry policy.
+                    tx.execute(
+                        "UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL,next_eligible_at=NULL,updated_at=?1 WHERE id=?2",
+                        params![now, row.task_id],
+                    ).map_err(map_sqlite)?;
+                    release_agent(tx, &row.logical_agent_id, now)?;
+                    recompute_batch(tx, &row.batch_id, now)?;
+                    report.suspended += 1;
+                    continue;
+                }
                 if let Some(inc) = &row.incarnation_id {
                     tx.execute(
                         "UPDATE incarnations SET state='LOST',ended_at=?1 WHERE id=?2
@@ -3461,8 +3671,8 @@ impl Kernel {
     /// correctness never depends on it: current-authority candidates first
     /// (by nearest lease expiry), stale physical-history candidates last.
     pub fn reconciliation_candidates(&self) -> Result<Vec<ExecutionReconciliationSnapshot>, Error> {
-        self.store.query(|conn| {
-            let mut stmt = conn
+        self.tx(|tx, _now| {
+            let mut stmt = tx
                 .prepare(
                     "SELECT e.id,e.request_id,e.task_id,e.attempt_id,e.incarnation_id,
                             e.adapter_kind,e.adapter_binding_key,e.state,e.runtime_handle_json,
@@ -3508,10 +3718,20 @@ impl Kernel {
             let collected: Vec<ReconciliationRow> = rows
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(map_sqlite)?;
-            collected
+            let snapshots: Vec<ExecutionReconciliationSnapshot> = collected
                 .into_iter()
                 .map(ExecutionReconciliationSnapshot::from_row)
-                .collect()
+                .collect::<Result<_, _>>()?;
+            // Restart recovery MUST NOT bypass the BindingSnapshot positive
+            // marker: every Execution's provisioning-snapshot marker and child
+            // row are one invariant, checked through the same authority read the
+            // supported surface uses. A `SNAPSHOT` Execution with a missing or
+            // incoherent snapshot, or a `NONE` Execution with an unexpected
+            // child, aborts the whole recovery candidate read.
+            for snapshot in &snapshots {
+                crate::provisioning::get_binding_snapshot(tx, snapshot.execution_id())?;
+            }
+            Ok(snapshots)
         })
     }
 
@@ -3949,6 +4169,47 @@ impl Kernel {
         })
     }
 
+    /// Read-only **full** committed-claim authority fence. It reuses the same
+    /// `AuthoritySnapshot` validation as every authority-bearing transaction
+    /// (Attempt `ACTIVE`, Lease `ACTIVE`, lease epoch, `Task.current_attempt_id`,
+    /// `Task.fencing_epoch`, lease unexpired) and additionally requires the
+    /// Claim's identity copies to match the durable Attempt. The typed acquisition
+    /// runs it before and after the pure `prepare`, so the resolution boundary is
+    /// fenced no more weakly than M5's.
+    pub fn claim_authority_is_current(&self, claim: &Claim) -> Result<bool, Error> {
+        let attempt_id = claim.attempt_id.as_str().to_string();
+        self.tx(|tx, now| {
+            match validate_authority_tx(tx, &attempt_id, claim.lease_epoch.get(), now) {
+                Err(Error::StaleAuthority(_)) => Ok(false),
+                Err(err) => Err(err),
+                Ok((attempt, _lease, _task)) => Ok(attempt.task_id == claim.task_id.as_str()
+                    && attempt.logical_agent_id == claim.logical_agent_id.as_str()
+                    && attempt.execution_target == claim.execution_target
+                    && attempt.execution_profile == claim.execution_profile),
+            }
+        })
+    }
+
+    /// Persist a confirmed fatal producer fact before returning it to control.
+    /// This fences Execution commitment without fabricating a Task failure or
+    /// physical outcome. Recovery closes the claim and keeps the Task suspended.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn record_preparation_fault(
+        &self,
+        claim: &Claim,
+        kind: crate::PreparationFaultKind,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::preparation::record_fault(tx, now, claim, kind))
+    }
+
+    pub fn preparation_fault_kind(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<crate::PreparationFaultKind>, Error> {
+        self.store
+            .query(|conn| crate::preparation::get_fault(conn, attempt_id))
+    }
+
     pub fn logical_agent(&self, id: &LogicalAgentId) -> Result<LogicalAgentRecord, Error> {
         self.store.query(|conn| {
             conn.query_row(
@@ -4225,8 +4486,26 @@ struct ReconciliationRow {
     current_attempt_id: Option<String>,
 }
 
+/// Map the agent-contract coarse network policy to the neutral M5 vocabulary
+/// carried to the physical execution request.
+fn network_enforcement(
+    policy: agentype_agent_contract::NetworkPolicy,
+) -> agentype_execution_config::NetworkEnforcement {
+    match policy {
+        agentype_agent_contract::NetworkPolicy::Disabled => {
+            agentype_execution_config::NetworkEnforcement::Disabled
+        }
+        agentype_agent_contract::NetworkPolicy::Restricted => {
+            agentype_execution_config::NetworkEnforcement::Restricted
+        }
+        agentype_agent_contract::NetworkPolicy::Enabled => {
+            agentype_execution_config::NetworkEnforcement::Enabled
+        }
+    }
+}
+
 #[cfg(any(test, feature = "runtime-internal"))]
-fn claim_selected(
+pub(crate) fn claim_selected(
     tx: &rusqlite::Transaction<'_>,
     agent: &AgentRow,
     partition: &PartitionRow,

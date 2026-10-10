@@ -464,6 +464,17 @@ match_existing_agents       pure M5-placement + type-contract filter, then
 
 Rules now enforced:
 
+- **Frozen-contract parity.** Legacy claim selection, B.3 preselection and B.4
+  acquisition share the Core placement decision; Required continuity needs a
+  concrete matching workstream. Target isolation must satisfy semantic demands
+  and be enforceable by the exact adapter, before attestation and authority.
+  Acquisition reserves the Incarnation through its immutable ProvisioningBinding
+  but leaves `Attempt.incarnation_id` unset until Execution + BindingSnapshot
+  commitment. Pre-Execution closure therefore preserves an earlier WARM host;
+  a fresh STARTING reservation can be reused. Existing M5 settlement and writer
+  safety apply unchanged after execution commitment. See
+  [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md).
+
 - **Atomic typed admission.** `admit_typed_proposal` creates the M5 Task, the
   `GenerationTaskBinding`, and the immutable `TaskAgentRequirement` in one SQLite
   transaction. A failure leaves none of the three. It resolves the exact
@@ -606,3 +617,146 @@ INV-B9  enforced != declared
 M5-B* (adapter physical-only, exact binding frozen at Execution, no
 provisioning side effects in transactions) and M6A-B* (no Task creation, no
 Generation expansion, provisioning after admission) remain in force.
+
+## 9. Provisioning binding and exact launch (M6-B.4)
+
+M6-B.4 is the first **authority-bearing typed acquisition**. It turns a typed
+Task (exact AgentType pin + hard requirement) into a physical commitment without
+reopening M6-A admission, M6-B.1 predicates, M6-B.2 catalogue identity, or
+M6-B.3 requirement/binding durability.
+
+```text
+SCHEMA_VERSION = 8
+
+ProvisioningBinding     per-Incarnation immutable exact source/config/policy
+BindingSnapshot         per-Execution immutable exact physical choice
+ResolvedProvisioningSelection
+                        the durable acquisition input (re-proved in-transaction)
+SourceProvisioningCandidate
+                        one eligible source/config candidate carrying the exact
+                        resolved (adapter_kind, adapter_binding_key)
+ResolvedProvisioningEvidence
+                        production producer behind the provisioning-producer
+                        feature, enabled only by the internal runtime
+AdapterSafetyEnvelope   additively carries imported workspace/network
+AdapterRegistry          resolve_binding_ref (stable alias -> exact binding)
+```
+
+Rules now enforced:
+
+- **Imported evidence only.** `ResolvedProvisioningEvidence` is built by the
+  internal resolver from the imported M5 binding (`ImportableAdapter`), never
+  from a catalog `DECLARED` label or a control-surface caller. The production
+  producer is compiled only under the `provisioning-producer` feature, so the
+  default surface keeps no evidence constructor
+  ([ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md)).
+- **Mandatory conjuncts are re-proved in the authority transaction.**
+  Acquisition re-loads the current Task authority, the current
+  `LogicalAgentTypeBinding`, the validated source/config/policy revisions, and
+  the capability catalog, and re-proves `can_execute`/`can_provision_task`
+  (active `AdapterBindingPolicy`, satisfied `required_safety`, exact
+  `AdapterKind`/`AdapterBindingKey`), and requires the partition target's
+  `adapter_kind` to equal the policy's, all before any Attempt/Lease. A
+  caller-assembled selection that fails the predicates is rejected. The M5
+  placement gates are re-checked, not assumed. A `B3Candidate` is not an eligible
+  execution candidate.
+- **The actual bound AgentType is executable.** A refinement, broader, or
+  otherwise compatible B.3 candidate is accepted if `can_execute` holds; a
+  different revision of the same `type_id` stays excluded.
+- **Proof-to-launch bridges.** `attempt_isolation` is authoritative from the
+  ExecutionRegistry target (M4), never adapter self-assertion; the effective
+  isolation is the OR of the AgentType and Task flags; the effective network
+  policy is carried on the provider-neutral `EnvironmentStartRequest`; the
+  committed selection is built from the Scheduler-derived winner and its exact
+  `binding_ref` is re-resolved immediately before the authority transaction; a
+  config that declares credential refs fails closed (availability is B.5, never a
+  caller-minted fact); an `OpaqueJson` config is eligible once its body digest
+  validates, while an `ExternalRef` config is eligible only when a source
+  integration attests its content identity under the exact physical domain (and
+  is ineligible until then). Credential-bearing and wrong-target-kind candidates
+  are filtered BEFORE deterministic ranking, so the selection input set is fully
+  hard-eligible; and `ProvisioningBinding.agent_type` must equal the agent's frozen
+  `LogicalAgentTypeBinding`. `ProvisioningBinding` records an enforceability
+  capability while `BindingSnapshot` records the per-execution effective policy
+  separately, so a domain that can isolate but does not use it is representable.
+- **No unprovenanced typed execution.** The legacy `create_execution` fails
+  closed for a TYPED Task, so every typed Execution commits through
+  `create_execution_with_snapshot`; `reconcile_pool` aborts on a marker/child
+  binding mismatch; restart reconciliation validates the Execution snapshot
+  marker/child coherence through the same authority read; the effective
+  isolation is re-proved at commitment; and every durable UNIQUE identity is
+  guarded against `INSERT OR REPLACE`. The authority facade applies the frozen continuity
+  dimension and commits the winner; a tie on the unmodelled availability/cost
+  dimensions fails closed rather than using an invented tie-break
+  ([ADR-0010](../../decisions/0010-m6b-selection-order-scope.md)).
+- **SourceConfig is resolved, not materialized by B.4.** A `SourceConfigIntegration`
+  consumes the validated `SourceConfigRevision` and, via pure `attest`/`prepare`,
+  produces a secret-free **attested** digest bound to the exact physical domain
+  (also the B.4 `ExternalRef` attestation) and an opaque **launch descriptor**.
+  Neither creates a physical resource: M6-B never creates a physical environment.
+  The digest is frozen in the `ProvisioningBinding`/`BindingSnapshot` and
+  required, and the descriptor is frozen in the `BindingSnapshot` and carried on
+  the `EnvironmentStartRequest`, so the exact `ExecutionAdapter` physically
+  materializes the described environment inside `start_execution` (M5 owns the
+  physical lifecycle). The existing-vs-new decision is Scheduler-owned: a single
+  `acquire_typed_task` applies the frozen spec 06 existing-first order before
+  provisioning a new agent, re-qualifying full claim authority (and taking a
+  distinct winner-preparation deadline) around the pure `prepare`. The
+  provisioned descriptor is bound to the exact adapter by a **provisioning
+  protocol identity** proven at eligibility and re-checked at the handoff, and the
+  member's realized M4 `Retention` must be contained in the source/config
+  effective lifecycle. The acquisition returns its winner candidate alongside the
+  committed `TypedAcquisition`, so the daemon-internal Execution handoff
+  (`prepare_typed_execution_launch`) can freeze the `BindingSnapshot` and commit a
+  snapshot-bearing Execution via `create_execution_with_snapshot`, resolving the
+  adapter by the exact frozen `(adapter_kind, adapter_binding_key)`. The handoff
+  stops at the assembled `EnvironmentStartRequest`; the physical start and its
+  observation commit remain the (not-yet-wired) daemon dispatch step.
+- **Physical target/profile from the partition/anchor.** `SpawnSource` selects
+  the exact installed binding (`binding_ref`) of the policy's `adapter_kind`; the
+  target's `adapter_kind` MUST agree or the candidate is ineligible. The exact
+  binding identity is carried from resolution into the acquisition and snapshot.
+  The frozen B.2 canonical `SpawnSource` content is unchanged.
+- **ProvisioningBinding is stable per-Incarnation provenance.** A B.3 binding is
+  semantic identity only; the first acquisition mints a `ProvisioningBinding`
+  (or reuses one whose provenance, exact domain, and resolved enforceability
+  still qualify). The binding freezes the exact `(adapter_kind,
+  adapter_binding_key)` and the resolved enforceability, but NOT a per-Task
+  requirement (that lives on the Execution `BindingSnapshot`), so the proven
+  domain survives the acquisition transaction and restart. A source/config/
+  domain/safety change fences the idle Incarnation and rolls over to a fresh one.
+  A legacy Incarnation with any execution history is never promoted to a
+  SourceConfig provenance (M5 history proves only the domain); only a truly fresh
+  one is adopted.
+- **The evidence subject binds the exact physical domain.** The authority
+  transaction requires the imported evidence's `(adapter_kind,
+  adapter_binding_key)` to equal the selected binding, so a proof from one
+  installation can never authorize another. Enforceability is exact-set
+  (`AdapterSafetyEnvelope::enforces_workspace`), matching the frozen B.1
+  `PhysicalSafety`.
+- **BindingSnapshot is an atomic, coherent commitment.**
+  `create_execution_with_snapshot` freezes the exact physical choice in the
+  execution-creation transaction and checks the adapter key/kind, target/profile,
+  provisioning-binding provenance, and validated config digest; after that, a
+  missing exact binding is a recovery/configuration failure, never a silent
+  re-selection. Candidate fallback is pre-commit only, and a candidate-local
+  ineligibility skips only that candidate.
+- **Mechanical guards.** `provisioning_bindings`/`binding_snapshots` are
+  write-once keyed by both the primary key and the durable unique identity
+  (`incarnation_id`/`execution_id`), so `INSERT OR REPLACE` cannot replace a
+  frozen row; the parent markers (`incarnations.provisioning_mode`,
+  `executions.binding_snapshot_mode`) and the parent identities are equally
+  guarded, and a `PROVISIONED`/`SNAPSHOT` parent without its child row is
+  corruption, never `None`.
+- **Validated-read enumeration.** Active source/config enumeration loads every
+  immutable revision through the validated catalog read, so a missing disposition
+  overlay fails closed instead of silently disappearing.
+- **D-TOPOLOGY seam.** V0.1 `reconcile_pool` counts and retires only untyped
+  (`UNBOUND`) agents ([ADR-0009](../../decisions/0009-m6b-topology-capacity-seam.md));
+  full typed-population targets remain deferred.
+
+Deliberately deferred to B.5 and beyond: enforced sandbox-policy / security-class
+capability evidence (adapters currently import coarse safety only), credential
+resolution/brokering and credential-availability (B.4 records only a secret-free
+`credential_refs_digest`), typed cold/revivable matching, MemoryCapsule,
+Transform, and `D-DB-MIGRATE`/`D-SANDBOX-*`.

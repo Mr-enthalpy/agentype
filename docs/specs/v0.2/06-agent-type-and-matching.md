@@ -95,9 +95,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   stays a per-task requirement), and when effective it MUST be physically
   enforceable. Full eligibility additionally
   requires an active adapter policy, satisfied `required_safety`, a coherent
-  adapter kind/binding, a currently resolvable exact binding, and available
-  required credential refs (B.4/B.5); no second implicit eligibility relation may
-  be introduced for these. For `Restriction` capabilities the
+  adapter kind/binding, and a currently resolvable exact binding (M6-B.4); the
+  availability of required credential refs is a B.5 conjunct, and B.4 records
+  only a secret-free credential-reference digest. No second implicit eligibility
+  relation may be introduced for these. For `Restriction` capabilities the
   effective value is the deterministic join of the AgentType and Task values
   (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality). `Bool`
   uses presence semantics (`false` absent, `true` present); a present value
@@ -347,3 +348,79 @@ provisioning from an eligible SpawnSource, full physical eligibility
 physical eligibility evidence for an existing Incarnation; M6-B.4 MUST obtain
 trustworthy provisioning evidence/binding provenance, or require a
 new/requalified Incarnation, before any authority-bearing typed acquisition.
+
+## Typed provisioning acquisition (M6-B.4)
+
+Both existing-agent and newborn acquisition MUST apply the frozen M5 placement
+decision. `Required` continuity MUST have a concrete Task workstream equal to
+the agent's workstream; two absent workstreams MUST NOT satisfy it. B.3
+preselection and authoritative acquisition MUST agree on this gate
+([ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md)).
+
+The first authority-bearing typed acquisition is M6-B.4. It consumes the frozen
+B.2 catalogue and B.3 requirement/binding as semantic authority and produces a
+physical commitment. A `B3Candidate` and a `LogicalAgentTypeBinding` are NEVER
+physical eligibility proof ([ADR-0007](../../decisions/0007-m6b-can-provision-task-staging.md)).
+
+- **Mandatory conjuncts are re-proved inside the authority transaction.** Before
+  any typed `Attempt`/`Lease`/`Execution` is created, acquisition MUST re-load the
+  current Task authority/state, the current `LogicalAgentTypeBinding`, the
+  validated source/config/policy revisions, and the capability catalog, and MUST
+  re-prove `can_execute` and `can_provision_task` (an `ACTIVE`
+  `AdapterBindingPolicy` whose `required_safety` is satisfied by imported
+  enforceability, and a coherent exact `AdapterKind` + `AdapterBindingKey`). A
+  caller-assembled selection that does not satisfy them is rejected at the
+  transaction, not trusted.
+- **The actual bound AgentType is the executable contract.** Acquisition proves
+  `can_execute`/`can_provision_task` over the agent's exact bound `AgentTypeRef`
+  (which MAY be a refinement, broader, or otherwise compatible B.3 candidate),
+  not over equality with the Task pin; a different revision of the same `type_id`
+  stays excluded (`D-TYPE-REV-COMPAT` deferred). The M5 placement gates (exact
+  partition, tag superset, `Required` continuity workstream) are re-checked.
+- **Evidence is imported, not declared, and binds the exact physical domain.**
+  `ResolvedProvisioningEvidence` is produced only by the internal provisioning
+  resolver from the imported M5 execution binding plus validated catalogue reads;
+  the production producer is behind the internal `provisioning-producer` feature,
+  and no control surface accepts caller-supplied evidence. Its subject includes
+  the `adapter_kind` and opaque `adapter_binding_key`, and the authority
+  transaction requires them to equal the selected binding, so an enforceability
+  proof from one installed domain can never authorize another
+  ([ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md)).
+- **Physical target/profile.** The M5 `execution_target`/`execution_profile`
+  come from the Task's partition/anchor. `SpawnSource`/`AdapterBindingPolicy`
+  select the exact installed binding (`binding_ref` -> `AdapterKind` +
+  `AdapterBindingKey`) of the matching kind; the target's `adapter_kind` MUST
+  agree with the policy's, or the candidate is ineligible. The exact binding
+  identity is carried from resolution into the acquisition and the snapshot and
+  is re-resolved at commitment. `attempt_isolation` is authoritative from the
+  target registry (M4), not from adapter self-assertion, and the effective
+  network policy is carried on the physical request.
+- **Pre-authority credential and attestation conjuncts.** M6-B.4 has no trusted,
+  source-bound credential-availability authority, so any config that declares
+  `credential_refs` fails closed: credential resolution, availability, and
+  brokering are B.5. No caller-supplied fact can grant credential authority.
+  Source-config body eligibility is digest-attested:
+    - `OpaqueJson`: eligible when the validated revision is materializable for
+      the exact physical domain; Core verifies its body digest directly.
+    - `ExternalRef`: eligible only when the source integration (`attest`)
+      resolves and hashes the declared content identity under the exact physical
+      domain, producing a non-empty trusted attestation.
+    - an unattested `ExternalRef` is ineligible.
+  Ineligible candidates are filtered out **before** deterministic selection, so
+  they never enter the ranking input set.
+- **ProvisioningBinding is stable per-Incarnation provenance.** It freezes the
+  exact physical domain (adapter kind + binding key), source/config/policy, and
+  the resolved enforceability; it does NOT carry a per-Task requirement. The
+  first typed acquisition mints one for the selected Incarnation or reuses one
+  whose provenance still qualifies. A legacy Incarnation is adopted in place only
+  when it is truly fresh; one with any execution history is never promoted to a
+  SourceConfig provenance and rolls over. A source/config/domain/safety change
+  requires a new Incarnation.
+- **BindingSnapshot is per Execution and atomic.** The exact physical choice is
+  frozen together with the `Execution`; after it commits, a missing exact binding
+  is a recovery/configuration failure, never a silent re-selection. Candidate
+  fallback is permitted only before commitment.
+- **PoolPartition capacity excludes typed population**
+  ([ADR-0009](../../decisions/0009-m6b-topology-capacity-seam.md)); full typed
+  population targets and `D-TOPOLOGY` remain deferred, and sandbox-policy
+  ordering/intersection remains B.5.

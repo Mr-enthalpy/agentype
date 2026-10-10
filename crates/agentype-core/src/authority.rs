@@ -28,12 +28,27 @@ pub fn validate_authority(
     expected_epoch: LeaseEpoch,
     now: UnixTime,
 ) -> CoreResult<()> {
+    validate_claim_ownership(snap, expected_epoch)?;
+    if snap.lease_expires_at <= now {
+        return Err(Error::stale(
+            "attempt no longer owns authoritative task state",
+        ));
+    }
+    Ok(())
+}
+
+/// Identity/ownership fence for recording a late control-plane fact only.
+/// This does not grant execution, renewal, or worker settlement authority: those
+/// operations must also check expiry through `validate_authority`.
+pub fn validate_claim_ownership(
+    snap: &AuthoritySnapshot,
+    expected_epoch: LeaseEpoch,
+) -> CoreResult<()> {
     if snap.attempt_state != AttemptState::Active
         || snap.lease_state != LeaseState::Active
         || snap.lease_epoch != expected_epoch
         || snap.task_current_attempt_id.as_ref() != Some(&snap.attempt_id)
         || snap.task_fencing_epoch != expected_epoch
-        || snap.lease_expires_at <= now
     {
         return Err(Error::stale(
             "attempt no longer owns authoritative task state",
