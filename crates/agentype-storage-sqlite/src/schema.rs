@@ -246,6 +246,38 @@ CREATE TABLE IF NOT EXISTS failures (
     created_at REAL NOT NULL
 );
 
+-- Additive schema-v8 control-plane disposition. Initialization installs this
+-- table/guards on both fresh databases and prior PR-era v8 databases.
+CREATE TABLE IF NOT EXISTS preparation_faults (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN ('STORAGE_FAILURE','INVARIANT_VIOLATION',
+        'RECOVERY_REQUIRED','MISSING_REVISION','INVALID_CONTRACT','OTHER')),
+    created_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS preparation_faults_no_replace
+BEFORE INSERT ON preparation_faults
+WHEN EXISTS(SELECT 1 FROM preparation_faults WHERE attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'a preparation fault cannot be replaced'); END;
+
+CREATE TRIGGER IF NOT EXISTS preparation_faults_no_update
+BEFORE UPDATE ON preparation_faults
+BEGIN SELECT RAISE(ABORT, 'a preparation fault is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS preparation_faults_no_delete
+BEFORE DELETE ON preparation_faults
+BEGIN SELECT RAISE(ABORT, 'a preparation fault cannot be deleted'); END;
+
+CREATE TRIGGER IF NOT EXISTS preparation_faults_require_no_execution
+BEFORE INSERT ON preparation_faults
+WHEN EXISTS(SELECT 1 FROM executions WHERE attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'a preparation fault cannot describe a physical execution'); END;
+
+CREATE TRIGGER IF NOT EXISTS executions_reject_preparation_fault
+BEFORE INSERT ON executions
+WHEN EXISTS(SELECT 1 FROM preparation_faults WHERE attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'a preparation fault forbids execution commitment'); END;
+
 CREATE TABLE IF NOT EXISTS escalations (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,

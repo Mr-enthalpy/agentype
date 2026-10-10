@@ -27,6 +27,7 @@
 pub mod catalog;
 pub mod frontier;
 mod kernel;
+mod preparation;
 pub mod provisioning;
 pub mod requirement;
 mod schema;
@@ -42,6 +43,7 @@ pub use kernel::{
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,
     SupervisedRenewal,
 };
+pub use preparation::PreparationFaultKind;
 #[cfg(any(test, feature = "runtime-internal"))]
 pub use provisioning::{acquire_typed_task_existing, acquire_typed_task_new_agent};
 pub use provisioning::{

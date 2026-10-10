@@ -569,6 +569,8 @@ pub struct ExecutionLaunchSnapshot {
     workstream_id: Option<WorkstreamId>,
     continuity: CommittedContinuitySnapshot,
     safety: FrozenExecutionSafety,
+    /// None for legacy; Some for an immutable typed BindingSnapshot descriptor.
+    committed_launch_descriptor: Option<String>,
 }
 
 impl ExecutionLaunchSnapshot {
@@ -581,6 +583,8 @@ impl ExecutionLaunchSnapshot {
     /// which has atomically validated the Attempt, Lease, Task, Agent, and
     /// Incarnation records from durable storage, so that every field reflects
     /// durable authority.
+    /// `committed_launch_descriptor` MUST equal the validated BindingSnapshot's
+    /// nonblank descriptor for a typed Execution and MUST be None for legacy.
     ///
     /// This `unsafe` marker is a **procedural contract, not an access-control
     /// mechanism**: Rust memory safety does not enforce the kernel-only
@@ -612,6 +616,7 @@ impl ExecutionLaunchSnapshot {
         workstream_id: Option<WorkstreamId>,
         continuity: CommittedContinuitySnapshot,
         safety: FrozenExecutionSafety,
+        committed_launch_descriptor: Option<String>,
     ) -> Self {
         Self {
             execution_id,
@@ -636,11 +641,18 @@ impl ExecutionLaunchSnapshot {
             workstream_id,
             continuity,
             safety,
+            committed_launch_descriptor,
         }
     }
 
     pub fn execution_id(&self) -> &ExecutionId {
         &self.execution_id
+    }
+
+    /// Exact opaque descriptor frozen in the same transaction as this Execution.
+    /// The trusted constructor must supply None only for legacy Executions.
+    pub fn committed_launch_descriptor(&self) -> Option<&str> {
+        self.committed_launch_descriptor.as_deref()
     }
 
     pub fn request_id(&self) -> &RequestId {

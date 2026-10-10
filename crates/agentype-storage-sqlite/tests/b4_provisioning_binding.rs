@@ -293,6 +293,7 @@ fn pre_execution_settlement_preserves_a_reused_resident_host_across_all_closures
         "cancel-batch",
         "expiry",
         "restart",
+        "fatal-preparation",
         "nack-history",
         "ack",
     ] {
@@ -341,6 +342,34 @@ fn pre_execution_settlement_preserves_a_reused_resident_host_across_all_closures
                         None,
                     )
                     .unwrap();
+            }
+            "fatal-preparation" => {
+                env.kernel
+                    .record_preparation_fault(
+                        claim,
+                        agentype_storage_sqlite::PreparationFaultKind::InvariantViolation,
+                    )
+                    .unwrap();
+                let reopened = Kernel::open(
+                    &env.path,
+                    Arc::new(ManualClock::new(2_000.0)),
+                    10.0,
+                    MAX_BYTES,
+                )
+                .unwrap();
+                let report = reopened.recover_authority().unwrap();
+                assert_eq!(report.retried, 0);
+                assert_eq!(reopened.task(&task).unwrap().state, TaskState::Suspended);
+                assert_eq!(
+                    env.raw()
+                        .query_row(
+                            "SELECT COUNT(*) FROM failures WHERE attempt_id=?1",
+                            [claim.attempt_id.as_str()],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0
+                );
             }
             "ack" => {
                 env.kernel
@@ -970,12 +999,174 @@ fn typed_acquisition_and_atomic_binding_snapshot_round_trip() {
         .create_execution_with_snapshot(&acquisition.claim, physical, &snap)
         .unwrap();
     assert_eq!(launch.execution_id(), &execution_id);
+    assert_eq!(
+        launch.committed_launch_descriptor(),
+        Some(snap.launch_descriptor.as_str())
+    );
     // The effective network policy reaches the physical request.
     assert_eq!(launch.required_network(), NetworkEnforcement::Disabled);
     assert_eq!(
         kernel.get_binding_snapshot(&execution_id).unwrap(),
         Some(snap)
     );
+}
+
+#[test]
+fn preparation_fault_is_immutable_and_fences_execution_and_worker_settlement() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    let env = Env::new("preparation-fault", 1);
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "reviewer");
+    let catalog = publish_catalog(kernel, "fault");
+    let task = admit_typed_task(kernel, pin.clone());
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquisition = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    let claim = &acquisition.claim;
+    let physical = physical_binding(claim);
+    let snap = snapshot(
+        &agentype_core::ExecutionId::new(),
+        &acquisition.provisioning_binding,
+        &catalog,
+        claim,
+        &physical,
+    );
+    let mut forged = claim.clone();
+    forged.logical_agent_id = agentype_core::LogicalAgentId::new();
+    assert!(kernel
+        .record_preparation_fault(&forged, F::InvariantViolation)
+        .is_err());
+    assert_eq!(
+        kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+        None
+    );
+    kernel
+        .record_preparation_fault(claim, F::InvariantViolation)
+        .unwrap();
+    kernel.record_preparation_fault(claim, F::Other).unwrap();
+    assert_eq!(
+        kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+        Some(F::InvariantViolation)
+    );
+    assert!(matches!(
+        kernel.create_execution_with_snapshot(claim, physical, &snap),
+        Err(agentype_core::Error::RecoveryRequired(_))
+    ));
+    assert!(matches!(
+        kernel.report_configuration_unavailable(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            "unavailable"
+        ),
+        Err(agentype_core::Error::RecoveryRequired(_))
+    ));
+    let raw = env.raw();
+    for sql in [
+        "UPDATE preparation_faults SET kind='OTHER' WHERE attempt_id=?1",
+        "DELETE FROM preparation_faults WHERE attempt_id=?1",
+        "INSERT OR REPLACE INTO preparation_faults VALUES(?1,'OTHER',2000)",
+    ] {
+        assert!(raw.execute(sql, [claim.attempt_id.as_str()]).is_err());
+    }
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // Explicit cancellation remains available; it does not clear the fact or
+    // turn it into a quiescence obligation or an automatic retry.
+    kernel.cancel_task(&task, false).unwrap();
+    kernel.recover_authority().unwrap();
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Cancelled);
+    assert_eq!(
+        kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+        Some(F::InvariantViolation)
+    );
+}
+
+#[test]
+fn confirmed_preparation_fault_after_elapsed_lease_still_blocks_orphan_retry() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    let env = Env::new("late-preparation-fault", 1);
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "reviewer");
+    let catalog = publish_catalog(kernel, "late-fault");
+    let task = admit_typed_task(kernel, pin.clone());
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquisition = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    // The clock has elapsed, but no expiration/replacement transaction ran.
+    env.raw()
+        .execute(
+            "UPDATE leases SET expires_at=999 WHERE attempt_id=?1",
+            [acquisition.claim.attempt_id.as_str()],
+        )
+        .unwrap();
+    assert!(!kernel
+        .claim_authority_is_current(&acquisition.claim)
+        .unwrap());
+    kernel
+        .record_preparation_fault(&acquisition.claim, F::InvalidContract)
+        .unwrap();
+    let recovered = kernel.recover_authority().unwrap();
+    assert_eq!(recovered.retried, 0);
+    assert_eq!(recovered.suspended, 1);
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Suspended);
+    assert_eq!(
+        env.raw()
+            .query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(kernel
+        .record_preparation_fault(&acquisition.claim, F::Other)
+        .is_err());
+}
+
+#[test]
+fn prior_v8_database_reopen_installs_additive_preparation_fault_guards() {
+    let env = Env::new("prior-v8-fault-schema", 1);
+    let raw = env.raw();
+    // Emulate the schema at the audited v8 head, which has no fault table.
+    raw.execute_batch(
+        "DROP TRIGGER executions_reject_preparation_fault; DROP TABLE preparation_faults;",
+    )
+    .unwrap();
+    let path = env.path.clone();
+    drop(env);
+    let kernel = Kernel::open(&path, Arc::new(ManualClock::new(1000.0)), 10.0, MAX_BYTES).unwrap();
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM preparation_faults", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        8
+    );
+    let guards: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND
+        (name LIKE 'preparation_faults_%' OR name='executions_reject_preparation_fault')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(guards, 5);
+    assert!(kernel.ready_agent("general").is_ok());
 }
 
 #[test]

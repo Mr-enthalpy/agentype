@@ -14,7 +14,7 @@ mod states;
 pub use authority::{
     completed_task_must_not_reopen, physical_transition_allowed, require_physical_transition,
     tags_match, task_create_establishes_authority, unavailable_configuration_failure,
-    validate_authority, writer_is_safe_to_replace, AuthoritySnapshot,
+    validate_authority, validate_claim_ownership, writer_is_safe_to_replace, AuthoritySnapshot,
 };
 pub use clock::{Clock, ManualClock, SystemClock, UnixTime};
 pub use decisions::{

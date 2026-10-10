@@ -173,6 +173,7 @@ fn request(spec: AgentSpec) -> EnvironmentStartRequest {
             None,
             CommittedContinuitySnapshot::stateless(),
             environment.safety().clone(),
+            None,
         )
     };
     EnvironmentStartRequest::from_launch(&snapshot, &environment).unwrap()

@@ -32,7 +32,9 @@ at its own version.
 
 M6-B.4 deployment is restricted to fresh schema-v8 databases and reopening
 existing v8 databases. An existing v7 database MUST be rejected; passing v8
-conformance does not claim safe upgrade of frozen B.3 data.
+conformance does not claim safe upgrade of frozen B.3 data. During this unfrozen
+PR, additive v8 preparation-fault DDL is installed by idempotent initialization
+when reopening earlier PR-era v8 stores; existing record formats do not change.
 
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:
@@ -85,6 +87,21 @@ catalog:
   MUST NOT change scheduler behavior.
 
 M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
+
+- `preparation_faults` stores one immutable, payload-free fatal control-plane
+  category per pre-Execution Attempt. Exact ACTIVE ownership/epoch is required;
+  elapsed time alone does not discard a confirmed fact. It grants no activity
+  authority. Activity/settlement requires the unchanged unexpired authority
+  fence and absence of such a fault. Update/delete/replace and conflicting
+  Execution commitment are forbidden. Recovery closes a faulted claim and
+  suspends the Task without worker failure, ExecutionLost retry or quiescence
+  escalation; an unobserved pre-prepare crash keeps ordinary orphan recovery.
+  A fault write error propagates; unsuccessful persistence cannot establish a
+  durable fence. No automatic fault-resume API is part of this slice.
+- Kernel-produced `ExecutionLaunchSnapshot` carries the exact descriptor from
+  its coherent BindingSnapshot transaction (None for legacy). Typed start
+  construction MUST consume it or reject unequal/empty caller text; legacy
+  start construction MUST reject snapshot-bearing typed Executions.
 
 - `provisioning_bindings` is immutable and write-once, scoped to one
   Incarnation: it freezes the exact `(agent_type_id/revision, spawn_source_id/

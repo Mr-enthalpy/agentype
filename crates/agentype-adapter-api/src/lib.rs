@@ -176,18 +176,50 @@ impl EnvironmentStartRequest {
         launch: &ExecutionLaunchSnapshot,
         environment: &ResolvedExecutionEnvironment,
     ) -> Result<Self, LaunchEnvironmentMismatch> {
+        if launch.committed_launch_descriptor().is_some() {
+            return Err(LaunchEnvironmentMismatch {
+                detail: "typed Execution requires its committed descriptor".into(),
+            });
+        }
         Self::from_launch_with_descriptor(launch, environment, String::new())
     }
 
+    /// Typed requests consume the descriptor carried by Kernel's committed
+    /// launch capability. No caller-supplied descriptor can override provenance.
+    pub fn from_committed_launch(
+        launch: &ExecutionLaunchSnapshot,
+        environment: &ResolvedExecutionEnvironment,
+    ) -> Result<Self, LaunchEnvironmentMismatch> {
+        let descriptor =
+            launch
+                .committed_launch_descriptor()
+                .ok_or_else(|| LaunchEnvironmentMismatch {
+                    detail: "typed start requires a snapshot-bearing Execution".into(),
+                })?;
+        Self::from_launch_with_descriptor(launch, environment, descriptor.to_owned())
+    }
+
     /// Build the physical start request carrying the opaque launch descriptor
-    /// resolved for the exact committed source config, so the adapter physically
-    /// materializes the environment the Execution's provenance names rather than
-    /// an ambient/default one.
+    /// committed with the Execution. The supplied descriptor must exactly equal
+    /// that capability's descriptor; legacy capabilities permit only empty text.
     pub fn from_launch_with_descriptor(
         launch: &ExecutionLaunchSnapshot,
         environment: &ResolvedExecutionEnvironment,
         launch_descriptor: String,
     ) -> Result<Self, LaunchEnvironmentMismatch> {
+        match launch.committed_launch_descriptor() {
+            Some(committed) if committed.trim().is_empty() || committed != launch_descriptor => {
+                return Err(LaunchEnvironmentMismatch {
+                    detail: "descriptor differs from committed typed provenance".into(),
+                });
+            }
+            None if !launch_descriptor.is_empty() => {
+                return Err(LaunchEnvironmentMismatch {
+                    detail: "legacy Execution has no committed descriptor".into(),
+                });
+            }
+            _ => {}
+        }
         let safety = environment.safety();
         let mut mismatched: Vec<&'static str> = Vec::new();
         if launch.safety().attempt_id().as_str() != safety.attempt_id().as_str() {
@@ -827,6 +859,7 @@ mod tests {
                 None,
                 CommittedContinuitySnapshot::stateless(),
                 FrozenExecutionSafety::unisolated(binding.clone()),
+                None,
             )
         };
         MockLaunch {
@@ -932,6 +965,7 @@ mod tests {
                     serde_json::json!({"state": "saved"}),
                 ),
                 FrozenExecutionSafety::unisolated(binding.clone()),
+                None,
             )
         };
         // The safety proof is bound to the snapshot's own attempt identity.

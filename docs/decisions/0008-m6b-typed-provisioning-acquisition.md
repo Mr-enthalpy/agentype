@@ -134,7 +134,10 @@ Attestation returns `Result<Option<MaterializationDigest>, ProvisioningResolutio
 `Ok(None)` explicitly means unavailable; `Ok(Some(digest))` is a validated
 canonical value. A malformed digest cannot be a successful output and must
 surface as a producer error. This replaces the ambiguous `Ok("")` convention;
-preparation still rejects malformed successful output as fatal.
+preparation still rejects malformed successful output as fatal. An error carrying
+ConfigurationUnavailable is also candidate-local during attestation: skip that
+config and consider later candidates. StorageFailure and InvariantViolation
+abort the entire enumeration.
 
 Enumeration and winner preparation receive distinct absolute deadlines. No call
 renews its endpoint. The full committed-claim authority fence is checked before
@@ -153,7 +156,11 @@ adapter declares `None`.
 
 Every fallible handoff composition check precedes Execution commitment. The
 prepared descriptor then reaches the exact adapter through
-`EnvironmentStartRequest::from_launch_with_descriptor`. The adapter creates the
+`EnvironmentStartRequest::from_committed_launch`. Kernel carries the validated
+committed descriptor on ExecutionLaunchSnapshot; the explicit-descriptor
+constructor checks exact equality, and legacy from_launch rejects typed
+Executions. The unchecked trusted snapshot constructor gains this optional
+descriptor argument; None remains the legacy value. The adapter creates the
 physical environment inside `start_execution`. M5 Execution/RequestId,
 `reconcile_start`, observation and termination own the complete physical
 lifecycle; M6-B introduces no pre-Execution physical operation.
@@ -187,7 +194,15 @@ never a raw producer `err.to_string()`. Display and Debug cannot recover the
 discarded diagnostic; private logging remains the integration's responsibility.
 Successful output is also a producer boundary: a malformed canonical digest or
 blank descriptor propagates as fatal, preserving Attempt/Lease/provenance and
-writing no failure or retry. Output grammar is checked before post-call deadline
+writing no worker failure or retry. A confirmed fatal category is durably
+recorded against the exact Attempt before propagation, fencing later claim
+operations. Recovery closes the claim and suspends the Task without ExecutionLost
+or retry-policy evaluation; it does not alter the reserved host or invent
+quiescence. A crash before fault observation remains an ordinary M5 orphan.
+Fault-record persistence failure itself propagates; no durable-fence guarantee
+is claimed for an unsuccessful write. Cancellation/re-admission after repair is
+explicit; a dedicated fault-resume control API remains outside this slice.
+Output grammar is checked before post-call deadline
 and digest-equality availability checks. A valid digest whose content no longer
 matches attestation remains a distinct availability/TOCTOU rejection.
 
@@ -245,5 +260,7 @@ full typed topology and database migration remain pending. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)
 owns scope and verification evidence.
 This PR's deployment scope is explicitly fresh schema-v8 databases only, plus
-reopening databases already created at v8. Existing v7 databases are rejected;
+reopening databases already created at v8. Idempotent initialization adds the
+preparation_faults table and immutable/Execution exclusion guards to prior
+PR-era v8 databases; reopening conformance covers this additive amendment. Existing v7 databases are rejected;
 no upgrade compatibility is claimed until migration is implemented and verified.

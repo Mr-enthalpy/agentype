@@ -118,6 +118,13 @@ Incarnation/Execution. Core MUST NOT interpret vendor enums.
 
 Process death is not quiescence proof.
 
+For snapshot-bearing typed Executions, Kernel's launch capability MUST carry
+the exact committed BindingSnapshot descriptor. Typed start construction MUST
+consume that descriptor and reject caller substitution or empty legacy
+construction. Legacy Executions continue to use empty descriptors. This closes
+the provenance-to-physical-request boundary; the trusted unchecked snapshot
+constructor remains a procedural internal contract (ADR-0011).
+
 Adapter absolute deadlines are **M5** runtime conformance (the interface
 itself is required for M4 observation vocabulary).
 

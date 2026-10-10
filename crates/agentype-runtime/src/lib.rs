@@ -997,12 +997,8 @@ pub(crate) fn prepare_typed_execution_launch(
     // construction (the environment matches the committed binding), and even if
     // it failed here the Execution already exists and recovery reconciles it, so
     // no Task-level nack is fabricated.
-    let request = EnvironmentStartRequest::from_launch_with_descriptor(
-        &snapshot,
-        &plan.environment,
-        plan.descriptor,
-    )
-    .map_err(|m| TypedLaunchError::Kernel(Error::invalid_authority(m.detail)))?;
+    let request = EnvironmentStartRequest::from_committed_launch(&snapshot, &plan.environment)
+        .map_err(|m| TypedLaunchError::Kernel(Error::invalid_authority(m.detail)))?;
     Ok(PreparedTypedExecutionLaunch {
         launch: PreparedExecutionLaunch {
             snapshot,
@@ -1056,7 +1052,6 @@ struct TypedLaunchPlan {
     adapter_binding: ResolvedAdapterBinding,
     physical_binding: FrozenPhysicalExecutionBinding,
     snapshot_record: agentype_agent_contract::BindingSnapshot,
-    descriptor: String,
 }
 
 /// Map the agent-contract `NetworkPolicy` to the provider-neutral
@@ -1193,7 +1188,6 @@ fn plan_typed_execution_launch(
         adapter_binding,
         physical_binding,
         snapshot_record,
-        descriptor: outcome.launch_descriptor.clone(),
     })
 }
 

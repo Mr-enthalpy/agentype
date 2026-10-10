@@ -619,6 +619,7 @@ impl ProvisioningResolutionError {
                 | Self::SourceOrConfigInactive
                 | Self::ExternalReferenceNotAttested(_)
                 | Self::PolicyKindMismatch { .. }
+                | Self::Storage(agentype_core::Error::ConfigurationUnavailable(_))
         ) || matches!(self, Self::Evidence(error) if evidence_is_candidate_local(error))
             || matches!(self, Self::IntegrationFailure(failure) if failure.candidate_ineligible)
     }
@@ -1108,7 +1109,21 @@ fn finalize_preparation(
                 err.integration_failure_kind().message().into(),
             ))
         }
-        Err(PreparationFailure::Fatal(err)) => Err(err),
+        Err(PreparationFailure::Fatal(err)) => {
+            use agentype_storage_sqlite::PreparationFaultKind as F;
+            let kind = match err.integration_failure_kind() {
+                IntegrationFailureKind::StorageFailure => F::StorageFailure,
+                IntegrationFailureKind::InvariantViolation => F::InvariantViolation,
+                IntegrationFailureKind::RecoveryRequired => F::RecoveryRequired,
+                IntegrationFailureKind::MissingRevision => F::MissingRevision,
+                IntegrationFailureKind::InvalidContract => F::InvalidContract,
+                _ => F::Other,
+            };
+            // The durable fact must commit before the fatal disposition escapes.
+            // Persistence failure propagates; never downgrade it to a Task NACK.
+            kernel.record_preparation_fault(&outcome.acquisition.claim, kind)?;
+            Err(err)
+        }
     }
 }
 
@@ -1169,6 +1184,21 @@ fn prepare_winner(
     acquisition: &agentype_storage_sqlite::TypedAcquisition,
     deadline: &AdapterDeadline,
 ) -> Result<String, PreparationFailure> {
+    match kernel.preparation_fault_kind(&acquisition.claim.attempt_id) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(PreparationFailure::Fatal(
+                ProvisioningResolutionError::Storage(agentype_core::Error::RecoveryRequired(
+                    "confirmed preparation fault fences repeated preparation".into(),
+                )),
+            ))
+        }
+        Err(err) => {
+            return Err(PreparationFailure::Fatal(
+                ProvisioningResolutionError::Storage(err),
+            ))
+        }
+    }
     if deadline.is_expired() {
         return Err(PreparationFailure::Unavailable(
             ProvisioningResolutionError::ProvisioningDeadlineExceeded(
@@ -1951,7 +1981,18 @@ mod tests {
         claim: &agentype_core::Claim,
         binding: &ProvisioningBinding,
     ) {
-        assert!(kernel.claim_authority_is_current(claim).unwrap());
+        if kernel
+            .preparation_fault_kind(&claim.attempt_id)
+            .unwrap()
+            .is_some()
+        {
+            assert!(matches!(
+                kernel.claim_authority_is_current(claim),
+                Err(agentype_core::Error::RecoveryRequired(_))
+            ));
+        } else {
+            assert!(kernel.claim_authority_is_current(claim).unwrap());
+        }
         assert_eq!(
             kernel.task(&claim.task_id).unwrap().state,
             TaskState::Leased
@@ -2140,7 +2181,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(result, err.redact_integration_error());
-            assert!(kernel.claim_authority_is_current(&claim).unwrap());
+            assert!(matches!(
+                kernel.claim_authority_is_current(&claim),
+                Err(agentype_core::Error::RecoveryRequired(_))
+            ));
             assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
             assert_eq!(
                 kernel.attempt(&claim.attempt_id).unwrap().state,
@@ -3083,6 +3127,374 @@ mod tests {
             TaskState::Suspended | TaskState::RetryWait
         ));
         assert!(kernel.claim_next_available().unwrap().is_none());
+    }
+
+    #[test]
+    fn confirmed_fatal_preparation_survives_restart_without_execution_lost_retry() {
+        for integrations in [
+            si(PrepareError(ProvisioningResolutionError::Storage(
+                agentype_core::Error::InvariantViolation(PRIVATE_DIAGNOSTIC.into()),
+            ))),
+            si(PrepareError(ProvisioningResolutionError::Storage(
+                agentype_core::Error::StorageFailure(PRIVATE_DIAGNOSTIC.into()),
+            ))),
+            si(PrepareBoundaryProbe {
+                digest: Some("invalid"),
+                descriptor: None,
+                drift_during_prepare: false,
+                unavailable: false,
+                drifted: false.into(),
+                calls: 0.into(),
+            }),
+            si(PrepareBoundaryProbe {
+                digest: None,
+                descriptor: None,
+                drift_during_prepare: true,
+                unavailable: false,
+                drifted: false.into(),
+                calls: 0.into(),
+            }),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task_with_retry(
+                &kernel,
+                pin.clone(),
+                agentype_core::RetryPolicy {
+                    max_attempts: 3,
+                    base_backoff_seconds: 0.0,
+                    retry_classes: vec![
+                        FailureClass::ExecutionLost,
+                        FailureClass::ResourceUnavailable,
+                    ],
+                    ..Default::default()
+                },
+            );
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, starts) = adapters_with_start_probe();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let binding = outcome.acquisition.provisioning_binding.clone();
+            let error =
+                finalize_preparation(&kernel, &integrations, outcome, &deadline()).unwrap_err();
+            assert_public_error_is_redacted(&error);
+            assert_preparation_fault_preserves_claim(&kernel, &raw, &claim, &binding);
+
+            let path = raw.path().unwrap().to_string();
+            drop(kernel);
+            let kernel =
+                Kernel::open(path, Arc::new(ManualClock::new(2_000.0)), 10.0, MAX_BYTES).unwrap();
+            let recovered = kernel.recover_authority().unwrap();
+            assert_eq!(recovered.retried, 0);
+            assert_eq!(recovered.suspended, 1);
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Suspended);
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+            assert_eq!(
+                kernel
+                    .get_provisioning_binding(&binding.incarnation_id)
+                    .unwrap(),
+                Some(binding)
+            );
+            assert!(kernel.task(&task).unwrap().current_attempt_id.is_none());
+            assert!(kernel.open_escalation_for_task(&task).is_err());
+            for table in ["failures", "executions", "binding_snapshots"] {
+                assert_eq!(
+                    raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_no_private_diagnostic_in_store(&raw);
+            assert!(acquire_typed_task(
+                &kernel,
+                &task,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+                &deadline()
+            )
+            .is_err());
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+            assert_eq!(starts.start_call_count(), 0);
+            let second = kernel.recover_authority().unwrap();
+            assert_eq!(second.retried + second.suspended, 0);
+        }
+    }
+
+    #[test]
+    fn crash_before_preparation_keeps_ordinary_orphan_retry_after_restart() {
+        let (kernel, raw) = preparation_kernel();
+        let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+        let task = typed_task_with_retry(
+            &kernel,
+            pin.clone(),
+            agentype_core::RetryPolicy {
+                max_attempts: 3,
+                base_backoff_seconds: 0.0,
+                retry_classes: vec![FailureClass::ExecutionLost],
+                ..Default::default()
+            },
+        );
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let (adapters, starts) = adapters_with_start_probe();
+        let _unprepared = try_acquire_existing(
+            &kernel,
+            &task,
+            &agent,
+            &adapters,
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+        let path = raw.path().unwrap().to_string();
+        drop(kernel);
+        let kernel =
+            Kernel::open(path, Arc::new(ManualClock::new(2_000.0)), 10.0, MAX_BYTES).unwrap();
+        let recovered = kernel.recover_authority().unwrap();
+        assert_eq!(recovered.retried, 1);
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(
+            raw.query_row("SELECT failure_code FROM failures", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "CLAIM_ORPHANED"
+        );
+        acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 2);
+        assert_eq!(starts.start_call_count(), 0);
+    }
+
+    #[test]
+    fn preparation_fault_persistence_failure_is_fatal_without_task_nack() {
+        let (kernel, raw) = preparation_kernel();
+        let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+        let task = typed_task(&kernel, pin.clone());
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let outcome = try_acquire_existing(
+            &kernel,
+            &task,
+            &agent,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+        let claim = outcome.acquisition.claim.clone();
+        let binding = outcome.acquisition.provisioning_binding.clone();
+        raw.execute_batch(
+            "CREATE TRIGGER reject_fault_persistence BEFORE INSERT ON preparation_faults
+            BEGIN SELECT RAISE(ABORT, 'fault persistence unavailable'); END;",
+        )
+        .unwrap();
+        let error = finalize_preparation(
+            &kernel,
+            &si(PrepareError(ProvisioningResolutionError::Storage(
+                agentype_core::Error::InvariantViolation(PRIVATE_DIAGNOSTIC.into()),
+            ))),
+            outcome,
+            &deadline(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProvisioningResolutionError::Storage(_)));
+        assert_public_error_is_redacted(&error);
+        assert_eq!(
+            kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+            None
+        );
+        assert_preparation_fault_preserves_claim(&kernel, &raw, &claim, &binding);
+        assert_no_private_diagnostic_in_store(&raw);
+    }
+
+    struct CandidateAttestationFault {
+        error: ProvisioningResolutionError,
+        visited: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SourceConfigIntegration for CandidateAttestationFault {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            let id = revision.config().config_ref.config_id().as_str();
+            self.visited.lock().unwrap().push(id.into());
+            if id == "config" {
+                return Err(self.error.clone());
+            }
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, kind, key, deadline)
+        }
+    }
+
+    #[test]
+    fn attestation_unavailability_skips_only_its_config_while_integrity_faults_abort() {
+        for (error, local) in [
+            (
+                agentype_core::Error::ConfigurationUnavailable(PRIVATE_DIAGNOSTIC.into()),
+                true,
+            ),
+            (
+                agentype_core::Error::StorageFailure(PRIVATE_DIAGNOSTIC.into()),
+                false,
+            ),
+            (
+                agentype_core::Error::InvariantViolation(PRIVATE_DIAGNOSTIC.into()),
+                false,
+            ),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let body = json!({"model": "valid-b"});
+            let config = SourceConfig {
+                config_ref: SourceConfigRef::new(
+                    SpawnSourceRef::new("source", 1).unwrap(),
+                    "config-b",
+                    1,
+                )
+                .unwrap(),
+                config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+                lifecycle_modes: None,
+                continuity_modes: None,
+                credential_refs: vec![],
+                claims: vec![],
+                status: ConfigStatus::Active,
+            };
+            kernel
+                .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+                .unwrap();
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let task = typed_task(&kernel, pin);
+            let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let integrations = si(CandidateAttestationFault {
+                error: ProvisioningResolutionError::Storage(error),
+                visited: visited.clone(),
+            });
+            let result = acquire_typed_task(
+                &kernel,
+                &task,
+                &adapters_with_binding(),
+                &execution_registry(),
+                &integrations,
+                &deadline(),
+                &deadline(),
+            );
+            if local {
+                let winner = result.unwrap();
+                assert_eq!(
+                    winner
+                        .candidate
+                        .source_config
+                        .config_ref
+                        .config_id()
+                        .as_str(),
+                    "config-b"
+                );
+                assert_eq!(*visited.lock().unwrap(), ["config", "config-b"]);
+                assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+                assert_eq!(
+                    winner
+                        .acquisition
+                        .provisioning_binding
+                        .source_config
+                        .config_id()
+                        .as_str(),
+                    "config-b"
+                );
+            } else {
+                assert_public_error_is_redacted(&result.unwrap_err());
+                assert_eq!(*visited.lock().unwrap(), ["config"]);
+                assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+                assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+            }
+            assert_no_private_diagnostic_in_store(&raw);
+        }
+    }
+
+    #[test]
+    fn typed_start_request_rejects_descriptor_substitution_and_legacy_empty_descriptor() {
+        let kernel = partitioned_kernel();
+        let pin = publish(&kernel);
+        let task = typed_task(&kernel, pin);
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let outcome = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let prepared =
+            crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters).unwrap();
+        let (launch, _binding) = prepared.into_dispatch();
+        let committed = kernel
+            .get_binding_snapshot(launch.snapshot().execution_id())
+            .unwrap()
+            .unwrap();
+        for substitute in ["different-descriptor", "", " \t"] {
+            assert!(
+                agentype_adapter_api::EnvironmentStartRequest::from_launch_with_descriptor(
+                    launch.snapshot(),
+                    launch.resolved_environment(),
+                    substitute.into()
+                )
+                .is_err()
+            );
+        }
+        assert!(agentype_adapter_api::EnvironmentStartRequest::from_launch(
+            launch.snapshot(),
+            launch.resolved_environment()
+        )
+        .is_err());
+        let valid = agentype_adapter_api::EnvironmentStartRequest::from_launch_with_descriptor(
+            launch.snapshot(),
+            launch.resolved_environment(),
+            committed.launch_descriptor.clone(),
+        )
+        .unwrap();
+        assert_eq!(valid.launch_descriptor(), committed.launch_descriptor);
     }
 
     /// P1-2: a credential-bearing (stronger continuity) candidate must be filtered

@@ -76,7 +76,7 @@ before acquisition and leaves the host WARM. This narrows the B.4 replacement
 path because SQL fencing cannot satisfy M5 physical safety; same-provenance reuse
 and the frozen settlement/termination APIs retain their behavior.
 
-No settlement API or database schema changes are required. In particular, there
+The association correction requires no settlement API or schema changes. There
 is no new physical provisioning lifecycle and no generic `execution.is_none()`
 exception to the writer-safety gate.
 
@@ -106,7 +106,16 @@ availability failures. Runtime classifies errors by kind regardless of which
 component returned them. Only explicit availability errors settle as
 RESOURCE_UNAVAILABLE; authority loss remains recovery-owned. Durable/storage
 faults, missing revisions and unsupported errors default to Fatal and leave the
-committed claim intact for control-plane handling/recovery, without a Task NACK.
+committed claim rows intact, without a Task NACK. Before returning a confirmed
+Fatal, runtime commits an immutable, payload-free preparation fault category for
+that exact Attempt. This fences subsequent claim operations and survives restart.
+Recovery closes Attempt/Lease, suspends the Task and releases assignment without
+recording ExecutionLost, consulting retry policy, changing the reserved host or
+creating worker-failure/quiescence escalation. A crash before a confirmed fault
+still follows ordinary M5 orphan recovery. Fault persistence errors propagate
+fatally; an unsuccessful write cannot claim a durable disposition. Suspended
+faults require control-plane repair and explicit cancellation/re-admission; this
+slice does not offer automatic retry or a fault-resume control API.
 The existing Result signature is retained; its fault semantics are honored.
 
 The same rule applies to successful producer output: malformed digests and blank
@@ -120,7 +129,10 @@ At the integration boundary, successful attestation now returns an optional
 validated MaterializationDigest: None explicitly means unavailable and Some
 cannot contain the former empty-string sentinel. This is a scoped SPI amendment
 to separate availability from producer output validity, without changing the
-authority transaction or M5 adapter interfaces.
+authority transaction or M5 adapter interfaces. Attestation may also return
+ConfigurationUnavailable as an error: it has the same candidate-local outcome
+as None in enumeration and facade fallback. StorageFailure/InvariantViolation
+remain global, and deadlines/authority faults retain their stage semantics.
 
 Source-returned private diagnostics are discarded before propagation. A sanitized
 IntegrationFailure exposes a fixed category and carries runtime-only routing
@@ -141,6 +153,23 @@ deadline policy alongside the request. Dispatch consumes this pair without
 registry re-selection, so keeping kind/key while swapping an instance cannot
 change a previously validated launch. The public legacy launch interface is
 unchanged; actual typed daemon dispatch remains pending.
+
+ExecutionLaunchSnapshot now carries the optional committed descriptor. The
+trusted unchecked constructor gains this argument because an Execution-only
+capability could not constrain a later free String to immutable provenance.
+Kernel returns Some only after coherent snapshot commitment and None for legacy.
+EnvironmentStartRequest::from_committed_launch consumes that value; the retained
+explicit-descriptor constructor accepts only exact equality, and legacy
+from_launch rejects typed Executions. Legacy requests still use an empty
+descriptor. The raw unsafe constructor remains a procedural trust contract,
+not an access-control token.
+
+Fault facts add a small table and guards to the unfrozen v8 schema. Idempotent
+initialization installs them on prior PR-era v8 databases, without changing
+existing records or admitting v7. Recording a late confirmed fault checks exact
+ACTIVE claim ownership even after elapsed time; it grants no work authority.
+Core validate_authority still requires an unexpired lease for execution,
+renewal and settlement. Closed/replaced claims cannot acquire a fault fact.
 
 ## Acceptance and consequences
 
@@ -178,5 +207,14 @@ Tests must include valid counterparts and assert authoritative consequences
 merely a returned error. Existing M4 writer-safety/recovery and M6-A/B.3 suites
 remain required, alongside default-feature API boundary probes. Passing a new
 regression suite is not proof of full daemon integration or milestone freeze.
+
+Paired restart tests allow ExecutionLost retry and prove confirmed fatal output,
+protocol drift and storage/invariant faults suspend without a worker failure,
+while a crash before prepare retries normally. Guard tests cover identity
+forgery, immutable facts, late elapsed leases, blocked commitment/settlement,
+explicit cancellation, prior-v8 reopening and preservation of an executed WARM
+host. Two-config attestation tests distinguish local unavailability from global
+integrity faults. Descriptor tests reject committed A replaced by B, empty
+typed requests and the legacy typed constructor, while exact A succeeds.
 
 Evidence: [frozen-contract counterexample witness](../reports/v0.2/riir-m6b.4-contract-parity.md).

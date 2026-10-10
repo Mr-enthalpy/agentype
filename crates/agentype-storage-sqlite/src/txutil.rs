@@ -75,6 +75,32 @@ pub fn validate_authority_tx(
     lease_epoch: u64,
     now: UnixTime,
 ) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
+    let records = validate_claim_tx(tx, attempt_id, lease_epoch, Some(now))?;
+    if crate::preparation::get_fault(tx, &AttemptId::from_string(attempt_id))?.is_some() {
+        return Err(Error::RecoveryRequired(
+            "confirmed preparation fault fences claim operations".into(),
+        ));
+    }
+    Ok(records)
+}
+
+/// Persisting a confirmed fault cannot grant activity. An elapsed lease may
+/// still be fenced while its exact claim is ACTIVE and has not been replaced.
+#[cfg(any(test, feature = "runtime-internal"))]
+pub(crate) fn validate_preparation_fact_tx(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    lease_epoch: u64,
+) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
+    validate_claim_tx(tx, attempt_id, lease_epoch, None)
+}
+
+fn validate_claim_tx(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    lease_epoch: u64,
+    now: Option<UnixTime>,
+) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
     let attempt = required_attempt(tx, attempt_id)?;
     let task = required_task(tx, &attempt.task_id)?;
     let lease = query_opt(
@@ -93,7 +119,10 @@ pub fn validate_authority_tx(
         task_current_attempt_id: task.current_attempt_id.as_ref().map(AttemptId::from_string),
         task_fencing_epoch: LeaseEpoch(task.fencing_epoch),
     };
-    validate_authority(&snap, LeaseEpoch(lease_epoch), now)?;
+    match now {
+        Some(now) => validate_authority(&snap, LeaseEpoch(lease_epoch), now)?,
+        None => agentype_core::validate_claim_ownership(&snap, LeaseEpoch(lease_epoch))?,
+    }
     if lease.epoch != lease_epoch {
         return Err(Error::stale(
             "attempt no longer owns authoritative task state",

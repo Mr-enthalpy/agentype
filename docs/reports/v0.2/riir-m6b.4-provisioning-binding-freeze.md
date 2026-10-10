@@ -15,7 +15,8 @@ Execution handoff. Typed daemon dispatch and production source integration remai
 pending; this is a library/composition boundary, not an end-to-end production
 typed dispatch claim.
 Deployment is restricted to fresh schema-v8 databases and reopening existing
-v8 databases. Existing v7 databases are rejected; this PR offers no upgrade path.
+v8 databases. Idempotent initialization installs additive preparation-fault
+guards on prior PR-era v8 stores. Existing v7 databases are rejected; this PR offers no upgrade path.
 
 The frozen specs govern acceptance. Interface amendments are justified in
 [ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) and
@@ -70,15 +71,23 @@ into running typed daemon dispatch is a remaining step.
 - Preparation preserves integration-returned fault kinds. Explicit availability
   settles as RESOURCE_UNAVAILABLE; authority loss produces no Task NACK; storage,
   invariant, recovery-required, missing-revision and unknown faults propagate
-  without writing a Task failure or closing the committed claim.
+  without writing a Task failure. A confirmed fatal category commits as an
+immutable Attempt fact and fences further claim operations. Recovery closes
+Attempt/Lease and suspends without ExecutionLost, automatic retry or quiescence
+escalation; a crash before confirmed fault keeps ordinary orphan recovery.
+If fault persistence fails, its error propagates and no durable-fence guarantee
+is claimed. Cancellation/re-admission after repair is explicit; a dedicated
+fault-resume control API is outside this slice.
 - Malformed successful producer output and observed integration-protocol drift
-  are fatal too. They preserve authority and produce no failure, retry,
+  are fatal too. They preserve claim rows, fence activity and produce no worker failure, retry,
   Execution or snapshot. Grammar checks precede post-call availability checks.
 - Source-returned errors lose every private diagnostic payload before control
   propagation, including nested storage/contract errors. Public Display/Debug and
   settlement use fixed categories while retaining original fault dispositions.
 - Attestation has an explicit optional validated digest: None is unavailable;
-  Some cannot be empty/noncanonical text. Adding an equally continuous config
+  Some cannot be empty/noncanonical text. Attestation ConfigurationUnavailable
+skips only that config, consistently with candidate-local fallback; storage
+and invariant faults abort enumeration. Adding an equally continuous config
   can still block an existing WARM host before acquisition; removing the tie
   restores reuse. ADR-0010 retains this liveness limit as an open policy question.
 - Production routing has no wildcard API; each source revision needs an explicit
@@ -99,7 +108,8 @@ capacity and retirement fencing retain their behavior.
 |---|---|
 | Adapter workspace/network and optional provisioning-protocol import | Typed eligibility requires actual enforcement and descriptor support. Conservative defaults preserve ordinary M5 adapters and make unsupported typed acquisition ineligible |
 | Pure source-local attest/prepare, separate deadlines | Opaque config interpretation belongs to its source integration. Physical creation remains inside M5 adapter start; candidate probes cannot consume the winner's preparation budget |
-| Descriptor/effective network on start request; attested digest on durable records | Persist and deliver the environment identity/policy that the exact adapter must consume; the digest describes expected identity, not prior physical creation |
+| Committed descriptor on ExecutionLaunchSnapshot and start constructors | The trusted constructor gains an optional descriptor to close the committed-provenance → request boundary. Typed request construction consumes committed A and rejects B/empty/legacy construction; legacy remains empty. The raw unsafe constructor is still a procedural trust contract |
+| Durable preparation-fault category and ownership-only fact fence | Confirmed producer faults must survive recovery without becoming ExecutionLost. No worker FailureClass or physical lifecycle is introduced. An elapsed but still-owned ACTIVE claim may record a late fact; activity authority still requires an unexpired lease |
 | Resolver requires ExecutionRegistry | Authoritative target/profile are needed before attestation, so irrelevant candidates cannot spend the shared budget or hide eligible sources |
 | Shared placement/isolation decisions | Preserve frozen gates across preselection, authority, snapshot and handoff instead of maintaining inconsistent copies |
 | Attempt association deferred to Execution | Restore frozen M5 physical-phase assumptions and preserve earlier WARM hosts across every pre-Execution closure; settlement APIs and schema need no additional amendment |
@@ -116,8 +126,8 @@ Local checks on 2026-10-10:
 
 | Check | Result |
 |---|---|
-| Storage with test-support | 301 tests and 1 doc probe passed, including B.4 43, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 38 passed, including private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
+| Storage with test-support | 304 tests and 1 doc probe passed, including B.4 46, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 43 passed, including restart fault/orphan counterparts, two-config fault routing, descriptor substitution, fault-write failure and private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
 | Default-feature public API boundary | 35 probes passed, including wildcard-constructor and raw-string attestation compile-fail probes |
 | Runtime rustdoc | 11 passed, including the actual optional validated attestation SPI signature |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |

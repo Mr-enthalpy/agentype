@@ -463,6 +463,20 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   while authority loss and fatal/control-plane faults produce no Task failure
   row; StorageFailure, InvariantViolation, RecoveryRequired and missing revisions
   propagate without closing the committed claim;
+- confirmed fatal preparation facts survive close/reopen/recovery: Task becomes
+  SUSPENDED without ExecutionLost, worker failure, automatic retry, host death
+  or invented quiescence; crash before fault observation retains ordinary orphan
+  retry. Include permitted ExecutionLost retry with max_attempts > 1, malformed
+  success, protocol drift, storage/invariant faults and failed fault persistence;
+- preparation fault facts reject update/delete/replace, forged ownership,
+  subsequent execution/worker settlement and closed/replaced claims; an elapsed
+  but still-owned ACTIVE claim can record a late fact without gaining activity
+  authority. Explicit cancellation works, and prior PR-era v8 reopening installs
+  additive guards. A stored executed WARM host survives this recovery;
+- attestation A ConfigurationUnavailable / B valid commits B, while A
+  StorageFailure/InvariantViolation aborts before B with no claim;
+- committed descriptor A rejects explicit B, empty/whitespace and legacy typed
+  construction; exact A and ordinary legacy requests succeed;
 - an earlier credential-bearing config and a wrong-kind source whose attestation
   would fail the whole search are skipped without invoking that attestation.
 

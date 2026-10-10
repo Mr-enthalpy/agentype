@@ -2004,7 +2004,7 @@ impl Kernel {
                 claim,
                 &physical_binding,
                 ExecutionId::new(),
-                false,
+                None,
             )
         })
     }
@@ -2027,7 +2027,7 @@ impl Kernel {
                 claim,
                 &physical_binding,
                 binding_snapshot.execution_id.clone(),
-                true,
+                Some(&binding_snapshot.launch_descriptor),
             )?;
             // Full cross-record authority proof (shared with the authoritative
             // read), executed before the snapshot is frozen.
@@ -2052,7 +2052,7 @@ impl Kernel {
         claim: &Claim,
         physical_binding: &FrozenPhysicalExecutionBinding,
         execution_id: ExecutionId,
-        snapshot_bearing: bool,
+        committed_launch_descriptor: Option<&str>,
     ) -> Result<ExecutionLaunchSnapshot, Error> {
         let safety = physical_binding.safety();
         // Kernel invariant check (M5.3 §36): the frozen adapter routing
@@ -2099,7 +2099,7 @@ impl Kernel {
         // path fails closed so every typed Execution freezes its provenance
         // atomically. Checked after authority validation, against the
         // authoritative Attempt, so a tampered Claim cannot steer the error.
-        if !snapshot_bearing
+        if committed_launch_descriptor.is_none()
             && crate::requirement::task_agent_requirement_mode(
                 tx,
                 &TaskId::from_string(&attempt.task_id),
@@ -2258,6 +2258,7 @@ impl Kernel {
                 task.workstream_id.map(WorkstreamId::from_string),
                 continuity,
                 safety.clone(),
+                committed_launch_descriptor.map(str::to_owned),
             )
         })
     }
@@ -3147,6 +3148,14 @@ impl Kernel {
                 if !seen.insert(row.attempt_id.clone()) {
                     continue;
                 }
+                let preparation_fault = crate::preparation::get_fault(
+                    tx, &AttemptId::from_string(&row.attempt_id),
+                )?;
+                if preparation_fault.is_some()
+                    && (row.execution_id.is_some() || row.incarnation_id.is_some())
+                {
+                    return Err(Error::invariant("preparation fault has physical execution authority"));
+                }
                 tx.execute(
                     "UPDATE leases SET state='EXPIRED',ended_at=?1 WHERE id=?2 AND state='ACTIVE'",
                     params![now, row.lease_id],
@@ -3157,6 +3166,19 @@ impl Kernel {
                     params![now, row.attempt_id],
                 )
                 .map_err(map_sqlite)?;
+                if preparation_fault.is_some() {
+                    // A confirmed producer/control-plane fact is not an
+                    // ordinary orphan, a worker NACK, or a quiescence witness.
+                    // Close only this claim and suspend without retry policy.
+                    tx.execute(
+                        "UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL,next_eligible_at=NULL,updated_at=?1 WHERE id=?2",
+                        params![now, row.task_id],
+                    ).map_err(map_sqlite)?;
+                    release_agent(tx, &row.logical_agent_id, now)?;
+                    recompute_batch(tx, &row.batch_id, now)?;
+                    report.suspended += 1;
+                    continue;
+                }
                 if let Some(inc) = &row.incarnation_id {
                     tx.execute(
                         "UPDATE incarnations SET state='LOST',ended_at=?1 WHERE id=?2
@@ -4166,6 +4188,26 @@ impl Kernel {
                     && attempt.execution_profile == claim.execution_profile),
             }
         })
+    }
+
+    /// Persist a confirmed fatal producer fact before returning it to control.
+    /// This fences Execution commitment without fabricating a Task failure or
+    /// physical outcome. Recovery closes the claim and keeps the Task suspended.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn record_preparation_fault(
+        &self,
+        claim: &Claim,
+        kind: crate::PreparationFaultKind,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| crate::preparation::record_fault(tx, now, claim, kind))
+    }
+
+    pub fn preparation_fault_kind(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<crate::PreparationFaultKind>, Error> {
+        self.store
+            .query(|conn| crate::preparation::get_fault(conn, attempt_id))
     }
 
     pub fn logical_agent(&self, id: &LogicalAgentId) -> Result<LogicalAgentRecord, Error> {
