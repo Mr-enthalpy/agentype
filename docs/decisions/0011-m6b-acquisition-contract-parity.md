@@ -116,6 +116,20 @@ calls; observed drift is fatal. Integrity faults cannot be hidden by an
 availability error or post-call deadline. Valid but changed content remains an
 availability failure. Diagnostics never echo malformed producer content.
 
+At the integration boundary, successful attestation now returns an optional
+validated MaterializationDigest: None explicitly means unavailable and Some
+cannot contain the former empty-string sentinel. This is a scoped SPI amendment
+to separate availability from producer output validity, without changing the
+authority transaction or M5 adapter interfaces.
+
+Source-returned private diagnostics are discarded before propagation. A sanitized
+IntegrationFailure exposes a fixed category and carries runtime-only routing
+metadata computed from the original error, preserving candidate fallback,
+authority loss and fatal settlement rules. Nested storage/contract errors lose
+their private strings too; preparation settlement uses category messages instead
+of rewrapping arbitrary producer text. This changes outward diagnostic payloads,
+not fault dispositions or Task retry policy.
+
 Production source routing requires an explicit registration for each exact
 SpawnSourceRef; the wildcard helper is private and unit-test-only. This prevents
 a new revision from gaining config interpretation without a composition-root
@@ -150,6 +164,14 @@ Execution/ACK proves the WARM replacement guard; a dispatch-handoff test replace
 the registry with a different instance at the same kind/key and proves only the
 captured instance receives start. Exact source revisions and the production
 wildcard API boundary are checked separately.
+
+Attest/prepare sentinel matrices check Display, Debug and all durable text/blob
+cells while asserting availability settlement versus preserved fatal/authority
+claims. A stage-specific matrix preserves distinctions such as global deadline
+versus candidate-local unavailability. A real stored WARM host demonstrates that
+an added equally continuous config blocks acquisition, without creating authority
+or replacing the host; removing the tie restores reuse. ADR-0010 explicitly
+retains that liveness limit rather than inventing a hidden preference rule.
 
 Tests must include valid counterparts and assert authoritative consequences
 (Attempt/Lease absence, atomic rollback, unchanged host identity/state), not

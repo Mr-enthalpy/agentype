@@ -429,3 +429,12 @@ pub fn catalog_admin_surface() {}
 /// }
 /// ```
 pub fn probes() {}
+
+/// Attestation cannot encode unavailability as a successful empty string.
+/// ```compile_fail
+/// use agentype_agent_contract::MaterializationDigest;
+/// use agentype_runtime::ProvisioningResolutionError;
+/// let _: Result<Option<MaterializationDigest>, ProvisioningResolutionError> =
+///     Ok(Some(String::new()));
+/// ```
+pub fn typed_attestation_outcome() {}

@@ -130,6 +130,12 @@ committed winner re-derives the expected digest and returns an opaque,
 secret-free launch descriptor. Its canonical `sha256:<64 hex>` digest must match
 the committed `attested_materialization_digest`; mismatch diagnostics are redacted.
 
+Attestation returns `Result<Option<MaterializationDigest>, ProvisioningResolutionError>`.
+`Ok(None)` explicitly means unavailable; `Ok(Some(digest))` is a validated
+canonical value. A malformed digest cannot be a successful output and must
+surface as a producer error. This replaces the ambiguous `Ok("")` convention;
+preparation still rejects malformed successful output as fatal.
+
 Enumeration and winner preparation receive distinct absolute deadlines. No call
 renews its endpoint. The full committed-claim authority fence is checked before
 and after preparation, and deadlines/digests are checked on return.
@@ -172,6 +178,13 @@ availability errors may settle as RESOURCE_UNAVAILABLE; authority loss is left
 to recovery; StorageFailure, InvariantViolation, RecoveryRequired, missing
 revisions and all unrecognized errors propagate without writing a Task failure.
 The broad prepare Result type does not imply that every error is availability.
+At both integration returns, runtime discards every producer-controlled error
+payload, including nested storage/contract diagnostics and identifiers. The
+public `IntegrationFailure` exposes only a fixed category; private routing
+metadata retains the original candidate/fatal/authority classification.
+Preparation settlement and its outward error use fixed category messages,
+never a raw producer `err.to_string()`. Display and Debug cannot recover the
+discarded diagnostic; private logging remains the integration's responsibility.
 Successful output is also a producer boundary: a malformed canonical digest or
 blank descriptor propagates as fatal, preserving Attempt/Lease/provenance and
 writing no failure or retry. Output grammar is checked before post-call deadline
@@ -211,6 +224,10 @@ mode. Effective workspace and network policy are carried to the start request.
   handoff gains an owned exact adapter binding to preserve the validated instance
   through dispatch; this does not widen the legacy launch API or grant new
   Scheduler authority.
+- The attestation SPI uses optional validated digests instead of successful
+  empty strings, making availability explicit. Source-returned errors become
+  sanitized public categories while retaining stage-specific dispositions;
+  arbitrary private diagnostic text never grants control-plane disclosure.
 - The internal `provisioning-producer` feature narrows the default contract-crate
   surface. Cargo feature unification means it is not an unforgeable authority
   token; transactional re-proof and control APIs that accept no caller-supplied
@@ -221,7 +238,8 @@ V0.1 capacity amendment: only UNBOUND population counts toward legacy capacity;
 BOUND agents cannot be chosen as legacy excess. The full typed topology model
 remains deferred.
 
-M6-B.4 is implemented, not frozen. Typed daemon dispatch, concrete production
+M6-B.4's library slice is implemented; the milestone is incomplete, not frozen.
+Typed daemon dispatch, concrete production
 source integration, B.5 credential/security import, cold/revivable matching,
 full typed topology and database migration remain pending. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)

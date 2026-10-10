@@ -38,9 +38,57 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Public, payload-free categories at the source-integration boundary. Private
+/// producer diagnostics are discarded before runtime logging or control errors.
+/// This is error metadata, not a Task failure class or an authority capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationFailureKind {
+    Unavailable,
+    AuthorityLost,
+    StorageFailure,
+    InvariantViolation,
+    RecoveryRequired,
+    MissingRevision,
+    InvalidContract,
+    Other,
+}
+
+impl IntegrationFailureKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "source integration unavailable",
+            Self::AuthorityLost => "source integration authority lost",
+            Self::StorageFailure => "source integration storage failure",
+            Self::InvariantViolation => "source integration invariant violation",
+            Self::RecoveryRequired => "source integration recovery required",
+            Self::MissingRevision => "source integration missing revision",
+            Self::InvalidContract => "source integration contract violation",
+            Self::Other => "source integration control-plane failure",
+        }
+    }
+}
+
+/// Sanitized source failure. Only runtime constructs its routing metadata;
+/// public callers can inspect the category but cannot recover private payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationFailure {
+    kind: IntegrationFailureKind,
+    candidate_ineligible: bool,
+    candidate_local: bool,
+}
+
+impl IntegrationFailure {
+    pub fn kind(&self) -> IntegrationFailureKind {
+        self.kind
+    }
+}
+
 /// A typed provisioning resolution failure. None of these is an M5 failure
 /// class; the acquisition path maps "no eligible candidate" to
 /// `RESOURCE_UNAVAILABLE` and treats corruption as fatal.
+/// Integrations may use string-bearing variants for private diagnostics. Runtime
+/// discards those payloads at both SPI returns before control errors or logging;
+/// `IntegrationFailure` retains only categories and original routing semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisioningResolutionError {
     NotTypedTask,
@@ -66,6 +114,7 @@ pub enum ProvisioningResolutionError {
     },
     Evidence(agentype_agent_contract::ContractError),
     Storage(agentype_core::Error),
+    IntegrationFailure(IntegrationFailure),
 }
 
 impl std::fmt::Display for ProvisioningResolutionError {
@@ -145,6 +194,7 @@ impl std::fmt::Display for ProvisioningResolutionError {
             ),
             Self::Evidence(e) => write!(f, "provisioning evidence: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
+            Self::IntegrationFailure(failure) => f.write_str(failure.kind.message()),
         }
     }
 }
@@ -305,16 +355,31 @@ pub trait SourceConfigIntegration: Send + Sync {
     /// Pure, side-effect-free attestation used during candidate eligibility:
     /// verify the exact validated revision is materializable for the exact
     /// physical domain (resolving and hashing an `ExternalRef` locator, or
-    /// shape-checking an opaque body) and return the expected, secret-free
-    /// materialization digest. MUST NOT mutate anything. The single absolute
-    /// `deadline` bounds every Scheduler-facing stage (M5.6 discipline).
+    /// shape-checking an opaque body). `Ok(None)` explicitly means unavailable;
+    /// `Ok(Some(digest))` contains a validated canonical materialization digest.
+    /// There is no successful empty-string state. MUST NOT mutate anything.
+    /// The absolute `deadline` bounds every Scheduler-facing stage (M5.6).
+    /// Private diagnostics in Err are discarded at the runtime boundary; source
+    /// integrations own any private diagnostic logging.
+    ///
+    /// ```
+    /// use agentype_runtime::{ProvisioningResolutionError, SourceConfigIntegration};
+    /// use agentype_agent_contract::MaterializationDigest;
+    /// # use agentype_adapter_api::AdapterDeadline;
+    /// # use agentype_storage_sqlite::SourceConfigRevision;
+    /// # fn inspect(integration: &dyn SourceConfigIntegration, revision: &SourceConfigRevision, deadline: &AdapterDeadline) {
+    /// let outcome: Result<Option<MaterializationDigest>, ProvisioningResolutionError> =
+    ///     integration.attest(revision, "kind", "key", deadline);
+    /// // None is explicitly unavailable; Some is a validated canonical digest.
+    /// # }
+    /// ```
     fn attest(
         &self,
         revision: &agentype_storage_sqlite::SourceConfigRevision,
         adapter_kind: &str,
         adapter_binding_key: &str,
         deadline: &AdapterDeadline,
-    ) -> Result<String, ProvisioningResolutionError>;
+    ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError>;
 
     /// Pure, read-only preparation of the durably committed winner. Resolves the
     /// source-private config into an opaque launch [`PreparedSource`] descriptor
@@ -330,6 +395,8 @@ pub trait SourceConfigIntegration: Send + Sync {
     /// A successful return must contain a canonical digest and a nonblank
     /// descriptor. Malformed output or protocol drift is a producer fault,
     /// never a resource-availability failure or an automatic Task retry.
+    /// Runtime exposes only a sanitized failure category, never Err's private
+    /// payload, even for fatal faults or Debug formatting.
     fn prepare(
         &self,
         revision: &agentype_storage_sqlite::SourceConfigRevision,
@@ -496,6 +563,52 @@ fn evidence_is_candidate_local(error: &agentype_agent_contract::ContractError) -
 }
 
 impl ProvisioningResolutionError {
+    /// Discard every producer-controlled payload, including nested errors and
+    /// identifiers. Never format the raw error to construct an outward error.
+    fn integration_failure_kind(&self) -> IntegrationFailureKind {
+        use agentype_agent_contract::ContractError as C;
+        use agentype_core::Error as E;
+        use IntegrationFailureKind as K;
+        match self {
+            Self::IntegrationFailure(failure) => failure.kind,
+            Self::ProvisioningAuthorityExpired(_)
+            | Self::Storage(E::StaleAuthority(_) | E::InvalidAuthority(_)) => K::AuthorityLost,
+            Self::ExternalReferenceNotAttested(_)
+            | Self::CredentialUnavailable(_)
+            | Self::SourceOrConfigInactive
+            | Self::ExactBindingUnresolved(_)
+            | Self::ExactBindingChanged(_)
+            | Self::ProvisioningDeadlineExceeded(_)
+            | Self::MaterializationMismatch(_)
+            | Self::Storage(E::ConfigurationUnavailable(_)) => K::Unavailable,
+            Self::Storage(E::StorageFailure(_)) => K::StorageFailure,
+            Self::Storage(E::InvariantViolation(_)) | Self::Evidence(C::InvariantViolation(_)) => {
+                K::InvariantViolation
+            }
+            Self::Storage(E::RecoveryRequired(_)) => K::RecoveryRequired,
+            Self::MissingRevision(_)
+            | Self::AgentTypeMissing(_)
+            | Self::Storage(E::NotFound(_)) => K::MissingRevision,
+            Self::Evidence(error) if evidence_is_candidate_local(error) => K::Unavailable,
+            Self::Evidence(_) | Self::Storage(E::InvalidTransition(_) | E::Conflict(_)) => {
+                K::InvalidContract
+            }
+            _ => K::Other,
+        }
+    }
+
+    fn redact_integration_error(self) -> Self {
+        Self::IntegrationFailure(self.sanitized_integration_failure())
+    }
+
+    fn sanitized_integration_failure(&self) -> IntegrationFailure {
+        IntegrationFailure {
+            kind: self.integration_failure_kind(),
+            candidate_ineligible: self.is_candidate_ineligible(),
+            candidate_local: is_candidate_local(self),
+        }
+    }
+
     /// A candidate-local ineligibility (no binding, inactive source/config,
     /// unsatisfied safety, capability mismatch) skips just that candidate.
     /// Catalog/durable corruption and storage faults fail the whole resolution.
@@ -507,6 +620,7 @@ impl ProvisioningResolutionError {
                 | Self::ExternalReferenceNotAttested(_)
                 | Self::PolicyKindMismatch { .. }
         ) || matches!(self, Self::Evidence(error) if evidence_is_candidate_local(error))
+            || matches!(self, Self::IntegrationFailure(failure) if failure.candidate_ineligible)
     }
 }
 
@@ -695,8 +809,8 @@ fn enumerate_candidates(
             // Pure, side-effect-free attestation during eligibility. The source
             // integration verifies the exact revision is materializable for this
             // exact physical domain (resolving/hashing an ExternalRef, or
-            // shape-checking an opaque body). An empty attestation is ineligible
-            // and never enters selection. The same absolute endpoint is
+            // shape-checking an opaque body). Explicit None is ineligible and
+            // never enters selection. The same absolute endpoint is
             // re-qualified after the call: attestation evidence obtained after
             // the deadline MUST NOT become candidate evidence.
             if deadline.is_expired() {
@@ -710,20 +824,20 @@ fn enumerate_candidates(
                 imported.adapter_binding_key().as_str(),
                 deadline,
             );
+            // Classify and redact before deadline handling: an expired budget
+            // cannot hide a producer's fatal fault as ordinary availability.
+            let attestation = match attestation {
+                Ok(value) => value,
+                Err(err) if err.is_candidate_ineligible() => None,
+                Err(err) => return Err(err.redact_integration_error()),
+            };
             if deadline.is_expired() {
                 return Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(
                     "deadline expired after attest".into(),
                 ));
             }
-            let materialization_digest = match attestation {
-                // A malformed (non-canonical) digest from the integration is a
-                // control-plane fault, not a candidate-local ineligibility: it
-                // fails the whole resolution closed rather than being skipped.
-                Ok(digest) if !digest.trim().is_empty() => MaterializationDigest::new(digest)
-                    .map_err(ProvisioningResolutionError::Evidence)?,
-                Ok(_) => continue,
-                Err(err) if err.is_candidate_ineligible() => continue,
-                Err(err) => return Err(err),
+            let Some(materialization_digest) = attestation else {
+                continue;
             };
             let effective_security = evidence.enforceable_safety().clone();
             out.push(SourceProvisioningCandidate {
@@ -981,16 +1095,17 @@ fn finalize_preparation(
             Ok(outcome)
         }
         Err(PreparationFailure::Unavailable(err)) => {
-            settle_configuration_unavailable(kernel, &outcome.acquisition.claim, &err.to_string())?;
+            let message = err.integration_failure_kind().message();
+            settle_configuration_unavailable(kernel, &outcome.acquisition.claim, message)?;
             Err(ProvisioningResolutionError::PostCommitPreparationFailed(
-                err.to_string(),
+                message.into(),
             ))
         }
         Err(PreparationFailure::AuthorityLost(err)) => {
             // Authority already gone before any (pure) work; not a Task-level
             // configuration failure. Recovery/expire settles the claim.
             Err(ProvisioningResolutionError::PostCommitPreparationFailed(
-                err.to_string(),
+                err.integration_failure_kind().message().into(),
             ))
         }
         Err(PreparationFailure::Fatal(err)) => Err(err),
@@ -1016,10 +1131,21 @@ impl PreparationFailure {
     fn from_integration(error: ProvisioningResolutionError) -> Self {
         use agentype_core::Error;
         use ProvisioningResolutionError as P;
+        let public = P::IntegrationFailure(error.sanitized_integration_failure());
         match &error {
+            P::IntegrationFailure(failure)
+                if failure.kind == IntegrationFailureKind::AuthorityLost =>
+            {
+                Self::AuthorityLost(public)
+            }
+            P::IntegrationFailure(failure)
+                if failure.kind == IntegrationFailureKind::Unavailable =>
+            {
+                Self::Unavailable(public)
+            }
             P::ProvisioningAuthorityExpired(_)
             | P::Storage(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
-                Self::AuthorityLost(error)
+                Self::AuthorityLost(public)
             }
             P::ExternalReferenceNotAttested(_)
             | P::CredentialUnavailable(_)
@@ -1028,11 +1154,11 @@ impl PreparationFailure {
             | P::ExactBindingChanged(_)
             | P::ProvisioningDeadlineExceeded(_)
             | P::MaterializationMismatch(_)
-            | P::Storage(Error::ConfigurationUnavailable(_)) => Self::Unavailable(error),
+            | P::Storage(Error::ConfigurationUnavailable(_)) => Self::Unavailable(public),
             P::Evidence(contract_error) if evidence_is_candidate_local(contract_error) => {
-                Self::Unavailable(error)
+                Self::Unavailable(public)
             }
-            _ => Self::Fatal(error),
+            _ => Self::Fatal(public),
         }
     }
 }
@@ -1192,6 +1318,7 @@ fn require_materialization_receipt(
 /// trying the next route. The default (unknown errors) is NOT local: fail closed.
 fn is_candidate_local(error: &ProvisioningResolutionError) -> bool {
     match error {
+        ProvisioningResolutionError::IntegrationFailure(failure) => failure.candidate_local,
         ProvisioningResolutionError::NoEligibleSource
         | ProvisioningResolutionError::AgentNotBound
         | ProvisioningResolutionError::RequiredSafetyUnsatisfied(_)
@@ -1322,7 +1449,7 @@ mod tests {
             kind: &str,
             key: &str,
             deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
             if !revision.config().credential_refs.is_empty()
                 || kind == "other"
                 || key == "k1"
@@ -1508,7 +1635,7 @@ mod tests {
             kind: &str,
             key: &str,
             deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
             EchoMaterializer.attest(revision, kind, key, deadline)
         }
 
@@ -1541,6 +1668,227 @@ mod tests {
         (kernel, raw)
     }
 
+    const PRIVATE_DIAGNOSTIC: &str = "PRIVATE_LOCATOR_SENTINEL";
+
+    fn assert_public_error_is_redacted(error: &ProvisioningResolutionError) {
+        // Display and Debug are the runtime's public/logging formatting seams;
+        // there is no running typed daemon logger yet. Do not claim otherwise.
+        for text in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(
+                !text.contains(PRIVATE_DIAGNOSTIC),
+                "private integration diagnostic escaped"
+            );
+        }
+    }
+
+    fn assert_no_private_diagnostic_in_store(raw: &rusqlite::Connection) {
+        let tables: Vec<String> = raw
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for table in tables {
+            let query = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+            let mut statement = raw.prepare(&query).unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    if let rusqlite::types::ValueRef::Text(bytes)
+                    | rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(column).unwrap()
+                    {
+                        assert!(
+                            !bytes
+                                .windows(PRIVATE_DIAGNOSTIC.len())
+                                .any(|part| part == PRIVATE_DIAGNOSTIC.as_bytes()),
+                            "private diagnostic persisted in {table}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_private_diagnostics_never_cross_the_public_or_durable_boundary() {
+        for (error, settled) in [
+            (
+                ProvisioningResolutionError::ExternalReferenceNotAttested(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ),
+                true,
+            ),
+            (
+                ProvisioningResolutionError::CredentialUnavailable(PRIVATE_DIAGNOSTIC.into()),
+                true,
+            ),
+            (
+                ProvisioningResolutionError::MaterializationMismatch(PRIVATE_DIAGNOSTIC.into()),
+                true,
+            ),
+            (
+                ProvisioningResolutionError::Storage(
+                    agentype_core::Error::configuration_unavailable(PRIVATE_DIAGNOSTIC),
+                ),
+                true,
+            ),
+            (
+                ProvisioningResolutionError::Storage(agentype_core::Error::storage_failure(
+                    PRIVATE_DIAGNOSTIC,
+                )),
+                false,
+            ),
+            (
+                ProvisioningResolutionError::Evidence(
+                    agentype_agent_contract::ContractError::InvariantViolation(
+                        PRIVATE_DIAGNOSTIC.into(),
+                    ),
+                ),
+                false,
+            ),
+            (
+                ProvisioningResolutionError::MissingRevision(PRIVATE_DIAGNOSTIC.into()),
+                false,
+            ),
+            (
+                ProvisioningResolutionError::ProvisioningAuthorityExpired(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ),
+                false,
+            ),
+            (
+                ProvisioningResolutionError::PolicyKindMismatch {
+                    policy_kind: PRIVATE_DIAGNOSTIC.into(),
+                    imported_kind: PRIVATE_DIAGNOSTIC.into(),
+                },
+                false,
+            ),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, starts) = adapters_with_start_probe();
+            let outcome = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let binding = outcome.acquisition.provisioning_binding.clone();
+            let public =
+                finalize_preparation(&kernel, &si(PrepareError(error)), outcome, &deadline())
+                    .unwrap_err();
+            assert_public_error_is_redacted(&public);
+            assert_no_private_diagnostic_in_store(&raw);
+            if settled {
+                assert_eq!(
+                    kernel.attempt(&claim.attempt_id).unwrap().state,
+                    agentype_core::AttemptState::Failed
+                );
+                assert_eq!(
+                    raw.query_row(
+                        "SELECT failure_class FROM failures WHERE attempt_id=?1",
+                        [claim.attempt_id.as_str()],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    "RESOURCE_UNAVAILABLE"
+                );
+            } else {
+                assert_preparation_fault_preserves_claim(&kernel, &raw, &claim, &binding);
+            }
+            assert_eq!(starts.start_call_count(), 0);
+        }
+    }
+
+    struct AttestationError(ProvisioningResolutionError);
+
+    impl SourceConfigIntegration for AttestationError {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            _revision: &agentype_storage_sqlite::SourceConfigRevision,
+            _kind: &str,
+            _key: &str,
+            _deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            Err(self.0.clone())
+        }
+
+        fn prepare(
+            &self,
+            _revision: &agentype_storage_sqlite::SourceConfigRevision,
+            _kind: &str,
+            _key: &str,
+            _deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            panic!("failed attestation cannot reach prepare")
+        }
+    }
+
+    #[test]
+    fn attest_private_diagnostics_are_redacted_without_changing_candidate_fallback() {
+        for error in [
+            ProvisioningResolutionError::Storage(agentype_core::Error::storage_failure(
+                PRIVATE_DIAGNOSTIC,
+            )),
+            ProvisioningResolutionError::Evidence(
+                agentype_agent_contract::ContractError::InvariantViolation(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ),
+            ),
+            ProvisioningResolutionError::ExternalReferenceNotAttested(PRIVATE_DIAGNOSTIC.into()),
+        ] {
+            let candidate_local = matches!(
+                error,
+                ProvisioningResolutionError::ExternalReferenceNotAttested(_)
+            );
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, starts) = adapters_with_start_probe();
+            let public = try_acquire_existing(
+                &kernel,
+                &task,
+                &agent,
+                &adapters,
+                &execution_registry(),
+                &si(AttestationError(error)),
+                &deadline(),
+            )
+            .unwrap_err();
+            assert_public_error_is_redacted(&public);
+            assert_eq!(
+                matches!(public, ProvisioningResolutionError::NoEligibleSource),
+                candidate_local
+            );
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+            assert_eq!(starts.start_call_count(), 0);
+            assert_no_private_diagnostic_in_store(&raw);
+        }
+    }
+
     struct PrepareBoundaryProbe {
         digest: Option<&'static str>,
         descriptor: Option<&'static str>,
@@ -1565,7 +1913,7 @@ mod tests {
             kind: &str,
             key: &str,
             deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
             EchoMaterializer.attest(revision, kind, key, deadline)
         }
 
@@ -1791,7 +2139,7 @@ mod tests {
                 &deadline(),
             )
             .unwrap_err();
-            assert_eq!(result, err);
+            assert_eq!(result, err.redact_integration_error());
             assert!(kernel.claim_authority_is_current(&claim).unwrap());
             assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
             assert_eq!(
@@ -2058,7 +2406,7 @@ mod tests {
             kind: &str,
             key: &str,
             deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
             EchoMaterializer.attest(revision, kind, key, deadline)
         }
         fn prepare(
@@ -2162,8 +2510,10 @@ mod tests {
             _adapter_kind: &str,
             _adapter_binding_key: &str,
             _deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
-            Ok(revision.config().config_digest.as_str().to_string())
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            MaterializationDigest::new(revision.config().config_digest.as_str())
+                .map(Some)
+                .map_err(ProvisioningResolutionError::Evidence)
         }
 
         fn prepare(
@@ -2211,6 +2561,14 @@ mod tests {
     }
 
     fn publish_with_lifecycle(kernel: &Kernel, lifecycle: LifecycleMode) -> AgentTypeRef {
+        publish_with_lifecycle_and_continuity(kernel, lifecycle, ContinuityMode::None)
+    }
+
+    fn publish_with_lifecycle_and_continuity(
+        kernel: &Kernel,
+        lifecycle: LifecycleMode,
+        continuity: ContinuityMode,
+    ) -> AgentTypeRef {
         let agent = AgentType {
             type_ref: AgentTypeRef::new("reviewer", 1).unwrap(),
             based_on: None,
@@ -2225,7 +2583,7 @@ mod tests {
                     requires_attempt_isolation: false,
                 },
                 lifecycle: [lifecycle].into_iter().collect(),
-                continuity: ContinuityMode::None,
+                continuity,
                 sandbox_policy: None,
                 anchor_constraint: None,
             },
@@ -2245,7 +2603,7 @@ mod tests {
             source_ref: SpawnSourceRef::new("source", 1).unwrap(),
             adapter_policy: policy.policy_ref.clone(),
             lifecycle_modes: [lifecycle].into_iter().collect(),
-            continuity_modes: [ContinuityMode::None].into_iter().collect(),
+            continuity_modes: [continuity].into_iter().collect(),
             functional_envelope: BTreeMap::new(),
             claims: Vec::new(),
             status: SourceStatus::Active,
@@ -2447,8 +2805,8 @@ mod tests {
         adapters
     }
 
-    /// Attests a canonically valid digest but fails the physical materialization
-    /// with an error after the invocation has been entered.
+    /// Attests a canonically valid digest but fails pure preparation after the
+    /// invocation has been entered.
     struct FailingMaterializeMaterializer;
 
     impl SourceConfigIntegration for FailingMaterializeMaterializer {
@@ -2462,8 +2820,8 @@ mod tests {
             _adapter_kind: &str,
             _adapter_binding_key: &str,
             _deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
-            Ok(TEST_DIGEST.to_string())
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            Ok(Some(MaterializationDigest::new(TEST_DIGEST).unwrap()))
         }
 
         fn prepare(
@@ -2516,8 +2874,8 @@ mod tests {
         assert!(kernel.claim_next_available().unwrap().is_none());
     }
 
-    /// A materializer that records that the physical side effect happened, then
-    /// returns an error (a lost acknowledgement, not an absence).
+    /// A preparation probe that records invocation and can return unavailable.
+    /// The flag is test bookkeeping, not physical resource creation.
     struct SideEffectProbe {
         observed: Arc<std::sync::atomic::AtomicBool>,
         fail: bool,
@@ -2534,8 +2892,8 @@ mod tests {
             _adapter_kind: &str,
             _adapter_binding_key: &str,
             _deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
-            Ok(TEST_DIGEST.to_string())
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            Ok(Some(MaterializationDigest::new(TEST_DIGEST).unwrap()))
         }
 
         fn prepare(
@@ -2560,8 +2918,8 @@ mod tests {
         }
     }
 
-    /// A deadline that expired BEFORE the side-effectful invocation is provably
-    /// side-effect-free, so the integration is never called and the frozen
+    /// A deadline that expired BEFORE preparation prevents integration
+    /// invocation entirely, and the frozen
     /// pre-start (`RESOURCE_UNAVAILABLE`) boundary applies.
     #[test]
     fn materialize_deadline_before_invocation_is_provably_side_effect_free() {
@@ -3274,7 +3632,7 @@ mod tests {
             _adapter_kind: &str,
             _adapter_binding_key: &str,
             _deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
             Err(ProvisioningResolutionError::ExternalReferenceNotAttested(
                 "no integration".into(),
             ))
@@ -3293,10 +3651,10 @@ mod tests {
         }
     }
 
-    /// Materializer that returns an empty attestation.
-    struct EmptyMaterializer;
+    /// Integration that explicitly reports attestation unavailability.
+    struct UnavailableAttestation;
 
-    impl SourceConfigIntegration for EmptyMaterializer {
+    impl SourceConfigIntegration for UnavailableAttestation {
         fn protocol(&self) -> &str {
             crate::TEST_PROVISIONING_PROTOCOL
         }
@@ -3307,8 +3665,8 @@ mod tests {
             _adapter_kind: &str,
             _adapter_binding_key: &str,
             _deadline: &AdapterDeadline,
-        ) -> Result<String, ProvisioningResolutionError> {
-            Ok(String::new())
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            Ok(None)
         }
 
         fn prepare(
@@ -3388,19 +3746,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_attestation_is_ineligible_before_selection() {
+    fn explicitly_unavailable_attestation_is_ineligible_before_selection() {
         let kernel = kernel();
         let pin = publish(&kernel);
         let task = typed_task(&kernel, pin);
         let adapters = adapters_with_binding();
-        // An empty attestation is rejected during eligibility, so it never
+        // An explicit unavailable outcome is rejected during eligibility, so it never
         // reaches selection and cannot mask a later eligible candidate.
         let candidates = resolve_source_candidates(
             &kernel,
             &task,
             &adapters,
             &execution_registry(),
-            &si(EmptyMaterializer),
+            &si(UnavailableAttestation),
             &deadline(),
         )
         .unwrap();
@@ -3464,6 +3822,219 @@ mod tests {
             select_candidate(&candidates),
             Err(ProvisioningResolutionError::SelectionAmbiguous(_))
         ));
+    }
+
+    #[test]
+    fn a_new_equal_continuity_config_blocks_warm_reuse_until_the_tie_is_removed() {
+        let (kernel, raw) = preparation_kernel();
+        let pin = publish_with_lifecycle_and_continuity(
+            &kernel,
+            LifecycleMode::Resident,
+            ContinuityMode::Logical,
+        );
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let (adapters, starts) = adapters_with_start_probe();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let first_task = typed_task(&kernel, pin.clone());
+        let first = acquire_typed_task(
+            &kernel,
+            &first_task,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let binding = first.acquisition.provisioning_binding.clone();
+        let claim = first.acquisition.claim.clone();
+        let launch =
+            crate::prepare_typed_execution_launch(&kernel, first, &registry, &adapters).unwrap();
+        kernel
+            .ack_success(
+                &claim.attempt_id,
+                claim.lease_epoch,
+                Some(launch.snapshot().execution_id()),
+                &json!({}),
+                None,
+                true,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        // With only A, a later Task can actually reuse this committed WARM host.
+        let before_task = typed_task(&kernel, pin.clone());
+        let before = acquire_typed_task(
+            &kernel,
+            &before_task,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(before.acquisition.provisioning_binding, binding);
+        kernel.cancel_task(&before_task, false).unwrap();
+        let other_body = json!({"model": "other"});
+        let other = SourceConfig {
+            config_ref: SourceConfigRef::new(binding.spawn_source.clone(), "config-b", 1).unwrap(),
+            config_digest: ConfigDigest::new(canonical_json_body_digest(&other_body)).unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: Vec::new(),
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        };
+        kernel
+            .publish_source_config(&other, &SourceConfigBody::OpaqueJson(other_body))
+            .unwrap();
+        let task = typed_task(&kernel, pin);
+        let matches = kernel.match_existing_agents_for_task(&task).unwrap();
+        assert_eq!(matches[0].logical_agent_id, agent);
+        let candidates = resolve_source_candidates_for_agent(
+            &kernel,
+            &task,
+            &agent,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| continuity_rank(candidate) == 1));
+        let error = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProvisioningResolutionError::SelectionAmbiguous(_)
+        ));
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+        assert_eq!(
+            kernel.logical_agent(&agent).unwrap().state,
+            LogicalAgentState::Ready
+        );
+        assert_eq!(
+            kernel.incarnation(&binding.incarnation_id).unwrap().state,
+            agentype_core::IncarnationState::Warm
+        );
+        assert_eq!(
+            kernel
+                .get_provisioning_binding(&binding.incarnation_id)
+                .unwrap(),
+            Some(binding.clone())
+        );
+        for table in [
+            "logical_agents",
+            "incarnations",
+            "provisioning_bindings",
+            "executions",
+            "binding_snapshots",
+        ] {
+            assert_eq!(
+                raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(starts.start_call_count(), 0);
+        // Resolving the catalog tie restores A reuse; no implicit identity sort
+        // or new WARM-preference relation is smuggled into ADR-0010's policy.
+        kernel
+            .set_source_config_status(&other.config_ref, ConfigStatus::Disabled)
+            .unwrap();
+        let resumed = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(resumed.acquisition.provisioning_binding, binding);
+    }
+
+    #[test]
+    fn redaction_preserves_stage_specific_fallback_and_fault_categories() {
+        use agentype_core::Error;
+        use IntegrationFailureKind as K;
+        for (error, ineligible, local, kind) in [
+            (
+                ProvisioningResolutionError::ExternalReferenceNotAttested(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ),
+                true,
+                true,
+                K::Unavailable,
+            ),
+            (
+                ProvisioningResolutionError::CredentialUnavailable(PRIVATE_DIAGNOSTIC.into()),
+                false,
+                true,
+                K::Unavailable,
+            ),
+            (
+                ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ),
+                false,
+                false,
+                K::Unavailable,
+            ),
+            (
+                ProvisioningResolutionError::Storage(Error::invalid_authority(PRIVATE_DIAGNOSTIC)),
+                false,
+                true,
+                K::AuthorityLost,
+            ),
+            (
+                ProvisioningResolutionError::Storage(Error::stale(PRIVATE_DIAGNOSTIC)),
+                false,
+                false,
+                K::AuthorityLost,
+            ),
+            (
+                ProvisioningResolutionError::Storage(Error::storage_failure(PRIVATE_DIAGNOSTIC)),
+                false,
+                false,
+                K::StorageFailure,
+            ),
+            (
+                ProvisioningResolutionError::PolicyKindMismatch {
+                    policy_kind: PRIVATE_DIAGNOSTIC.into(),
+                    imported_kind: PRIVATE_DIAGNOSTIC.into(),
+                },
+                true,
+                true,
+                K::Other,
+            ),
+        ] {
+            let redacted = error.redact_integration_error();
+            assert_public_error_is_redacted(&redacted);
+            assert_eq!(redacted.is_candidate_ineligible(), ineligible);
+            assert_eq!(is_candidate_local(&redacted), local);
+            let ProvisioningResolutionError::IntegrationFailure(failure) = redacted else {
+                panic!("expected sanitized source error")
+            };
+            assert_eq!(failure.kind(), kind);
+        }
     }
 
     #[test]

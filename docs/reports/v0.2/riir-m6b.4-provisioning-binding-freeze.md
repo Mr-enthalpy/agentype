@@ -1,7 +1,7 @@
 # RIIR M6-B.4 — Provisioning Binding and Exact Launch Implementation Record
 
 Status: Historical Report
-Implementation status: M6-B.4 implemented, not frozen
+Implementation status: M6-B.4 library slice implemented; milestone incomplete, not frozen
 Date: 2026-10-10
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert milestone freeze.
@@ -74,6 +74,13 @@ into running typed daemon dispatch is a remaining step.
 - Malformed successful producer output and observed integration-protocol drift
   are fatal too. They preserve authority and produce no failure, retry,
   Execution or snapshot. Grammar checks precede post-call availability checks.
+- Source-returned errors lose every private diagnostic payload before control
+  propagation, including nested storage/contract errors. Public Display/Debug and
+  settlement use fixed categories while retaining original fault dispositions.
+- Attestation has an explicit optional validated digest: None is unavailable;
+  Some cannot be empty/noncanonical text. Adding an equally continuous config
+  can still block an existing WARM host before acquisition; removing the tie
+  restores reuse. ADR-0010 retains this liveness limit as an open policy question.
 - Production routing has no wildcard API; each source revision needs an explicit
   registration. Typed dispatch handoff keeps the same validated adapter instance
   and operation policy even if a new registry reuses its kind/key.
@@ -99,6 +106,8 @@ capacity and retirement fencing retain their behavior.
 | Source registry wildcard restricted to private unit tests | A new source revision must not inherit opaque-config interpretation without an explicit composition-root routing decision; shared integrations use multiple registrations |
 | Internal PreparedTypedExecutionLaunch owns exact binding | Retain the validated instance and deadlines through dispatch, preventing stale-binding re-selection; public legacy PreparedExecutionLaunch remains unchanged |
 | Executed WARM provenance replacement fails closed | Terminal Execution rows cannot prove cleanup of external resources; preserve the host until M5 lifecycle closure or a future verified safety witness |
+| Attestation returns Option<MaterializationDigest> | Separate explicit unavailability from valid successful output; replace the empty-string SPI convention without changing acquisition authority |
+| Sanitized integration failure categories | Private source diagnostics do not become authorized public/log output; discard payloads and preserve existing stage-specific candidate/fatal/authority semantics |
 | Typed population excluded from legacy capacity | Legacy desired population cannot retire semantically bound agents; full typed topology remains deferred (ADR-0009) |
 
 ## Verification
@@ -108,8 +117,9 @@ Local checks on 2026-10-10:
 | Check | Result |
 |---|---|
 | Storage with test-support | 301 tests and 1 doc probe passed, including B.4 43, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 34 passed, including producer-output/protocol/fault matrices, exact-instance handoff, explicit revision routing, source rollover and WARM preservation |
-| Default-feature public API boundary | 34 probes passed, including the production wildcard-constructor compile-fail probe |
+| Provisioning resolver unit target | 38 passed, including private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
+| Default-feature public API boundary | 35 probes passed, including wildcard-constructor and raw-string attestation compile-fail probes |
+| Runtime rustdoc | 11 passed, including the actual optional validated attestation SPI signature |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
 | Formatting and whitespace | cargo fmt --all --check and git diff --check passed |
 | Full Windows workspace runtime gate | Local ProcessLock setup is restricted; full runtime acceptance is checked against the pushed head's remote CI |
@@ -129,7 +139,8 @@ checked against their pushed head, not that earlier green result.
 
 ## Remaining acceptance and scope
 
-M6-B.4 remains IMPLEMENTED, NOT FROZEN. Full runtime/CI acceptance and independent
+M6-B.4's library slice is implemented; the milestone remains INCOMPLETE, NOT FROZEN.
+Full runtime/CI acceptance and independent
 freeze review remain separate gates. Remaining implementation includes typed
 ControlLoopService dispatch, a concrete production SourceConfigIntegration,
 B.5 credentials/security import, cold/revivable matching, full typed topology
@@ -144,3 +155,12 @@ verified migration. Resident WARM source replacement is currently blocked when
 there is Execution history. Enabling it requires real-adapter conformance for
 stopping, isolating or safely retaining old resources and an explicit lifecycle
 witness; durable fencing alone is not physical termination.
+
+WARM provenance priority among equal-continuity candidates is not implemented.
+The current fail-closed tie can stall a previously reusable host; defining a
+positive reuse-priority relation needs an explicit policy amendment and tests,
+not implicit source/config identity ordering. Real typed daemon acceptance must
+cover crash between Execution commitment and start, missing exact binding after
+restart, same-key instance replacement, ambiguous writer start with expiry/retry,
+and actual workspace/network/protocol enforcement. Current library tests do not
+prove those production physical scenarios.

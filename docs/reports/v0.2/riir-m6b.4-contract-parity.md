@@ -6,73 +6,57 @@ Applies to: PR #24 against frozen M4–M6-B.3
 Canonical path: `docs/reports/v0.2/riir-m6b.4-contract-parity.md`
 Not a specification.
 
-## Purpose
+## Current acceptance evidence
 
-This report records discriminating regression evidence against frozen M4–M6-B.3.
-The [implementation record](riir-m6b.4-provisioning-binding-freeze.md) owns current
-scope and verification. [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md)
-owns the shared eligibility and physical-phase rationale.
+The [implementation record](riir-m6b.4-provisioning-binding-freeze.md) owns scope
+and validation. [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md)
+explains shared eligibility, phase boundaries and interface reasons. This is one
+matrix of final observable behavior; earlier audit narratives are not competing
+acceptance rules. Resolver passes 38 tests; B.4 storage passes 43; default API
+passes 35 probes and runtime rustdoc passes 11.
 
-## Original implementation versus corrected implementation
-
-The five added storage tests were run with the original `515a25ca` provisioning
-implementation and the new tests retained. All five failed while all 34 existing
-B.4 tests passed. Restoring the correction made all 39 B.4 tests pass.
-
-| Regression test | Frozen-contract consequence asserted |
+| Boundary | Authoritative consequence and valid counterpart |
 |---|---|
-| required_continuity_has_the_same_gate_for_existing_and_new_acquisition | Existing/new and B.3 placement agree; Required without a concrete workstream creates no authority, binding or newborn agent |
-| target_isolation_is_reproved_before_both_acquisition_paths | Independent target/importer isolation combinations reject unenforceable target policy before authority on both paths |
-| execution_cannot_freeze_target_isolation_beyond_the_committed_capability | A snapshot cannot overclaim capability; rejected Execution creation rolls back its association and snapshot |
-| pre_execution_settlement_preserves_a_reused_resident_host_across_all_closures | A genuine earlier Execution and ACK produce a reusable WARM host; config failure, Task/Batch cancellation, expiry, restart, NACK and ACK before a new Execution preserve its identity/state |
-| fresh_pre_execution_reservation_remains_starting_and_can_be_reused | Pure pre-Execution closure leaves a fresh STARTING reservation reusable with the same immutable provisioning identity |
+| Required continuity | B.3/existing/new placement agree; absent concrete matching workstream creates no authority, binding or newborn agent; concrete matching continuity succeeds |
+| Target/importer isolation | Independent target/importer combinations reject unenforceable target policy before authority on both paths; imported capability alone does not enable policy |
+| Snapshot commitment | An isolation overclaim rolls back Execution, association and snapshot; coherent exact binding commits atomically |
+| Pre-Execution closure | A stored resident Execution/ACK produces WARM; config failure, Task/Batch cancellation, expiry, restart, NACK and ACK before another Execution preserve its identity/state |
+| Pure reservation reuse/rollover | STARTING with validated binding and no Execution history reuses its source, or changes source/config after pure failure/cancellation and same-Task retry; old provenance stays immutable, one reservation remains active, no adapter starts |
+| Physical-history guard | ACTIVE agent claims with NULL association and STARTING with any Execution history cannot be replaced; executed WARM provenance change fails before a new claim and preserves the host |
+| Known ineligibility before I/O | Poisoned credential/wrong-kind attestations are never invoked; a later eligible candidate remains usable while corruption on an actually performed read is fatal |
+| Integration fault dispositions | Availability settles RESOURCE_UNAVAILABLE; authority loss remains recovery-owned; storage/invariant/recovery-required/missing-revision/unknown faults preserve claim/Lease and write no Task failure |
+| Private diagnostics | Attest/prepare sentinel matrices, including nested storage/contract faults, expose no private text in public Display/Debug or any durable text/blob cell; stage-specific candidate/global/fatal semantics remain unchanged |
+| Attestation SPI | None explicitly means unavailable; Some is a validated canonical MaterializationDigest; runtime rustdoc checks the actual signature and default API rejects successful raw-string output |
+| Preparation output/protocol | Malformed digest and empty/whitespace descriptor are fatal, with no automatic retry, Execution or snapshot; protocol drift before prepare prevents the call, and drift during success/availability-error returns is fatal |
+| Exact adapter instance | Drop the original registry after commitment and install another instance at the same kind/key; consuming the handoff starts only the original captured instance with its retained deadline/request identity |
+| Exact source routing | A new source revision has no inherited route; shared integrations need explicit registrations; default production API cannot call the wildcard helper |
+| WARM equal-continuity tie | A is reusable before equally continuous B is published; then B.3 still returns the existing agent but acquisition leaves the Task QUEUED with no new authority or host replacement; disabling B restores A reuse |
 
-These tests pair rejected scenarios with valid counterparts and check durable
-consequences, including rollback, authority absence and unchanged physical host
-state. They do not infer correctness from an error return alone.
+The last row proves an accepted liveness limitation, not a completed reuse-priority
+policy. [ADR-0010](../../decisions/0010-m6b-selection-order-scope.md) explicitly
+leaves that selection relation unresolved. Assertions cover durable rows,
+rollback, unchanged host identity/state, absence of automatic retry and adapter
+call counts rather than merely returned errors.
 
-## Source-private I/O and integration evidence
+## Discriminating code baselines
 
-The resolver suite passes 34 tests. Added cases place a credential config ahead
-of a valid one and install poisoned attestations for credential/wrong-kind
-candidates; those integrations are never called. An isolated target rejects an
-incapable domain before attestation while admitting a capable source. An actual
-pure preparation failure after a prior committed resident Execution preserves
-the WARM host.
+The regression tests were retained while running the relevant prior code:
 
-Reservation and fault regressions retained against `ecc2990` reproduce the next
-uncovered phase boundaries: storage reports 41 passed / 1 failed and resolver
-reports 27 passed / 3 failed. The failures are source replacement after closure,
-fatal integration errors being settled as availability, and authority-loss
-errors producing Task failure. The availability counterpart and physical-history
-guards pass on both implementations. After correction, B.4 passes all 42 tests
-and resolver passes all 30.
-
-Against audited `149edce`, the producer-boundary tests report resolver 30 passed
-/ 2 failed: malformed successful output is downgraded to retryable failure, and
-protocol drift is accepted. A separate resident Execution/ACK WARM replacement
-counterexample also fails because SQL fencing permits provenance change without
-physical lifecycle evidence. The corrected implementation passes resolver 34,
-B.4 storage 43, complete storage 301 plus 1 doc probe, and production API 34
-probes. These are retained witnesses, not additional audit-round acceptance rules.
-
-| Producer/physical boundary | Authoritative consequence asserted |
+| Code under test | Counterexample result |
 |---|---|
-| Successful output grammar | Malformed digest, empty and whitespace descriptors propagate fatal InvalidRef with redacted messages; explicit retry policy produces no failure/retry, Execution or snapshot |
-| Protocol drift | Drift before prepare prevents the call; drift during prepare is fatal on success and availability-error returns; claim/Lease/provenance survive and no adapter starts |
-| Executed WARM replacement | A real stored resident Execution/ACK produces WARM; different provenance is rejected before a claim, preserving host state and immutable binding; same-provenance reuse and pure-reservation rollover still pass |
-| Exact adapter instance | Drop the original registry after commitment and install another instance at the same kind/key; the consumed handoff starts only the original instance with its retained deadlines/request identity |
-| Exact source routing | A new source revision has no inherited route; shared integrations require explicit registration for both; production API cannot call the wildcard constructor |
+| Original provisioning `515a25ca` | Five placement/isolation/association regressions fail while its 34 existing B.4 tests pass |
+| `ecc2990` | Storage 41 pass / 1 fail and resolver 27 pass / 3 fail: closed reservation cannot change source; fatal and authority-loss errors produce Task failures |
+| `149edce` | Resolver 30 pass / 2 fail: malformed successful output is downgraded and protocol drift is accepted; the separate executed-WARM replacement counterexample also fails |
+| Audited `bd7019c` | Both retained private-diagnostic sentinel tests fail at the outward-error boundary; the WARM tie limitation is reproduced without changing its policy |
+| Corrected library slice | Resolver 38 pass; B.4 storage 43 pass; full storage 301 plus 1 doc probe; default API 35 probes; runtime rustdoc 11 pass |
 
-The replacement matrix covers pure preparation failure and cancellation, a new
-config on the same source and a new source, same-Task retry, immutable old
-provenance, one active reservation and zero physical starts. Guard cases retain
-the restriction for an ACTIVE claim with NULL Incarnation association and a
-STARTING Incarnation with Execution history. Fault matrices assert exact fatal
-propagation, unchanged claim/Lease and no failure rows, alongside an actual
-RESOURCE_UNAVAILABLE settlement for availability errors.
+Complete storage verification retains frozen M4 writer-safety/recovery, M6-A
+frontier and B.3 admission/matching. Default API probes supplement transactional
+re-proof; feature visibility is not an authority token. Local full Windows
+runtime remains limited by ProcessLock setup, so full remote acceptance must be
+checked for the exact pushed head.
 
-Together these cases exercise placement, target/importer qualification,
-reservation/Execution separation and source-private I/O ordering. Full daemon
-integration, runtime/CI acceptance and milestone freeze remain the distinct
-gates documented in the implementation record.
+These witnesses establish the library boundaries above. Actual typed daemon
+start/recovery, real source lifecycle and security conformance, v7 migration and
+milestone freeze remain separate gates. Stored WARM state and fake-adapter calls
+are not claims of production physical cleanup or enforcement.

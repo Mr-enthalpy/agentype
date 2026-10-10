@@ -164,6 +164,11 @@ Each exact SpawnSourceRef MUST be explicitly registered to its integration;
 production wildcard routing is unsupported. The typed handoff MUST retain the
 same resolved adapter instance and operation policy for dispatch rather than
 selecting it again from a mutable registry.
+Attestation MUST distinguish explicit unavailability (`Ok(None)`) from a
+successful validated canonical MaterializationDigest (`Ok(Some(digest))`), never
+use successful empty text as a control state. Source-private error payloads MUST
+be discarded at attest/prepare runtime returns before public control errors or
+logging; fixed error categories preserve stage-specific fault dispositions.
 The physical materialization of the descriptor happens inside
 `start_execution` (M6-B never creates a physical environment). Effective safety
 is the intersection of the ExecutionTarget requirement and the imported source's

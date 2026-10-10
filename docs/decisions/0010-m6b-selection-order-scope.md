@@ -2,6 +2,7 @@
 
 Status: Accepted (M6-B.4)
 Date: 2026-10-06
+Clarified: 2026-10-10
 Canonical path: `docs/decisions/0010-m6b-selection-order-scope.md`
 
 ## Context
@@ -48,3 +49,27 @@ This ADR scopes what B.4 actually implements and what remains deferred.
 - The physical provisioning choice is derived by the Scheduler, not a free
   parameter of the authority caller.
 - Any future change to the selection order or winner rule is a new ADR.
+
+## Existing WARM provenance and liveness limit
+
+An existing READY type-bound LogicalAgent may already have a reusable WARM
+Incarnation whose immutable provisioning provenance selects config A. Publishing
+another eligible config B with equal Logical continuity currently makes that
+agent's selection ambiguous too. B.3 still ranks the existing agent, but B.4
+creates no new Attempt/Lease/Execution and leaves its WARM host unchanged.
+Removing the tie restores A reuse. Adding an eligible candidate can therefore
+block progress; selection is not monotonic in the eligible candidate set.
+
+This limit is explicit and covered by an actual acquisition regression. The
+current library returns SelectionAmbiguous before a claim, leaving the Task
+QUEUED; future daemon settlement must not invent a NACK for an absent Attempt.
+The earlier RESOURCE_UNAVAILABLE wording describes the intended resolution
+classification, not a currently wired daemon failure row.
+
+The open policy question is whether, for the same LogicalAgent, validated and
+reusable Incarnation provenance should precede other equally continuous
+candidates. That positive durable fact is not an external cost estimate, but no
+such selection relation is specified or implemented here. An affirmative answer
+requires an explicit policy amendment and conformance for both reusable and
+stale provenance; source/config identity sorting is not a substitute. This PR
+retains fail-closed ties and does not claim WARM reuse priority is complete.

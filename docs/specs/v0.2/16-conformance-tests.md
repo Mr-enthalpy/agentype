@@ -379,6 +379,16 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   source's integration
 - production source routing has no wildcard constructor; a new revision remains
   unrouted until explicitly registered, even when an integration supports both
+- attestation None explicitly makes a candidate unavailable, while Some contains
+  a validated canonical digest; raw/empty successful strings cannot satisfy SPI
+- producer-controlled diagnostic sentinels from attest and prepare, including
+  nested storage/contract errors, appear in neither public Display/Debug nor
+  durable text/blob cells; availability, authority loss and fatal dispositions
+  and candidate-local versus global fallback retain their original semantics
+- adding an equally continuous config to an existing reusable WARM host returns
+  SelectionAmbiguous before authority, preserves the host/provenance and leaves
+  the Task QUEUED; removing the tie restores reuse. WARM provenance priority
+  remains an explicit policy gap (ADR-0010), not an identity-sort tie-break
 - successful prepare output with malformed digest or blank/whitespace descriptor
   is fatal and preserves Attempt/Lease/provenance; it creates no failure, retry,
   Execution or snapshot. Valid changed content remains an availability rejection
