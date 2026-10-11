@@ -413,6 +413,66 @@ fn pre_execution_settlement_preserves_a_reused_resident_host_across_all_closures
 }
 
 #[test]
+fn merge_cannot_abandon_a_typed_warm_host_on_ready_or_pre_execution_agents() {
+    for assigned in [false, true] {
+        let env = Env::with_retention("typed-warm-merge", 1, Retention::Resident);
+        let (pin, catalog, agent, incarnation) = resident_host(&env);
+        env.kernel
+            .upsert_partition(&PartitionSpec::new(
+                "other",
+                0,
+                Retention::Resident,
+                "remote",
+                "default",
+            ))
+            .unwrap();
+        let task = admit_typed_task(&env.kernel, pin);
+        if assigned {
+            let acquired = env
+                .kernel
+                .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+                .unwrap();
+            assert!(env
+                .kernel
+                .attempt(&acquired.claim.attempt_id)
+                .unwrap()
+                .incarnation_id
+                .is_none());
+        }
+        let before = env.kernel.logical_agent(&agent).unwrap();
+        let binding = env.kernel.get_provisioning_binding(&incarnation).unwrap();
+        assert!(
+            env.kernel.merge_partitions("general", "other").is_err(),
+            "cross-target MERGE abandoned a typed WARM host"
+        );
+        let after = env.kernel.logical_agent(&agent).unwrap();
+        assert_eq!(after.partition, before.partition);
+        assert_eq!(after.pending_partition, before.pending_partition);
+        assert_eq!(after.state, before.state);
+        assert_eq!(
+            env.kernel.incarnation(&incarnation).unwrap().state,
+            agentype_core::IncarnationState::Warm
+        );
+        assert_eq!(
+            env.kernel.get_provisioning_binding(&incarnation).unwrap(),
+            binding
+        );
+        assert_eq!(
+            env.kernel.task(&task).unwrap().partition.as_str(),
+            "general"
+        );
+        assert!(env
+            .raw()
+            .query_row(
+                "SELECT active FROM pool_partitions WHERE name='general'",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+    }
+}
+
+#[test]
 fn fresh_pre_execution_reservation_remains_starting_and_can_be_reused() {
     let env = Env::with_retention("fresh-reservation", 1, Retention::Resident);
     let kernel = &env.kernel;
@@ -449,6 +509,269 @@ fn fresh_pre_execution_reservation_remains_starting_and_can_be_reused() {
         .unwrap();
     assert_eq!(second.provisioning_binding, first.provisioning_binding);
     assert_eq!(count_provisioning_bindings(&env), 1);
+}
+
+#[test]
+fn pre_execution_closure_defers_an_old_pending_move_without_losing_the_warm_host() {
+    for action in ["configuration", "cancel", "recovery", "fatal"] {
+        let env = Env::with_retention("old-typed-pending", 1, Retention::Resident);
+        let (pin, catalog, agent, incarnation) = resident_host(&env);
+        env.kernel
+            .upsert_partition(&PartitionSpec::new(
+                "other",
+                0,
+                Retention::Resident,
+                "remote",
+                "default",
+            ))
+            .unwrap();
+        let task = admit_typed_task(&env.kernel, pin);
+        let acquired = env
+            .kernel
+            .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+            .unwrap();
+        let binding = acquired.provisioning_binding.clone();
+        // An accepted old-v8 pending intent, preceding the common host guard.
+        let raw = env.raw();
+        raw.execute(
+            "UPDATE logical_agents SET pending_partition_name='other' WHERE id=?1",
+            [agent.as_str()],
+        )
+        .unwrap();
+        match action {
+            "configuration" => {
+                env.kernel
+                    .report_configuration_unavailable(
+                        &acquired.claim.attempt_id,
+                        acquired.claim.lease_epoch,
+                        "not available",
+                    )
+                    .unwrap();
+            }
+            "cancel" => env.kernel.cancel_task(&task, false).unwrap(),
+            "recovery" => {
+                env.kernel.recover_authority().unwrap();
+            }
+            "fatal" => {
+                env.kernel
+                    .record_preparation_fault(
+                        &acquired.claim,
+                        agentype_core::PreparationFaultKind::InvariantViolation,
+                    )
+                    .unwrap();
+                env.kernel.recover_authority().unwrap();
+                assert_eq!(
+                    env.kernel
+                        .open_escalation_for_task(&task)
+                        .unwrap()
+                        .failure_class(),
+                    None
+                );
+            }
+            _ => unreachable!(),
+        }
+        let after = env.kernel.logical_agent(&agent).unwrap();
+        assert_eq!(after.state, LogicalAgentState::Suspended, "{action}");
+        assert_eq!(after.partition.as_str(), "general");
+        assert_eq!(after.retention, Retention::Resident);
+        assert_eq!(after.pending_partition.unwrap().as_str(), "other");
+        assert!(after.current_task_id.is_none());
+        assert_eq!(
+            env.kernel.incarnation(&incarnation).unwrap().state,
+            agentype_core::IncarnationState::Warm
+        );
+        assert_eq!(
+            env.kernel.get_provisioning_binding(&incarnation).unwrap(),
+            Some(binding)
+        );
+        assert_eq!(
+            raw.query_row(
+                "SELECT COUNT(*) FROM attempts WHERE state='ACTIVE'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM incarnations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        env.kernel.recover_authority().unwrap();
+        assert_eq!(
+            env.kernel.logical_agent(&agent).unwrap().state,
+            LogicalAgentState::Suspended
+        );
+        assert_eq!(
+            env.kernel.incarnation(&incarnation).unwrap().state,
+            agentype_core::IncarnationState::Warm
+        );
+    }
+}
+
+#[test]
+fn merge_rechecks_an_assigned_agents_redirected_pending_destination() {
+    let env = Env::with_retention("typed-pending-redirect", 1, Retention::Resident);
+    let (pin, catalog, agent, incarnation) = resident_host(&env);
+    for (name, target) in [("middle", "local"), ("other", "remote")] {
+        env.kernel
+            .upsert_partition(&PartitionSpec::new(
+                name,
+                0,
+                Retention::Resident,
+                target,
+                "default",
+            ))
+            .unwrap();
+    }
+    let task = admit_typed_task(&env.kernel, pin);
+    let acquired = env
+        .kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    // Same-target MERGE legitimately stages the assigned member. A subsequent
+    // merge must check its redirected intent even though it is not a member of
+    // the source partition yet.
+    env.kernel.merge_partitions("general", "middle").unwrap();
+    let staged = env.kernel.logical_agent(&agent).unwrap();
+    assert_eq!(staged.partition.as_str(), "general");
+    assert_eq!(staged.pending_partition.unwrap().as_str(), "middle");
+    assert!(env.kernel.merge_partitions("middle", "other").is_err());
+    assert_eq!(env.kernel.task(&task).unwrap().partition.as_str(), "middle");
+    assert_eq!(
+        env.kernel
+            .logical_agent(&agent)
+            .unwrap()
+            .pending_partition
+            .unwrap()
+            .as_str(),
+        "middle"
+    );
+    assert_eq!(
+        env.kernel.incarnation(&incarnation).unwrap().state,
+        agentype_core::IncarnationState::Warm
+    );
+    env.kernel
+        .report_configuration_unavailable(
+            &acquired.claim.attempt_id,
+            acquired.claim.lease_epoch,
+            "not available",
+        )
+        .unwrap();
+    assert_eq!(
+        env.kernel.logical_agent(&agent).unwrap().partition.as_str(),
+        "middle"
+    );
+    assert_eq!(
+        env.kernel.incarnation(&incarnation).unwrap().state,
+        agentype_core::IncarnationState::Warm
+    );
+}
+
+#[test]
+fn typed_merge_allows_same_target_warm_and_cross_target_unstarted_reservation() {
+    for executed in [true, false] {
+        let env = Env::with_retention("safe-typed-merge", 1, Retention::Resident);
+        let incarnation = if executed {
+            resident_host(&env).3
+        } else {
+            let pin = publish_agent_contract(
+                &env.kernel,
+                "resident",
+                false,
+                LifecycleMode::Resident,
+                ContinuityMode::None,
+            );
+            let catalog = publish_source_contract(
+                &env.kernel,
+                "resident",
+                LifecycleMode::Resident,
+                ContinuityMode::None,
+            );
+            let agent = env.kernel.ready_agent("general").unwrap();
+            env.kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let task = admit_typed_task(&env.kernel, pin);
+            let acquired = env
+                .kernel
+                .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+                .unwrap();
+            env.kernel.cancel_task(&task, false).unwrap();
+            acquired.provisioning_binding.incarnation_id
+        };
+        let host = env.kernel.incarnation(&incarnation).unwrap();
+        let binding = env.kernel.get_provisioning_binding(&incarnation).unwrap();
+        env.kernel
+            .upsert_partition(&PartitionSpec::new(
+                "other",
+                0,
+                Retention::Resident,
+                if executed { "local" } else { "remote" },
+                "default",
+            ))
+            .unwrap();
+        env.kernel.merge_partitions("general", "other").unwrap();
+        assert_eq!(
+            env.kernel
+                .logical_agent(&host.logical_agent_id)
+                .unwrap()
+                .partition
+                .as_str(),
+            "other"
+        );
+        assert_eq!(
+            env.kernel.incarnation(&incarnation).unwrap().state,
+            if executed {
+                agentype_core::IncarnationState::Warm
+            } else {
+                agentype_core::IncarnationState::Lost
+            }
+        );
+        assert_eq!(
+            env.kernel.get_provisioning_binding(&incarnation).unwrap(),
+            binding
+        );
+    }
+}
+
+#[test]
+fn merge_cannot_downgrade_a_missing_provisioning_child_to_legacy_cutover() {
+    let env = Env::with_retention("corrupt-typed-merge", 1, Retention::Resident);
+    let (_, _, agent, incarnation) = resident_host(&env);
+    env.kernel
+        .upsert_partition(&PartitionSpec::new(
+            "other",
+            0,
+            Retention::Resident,
+            "remote",
+            "default",
+        ))
+        .unwrap();
+    let raw = env.raw();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    raw.execute("DROP TRIGGER provisioning_bindings_immutable_delete", [])
+        .unwrap();
+    raw.execute(
+        "DELETE FROM provisioning_bindings WHERE incarnation_id=?1",
+        [incarnation.as_str()],
+    )
+    .unwrap();
+    assert!(env.kernel.merge_partitions("general", "other").is_err());
+    assert_eq!(
+        env.kernel.logical_agent(&agent).unwrap().partition.as_str(),
+        "general"
+    );
+    assert_eq!(
+        env.kernel.incarnation(&incarnation).unwrap().state,
+        agentype_core::IncarnationState::Warm
+    );
 }
 
 #[test]

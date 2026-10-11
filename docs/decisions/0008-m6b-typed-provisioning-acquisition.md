@@ -40,14 +40,17 @@ retention, source/type compatibility and imported enforcement must all qualify.
 Evidence is bound to that exact physical domain. Catalog declarations cannot
 substitute for imported enforceability.
 
-The resolver validates target/profile and all known hard filters before
-source-private attestation: policy activity/kind, protocol support, credentials,
-retention, contract compatibility and enforceability. Only otherwise eligible
-revisions enter read-only I/O. The transaction independently re-proves its
-mandatory predicates; preflight grants no authority. The frozen readiness
-gate is shared with legacy claim selection: QUEUED Task, ACTIVE Batch, active
-partition and due backoff. Both existing/new paths reload it in the final
-authority transaction; a suspended sibling Batch cannot grant a typed claim.
+Before semantic matching, the acquisition facade performs a read-only readiness
+preflight; direct candidate enumeration uses the same gate before private I/O.
+One SELECT observes QUEUED Task, ACTIVE Batch, active partition and due backoff
+through Core `claim_task_ready`. Known unreadiness rejects before attestation
+faults or budgets can affect the control loop. Success grants no authority.
+The resolver also validates target/profile, policy activity/kind, protocol,
+credentials, retention, compatibility and enforceability before attestation.
+Both existing/new paths independently re-prove readiness and all mandatory
+predicates in the authority transaction. A concurrent change during attestation
+cannot grant a claim or leave newborn rows; a suspended sibling Batch cannot
+grant a typed claim.
 
 Credential-bearing configs fail closed until B.5 supplies trusted, source-bound
 availability and brokering. A caller-provided boolean is not such proof. Core
@@ -100,6 +103,13 @@ ConfigurationUnavailable, preserving the old host and creating no new claim.
 Same-provenance reuse remains valid. Enabling replacement requires the actual
 M5 lifecycle to close the host or a separately specified and conformant physical
 safety witness; a SQL LOST update supplies neither.
+
+This guard also governs common legacy cutover. MERGE preflights typed hosts
+before topology changes, and commit rechecks. A prior-v8 unsafe pending intent
+defers at claim release: preserve the old host/partition/retention, keep pending
+and suspend the unassigned agent. Same-target movement and never-executed
+reservations remain valid; terminal Execution is not a cross-target host-stop
+proof. MOVE_CAPACITY continues to exclude BOUND population.
 
 `BindingSnapshot` is the per-Execution commitment. It records exact binding
 provenance, target/profile, admitted capabilities, imported capability and
@@ -206,6 +216,11 @@ physical quiescence. Root can explicitly retry or cancel through the existing
 resolution primitive after repair. A crash before fault observation remains an
 ordinary M5 orphan. Failed fault persistence propagates without claiming a
 durable fence; failed notification persistence rolls back the suspension.
+Confirmed fatal typed launch composition and definite snapshot/settlement
+rejection use the same fact and Root decision mechanism. Fault writes re-prove
+exact ownership and no Execution/association. StorageFailure/RecoveryRequired
+at Execution COMMIT can have an unknown outcome and remain M5-recovery-owned;
+they cannot claim an absent Execution or a successful fault fence.
 Output grammar is checked before post-call deadline
 and digest-equality availability checks. A valid digest whose content no longer
 matches attestation remains a distinct availability/TOCTOU rejection.
@@ -254,6 +269,10 @@ mode. Effective workspace and network policy are carried to the start request.
   new domain needs an actionable Root decision without counterfeit Task failure
   or quiescence. PreparationFaultKind is shared in Core and re-exported by storage.
   Existing retry/cancel primitives and worker writer-safety behavior remain.
+- Legacy MERGE/cutover now protects provisioned physical hosts too; assigned
+  pre-Execution and old pending paths cannot bypass provenance closure. The
+  existing fault API covers pure handoff as well as source prepare; COMMIT
+  uncertainty retains M5 semantics. ADR-0011 states these behavior reasons.
 - The internal `provisioning-producer` feature narrows the default contract-crate
   surface. Cargo feature unification means it is not an unforgeable authority
   token; transactional re-proof and control APIs that accept no caller-supplied

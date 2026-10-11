@@ -25,9 +25,15 @@ not silently change. B.5 and daemon wiring remain outside this correction.
 
 Legacy and both typed authority paths share Core `claim_task_ready`: Task
 QUEUED, Batch ACTIVE, partition active and backoff due. Typed acquisition reloads
-these facts inside its final transaction. Semantic compatibility cannot waive
-Batch suspension. The legacy wrapper additionally excludes typed Tasks; typed
-acquisition still requires its separate semantic and provisioning proof.
+these facts inside its final transaction. Its facade also performs a read-only
+readiness preflight before matching, and candidate enumeration guards direct
+internal calls before source-private attestation. One SELECT reads all readiness
+facts together. This internal check avoids irrelevant I/O and lets readiness
+rejection precede producer faults; success is not a claim capability. A concurrent
+change during attestation still requires transactional rejection/rollback.
+Semantic compatibility cannot waive Batch suspension. The legacy wrapper
+additionally excludes typed Tasks; typed acquisition still requires its separate
+semantic and provisioning proof.
 
 Legacy claim selection, B.3 semantic preselection and B.4 transactional placement
 use the same pure Core `claim_placement_eligible` decision. Required continuity
@@ -82,6 +88,24 @@ before acquisition and leaves the host WARM. This narrows the B.4 replacement
 path because SQL fencing cannot satisfy M5 physical safety; same-provenance reuse
 and the frozen settlement/termination APIs retain their behavior.
 
+The same physical-phase check applies at the common partition cutover boundary.
+A validated ProvisioningBinding on a WARM/STARTING Incarnation with Execution
+history requires actual host lifecycle closure before cross-target movement.
+Terminal Task Executions alone are insufficient. MERGE checks all resulting
+destinations, including assigned pre-Execution agents and redirected pending
+intents, before rewriting topology. Commit independently rechecks. Lost or
+incoherent provenance fails closed rather than selecting legacy semantics.
+
+A prior-v8 pending move can predate this guard. Claim closure still commits, but
+release preserves the old host, partition and retention, keeps the destination
+pending and suspends the unassigned agent. It does not perform SQL-only LOST,
+grant a new claim or pretend to stop resources. Actual host closure is required
+before resuming that move and remains a physical integration gate. Same-target
+movement and pure reservations with no Execution history still work. Legacy
+UNBOUND topology retains its frozen rules; MOVE_CAPACITY already excludes BOUND
+population. This narrows the existing MERGE/cutover behavior because the new
+physical provenance must remain protected across old interfaces too.
+
 The association correction requires no settlement API or schema changes. There
 is no new physical provisioning lifecycle and no generic `execution.is_none()`
 exception to the writer-safety gate.
@@ -124,6 +148,20 @@ errors propagate fatally; an unsuccessful write cannot claim a durable fence.
 After control-plane repair, Root uses the existing resolve_escalation primitive
 to choose retry or cancellation explicitly; automatic retry remains forbidden.
 The existing Result signature is retained; its fault semantics are honored.
+
+Pure preparation extends through typed launch composition and definite snapshot
+validation/constraint rejection. A confirmed fatal handoff inconsistency or
+failed pre-start settlement uses the same immutable Attempt fault and Root
+decision flow before returning; no separate fault lifecycle is introduced.
+Fact recording re-proves exact ownership and absence of Execution/association.
+Failed persistence remains fatal without claiming a successful fence.
+
+The Execution COMMIT boundary is different. StorageFailure/RecoveryRequired may
+mean an unknown transaction outcome; runtime preserves that error for M5
+reconciliation without writing a pre-Execution fact or asserting Execution is
+absent. A definite validation/constraint rejection can record a fault only in a
+fresh fenced transaction. An existing Execution forbids the fact. Errors after
+Execution commitment remain in M5's RequestId/reconciliation domain.
 
 EscalationRecord and the Core resolution snapshot now carry EscalationCause:
 TaskFailure(FailureClass) or PreparationFault(attempt_id, kind). The former
@@ -239,7 +277,17 @@ Batch blocks both acquisition paths without newborn side rows; explicit Root
 resolution restores ACTIVE and permits acquisition. Recovery tests prove one
 preparation decision/event, notification-failure rollback, idempotence, explicit
 retry/cancel and no counterfeit worker/quiescence cause. Prior-v8 suspended
-faults gain a decision once; resolved faults never reopen. Guard tests cover identity
+faults gain a decision once; resolved faults never reopen. Readiness probes cover
+Task state, Batch suspension, inactive partition and future backoff on both
+existing/new paths: zero attest/prepare calls and unchanged authority/population
+rows, with a valid due-backoff counterpart. A separate controller changes each
+readiness fact during attestation; the final transaction rejects with zero
+prepare calls and no newborn side rows. MERGE and old pending-move tests cover READY/assigned host preservation,
+same-target and unstarted counterparts, pre-Execution closure and corrupted
+provenance. Handoff fault tests cover target/candidate drift, rejected snapshot
+commitment and failed availability settlement; restart yields one Root decision
+with no ExecutionLost retry. A real committed Execution/RequestId survives an
+unknown-result error without a preparation fact. Guard tests cover identity
 forgery, immutable facts, late elapsed leases, blocked commitment/settlement,
 explicit cancellation, prior-v8 reopening and preservation of an executed WARM
 host. Two-config attestation tests distinguish local unavailability from global

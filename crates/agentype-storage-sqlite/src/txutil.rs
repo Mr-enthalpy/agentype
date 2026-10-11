@@ -210,6 +210,13 @@ pub fn unsafe_cross_target_execution(
     target_execution_target: &str,
     now: UnixTime,
 ) -> Result<bool, Error> {
+    if crate::provisioning::cross_target_provisioned_host_requires_closure(
+        tx,
+        agent_id,
+        target_execution_target,
+    )? {
+        return Ok(true);
+    }
     let mut stmt = tx
         .prepare(
             "SELECT e.attempt_isolation,e.terminal_confirmed,e.quiescent_confirmed,a.state AS attempt_state,
@@ -363,6 +370,24 @@ pub fn release_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime) -> Res
         .pending_partition
         .clone()
         .unwrap_or_else(|| agent.partition.clone());
+    let destination = canonical_partition(tx, &target_name)?;
+    if crate::provisioning::cross_target_provisioned_host_requires_closure(
+        tx,
+        agent_id,
+        &destination.execution_target,
+    )? {
+        // An earlier PR-era pending intent may predate the topology guard.
+        // Close the claim without committing that unsafe move or losing its
+        // host. Keep the original partition/retention and the pending intent;
+        // no new claim can use this agent until actual lifecycle closure.
+        tx.execute(
+            "UPDATE logical_agents SET state='SUSPENDED',current_task_id=NULL,
+             pending_partition_name=?1,available_since=NULL,updated_at=?2 WHERE id=?3",
+            params![destination.name, now, agent_id],
+        )
+        .map_err(map_sqlite)?;
+        return Ok(());
+    }
     let target = commit_partition_cutover(tx, &agent, &target_name, now)?;
     let target_retention = Retention::parse_sql(&target.retention)?;
     let disposition = agent_release_disposition(false, target_retention);

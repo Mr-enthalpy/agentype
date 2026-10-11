@@ -779,6 +779,49 @@ fn incarnation_is_fresh(tx: &Transaction<'_>, incarnation_id: &str) -> Result<bo
     Ok(any_execution.is_none())
 }
 
+/// A Task's terminal Execution is not a stop witness for its reusable host.
+/// Acquisition and legacy topology must use the same physical-phase boundary.
+pub(crate) fn incarnation_requires_physical_closure(
+    tx: &Transaction<'_>,
+    incarnation_id: &str,
+    state: &str,
+) -> Result<bool, Error> {
+    Ok(matches!(state, "WARM" | "STARTING") && !incarnation_is_fresh(tx, incarnation_id)?)
+}
+
+/// Preserve frozen legacy cutover semantics, but never abandon a provisioned
+/// physical host merely because its Task Executions have become terminal.
+pub(crate) fn cross_target_provisioned_host_requires_closure(
+    tx: &Transaction<'_>,
+    agent_id: &str,
+    execution_target: &str,
+) -> Result<bool, Error> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id,state FROM incarnations
+        WHERE logical_agent_id=?1 AND execution_target<>?2 AND state IN ('STARTING','WARM','COLD')",
+        )
+        .map_err(map_sqlite)?;
+    let rows = statement
+        .query_map(params![agent_id, execution_target], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(map_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_sqlite)?;
+    let mut requires_closure = false;
+    for (id, state) in rows {
+        // Validated marker/child reads also reject lost provenance; corruption
+        // cannot silently downgrade a typed host to the legacy cutover policy.
+        if get_provisioning_binding(tx, &IncarnationId::from_string(&id))?.is_some()
+            && incarnation_requires_physical_closure(tx, &id, &state)?
+        {
+            requires_closure = true;
+        }
+    }
+    Ok(requires_closure)
+}
+
 #[cfg(any(test, feature = "runtime-internal"))]
 /// Fence an idle Incarnation so a new provenance can be rolled over onto a fresh
 /// one. Active claims and executions prevent rollover. A STARTING Incarnation
@@ -826,13 +869,14 @@ fn fence_idle_incarnation(
     // were stopped or isolated. B.4 has no durable physical cleanup witness;
     // preserve the host until the M5 lifecycle actually closes it. This is a
     // pre-acquisition eligibility rejection, not a Task NACK or SQL-only LOST.
-    if state == "WARM" && !incarnation_is_fresh(tx, incarnation_id)? {
+    let requires_closure = incarnation_requires_physical_closure(tx, incarnation_id, &state)?;
+    if state == "WARM" && requires_closure {
         return Err(Error::configuration_unavailable(
             "warm incarnation provenance replacement requires physical lifecycle evidence",
         ));
     }
     if state == "STARTING"
-        && (!incarnation_is_fresh(tx, incarnation_id)?
+        && (requires_closure
             || get_provisioning_binding(tx, &IncarnationId::from_string(incarnation_id))?.is_none())
     {
         return Err(Error::invalid_transition(

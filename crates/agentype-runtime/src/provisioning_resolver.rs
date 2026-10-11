@@ -707,6 +707,10 @@ fn enumerate_candidates(
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    // Internal enumeration is also used outside the acquisition facade. Reject
+    // known unreadiness before any source-private I/O; the final transaction
+    // still re-proves readiness and owns all Attempt/Lease authority.
+    kernel.check_typed_acquisition_readiness(task_id)?;
     let task = kernel.task(task_id)?;
     let partition = kernel.partition(task.partition.as_str())?;
     let (target, _profile) = agentype_execution_config::resolve_target_profile(
@@ -1030,6 +1034,9 @@ pub(crate) fn acquire_typed_task(
     attest_deadline: &AdapterDeadline,
     prepare_deadline: &AdapterDeadline,
 ) -> Result<TypedAcquisitionOutcome, ProvisioningResolutionError> {
+    // Readiness rejection must win over semantic/source resolution faults for
+    // work that cannot be dispatched. This read grants no acquisition authority.
+    kernel.check_typed_acquisition_readiness(task_id)?;
     let existing = kernel.match_existing_agents_for_task(task_id)?;
     let mut last_error: Option<ProvisioningResolutionError> = None;
     for candidate in existing {
@@ -1463,6 +1470,252 @@ mod tests {
     use std::time::Duration;
 
     const MAX_BYTES: usize = 16_384;
+
+    struct ReadinessProbe {
+        attest_calls: Arc<std::sync::atomic::AtomicUsize>,
+        prepare_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_attest: bool,
+        // Synchronize a separate controller's write during pure attestation.
+        after_attest: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl SourceConfigIntegration for ReadinessProbe {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            self.attest_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(after_attest) = &self.after_attest {
+                after_attest();
+            }
+            if self.fail_attest {
+                return Err(ProvisioningResolutionError::MissingRevision(
+                    "unready Task reached a fatal producer".into(),
+                ));
+            }
+            EchoMaterializer.attest(revision, kind, key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            kind: &str,
+            key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            self.prepare_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            EchoMaterializer.prepare(revision, kind, key, deadline)
+        }
+    }
+
+    fn set_unready(raw: &rusqlite::Connection, task: &TaskId, condition: &str) {
+        let sql = match condition {
+            "batch" => "UPDATE batches SET state='SUSPENDED' WHERE id=(SELECT batch_id FROM tasks WHERE id=?1)",
+            "partition" => "UPDATE pool_partitions SET active=0 WHERE name=(SELECT partition_name FROM tasks WHERE id=?1)",
+            "backoff" => "UPDATE tasks SET next_eligible_at=1001.0 WHERE id=?1",
+            "task" => "UPDATE tasks SET state='SUSPENDED' WHERE id=?1",
+            _ => unreachable!(),
+        };
+        raw.execute(sql, [task.as_str()]).unwrap();
+    }
+
+    fn readiness_store_counts(raw: &rusqlite::Connection) -> Vec<i64> {
+        [
+            "attempts",
+            "leases",
+            "provisioning_bindings",
+            "logical_agents",
+            "incarnations",
+            "failures",
+            "preparation_faults",
+        ]
+        .iter()
+        .map(|table| {
+            raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn unready_typed_task_never_calls_source_attestation() {
+        for existing in [false, true] {
+            for condition in ["batch", "partition", "backoff", "task"] {
+                let (kernel, raw) = preparation_kernel();
+                let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+                let task = typed_task(&kernel, pin.clone());
+                if existing {
+                    let agent = kernel.ready_agent("general").unwrap();
+                    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+                }
+                set_unready(&raw, &task, condition);
+                let counts = readiness_store_counts(&raw);
+                let attest_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let prepare_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let integrations = si(ReadinessProbe {
+                    attest_calls: attest_calls.clone(),
+                    prepare_calls: prepare_calls.clone(),
+                    fail_attest: true,
+                    after_attest: None,
+                });
+                let adapters = adapters_with_binding();
+                let registry = execution_registry();
+                let result = acquire_typed_task(
+                    &kernel,
+                    &task,
+                    &adapters,
+                    &registry,
+                    &integrations,
+                    &deadline(),
+                    &deadline(),
+                );
+                assert_eq!(
+                    attest_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{existing}/{condition}"
+                );
+                assert!(matches!(
+                    result,
+                    Err(ProvisioningResolutionError::Storage(
+                        agentype_core::Error::InvalidTransition(_)
+                    ))
+                ));
+                // Direct internal enumeration cannot bypass the same preflight.
+                let result = resolve_source_candidates(
+                    &kernel,
+                    &task,
+                    &adapters,
+                    &registry,
+                    &integrations,
+                    &deadline(),
+                );
+                assert!(matches!(
+                    result,
+                    Err(ProvisioningResolutionError::Storage(
+                        agentype_core::Error::InvalidTransition(_)
+                    ))
+                ));
+                assert_eq!(attest_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(prepare_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(readiness_store_counts(&raw), counts);
+            }
+        }
+    }
+
+    #[test]
+    fn ready_typed_task_attests_and_prepares_on_existing_and_new_paths() {
+        for existing in [false, true] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin.clone());
+            let agent = kernel.ready_agent("general").unwrap();
+            if existing {
+                kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            }
+            raw.execute(
+                "UPDATE tasks SET next_eligible_at=1000.0 WHERE id=?1",
+                [task.as_str()],
+            )
+            .unwrap();
+            let attest_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prepare_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let result = acquire_typed_task(
+                &kernel,
+                &task,
+                &adapters_with_binding(),
+                &execution_registry(),
+                &si(ReadinessProbe {
+                    attest_calls: attest_calls.clone(),
+                    prepare_calls: prepare_calls.clone(),
+                    fail_attest: false,
+                    after_attest: None,
+                }),
+                &deadline(),
+                &deadline(),
+            )
+            .unwrap();
+            assert_eq!(attest_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(prepare_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(result.acquisition.claim.logical_agent_id == agent, existing);
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+        }
+    }
+
+    #[test]
+    fn readiness_loss_during_attestation_still_rolls_back_authority() {
+        for existing in [false, true] {
+            for condition in ["batch", "partition", "backoff", "task"] {
+                let (kernel, raw) = preparation_kernel();
+                let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+                let task = typed_task(&kernel, pin.clone());
+                if existing {
+                    let agent = kernel.ready_agent("general").unwrap();
+                    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+                }
+                let counts = readiness_store_counts(&raw);
+                let attest_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let prepare_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+                let path = raw.path().unwrap().to_string();
+                let task_for_controller = task.clone();
+                let controller = std::thread::spawn(move || {
+                    start_rx.recv().unwrap();
+                    let connection = rusqlite::Connection::open(path).unwrap();
+                    set_unready(&connection, &task_for_controller, condition);
+                    done_tx.send(()).unwrap();
+                });
+                let done_rx = std::sync::Mutex::new(done_rx);
+                let result = acquire_typed_task(
+                    &kernel,
+                    &task,
+                    &adapters_with_binding(),
+                    &execution_registry(),
+                    &si(ReadinessProbe {
+                        attest_calls: attest_calls.clone(),
+                        prepare_calls: prepare_calls.clone(),
+                        fail_attest: false,
+                        after_attest: Some(Box::new(move || {
+                            start_tx.send(()).unwrap();
+                            done_rx.lock().unwrap().recv().unwrap();
+                        })),
+                    }),
+                    &deadline(),
+                    &deadline(),
+                );
+                controller.join().unwrap();
+                // New-agent birth also requires an active partition, so that
+                // transaction may reject there before reaching finish_acquisition.
+                let rejected = match &result {
+                    Err(ProvisioningResolutionError::Storage(
+                        agentype_core::Error::InvalidTransition(_),
+                    )) => true,
+                    Err(ProvisioningResolutionError::Storage(agentype_core::Error::NotFound(
+                        _,
+                    ))) => !existing && condition == "partition",
+                    _ => false,
+                };
+                assert!(rejected, "{existing}/{condition}: {result:?}");
+                assert_eq!(attest_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(prepare_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(
+                    readiness_store_counts(&raw),
+                    counts,
+                    "{existing}/{condition}"
+                );
+            }
+        }
+    }
 
     // A fatal attestation error makes accidental evaluation visible: known
     // ineligibility must never spend a deadline or abort later valid candidates.
@@ -3878,6 +4131,254 @@ mod tests {
         assert!(matches!(err, crate::TypedLaunchError::Inconsistent(_)));
     }
 
+    #[test]
+    fn confirmed_fatal_handoff_survives_restart_as_a_root_decision() {
+        for fault in [
+            "target-kind",
+            "candidate-protocol",
+            "snapshot-descriptor",
+            "snapshot-constraint",
+            "settlement",
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task_with_retry(
+                &kernel,
+                pin.clone(),
+                agentype_core::RetryPolicy {
+                    max_attempts: 3,
+                    base_backoff_seconds: 0.0,
+                    retry_classes: vec![FailureClass::ExecutionLost],
+                    ..Default::default()
+                },
+            );
+            let agent = kernel.ready_agent("general").unwrap();
+            kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+            let (adapters, starts) = adapters_with_start_probe();
+            let mut outcome = acquire_typed_task(
+                &kernel,
+                &task,
+                &adapters,
+                &execution_registry(),
+                &si(EchoMaterializer),
+                &deadline(),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let mut registry = execution_registry();
+            match fault {
+            "target-kind" => {
+                registry = ExecutionRegistry::new();
+                registry.register_target(ExecutionTargetConfig::new("local", "different-kind", false)).unwrap();
+                registry.register_profile(ExecutionProfileConfig::new("default")).unwrap();
+            }
+            "candidate-protocol" => outcome.candidate.provisioning_protocol = "changed-protocol".into(),
+            "snapshot-descriptor" => outcome.launch_descriptor.clear(),
+            "snapshot-constraint" => raw.execute_batch("CREATE TRIGGER reject_snapshot BEFORE INSERT ON binding_snapshots BEGIN SELECT RAISE(ABORT,'snapshot constraint'); END;").unwrap(),
+            "settlement" => {
+                registry = ExecutionRegistry::new();
+                raw.execute_batch("CREATE TRIGGER reject_settlement BEFORE INSERT ON failures BEGIN SELECT RAISE(ABORT,'settlement constraint'); END;").unwrap();
+            }
+            _ => unreachable!(),
+        }
+            let error =
+                crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters)
+                    .unwrap_err();
+            assert_eq!(
+                error.disposition(),
+                crate::TypedLaunchDisposition::Fatal,
+                "{fault}: {error}"
+            );
+            assert_eq!(
+                kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+                Some(agentype_core::PreparationFaultKind::InvariantViolation)
+            );
+            let path = raw.path().unwrap().to_string();
+            drop(kernel);
+            let kernel =
+                Kernel::open(path, Arc::new(ManualClock::new(2_000.0)), 10.0, MAX_BYTES).unwrap();
+            let report = kernel.recover_authority().unwrap();
+            assert_eq!(report.retried, 0);
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Suspended);
+            let decision = kernel.open_escalation_for_task(&task).unwrap();
+            assert_eq!(
+                decision.cause,
+                agentype_core::EscalationCause::PreparationFault {
+                    attempt_id: claim.attempt_id,
+                    kind: agentype_core::PreparationFaultKind::InvariantViolation
+                }
+            );
+            for table in ["executions", "binding_snapshots", "failures"] {
+                assert_eq!(
+                    raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            kernel.recover_authority().unwrap();
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM escalations", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                raw.query_row(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id=?1",
+                    [decision.id.as_str()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(starts.start_call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn handoff_fault_persistence_failure_propagates_without_task_nack() {
+        let (kernel, raw) = preparation_kernel();
+        let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+        let task = typed_task(&kernel, pin);
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let mut outcome = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let claim = outcome.acquisition.claim.clone();
+        outcome.candidate.adapter_kind = "different-kind".into();
+        raw.execute_batch("CREATE TRIGGER reject_handoff_fault BEFORE INSERT ON preparation_faults BEGIN SELECT RAISE(ABORT,'fault persistence unavailable'); END;").unwrap();
+        let error = crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::TypedLaunchError::FaultPersistenceFailed(_)
+        ));
+        assert_eq!(error.disposition(), crate::TypedLaunchDisposition::Fatal);
+        assert_eq!(
+            kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+            None
+        );
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+        for table in ["executions", "failures", "escalations"] {
+            assert_eq!(
+                raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_execution_commit_cannot_be_replaced_with_a_pre_execution_fault() {
+        for error in [
+            agentype_core::Error::StorageFailure("commit result unknown".into()),
+            agentype_core::Error::RecoveryRequired("commit result unknown".into()),
+        ] {
+            let (kernel, raw) = preparation_kernel();
+            let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+            let task = typed_task(&kernel, pin);
+            let (adapters, starts) = adapters_with_start_probe();
+            let registry = execution_registry();
+            let outcome = acquire_typed_task(
+                &kernel,
+                &task,
+                &adapters,
+                &registry,
+                &si(EchoMaterializer),
+                &deadline(),
+                &deadline(),
+            )
+            .unwrap();
+            let claim = outcome.acquisition.claim.clone();
+            let plan = crate::plan_typed_execution_launch(&kernel, &outcome, &registry, &adapters)
+                .unwrap();
+            let snapshot = kernel
+                .create_execution_with_snapshot(
+                    &claim,
+                    plan.physical_binding,
+                    &plan.snapshot_record,
+                )
+                .unwrap();
+            // Model a committed transaction whose result was not received. The
+            // same production error handler must preserve this Execution and
+            // RequestId for M5 reconciliation, never invent an absent Execution.
+            let returned = crate::typed_execution_commit_error(&kernel, &claim, error.clone());
+            assert_eq!(returned, crate::TypedLaunchError::Kernel(error));
+            assert_eq!(returned.disposition(), crate::TypedLaunchDisposition::Fatal);
+            assert_eq!(
+                kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+                None
+            );
+            assert_eq!(
+                raw.query_row(
+                    "SELECT request_id FROM executions WHERE id=?1",
+                    [snapshot.execution_id().as_str()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                snapshot.request_id().as_str()
+            );
+            assert!(kernel
+                .get_binding_snapshot(snapshot.execution_id())
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(starts.start_call_count(), 0);
+        }
+    }
+
+    #[test]
+    fn typed_handoff_authority_loss_remains_recovery_owned_without_fault_fact() {
+        let (kernel, raw) = preparation_kernel();
+        let pin = publish_with_lifecycle(&kernel, LifecycleMode::Resident);
+        let task = typed_task(&kernel, pin);
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let outcome = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters,
+            &registry,
+            &si(EchoMaterializer),
+            &deadline(),
+            &deadline(),
+        )
+        .unwrap();
+        let claim = outcome.acquisition.claim.clone();
+        kernel.cancel_task(&task, false).unwrap();
+        let error = crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters)
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            crate::TypedLaunchDisposition::AuthorityLoss
+        );
+        assert_eq!(
+            kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+            None
+        );
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
     /// The exact acquired binding must still be installed at handoff time.
     #[test]
     fn typed_handoff_requires_the_exact_installed_binding() {
@@ -3899,6 +4400,7 @@ mod tests {
             &deadline(),
         )
         .unwrap();
+        let claim = outcome.acquisition.claim.clone();
         outcome.candidate.adapter_binding_key = "not-installed".into();
         let err = crate::prepare_typed_execution_launch(&kernel, outcome, &registry, &adapters)
             .unwrap_err();
@@ -3906,6 +4408,10 @@ mod tests {
             err,
             crate::TypedLaunchError::Adapter(crate::AdapterUnavailable::Missing { .. })
         ));
+        assert_eq!(
+            kernel.preparation_fault_kind(&claim.attempt_id).unwrap(),
+            None
+        );
     }
 
     /// The handoff re-qualifies the CURRENT installed enforceability against the

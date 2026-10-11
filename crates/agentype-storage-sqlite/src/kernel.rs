@@ -1408,6 +1408,25 @@ impl Kernel {
         self.tx(|tx, now| {
             let source_p = required_partition(tx, source, true)?;
             let target_p = required_partition(tx, target, true)?;
+            // MERGE includes BOUND agents, unlike legacy MOVE_CAPACITY. Check
+            // every resulting destination before rewriting Tasks/partitions,
+            // including assigned pre-Execution agents and redirected pending
+            // moves. The shared commit guard independently rechecks at release.
+            let affected: Vec<(String, Option<String>)> = {
+                let mut statement = tx.prepare("SELECT id,pending_partition_name FROM logical_agents
+                    WHERE state<>'RETIRED' AND (partition_name=?1 OR pending_partition_name=?1)").map_err(map_sqlite)?;
+                let rows = statement.query_map([source], |r| Ok((r.get(0)?, r.get(1)?))).map_err(map_sqlite)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_sqlite)?
+            };
+            for (agent_id, pending) in affected {
+                let desired = pending.as_deref().filter(|p| *p != source).unwrap_or(target);
+                let destination = canonical_partition(tx, desired)?;
+                if crate::provisioning::cross_target_provisioned_host_requires_closure(
+                    tx, &agent_id, &destination.execution_target,
+                )? {
+                    return Err(Error::invalid_transition("typed host cutover requires physical lifecycle closure"));
+                }
+            }
             let revision = insert_revision(
                 tx,
                 "MERGE",
@@ -4052,6 +4071,42 @@ impl Kernel {
     }
 
     // ------------------------------------------------------------------ getters
+
+    /// Read-only rejection gate before source-private typed acquisition work.
+    /// One SELECT observes Task/Batch/partition/backoff together; success grants
+    /// no authority. The acquisition transaction must re-prove the same Core
+    /// readiness predicate after any attestation or concurrent control change.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
+        let now = self.clock.now();
+        self.store.query(|conn| {
+            let (state, batch, active, next): (String, Option<String>, Option<bool>, Option<f64>) =
+                conn.query_row(
+                    "SELECT t.state,b.state,p.active,t.next_eligible_at FROM tasks t
+                     LEFT JOIN batches b ON b.id=t.batch_id
+                     LEFT JOIN pool_partitions p ON p.name=t.partition_name WHERE t.id=?1",
+                    params![id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(map_sqlite)?
+                .ok_or_else(|| Error::not_found(format!("tasks {id:?} not found")))?;
+            let batch = batch.ok_or_else(|| Error::invariant("Task has no Batch"))?;
+            let active = active.ok_or_else(|| Error::invariant("Task has no partition"))?;
+            if !claim_task_ready(
+                TaskState::parse_sql(&state)?,
+                BatchState::parse_sql(&batch)?,
+                active,
+                next,
+                now,
+            ) {
+                return Err(Error::invalid_transition(
+                    "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
+                ));
+            }
+            Ok(())
+        })
+    }
 
     pub fn task(&self, id: &TaskId) -> Result<TaskRecord, Error> {
         self.store.query(|conn| {

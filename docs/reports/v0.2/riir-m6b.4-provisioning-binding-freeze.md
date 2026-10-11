@@ -13,7 +13,8 @@ M4–M6-B.3 (`cbd5a7518395247dc7abfef996eb307e7a526f25`, schema v7). It introduc
 schema v8 provisioning provenance, pure source preparation and a snapshot-bearing
 Execution handoff. Typed daemon dispatch and production source integration remain
 pending; this is a library/composition boundary, not an end-to-end production
-typed dispatch claim.
+typed dispatch claim. It is not a deployable production typed runtime or a
+drop-in upgrade of existing v7 installations.
 Deployment is restricted to fresh schema-v8 databases and reopening existing
 v8 databases. Idempotent initialization installs additive preparation-fault
 and decision guards on prior PR-era v8 stores; recovery repairs a latest
@@ -67,7 +68,11 @@ into running typed daemon dispatch is a remaining step.
 - The authority transaction re-proves imported facts and the catalog frontier.
   No public control API accepts caller-supplied enforcement evidence. Default
   producer visibility is a supported-surface fence, not an authority token.
-- Known hard filters precede source-private I/O. Credentials fail closed for
+- Read-only Task/Batch/partition/backoff preflight precedes semantic matching
+  and direct source enumeration. Known unreadiness spends no attest/prepare
+  budget; success grants no authority and concurrent changes still reject or
+  roll back in the final transaction. Known hard filters precede private I/O.
+  Credentials fail closed for
   B.5; ambiguous continuity ties fail closed while availability/cost ranking is
   deferred. Corruption is fatal, never silently skipped.
 - Preparation preserves integration-returned fault kinds. Explicit availability
@@ -81,6 +86,8 @@ into running typed daemon dispatch is a remaining step.
   retry/cancel after repair through the existing resolution primitive. A crash
   before confirmed fault keeps ordinary orphan recovery. Failed fault writes
   cannot claim a durable fence; failed notification writes roll back suspension.
+  Confirmed pure handoff and definite snapshot/settlement faults use that same
+  mechanism; uncertain Execution COMMIT errors preserve M5 reconciliation.
 - Malformed successful producer output and observed integration-protocol drift
   are fatal too. They preserve claim rows, fence activity and produce no worker failure, retry,
   Execution or snapshot. Grammar checks precede post-call availability checks.
@@ -114,12 +121,13 @@ capacity and retirement fencing retain their behavior.
 | Committed descriptor on ExecutionLaunchSnapshot and start constructors | The trusted constructor gains an optional descriptor to close the committed-provenance → request boundary. Typed request construction consumes committed A and rejects B/empty/legacy construction; legacy remains empty. The raw unsafe constructor is still a procedural trust contract |
 | Durable preparation-fault category and ownership-only fact fence | Confirmed producer faults must survive recovery without becoming ExecutionLost. No worker FailureClass or physical lifecycle is introduced. An elapsed but still-owned ACTIVE claim may record a late fact; activity authority still requires an unexpired lease |
 | Resolver requires ExecutionRegistry | Authoritative target/profile are needed before attestation, so irrelevant candidates cannot spend the shared budget or hide eligible sources |
-| Shared readiness/placement/isolation decisions | Legacy and both typed authority paths share QUEUED/ACTIVE Batch/active partition/due backoff; placement and isolation also preserve frozen gates across matching, commitment and handoff |
+| Shared readiness/placement/isolation decisions and read-only readiness check | Legacy and both typed authority paths share QUEUED/ACTIVE Batch/active partition/due backoff. Preflight rejects before irrelevant private I/O or producer faults, without granting authority; concurrent changes still require final recheck. Placement/isolation preserve frozen gates across matching, commitment and handoff |
 | EscalationCause replaces mandatory failure_class | A new preparation domain needs Root notification/resolution without a worker FailureClass. TaskFailure keeps legacy safety rules; PreparationFault names the immutable Attempt fact. The optional failure_class() getter and storage kind re-export preserve meaningful legacy access |
 | Attempt association deferred to Execution | Restore frozen M5 physical-phase assumptions and preserve earlier WARM hosts across every pre-Execution closure; settlement APIs and schema need no additional amendment |
 | Source registry wildcard restricted to private unit tests | A new source revision must not inherit opaque-config interpretation without an explicit composition-root routing decision; shared integrations use multiple registrations |
 | Internal PreparedTypedExecutionLaunch owns exact binding | Retain the validated instance and deadlines through dispatch, preventing stale-binding re-selection; public legacy PreparedExecutionLaunch remains unchanged |
-| Executed WARM provenance replacement fails closed | Terminal Execution rows cannot prove cleanup of external resources; preserve the host until M5 lifecycle closure or a future verified safety witness |
+| Executed WARM provenance replacement and common cutover fail closed | Terminal Execution rows cannot prove host cleanup. MERGE preflights READY/assigned typed hosts; commit rechecks. Prior unsafe pending moves defer at release with original host/partition/retention and a suspended agent. Same-target/unstarted movement remains valid |
+| Pure typed handoff shares the durable fault fence | A confirmed compositor or definite snapshot/settlement fault is control-plane evidence, not an orphan worker failure. Existing fault/Root machinery applies before Execution; uncertain COMMIT and committed RequestId remain M5-owned |
 | Attestation returns Option<MaterializationDigest> | Separate explicit unavailability from valid successful output; replace the empty-string SPI convention without changing acquisition authority |
 | Sanitized integration failure categories | Private source diagnostics do not become authorized public/log output; discard payloads and preserve existing stage-specific candidate/fatal/authority semantics |
 | Typed population excluded from legacy capacity | Legacy desired population cannot retire semantically bound agents; full typed topology remains deferred (ADR-0009) |
@@ -130,8 +138,8 @@ Local checks on 2026-10-11:
 
 | Check | Result |
 |---|---|
-| Storage with test-support | 309 tests and 1 doc probe passed, including B.4 51, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 43 passed, including actionable Root recovery and restart fault/orphan counterparts, two-config fault routing, descriptor substitution, fault-write failure and private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
+| Storage with test-support | 314 tests and 1 doc probe passed, including B.4 56, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 50 passed, including zero-I/O unreadiness, due-backoff existing/new counterparts, separate-controller readiness races, fatal handoff/snapshot/settlement restart, uncertain-COMMIT counterpart, failed fact persistence and actionable Root recovery and restart fault/orphan counterparts, two-config fault routing, descriptor substitution, fault-write failure and private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
 | Default-feature public API boundary | 35 probes passed, including wildcard-constructor and raw-string attestation compile-fail probes |
 | Runtime rustdoc | 11 passed, including the actual optional validated attestation SPI signature |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
@@ -141,7 +149,13 @@ Local checks on 2026-10-11:
 The two Task/Batch readiness and Root-decision counterexamples retained on
 `32377e1d` fail (46 pass / 2 fail), then pass with the correction. The complete
 suite also verifies notice-failure rollback, cause provenance, idempotent old-v8
-repair and explicit Root resolution. Earlier witnesses remain consolidated.
+repair and explicit Root resolution. Focused typed WARM MERGE and fatal
+handoff target-drift regressions also fail on `a12575a3`; corrected counterparts
+cover shared cutover, old pending release and confirmed versus uncertain
+pre-Execution outcomes. Earlier witnesses remain consolidated.
+The unready-Task probe failed before preflight, with other corrections retained:
+attestation ran once instead of zero. It now passes alongside ready and concurrent
+change counterparts; transactional recheck remains the authority boundary.
 The focused [counterexample witness](riir-m6b.4-contract-parity.md) records the
 discriminating cases. Passing test counts alone are not the acceptance argument.
 

@@ -397,6 +397,12 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   Execution or snapshot. Valid changed content remains an availability rejection
 - the typed dispatch handoff retains the verified adapter instance and deadlines;
   replacing a registry entry at the same kind/key cannot redirect that request
+- cross-target MERGE rejects READY and assigned pre-Execution typed WARM hosts
+  atomically, preserving Task routing/topology/assignment/provenance. Old pending
+  cutover after pure failure, cancellation or recovery closes the claim but
+  preserves the host, original partition/retention and suspended pending agent.
+  Same-target WARM and never-executed cross-target reservations succeed; missing
+  provisioning children cannot downgrade to legacy cutover;
 - provenance change on a previously executed WARM host fails closed before a
   new claim, preserving its state and immutable provenance; terminal Execution
   rows alone cannot authorize SQL-only resource replacement
@@ -441,6 +447,14 @@ M6-B.4 provisioning binding and exact launch MUST cover:
 
 The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 
+- unreadiness due to Task state, suspended Batch, inactive partition or future
+  backoff before acquisition/direct enumeration: zero attest/prepare calls and
+  no new Attempt/Lease/binding or population rows on existing/new paths, even
+  with an integration that would return a fatal attestation error; a ready Task
+  with due backoff attests, prepares and acquires successfully;
+- a separate controller changes each readiness fact during attestation:
+  transactional rejection or newborn rollback, zero prepare calls and no new
+  authority/population/fault rows; preflight never replaces authoritative recheck;
 - B.3/existing/new parity for Required continuity with no workstream and with a
   concrete matching workstream; rejection creates no Attempt/Lease/binding or
   newborn agent;
@@ -478,6 +492,13 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   without fake quiescence, and release_cancelled_writer is rejected. A latest
   already-suspended prior-v8 fault gains the missing decision once; resolved or
   cancelled work cannot reopen. Cause/child/fault mismatch fails closed;
+- confirmed fatal typed handoff target/candidate inconsistency, rejected
+  snapshot validation/constraint and failed availability settlement persist the
+  same fault. Restart creates one actionable Root decision/event, with no
+  ExecutionLost, worker Failure, retry or adapter start. Fault-write failure
+  propagates fatally; authority loss/availability keep their distinct semantics.
+  A real committed Execution and RequestId remain intact after a simulated lost
+  COMMIT result, without a pre-Execution fault;
 - preparation fault facts reject update/delete/replace, forged ownership,
   subsequent execution/worker settlement and closed/replaced claims; an elapsed
   but still-owned ACTIVE claim can record a late fact without gaining activity

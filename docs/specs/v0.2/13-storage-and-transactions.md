@@ -101,16 +101,31 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   ExecutionLost retry or quiescence assertion; an unobserved pre-prepare crash
   keeps ordinary orphan recovery. Root explicitly chooses retry/cancel through
   the existing resolution primitive after repair. Fault writes cannot claim an
-  unsuccessful fence; failed notice writes roll back the suspension.
+  unsuccessful fence; failed notice writes roll back the suspension. Confirmed
+  pure handoff and definite snapshot/settlement rejection MUST use the same fact
+  fence. Execution COMMIT StorageFailure/RecoveryRequired can have unknown
+  outcomes and MUST remain M5-recovery-owned without asserting absence or
+  fabricating a pre-Execution fact.
 - preparation_escalations immutably maps a cause-tagged Escalation to one
   preparation_faults Attempt. Parent tag, Task owner, fault kind and absence of
   physical Execution/association MUST agree on authoritative reads. Missing or
   conflicting children fail closed. A resolved mapping is retained, preventing
   recovery from recreating its decision or notification. EscalationCause replaces
   the mandatory worker failure field for this new domain (ADR-0011).
+- Legacy partition cutover MUST recheck validated provisioning provenance. A
+  WARM/STARTING provisioned host with Execution history cannot be marked LOST
+  merely to change target. MERGE rejects unsafe resulting destinations before
+  topology rewrite. Prior unsafe pending intents defer at claim release, keeping
+  the original host/partition/retention and suspending the unassigned agent until
+  actual host lifecycle closure. Same-target and unstarted reservations retain
+  their valid cutover behavior (ADR-0011).
 - Both typed acquisition paths MUST transactionally recheck the shared Core
   claim_task_ready gate: Task QUEUED, Batch ACTIVE, partition active and backoff
   due. Failure MUST roll back Attempt/Lease, binding and any newborn agent rows.
+  Runtime MUST also reject known unreadiness through a read-only preflight
+  before semantic matching/source-private attestation. Internal enumeration
+  MUST guard its direct callers before I/O. Preflight success grants no authority
+  and MUST NOT replace the final transaction's recheck after concurrent changes.
 - Kernel-produced `ExecutionLaunchSnapshot` carries the exact descriptor from
   its coherent BindingSnapshot transaction (None for legacy). Typed start
   construction MUST consume it or reject unequal/empty caller text; legacy

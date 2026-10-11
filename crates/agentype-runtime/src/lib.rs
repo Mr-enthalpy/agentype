@@ -182,6 +182,9 @@ pub(crate) enum TypedLaunchError {
     /// The pre-start settlement itself failed with a persistence/invariant fault:
     /// fatal control-plane fault, surfaced rather than swallowed.
     SettlementFailed(Error),
+    /// A confirmed pure-phase fault could not establish its durable fence.
+    /// Remains fatal even if the claim was concurrently closed or replaced.
+    FaultPersistenceFailed(Error),
 }
 
 /// How a typed-handoff failure must be treated. Only a pre-start availability
@@ -204,9 +207,10 @@ impl TypedLaunchError {
             Self::Kernel(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
                 TypedLaunchDisposition::AuthorityLoss
             }
-            Self::Inconsistent(_) | Self::Kernel(_) | Self::SettlementFailed(_) => {
-                TypedLaunchDisposition::Fatal
-            }
+            Self::Inconsistent(_)
+            | Self::Kernel(_)
+            | Self::SettlementFailed(_)
+            | Self::FaultPersistenceFailed(_) => TypedLaunchDisposition::Fatal,
         }
     }
 }
@@ -223,11 +227,52 @@ impl std::fmt::Display for TypedLaunchError {
             Self::SettlementFailed(e) => {
                 write!(f, "typed execution pre-start settlement failed: {e}")
             }
+            Self::FaultPersistenceFailed(e) => write!(f, "typed execution fault fence failed: {e}"),
         }
     }
 }
 
 impl std::error::Error for TypedLaunchError {}
+
+/// Preparation includes the pure launch-composition phase. Persist a confirmed
+/// fatal before returning it, using the existing ownership/no-Execution fence.
+/// A failed write never establishes a fact or turns the error into a Task NACK.
+fn persist_typed_launch_fault(
+    kernel: &Kernel,
+    claim: &Claim,
+    error: &TypedLaunchError,
+) -> Result<(), TypedLaunchError> {
+    use agentype_core::PreparationFaultKind as F;
+    let kind = match error {
+        TypedLaunchError::Inconsistent(_) => F::InvariantViolation,
+        TypedLaunchError::Kernel(e) | TypedLaunchError::SettlementFailed(e) => match e {
+            Error::InvariantViolation(_) | Error::Conflict(_) => F::InvariantViolation,
+            Error::StorageFailure(_) => F::StorageFailure,
+            Error::RecoveryRequired(_) => F::RecoveryRequired,
+            Error::InvalidTransition(_) => F::InvalidContract,
+            _ => F::Other,
+        },
+        _ => return Ok(()),
+    };
+    if error.disposition() == TypedLaunchDisposition::Fatal {
+        kernel
+            .record_preparation_fault(claim, kind)
+            .map_err(TypedLaunchError::FaultPersistenceFailed)?;
+    }
+    Ok(())
+}
+
+fn typed_execution_commit_error(kernel: &Kernel, claim: &Claim, error: Error) -> TypedLaunchError {
+    let commit_outcome_unknown =
+        matches!(error, Error::StorageFailure(_) | Error::RecoveryRequired(_));
+    let error = TypedLaunchError::Kernel(error);
+    if !commit_outcome_unknown {
+        if let Err(fence_error) = persist_typed_launch_fault(kernel, claim, &error) {
+            return fence_error;
+        }
+    }
+    error
+}
 
 /// Authoritative launch snapshot, the runtime-assembled worker request, and
 /// the resolved environment that minted the persisted safety proof — bound to
@@ -969,7 +1014,7 @@ pub(crate) fn prepare_typed_execution_launch(
     // corruption/persistence fault is fatal (never disguised as a Task failure).
     let plan = match plan_typed_execution_launch(kernel, &outcome, execution_registry, adapters) {
         Ok(plan) => plan,
-        Err(err) => {
+        Err(mut err) => {
             if matches!(
                 err.disposition(),
                 TypedLaunchDisposition::PreStartUnavailable
@@ -981,18 +1026,29 @@ pub(crate) fn prepare_typed_execution_launch(
                 ) {
                     Ok(_) => {}
                     Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {}
-                    Err(e) => return Err(TypedLaunchError::SettlementFailed(e)),
+                    Err(e) => err = TypedLaunchError::SettlementFailed(e),
                 }
             }
+            persist_typed_launch_fault(kernel, &claim, &err)?;
             return Err(err);
         }
     };
     // PHASE 2 — commit the snapshot-bearing Execution. A failure here is an
     // authority loss or a fatal persistence fault, NEVER a Task-level
-    // configuration failure; recovery reconciles the (absent) Execution.
-    let snapshot = kernel
-        .create_execution_with_snapshot(&claim, plan.physical_binding, &plan.snapshot_record)
-        .map_err(TypedLaunchError::Kernel)?;
+    // configuration failure. Definite validation/constraint rejection can
+    // establish the same pure-phase fact in a fresh ownership-fenced transaction.
+    // StorageFailure/RecoveryRequired may have an unknown COMMIT outcome: leave
+    // those to M5 reconciliation and never assert that Execution is absent.
+    let snapshot = match kernel.create_execution_with_snapshot(
+        &claim,
+        plan.physical_binding,
+        &plan.snapshot_record,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(typed_execution_commit_error(kernel, &claim, error));
+        }
+    };
     // PHASE 3 — assemble the physical start request. This is infallible by
     // construction (the environment matches the committed binding), and even if
     // it failed here the Execution already exists and recovery reconciles it, so
