@@ -6,8 +6,11 @@
 //! (`M6A-B9`). It cannot create a Task, admit a proposal, or expand a Generation,
 //! and it never starts physical work.
 
-use agentype_agent_contract::{AgentTypeRef, ExistingAgentCandidate, TaskAgentRequirement};
-use agentype_core::{Error, LogicalAgentId, TaskId};
+use agentype_agent_contract::{
+    AgentTypeRef, BindingSnapshot, ExistingAgentCandidate, ProvisioningBinding,
+    TaskAgentRequirement,
+};
+use agentype_core::{Error, ExecutionId, IncarnationId, LogicalAgentId, TaskId};
 use agentype_storage_sqlite::Kernel;
 
 /// Operator authority over durable agent-type bindings and typed reads.
@@ -65,6 +68,22 @@ impl<'a> ProvisioningAdmin<'a> {
         task_id: &TaskId,
     ) -> Result<Vec<ExistingAgentCandidate>, Error> {
         self.kernel.match_existing_agents_for_task(task_id)
+    }
+
+    /// The immutable provisioning binding for an Incarnation, if any (M6-B.4).
+    pub fn provisioning_binding(
+        &self,
+        incarnation_id: &IncarnationId,
+    ) -> Result<Option<ProvisioningBinding>, Error> {
+        self.kernel.get_provisioning_binding(incarnation_id)
+    }
+
+    /// The immutable binding snapshot for an Execution, if any (M6-B.4).
+    pub fn binding_snapshot(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<BindingSnapshot>, Error> {
+        self.kernel.get_binding_snapshot(execution_id)
     }
 }
 

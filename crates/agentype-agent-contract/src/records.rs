@@ -9,7 +9,7 @@
 use crate::capability::{CapabilityCatalog, CapabilityClaim, CapabilityRef, CapabilityValue};
 use crate::error::ContractError;
 use crate::ids::{AdapterPolicyId, AgentTypeId, SandboxPolicyId, SourceConfigId, SpawnSourceId};
-use agentype_core::{InformationFunction, WorkspaceMode};
+use agentype_core::{InformationFunction, Retention, WorkspaceMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A validated non-negative, finite budget.
@@ -210,6 +210,19 @@ pub enum NetworkPolicy {
     Disabled,
     Restricted,
     Enabled,
+}
+
+/// The source/config lifecycle a realized M4 `Retention` requires. A `Resident`
+/// pool member must be provisioned by a source/config that supports `Resident`;
+/// an `Ephemeral` member by one that supports `Ephemeral`. This is the B.3
+/// "realized-lifecycle eligibility is a B.4 provisioning concern" conjunct: the
+/// frozen B.3 matcher only sees the semantic AgentType envelope, so the physical
+/// realization must be re-proved at acquisition.
+pub fn required_lifecycle(retention: Retention) -> LifecycleMode {
+    match retention {
+        Retention::Resident => LifecycleMode::Resident,
+        Retention::Ephemeral => LifecycleMode::Ephemeral,
+    }
 }
 
 pub fn workspace_rank(mode: WorkspaceMode) -> u8 {

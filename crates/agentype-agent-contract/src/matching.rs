@@ -33,7 +33,8 @@ use crate::predicates::{can_execute, more_specific_for};
 use crate::records::AgentType;
 use crate::requirement::TaskAgentRequirement;
 use agentype_core::{
-    claim_tiebreak, ContinuityPreference, LogicalAgentId, PartitionId, WorkstreamId,
+    claim_placement_eligible, claim_tiebreak, ClaimIntent, ContinuityPreference, LogicalAgentId,
+    PartitionId, WorkstreamId,
 };
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -116,19 +117,21 @@ fn same_workstream(candidate: &ExistingAgentCandidate, placement: &TaskPlacement
     placement.workstream_id.is_some() && candidate.workstream_id == placement.workstream_id
 }
 
-/// Frozen M5 placement eligibility, mirrored from `core::select_claim_agent`.
+/// Use the same M5 decision as legacy selection and typed authority commitment.
 fn placement_eligible(candidate: &ExistingAgentCandidate, placement: &TaskPlacement) -> bool {
-    if candidate.partition != placement.partition {
-        return false;
-    }
-    if !placement
-        .required_tags
-        .iter()
-        .all(|tag| candidate.tags.contains(tag))
-    {
-        return false;
-    }
-    placement.continuity != ContinuityPreference::Required || same_workstream(candidate, placement)
+    let required_tags: Vec<String> = placement.required_tags.iter().cloned().collect();
+    let actual_tags: Vec<String> = candidate.tags.iter().cloned().collect();
+    claim_placement_eligible(
+        &ClaimIntent {
+            partition: placement.partition.as_str(),
+            required_tags: &required_tags,
+            workstream_id: placement.workstream_id.as_ref().map(|id| id.as_str()),
+            continuity: placement.continuity,
+        },
+        candidate.partition.as_str(),
+        &actual_tags,
+        candidate.workstream_id.as_ref().map(|id| id.as_str()),
+    )
 }
 
 /// Rank existing bound, `READY`, unassigned agents for one Task, best first.

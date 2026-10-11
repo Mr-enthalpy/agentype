@@ -66,6 +66,10 @@ serde_json.workspace = true
 [dev-dependencies]
 agentype-adapter-api.workspace = true
 agentype-execution-config = { workspace = true, features = ["test-support"] }
+# Test builds need the production evidence producer so the B.4 acquisition can
+# be driven with realistic imported evidence; the library default surface still
+# has no evidence constructor.
+agentype-agent-contract = { workspace = true, features = ["provisioning-producer"] }
 # Self dev-dependency: this crate's own integration targets are a separate
 # crate, so they need the mechanical Kernel surface explicitly. Feature
 # unification makes the flag apply to the library under test too.

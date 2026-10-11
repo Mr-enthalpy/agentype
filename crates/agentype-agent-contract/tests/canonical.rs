@@ -2,7 +2,9 @@
 //! absence, conflict fail-closed behavior, and content-digest stability.
 
 use agentype_agent_contract::*;
-use agentype_core::{InformationFunction, WorkspaceMode};
+use agentype_core::{
+    ExecutionId, IncarnationId, InformationFunction, LogicalAgentId, WorkspaceMode,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -520,4 +522,95 @@ fn b3_golden_digest_vectors_are_stable() {
         generation_policy_content_digest(&policy),
         "sha256:edac6e142420b01e96005a57403ddc5205ab561b7c9394f81d72aa06ac8ea225"
     );
+}
+
+fn b4_safety() -> PhysicalSafety {
+    PhysicalSafety::new(
+        false,
+        vec![WorkspaceMode::ReadOnly],
+        [NetworkPolicy::Disabled].into_iter().collect(),
+    )
+    .unwrap()
+}
+
+fn b4_binding() -> ProvisioningBinding {
+    ProvisioningBinding {
+        provisioning_binding_id: "pb-1".into(),
+        logical_agent_id: LogicalAgentId::from_string("agent-1"),
+        incarnation_id: IncarnationId::from_string("inc-1"),
+        agent_type: AgentTypeRef::new("reviewer", 3).unwrap(),
+        spawn_source: SpawnSourceRef::new("codex-local", 2).unwrap(),
+        source_config: SourceConfigRef::new(
+            SpawnSourceRef::new("codex-local", 2).unwrap(),
+            "deep-reasoning",
+            7,
+        )
+        .unwrap(),
+        adapter_policy: AdapterPolicyRef::new("codex-local-adapter", 3).unwrap(),
+        adapter_kind: "codex_cli".into(),
+        adapter_binding_key: "local:boot:1".into(),
+        attested_materialization_digest: MaterializationDigest::new(
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        )
+        .unwrap(),
+        provisioning_protocol: "codex-cli/1".into(),
+        effective_security: b4_safety(),
+    }
+}
+
+fn b4_snapshot() -> BindingSnapshot {
+    BindingSnapshot {
+        snapshot_id: "snap-1".into(),
+        execution_id: ExecutionId::from_string("exec-1"),
+        provisioning_binding_id: "pb-1".into(),
+        adapter_kind: "codex_cli".into(),
+        adapter_binding_key: "local:boot:1".into(),
+        spawn_source: SpawnSourceRef::new("codex-local", 2).unwrap(),
+        source_config: SourceConfigRef::new(
+            SpawnSourceRef::new("codex-local", 2).unwrap(),
+            "deep-reasoning",
+            7,
+        )
+        .unwrap(),
+        source_config_digest: ConfigDigest::new(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        )
+        .unwrap(),
+        attested_materialization_digest: MaterializationDigest::new(
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        )
+        .unwrap(),
+        launch_descriptor: "env-handle-1".into(),
+        execution_target: "local".into(),
+        execution_profile: "default".into(),
+        required_capabilities: BTreeMap::new(),
+        enforceable_security: b4_safety(),
+        effective_isolation: false,
+        effective_workspace: WorkspaceMode::ReadOnly,
+        effective_network: NetworkPolicy::Disabled,
+        credential_refs_digest: None,
+        resolver_version: RESOLVER_VERSION.to_string(),
+    }
+}
+
+#[test]
+fn b4_provisioning_binding_canonical_round_trips() {
+    let binding = b4_binding();
+    let bytes = canonical_provisioning_binding_bytes(&binding);
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    let decoded = provisioning_binding_from_canonical_json(&json).unwrap();
+    assert_eq!(decoded, binding);
+    assert_eq!(canonical_provisioning_binding_bytes(&decoded), bytes);
+    assert!(provisioning_binding_content_digest(&binding).starts_with("sha256:"));
+}
+
+#[test]
+fn b4_binding_snapshot_canonical_round_trips() {
+    let snapshot = b4_snapshot();
+    let bytes = canonical_binding_snapshot_bytes(&snapshot);
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    let decoded = binding_snapshot_from_canonical_json(&json).unwrap();
+    assert_eq!(decoded, snapshot);
+    assert_eq!(canonical_binding_snapshot_bytes(&decoded), bytes);
+    assert!(binding_snapshot_content_digest(&snapshot).starts_with("sha256:"));
 }

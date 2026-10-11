@@ -114,7 +114,7 @@ pub fn result_carried_ingress() {}
 ///
 /// ```no_run
 /// use agentype_agent_contract::AgentTypeRef;
-/// use agentype_core::{LogicalAgentId, TaskId};
+/// use agentype_core::{ExecutionId, IncarnationId, LogicalAgentId, TaskId};
 /// use agentype_runtime::ProvisioningAdmin;
 ///
 /// fn use_admin(
@@ -122,6 +122,8 @@ pub fn result_carried_ingress() {}
 ///     agent: &LogicalAgentId,
 ///     task: &TaskId,
 ///     type_ref: &AgentTypeRef,
+///     incarnation: &IncarnationId,
+///     execution: &ExecutionId,
 /// ) {
 ///     admin
 ///         .bind_logical_agent_type(agent, type_ref)
@@ -129,6 +131,8 @@ pub fn result_carried_ingress() {}
 ///     let _ = admin.task_agent_requirement(task);
 ///     let _ = admin.logical_agent_type_binding(agent);
 ///     let _ = admin.match_existing_agents_for_task(task);
+///     let _ = admin.provisioning_binding(incarnation);
+///     let _ = admin.binding_snapshot(execution);
 /// }
 /// ```
 pub fn provisioning_admin_surface() {}
@@ -140,7 +144,10 @@ pub fn provisioning_admin_surface() {}
 /// into the internal storage crate to establish those durable preconditions.
 ///
 /// ```no_run
-/// use agentype_agent_contract::{AgentType, AgentTypeRef, CapabilityDefinition, CapabilityRef};
+/// use agentype_agent_contract::{
+///     AdapterBindingPolicy, AgentType, AgentTypeRef, CapabilityDefinition, CapabilityRef,
+///     SpawnSource,
+/// };
 /// use agentype_runtime::CatalogAdmin;
 ///
 /// fn use_catalog(
@@ -148,10 +155,14 @@ pub fn provisioning_admin_surface() {}
 ///     definition: &CapabilityDefinition,
 ///     agent: &AgentType,
 ///     reference: &AgentTypeRef,
+///     policy: &AdapterBindingPolicy,
+///     source: &SpawnSource,
 /// ) {
 ///     let _ = admin.publish_capability_definition(&CapabilityRef::new("tools", 1).unwrap(), definition);
 ///     let _ = admin.publish_agent_type(agent);
 ///     let _ = admin.deprecate_agent_type(reference);
+///     let _ = admin.publish_adapter_binding_policy(policy);
+///     let _ = admin.publish_spawn_source(source);
 /// }
 /// ```
 pub fn catalog_admin_surface() {}
@@ -301,11 +312,14 @@ pub fn catalog_admin_surface() {}
 /// ```
 ///
 /// ```compile_fail
-/// // 18. Imported enforcement evidence has no constructor on the supported
-/// //     default production surface; `for_tests` exists only under
-/// //     `test-support`, so an ordinary consumer cannot mint a security proof.
+/// // 18. The test-support evidence constructor is not on the default surface
+/// //     (`for_tests` is gated behind `test-support`). This is NOT the security
+/// //     fence: under Cargo feature unification a host that also depends on the
+/// //     runtime can see `from_imported_binding` (`provisioning-producer`). The
+/// //     load-bearing boundary is the acquisition control surface plus in-
+/// //     transaction re-proof, not constructor secrecy.
 /// use agentype_agent_contract::ResolvedProvisioningEvidence;
-/// fn _no_evidence_mint() {
+/// fn _no_test_evidence_mint() {
 ///     let _ = ResolvedProvisioningEvidence::for_tests;
 /// }
 /// ```
@@ -375,4 +389,52 @@ pub fn catalog_admin_surface() {}
 ///     let _ = admin.claim_next_available();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// // 26. ProvisioningAdmin has no authority-bearing typed acquisition: the
+/// //     first typed acquisition is an internal mechanical path, not a
+/// //     supported operator command.
+/// use agentype_runtime::ProvisioningAdmin;
+/// fn _admin_cannot_acquire(admin: &ProvisioningAdmin<'_>) {
+///     let _ = admin.acquire_typed_task_existing;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 27. No control surface exposes the internal provisioning resolver, so a
+/// //     caller cannot drive candidate resolution or inject enforcement facts.
+/// use agentype_runtime::SchedulerControl;
+/// fn _control_cannot_resolve(control: &SchedulerControl<'_>) {
+///     let _ = control.resolve_source_candidates;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 28. The authority-bearing typed acquisition is daemon-internal until the
+/// //     ControlLoopService owns it; it is not on the supported surface.
+/// use agentype_runtime::acquire_typed_task;
+/// ```
+///
+/// ```compile_fail
+/// // 29. The candidate resolution mechanics are not on the supported surface.
+/// use agentype_runtime::resolve_source_candidates;
+/// ```
+///
+/// ```compile_fail
+/// // 30. Production source routing has no wildcard constructor. A new source
+/// //     revision needs an explicit registration, even for a shared integration.
+/// use agentype_runtime::provisioning_resolver::SourceIntegrationRegistry;
+/// fn _no_uniform_source_route() {
+///     let _ = SourceIntegrationRegistry::uniform;
+/// }
+/// ```
 pub fn probes() {}
+
+/// Attestation cannot encode unavailability as a successful empty string.
+/// ```compile_fail
+/// use agentype_agent_contract::MaterializationDigest;
+/// use agentype_runtime::ProvisioningResolutionError;
+/// let _: Result<Option<MaterializationDigest>, ProvisioningResolutionError> =
+///     Ok(Some(String::new()));
+/// ```
+pub fn typed_attestation_outcome() {}

@@ -31,6 +31,12 @@ Exact schema is IMPLEMENTATION-DEFINED if these categories are enforceable.
 If a SpawnSource or Adapter cannot enforce the requested sandbox, it MUST be
 ineligible to provision that type.
 
+The effective workspace mode and the effective network policy MUST reach the
+physical `EnvironmentStartRequest`; proving a domain *can* enforce a mode is not
+enough, the concrete execution must request it. Attempt isolation is
+authoritative from the ExecutionTarget registry, never from adapter
+self-assertion.
+
 ## Intersection
 
 **M6** semantic enforcement: effective execution permission MUST equal
@@ -42,6 +48,12 @@ Root-created refinements MUST only narrow ([06](06-agent-type-and-matching.md)).
 
 **M4** continues the V0.1 WorkspaceMode / adapter enforcement contract only.
 M4 MUST NOT require AgentType or Generation objects to exist.
+
+Adapter-imported enforceability is an exact-set fact: a domain that can enforce
+`Write` does not thereby claim `ReadOnly`, and M6-B.4 MUST NOT infer one
+workspace mode from another. An importer that can enforce both MUST import both.
+The evidence subject binds the exact `(adapter_kind, adapter_binding_key)` the
+enforceability was imported from.
 
 ## V0.1 mapping (kernel)
 

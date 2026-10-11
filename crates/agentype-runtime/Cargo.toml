@@ -10,7 +10,11 @@ test-support = ["agentype-execution-config/test-support"]
 
 [dependencies]
 agentype-core.workspace = true
-agentype-agent-contract.workspace = true
+# The internal provisioning resolver is the only supported producer of imported
+# enforcement evidence, so runtime enables the producer feature for the crate it
+# owns. A consumer depending on agentype-agent-contract alone keeps the default
+# surface with no evidence constructor.
+agentype-agent-contract = { workspace = true, features = ["provisioning-producer"] }
 agentype-execution-config.workspace = true
 agentype-adapter-api.workspace = true
 agentype-root-bridge.workspace = true
@@ -23,6 +27,7 @@ agentype-storage-sqlite = { workspace = true, features = ["runtime-internal"] }
 serde_json.workspace = true
 fs4.workspace = true
 agentype-nlink.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

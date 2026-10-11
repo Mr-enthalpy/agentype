@@ -27,11 +27,14 @@
 pub mod catalog;
 pub mod frontier;
 mod kernel;
+mod preparation;
+pub mod provisioning;
 pub mod requirement;
 mod schema;
 mod store;
 pub mod txutil;
 
+pub use agentype_core::PreparationFaultKind;
 pub use catalog::{
     AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigBodyView,
     SourceConfigRevision,
@@ -40,6 +43,13 @@ pub use kernel::{
     CurrentAuthorityHint, ExecutionReconciliationSnapshot, ExecutionRoutingFacts, Kernel,
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,
     SupervisedRenewal,
+};
+#[cfg(any(test, feature = "runtime-internal"))]
+pub use provisioning::{acquire_typed_task_existing, acquire_typed_task_new_agent};
+pub use provisioning::{
+    execution_binding_snapshot_mode, get_binding_snapshot, get_provisioning_binding,
+    incarnation_provisioning_mode, insert_binding_snapshot, insert_provisioning_binding,
+    mark_incarnation_provisioned, ResolvedProvisioningSelection, TypedAcquisition,
 };
 pub use schema::{SCHEMA_SQL, SCHEMA_VERSION};
 // Shared with `agentype-runtime`: the process lock resolves store identity

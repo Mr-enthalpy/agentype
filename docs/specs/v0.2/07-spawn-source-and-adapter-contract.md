@@ -65,6 +65,14 @@ defined only over canonicalized records.
 Cost MUST NOT override correctness or security eligibility.
 A source that cannot enforce the required sandbox MUST be ineligible.
 
+M6-B.4 implements the hard filters (1-3) as eligibility and the continuity
+dimension (4). Availability (5) and cost/resource (6) have no durable model yet,
+so when more than one candidate is tied on continuity the selection is
+**unresolved and fails closed** (`RESOURCE_UNAVAILABLE`) rather than via an
+invented tie-break; this order is unchanged and the gap is recorded in
+[ADR-0010](../../decisions/0010-m6b-selection-order-scope.md). Selection is part
+of the authority path.
+
 ## ExecutionAdapter (correctness required)
 
 Narrow interface, UNCHANGED from V0.1:
@@ -110,6 +118,13 @@ Incarnation/Execution. Core MUST NOT interpret vendor enums.
 
 Process death is not quiescence proof.
 
+For snapshot-bearing typed Executions, Kernel's launch capability MUST carry
+the exact committed BindingSnapshot descriptor. Typed start construction MUST
+consume that descriptor and reject caller substitution or empty legacy
+construction. Legacy Executions continue to use empty descriptors. This closes
+the provenance-to-physical-request boundary; the trusted unchecked snapshot
+constructor remains a procedural internal contract (ADR-0011).
+
 Adapter absolute deadlines are **M5** runtime conformance (the interface
 itself is required for M4 observation vocabulary).
 
@@ -128,14 +143,65 @@ An Execution MUST atomically freeze `adapter_kind` and
 `adapter_binding_key` at creation. Recovery MUST `resolve_exact(kind, key)`
 and MUST NOT fall back to another source of the same kind.
 
-Until the M6 source-resolved exact-binding launch path is implemented, launch
-MUST `resolve_unique(kind)`. Ambiguous installations of the same kind MUST fail
-closed.
+A legacy (untyped) launch uses `resolve_unique(kind)`; ambiguous installations
+of the same kind MUST fail closed. M6-B.4 DEFINES a source-resolved exact-binding
+launch path: it resolves the exact installed binding from the
+`AdapterBindingPolicy`'s stable `binding_ref` (within the policy's
+`adapter_kind`), freezes `(adapter_kind, adapter_binding_key)` at Execution
+creation, and MUST NOT use `resolve_unique`. **That typed path is not yet wired
+into the production dispatch composition**, which continues to use
+`resolve_unique` until the daemon integration lands; the typed library path
+already carries the exact binding into the `ProvisioningBinding` and
+`BindingSnapshot`. Recovery for either path MUST `resolve_exact(kind, key)`.
 
 An imported source owns its kind, binding key, and enforceable physical
-capabilities. Effective safety is the intersection of the ExecutionTarget
-requirement and the imported source's enforceability. A composition caller
-MUST NOT mint durable isolation or a binding key without that intersection.
+capabilities. It MAY optionally declare a **provisioning protocol identity**
+(`ImportableAdapter::import_provisioning_protocol`, default `None`): the
+descriptor grammar its `start_execution` consumes. An adapter that declares none
+is not provisioning-capable and is ineligible for typed acquisition; it MUST NOT
+claim a grammar it ignores. A provisioning-capable adapter is routed by the
+composition root to a source-local `SourceConfigIntegration` that prepares
+descriptors in the same protocol; M6-B.4 requires them to match when the
+candidate is resolved, checks the committed protocol before/after preparation,
+and re-checks the frozen protocol at the Execution handoff,
+so a descriptor produced for one adapter can never be launched against another.
+Integration protocol identity MUST remain stable during and between those calls,
+including concurrent calls; observed drift MUST fail closed as a producer fault.
+Each exact SpawnSourceRef MUST be explicitly registered to its integration;
+production wildcard routing is unsupported. The typed handoff MUST retain the
+same resolved adapter instance and operation policy for dispatch rather than
+selecting it again from a mutable registry.
+Attestation MUST distinguish explicit unavailability (`Ok(None)`) from a
+successful validated canonical MaterializationDigest (`Ok(Some(digest))`), never
+use successful empty text as a control state. Source-private error payloads MUST
+be discarded at attest/prepare runtime returns before public control errors or
+logging; fixed error categories preserve stage-specific fault dispositions.
+The physical materialization of the descriptor happens inside
+`start_execution` (M6-B never creates a physical environment). Effective safety
+is the intersection of the ExecutionTarget requirement and the imported source's
+enforceability. A composition caller MUST NOT mint durable isolation or a binding
+key without that intersection.
+`attempt_isolation` is authoritative from the ExecutionTarget/`ExecutionRegistry`
+(M4), never from adapter self-assertion; a domain that merely claims isolation
+does not grant it. The effective network policy is carried provider-neutrally on
+`EnvironmentStartRequest` so no layer widens a stricter upstream policy.
+
+## Typed acquisition qualification (M6-B.4)
+
+For typed acquisition, semantic isolation requirements MUST fit the configured
+ExecutionTarget, and any isolation configured on that target MUST be enforceable
+by the exact imported adapter even when AgentType and Task do not request it.
+These gates MUST hold before Attempt/Lease commitment and be independently
+requalified at launch; snapshot commitment/read MUST reject effective isolation
+outside the frozen binding's capability.
+
+Known static ineligibility (credentials unsupported by B.4, inactive policy,
+wrong target kind, isolation mismatch, realized retention or static contract
+failure) MUST be filtered before source-private `attest` I/O. Such candidates
+MUST NOT spend the attestation deadline or prevent later eligible candidates
+from being considered. Unknown availability and config identity still require
+bounded attestation. See
+[ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md).
 
 ## ExecutionProfile registry (**M5**)
 

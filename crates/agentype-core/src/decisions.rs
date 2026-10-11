@@ -57,10 +57,28 @@ pub struct ClaimTaskSnapshot {
 /// the authoritative re-check so that query text alone cannot change behavior.
 pub fn claim_task_eligible(s: &ClaimTaskSnapshot, now: f64) -> bool {
     !s.typed
-        && s.state == TaskState::Queued
-        && s.batch_state == BatchState::Active
-        && s.partition_active
-        && s.next_eligible_at.is_none_or(|t| t <= now)
+        && claim_task_ready(
+            s.state,
+            s.batch_state,
+            s.partition_active,
+            s.next_eligible_at,
+            now,
+        )
+}
+
+/// Shared frozen readiness gate. Typed and legacy authority use the same Task,
+/// Batch, partition and backoff requirements; semantic type routing is separate.
+pub fn claim_task_ready(
+    state: TaskState,
+    batch_state: BatchState,
+    partition_active: bool,
+    next_eligible_at: Option<f64>,
+    now: f64,
+) -> bool {
+    state == TaskState::Queued
+        && batch_state == BatchState::Active
+        && partition_active
+        && next_eligible_at.is_none_or(|t| t <= now)
 }
 
 /// Frozen task order for claiming: highest priority, oldest submission, then
@@ -108,6 +126,21 @@ pub struct ClaimIntent<'a> {
     pub continuity: ContinuityPreference,
 }
 
+/// Shared frozen M5 placement gate for legacy claims, typed preselection and
+/// typed acquisition. Required continuity needs a concrete Task workstream;
+/// two absent workstreams never establish continuity.
+pub fn claim_placement_eligible(
+    intent: &ClaimIntent<'_>,
+    agent_partition: &str,
+    agent_tags: &[String],
+    agent_workstream: Option<&str>,
+) -> bool {
+    agent_partition == intent.partition
+        && crate::authority::tags_match(intent.required_tags, agent_tags)
+        && (intent.continuity != ContinuityPreference::Required
+            || (intent.workstream_id.is_some() && intent.workstream_id == agent_workstream))
+}
+
 /// Select the single best consumer for a task per the frozen matching rules:
 /// exact partition, READY + unassigned, tag subset, continuity gate, then
 /// rank (workstream-aware placement) with availability/id tiebreaks.
@@ -121,13 +154,12 @@ pub fn select_claim_agent<'a>(
             !a.type_bound
                 && a.state == LogicalAgentState::Ready
                 && !a.assigned_to_task
-                && a.partition == intent.partition
-                && crate::authority::tags_match(intent.required_tags, &a.tags)
-        })
-        .filter(|a| {
-            let same_ws = intent.workstream_id.is_some()
-                && Some(intent.workstream_id.unwrap()) == a.workstream_id.as_deref();
-            intent.continuity != ContinuityPreference::Required || same_ws
+                && claim_placement_eligible(
+                    intent,
+                    &a.partition,
+                    &a.tags,
+                    a.workstream_id.as_deref(),
+                )
         })
         .min_by(|a, b| {
             let same_a = intent.workstream_id.is_some()
@@ -516,7 +548,7 @@ impl EscalationOperation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscalationResolutionSnapshot {
     pub escalation_is_open: bool,
-    pub failure_class: FailureClass,
+    pub cause: crate::EscalationCause,
     pub task_state: TaskState,
     pub workspace_mode: WorkspaceMode,
     pub frozen_isolation: bool,
@@ -559,12 +591,13 @@ pub fn plan_escalation_resolution(
         return Err(Error::invalid_transition("escalation is not open"));
     }
     let is_writer_safe = quiescence_confirmed || snap.frozen_isolation;
+    let writer_unknown = matches!(
+        snap.cause,
+        crate::EscalationCause::TaskFailure(FailureClass::WriterQuiescenceUnknown)
+    );
     match op {
         EscalationOperation::ReleaseCancelledWriter => {
-            if snap.task_state != TaskState::Cancelled
-                || snap.failure_class != FailureClass::WriterQuiescenceUnknown
-                || !is_writer_safe
-            {
+            if snap.task_state != TaskState::Cancelled || !writer_unknown || !is_writer_safe {
                 return Err(Error::invalid_transition(
                     "cancelled writer release requires confirmed quiescence or attempt isolation",
                 ));
@@ -581,15 +614,12 @@ pub fn plan_escalation_resolution(
                     "only a suspended task can be retried",
                 ));
             }
-            if snap.workspace_mode == WorkspaceMode::Write
-                && snap.failure_class == FailureClass::WriterQuiescenceUnknown
-                && !is_writer_safe
-            {
+            if snap.workspace_mode == WorkspaceMode::Write && writer_unknown && !is_writer_safe {
                 return Err(Error::invalid_transition(
                     "writer retry requires confirmed quiescence or attempt isolation",
                 ));
             }
-            let is_writer_unknown = snap.failure_class == FailureClass::WriterQuiescenceUnknown;
+            let is_writer_unknown = writer_unknown;
             Ok(EscalationResolutionPlan::Retry {
                 next_task_state: TaskState::Queued,
                 reactivate_batch: true,
@@ -603,7 +633,7 @@ pub fn plan_escalation_resolution(
             })
         }
         EscalationOperation::CancelTask => {
-            let is_writer_unknown = snap.failure_class == FailureClass::WriterQuiescenceUnknown;
+            let is_writer_unknown = writer_unknown;
             Ok(EscalationResolutionPlan::CancelTask {
                 next_task_state: TaskState::Cancelled,
                 resolve_escalation: !is_writer_unknown,

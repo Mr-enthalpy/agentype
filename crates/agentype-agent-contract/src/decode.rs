@@ -20,6 +20,7 @@ use crate::capability::{
     CapabilityValue, MatcherKind, Quantity, SecurityClass,
 };
 use crate::error::ContractError;
+use crate::provisioning::{BindingSnapshot, MaterializationDigest, ProvisioningBinding};
 use crate::records::{
     workspace_rank, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint, AgentType,
     AgentTypeContract, AgentTypeRef, Budget, ConfigDigest, ConfigStatus, ContinuityMode,
@@ -28,7 +29,9 @@ use crate::records::{
     TaskRequirement,
 };
 use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
-use agentype_core::{InformationFunction, WorkspaceMode};
+use agentype_core::{
+    ExecutionId, IncarnationId, InformationFunction, LogicalAgentId, WorkspaceMode,
+};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -597,4 +600,153 @@ pub fn generation_policy_from_canonical_json(
         allowed_affinity,
         anchor_constraint: opt_string(field(policy, "anchor_constraint")?)?,
     })
+}
+
+fn physical_safety_from(value: &Value) -> Result<PhysicalSafety, ContractError> {
+    let safety = object(value, "physical safety")?;
+    let attempt_isolation = field(safety, "attempt_isolation")?
+        .as_bool()
+        .ok_or_else(|| err("attempt_isolation must be boolean"))?;
+    let mut workspace_modes = Vec::new();
+    for item in array(field(safety, "workspace_modes")?, "workspace_modes")? {
+        workspace_modes.push(workspace_mode(&string_of(item, "workspace mode")?)?);
+    }
+    let mut network_modes = BTreeSet::new();
+    for item in array(field(safety, "network_modes")?, "network_modes")? {
+        network_modes.insert(network_policy(&string_of(item, "network mode")?)?);
+    }
+    PhysicalSafety::new(attempt_isolation, workspace_modes, network_modes)
+}
+
+fn agent_type_ref_from(value: &Value) -> Result<AgentTypeRef, ContractError> {
+    let object = object(value, "agent type ref")?;
+    AgentTypeRef::new(
+        string_of(field(object, "type_id")?, "type_id")?,
+        u64_of(field(object, "revision")?, "revision")?,
+    )
+}
+
+fn spawn_source_ref_from(value: &Value) -> Result<SpawnSourceRef, ContractError> {
+    let object = object(value, "spawn source ref")?;
+    SpawnSourceRef::new(
+        string_of(field(object, "source_id")?, "source_id")?,
+        u64_of(field(object, "revision")?, "revision")?,
+    )
+}
+
+fn adapter_policy_ref_from(value: &Value) -> Result<AdapterPolicyRef, ContractError> {
+    let object = object(value, "adapter policy ref")?;
+    AdapterPolicyRef::new(
+        string_of(field(object, "adapter_policy_id")?, "adapter_policy_id")?,
+        u64_of(field(object, "revision")?, "revision")?,
+    )
+}
+
+fn source_config_ref_from(value: &Value) -> Result<SourceConfigRef, ContractError> {
+    let object = object(value, "source config ref")?;
+    let source = SpawnSourceRef::new(
+        string_of(field(object, "source_id")?, "source_id")?,
+        u64_of(field(object, "source_revision")?, "source_revision")?,
+    )?;
+    SourceConfigRef::new(
+        source,
+        string_of(field(object, "config_id")?, "config_id")?,
+        u64_of(field(object, "revision")?, "revision")?,
+    )
+}
+
+/// Decode a `ProvisioningBinding`. The caller MUST also verify the stored
+/// content digest and canonical byte equality at the durable boundary.
+pub fn provisioning_binding_from_canonical_json(
+    json: &str,
+) -> Result<ProvisioningBinding, ContractError> {
+    let value = parse_document(json, "PROVISIONING_BINDING")?;
+    let document = object(&value, "provisioning binding")?;
+    let binding = ProvisioningBinding {
+        provisioning_binding_id: string_of(
+            field(document, "provisioning_binding_id")?,
+            "provisioning_binding_id",
+        )?,
+        logical_agent_id: LogicalAgentId::from_string(&string_of(
+            field(document, "logical_agent_id")?,
+            "logical_agent_id",
+        )?),
+        incarnation_id: IncarnationId::from_string(&string_of(
+            field(document, "incarnation_id")?,
+            "incarnation_id",
+        )?),
+        agent_type: agent_type_ref_from(field(document, "agent_type")?)?,
+        spawn_source: spawn_source_ref_from(field(document, "spawn_source")?)?,
+        source_config: source_config_ref_from(field(document, "source_config")?)?,
+        adapter_policy: adapter_policy_ref_from(field(document, "adapter_policy")?)?,
+        adapter_kind: string_of(field(document, "adapter_kind")?, "adapter_kind")?,
+        adapter_binding_key: string_of(
+            field(document, "adapter_binding_key")?,
+            "adapter_binding_key",
+        )?,
+        attested_materialization_digest: MaterializationDigest::new(string_of(
+            field(document, "attested_materialization_digest")?,
+            "attested_materialization_digest",
+        )?)?,
+        provisioning_protocol: string_of(
+            field(document, "provisioning_protocol")?,
+            "provisioning_protocol",
+        )?,
+        effective_security: physical_safety_from(field(document, "effective_security")?)?,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+/// Decode a `BindingSnapshot`. The caller MUST also verify the stored content
+/// digest and canonical byte equality at the durable boundary.
+pub fn binding_snapshot_from_canonical_json(json: &str) -> Result<BindingSnapshot, ContractError> {
+    let value = parse_document(json, "BINDING_SNAPSHOT")?;
+    let document = object(&value, "binding snapshot")?;
+    let snapshot = BindingSnapshot {
+        snapshot_id: string_of(field(document, "snapshot_id")?, "snapshot_id")?,
+        execution_id: ExecutionId::from_string(&string_of(
+            field(document, "execution_id")?,
+            "execution_id",
+        )?),
+        provisioning_binding_id: string_of(
+            field(document, "provisioning_binding_id")?,
+            "provisioning_binding_id",
+        )?,
+        adapter_kind: string_of(field(document, "adapter_kind")?, "adapter_kind")?,
+        adapter_binding_key: string_of(
+            field(document, "adapter_binding_key")?,
+            "adapter_binding_key",
+        )?,
+        spawn_source: spawn_source_ref_from(field(document, "spawn_source")?)?,
+        source_config: source_config_ref_from(field(document, "source_config")?)?,
+        source_config_digest: ConfigDigest::new(string_of(
+            field(document, "source_config_digest")?,
+            "source_config_digest",
+        )?)?,
+        attested_materialization_digest: MaterializationDigest::new(string_of(
+            field(document, "attested_materialization_digest")?,
+            "attested_materialization_digest",
+        )?)?,
+        launch_descriptor: string_of(field(document, "launch_descriptor")?, "launch_descriptor")?,
+        execution_target: string_of(field(document, "execution_target")?, "execution_target")?,
+        execution_profile: string_of(field(document, "execution_profile")?, "execution_profile")?,
+        required_capabilities: capability_map_from(field(document, "required_capabilities")?)?,
+        enforceable_security: physical_safety_from(field(document, "enforceable_security")?)?,
+        effective_isolation: field(document, "effective_isolation")?
+            .as_bool()
+            .ok_or_else(|| err("effective_isolation must be boolean"))?,
+        effective_workspace: workspace_mode(&string_of(
+            field(document, "effective_workspace")?,
+            "effective_workspace",
+        )?)?,
+        effective_network: network_policy(&string_of(
+            field(document, "effective_network")?,
+            "effective_network",
+        )?)?,
+        credential_refs_digest: opt_string(field(document, "credential_refs_digest")?)?,
+        resolver_version: string_of(field(document, "resolver_version")?, "resolver_version")?,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }

@@ -23,9 +23,11 @@ use crate::capability::{
 };
 use crate::error::ContractError;
 use crate::predicates::{validate_source_config, validate_spawn_source};
+use crate::provisioning::{BindingSnapshot, ProvisioningBinding};
 use crate::records::{
     AdapterBindingPolicy, AffinityConstraint, AgentType, AgentTypeContract, ContinuityMode,
-    CredentialRef, LifecycleMode, NetworkPolicy, SourceConfig, SpawnSource, TaskRequirement,
+    CredentialRef, LifecycleMode, NetworkPolicy, PhysicalSafety, SourceConfig, SpawnSource,
+    TaskRequirement,
 };
 use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
 use serde_json::{json, Value};
@@ -555,6 +557,91 @@ pub fn canonical_generation_policy_bytes(policy: &GenerationPolicy) -> Vec<u8> {
     }))
 }
 
+fn physical_safety_value(safety: &PhysicalSafety) -> Value {
+    json!({
+        "attempt_isolation": safety.attempt_isolation(),
+        "workspace_modes": safety
+            .enforceable_workspace_modes()
+            .iter()
+            .map(|m| m.as_sql())
+            .collect::<Vec<_>>(),
+        "network_modes": safety
+            .enforceable_network_modes()
+            .iter()
+            .map(|m| network_str(*m))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Canonical bytes of an immutable `ProvisioningBinding` (M6-B.4).
+pub fn canonical_provisioning_binding_bytes(binding: &ProvisioningBinding) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "PROVISIONING_BINDING",
+        "provisioning_binding_id": binding.provisioning_binding_id,
+        "logical_agent_id": binding.logical_agent_id.as_str(),
+        "incarnation_id": binding.incarnation_id.as_str(),
+        "agent_type": {
+            "type_id": binding.agent_type.id().as_str(),
+            "revision": binding.agent_type.revision(),
+        },
+        "spawn_source": {
+            "source_id": binding.spawn_source.id().as_str(),
+            "revision": binding.spawn_source.revision(),
+        },
+        "source_config": {
+            "source_id": binding.source_config.source().id().as_str(),
+            "source_revision": binding.source_config.source().revision(),
+            "config_id": binding.source_config.config_id().as_str(),
+            "revision": binding.source_config.revision(),
+        },
+        "adapter_policy": {
+            "adapter_policy_id": binding.adapter_policy.id().as_str(),
+            "revision": binding.adapter_policy.revision(),
+        },
+        "adapter_kind": binding.adapter_kind,
+        "adapter_binding_key": binding.adapter_binding_key,
+        "attested_materialization_digest": binding.attested_materialization_digest.as_str(),
+        "provisioning_protocol": binding.provisioning_protocol,
+        "effective_security": physical_safety_value(&binding.effective_security),
+    }))
+}
+
+/// Canonical bytes of an immutable `BindingSnapshot` (M6-B.4).
+pub fn canonical_binding_snapshot_bytes(snapshot: &BindingSnapshot) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "BINDING_SNAPSHOT",
+        "snapshot_id": snapshot.snapshot_id,
+        "execution_id": snapshot.execution_id.as_str(),
+        "provisioning_binding_id": snapshot.provisioning_binding_id,
+        "adapter_kind": snapshot.adapter_kind,
+        "adapter_binding_key": snapshot.adapter_binding_key,
+        "spawn_source": {
+            "source_id": snapshot.spawn_source.id().as_str(),
+            "revision": snapshot.spawn_source.revision(),
+        },
+        "source_config": {
+            "source_id": snapshot.source_config.source().id().as_str(),
+            "source_revision": snapshot.source_config.source().revision(),
+            "config_id": snapshot.source_config.config_id().as_str(),
+            "revision": snapshot.source_config.revision(),
+        },
+        "source_config_digest": snapshot.source_config_digest.as_str(),
+        "attested_materialization_digest": snapshot.attested_materialization_digest.as_str(),
+        "launch_descriptor": snapshot.launch_descriptor,
+        "execution_target": snapshot.execution_target,
+        "execution_profile": snapshot.execution_profile,
+        "required_capabilities": capability_map_value(&snapshot.required_capabilities),
+        "enforceable_security": physical_safety_value(&snapshot.enforceable_security),
+        "effective_isolation": snapshot.effective_isolation,
+        "effective_workspace": snapshot.effective_workspace.as_sql(),
+        "effective_network": network_str(snapshot.effective_network),
+        "credential_refs_digest": snapshot.credential_refs_digest,
+        "resolver_version": snapshot.resolver_version,
+    }))
+}
+
 // =============================================================================
 // Digests
 // =============================================================================
@@ -611,4 +698,28 @@ pub fn task_agent_requirement_content_digest(req: &TaskAgentRequirement) -> Stri
 
 pub fn generation_policy_content_digest(policy: &GenerationPolicy) -> String {
     content_digest(&canonical_generation_policy_bytes(policy))
+}
+
+pub fn provisioning_binding_content_digest(binding: &ProvisioningBinding) -> String {
+    content_digest(&canonical_provisioning_binding_bytes(binding))
+}
+
+/// Secret-free digest of a credential-reference set (sorted/deduped), or `None`
+/// when there are no references. Only opaque references are hashed; no secret
+/// value ever enters Core.
+pub fn credential_refs_digest(refs: &[CredentialRef]) -> Option<String> {
+    if refs.is_empty() {
+        return None;
+    }
+    let mut items: Vec<&str> = refs.iter().map(|reference| reference.as_str()).collect();
+    items.sort_unstable();
+    items.dedup();
+    Some(content_digest(&to_bytes(json!({
+        "kind": "CREDENTIAL_REFS",
+        "refs": items,
+    }))))
+}
+
+pub fn binding_snapshot_content_digest(snapshot: &BindingSnapshot) -> String {
+    content_digest(&canonical_binding_snapshot_bytes(snapshot))
 }
