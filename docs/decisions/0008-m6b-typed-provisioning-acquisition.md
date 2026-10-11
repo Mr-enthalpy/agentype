@@ -2,7 +2,7 @@
 
 Status: Accepted (M6-B.4; not a milestone freeze)
 Date: 2026-10-06
-Consolidated: 2026-10-10
+Consolidated: 2026-10-11
 Canonical path: `docs/decisions/0008-m6b-typed-provisioning-acquisition.md`
 
 ## Context
@@ -44,7 +44,10 @@ The resolver validates target/profile and all known hard filters before
 source-private attestation: policy activity/kind, protocol support, credentials,
 retention, contract compatibility and enforceability. Only otherwise eligible
 revisions enter read-only I/O. The transaction independently re-proves its
-mandatory predicates; preflight grants no authority.
+mandatory predicates; preflight grants no authority. The frozen readiness
+gate is shared with legacy claim selection: QUEUED Task, ACTIVE Batch, active
+partition and due backoff. Both existing/new paths reload it in the final
+authority transaction; a suspended sibling Batch cannot grant a typed claim.
 
 Credential-bearing configs fail closed until B.5 supplies trusted, source-bound
 availability and brokering. A caller-provided boolean is not such proof. Core
@@ -196,12 +199,13 @@ Successful output is also a producer boundary: a malformed canonical digest or
 blank descriptor propagates as fatal, preserving Attempt/Lease/provenance and
 writing no worker failure or retry. A confirmed fatal category is durably
 recorded against the exact Attempt before propagation, fencing later claim
-operations. Recovery closes the claim and suspends the Task without ExecutionLost
-or retry-policy evaluation; it does not alter the reserved host or invent
-quiescence. A crash before fault observation remains an ordinary M5 orphan.
-Fault-record persistence failure itself propagates; no durable-fence guarantee
-is claimed for an unsuccessful write. Cancellation/re-admission after repair is
-explicit; a dedicated fault-resume control API remains outside this slice.
+operations. Recovery atomically closes the claim, suspends Task/Batch and creates
+a preparation-cause Escalation plus DECISION_REQUIRED outbox event. It writes no
+worker Failure or ExecutionLost, evaluates no retry policy and invents no
+physical quiescence. Root can explicitly retry or cancel through the existing
+resolution primitive after repair. A crash before fault observation remains an
+ordinary M5 orphan. Failed fault persistence propagates without claiming a
+durable fence; failed notification persistence rolls back the suspension.
 Output grammar is checked before post-call deadline
 and digest-equality availability checks. A valid digest whose content no longer
 matches attestation remains a distinct availability/TOCTOU rejection.
@@ -231,7 +235,8 @@ mode. Effective workspace and network policy are carried to the start request.
 - Resolver entry points require the execution registry to apply authoritative
   target/profile filters before attestation. Separate deadlines preserve the
   winner's preparation budget.
-- Shared pure placement/isolation decisions remove duplicated eligibility rules.
+- Shared Task/Batch readiness and pure placement/isolation decisions remove
+  duplicated eligibility rules.
   Moving Attempt association to Execution restores M5 settlement assumptions
   without changing settlement APIs or adding a physical lifecycle.
 - Exact-source registration replaces the production wildcard helper to preserve
@@ -243,6 +248,12 @@ mode. Effective workspace and network policy are carried to the start request.
   empty strings, making availability explicit. Source-returned errors become
   sanitized public categories while retaining stage-specific dispositions;
   arbitrary private diagnostic text never grants control-plane disclosure.
+- EscalationCause distinguishes TaskFailure from PreparationFault. The record
+  and Core resolution snapshot replace mandatory failure_class with this cause;
+  failure_class() returns Some for worker causes and None for preparation. This
+  new domain needs an actionable Root decision without counterfeit Task failure
+  or quiescence. PreparationFaultKind is shared in Core and re-exported by storage.
+  Existing retry/cancel primitives and worker writer-safety behavior remain.
 - The internal `provisioning-producer` feature narrows the default contract-crate
   surface. Cargo feature unification means it is not an unforgeable authority
   token; transactional re-proof and control APIs that accept no caller-supplied
@@ -261,6 +272,9 @@ full typed topology and database migration remain pending. The
 owns scope and verification evidence.
 This PR's deployment scope is explicitly fresh schema-v8 databases only, plus
 reopening databases already created at v8. Idempotent initialization adds the
-preparation_faults table and immutable/Execution exclusion guards to prior
-PR-era v8 databases; reopening conformance covers this additive amendment. Existing v7 databases are rejected;
+preparation_faults and preparation_escalations tables with immutable/coherence
+guards to prior PR-era v8 databases. Recovery also supplies the missing Root
+decision for a latest already-suspended fault, without reopening resolved or
+cancelled work. Reopening conformance covers this additive amendment. Existing
+v7 databases are rejected;
 no upgrade compatibility is claimed until migration is implemented and verified.

@@ -2,7 +2,7 @@
 
 Status: Historical Report
 Implementation status: M6-B.4 library slice implemented; milestone incomplete, not frozen
-Date: 2026-10-10
+Date: 2026-10-11
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert milestone freeze.
 
@@ -16,7 +16,9 @@ pending; this is a library/composition boundary, not an end-to-end production
 typed dispatch claim.
 Deployment is restricted to fresh schema-v8 databases and reopening existing
 v8 databases. Idempotent initialization installs additive preparation-fault
-guards on prior PR-era v8 stores. Existing v7 databases are rejected; this PR offers no upgrade path.
+and decision guards on prior PR-era v8 stores; recovery repairs a latest
+already-suspended preparation fault missing its Root decision once. Existing v7
+databases are rejected; this PR offers no upgrade path.
 
 The frozen specs govern acceptance. Interface amendments are justified in
 [ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) and
@@ -72,12 +74,13 @@ into running typed daemon dispatch is a remaining step.
   settles as RESOURCE_UNAVAILABLE; authority loss produces no Task NACK; storage,
   invariant, recovery-required, missing-revision and unknown faults propagate
   without writing a Task failure. A confirmed fatal category commits as an
-immutable Attempt fact and fences further claim operations. Recovery closes
-Attempt/Lease and suspends without ExecutionLost, automatic retry or quiescence
-escalation; a crash before confirmed fault keeps ordinary orphan recovery.
-If fault persistence fails, its error propagates and no durable-fence guarantee
-is claimed. Cancellation/re-admission after repair is explicit; a dedicated
-fault-resume control API is outside this slice.
+  immutable Attempt fact and fences further claim operations. Recovery closes
+  Attempt/Lease, releases assignment and atomically suspends Task/Batch with a
+  preparation-cause Escalation and DECISION_REQUIRED outbox event. No worker
+  Failure, automatic retry or quiescence is invented. Root explicitly chooses
+  retry/cancel after repair through the existing resolution primitive. A crash
+  before confirmed fault keeps ordinary orphan recovery. Failed fault writes
+  cannot claim a durable fence; failed notification writes roll back suspension.
 - Malformed successful producer output and observed integration-protocol drift
   are fatal too. They preserve claim rows, fence activity and produce no worker failure, retry,
   Execution or snapshot. Grammar checks precede post-call availability checks.
@@ -86,8 +89,8 @@ fault-resume control API is outside this slice.
   settlement use fixed categories while retaining original fault dispositions.
 - Attestation has an explicit optional validated digest: None is unavailable;
   Some cannot be empty/noncanonical text. Attestation ConfigurationUnavailable
-skips only that config, consistently with candidate-local fallback; storage
-and invariant faults abort enumeration. Adding an equally continuous config
+  skips only that config, consistently with candidate-local fallback; storage
+  and invariant faults abort enumeration. Adding an equally continuous config
   can still block an existing WARM host before acquisition; removing the tie
   restores reuse. ADR-0010 retains this liveness limit as an open policy question.
 - Production routing has no wildcard API; each source revision needs an explicit
@@ -111,7 +114,8 @@ capacity and retirement fencing retain their behavior.
 | Committed descriptor on ExecutionLaunchSnapshot and start constructors | The trusted constructor gains an optional descriptor to close the committed-provenance → request boundary. Typed request construction consumes committed A and rejects B/empty/legacy construction; legacy remains empty. The raw unsafe constructor is still a procedural trust contract |
 | Durable preparation-fault category and ownership-only fact fence | Confirmed producer faults must survive recovery without becoming ExecutionLost. No worker FailureClass or physical lifecycle is introduced. An elapsed but still-owned ACTIVE claim may record a late fact; activity authority still requires an unexpired lease |
 | Resolver requires ExecutionRegistry | Authoritative target/profile are needed before attestation, so irrelevant candidates cannot spend the shared budget or hide eligible sources |
-| Shared placement/isolation decisions | Preserve frozen gates across preselection, authority, snapshot and handoff instead of maintaining inconsistent copies |
+| Shared readiness/placement/isolation decisions | Legacy and both typed authority paths share QUEUED/ACTIVE Batch/active partition/due backoff; placement and isolation also preserve frozen gates across matching, commitment and handoff |
+| EscalationCause replaces mandatory failure_class | A new preparation domain needs Root notification/resolution without a worker FailureClass. TaskFailure keeps legacy safety rules; PreparationFault names the immutable Attempt fact. The optional failure_class() getter and storage kind re-export preserve meaningful legacy access |
 | Attempt association deferred to Execution | Restore frozen M5 physical-phase assumptions and preserve earlier WARM hosts across every pre-Execution closure; settlement APIs and schema need no additional amendment |
 | Source registry wildcard restricted to private unit tests | A new source revision must not inherit opaque-config interpretation without an explicit composition-root routing decision; shared integrations use multiple registrations |
 | Internal PreparedTypedExecutionLaunch owns exact binding | Retain the validated instance and deadlines through dispatch, preventing stale-binding re-selection; public legacy PreparedExecutionLaunch remains unchanged |
@@ -122,20 +126,22 @@ capacity and retirement fencing retain their behavior.
 
 ## Verification
 
-Local checks on 2026-10-10:
+Local checks on 2026-10-11:
 
 | Check | Result |
 |---|---|
-| Storage with test-support | 304 tests and 1 doc probe passed, including B.4 46, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
-| Provisioning resolver unit target | 43 passed, including restart fault/orphan counterparts, two-config fault routing, descriptor substitution, fault-write failure and private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
+| Storage with test-support | 309 tests and 1 doc probe passed, including B.4 51, B.3 40, catalog 32, M6-A frontier 49, M4 kernel 71 and all storage recovery/topology/supervision/outbox suites |
+| Provisioning resolver unit target | 43 passed, including actionable Root recovery and restart fault/orphan counterparts, two-config fault routing, descriptor substitution, fault-write failure and private-diagnostic sentinel/fallback matrices, WARM equal-continuity tie and restored reuse, typed attestation, producer/protocol faults and exact-instance handoff |
 | Default-feature public API boundary | 35 probes passed, including wildcard-constructor and raw-string attestation compile-fail probes |
 | Runtime rustdoc | 11 passed, including the actual optional validated attestation SPI signature |
 | Workspace all-target compilation, default/all-feature clippy | Passed; warnings denied |
 | Formatting and whitespace | cargo fmt --all --check and git diff --check passed |
 | Full Windows workspace runtime gate | Local ProcessLock setup is restricted; full runtime acceptance is checked against the pushed head's remote CI |
 
-The five new B.4 storage regressions also fail against the original provisioning
-implementation while its 34 existing tests pass, then pass with the correction.
+The two Task/Batch readiness and Root-decision counterexamples retained on
+`32377e1d` fail (46 pass / 2 fail), then pass with the correction. The complete
+suite also verifies notice-failure rollback, cause provenance, idempotent old-v8
+repair and explicit Root resolution. Earlier witnesses remain consolidated.
 The focused [counterexample witness](riir-m6b.4-contract-parity.md) records the
 discriminating cases. Passing test counts alone are not the acceptance argument.
 

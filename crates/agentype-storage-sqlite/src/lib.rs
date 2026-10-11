@@ -34,6 +34,7 @@ mod schema;
 mod store;
 pub mod txutil;
 
+pub use agentype_core::PreparationFaultKind;
 pub use catalog::{
     AgentTypeStatus, ConfigMode, DurableAgentTypeLookup, SourceConfigBody, SourceConfigBodyView,
     SourceConfigRevision,
@@ -43,7 +44,6 @@ pub use kernel::{
     LeaseSupervisionView, OutboxDeliveryCandidate, OutboxDeliverySnapshot, RunningAuthorityGrant,
     SupervisedRenewal,
 };
-pub use preparation::PreparationFaultKind;
 #[cfg(any(test, feature = "runtime-internal"))]
 pub use provisioning::{acquire_typed_task_existing, acquire_typed_task_new_agent};
 pub use provisioning::{

@@ -296,6 +296,28 @@ CREATE TABLE IF NOT EXISTS escalations (
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_escalation_per_task
 ON escalations(task_id) WHERE state = 'OPEN';
 
+-- The legacy NOT NULL failure_class column is a cause tag for preparation
+-- decisions. A typed child points to the immutable fact; it is not a Failure.
+CREATE TABLE IF NOT EXISTS preparation_escalations (
+    escalation_id TEXT PRIMARY KEY REFERENCES escalations(id) ON DELETE RESTRICT,
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES preparation_faults(attempt_id) ON DELETE RESTRICT
+);
+CREATE TRIGGER IF NOT EXISTS preparation_escalations_require_parent
+BEFORE INSERT ON preparation_escalations
+WHEN NOT EXISTS(SELECT 1 FROM escalations e JOIN attempts a ON a.id=NEW.attempt_id
+    WHERE e.id=NEW.escalation_id AND e.failure_class='PREPARATION_CONTROL_PLANE' AND e.task_id=a.task_id)
+BEGIN SELECT RAISE(ABORT,'preparation escalation parent/cause mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS preparation_escalations_no_update
+BEFORE UPDATE ON preparation_escalations
+BEGIN SELECT RAISE(ABORT,'preparation escalation provenance is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS preparation_escalations_no_delete
+BEFORE DELETE ON preparation_escalations
+BEGIN SELECT RAISE(ABORT,'preparation escalation provenance cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS preparation_escalations_no_replace
+BEFORE INSERT ON preparation_escalations
+WHEN EXISTS(SELECT 1 FROM preparation_escalations WHERE escalation_id=NEW.escalation_id OR attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT,'preparation escalation provenance cannot be replaced'); END;
+
 CREATE TABLE IF NOT EXISTS checkpoints (
     id TEXT PRIMARY KEY,
     logical_agent_id TEXT NOT NULL REFERENCES logical_agents(id) ON DELETE RESTRICT,

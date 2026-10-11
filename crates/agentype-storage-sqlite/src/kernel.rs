@@ -3166,7 +3166,7 @@ impl Kernel {
                     params![now, row.attempt_id],
                 )
                 .map_err(map_sqlite)?;
-                if preparation_fault.is_some() {
+                if let Some(kind) = preparation_fault {
                     // A confirmed producer/control-plane fact is not an
                     // ordinary orphan, a worker NACK, or a quiescence witness.
                     // Close only this claim and suspend without retry policy.
@@ -3175,6 +3175,10 @@ impl Kernel {
                         params![now, row.task_id],
                     ).map_err(map_sqlite)?;
                     release_agent(tx, &row.logical_agent_id, now)?;
+                    create_escalation_with_cause(tx, &row.task_id, &row.batch_id,
+                        Some(&row.logical_agent_id), row.workstream_id.as_deref(),
+                        &EscalationCause::PreparationFault { attempt_id: AttemptId::from_string(&row.attempt_id), kind },
+                        None, Some("confirmed fatal preparation fault; Root must repair and explicitly choose retry or cancellation"), now)?;
                     recompute_batch(tx, &row.batch_id, now)?;
                     report.suspended += 1;
                     continue;
@@ -3273,6 +3277,7 @@ impl Kernel {
                     report.suspended += 1;
                 }
             }
+            crate::preparation::restore_missing_escalations(tx, now)?;
             Ok(report)
         })
     }
@@ -3809,6 +3814,7 @@ impl Kernel {
                 )
                 .map_err(map_sqlite)?;
             let task = required_task(tx, &task_id)?;
+            let cause = crate::preparation::escalation_cause(tx, escalation_id.as_str(), &task_id, &failure_class)?;
             let latest = query_opt(
                 tx,
                 "SELECT a.incarnation_id,e.id,e.attempt_isolation FROM attempts a
@@ -3828,7 +3834,7 @@ impl Kernel {
 
             let snap = EscalationResolutionSnapshot {
                 escalation_is_open: state == "OPEN",
-                failure_class: FailureClass::parse_sql(&failure_class)?,
+                cause,
                 task_state: TaskState::parse_sql(&task.state)?,
                 workspace_mode: WorkspaceMode::parse_sql(&task.workspace_mode)?,
                 frozen_isolation,
@@ -4382,12 +4388,13 @@ impl Kernel {
                 other => map_sqlite(other),
             })
             .and_then(|(id, tid, bid, agent, class, state)| {
+                let cause = crate::preparation::escalation_cause(conn, &id, &tid, &class)?;
                 Ok(EscalationRecord {
                     id: EscalationId::from_string(id),
                     task_id: TaskId::from_string(tid),
                     batch_id: BatchId::from_string(bid),
                     logical_agent_id: agent.map(LogicalAgentId::from_string),
-                    failure_class: FailureClass::parse_sql(&class)?,
+                    cause,
                     state: EscalationState::parse_sql(&state)?,
                 })
             })

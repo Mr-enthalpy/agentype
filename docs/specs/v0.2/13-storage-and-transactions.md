@@ -33,8 +33,10 @@ at its own version.
 M6-B.4 deployment is restricted to fresh schema-v8 databases and reopening
 existing v8 databases. An existing v7 database MUST be rejected; passing v8
 conformance does not claim safe upgrade of frozen B.3 data. During this unfrozen
-PR, additive v8 preparation-fault DDL is installed by idempotent initialization
-when reopening earlier PR-era v8 stores; existing record formats do not change.
+PR, additive v8 preparation-fault/decision DDL is installed by idempotent
+initialization when reopening earlier PR-era v8 stores. Existing worker
+escalations retain their format; preparation causes use a tagged child. Recovery
+repairs latest already-suspended faults missing their Root decision exactly once.
 
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:
@@ -93,11 +95,22 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   elapsed time alone does not discard a confirmed fact. It grants no activity
   authority. Activity/settlement requires the unchanged unexpired authority
   fence and absence of such a fault. Update/delete/replace and conflicting
-  Execution commitment are forbidden. Recovery closes a faulted claim and
-  suspends the Task without worker failure, ExecutionLost retry or quiescence
-  escalation; an unobserved pre-prepare crash keeps ordinary orphan recovery.
-  A fault write error propagates; unsuccessful persistence cannot establish a
-  durable fence. No automatic fault-resume API is part of this slice.
+  Execution commitment are forbidden. Recovery atomically closes Attempt/Lease,
+  releases assignment, suspends Task/Batch and creates a preparation-cause
+  Escalation plus DECISION_REQUIRED outbox event. It writes no worker Failure,
+  ExecutionLost retry or quiescence assertion; an unobserved pre-prepare crash
+  keeps ordinary orphan recovery. Root explicitly chooses retry/cancel through
+  the existing resolution primitive after repair. Fault writes cannot claim an
+  unsuccessful fence; failed notice writes roll back the suspension.
+- preparation_escalations immutably maps a cause-tagged Escalation to one
+  preparation_faults Attempt. Parent tag, Task owner, fault kind and absence of
+  physical Execution/association MUST agree on authoritative reads. Missing or
+  conflicting children fail closed. A resolved mapping is retained, preventing
+  recovery from recreating its decision or notification. EscalationCause replaces
+  the mandatory worker failure field for this new domain (ADR-0011).
+- Both typed acquisition paths MUST transactionally recheck the shared Core
+  claim_task_ready gate: Task QUEUED, Batch ACTIVE, partition active and backoff
+  due. Failure MUST roll back Attempt/Lease, binding and any newborn agent rows.
 - Kernel-produced `ExecutionLaunchSnapshot` carries the exact descriptor from
   its coherent BindingSnapshot transaction (None for legacy). Typed start
   construction MUST consume it or reject unequal/empty caller text; legacy

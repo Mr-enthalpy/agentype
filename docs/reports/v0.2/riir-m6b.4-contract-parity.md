@@ -1,7 +1,7 @@
 # M6-B.4 — Frozen-contract counterexample witness
 
 Status: Historical Report
-Date: 2026-10-10
+Date: 2026-10-11
 Applies to: PR #24 against frozen M4–M6-B.3
 Canonical path: `docs/reports/v0.2/riir-m6b.4-contract-parity.md`
 Not a specification.
@@ -12,11 +12,13 @@ The [implementation record](riir-m6b.4-provisioning-binding-freeze.md) owns scop
 and validation. [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md)
 explains shared eligibility, phase boundaries and interface reasons. This is one
 matrix of final observable behavior; earlier audit narratives are not competing
-acceptance rules. Resolver passes 43 tests; B.4 storage passes 46; default API
+acceptance rules. Resolver passes 43 tests; B.4 storage passes 51; default API
 passes 35 probes and runtime rustdoc passes 11.
 
 | Boundary | Authoritative consequence and valid counterpart |
 |---|---|
+| Task/Batch readiness | QUEUED sibling in SUSPENDED Batch creates no Attempt/Lease or newborn side rows on either typed path; explicit Root resolution restores ACTIVE and permits the same Task |
+| Root decision transaction | Fatal recovery atomically suspends Task/Batch with one preparation-cause Escalation/event; outbox failure rolls back closure/release/suspension; repeat recovery and prior-v8 repair are idempotent, explicit retry/cancel works, and resolved causes never reopen |
 | Required continuity | B.3/existing/new placement agree; absent concrete matching workstream creates no authority, binding or newborn agent; concrete matching continuity succeeds |
 | Target/importer isolation | Independent target/importer combinations reject unenforceable target policy before authority on both paths; imported capability alone does not enable policy |
 | Snapshot commitment | An isolation overclaim rolls back Execution, association and snapshot; coherent exact binding commits atomically |
@@ -25,7 +27,7 @@ passes 35 probes and runtime rustdoc passes 11.
 | Physical-history guard | ACTIVE agent claims with NULL association and STARTING with any Execution history cannot be replaced; executed WARM provenance change fails before a new claim and preserves the host |
 | Known ineligibility before I/O | Poisoned credential/wrong-kind attestations are never invoked; a later eligible candidate remains usable while corruption on an actually performed read is fatal |
 | Integration fault dispositions | Availability settles RESOURCE_UNAVAILABLE; authority loss remains recovery-owned; storage/invariant/recovery-required/missing-revision/unknown faults retain claim rows plus a durable immutable fault fence and write no worker failure |
-| Confirmed fault across recovery | Reopen after fatal output/protocol/storage/invariant observation: suspend without ExecutionLost, worker failure, new Attempt or physical obligation; reopen before prepare: ordinary ExecutionLost retry succeeds. Failed fault persistence propagates without Task NACK |
+| Confirmed fault across recovery | Reopen after fatal output/protocol/storage/invariant observation: suspend with one actionable Root decision/event, without ExecutionLost, worker failure, new Attempt or physical obligation; reopen before prepare: ordinary ExecutionLost retry succeeds. Failed fault persistence propagates without Task NACK |
 | Fault authority and v8 reopening | Exact identity/epoch ownership, immutable/replace/delete guards, elapsed-but-owned fact recording, blocked worker settlement/Execution and explicit cancellation; prior PR-era v8 initializes additive guards, and executed WARM remains unchanged |
 | Attestation fallback scope | Config A ConfigurationUnavailable / B valid chooses and commits B; A StorageFailure/InvariantViolation aborts before B and leaves no claim |
 | Committed descriptor | Snapshot A rejects explicit B, empty/whitespace and legacy typed construction; exact A and normal legacy requests succeed |
@@ -53,7 +55,8 @@ The regression tests were retained while running the relevant prior code:
 | `149edce` | Resolver 30 pass / 2 fail: malformed successful output is downgraded and protocol drift is accepted; the separate executed-WARM replacement counterexample also fails |
 | Audited `bd7019c` | Both retained private-diagnostic sentinel tests fail at the outward-error boundary; the WARM tie limitation is reproduced without changing its policy |
 | Audited `2ab94c0` | Retained restart-fatal, two-config unavailable and descriptor-substitution counterexamples fail; ordinary pre-prepare orphan retry passes |
-| Corrected library slice | Resolver 43 pass; B.4 storage 46 pass; full storage 304 plus 1 doc probe; default API 35 probes; runtime rustdoc 11 pass |
+| Audited `32377e1d` | Retained Batch-readiness and missing-Root-decision counterexamples fail (46 pass / 2 fail) |
+| Corrected library slice | Resolver 43 pass; B.4 storage 51 pass; full storage 309 plus 1 doc probe; default API 35 probes; runtime rustdoc 11 pass |
 
 Complete storage verification retains frozen M4 writer-safety/recovery, M6-A
 frontier and B.3 admission/matching. Default API probes supplement transactional

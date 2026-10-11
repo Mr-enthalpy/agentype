@@ -935,9 +935,23 @@ fn finish_acquisition(
     execution_registry: &agentype_execution_config::ExecutionRegistry,
 ) -> Result<TypedAcquisition, Error> {
     let task = required_task(tx, task_id.as_str())?;
-    if task.state != "QUEUED" {
+    let batch_state: String = tx
+        .query_row(
+            "SELECT state FROM batches WHERE id=?1",
+            params![task.batch_id],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite)?;
+    let partition = required_partition(tx, &task.partition, false)?;
+    if !agentype_core::claim_task_ready(
+        agentype_core::TaskState::parse_sql(&task.state)?,
+        agentype_core::BatchState::parse_sql(&batch_state)?,
+        partition.active,
+        task.next_eligible_at,
+        now,
+    ) {
         return Err(Error::invalid_transition(
-            "typed acquisition requires a QUEUED task",
+            "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
         ));
     }
     let mode: String = query_opt(

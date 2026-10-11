@@ -572,20 +572,75 @@ pub fn create_escalation(
     detail: Option<&str>,
     now: UnixTime,
 ) -> Result<String, Error> {
+    create_escalation_with_cause(
+        tx,
+        task_id,
+        batch_id,
+        logical_agent_id,
+        workstream_id,
+        &EscalationCause::TaskFailure(failure_class),
+        signature,
+        detail,
+        now,
+    )
+}
+
+pub(crate) fn create_escalation_with_cause(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    batch_id: &str,
+    logical_agent_id: Option<&str>,
+    workstream_id: Option<&str>,
+    cause: &EscalationCause,
+    signature: Option<&str>,
+    detail: Option<&str>,
+    now: UnixTime,
+) -> Result<String, Error> {
     if let Some(existing) = query_opt(
         tx,
         "SELECT id FROM escalations WHERE task_id=?1 AND state='OPEN'",
         params![task_id],
         |r| r.get::<_, String>(0),
     )? {
+        let tag: String = tx
+            .query_row(
+                "SELECT failure_class FROM escalations WHERE id=?1",
+                [&existing],
+                |r| r.get(0),
+            )
+            .map_err(map_sqlite)?;
+        let actual = crate::preparation::escalation_cause(tx, &existing, task_id, &tag)?;
+        if (matches!(cause, EscalationCause::PreparationFault { .. })
+            || matches!(actual, EscalationCause::PreparationFault { .. }))
+            && actual != *cause
+        {
+            return Err(Error::invariant(
+                "open escalation has a different control-plane cause",
+            ));
+        }
         return Ok(existing);
     }
+    let (tag, cause_kind, cause_json, failure_class) = match cause {
+        EscalationCause::TaskFailure(class) => (
+            class.as_sql(),
+            "TASK_FAILURE",
+            serde_json::json!({"kind":"TASK_FAILURE","failure_class":class.as_sql()}),
+            Some(class.as_sql()),
+        ),
+        EscalationCause::PreparationFault { attempt_id, kind } => (
+            crate::preparation::PREPARATION_ESCALATION,
+            "PREPARATION_FAULT",
+            serde_json::json!({"kind":"PREPARATION_FAULT","attempt_id":attempt_id.as_str(),"fault_kind":kind.as_sql()}),
+            None,
+        ),
+    };
     let escalation_id = EscalationId::new().to_string();
     let snapshot = serde_json::json!({
         "task_id": task_id,
         "logical_agent_id": logical_agent_id,
         "workstream_id": workstream_id,
-        "failure_class": failure_class.as_sql(),
+        "failure_class": failure_class,
+        "cause": cause_json,
         "normalized_failure_signature": signature,
         "detail": detail,
     });
@@ -599,7 +654,7 @@ pub fn create_escalation(
             batch_id,
             logical_agent_id,
             workstream_id,
-            failure_class.as_sql(),
+            tag,
             signature,
             json_dump(&snapshot),
             "Root must choose an explicit recovery primitive",
@@ -607,6 +662,9 @@ pub fn create_escalation(
         ],
     )
     .map_err(map_sqlite)?;
+    if let EscalationCause::PreparationFault { attempt_id, kind } = cause {
+        crate::preparation::attach_escalation(tx, &escalation_id, task_id, attempt_id, *kind)?;
+    }
     enqueue_event(
         tx,
         DECISION_REQUIRED,
@@ -615,7 +673,8 @@ pub fn create_escalation(
         &serde_json::json!({
             "escalation_id": escalation_id,
             "task_id": task_id,
-            "batch_id": batch_id
+            "batch_id": batch_id,
+            "cause_kind": cause_kind
         }),
         now,
     )?;

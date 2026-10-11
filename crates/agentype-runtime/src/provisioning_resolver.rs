@@ -3121,7 +3121,10 @@ mod tests {
 
         kernel.recover_authority().unwrap();
         let escalation = kernel.open_escalation_for_task(&task).unwrap();
-        assert_eq!(escalation.failure_class, FailureClass::ExecutionLost);
+        assert_eq!(
+            escalation.failure_class(),
+            Some(FailureClass::ExecutionLost)
+        );
         assert!(matches!(
             kernel.task(&task).unwrap().state,
             TaskState::Suspended | TaskState::RetryWait
@@ -3206,7 +3209,12 @@ mod tests {
                 Some(binding)
             );
             assert!(kernel.task(&task).unwrap().current_attempt_id.is_none());
-            assert!(kernel.open_escalation_for_task(&task).is_err());
+            let decision = kernel.open_escalation_for_task(&task).unwrap();
+            assert!(matches!(
+                decision.cause,
+                agentype_core::EscalationCause::PreparationFault { .. }
+            ));
+            assert_eq!(decision.failure_class(), None);
             for table in ["failures", "executions", "binding_snapshots"] {
                 assert_eq!(
                     raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
@@ -3957,8 +3965,8 @@ mod tests {
             kernel
                 .open_escalation_for_task(&task)
                 .unwrap()
-                .failure_class,
-            FailureClass::WriterQuiescenceUnknown
+                .failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
         );
     }
 

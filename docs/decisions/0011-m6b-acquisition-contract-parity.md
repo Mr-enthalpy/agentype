@@ -2,16 +2,16 @@
 
 Status: Accepted (M6-B.4 correction; not a milestone freeze)
 Date: 2026-10-08
-Updated: 2026-10-10
+Updated: 2026-10-11
 Canonical path: `docs/decisions/0011-m6b-acquisition-contract-parity.md`
 
 ## Context
 
-The independent review of PR #24 at `515a25ca` found three correctness gaps and
-one candidate-enumeration gap against the frozen M4–M6-B.3 baseline. Repeated
-local corrections had left two structural sources of drift: duplicated
-eligibility decisions and an acquisition-time Attempt→Incarnation association
-that changed the assumptions of M5 settlement without an Execution.
+Typed acquisition and preparation introduce new authority boundaries above
+frozen M4–M6-B.3. Duplicated eligibility, early physical association and a
+claim-only fatal disposition can each omit obligations already enforced by the
+legacy path. Shared decisions and complete transaction boundaries must preserve
+Task/Batch readiness, M5 physical safety and Root-observable suspension together.
 
 This decision supplies the rationale for the shared gates and phase boundary
 in ADR-0008's consolidated prepare-only model. Frozen specs and observable
@@ -22,6 +22,12 @@ not silently change. B.5 and daemon wiring remain outside this correction.
 ## Decision
 
 ### Shared eligibility, separate authority boundaries
+
+Legacy and both typed authority paths share Core `claim_task_ready`: Task
+QUEUED, Batch ACTIVE, partition active and backoff due. Typed acquisition reloads
+these facts inside its final transaction. Semantic compatibility cannot waive
+Batch suspension. The legacy wrapper additionally excludes typed Tasks; typed
+acquisition still requires its separate semantic and provisioning proof.
 
 Legacy claim selection, B.3 semantic preselection and B.4 transactional placement
 use the same pure Core `claim_placement_eligible` decision. Required continuity
@@ -109,14 +115,26 @@ faults, missing revisions and unsupported errors default to Fatal and leave the
 committed claim rows intact, without a Task NACK. Before returning a confirmed
 Fatal, runtime commits an immutable, payload-free preparation fault category for
 that exact Attempt. This fences subsequent claim operations and survives restart.
-Recovery closes Attempt/Lease, suspends the Task and releases assignment without
-recording ExecutionLost, consulting retry policy, changing the reserved host or
-creating worker-failure/quiescence escalation. A crash before a confirmed fault
-still follows ordinary M5 orphan recovery. Fault persistence errors propagate
-fatally; an unsuccessful write cannot claim a durable disposition. Suspended
-faults require control-plane repair and explicit cancellation/re-admission; this
-slice does not offer automatic retry or a fault-resume control API.
+Recovery closes Attempt/Lease, releases assignment and atomically commits Task
+and Batch suspension, a preparation-cause Escalation and its DECISION_REQUIRED
+outbox event. It records no worker Failure or ExecutionLost, consults no retry
+policy and supplies no physical death/quiescence assertion. A crash before a
+confirmed fault still follows ordinary M5 orphan recovery. Fault persistence
+errors propagate fatally; an unsuccessful write cannot claim a durable fence.
+After control-plane repair, Root uses the existing resolve_escalation primitive
+to choose retry or cancellation explicitly; automatic retry remains forbidden.
 The existing Result signature is retained; its fault semantics are honored.
+
+EscalationRecord and the Core resolution snapshot now carry EscalationCause:
+TaskFailure(FailureClass) or PreparationFault(attempt_id, kind). The former
+mandatory failure_class field could express this new fault domain only by
+counterfeiting a worker failure. The optional failure_class() accessor returns
+Some for legacy causes and None for preparation. PreparationFaultKind moves to
+Core so the shared decision can represent it; storage re-exports its prior path.
+Writer finalization/revival remains exclusive to WriterQuiescenceUnknown. A
+preparation retry needs no quiescence claim and never authorizes writer release.
+This is an explicit amendment to the reason type, preserving M4 notification
+and decision transaction boundaries rather than introducing a parallel API.
 
 The same rule applies to successful producer output: malformed digests and blank
 descriptors are fatal contract faults, not Task availability. Integration protocol
@@ -165,9 +183,15 @@ descriptor. The raw unsafe constructor remains a procedural trust contract,
 not an access-control token.
 
 Fault facts add a small table and guards to the unfrozen v8 schema. Idempotent
-initialization installs them on prior PR-era v8 databases, without changing
-existing records or admitting v7. Recording a late confirmed fault checks exact
-ACTIVE claim ownership even after elapsed time; it grants no work authority.
+initialization installs them on prior PR-era v8 databases without admitting v7.
+The additive preparation_escalations child maps one Escalation to one immutable
+Attempt fact. The parent cause tag and validated child/fault/Task ownership must
+agree; missing or conflicting provenance fails closed. Legacy worker records
+retain their format. Recovery repairs a prior-v8 already-suspended fault only
+when it is the latest closed unstarted Attempt with no mapped decision. Resolved
+decisions and cancelled Tasks cannot be reopened by this repair. Recording a
+late confirmed fault checks exact ACTIVE claim ownership even after elapsed
+time; it grants no work authority.
 Core validate_authority still requires an unexpired lease for execution,
 renewal and settlement. Closed/replaced claims cannot acquire a fault fact.
 
@@ -210,7 +234,12 @@ regression suite is not proof of full daemon integration or milestone freeze.
 
 Paired restart tests allow ExecutionLost retry and prove confirmed fatal output,
 protocol drift and storage/invariant faults suspend without a worker failure,
-while a crash before prepare retries normally. Guard tests cover identity
+while a crash before prepare retries normally. A suspended/queued sibling
+Batch blocks both acquisition paths without newborn side rows; explicit Root
+resolution restores ACTIVE and permits acquisition. Recovery tests prove one
+preparation decision/event, notification-failure rollback, idempotence, explicit
+retry/cancel and no counterfeit worker/quiescence cause. Prior-v8 suspended
+faults gain a decision once; resolved faults never reopen. Guard tests cover identity
 forgery, immutable facts, late elapsed leases, blocked commitment/settlement,
 explicit cancellation, prior-v8 reopening and preservation of an executed WARM
 host. Two-config attestation tests distinguish local unavailability from global

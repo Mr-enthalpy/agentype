@@ -200,6 +200,9 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   single authority-bearing typed acquisition re-proves every mandatory conjunct
   (`can_execute`, `can_provision_task`, active `AdapterBindingPolicy` with
   satisfied `required_safety`, exact binding) over the current catalog
+- a SUSPENDED sibling Task and QUEUED typed Task share a SUSPENDED Batch: both
+  existing/new acquisition reject without Attempt/Lease or newborn side rows.
+  Explicit Root resolution restores ACTIVE and the same Task can be acquired;
 - acquisition proves `can_execute`/`can_provision_task` over the agent's actual
   bound type (a refinement, broader, or otherwise compatible B.3 candidate is
   accepted; a different revision of the same `type_id` is not), re-checks M5
@@ -468,6 +471,13 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   or invented quiescence; crash before fault observation retains ordinary orphan
   retry. Include permitted ExecutionLost retry with max_attempts > 1, malformed
   success, protocol drift, storage/invariant faults and failed fault persistence;
+  the same suspension transaction creates exactly one preparation-cause
+  Escalation and DECISION_REQUIRED event, with no worker FailureClass. Rejecting
+  the event INSERT rolls back claim closure, release, Task/Batch suspension and
+  decision. Repeated recovery is idempotent; explicit retry/cancel resolves it
+  without fake quiescence, and release_cancelled_writer is rejected. A latest
+  already-suspended prior-v8 fault gains the missing decision once; resolved or
+  cancelled work cannot reopen. Cause/child/fault mismatch fails closed;
 - preparation fault facts reject update/delete/replace, forged ownership,
   subsequent execution/worker settlement and closed/replaced claims; an elapsed
   but still-owned ACTIVE claim can record a late fact without gaining activity

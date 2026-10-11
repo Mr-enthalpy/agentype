@@ -197,7 +197,10 @@ fn lease_expiration_alone_does_not_permit_duplicate_writer() {
     let task = k.task(&task_id).unwrap();
     assert_eq!(task.state, TaskState::Suspended);
     let esc = k.open_escalation_for_task(&task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
     assert!(k.claim_next_available().unwrap().is_none());
 }
 
@@ -273,7 +276,10 @@ fn cancelled_writer_still_requires_quiescence() {
     k.cancel_task(&task_id, false).unwrap();
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Cancelled);
     let esc = k.open_escalation_for_task(&task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
     let agent = k.logical_agent(&claim.logical_agent_id).unwrap();
     assert_eq!(agent.state, LogicalAgentState::Suspended);
 }
@@ -497,7 +503,10 @@ fn configuration_unavailable_with_running_writer_must_not_retry() {
     assert_eq!(state, TaskState::Suspended);
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Suspended);
     let esc = k.open_escalation_for_task(&task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
     assert!(k.claim_next_available().unwrap().is_none());
 }
 
@@ -633,7 +642,10 @@ fn nonterminal_nack_cannot_retry_writer_on_unproven_quiescence() {
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Suspended);
     assert_eq!(k.batch(&batch).unwrap().state, BatchState::Suspended);
     let esc = k.open_escalation_for_task(&task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
     assert!(k.claim_next_available().unwrap().is_none());
 
     // Crash-restart convergence: recovery must not resurrect a replacement.
@@ -859,7 +871,10 @@ fn cancel_active_writer_with_unknown_quiescence_keeps_obligation_open() {
     assert_eq!(k.batch(&batch).unwrap().state, BatchState::Cancelled);
     assert_eq!(k.task(&task_id).unwrap().state, TaskState::Cancelled);
     let esc = k.open_escalation_for_task(&task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
     let agent = k.logical_agent(&claim.logical_agent_id).unwrap();
     assert_eq!(agent.state, LogicalAgentState::Suspended);
     // The surviving obligation still blocks partition retirement.
@@ -922,8 +937,8 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
         env.k
             .open_escalation_for_task(&stuck_id)
             .unwrap()
-            .failure_class,
-        FailureClass::WriterQuiescenceUnknown
+            .failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
     );
 
     env.k.cancel_batch(&batch).unwrap();
@@ -938,7 +953,10 @@ fn cancel_suspended_batch_preserves_open_writer_obligation() {
     ));
     // Pre-existing writer-safety escalation survives batch cancellation.
     let esc = env.k.open_escalation_for_task(&stuck_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
 }
 
 #[test]
@@ -1466,7 +1484,10 @@ fn escalation_resolution_of_lost_writer_transitions_to_terminated_with_durable_q
     assert_eq!(k.task(&claim.task_id).unwrap().state, TaskState::Suspended);
 
     let esc = k.open_escalation_for_task(&claim.task_id).unwrap();
-    assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+    assert_eq!(
+        esc.failure_class(),
+        Some(FailureClass::WriterQuiescenceUnknown)
+    );
 
     // Root confirms quiescence and resolves escalation to retry
     k.resolve_escalation(&esc.id, "retry", true).unwrap();

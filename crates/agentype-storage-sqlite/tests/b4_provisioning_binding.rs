@@ -1012,6 +1012,413 @@ fn typed_acquisition_and_atomic_binding_snapshot_round_trip() {
 }
 
 #[test]
+fn typed_acquisition_requires_active_batch_on_existing_and_new_paths() {
+    for existing in [true, false] {
+        let env = Env::new("batch-claimability", 2);
+        let kernel = &env.kernel;
+        let pin = publish_agent_type(kernel, "reviewer");
+        let catalog = publish_catalog(kernel, "batch");
+        let queued = admit_typed_task(kernel, pin.clone());
+        let sibling = admit_typed_task(kernel, pin.clone());
+        let batch = kernel.task(&queued).unwrap().batch_id;
+        // Build a coherent multi-Task Batch fixture; B.3's public single-proposal
+        // convenience admission currently allocates one Batch per Task.
+        env.raw()
+            .execute(
+                "UPDATE tasks SET batch_id=?1 WHERE id=?2",
+                rusqlite::params![batch.as_str(), sibling.as_str()],
+            )
+            .unwrap();
+        let sibling_agent = kernel.ready_agent("general").unwrap();
+        kernel
+            .bind_logical_agent_type(&sibling_agent, &pin)
+            .unwrap();
+        let sibling_claim = kernel
+            .acquire_typed_task_existing(&sibling, &sibling_agent, &catalog.selection, &registry())
+            .unwrap()
+            .claim;
+        kernel
+            .report_configuration_unavailable(
+                &sibling_claim.attempt_id,
+                sibling_claim.lease_epoch,
+                "unavailable",
+            )
+            .unwrap();
+        assert_eq!(
+            kernel.batch(&batch).unwrap().state,
+            agentype_core::BatchState::Suspended
+        );
+        assert_eq!(kernel.task(&queued).unwrap().state, TaskState::Queued);
+        let agent = kernel.ready_agent("general").unwrap();
+        kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let raw = env.raw();
+        let count = |table: &str| {
+            raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let tables = [
+            "attempts",
+            "leases",
+            "logical_agents",
+            "incarnations",
+            "provisioning_bindings",
+            "executions",
+            "binding_snapshots",
+        ];
+        let before: Vec<_> = tables.iter().map(|table| count(table)).collect();
+        let acquire = || {
+            if existing {
+                kernel.acquire_typed_task_existing(&queued, &agent, &catalog.selection, &registry())
+            } else {
+                kernel.acquire_typed_task_new_agent(&queued, &catalog.selection, &registry())
+            }
+        };
+        assert!(
+            acquire().is_err(),
+            "suspended Batch created typed authority"
+        );
+        assert_eq!(kernel.attempt_count_for_task(&queued).unwrap(), 0);
+        assert_eq!(kernel.task(&queued).unwrap().state, TaskState::Queued);
+        assert_eq!(
+            tables.iter().map(|table| count(table)).collect::<Vec<_>>(),
+            before
+        );
+        let escalation = kernel.open_escalation_for_task(&sibling).unwrap();
+        kernel
+            .resolve_escalation(&escalation.id, "retry", false)
+            .unwrap();
+        assert_eq!(
+            kernel.batch(&batch).unwrap().state,
+            agentype_core::BatchState::Active
+        );
+        acquire().unwrap();
+        assert_eq!(kernel.attempt_count_for_task(&queued).unwrap(), 1);
+        assert_eq!(kernel.task(&queued).unwrap().state, TaskState::Leased);
+    }
+}
+
+#[test]
+fn fatal_preparation_recovery_creates_one_root_decision_and_can_be_resolved() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    for operation in ["retry", "cancel_task"] {
+        let env = Env::new("preparation-root-decision", 1);
+        let pin = publish_agent_type(&env.kernel, "reviewer");
+        let catalog = publish_catalog(&env.kernel, "decision");
+        let task = admit_typed_task(&env.kernel, pin.clone());
+        let agent = env.kernel.ready_agent("general").unwrap();
+        env.kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+        let acquired = env
+            .kernel
+            .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+            .unwrap();
+        env.kernel
+            .record_preparation_fault(&acquired.claim, F::InvariantViolation)
+            .unwrap();
+        let path = env.path.clone();
+        let raw = env.raw();
+        drop(env);
+        let kernel =
+            Kernel::open(path, Arc::new(ManualClock::new(2_000.0)), 10.0, MAX_BYTES).unwrap();
+        let report = kernel.recover_authority().unwrap();
+        assert_eq!(report.retried, 0);
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Suspended);
+        assert_eq!(
+            kernel.batch(&acquired.claim.batch_id).unwrap().state,
+            agentype_core::BatchState::Suspended
+        );
+        let escalation = kernel.open_escalation_for_task(&task).unwrap();
+        assert_eq!(
+            escalation.cause,
+            agentype_core::EscalationCause::PreparationFault {
+                attempt_id: acquired.claim.attempt_id.clone(),
+                kind: F::InvariantViolation,
+            }
+        );
+        assert_eq!(escalation.failure_class(), None);
+        let snapshot_json: String = raw
+            .query_row(
+                "SELECT snapshot_json FROM escalations WHERE id=?1",
+                [escalation.id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cause_snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        assert!(cause_snapshot["failure_class"].is_null());
+        assert_eq!(cause_snapshot["cause"]["kind"], "PREPARATION_FAULT");
+        let payload: String = raw.query_row(
+            "SELECT payload_json FROM notification_outbox WHERE event_type='DECISION_REQUIRED' AND aggregate_id=?1",
+            [escalation.id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["cause_kind"],
+            "PREPARATION_FAULT"
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM executions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let decision_count = || {
+            raw.query_row(
+                "SELECT COUNT(*) FROM escalations WHERE task_id=?1",
+                [task.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let event_count = || {
+            raw.query_row("SELECT COUNT(*) FROM notification_outbox WHERE event_type='DECISION_REQUIRED' AND aggregate_id=?1", [escalation.id.as_str()], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(decision_count(), 1);
+        assert_eq!(event_count(), 1);
+        kernel.recover_authority().unwrap();
+        assert_eq!(decision_count(), 1);
+        assert_eq!(event_count(), 1);
+        assert!(kernel
+            .resolve_escalation(&escalation.id, "release_cancelled_writer", true)
+            .is_err());
+        kernel
+            .resolve_escalation(&escalation.id, operation, false)
+            .unwrap();
+        assert!(kernel
+            .resolve_escalation(&escalation.id, operation, false)
+            .is_err());
+        assert!(kernel.open_escalation_for_task(&task).is_err());
+        assert_eq!(
+            kernel
+                .preparation_fault_kind(&acquired.claim.attempt_id)
+                .unwrap(),
+            Some(F::InvariantViolation)
+        );
+        kernel.recover_authority().unwrap();
+        assert_eq!(decision_count(), 1, "a resolved fault must not reopen");
+        assert_eq!(event_count(), 1);
+        if operation == "retry" {
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+            assert_eq!(
+                kernel.batch(&acquired.claim.batch_id).unwrap().state,
+                agentype_core::BatchState::Active
+            );
+            kernel
+                .acquire_typed_task_new_agent(&task, &catalog.selection, &registry())
+                .unwrap();
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 2);
+        } else {
+            assert_eq!(kernel.task(&task).unwrap().state, TaskState::Cancelled);
+            assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+        }
+        assert_eq!(event_count(), 1);
+    }
+}
+
+#[test]
+fn preparation_recovery_rolls_back_if_root_notification_cannot_commit() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    let env = Env::new("preparation-notice-atomicity", 1);
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "reviewer");
+    let catalog = publish_catalog(kernel, "atomic");
+    let task = admit_typed_task(kernel, pin.clone());
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquired = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    kernel
+        .record_preparation_fault(&acquired.claim, F::StorageFailure)
+        .unwrap();
+    let raw = env.raw();
+    raw.execute_batch("CREATE TRIGGER reject_root_decision BEFORE INSERT ON notification_outbox
+        WHEN NEW.event_type='DECISION_REQUIRED' BEGIN SELECT RAISE(ABORT,'test notification failure'); END;").unwrap();
+    assert!(kernel.recover_authority().is_err());
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+    assert_eq!(
+        kernel.batch(&acquired.claim.batch_id).unwrap().state,
+        agentype_core::BatchState::Active
+    );
+    assert_eq!(
+        kernel.logical_agent(&agent).unwrap().state,
+        LogicalAgentState::Assigned
+    );
+    for table in ["attempts", "leases"] {
+        assert_eq!(
+            raw.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE state='ACTIVE'"),
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+    for table in ["escalations", "preparation_escalations", "failures"] {
+        assert_eq!(
+            raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        kernel
+            .preparation_fault_kind(&acquired.claim.attempt_id)
+            .unwrap(),
+        Some(F::StorageFailure)
+    );
+    raw.execute("DROP TRIGGER reject_root_decision", [])
+        .unwrap();
+    kernel.recover_authority().unwrap();
+    let decision = kernel.open_escalation_for_task(&task).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id=?1",
+            [decision.id.as_str()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn prior_v8_suspended_preparation_fault_gets_one_actionable_root_decision() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    let env = Env::new("prior-v8-preparation-decision", 1);
+    let pin = publish_agent_type(&env.kernel, "reviewer");
+    let catalog = publish_catalog(&env.kernel, "prior-decision");
+    let task = admit_typed_task(&env.kernel, pin.clone());
+    let agent = env.kernel.ready_agent("general").unwrap();
+    env.kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquired = env
+        .kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    env.kernel
+        .record_preparation_fault(&acquired.claim, F::InvalidContract)
+        .unwrap();
+    let raw = env.raw();
+    // Reproduce the previous v8 recovery result and schema, with no Root decision.
+    raw.execute_batch(
+        "DROP TABLE preparation_escalations;
+        UPDATE attempts SET state='EXPIRED',ended_at=1000;
+        UPDATE leases SET state='EXPIRED',ended_at=1000;
+        UPDATE tasks SET state='SUSPENDED',current_attempt_id=NULL;
+        UPDATE batches SET state='SUSPENDED';
+        UPDATE logical_agents SET state='RETIRED',current_task_id=NULL;",
+    )
+    .unwrap();
+    let path = env.path.clone();
+    drop(env);
+    let kernel = Kernel::open(&path, Arc::new(ManualClock::new(2_000.0)), 10.0, MAX_BYTES).unwrap();
+    assert_eq!(kernel.recover_authority().unwrap().retried, 0);
+    let decision = kernel.open_escalation_for_task(&task).unwrap();
+    assert_eq!(
+        decision.cause,
+        agentype_core::EscalationCause::PreparationFault {
+            attempt_id: acquired.claim.attempt_id.clone(),
+            kind: F::InvalidContract
+        }
+    );
+    kernel.recover_authority().unwrap();
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM escalations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id=?1",
+            [decision.id.as_str()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM failures", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    kernel
+        .resolve_escalation(&decision.id, "retry", false)
+        .unwrap();
+    kernel.recover_authority().unwrap();
+    assert!(kernel.open_escalation_for_task(&task).is_err());
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM escalations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn preparation_decision_provenance_is_immutable_and_missing_child_fails_closed() {
+    use agentype_storage_sqlite::PreparationFaultKind as F;
+    let env = Env::new("preparation-decision-provenance", 1);
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "reviewer");
+    let catalog = publish_catalog(kernel, "decision-guards");
+    let task = admit_typed_task(kernel, pin.clone());
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let acquired = kernel
+        .acquire_typed_task_existing(&task, &agent, &catalog.selection, &registry())
+        .unwrap();
+    kernel
+        .record_preparation_fault(&acquired.claim, F::Other)
+        .unwrap();
+    kernel.recover_authority().unwrap();
+    let decision = kernel.open_escalation_for_task(&task).unwrap();
+    let raw = env.raw();
+    for sql in [
+        "UPDATE preparation_escalations SET attempt_id=attempt_id WHERE escalation_id=?1",
+        "DELETE FROM preparation_escalations WHERE escalation_id=?1",
+        "INSERT OR REPLACE INTO preparation_escalations SELECT * FROM preparation_escalations WHERE escalation_id=?1",
+        "INSERT INTO preparation_escalations SELECT 'another-escalation',attempt_id FROM preparation_escalations WHERE escalation_id=?1",
+    ] {
+        assert!(raw.execute(sql, [decision.id.as_str()]).is_err());
+    }
+    raw.execute(
+        "UPDATE escalations SET failure_class='EXECUTION_LOST' WHERE id=?1",
+        [decision.id.as_str()],
+    )
+    .unwrap();
+    assert!(kernel.open_escalation_for_task(&task).is_err());
+    assert!(kernel
+        .resolve_escalation(&decision.id, "retry", false)
+        .is_err());
+    raw.execute(
+        "UPDATE escalations SET failure_class='PREPARATION_CONTROL_PLANE' WHERE id=?1",
+        [decision.id.as_str()],
+    )
+    .unwrap();
+    raw.execute("DROP TRIGGER preparation_escalations_no_delete", [])
+        .unwrap();
+    raw.execute(
+        "DELETE FROM preparation_escalations WHERE escalation_id=?1",
+        [decision.id.as_str()],
+    )
+    .unwrap();
+    assert!(kernel.open_escalation_for_task(&task).is_err());
+    assert!(kernel
+        .resolve_escalation(&decision.id, "retry", false)
+        .is_err());
+    assert!(kernel.recover_authority().is_err());
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Suspended);
+    assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
+}
+
+#[test]
 fn preparation_fault_is_immutable_and_fences_execution_and_worker_settlement() {
     use agentype_storage_sqlite::PreparationFaultKind as F;
     let env = Env::new("preparation-fault", 1);

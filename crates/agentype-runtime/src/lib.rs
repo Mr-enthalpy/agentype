@@ -2232,7 +2232,10 @@ mod tests {
             TaskState::Suspended
         );
         let esc = kernel.open_escalation_for_task(&claim.task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
 
         // Backoff time passing does not resurrect a suspended writer.
         clock.advance(60.0);
@@ -3734,7 +3737,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(!exec.quiescent_confirmed);
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -3922,7 +3928,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // replacement — the writer-safety suspension stands.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -4040,7 +4049,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // writer: the task suspends instead of retrying.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -4193,7 +4205,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // quiescence-proven: suspension, never a replacement writer.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -4345,7 +4360,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
     }
 
     /// Test adapter whose collect_outcome corrupts one durable column below
