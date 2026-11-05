@@ -1189,6 +1189,7 @@ fn spawn_jailed(
 ) -> AdapterResult<Spawned> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let exec_dir = std::env::temp_dir().join(format!(
