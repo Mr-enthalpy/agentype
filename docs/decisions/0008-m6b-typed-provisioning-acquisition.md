@@ -152,9 +152,12 @@ ConfigurationUnavailable is also candidate-local during attestation: skip that
 config and consider later candidates. StorageFailure and InvariantViolation
 abort the entire enumeration.
 
-Enumeration and winner preparation receive distinct absolute deadlines. No call
-renews its endpoint. The full committed-claim authority fence is checked before
-and after preparation, and deadlines/digests are checked on return.
+Enumeration and winner preparation receive distinct absolute deadlines, and no
+call renews its endpoint. Candidate attestation probes run under the enumeration
+deadline; the winner's preparation budget starts only after winner selection and
+commit, so slow attestation cannot consume it. The full committed-claim
+authority fence is checked before and after preparation, and deadlines/digests
+are checked on return.
 
 The integration's protocol must equal the exact adapter's imported provisioning
 protocol at eligibility and handoff. Preparation checks the integration against
@@ -287,7 +290,16 @@ M6-B.4's library slice and the end-to-end typed execution loop are implemented o
 PR #24: production `ControlLoopService` typed dispatch, a concrete
 `SourceConfigIntegration` (`agentype-source-workspace-jail`) and a
 provisioning-capable adapter with real OS enforcement
-(`JailedProcessAgentAdapter`). B.5 credential/security import, cold/revivable
+(`JailedProcessAgentAdapter`). The adapter's current enforcement claims are:
+per-Execution Windows restricting SID (never the global `S-1-5-12`) with a
+direct-ACL write grant only on that jail; Linux Landlock ABI >= 3 required so
+`truncate(2)`/`O_TRUNC` cannot bypass the ruleset; one absolute deadline carried
+through jail creation, ACL, spawn, identity probe and cleanup; and an explicit
+minimal worker environment allowlist instead of daemon inheritance. Candidate
+cooldown is excluded before the probe limit, and the winner's prepare budget is
+created only after winner commit. The E2E Result ACK is harness-injected through
+the durable Kernel command boundary; no production worker transport/auth/retry
+is claimed. B.5 credential/security import, cold/revivable
 matching, full typed topology, executed-WARM replacement and database migration
 remain pending and fail closed. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)

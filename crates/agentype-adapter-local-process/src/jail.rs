@@ -7,14 +7,22 @@
 //!
 //! Enforcement is mechanical, not declared:
 //!
-//! * Windows: a restricted token (`WRITE_RESTRICTED` plus the `RESTRICTED` SID)
-//!   is created and passed to `CreateProcessAsUserW`. Write access therefore
-//!   requires both the normal access check **and** a write ACE for `S-1-5-12`.
-//!   `ReadOnly` grants no such ACE; `Write` grants modify access on the
-//!   per-execution jail root only.
+//! * Windows: a restricted token (`WRITE_RESTRICTED` plus a **per-execution**
+//!   restricting SID derived from the RequestId) is created and passed to
+//!   `CreateProcessAsUserW`. Write access therefore requires both the normal
+//!   access check **and** a write ACE for that Execution's SID. `ReadOnly`
+//!   grants no such ACE; `Write` grants modify access on the per-execution jail
+//!   root only. A different Execution carries a different restricting SID, so an
+//!   ACE for one jail can never authorize another Execution's token.
 //! * Linux: Landlock is installed in the child via `pre_exec`. The ruleset
-//!   handles every write-class filesystem right; `ReadOnly` adds no path rule,
-//!   `Write` adds one rule for the per-execution jail root.
+//!   handles every write-class filesystem right including `TRUNCATE` (Landlock
+//!   ABI >= 3 is required; older ABIs cannot deny `truncate(2)` and are refused).
+//!   `ReadOnly` adds no path rule; `Write` adds one rule for the per-execution
+//!   jail root.
+//!
+//! The worker never inherits the daemon environment. Both platforms pass only a
+//! minimal, explicit allowlist of non-sensitive runtime variables plus a
+//! per-execution instance token; credential-like daemon state is absent.
 //!
 //! Network enforcement is `Enabled` only. `attempt_isolation` is not
 //! enforceable and is reported as `false`, so an isolating Task is ineligible
@@ -301,9 +309,19 @@ impl ImportableAdapter for JailedProcessAgentAdapter {
     }
 
     fn import_enforceable_workspace(&self) -> Vec<WorkspaceMode> {
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(windows)]
         {
             vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // ABI 1/2 cannot deny `truncate(2)`, so neither ReadOnly nor the
+            // bounded Write root would be honest on such a host.
+            if landlock_enforceable() {
+                vec![WorkspaceMode::ReadOnly, WorkspaceMode::Write]
+            } else {
+                Vec::new()
+            }
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -346,13 +364,62 @@ fn safe_component(value: &str) -> String {
         .collect()
 }
 
+/// Per-execution restricting SID. Windows access checks require the restricting
+/// SID to have an ACE on the target, so granting this SID on one jail root can
+/// never authorize another Execution (which carries a different SID).
+/// `S-1-5-12` is deliberately not used: it is a well-known, process-global code
+/// SID shared by every restricted token.
+fn restricting_sid(request_id: &RequestId) -> String {
+    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+    let raw = request_id.as_str().as_bytes();
+    let a = fnv1a(0xcbf2_9ce4_8422_2325, raw) as u32 | 1;
+    let b = (fnv1a(0x9e37_79b9_7f4a_7c15, raw) >> 32) as u32 | 1;
+    let c = fnv1a(0x85eb_ca6b, raw) as u32 | 1;
+    let d = (fnv1a(0xc2b2_ae35, raw) >> 16) as u32 | 1;
+    format!("S-1-5-21-{a}-{b}-{c}-{d}")
+}
+
 fn prepare_jail(
     descriptor: &JailLaunchDescriptor,
     request_id: &RequestId,
     mode: WorkspaceMode,
+    restricting_sid: &str,
+    deadline: &AdapterDeadline,
 ) -> AdapterResult<(PathBuf, PathBuf)> {
+    prepare_jail_impl(
+        descriptor,
+        request_id,
+        mode,
+        restricting_sid,
+        deadline,
+        |_| {},
+    )
+}
+
+/// Shared preparation body. `phase_observer` runs after each physical phase so
+/// a test can deterministically consume the absolute deadline *between*
+/// phases; production passes a no-op, and every phase is followed by the same
+/// `require_deadline` check either way.
+fn prepare_jail_impl<F: FnMut(&'static str)>(
+    descriptor: &JailLaunchDescriptor,
+    request_id: &RequestId,
+    mode: WorkspaceMode,
+    restricting_sid: &str,
+    deadline: &AdapterDeadline,
+    mut phase_observer: F,
+) -> AdapterResult<(PathBuf, PathBuf)> {
+    require_deadline(deadline, "workspace jail base deadline exhausted", None)?;
     fs::create_dir_all(descriptor.jail_root())
         .map_err(|_| AdapterError::unavailable("cannot create workspace jail base"))?;
+    phase_observer("base");
+    require_deadline(deadline, "workspace jail root deadline exhausted", None)?;
     let root = descriptor.jail_root().join(format!(
         "agentype-jail-{}",
         safe_component(request_id.as_str())
@@ -360,16 +427,29 @@ fn prepare_jail(
     fs::create_dir(&root).map_err(|_| {
         AdapterError::unavailable("workspace jail root already exists or cannot be created")
     })?;
+    phase_observer("root");
+    require_deadline(
+        deadline,
+        "workspace jail workspace deadline exhausted",
+        None,
+    )?;
     let workspace = root.join("workspace");
     fs::create_dir(&workspace)
         .map_err(|_| AdapterError::unavailable("cannot create workspace jail workspace"))?;
+    phase_observer("workspace");
     #[cfg(windows)]
     {
         if mode == WorkspaceMode::Write {
-            grant_restricted_write(&root)?;
+            grant_restricted_write(&root, &workspace, restricting_sid, deadline)?;
         }
     }
-    let _ = mode;
+    let _ = (mode, restricting_sid);
+    phase_observer("acl");
+    require_deadline(
+        deadline,
+        "workspace jail preparation deadline exhausted",
+        None,
+    )?;
     Ok((root, workspace))
 }
 
@@ -397,10 +477,30 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
             ));
         }
         let descriptor = JailLaunchDescriptor::parse(raw)?;
-        let (root, workspace) =
-            prepare_jail(&descriptor, request.request_id(), request.workspace_mode())?;
+        #[cfg(target_os = "linux")]
+        if !landlock_enforceable() {
+            return Err(AdapterError::unavailable(
+                "Landlock ABI 3 or newer is required to deny truncate(2)",
+            ));
+        }
+        let sid = restricting_sid(request.request_id());
+        let (root, workspace) = prepare_jail(
+            &descriptor,
+            request.request_id(),
+            request.workspace_mode(),
+            &sid,
+            deadline,
+        )?;
         let inst = instance_token();
-        let spawned = spawn_jailed(&descriptor, &root, &workspace, request, &inst, deadline)?;
+        let spawned = spawn_jailed(
+            &descriptor,
+            &root,
+            &workspace,
+            request,
+            &inst,
+            &sid,
+            deadline,
+        )?;
         let parsed = ParsedHandle {
             pid: spawned.pid,
             birth: spawned.birth,
@@ -771,8 +871,9 @@ fn spawn_jailed(
     _root: &Path,
     workspace: &Path,
     request: &EnvironmentStartRequest,
-    _inst: &str,
-    _deadline: &AdapterDeadline,
+    inst: &str,
+    restricting_sid: &str,
+    deadline: &AdapterDeadline,
 ) -> AdapterResult<Spawned> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
@@ -787,6 +888,11 @@ fn spawn_jailed(
             "restricted-token workspace jail requires an inherited Windows console",
         ));
     }
+    require_deadline(
+        deadline,
+        "workspace jail spawn deadline already expired",
+        None,
+    )?;
 
     type Handle = *mut core::ffi::c_void;
     type Dword = u32;
@@ -801,6 +907,7 @@ fn spawn_jailed(
     const STILL_ACTIVE: Dword = 259;
     const STARTF_USESTDHANDLES: Dword = 0x0000_0100;
     const EXTENDED_STARTUPINFO_PRESENT: Dword = 0x0008_0000;
+    const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
     const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 
     #[repr(C)]
@@ -850,6 +957,7 @@ fn spawn_jailed(
         fn GetCurrentProcess() -> Handle;
         fn GetConsoleCP() -> Dword;
         fn GetExitCodeProcess(process: Handle, code: *mut Dword) -> Bool;
+        fn TerminateProcess(process: Handle, exit_code: Dword) -> Bool;
         fn CloseHandle(handle: Handle) -> Bool;
         fn LocalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
         fn SetHandleInformation(handle: Handle, mask: Dword, flags: Dword) -> Bool;
@@ -979,7 +1087,7 @@ fn spawn_jailed(
         ));
     }
 
-    let restricted_sid_string = wide(std::ffi::OsStr::new("S-1-5-12"));
+    let restricted_sid_string = wide(std::ffi::OsStr::new(restricting_sid));
     let mut restricted_sid: *mut core::ffi::c_void = std::ptr::null_mut();
     let sid_ok =
         unsafe { ConvertStringSidToSidW(restricted_sid_string.as_ptr(), &mut restricted_sid) };
@@ -1032,6 +1140,11 @@ fn spawn_jailed(
         .chain(std::iter::once(0))
         .collect();
     let current_directory = wide(workspace.as_os_str());
+    // Do not inherit the daemon environment. Build an explicit, minimal block:
+    // without CREATE_UNICODE_ENVIRONMENT a null pointer silently means
+    // "inherit", which would hand every daemon secret to the worker.
+    let mut environment = jailed_environment_block(inst, workspace);
+    require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
 
     // Restrict inheritance to exactly the three stdio handles.
     let mut list_size = 0usize;
@@ -1093,8 +1206,8 @@ fn spawn_jailed(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             1,
-            EXTENDED_STARTUPINFO_PRESENT,
-            std::ptr::null_mut(),
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_mut_ptr() as *mut core::ffi::c_void,
             current_directory.as_ptr(),
             &startup.startup_info,
             &mut process_info,
@@ -1119,11 +1232,21 @@ fn spawn_jailed(
     unsafe {
         CloseHandle(process_info.thread);
     }
+    if deadline.is_expired() {
+        unsafe {
+            TerminateProcess(process_info.process, 1);
+            CloseHandle(process_info.process);
+        }
+        return Err(AdapterError::deadline_exceeded(
+            "workspace jail spawn deadline exhausted before identity probe",
+        ));
+    }
 
     let birth = match super::pin::creation_from_handle(process_info.process) {
         Ok(birth) => birth,
         Err(err) => {
             unsafe {
+                TerminateProcess(process_info.process, 1);
                 CloseHandle(process_info.process);
             }
             return Err(err);
@@ -1132,11 +1255,24 @@ fn spawn_jailed(
     let mut code = STILL_ACTIVE;
     // SAFETY: process_info.process is a valid process handle.
     let query_ok = unsafe { GetExitCodeProcess(process_info.process, &mut code) } != 0;
+    if !query_ok {
+        unsafe {
+            TerminateProcess(process_info.process, 1);
+            CloseHandle(process_info.process);
+        }
+        return Err(AdapterError::other("GetExitCodeProcess failed after spawn"));
+    }
+    if deadline.is_expired() {
+        unsafe {
+            TerminateProcess(process_info.process, 1);
+            CloseHandle(process_info.process);
+        }
+        return Err(AdapterError::deadline_exceeded(
+            "workspace jail spawn deadline exhausted",
+        ));
+    }
     unsafe {
         CloseHandle(process_info.process);
-    }
-    if !query_ok {
-        return Err(AdapterError::other("GetExitCodeProcess failed after spawn"));
     }
 
     Ok(Spawned {
@@ -1149,33 +1285,281 @@ fn spawn_jailed(
 }
 
 #[cfg(windows)]
-fn grant_restricted_write(root: &Path) -> AdapterResult<()> {
-    use std::process::{Command, Stdio};
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-    let icacls = system_root.join("System32").join("icacls.exe");
-    let status = Command::new(icacls)
-        .arg(root)
-        .arg("/grant")
-        .arg("*S-1-5-12:(OI)(CI)(M)")
-        .arg("/T")
-        .arg("/C")
-        .arg("/Q")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| AdapterError::unavailable("workspace jail ACL tool unavailable"))?;
-    if !status.success() {
-        return Err(AdapterError::unavailable("workspace jail ACL grant failed"));
+const JAIL_ENV_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+];
+
+/// Build a sorted, explicit UTF-16 environment block for `CreateProcessAsUserW`.
+///
+/// Only a fixed allowlist of non-sensitive OS variables is copied from the
+/// daemon. Everything else (tokens, provider keys, credential refs) is absent.
+/// `TEMP`/`TMP`/`HOME` are redirected into the jail workspace so scratch files
+/// stay inside the enforced boundary.
+#[cfg(windows)]
+fn jailed_environment_block(inst: &str, workspace: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut entries: Vec<(String, std::ffi::OsString)> = Vec::new();
+    for name in JAIL_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            entries.push(((*name).to_string(), value));
+        }
     }
-    Ok(())
+    let workspace = workspace.as_os_str().to_os_string();
+    entries.push(("AGENTYPE_INSTANCE".into(), inst.into()));
+    entries.push(("HOME".into(), workspace.clone()));
+    entries.push(("TEMP".into(), workspace.clone()));
+    entries.push(("TMP".into(), workspace));
+    entries.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+
+    let mut block = Vec::new();
+    for (name, value) in entries {
+        block.extend(name.encode_utf16());
+        block.push(u16::from(b'='));
+        block.extend(value.as_os_str().encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn grant_restricted_write(
+    root: &Path,
+    workspace: &Path,
+    restricting_sid: &str,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+
+    const SE_FILE_OBJECT: i32 = 1;
+    const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
+    const GRANT_ACCESS: i32 = 1;
+    const TRUSTEE_IS_SID: i32 = 0;
+    const TRUSTEE_IS_UNKNOWN: i32 = 0;
+    const OBJECT_INHERIT_ACE: Dword = 0x0000_0001;
+    const CONTAINER_INHERIT_ACE: Dword = 0x0000_0002;
+    // FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+    // the direct-ACL equivalent of icacls' `(M)`.
+    const FILE_MODIFY: Dword = 0x0013_01BF;
+
+    #[repr(C)]
+    struct TrusteeW {
+        multiple_trustee: *mut TrusteeW,
+        multiple_trustee_operation: i32,
+        trustee_form: i32,
+        trustee_type: i32,
+        name: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ExplicitAccessW {
+        access_permissions: Dword,
+        access_mode: i32,
+        inheritance: Dword,
+        trustee: TrusteeW,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut Handle) -> Bool;
+        fn GetNamedSecurityInfoW(
+            object_name: *const u16,
+            object_type: i32,
+            security_info: Dword,
+            owner: *mut Handle,
+            group: *mut Handle,
+            dacl: *mut Handle,
+            sacl: *mut Handle,
+            descriptor: *mut Handle,
+        ) -> Dword;
+        fn SetEntriesInAclW(
+            count: u32,
+            entries: *const ExplicitAccessW,
+            old_acl: *const core::ffi::c_void,
+            new_acl: *mut Handle,
+        ) -> Dword;
+        fn SetNamedSecurityInfoW(
+            object_name: *mut u16,
+            object_type: i32,
+            security_info: Dword,
+            owner: Handle,
+            group: Handle,
+            dacl: Handle,
+            sacl: Handle,
+        ) -> Dword;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: Handle) -> Handle;
+    }
+
+    // An arbitrary per-execution SID is intentionally not a local account, so
+    // `icacls` cannot resolve it. Grant the explicit ACE through the security
+    // APIs, which accept a SID directly and never wait on an external process.
+    let sid_string: Vec<u16> = std::ffi::OsStr::new(restricting_sid)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sid: Handle = std::ptr::null_mut();
+    // SAFETY: sid_string is NUL terminated; sid is an out parameter.
+    if unsafe { ConvertStringSidToSidW(sid_string.as_ptr(), &mut sid) } == 0 {
+        return Err(AdapterError::unavailable(
+            "cannot resolve the per-execution restricting SID",
+        ));
+    }
+
+    let entry = ExplicitAccessW {
+        access_permissions: FILE_MODIFY,
+        access_mode: GRANT_ACCESS,
+        inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        trustee: TrusteeW {
+            multiple_trustee: std::ptr::null_mut(),
+            multiple_trustee_operation: 0,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_UNKNOWN,
+            name: sid.cast::<u16>(),
+        },
+    };
+
+    let mut result = Ok(());
+    for path in [root, workspace] {
+        if let Err(err) = require_deadline(deadline, "workspace jail ACL deadline exhausted", None)
+        {
+            result = Err(err);
+            break;
+        }
+        let mut name: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut old_dacl: Handle = std::ptr::null_mut();
+        let mut descriptor: Handle = std::ptr::null_mut();
+        // SAFETY: name is NUL terminated; out pointers are owned by this frame.
+        let read = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if read != 0 {
+            result = Err(AdapterError::unavailable(
+                "cannot read the workspace jail DACL",
+            ));
+            break;
+        }
+        let mut new_dacl: Handle = std::ptr::null_mut();
+        // SAFETY: entry and old_dacl are valid for the call; new_dacl is out.
+        let merged = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+        if merged != 0 {
+            unsafe {
+                LocalFree(descriptor);
+            }
+            result = Err(AdapterError::unavailable(
+                "cannot merge the workspace jail ACL",
+            ));
+            break;
+        }
+        // SAFETY: name is NUL terminated; new_dacl is a fresh merged ACL.
+        let applied = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe {
+            LocalFree(new_dacl);
+            LocalFree(descriptor);
+        }
+        if applied != 0 {
+            result = Err(AdapterError::unavailable(
+                "cannot apply the workspace jail ACL",
+            ));
+            break;
+        }
+    }
+
+    unsafe {
+        LocalFree(sid);
+    }
+    result
 }
 
 // =============================================================================
 // Linux: Landlock spawn
 // =============================================================================
+
+#[cfg(target_os = "linux")]
+const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+#[cfg(target_os = "linux")]
+const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
+#[cfg(target_os = "linux")]
+const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
+#[cfg(target_os = "linux")]
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_MIN_ABI: u64 = 3;
+
+/// Probe the kernel Landlock ABI without installing a ruleset. ABI 1 and 2
+/// cannot deny `truncate(2)`, which bypasses `WRITE_FILE`; accepting them would
+/// let a ReadOnly or bounded-Write worker truncate files outside its jail.
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> Option<u64> {
+    // SAFETY: documented probe call; no memory is written.
+    let abi = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    (abi >= 0).then_some(abi as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_abi_enforceable(abi: u64) -> bool {
+    abi >= LANDLOCK_MIN_ABI
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_enforceable() -> bool {
+    landlock_abi().is_some_and(landlock_abi_enforceable)
+}
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -1185,6 +1569,7 @@ fn spawn_jailed(
     workspace: &Path,
     request: &EnvironmentStartRequest,
     inst: &str,
+    _restricting_sid: &str,
     deadline: &AdapterDeadline,
 ) -> AdapterResult<Spawned> {
     use std::ffi::CString;
@@ -1192,18 +1577,25 @@ fn spawn_jailed(
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    require_deadline(
+        deadline,
+        "workspace jail spawn deadline already expired",
+        None,
+    )?;
     let exec_dir = std::env::temp_dir().join(format!(
         "agentype-jail-exec-{}",
         request.request_id().as_str()
     ));
     fs::create_dir_all(&exec_dir)
         .map_err(|_| AdapterError::unavailable("cannot create jailed execution dir"))?;
+    require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
     let stdout_path = exec_dir.join("stdout.txt");
     let stderr_path = exec_dir.join("stderr.txt");
     let stdout = File::create(&stdout_path)
         .map_err(|_| AdapterError::unavailable("cannot create stdout"))?;
     let stderr = File::create(&stderr_path)
         .map_err(|_| AdapterError::unavailable("cannot create stderr"))?;
+    require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
 
     let jail_root = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| AdapterError::protocol("workspace jail root contains NUL"))?;
@@ -1212,6 +1604,18 @@ fn spawn_jailed(
     command
         .args(descriptor.args())
         .current_dir(workspace)
+        // Never inherit the daemon environment. Only non-sensitive runtime
+        // variables are copied; anything credential-like stays in the daemon.
+        .env_clear();
+    for name in ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("HOME", workspace)
+        .env("TMPDIR", workspace)
+        .env("TMP", workspace)
         .env("AGENTYPE_INSTANCE", inst)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -1221,6 +1625,7 @@ fn spawn_jailed(
     unsafe {
         command.pre_exec(move || apply_landlock(&jail_root, mode));
     }
+    require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
     let mut child = command
         .spawn()
         .map_err(|_| AdapterError::unavailable("workspace jail spawn failed"))?;
@@ -1228,8 +1633,7 @@ fn spawn_jailed(
     let birth = match super::process_birth(pid, deadline) {
         Ok(birth) => birth,
         Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap_after_kill(child, deadline);
             return Err(err);
         }
     };
@@ -1237,11 +1641,16 @@ fn spawn_jailed(
         Ok(Some(_)) => false,
         Ok(None) => true,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap_after_kill(child, deadline);
             return Err(AdapterError::other("child wait failed after spawn"));
         }
     };
+    if deadline.is_expired() {
+        reap_after_kill(child, deadline);
+        return Err(AdapterError::deadline_exceeded(
+            "workspace jail spawn deadline exhausted",
+        ));
+    }
     Ok(Spawned {
         pid,
         birth,
@@ -1252,13 +1661,28 @@ fn spawn_jailed(
     })
 }
 
+/// Kill and reap a child without ever blocking past the absolute deadline.
+///
+/// When budget remains, wait in deadline-sized slices. When it is exhausted,
+/// hand the child to a detached reaper: the adapter still returns on time and
+/// the OS still collects the eventual exit instead of leaving a zombie.
+#[cfg(unix)]
+fn reap_after_kill(mut child: std::process::Child, deadline: &AdapterDeadline) {
+    let _ = child.kill();
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if !deadline.is_expired() && wait_child_exit(&mut child, deadline).unwrap_or(false) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn apply_landlock(root: &std::ffi::CString, mode: WorkspaceMode) -> std::io::Result<()> {
-    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
-    const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
-    const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
-    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
     const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
 
@@ -1310,6 +1734,12 @@ fn apply_landlock(root: &std::ffi::CString, mode: WorkspaceMode) -> std::io::Res
         return Err(last_error());
     }
     let abi = abi as u64;
+    if !landlock_abi_enforceable(abi) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("Landlock ABI {abi} cannot deny truncate(2); ABI 3 or newer required"),
+        ));
+    }
 
     let mut handled = ACCESS_WRITE_FILE
         | ACCESS_REMOVE_DIR
@@ -1400,6 +1830,7 @@ fn spawn_jailed(
     _workspace: &Path,
     _request: &EnvironmentStartRequest,
     _inst: &str,
+    _restricting_sid: &str,
     _deadline: &AdapterDeadline,
 ) -> AdapterResult<Spawned> {
     // `import_enforceable_workspace` is empty on these hosts, so typed
@@ -1464,5 +1895,152 @@ mod tests {
                 "descriptor must not contain {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn restricting_sid_is_unique_and_deterministic_per_request() {
+        let a = RequestId::new();
+        let b = RequestId::new();
+        assert_eq!(restricting_sid(&a), restricting_sid(&a));
+        assert_ne!(restricting_sid(&a), restricting_sid(&b));
+        assert!(restricting_sid(&a).starts_with("S-1-5-21-"));
+        assert_ne!(restricting_sid(&a), "S-1-5-12");
+    }
+
+    #[test]
+    fn expired_prepare_deadline_creates_no_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "agentype-expired-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let command = std::env::current_exe().unwrap();
+        let descriptor =
+            JailLaunchDescriptor::new(command.to_string_lossy().into_owned(), Vec::new(), &root)
+                .unwrap();
+        let expired = AdapterDeadline::from_instant(std::time::Instant::now());
+        let err = prepare_jail(
+            &descriptor,
+            &RequestId::new(),
+            WorkspaceMode::Write,
+            "S-1-5-21-1-2-3-4",
+            &expired,
+        )
+        .expect_err("an expired prepare deadline must not create a jail");
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
+        assert!(!root.exists());
+    }
+
+    /// P1-4: the absolute deadline must be re-checked between physical phases,
+    /// not only on entry. A deterministic observer consumes the remaining
+    /// budget after the jail root exists; the next phase must be refused.
+    #[test]
+    fn deadline_expiring_between_phases_stops_before_the_next_phase() {
+        let base = std::env::temp_dir().join(format!(
+            "agentype-mid-phase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let command = std::env::current_exe().unwrap();
+        let descriptor =
+            JailLaunchDescriptor::new(command.to_string_lossy().into_owned(), Vec::new(), &base)
+                .unwrap();
+        let request_id = RequestId::new();
+        let deadline = AdapterDeadline::after(std::time::Duration::from_millis(100)).unwrap();
+        let root = base.join(format!(
+            "agentype-jail-{}",
+            safe_component(request_id.as_str())
+        ));
+        let mut phases = Vec::new();
+        let err = prepare_jail_impl(
+            &descriptor,
+            &request_id,
+            WorkspaceMode::ReadOnly,
+            "S-1-5-21-1-2-3-4",
+            &deadline,
+            |phase| {
+                phases.push(phase);
+                if phase == "root" {
+                    // Consume the rest of the absolute budget inside a phase.
+                    std::thread::sleep(deadline.remaining() + std::time::Duration::from_millis(10));
+                }
+            },
+        )
+        .expect_err("expiry between phases must stop preparation");
+        assert_eq!(
+            err.kind(),
+            agentype_adapter_api::AdapterErrorKind::DeadlineExceeded
+        );
+        assert_eq!(
+            phases,
+            vec!["base", "root"],
+            "preparation must not run any phase after the deadline expired"
+        );
+        assert!(
+            root.exists(),
+            "the completed phase keeps its physical effect"
+        );
+        assert!(
+            !root.join("workspace").exists(),
+            "the next phase must not create its directory after expiry"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_landlock_abis_are_not_enforceable() {
+        assert!(!landlock_abi_enforceable(1));
+        assert!(!landlock_abi_enforceable(2));
+        assert!(landlock_abi_enforceable(3));
+        assert!(landlock_abi_enforceable(4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_never_blocks_past_an_expired_deadline() {
+        use std::process::{Command, Stdio};
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let expired = AdapterDeadline::from_instant(std::time::Instant::now());
+        let started = std::time::Instant::now();
+        reap_after_kill(child, &expired);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cleanup waited for an unbounded child after the deadline"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn arbitrary_per_execution_sid_can_be_granted_without_icacls() {
+        let base = std::env::temp_dir().join(format!(
+            "agentype-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("jail");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let deadline = AdapterDeadline::after(std::time::Duration::from_secs(10)).unwrap();
+        grant_restricted_write(&root, &workspace, "S-1-5-21-11-22-33-44", &deadline)
+            .expect("a per-execution SID must be grantable without account lookup");
     }
 }

@@ -2,9 +2,9 @@
 //! or, for legacy fixtures, by env vars. This is not a model, provider, or
 //! harness.
 //!
-//! Argument-selected behavior exists because a restricted-token workspace jail
-//! inherits the parent environment on Windows: parallel tests cannot safely
-//! select behavior through process-global env vars.
+//! Argument-selected behavior exists because a workspace-jail worker runs with
+//! an explicit minimal environment on every platform, so tests cannot select
+//! behavior through the daemon's inherited environment.
 
 use std::env;
 use std::fs;
@@ -32,6 +32,19 @@ fn arg_value(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn arg_values(name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            if let Some(value) = args.next() {
+                values.push(value);
+            }
+        }
+    }
+    values
 }
 
 fn sleep_ms_from_env() {
@@ -130,6 +143,74 @@ fn remove_probe(path: &Path, label: &str) {
     }
 }
 
+/// Truncate an existing file through a normal write handle (`ftruncate`).
+fn truncate_probe(path: &str, label: &str) {
+    let target = PathBuf::from(path);
+    let result = (|| {
+        let file = fs::OpenOptions::new().write(true).open(&target)?;
+        file.set_len(0)
+    })();
+    match result {
+        Ok(()) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":true}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy())
+        ),
+        Err(err) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":false,"kind":"{}"}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy()),
+            json_escape(&format!("{:?}", err.kind()))
+        ),
+    }
+}
+
+/// Truncate via `open(path, O_RDONLY | O_TRUNC)`, which does not request
+/// `WRITE_FILE` and is therefore the Landlock ABI < 3 bypass.
+#[cfg(target_os = "linux")]
+fn open_truncate_probe(path: &str, label: &str) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = PathBuf::from(path);
+    let result = (|| -> io::Result<()> {
+        let raw = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // SAFETY: `raw` is a valid NUL-terminated path.
+        let fd = unsafe { libc::open(raw.as_ptr(), libc::O_RDONLY | libc::O_TRUNC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is owned by this frame.
+        unsafe {
+            libc::close(fd);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":true}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy())
+        ),
+        Err(err) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":false,"kind":"{}"}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy()),
+            json_escape(&format!("{:?}", err.kind()))
+        ),
+    }
+}
+
+/// Report whether an environment variable is visible. The value is never
+/// printed so a sentinel secret cannot leak into the captured artifact.
+fn env_probe(name: &str) {
+    let present = env::var_os(name).is_some();
+    println!(
+        r#"{{"probe":{{"label":"env","name":"{}","present":{present},"ok":{present}}}}}"#,
+        json_escape(name)
+    );
+}
+
 fn main() {
     if flag("FAKE_AGENT_TRAP_INT") || arg_flag("--trap-int") {
         trap_interrupt();
@@ -165,6 +246,19 @@ fn main() {
 
     if let Some(path) = arg_value("--write-probe") {
         write_probe(&path, "write");
+    }
+
+    if let Some(path) = arg_value("--truncate-probe") {
+        truncate_probe(&path, "truncate");
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(path) = arg_value("--open-truncate-probe") {
+        open_truncate_probe(&path, "open-truncate");
+    }
+
+    for name in arg_values("--env-probe") {
+        env_probe(&name);
     }
 
     if let Some(path) = arg_value("--remove-probe") {

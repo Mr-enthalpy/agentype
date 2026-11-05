@@ -1974,6 +1974,22 @@ impl Kernel {
     ///
     /// `limit` bounds the work a single cycle may probe; 0 returns nothing.
     pub fn list_typed_dispatch_candidates(&self, limit: usize) -> Result<Vec<TaskId>, Error> {
+        self.list_typed_dispatch_candidates_excluding(limit, &[])
+    }
+
+    /// Authority-free enumeration that excludes runtime-local cooldown
+    /// candidates **before** applying `limit`.
+    ///
+    /// The typed control loop owns cooldown state and never persists it. This
+    /// read accepts that set only as an opaque filter, so a cooling Task cannot
+    /// consume one of the `limit` slots and starve every Task behind it. The
+    /// frozen `priority DESC, created_at ASC, id ASC` order is unchanged for
+    /// the remaining candidates. `limit == 0` returns nothing.
+    pub fn list_typed_dispatch_candidates_excluding(
+        &self,
+        limit: usize,
+        excluded: &[TaskId],
+    ) -> Result<Vec<TaskId>, Error> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2022,8 +2038,11 @@ impl Kernel {
                 typed: true,
             });
         }
+        let excluded: std::collections::HashSet<&str> =
+            excluded.iter().map(|task| task.as_str()).collect();
         Ok(order_ready_tasks(&snapshots, now)
             .into_iter()
+            .filter(|id| !excluded.contains(id.as_str()))
             .take(limit)
             .map(TaskId::from_string)
             .collect())

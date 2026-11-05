@@ -213,6 +213,14 @@ unchanged. Production typed daemon dispatch is now wired through
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)
 owns scope and evidence.
 
+The E2E suite's Result ACK is harness-injected: it calls the durable
+`Kernel::ack_success` command directly after reading the committed
+Attempt/Lease/Execution. It does not provide or prove a production worker
+transport, worker authentication, delivery retry, or a worker-originated ACK
+path; those remain out of scope with B.5 credentials and a worker data plane.
+The covered boundary is the durable Kernel ACK contract (lease-epoch validation,
+ReadOnly completion, Write quiescence refusal, late physical end as history).
+
 ExecutionLaunchSnapshot now carries the optional committed descriptor. The
 trusted unchecked constructor gains this argument because an Execution-only
 capability could not constrain a later free String to immutable provenance.

@@ -36,6 +36,7 @@ use agentype_execution_config::ExecutionRegistry;
 use agentype_storage_sqlite::Kernel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Public, payload-free categories at the source-integration boundary. Private
@@ -1031,7 +1032,7 @@ pub(crate) fn acquire_typed_task(
     execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     attest_deadline: &AdapterDeadline,
-    prepare_deadline: &AdapterDeadline,
+    prepare_budget: Duration,
 ) -> Result<TypedAcquisitionOutcome, ProvisioningResolutionError> {
     // Readiness rejection must win over semantic/source resolution faults for
     // work that cannot be dispatched. This read grants no acquisition authority.
@@ -1049,7 +1050,12 @@ pub(crate) fn acquire_typed_task(
             attest_deadline,
         ) {
             Ok(acquisition) => {
-                return finalize_preparation(kernel, integrations, acquisition, prepare_deadline)
+                return finalize_with_prepare_budget(
+                    kernel,
+                    integrations,
+                    acquisition,
+                    prepare_budget,
+                )
             }
             // Only an explicitly enumerated candidate-local ineligibility permits
             // falling through to the next agent/source. Anything else
@@ -1068,11 +1074,28 @@ pub(crate) fn acquire_typed_task(
         attest_deadline,
     ) {
         Ok(acquisition) => {
-            finalize_preparation(kernel, integrations, acquisition, prepare_deadline)
+            finalize_with_prepare_budget(kernel, integrations, acquisition, prepare_budget)
         }
         Err(err) if !is_candidate_local(&err) => Err(err),
         Err(err) => Err(last_error.unwrap_or(err)),
     }
+}
+
+/// Start the winner's preparation budget only here, after the authority
+/// transaction has selected and committed it. Candidate attestation time can
+/// therefore never consume the prepare budget.
+fn finalize_with_prepare_budget(
+    kernel: &Kernel,
+    integrations: &SourceIntegrationRegistry,
+    outcome: TypedAcquisitionOutcome,
+    prepare_budget: Duration,
+) -> Result<TypedAcquisitionOutcome, ProvisioningResolutionError> {
+    let deadline = AdapterDeadline::after(prepare_budget).map_err(|_| {
+        ProvisioningResolutionError::Storage(agentype_core::Error::invariant(
+            "validated typed prepare budget became invalid",
+        ))
+    })?;
+    finalize_preparation(kernel, integrations, outcome, &deadline)
 }
 
 /// Prepare (pure, read-only) the durably committed winner under its frozen
@@ -1585,7 +1608,7 @@ mod tests {
                     &registry,
                     &integrations,
                     &deadline(),
-                    &deadline(),
+                    Duration::from_secs(30),
                 );
                 assert_eq!(
                     attest_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1649,7 +1672,7 @@ mod tests {
                     after_attest: None,
                 }),
                 &deadline(),
-                &deadline(),
+                Duration::from_secs(30),
             )
             .unwrap();
             assert_eq!(attest_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1700,7 +1723,7 @@ mod tests {
                         })),
                     }),
                     &deadline(),
-                    &deadline(),
+                    Duration::from_secs(30),
                 );
                 controller.join().unwrap();
                 // New-agent birth also requires an active partition, so that
@@ -1795,7 +1818,7 @@ mod tests {
             &execution_registry(),
             &si(StaticFilterProbe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(
@@ -1823,7 +1846,7 @@ mod tests {
             &execution_registry(),
             &si(StaticFilterProbe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(result.candidate.adapter_kind, "default");
@@ -1904,7 +1927,7 @@ mod tests {
             &registry,
             &si(StaticFilterProbe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(result.candidate.adapter_binding_key, "k2");
@@ -2657,7 +2680,7 @@ mod tests {
                     &registry,
                     &si(EchoMaterializer),
                     &deadline(),
-                    &deadline(),
+                    Duration::from_secs(30),
                 )
                 .unwrap();
                 assert_eq!(next.acquisition.claim.logical_agent_id, agent);
@@ -2742,7 +2765,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let pb = first.acquisition.provisioning_binding.clone();
@@ -2769,7 +2792,7 @@ mod tests {
             &registry,
             &si(PrepareUnavailable),
             &deadline(),
-            &deadline()
+            Duration::from_secs(30)
         )
         .is_err());
         assert_eq!(
@@ -2851,6 +2874,44 @@ mod tests {
             ))
             .unwrap();
         kernel
+    }
+
+    /// Attestation is deliberately slow while preparation is immediate. This
+    /// distinguishes a prepare budget that starts at winner commit from one
+    /// that started before candidate probing and was silently consumed.
+    struct SlowAttestMaterializer {
+        prepare_remaining_ms: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SourceConfigIntegration for SlowAttestMaterializer {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            _adapter_kind: &str,
+            _adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            std::thread::sleep(Duration::from_millis(600));
+            EchoMaterializer.attest(revision, _adapter_kind, _adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            _adapter_kind: &str,
+            _adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            self.prepare_remaining_ms.store(
+                u64::try_from(deadline.remaining().as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            EchoMaterializer.prepare(revision, _adapter_kind, _adapter_binding_key, deadline)
+        }
     }
 
     fn safety() -> PhysicalSafety {
@@ -3160,7 +3221,7 @@ mod tests {
             &registry,
             &si(FailingMaterializeMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap_err();
         // A post-commit prepare failure is terminal, never candidate-local.
@@ -3244,7 +3305,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3297,7 +3358,7 @@ mod tests {
             &registry,
             &si(probe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap_err();
         assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
@@ -3340,7 +3401,7 @@ mod tests {
             &registry,
             &si(probe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap_err();
         assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
@@ -3493,7 +3554,7 @@ mod tests {
                 &execution_registry(),
                 &si(EchoMaterializer),
                 &deadline(),
-                &deadline()
+                Duration::from_secs(30)
             )
             .is_err());
             assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 1);
@@ -3550,7 +3611,7 @@ mod tests {
             &execution_registry(),
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 2);
@@ -3685,7 +3746,7 @@ mod tests {
                 &execution_registry(),
                 &integrations,
                 &deadline(),
-                &deadline(),
+                Duration::from_secs(30),
             );
             if local {
                 let winner = result.unwrap();
@@ -3733,7 +3794,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let prepared =
@@ -3790,7 +3851,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         // The weaker, credential-free source won; the stronger credential-bearing
@@ -3834,7 +3895,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(
@@ -3872,7 +3933,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let expected_kind = outcome.candidate.adapter_kind.clone();
@@ -3923,7 +3984,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let prepared =
@@ -4015,7 +4076,7 @@ mod tests {
             &registry,
             &si(probe),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap_err();
         assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
@@ -4044,7 +4105,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         // Expire the committed lease so the claim authority is no longer current.
@@ -4082,7 +4143,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         // Point the committed binding at a config revision that does not exist.
@@ -4131,7 +4192,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         outcome.candidate.adapter_kind = "not-the-target".into();
@@ -4171,7 +4232,7 @@ mod tests {
                 &execution_registry(),
                 &si(EchoMaterializer),
                 &deadline(),
-                &deadline(),
+                Duration::from_secs(30),
             )
             .unwrap();
             let claim = outcome.acquisition.claim.clone();
@@ -4260,7 +4321,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let claim = outcome.acquisition.claim.clone();
@@ -4306,7 +4367,7 @@ mod tests {
                 &registry,
                 &si(EchoMaterializer),
                 &deadline(),
-                &deadline(),
+                Duration::from_secs(30),
             )
             .unwrap();
             let claim = outcome.acquisition.claim.clone();
@@ -4365,7 +4426,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let claim = outcome.acquisition.claim.clone();
@@ -4406,7 +4467,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let claim = outcome.acquisition.claim.clone();
@@ -4445,7 +4506,7 @@ mod tests {
             &registry,
             &si(EchoMaterializer),
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
 
@@ -4780,7 +4841,7 @@ mod tests {
             &registry,
             &integrations,
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         let binding = first.acquisition.provisioning_binding.clone();
@@ -4808,7 +4869,7 @@ mod tests {
             &registry,
             &integrations,
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(before.acquisition.provisioning_binding, binding);
@@ -4850,7 +4911,7 @@ mod tests {
             &registry,
             &integrations,
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(
@@ -4900,7 +4961,7 @@ mod tests {
             &registry,
             &integrations,
             &deadline(),
-            &deadline(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(resumed.acquisition.provisioning_binding, binding);
@@ -5000,5 +5061,37 @@ mod tests {
         )
         .unwrap();
         assert!(candidates.is_empty());
+    }
+
+    /// P1-6: candidate attestation must not consume the winner's preparation
+    /// budget. Slow attestation (600 ms) plus a fast prepare must still observe
+    /// nearly the full fresh 1 s prepare budget. A deadline created before
+    /// `acquire_typed_task` would leave at most ~400 ms.
+    #[test]
+    fn prepare_budget_starts_after_winner_commit_not_before_attestation() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        let task = typed_task(&kernel, pin);
+        let prepare_remaining_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attest = AdapterDeadline::after(Duration::from_secs(5)).unwrap();
+
+        acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(SlowAttestMaterializer {
+                prepare_remaining_ms: prepare_remaining_ms.clone(),
+            }),
+            &attest,
+            Duration::from_secs(1),
+        )
+        .expect("slow attestation must not exhaust the winner's prepare budget");
+
+        let remaining = prepare_remaining_ms.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            remaining > 800,
+            "prepare saw only {remaining} ms; its budget started before winner commit"
+        );
     }
 }

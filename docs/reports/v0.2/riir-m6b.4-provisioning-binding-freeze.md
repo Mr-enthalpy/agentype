@@ -6,13 +6,15 @@ Date: 2026-11-06
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert a wider freeze.
 
-Verdict: **CLOSED WITH STATED SCOPE**. The scope is the typed Task → B.3
-matching → B.4 physical eligibility → Attempt/Lease/ProvisioningBinding → pure
-prepare → Execution/BindingSnapshot → exact adapter start → observation/recovery
-→ Worker Result ACK path, with a real source integration and a real OS-enforced
-workspace jail. B.5 credentials, cold/revivable matching, full typed topology,
-executed-WARM replacement and v7→v8 migration remain out of scope and fail
-closed (see *Remaining limits*).
+Verdict: **NOT FROZEN — revised implementation awaiting independent re-audit and
+final-SHA CI**. The scope is the typed Task → B.3 matching → B.4 physical
+eligibility → Attempt/Lease/ProvisioningBinding → pure prepare →
+Execution/BindingSnapshot → exact adapter start → observation/recovery →
+durable Result ACK boundary, with a real source integration and a real
+OS-enforced workspace jail. The Worker Result delivery/auth/retry data plane is
+not part of this scope (see *Harness-injected ACK boundary*). B.5 credentials,
+cold/revivable matching, full typed topology, executed-WARM replacement and
+v7→v8 migration remain out of scope and fail closed (see *Remaining limits*).
 
 ## Scope and acceptance baseline
 
@@ -40,14 +42,14 @@ retains the unresolved availability/cost ranking question.
 
 | Phase | Committed facts and checks |
 |---|---|
-| Enumerate | `Kernel::list_typed_dispatch_candidates` performs one authority-free read using the shared Core readiness predicate and the frozen `priority DESC, created_at ASC, id ASC` order; it returns no claim and mutates nothing |
+| Enumerate | `Kernel::list_typed_dispatch_candidates_excluding` performs one authority-free read using the shared Core readiness predicate and the frozen `priority DESC, created_at ASC, id ASC` order. A runtime-local cooldown exclusion is applied to the ordered candidates **before** `probe_limit`/`take`, so cooling Tasks cannot occupy the probe window and permanently starve Task N+1; it returns no claim and mutates nothing |
 | Resolve | Validate partition target/profile; apply known hard filters before bounded, read-only source-local attestation; rank eligible candidates and capture the catalog frontier |
 | Acquire | Transactionally reload and re-prove Task, actual bound AgentType, placement, source/config/policy, realized retention and exact imported safety; commit Attempt/Lease/assignment and per-Incarnation ProvisioningBinding; leave `Attempt.incarnation_id` unset |
-| Prepare | Re-resolve the explicitly registered exact source; fence claim authority and integration protocol before/after pure preparation; require the attested digest; return a secret-free descriptor |
+| Prepare | After winner selection/commit, create the winner's **fresh** prepare deadline; re-resolve the explicitly registered exact source; fence claim authority and integration protocol before/after pure preparation; require the attested digest; return a secret-free descriptor |
 | Commit Execution | Requalify target and current exact adapter; retain that adapter instance/deadlines; atomically create Execution, Attempt→Incarnation association and immutable BindingSnapshot |
 | Physical start | `Dispatcher::start_prepared` calls the retained adapter instance's `start_execution` while still holding the `DispatchGate` permit; the adapter creates the per-execution jail under the committed descriptor and OS-enforces the M5 workspace mode |
 | Observe / recover | Existing M5 observation, deadline, writer-safety and exact `(adapter_kind, adapter_binding_key)` recovery own the physical lifecycle; no adapter re-selection occurs after commitment |
-| Result ACK | Worker Result ACK goes through the durable Kernel authority; a late physical end is history only |
+| Result ACK | The durable Kernel Result-ACK command (harness-injected in E2E; no production worker transport) validates lease epoch and writer safety; a late physical end is history only |
 
 The production daemon enables this only through
 `SchedulerDaemonBuilder::typed_dispatch(integrations, config)`. Without that
@@ -62,17 +64,34 @@ fail-closed default.
 attempt isolation, so an isolating Task is ineligible rather than weakly
 provisioned.
 
-- Windows: `CreateRestrictedToken` with `WRITE_RESTRICTED` and restricting SID
-  `S-1-5-12`, then `CreateProcessAsUserW`. `Write` grants
-  `*S-1-5-12:(OI)(CI)(M)` on the per-execution jail root only; `ReadOnly` grants
-  no such ACE. A restricted child needs an inherited console, so the adapter
-  fails closed as Unavailable when the host has none (rather than spawning a
-  process that dies with `STATUS_DLL_INIT_FAILED`).
-- Linux: Landlock in `pre_exec` with `PR_SET_NO_NEW_PRIVS`. `ReadOnly` installs
-  no path rule; `Write` installs one path-beneath rule for the per-execution
-  jail root.
+- Windows: `CreateRestrictedToken` with `WRITE_RESTRICTED` and a
+  **per-Execution** restricting SID derived deterministically from the
+  RequestId (`S-1-5-21-<a>-<b>-<c>-<d>`), then `CreateProcessAsUserW`. The
+  process-global `S-1-5-12` is never used. `Write` grants one modify ACE for
+  that Execution's SID on the per-execution jail root and workspace via direct
+  `GetNamedSecurityInfoW`/`SetEntriesInAclW`/`SetNamedSecurityInfoW`; `icacls`
+  is not used because it cannot resolve an arbitrary non-account SID
+  (Windows error 1332). `ReadOnly` grants no such ACE. An ACE for Execution A's
+  SID cannot authorize Execution B's token, which carries a different SID.
+  A restricted child needs an inherited console, so the adapter fails closed as
+  Unavailable when the host has none (rather than spawning a process that dies
+  with `STATUS_DLL_INIT_FAILED`).
+- Linux: Landlock in `pre_exec` with `PR_SET_NO_NEW_PRIVS`. The adapter probes
+  the Landlock ABI and **requires ABI >= 3**: ABI 1/2 cannot deny `truncate(2)`,
+  which bypasses `WRITE_FILE`. `start_execution` and the child ruleset both
+  reject older ABIs rather than claiming enforcement. `ReadOnly` installs no
+  path rule; `Write` installs one path-beneath rule for the per-execution jail
+  root covering write-class rights including `TRUNCATE`.
 - Other hosts: the enforceable-workspace set is empty, so B.4 rejects the
   adapter; `start_execution` also fails closed.
+
+Both platforms construct an explicit minimal worker environment instead of
+inheriting the daemon environment. Windows builds a sorted UTF-16 environment
+block and passes it with `CREATE_UNICODE_ENVIRONMENT`; Linux uses `env_clear()`
+plus the same non-sensitive allowlist. `HOME`/`TEMP`/`TMP` (Windows) and
+`HOME`/`TMPDIR`/`TMP` (Linux) point into the jail workspace. Credential-like
+daemon variables are absent; the sentinel-secret test proves a daemon-only
+secret does not reach the worker while required non-sensitive variables remain.
 
 The source-config grammar is deliberately secret-free and carries no
 environment, credential, network, or workspace-mode field:
@@ -94,7 +113,11 @@ against another physical installation.
 | No fallback after Execution commitment | Preserved | `prepare_typed_execution_launch` phases; post-commit failures go to settlement/recovery, never candidate fallback |
 | `Attempt.incarnation_id` only at Execution commitment | Preserved | `typed_acquisition_and_atomic_binding_snapshot_round_trip` |
 | No authority/NACK for typed unavailability before Attempt | Preserved | E2E `unprovisionable_typed_task_creates_no_authority_and_no_nack`, `typed_task_requires_the_exact_adapter_binding_alias`; zero attempts/leases/executions/bindings/failures |
-| Bounded re-probe fairness | Preserved | `TypedDispatchState` cooldown per Task, invalidated on catalog-frontier change; typed/legacy alternation in `ControlLoopService` |
+| Bounded re-probe fairness | Preserved | `TypedDispatchState` cooldown per Task, invalidated on catalog-frontier change; cooling ids are excluded inside `list_typed_dispatch_candidates_excluding` **before** `probe_limit`, and `cooling_typed_tasks_do_not_consume_the_probe_window` proves Task N+1 stays visible when the first N are cooling |
+| Absolute deadlines across physical phases | Preserved | One `AdapterDeadline` is carried through jail creation, ACL, spawn, identity probe and cleanup; `expired_start_deadline_creates_no_jail_directory`, `expired_prepare_deadline_creates_no_directory`, `deadline_expiring_between_phases_stops_before_the_next_phase`, and Linux `cleanup_never_blocks_past_an_expired_deadline` |
+| Worker environment isolation | Preserved | Explicit allowlist on both platforms; `worker_does_not_inherit_daemon_secrets_but_keeps_runtime_variables` |
+| Per-Execution write authorization | Preserved | RequestId-derived restricting SID granted only on that jail; Windows `write_a_cannot_write_read_only_b_jail` and `write_a_cannot_write_write_b_jail` |
+| Linux truncate enforcement | Preserved | Landlock ABI >= 3 gate; `legacy_landlock_abis_are_not_enforceable`; Linux `ftruncate`/`open(O_TRUNC)` denial outside the jail and truncate allowance inside a Write jail |
 | Exact `(adapter_kind, adapter_binding_key)` recovery | Preserved | M5 recovery tests; retention of resolved adapter instance in typed handoff |
 | M5 writer safety and absolute deadlines | Preserved | Write E2E refuses ACK without quiescence; runtime deadline/writer suites |
 | Process lock, ReadyPermit, recover-before-dispatch | Preserved | Daemon startup unchanged; full process-lock/supervision suites |
@@ -137,10 +160,22 @@ filesystem, that:
 - a real per-execution jail directory and `workspace` child exist under the
   request-derived root, and the runtime handle names `jailed_process`;
 - the ProvisioningBinding is immutable and names the same physical domain;
-- the ACK occurs while the Execution is still `Running`, produces a Result and
-  moves the Task to `Completed`;
+- the durable Result ACK boundary is valid: the harness invokes
+  `Kernel::ack_success` with the committed Attempt, lease epoch and Execution,
+  produces a Result and moves the Task to `Completed`;
 - the subsequent physical end becomes `Succeeded`/terminal history and does not
-  replace the Worker Result.
+  replace the Result.
+
+### Harness-injected ACK boundary (P2-1)
+
+The E2E suite does **not** implement or exercise production Worker Result
+delivery. The harness reads the committed `ProvisioningBinding`/Execution and
+calls the durable Kernel command `ack_success` directly. There is no worker
+transport, worker authentication, delivery retry, queue, or network ingress in
+this scope; B.5 credentials and a worker data plane are deferred. The evidence
+therefore covers the **durable Kernel ACK contract** (lease-epoch validation,
+ReadOnly completion, Write quiescence refusal, late-physical-end history), not a
+complete worker-originated ACK path. Any wider claim would be unsupported.
 
 The full 7-test E2E suite also proves the newborn-agent path, a real in-jail
 write with a refused unquiescent Write ACK, unprovisionable and missing-alias
@@ -175,7 +210,7 @@ Local checks on 2026-11-06:
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
 | `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed |
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
-| `cargo test -p agentype-adapter-local-process --test jail_enforcement` | 6 passed (real OS enforcement) |
+| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 10 passed (real OS enforcement) |
 | `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 7 passed |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
@@ -199,13 +234,21 @@ reverts to NOT FROZEN.
   durable fencing is not physical termination. WARM equal-continuity priority
   remains unresolved (ADR-0010).
 - **v7→v8 migration**: not implemented; fresh-v8 or existing-v8 only.
-- **Platform coverage**: Windows enforcement is executed locally; Linux
-  Landlock is implemented but only exercised by remote CI on a Linux runner.
-  Other platforms honestly report no enforceable workspace mode and are
-  ineligible.
+- **Worker Result transport/auth/retry**: not implemented. E2E invokes the
+  durable `Kernel::ack_success` command from the harness; there is no production
+  worker data plane, worker authentication, delivery retry, or worker-originated
+  ACK claim. See *Harness-injected ACK boundary*.
+- **Platform coverage**: Windows enforcement is executed locally. Linux
+  Landlock is implemented and compiled here but must be executed by the Linux CI
+  runner; ABI 1/2 rejection and `ftruncate`/`open(O_TRUNC)` counterexamples are
+  Linux-only tests. Other platforms honestly report no enforceable workspace
+  mode and are ineligible.
 - **Windows console dependency**: a restricted-token child requires an
   inherited console; hosts without one get a fail-closed Unavailable, not an
   unconfined launch.
+- **Windows ACL mechanism**: direct security APIs replace `icacls`, which
+  cannot map an arbitrary per-execution SID (error 1332). The ACE is applied to
+  the jail root and workspace, not recursively to pre-existing content.
 - **Network enforcement**: the jail supports `Enabled` only; other policies are
   rejected as Unavailable rather than weakened.
 - **Attempt isolation**: not provided by a per-execution workspace and never

@@ -1,7 +1,7 @@
 //! M6-B.4 end-to-end: typed admission -> real B.3 matching -> real B.4
 //! physical eligibility -> Attempt/Lease/ProvisioningBinding -> pure prepare ->
-//! Execution/BindingSnapshot -> exact adapter start -> observation -> Worker
-//! Result ACK.
+//! Execution/BindingSnapshot -> exact adapter start -> observation -> durable
+//! Result ACK boundary.
 //!
 //! This drives the **production** `SchedulerDaemon` composition root. The typed
 //! Task is not dispatched by a test-only helper: the daemon's `ControlLoopService`
@@ -10,6 +10,14 @@
 //! real `JailedProcessAgentAdapter` physically creates and starts the jailed
 //! process. The assertions read only durable Scheduler state plus the physical
 //! jail directory, so a test-only shortcut cannot satisfy them.
+//!
+//! **ACK boundary.** The harness calls `Kernel::ack_success` directly, after
+//! reading the committed Attempt/Lease/Execution. There is no production Worker
+//! Result transport, worker authentication, delivery retry, or worker-originated
+//! ACK in this scope (B.5 credentials and a worker data plane are deferred). What
+//! this suite proves is the durable Kernel command boundary: a valid lease-epoch
+//! ACK completes the Task, and an invalid writer-safety/quiescence ACK is
+//! refused. It does not prove a production worker-originated ACK path.
 //!
 //! Linux enforcement (Landlock) and Windows enforcement (restricted token) are
 //! both real; on other platforms the adapter is honestly unable to enforce and
@@ -426,7 +434,8 @@ fn assert_no_authority(harness: &Harness, task: &agentype_core::TaskId) {
 }
 
 /// The full happy path on a ReadOnly Task: production daemon, real source
-/// integration, real jail, exact committed binding, and a Worker Result ACK that
+/// integration, real jail, exact committed binding, and a durable Result ACK
+/// (harness-injected `Kernel::ack_success`, not a worker transport) that
 /// completes the Task while the physical execution is still RUNNING.
 #[test]
 fn typed_read_only_task_runs_end_to_end_and_acks_through_the_daemon() {

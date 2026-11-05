@@ -1589,20 +1589,19 @@ impl TypedDispatchState {
         preferred
     }
 
-    fn is_cooling(&self, frontier: &str, task_id: &TaskId, now: Instant) -> bool {
+    /// Return the Task ids currently in a live cooldown and purge expired
+    /// entries. The returned set is only a query filter; it never grants or
+    /// persists authority. A catalog-frontier change clears the whole map.
+    fn cooling_ids(&self, frontier: &str, now: Instant) -> Vec<TaskId> {
         let mut inner = self.inner.lock().expect("typed dispatch state");
         if inner.frontier.as_deref() != Some(frontier) {
             inner.frontier = Some(frontier.to_string());
             inner.cooldowns.clear();
         }
-        match inner.cooldowns.get(task_id) {
-            Some(until) if *until > now => true,
-            Some(_) => {
-                inner.cooldowns.remove(task_id);
-                false
-            }
-            None => false,
-        }
+        inner.cooldowns.retain(|_, until| *until > now);
+        let mut ids: Vec<TaskId> = inner.cooldowns.keys().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
     }
 
     fn defer(&self, task_id: TaskId, until: Instant) {
@@ -1821,19 +1820,20 @@ impl<'a> Dispatcher<'a> {
             .kernel
             .catalog_frontier_digest()
             .map_err(DispatchError::Persistence)?;
+        let now = Instant::now();
+        // Cooldown is runtime-local and is applied as an enumeration filter
+        // *before* `probe_limit`, so a cooling Task cannot occupy a probe slot
+        // and permanently starve the Tasks ordered behind it.
+        let excluded = state.cooling_ids(&frontier, now);
         let candidates = self
             .kernel
-            .list_typed_dispatch_candidates(config.probe_limit())
+            .list_typed_dispatch_candidates_excluding(config.probe_limit(), &excluded)
             .map_err(DispatchError::Persistence)?;
         if candidates.is_empty() {
             return Ok(DispatchOneOutcome::NoWork);
         }
-        let now = Instant::now();
         let mut deferred: Option<String> = None;
         for task_id in candidates {
-            if state.is_cooling(&frontier, &task_id, now) {
-                continue;
-            }
             match self.dispatch_typed_candidate(&task_id, integrations, config, state)? {
                 Some(outcome) => return Ok(outcome),
                 None => deferred = Some("typed candidate is not currently provisionable".into()),
@@ -1860,11 +1860,9 @@ impl<'a> Dispatcher<'a> {
                 "validated typed attest budget became invalid",
             ))
         })?;
-        let prepare = AdapterDeadline::after(config.prepare_budget()).map_err(|_| {
-            DispatchError::Persistence(Error::invariant(
-                "validated typed prepare budget became invalid",
-            ))
-        })?;
+        // The winner's pure-preparation budget starts *after* acquisition
+        // selects and commits a winner. Creating it here would let candidate
+        // probing consume the winner's prepare budget.
         let outcome = match crate::provisioning_resolver::acquire_typed_task(
             self.kernel,
             task_id,
@@ -1872,7 +1870,7 @@ impl<'a> Dispatcher<'a> {
             self.execution_registry,
             integrations,
             &attest,
-            &prepare,
+            config.prepare_budget(),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -6205,5 +6203,141 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             handle_before,
             kernel.execution_runtime_handle(&execution_id).unwrap()
         );
+    }
+
+    fn publish_cooldown_type(kernel: &Kernel) -> agentype_agent_contract::AgentTypeRef {
+        use agentype_agent_contract::{
+            AffinityConstraint, AgentType, AgentTypeContract, AgentTypeRef, Budget, ContinuityMode,
+            LifecycleMode, NetworkPolicy, SecurityContract,
+        };
+        use agentype_core::WorkspaceMode;
+        use std::collections::BTreeMap;
+        let pin = AgentTypeRef::new("cooldown-reviewer", 1).unwrap();
+        kernel
+            .publish_agent_type(&AgentType {
+                type_ref: pin.clone(),
+                based_on: None,
+                contract: AgentTypeContract {
+                    allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                    required_capabilities: BTreeMap::new(),
+                    affinity: AffinityConstraint::Any,
+                    budget_ceiling: Budget::new(100.0).unwrap(),
+                    security: SecurityContract {
+                        workspace: WorkspaceMode::ReadOnly,
+                        network: NetworkPolicy::Disabled,
+                        requires_attempt_isolation: false,
+                    },
+                    lifecycle: [LifecycleMode::Resident].into_iter().collect(),
+                    continuity: ContinuityMode::Logical,
+                    sandbox_policy: None,
+                    anchor_constraint: None,
+                },
+            })
+            .unwrap();
+        pin
+    }
+
+    fn admit_cooldown_tasks(
+        kernel: &Kernel,
+        pin: &agentype_agent_contract::AgentTypeRef,
+        count: usize,
+    ) -> Vec<TaskId> {
+        use agentype_agent_contract::{
+            AgentRequirementDraft, AgentTypeSelector, Budget, NetworkPolicy,
+        };
+        use agentype_core::{
+            InformationFunction, PartitionId, RawWorkIntent, SemanticInputSet, TaskSpec,
+        };
+        use std::collections::BTreeMap;
+        (0..count)
+            .map(|index| {
+                let generation = kernel.create_generation(serde_json::json!({})).unwrap();
+                let mut spec = TaskSpec::new(format!("cooldown-{index}"), serde_json::json!({}));
+                spec.partition = PartitionId::new("general");
+                // Distinct descending priorities make the frozen order exactly
+                // `tasks[0], tasks[1], ...`, independent of wall-clock time.
+                spec.priority = i64::try_from(count - index).unwrap();
+                let intent = RawWorkIntent {
+                    raw_intent_key: format!("cooldown-intent-{index}"),
+                    objective: "cooldown starvation".into(),
+                    information_function: InformationFunction::Expand,
+                    semantic_input_set: SemanticInputSet::new(),
+                    rationale: None,
+                    suggested_task_spec: Some(spec),
+                };
+                let proposal = kernel
+                    .compile_root_intent(&generation.generation_id, intent, "session", 1)
+                    .unwrap();
+                kernel
+                    .admit_typed_proposal(
+                        &proposal.proposal_id,
+                        0,
+                        None,
+                        AgentRequirementDraft {
+                            required_type: AgentTypeSelector::Exact(pin.clone()),
+                            required_capabilities: BTreeMap::new(),
+                            required_network: NetworkPolicy::Disabled,
+                            required_attempt_isolation: false,
+                            sandbox_policy: None,
+                            required_anchor: None,
+                            budget: Budget::new(50.0).unwrap(),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// P1-1: a cooling Task must be excluded **before** `probe_limit`, or the
+    /// first N cooling Tasks permanently occupy the window and Task N+1 is
+    /// never enumerated. This uses the exact production state and read path
+    /// that `dispatch_typed_one` composes.
+    #[test]
+    fn cooling_typed_tasks_do_not_consume_the_probe_window() {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        let pin = publish_cooldown_type(&kernel);
+        let tasks = admit_cooldown_tasks(&kernel, &pin, 9);
+
+        let state = TypedDispatchState::new();
+        let frontier = kernel.catalog_frontier_digest().unwrap();
+        let now = Instant::now();
+        // Establish the frontier before recording cooldowns; a frontier change
+        // intentionally clears runtime-local cooldown state.
+        let _ = state.cooling_ids(&frontier, now);
+        for task in &tasks[..8] {
+            state.defer(task.clone(), now + Duration::from_secs(60));
+        }
+
+        let excluded = state.cooling_ids(&frontier, now);
+        assert_eq!(excluded.len(), 8);
+        let filtered = kernel
+            .list_typed_dispatch_candidates_excluding(8, &excluded)
+            .unwrap();
+        assert_eq!(
+            filtered,
+            vec![tasks[8].clone()],
+            "the ninth Task must be visible when the first eight are cooling"
+        );
+
+        let unfiltered = kernel.list_typed_dispatch_candidates(8).unwrap();
+        assert_eq!(
+            unfiltered,
+            tasks[..8].to_vec(),
+            "without filtering, the cooling Tasks would fill the whole probe window"
+        );
+        assert!(kernel
+            .list_typed_dispatch_candidates_excluding(0, &excluded)
+            .unwrap()
+            .is_empty());
     }
 }
