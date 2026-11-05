@@ -1,4 +1,5 @@
-//! M6-B.4 end-to-end: typed admission -> real B.3 matching -> real B.4
+//! M6-B.4 typed physical execution → durable ACK interface: typed admission ->
+//! real B.3 matching -> real B.4
 //! physical eligibility -> Attempt/Lease/ProvisioningBinding -> pure prepare ->
 //! Execution/BindingSnapshot -> exact adapter start -> observation -> durable
 //! Result ACK boundary.
@@ -24,9 +25,10 @@
 //! the suite is skipped.
 #![cfg(any(windows, target_os = "linux"))]
 
-use agentype_adapter_api::AdapterDeadline;
+use agentype_adapter_api::{AdapterDeadline, ExecutionAdapter, RuntimeHandle};
 use agentype_adapter_local_process::{
-    JailedProcessAgentAdapter, JAIL_ADAPTER_KIND, JAIL_PROVISIONING_PROTOCOL,
+    JailedProcessAgentAdapter, LocalProcessAgentAdapter,
+    ADAPTER_KIND as LOCAL_PROCESS_ADAPTER_KIND, JAIL_ADAPTER_KIND, JAIL_PROVISIONING_PROTOCOL,
 };
 use agentype_agent_contract::{
     canonical_json_body_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
@@ -36,8 +38,8 @@ use agentype_agent_contract::{
     SpawnSource, SpawnSourceRef,
 };
 use agentype_core::{
-    ExecutionState, InformationFunction, PartitionSpec, RawWorkIntent, Retention, SemanticInputSet,
-    SystemClock, TaskSpec, TaskState, WorkspaceMode,
+    ExecutionId, ExecutionState, InformationFunction, PartitionSpec, RawWorkIntent, Retention,
+    SemanticInputSet, SystemClock, TaskId, TaskSpec, TaskState, WorkspaceMode,
 };
 use agentype_execution_config::{
     AdapterBindingKey, ExecutionProfileConfig, ExecutionRegistry, ExecutionTargetConfig,
@@ -110,6 +112,21 @@ fn execution_registry() -> ExecutionRegistry {
     registry
         .register_profile(ExecutionProfileConfig::new("default"))
         .unwrap();
+    // The legacy queue targets the ordinary local-process adapter. Its command
+    // comes from target options, never from the typed BindingSnapshot.
+    registry
+        .register_target(
+            ExecutionTargetConfig::new("local", LOCAL_PROCESS_ADAPTER_KIND, false).with_options(
+                json!({
+                    "command": fake_bin(),
+                    "args": ["--sleep-ms", "5000"],
+                }),
+            ),
+        )
+        .unwrap();
+    registry
+        .register_profile(ExecutionProfileConfig::new("legacy-default"))
+        .unwrap();
     registry
 }
 
@@ -141,7 +158,12 @@ impl Harness {
     /// is published afterwards so no test-only dispatch path can observe a
     /// pre-seeded execution.
     fn start(tag: &str, integration: Arc<dyn SourceConfigIntegration>) -> Self {
-        let dir = test_dir(tag);
+        Self::start_at(test_dir(tag), tag, integration)
+    }
+
+    /// Start the production daemon against an explicit directory. Used by the
+    /// restart test, which must reopen the same store after a real crash.
+    fn start_at(dir: PathBuf, tag: &str, integration: Arc<dyn SourceConfigIntegration>) -> Self {
         let db = dir.join("scheduler.db");
         let jail_root = dir.join("jail-base");
         let source_ref = SpawnSourceRef::new(format!("source-{tag}"), 1).unwrap();
@@ -153,6 +175,15 @@ impl Harness {
         // declare exactly that alias or enumeration sees no candidate.
         adapters
             .import_source_with_binding_ref(adapter, "primary", deadlines())
+            .unwrap();
+        // A separate local-process adapter serves the legacy queue; it shares no
+        // binding key or descriptor with the typed jail path.
+        adapters
+            .import_source_with_binding_ref(
+                Arc::new(LocalProcessAgentAdapter::try_new().unwrap()),
+                "legacy",
+                deadlines(),
+            )
             .unwrap();
 
         let mut integrations = SourceIntegrationRegistry::new();
@@ -183,6 +214,15 @@ impl Harness {
                 Retention::Ephemeral,
                 "jail",
                 "default",
+            ))
+            .unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "legacy",
+                4,
+                Retention::Ephemeral,
+                "local",
+                "legacy-default",
             ))
             .unwrap();
         kernel.reconcile_pool().unwrap();
@@ -282,7 +322,11 @@ impl Harness {
         binding_ref: &str,
         extra_args: &[&str],
     ) -> AgentTypeRef {
-        let mut args = vec!["--sleep-ms".to_string(), "5000".to_string()];
+        let mut args = Vec::new();
+        if !extra_args.contains(&"--sleep-ms") {
+            args.push("--sleep-ms".to_string());
+            args.push("5000".to_string());
+        }
         args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
         let body = workspace_jail_config_body(
             fake_bin(),
@@ -327,6 +371,27 @@ impl Harness {
         };
         self.kernel
             .admit_typed_proposal(&proposal.proposal_id, 0, None, draft)
+            .unwrap()
+    }
+
+    /// Admit a legacy (no typed requirement) Task. Uses the same duplicate
+    /// generation/admission primitives as a real legacy front door.
+    fn admit_legacy(&self, spec: TaskSpec) -> agentype_core::TaskId {
+        let generation = self.kernel.create_generation(json!({})).unwrap();
+        let intent = RawWorkIntent {
+            raw_intent_key: format!("legacy-{}", nanos()),
+            objective: "legacy shared queue".into(),
+            information_function: InformationFunction::Expand,
+            semantic_input_set: SemanticInputSet::new(),
+            rationale: None,
+            suggested_task_spec: Some(spec),
+        };
+        let proposal = self
+            .kernel
+            .compile_root_intent(&generation.generation_id, intent, "session", 1)
+            .unwrap();
+        self.kernel
+            .admit_proposal(&proposal.proposal_id, 0, None)
             .unwrap()
     }
 
@@ -433,6 +498,210 @@ fn assert_no_authority(harness: &Harness, task: &agentype_core::TaskId) {
     assert!(harness.kernel.open_escalation_for_task(task).is_err());
 }
 
+const CRASH_CHILD_ENV: &str = "AGENTYPE_TYPED_DAEMON_CRASH_CHILD";
+
+/// Child half of `typed_daemon_restart_recovers_the_same_physical_instance`.
+///
+/// This test is a no-op unless the parent invokes the same test binary with an
+/// explicit environment variable. When invoked, it starts the real production
+/// daemon, admits and starts one typed Task, waits until the jailed worker has
+/// proven it is fully initialized, records the exact physical identity, and then
+/// calls `abort()`: a genuine process crash with no Drop, shutdown, or lease
+/// expiry.
+#[test]
+fn typed_daemon_crash_child_host() {
+    let Ok(root) = std::env::var(CRASH_CHILD_ENV) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let harness = Harness::start_at(
+        root.clone(),
+        "crash-child",
+        Arc::new(WorkspaceJailSourceIntegration::new()),
+    );
+    let pin = harness.publish_workspace_jail(
+        "crash-worker",
+        false,
+        "primary",
+        &["--sleep-ms", "0", "--ready-probe", "ready.txt", "--hang"],
+    );
+    let agent = harness.kernel.ready_agent("general").unwrap();
+    harness
+        .kernel
+        .bind_logical_agent_type(&agent, &pin)
+        .unwrap();
+    let task = harness.admit(
+        &pin,
+        TaskSpec::new("typed-crash", json!({"goal": "crash"}))
+            .partition("general")
+            .write(),
+        NetworkPolicy::Enabled,
+    );
+
+    wait_running(&harness.kernel, &task);
+    let snap = harness.only_snapshot();
+    let jail_dir = harness.jail_execution_dir(snap.request_id().as_str());
+    let ready = jail_dir.join("workspace").join("ready.txt");
+    wait_until(Duration::from_secs(20), || ready.is_file());
+
+    let info = json!({
+        "task": task.as_str(),
+        "execution": snap.execution_id().as_str(),
+        "request": snap.request_id().as_str(),
+        "pid": snap.runtime_handle()["pid"],
+        "jail_dir": jail_dir.to_string_lossy(),
+    });
+    std::fs::write(root.join("child-info.json"), info.to_string()).unwrap();
+
+    // The worker wrote its ready marker, so user32/DLL initialization is
+    // complete. Now crash the daemon for real.
+    std::process::abort();
+}
+
+/// A real typed daemon crash after Execution commitment: the parent reopens the
+/// same store and must recover the *same* physical worker, not respawn.
+#[test]
+fn typed_daemon_restart_recovers_the_same_physical_instance() {
+    let _serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let dir = test_dir("restart");
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "typed_daemon_crash_child_host", "--nocapture"])
+        .env(CRASH_CHILD_ENV, &dir)
+        .output()
+        .expect("the crash host must start");
+    assert!(
+        !output.status.success(),
+        "the child daemon must die by abort, not by a clean shutdown: {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let info: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("child-info.json"))
+            .expect("the crashed child must have recorded its physical identity"),
+    )
+    .expect("child info is JSON");
+    let task = TaskId::from_string(info["task"].as_str().unwrap());
+    let execution_id = ExecutionId::from_string(info["execution"].as_str().unwrap());
+    let crashed_pid = info["pid"].as_u64().expect("child recorded an exact pid");
+    assert_ne!(crashed_pid, 0);
+
+    // Reopen the same SQLite store with a fresh daemon. Its startup recovery
+    // must adopt the durable locator and the same live physical process.
+    let mut harness = Harness::start_at(
+        dir.clone(),
+        "restart-parent",
+        Arc::new(WorkspaceJailSourceIntegration::new()),
+    );
+    wait_until(Duration::from_secs(20), || {
+        harness
+            .kernel
+            .execution(&execution_id)
+            .map(|execution| execution.state == ExecutionState::Running)
+            .unwrap_or(false)
+    });
+    assert_eq!(
+        harness.kernel.execution(&execution_id).unwrap().state,
+        ExecutionState::Running,
+        "restart recovery must re-adopt the same running physical execution"
+    );
+    assert_eq!(
+        harness.kernel.task(&task).unwrap().state,
+        TaskState::Running
+    );
+
+    let snap = harness
+        .snapshots()
+        .into_iter()
+        .find(|snap| snap.execution_id() == &execution_id)
+        .expect("the recovered Execution must remain a reconciliation candidate");
+    assert_eq!(
+        snap.runtime_handle()["pid"].as_u64(),
+        Some(crashed_pid),
+        "recovery must not substitute or respawn a different physical process: {}",
+        snap.runtime_handle()
+    );
+    assert_eq!(
+        harness.snapshots().len(),
+        1,
+        "restart recovery must not fabricate a second Execution"
+    );
+
+    // Non-impersonating witness: a fresh adapter (no in-memory state from the
+    // crashed daemon) observes the recovered handle as the same running process.
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let deadline = AdapterDeadline::after(Duration::from_secs(5)).unwrap();
+    let handle = RuntimeHandle(snap.runtime_handle().clone());
+    let observed = adapter
+        .observe_execution(&handle, &deadline)
+        .expect("the recovered handle must be physically observable");
+    assert_eq!(observed.state, ExecutionState::Running);
+    let terminated = adapter
+        .terminate_execution(&handle, &deadline)
+        .expect("the recovered process must remain controllable");
+    assert_eq!(terminated.state, ExecutionState::Terminated);
+
+    assert!(matches!(
+        harness.daemon.take().unwrap().join(),
+        DaemonExit::Stopped
+    ));
+}
+
+/// With typed dispatch enabled, a legacy Task and a typed Task queued at the
+/// same time must both be dispatched. Neither queue may starve the other.
+#[test]
+fn legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue() {
+    let _serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut harness = Harness::start(
+        "mixed-queue",
+        Arc::new(WorkspaceJailSourceIntegration::new()),
+    );
+    let pin = harness.publish_workspace_jail("mixed-typed", false, "primary", &[]);
+
+    // The legacy Task takes the existing unbound READY pool agent. The typed
+    // Task deliberately uses the newborn path, so both are immediately
+    // provisionable at the same time.
+    let legacy =
+        harness.admit_legacy(TaskSpec::new("legacy-shared-queue", json!({})).partition("legacy"));
+    let typed = harness.admit(
+        &pin,
+        TaskSpec::new("typed-shared-queue", json!({})).partition("general"),
+        NetworkPolicy::Enabled,
+    );
+
+    let queue = [legacy.clone(), typed.clone()];
+    wait_until(Duration::from_secs(20), || {
+        queue.iter().all(|task| {
+            matches!(
+                harness.kernel.task(task).unwrap().state,
+                TaskState::Leased | TaskState::Running
+            )
+        })
+    });
+    wait_until(Duration::from_secs(20), || harness.snapshots().len() == 2);
+    let dispatched: BTreeSet<TaskId> = harness
+        .snapshots()
+        .iter()
+        .map(|snap| snap.task_id().clone())
+        .collect();
+    assert_eq!(
+        dispatched,
+        [legacy.clone(), typed.clone()].into_iter().collect(),
+        "both queued sides must receive exactly one Execution"
+    );
+
+    assert!(matches!(
+        harness.daemon.take().unwrap().join(),
+        DaemonExit::Stopped
+    ));
+}
+
 /// The full happy path on a ReadOnly Task: production daemon, real source
 /// integration, real jail, exact committed binding, and a durable Result ACK
 /// (harness-injected `Kernel::ack_success`, not a worker transport) that
@@ -528,8 +797,8 @@ fn typed_read_only_task_runs_end_to_end_and_acks_through_the_daemon() {
         jail_dir.display()
     );
 
-    // ACK while the worker is still physically RUNNING: this is the Worker
-    // Result path, not a collected physical end.
+    // ACK while the worker is still physically RUNNING: this exercises the
+    // durable ACK interface directly, not a worker-originated transport.
     assert_eq!(
         harness.kernel.execution(&execution_id).unwrap().state,
         ExecutionState::Running
@@ -571,7 +840,7 @@ fn typed_read_only_task_runs_end_to_end_and_acks_through_the_daemon() {
     assert_eq!(
         harness.kernel.result_for_task(&task).unwrap().id,
         result.id,
-        "late physical end must not replace the Worker Result"
+        "late physical end must not replace the durable ACK Result"
     );
     assert_eq!(
         harness.kernel.task(&task).unwrap().state,
@@ -656,7 +925,7 @@ fn typed_newborn_agent_is_provisioned_and_bound_by_the_scheduler() {
 }
 
 /// A real Write Task: the jailed worker physically writes inside its per-
-/// execution workspace, and a Worker ACK without a quiescence witness is
+/// execution workspace, and a durable ACK without a quiescence witness is
 /// refused rather than fabricated.
 #[test]
 fn typed_write_task_writes_inside_the_jail_and_cannot_fake_quiescence() {

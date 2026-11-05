@@ -292,14 +292,19 @@ PR #24: production `ControlLoopService` typed dispatch, a concrete
 provisioning-capable adapter with real OS enforcement
 (`JailedProcessAgentAdapter`). The adapter's current enforcement claims are:
 per-Execution Windows restricting SID (never the global `S-1-5-12`) with a
-direct-ACL write grant only on that jail; Linux Landlock ABI >= 3 required so
-`truncate(2)`/`O_TRUNC` cannot bypass the ruleset; one absolute deadline carried
-through jail creation, ACL, spawn, identity probe and cleanup; and an explicit
-minimal worker environment allowlist instead of daemon inheritance. Candidate
-cooldown is excluded before the probe limit, and the winner's prepare budget is
-created only after winner commit. The E2E Result ACK is harness-injected through
-the durable Kernel command boundary; no production worker transport/auth/retry
-is claimed. B.5 credential/security import, cold/revivable
+minimal token (only `SeChangeNotifyPrivilege` survives) and a private
+per-Execution desktop, with a direct-ACL write grant only on that jail; Linux
+Landlock ABI >= 3 required so `truncate(2)`/`O_TRUNC` cannot bypass the ruleset;
+one absolute deadline carried through jail creation, ACL, spawn, identity probe
+and cleanup; a durable `locator.json` written immediately after spawn and before
+the identity probe so a crash in that window remains recoverable; and an
+explicit minimal worker environment allowlist instead of daemon inheritance.
+Candidate cooldown is excluded before the probe limit, and the winner's prepare
+budget is created only after winner commit. The E2E Result ACK is
+harness-injected through the durable Kernel command boundary; no production
+worker transport/auth/retry is claimed. The accepted scope label is **typed
+physical execution → durable ACK interface**, not worker-originated end-to-end
+execution. B.5 credential/security import, cold/revivable
 matching, full typed topology, executed-WARM replacement and database migration
 remain pending and fail closed. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)

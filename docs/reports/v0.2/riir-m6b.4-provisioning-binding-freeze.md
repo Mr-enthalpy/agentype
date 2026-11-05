@@ -7,27 +7,40 @@ Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert a wider freeze.
 
 Verdict: **NOT FROZEN — revised implementation awaiting independent re-audit and
-final-SHA CI**. The scope is the typed Task → B.3 matching → B.4 physical
-eligibility → Attempt/Lease/ProvisioningBinding → pure prepare →
-Execution/BindingSnapshot → exact adapter start → observation/recovery →
-durable Result ACK boundary, with a real source integration and a real
-OS-enforced workspace jail. The Worker Result delivery/auth/retry data plane is
-not part of this scope (see *Harness-injected ACK boundary*). B.5 credentials,
-cold/revivable matching, full typed topology, executed-WARM replacement and
-v7→v8 migration remain out of scope and fail closed (see *Remaining limits*).
+final-SHA CI**. The accepted scope is **typed physical execution → durable ACK
+interface**: typed Task → B.3 matching → B.4 physical eligibility →
+Attempt/Lease/ProvisioningBinding → pure prepare → Execution/BindingSnapshot →
+exact adapter start → observation/recovery → durable Result ACK boundary, with a
+real source integration and a real OS-enforced workspace jail. A production
+worker-originated Result transport, worker authentication, delivery retry, and
+network ingress are **not** part of this scope (see *Harness-injected ACK
+boundary*); the suite does not claim worker-originated end-to-end ACK. B.5
+credentials, cold/revivable matching, full typed topology, executed-WARM
+replacement and v7→v8 migration remain out of scope and fail closed (see
+*Remaining limits*).
 
 ## Scope and acceptance baseline
 
 PR #24 implements the authority-bearing typed acquisition above the frozen
 baselines M4, M5, M6-A, M6-B.1/B.2/B.3
-(`cbd5a7518395247dc7abfef996eb307e7a526f25`, schema v7). This revision starts
-from the previous PR head `c8ed98f78ec599976903eae1e141849cfb361c52` and closes
-the three gaps recorded there:
+(`cbd5a7518395247dc7abfef996eb307e7a526f25`, schema v7). The first revision
+started from PR head `c8ed98f78ec599976903eae1e141849cfb361c52` and closed the
+three gaps recorded there:
 
 1. production `ControlLoopService` typed dispatch (not a test-only helper),
 2. a concrete `SourceConfigIntegration` (`agentype-source-workspace-jail`),
 3. a provisioning-capable real adapter with real OS enforcement
    (`JailedProcessAgentAdapter`).
+
+This revision starts from the independently re-audited head
+`12a7c0374654a34fb0788023063d538ed4a5fbc1` and closes P1-1, P1-2, P1-3, P2-2
+and P2-3 of that audit: the accepted scope is contracted to **typed physical
+execution → durable ACK interface**, physical locator evidence survives the
+`spawn → identity` window, Windows children keep only
+`SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed daemon
+restart test uses a real process crash over the same store, a mixed legacy/typed
+queue test proves no starvation, and the PR description is re-synchronized with
+the actual head.
 
 Deployment remains restricted to fresh schema-v8 databases and reopening
 existing v8 databases. v7→v8 migration is not implemented. The frozen specs
@@ -67,15 +80,29 @@ provisioned.
 - Windows: `CreateRestrictedToken` with `WRITE_RESTRICTED` and a
   **per-Execution** restricting SID derived deterministically from the
   RequestId (`S-1-5-21-<a>-<b>-<c>-<d>`), then `CreateProcessAsUserW`. The
-  process-global `S-1-5-12` is never used. `Write` grants one modify ACE for
-  that Execution's SID on the per-execution jail root and workspace via direct
+  process-global `S-1-5-12` is never used. The restricted token deletes every
+  host privilege except `SeChangeNotifyPrivilege`; shutdown, undock,
+  time-zone, working-set and any other inherited privilege are absent, and the
+  spawn fails closed if the privilege set cannot be proven minimal. Each
+  Execution runs on a per-Execution desktop (`agentype-desktop-<request_id>`)
+  whose DACL is extended with `DESKTOP_ALL_ACCESS` for that Execution's
+  restricting SID; the creating user's default ACEs remain, so this is
+  per-Execution desktop confinement, not a same-user security boundary. The
+  current window station receives the access required for Win32 initialization.
+  A new window station is attempted only if the host privilege exists;
+  `CreateWindowStationW` returns `ERROR_ACCESS_DENIED` for ordinary interactive
+  users, so the adapter fails closed rather than silently using the interactive
+  desktop. `Write`
+  grants one modify ACE for that Execution's SID on the per-execution jail root
+  and workspace via direct
   `GetNamedSecurityInfoW`/`SetEntriesInAclW`/`SetNamedSecurityInfoW`; `icacls`
   is not used because it cannot resolve an arbitrary non-account SID
   (Windows error 1332). `ReadOnly` grants no such ACE. An ACE for Execution A's
   SID cannot authorize Execution B's token, which carries a different SID.
   A restricted child needs an inherited console, so the adapter fails closed as
   Unavailable when the host has none (rather than spawning a process that dies
-  with `STATUS_DLL_INIT_FAILED`).
+  with `STATUS_DLL_INIT_FAILED`). This is a workspace/desktop confinement
+  mechanism, not a general malicious-code sandbox.
 - Linux: Landlock in `pre_exec` with `PR_SET_NO_NEW_PRIVS`. The adapter probes
   the Landlock ABI and **requires ABI >= 3**: ABI 1/2 cannot deny `truncate(2)`,
   which bypasses `WRITE_FILE`. `start_execution` and the child ruleset both
@@ -101,6 +128,46 @@ binds the canonical descriptor to the exact
 `(adapter_kind, adapter_binding_key)`, so a descriptor cannot be replayed
 against another physical installation.
 
+### Durable physical locator (P1-2)
+
+`spawn()` returns a process identity only after a birth-time probe, so a crash
+between OS spawn and that probe previously left no durable physical evidence.
+The adapters now write `locator.json` **immediately after spawn and before the
+identity probe** under
+`<temp>/agentype-jail-exec-<request_id>/locator.json` (jail) or
+`<temp>/agentype-exec-<request_id>/locator.json` (legacy local process). The
+record carries `v`, `kind`, `pid`, `inst`, `request_id`, stdout/stderr paths,
+optional `birth`, optional `spawn_after_ms`, plus
+`identity_complete=false` and `reconnectable=false`.
+
+- `reconcile_start` accepts the locator and, when `birth` is absent, verifies a
+  non-impersonating physical witness before adopting a numeric pid. On Windows
+  the witness is the per-Execution restricting SID on the process token; on
+  Linux it is birth/instance-token verification. A locator cannot impersonate an
+  unrelated pid.
+- `observe_execution`, `interrupt_execution`, `terminate_execution`, and
+  `collect_outcome` resolve a locator directly, so the process remains
+  controllable after the daemon restarts without a persisted pinned handle.
+- Once the birth identity is known, the locator is upgraded in place. A crash
+  after spawn but before the upgrade still yields a recoverable locator, never a
+  blind respawn.
+- No path treats "kill was called" as quiescence. Absence of a process produces
+  a terminal physical candidate; a terminal candidate without a quiescence
+  witness keeps writer safety closed.
+
+### Windows minimum privilege and private desktop (P1-3)
+
+The Windows child token keeps only `SeChangeNotifyPrivilege`. A per-Execution
+desktop is created and its DACL grants `DESKTOP_ALL_ACCESS` only to that
+Execution's restricting SID; the current window station is granted the access
+required for Win32 initialization. The parent-side desktop handle is retained
+until `collect_outcome` observes process exit, because closing it while the
+child is still initializing user32 causes `STATUS_DLL_INIT_FAILED`. If either
+the privilege reduction or the private desktop/ACL step fails, the spawn fails
+closed; there is no fallback to the interactive `Default` desktop. These are
+declared as workspace/desktop confinement properties, not as a general sandbox
+for arbitrary malicious code.
+
 ## Invariant checklist
 
 | Invariant | Status | Evidence |
@@ -117,6 +184,10 @@ against another physical installation.
 | Absolute deadlines across physical phases | Preserved | One `AdapterDeadline` is carried through jail creation, ACL, spawn, identity probe and cleanup; `expired_start_deadline_creates_no_jail_directory`, `expired_prepare_deadline_creates_no_directory`, `deadline_expiring_between_phases_stops_before_the_next_phase`, and Linux `cleanup_never_blocks_past_an_expired_deadline` |
 | Worker environment isolation | Preserved | Explicit allowlist on both platforms; `worker_does_not_inherit_daemon_secrets_but_keeps_runtime_variables` |
 | Per-Execution write authorization | Preserved | RequestId-derived restricting SID granted only on that jail; Windows `write_a_cannot_write_read_only_b_jail` and `write_a_cannot_write_write_b_jail` |
+| Recoverable locator after spawn | Preserved | `locator.json` written before the birth probe; `born_less_locator_is_recovered_after_the_spawn_identity_window`, `durable_locator_controls_the_process_after_adapter_restart`, impersonation negative |
+| Windows minimum privilege and private desktop | Preserved | `worker_token_is_minimal_and_desktop_is_private`; only `SeChangeNotifyPrivilege` survives; `Default`/input desktop opens fail |
+| Real daemon-crash restart with same physical instance | Preserved | `typed_daemon_restart_recovers_the_same_physical_instance` (separate child process aborts; parent reopens same DB) |
+| Legacy and typed queues share the control loop without starvation | Preserved | `legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue` |
 | Linux truncate enforcement | Preserved | Landlock ABI >= 3 gate; `legacy_landlock_abis_are_not_enforceable`; Linux `ftruncate`/`open(O_TRUNC)` denial outside the jail and truncate allowance inside a Write jail |
 | Exact `(adapter_kind, adapter_binding_key)` recovery | Preserved | M5 recovery tests; retention of resolved adapter instance in typed handoff |
 | M5 writer safety and absolute deadlines | Preserved | Write E2E refuses ACK without quiescence; runtime deadline/writer suites |
@@ -175,9 +246,24 @@ transport, worker authentication, delivery retry, queue, or network ingress in
 this scope; B.5 credentials and a worker data plane are deferred. The evidence
 therefore covers the **durable Kernel ACK contract** (lease-epoch validation,
 ReadOnly completion, Write quiescence refusal, late-physical-end history), not a
-complete worker-originated ACK path. Any wider claim would be unsupported.
+complete worker-originated ACK path. Any wider claim would be unsupported. The
+accepted scope label is therefore **typed physical execution → durable ACK
+interface**; this record does not claim worker-originated end-to-end execution.
 
-The full 7-test E2E suite also proves the newborn-agent path, a real in-jail
+Additional real-process evidence in this revision:
+
+- `typed_daemon_restart_recovers_the_same_physical_instance` starts the
+  production daemon in a **separate child test process**, waits until one typed
+  Execution is RUNNING and the jailed worker has written a ready marker, then
+  calls `abort()`. The parent reopens the same SQLite store, starts a fresh
+  daemon, and proves that recovery adopts the **same pid**, that a fresh adapter
+  observes the still-live process, and that no second Execution is created.
+- `legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue` queues a real
+  legacy Task (local-process target) and a real typed Task (jail target) at the
+  same time. The alternating control loop dispatches both, proving neither queue
+  starves the other.
+
+The full 10-test E2E suite also proves the newborn-agent path, a real in-jail
 write with a refused unquiescent Write ACK, unprovisionable and missing-alias
 Tasks with no authority, post-commit digest drift with no Execution, and a
 fatal preparation fault that fails the daemon and produces exactly one
@@ -190,6 +276,11 @@ fatal preparation fault that fails the daemon and produces exactly one
 | Post-Attempt / pre-prepare crash | `interrupted_acquisition_before_execution_recovers_as_execution_lost`; `post_commit_prepare_failure_settles_unavailable` |
 | Post-prepare / pre-Execution | `malformed_successful_prepare_is_fatal_without_nack_or_retry`; `prepare_protocol_drift_is_fatal_before_and_after_the_call`; fatal-prep E2E |
 | Post-Execution-commit / pre-start | `typed_acquisition_handoff_commits_snapshot_bearing_execution`; typed handoff recovery tests; M5 `execution_commitment_freezes_adapter_kind` |
+| `COMMIT → start` real crash | `typed_daemon_restart_recovers_the_same_physical_instance` (child daemon aborts; parent reopens the same store) |
+| `spawn → identity` crash window | `born_less_locator_is_recovered_after_the_spawn_identity_window`; `reconcile_without_persisted_handle_recovers_running_instance` |
+| `identity → observation persistence` crash window | `durable_locator_controls_the_process_after_adapter_restart`; locator-aware `observe`/`terminate`/`collect` |
+| Locator impersonation | `born_less_locator_cannot_impersonate_an_unrelated_pid` (restricting-SID witness) |
+| Missing locator/handle after restart | `reconcile_without_any_physical_evidence_is_ambiguous_not_respawned` |
 | Unknown Execution COMMIT | `uncertain COMMIT` counterparts in the resolver suite; `kernel_faults_are_never_classified_as_authority` |
 | Ambiguous process start | `dispatch_ambiguous_start_is_persisted_and_never_restarted`; `dispatch_ambiguous_write_start_never_gains_quiescence` |
 | Missing exact binding after restart | `dispatch_missing_adapter_creates_no_writer_ambiguity`; `physical_composition_never_falls_back_to_another_installed_adapter`; E2E missing-alias case |
@@ -210,8 +301,8 @@ Local checks on 2026-11-06:
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
 | `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed |
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
-| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 10 passed (real OS enforcement) |
-| `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 7 passed |
+| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 16 passed (real OS enforcement, including token/desktop and locator recovery) |
+| `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 10 passed (including real daemon restart and mixed legacy/typed queue) |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
 workspace directory because the sandboxed test process cannot create the
@@ -246,6 +337,13 @@ reverts to NOT FROZEN.
 - **Windows console dependency**: a restricted-token child requires an
   inherited console; hosts without one get a fail-closed Unavailable, not an
   unconfined launch.
+- **Windows window station**: a private per-Execution desktop is created, but a
+  new window station requires a privilege ordinary interactive users do not
+  have (`CreateWindowStationW` → `ERROR_ACCESS_DENIED`). The adapter therefore
+  fails closed on any private-desktop/ACL failure and never falls back to the
+  interactive desktop. The result is workspace/desktop confinement, not a
+  general malicious-code sandbox or a claim of resistance to every adversarial
+  window-message attack.
 - **Windows ACL mechanism**: direct security APIs replace `icacls`, which
   cannot map an arbitrary per-execution SID (error 1332). The ACE is applied to
   the jail root and workspace, not recursively to pre-existing content.

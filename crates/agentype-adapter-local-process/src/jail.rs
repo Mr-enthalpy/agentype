@@ -37,9 +37,11 @@
 #[cfg(unix)]
 use super::wait_child_exit;
 use super::{
-    deadline_exceeded_hint, instance_presence, instance_token, liveness_observation,
-    parse_handle_with_kind, qualify_ok, require_deadline, terminated_observation,
-    wait_instance_exit, InstancePresence, ParsedHandle,
+    deadline_exceeded_hint, encode_handle_with_kind, encode_locator_hint_with_kind,
+    instance_presence, instance_token, liveness_observation, parse_control_handle, qualify_ok,
+    read_locator_record, require_deadline, resolve_locator_to_parsed, terminated_observation,
+    wait_instance_exit, write_locator_record, ControlResolution, InstancePresence, LocatorHandle,
+    ParsedHandle, PhysicalControlHandle,
 };
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterResult, EnvironmentStartRequest, ExecutionAdapter,
@@ -51,7 +53,6 @@ use agentype_execution_config::{AdapterBindingKey, NetworkEnforcement};
 use serde_json::{Map, Value};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
-#[cfg(unix)]
 use std::sync::Mutex;
 
 /// Frozen `adapter_kind` for the jailing driver family.
@@ -260,6 +261,8 @@ struct JailLive {
 pub struct JailedProcessAgentAdapter {
     #[cfg(unix)]
     live: Mutex<std::collections::HashMap<u32, JailLive>>,
+    #[cfg(windows)]
+    live_desktops: Mutex<std::collections::HashMap<u32, DesktopHandle>>,
     binding_key: AdapterBindingKey,
 }
 
@@ -268,12 +271,80 @@ impl JailedProcessAgentAdapter {
         Ok(Self {
             #[cfg(unix)]
             live: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(windows)]
+            live_desktops: Mutex::new(std::collections::HashMap::new()),
             binding_key: super::capture_domain_key()?,
         })
     }
 
     pub fn binding_key(&self) -> &AdapterBindingKey {
         &self.binding_key
+    }
+
+    fn presence_for(
+        &self,
+        parsed: &ParsedHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<InstancePresence> {
+        #[cfg(unix)]
+        {
+            let mut live = self.live.lock().expect("jail live map");
+            match live.get_mut(&parsed.pid) {
+                Some(process) if process.birth == parsed.birth && process.inst == parsed.inst => {
+                    match process.child.try_wait() {
+                        Ok(Some(_)) => {
+                            live.remove(&parsed.pid);
+                            Ok(InstancePresence::Ended)
+                        }
+                        Ok(None) => Ok(InstancePresence::Running),
+                        Err(_) => Err(AdapterError::other("reconcile wait failed")),
+                    }
+                }
+                _ => {
+                    drop(live);
+                    instance_presence(
+                        parsed.pid,
+                        parsed.birth,
+                        &parsed.inst,
+                        &parsed.stdout_path,
+                        deadline,
+                    )
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            instance_presence(
+                parsed.pid,
+                parsed.birth,
+                &parsed.inst,
+                &parsed.stdout_path,
+                deadline,
+            )
+        }
+    }
+
+    fn control_parsed(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ControlResolution> {
+        match parse_control_handle(handle, JAIL_ADAPTER_KIND)? {
+            PhysicalControlHandle::Pinned(parsed) => Ok(ControlResolution {
+                stdout_path: parsed.stdout_path.clone(),
+                stderr_path: parsed.stderr_path.clone(),
+                parsed: Some(parsed),
+            }),
+            PhysicalControlHandle::Locator(locator) => {
+                let stdout_path = locator.stdout_path.clone();
+                let stderr_path = locator.stderr_path.clone();
+                Ok(ControlResolution {
+                    parsed: resolve_locator_to_parsed(locator, deadline)?,
+                    stdout_path,
+                    stderr_path,
+                })
+            }
+        }
     }
 }
 
@@ -286,6 +357,17 @@ impl Drop for JailedProcessAgentAdapter {
             for (_, mut process) in live.drain() {
                 let _ = process.child.try_wait();
             }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JailedProcessAgentAdapter {
+    fn drop(&mut self) {
+        // Closing the parent's desktop handle does not terminate a live worker:
+        // the child holds its own reference to the desktop for its lifetime.
+        if let Ok(mut live) = self.live_desktops.lock() {
+            live.clear();
         }
     }
 }
@@ -349,6 +431,9 @@ struct Spawned {
     running: bool,
     #[cfg(unix)]
     child: std::process::Child,
+    /// Owns the parent-side private-desktop handle until collect/terminate.
+    #[cfg(windows)]
+    desktop: DesktopHandle,
 }
 
 fn safe_component(value: &str) -> String {
@@ -501,6 +586,26 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
             &sid,
             deadline,
         )?;
+        #[cfg(windows)]
+        self.live_desktops
+            .lock()
+            .expect("jail desktop map")
+            .insert(spawned.pid, spawned.desktop);
+        // The locator was written immediately after spawn (before the birth
+        // probe). Upgrade it now that the exact birth identity is known.
+        let _ = write_locator_record(
+            &super::jail_exec_dir(request.request_id().as_str()),
+            JAIL_ADAPTER_KIND,
+            &LocatorHandle {
+                pid: spawned.pid,
+                birth: Some(spawned.birth),
+                inst: inst.clone(),
+                request_id: request.request_id().as_str().to_string(),
+                stdout_path: spawned.stdout_path.clone(),
+                stderr_path: spawned.stderr_path.clone(),
+                spawn_after_ms: None,
+            },
+        );
         let parsed = ParsedHandle {
             pid: spawned.pid,
             birth: spawned.birth,
@@ -542,34 +647,15 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "observe deadline already expired", None)?;
-        let parsed = parse_handle_with_kind(handle, JAIL_ADAPTER_KIND)?;
-        #[cfg(unix)]
-        {
-            let mut live = self.live.lock().expect("jail live map");
-            if let Some(process) = live.get_mut(&parsed.pid) {
-                if process.birth == parsed.birth && process.inst == parsed.inst {
-                    match process.child.try_wait() {
-                        Ok(Some(_)) => {
-                            live.remove(&parsed.pid);
-                            require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-                            return Ok(liveness_observation(InstancePresence::Ended));
-                        }
-                        Ok(None) => {
-                            require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
-                            return Ok(liveness_observation(InstancePresence::Running));
-                        }
-                        Err(_) => return Err(AdapterError::other("observe wait failed")),
-                    }
-                }
-            }
-        }
-        let presence = instance_presence(
-            parsed.pid,
-            parsed.birth,
-            &parsed.inst,
-            &parsed.stdout_path,
-            deadline,
-        )?;
+        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+            return qualify_ok(
+                deadline,
+                "observe deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
+        let presence = self.presence_for(&parsed, deadline)?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
         Ok(liveness_observation(presence))
     }
@@ -580,7 +666,14 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
-        let parsed = parse_handle_with_kind(handle, JAIL_ADAPTER_KIND)?;
+        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+            return qualify_ok(
+                deadline,
+                "interrupt deadline exhausted after locator resolution",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
         match super::pin::pin_instance(
             parsed.pid,
             parsed.birth,
@@ -605,7 +698,21 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "terminate deadline already expired", None)?;
-        let parsed = parse_handle_with_kind(handle, JAIL_ADAPTER_KIND)?;
+        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+            return qualify_ok(
+                deadline,
+                "terminate deadline exhausted after locator resolution",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
+        #[cfg(windows)]
+        {
+            self.live_desktops
+                .lock()
+                .expect("jail desktop map")
+                .remove(&parsed.pid);
+        }
         #[cfg(unix)]
         {
             let process = {
@@ -682,7 +789,26 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<PhysicalExecutionOutcome> {
         require_deadline(deadline, "collect deadline already expired", None)?;
-        let parsed = parse_handle_with_kind(handle, JAIL_ADAPTER_KIND)?;
+        let resolution = self.control_parsed(handle, deadline)?;
+        let Some(parsed) = resolution.parsed else {
+            return qualify_ok(
+                deadline,
+                "collect deadline exhausted after locator resolution",
+                Some(handle),
+                PhysicalExecutionOutcome {
+                    physical_state: PhysicalState::Terminated,
+                    exit_status: None,
+                    artifact_refs: Some(serde_json::json!({
+                        "stdout": resolution.stdout_path.to_string_lossy(),
+                        "stderr": resolution.stderr_path.to_string_lossy(),
+                    })),
+                    diagnostic: Some(
+                        "durable locator witness: spawned process is absent; not a blind retry"
+                            .into(),
+                    ),
+                },
+            );
+        };
         #[cfg(unix)]
         {
             let process = {
@@ -743,6 +869,12 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
                     handle.clone(),
                 ));
             }
+            // Only now is it safe to release the parent-side desktop handle:
+            // the worker has fully initialized and holds its own reference.
+            self.live_desktops
+                .lock()
+                .expect("jail desktop map")
+                .remove(&parsed.pid);
         }
         require_deadline(
             deadline,
@@ -767,94 +899,104 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         require_deadline(deadline, "reconcile deadline already expired", None)?;
-        let Some(handle) = persisted_handle else {
-            return Ok(StartObservation {
-                state: ExecutionState::Unknown,
-                runtime_handle: RuntimeHandle::default(),
-                ambiguous: true,
-                detail: Some("no persisted handle; identity is request_id only".into()),
-                terminal_confirmed: false,
-                quiescent_confirmed: false,
-            });
-        };
-        let parsed = match parse_handle_with_kind(handle, JAIL_ADAPTER_KIND) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                return Err(AdapterError::protocol(
-                    err.diagnostic().unwrap_or("invalid persisted handle"),
-                ));
-            }
-        };
-        if parsed.request_id != request_id.as_str() {
-            return Err(AdapterError::protocol(
-                "persisted handle request_id does not match reconcile identity",
-            ));
-        }
-        let presence = {
-            #[cfg(unix)]
-            {
-                let mut live = self.live.lock().expect("jail live map");
-                match live.get_mut(&parsed.pid) {
-                    Some(process)
-                        if process.birth == parsed.birth && process.inst == parsed.inst =>
-                    {
-                        match process.child.try_wait() {
-                            Ok(Some(_)) => {
-                                live.remove(&parsed.pid);
-                                InstancePresence::Ended
-                            }
-                            Ok(None) => InstancePresence::Running,
-                            Err(_) => {
-                                return Err(AdapterError::other("reconcile wait failed"));
-                            }
-                        }
-                    }
-                    _ => {
-                        drop(live);
-                        instance_presence(
-                            parsed.pid,
-                            parsed.birth,
-                            &parsed.inst,
-                            &parsed.stdout_path,
-                            deadline,
-                        )?
+        let control = match persisted_handle {
+            Some(handle) => parse_control_handle(handle, JAIL_ADAPTER_KIND)?,
+            None => {
+                let exec_dir = super::jail_exec_dir(request_id.as_str());
+                match read_locator_record(&exec_dir, JAIL_ADAPTER_KIND, request_id) {
+                    Some(locator) => PhysicalControlHandle::Locator(locator),
+                    None => {
+                        return Ok(StartObservation {
+                            state: ExecutionState::Unknown,
+                            runtime_handle: RuntimeHandle::default(),
+                            ambiguous: true,
+                            detail: Some(
+                                "no persisted handle and no durable locator; identity is request_id only"
+                                    .into(),
+                            ),
+                            terminal_confirmed: false,
+                            quiescent_confirmed: false,
+                        });
                     }
                 }
             }
-            #[cfg(windows)]
-            {
-                instance_presence(
-                    parsed.pid,
-                    parsed.birth,
-                    &parsed.inst,
-                    &parsed.stdout_path,
-                    deadline,
-                )?
+        };
+        let (parsed, observed_handle) = match control {
+            PhysicalControlHandle::Pinned(parsed) => {
+                if parsed.request_id != request_id.as_str() {
+                    return Err(AdapterError::protocol(
+                        "persisted handle request_id does not match reconcile identity",
+                    ));
+                }
+                (parsed, None)
+            }
+            PhysicalControlHandle::Locator(locator) => {
+                if locator.request_id != request_id.as_str() {
+                    return Err(AdapterError::protocol(
+                        "persisted locator request_id does not match reconcile identity",
+                    ));
+                }
+                let locator_handle = locator.to_runtime_handle(JAIL_ADAPTER_KIND);
+                // On Windows the per-execution restricting SID is the
+                // non-impersonating witness. A locator without a recorded birth
+                // must prove that SID before a numeric PID can be treated as
+                // this Execution's physical instance.
+                #[cfg(windows)]
+                if locator.birth.is_none() {
+                    match windows_restricted_sid_present(locator.pid, &restricting_sid(request_id))?
+                    {
+                        Some(true) => {}
+                        Some(false) | None => {
+                            let hint = locator_handle.clone();
+                            return qualify_ok(
+                                deadline,
+                                "reconcile deadline exhausted after locator witness",
+                                Some(&hint),
+                                super::ended_start_observation(locator_handle),
+                            );
+                        }
+                    }
+                }
+                match resolve_locator_to_parsed(locator, deadline)? {
+                    Some(parsed) => (parsed, Some(locator_handle)),
+                    None => {
+                        let hint = locator_handle.clone();
+                        return qualify_ok(
+                            deadline,
+                            "reconcile deadline exhausted after locator resolution",
+                            Some(&hint),
+                            super::ended_start_observation(locator_handle),
+                        );
+                    }
+                }
             }
         };
+        let presence = self.presence_for(&parsed, deadline)?;
+        let full_handle = encode_handle_with_kind(&parsed, JAIL_ADAPTER_KIND);
         let observation = match presence {
             InstancePresence::Running => StartObservation {
                 state: ExecutionState::Running,
-                runtime_handle: handle.clone(),
+                runtime_handle: full_handle,
                 ambiguous: false,
                 detail: None,
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
             },
-            InstancePresence::Ended => super::ended_start_observation(handle.clone()),
+            InstancePresence::Ended => super::ended_start_observation(full_handle),
             InstancePresence::Absent => StartObservation {
                 state: ExecutionState::Unknown,
-                runtime_handle: handle.clone(),
+                runtime_handle: observed_handle.unwrap_or(full_handle),
                 ambiguous: true,
                 detail: Some("process instance not found".into()),
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
             },
         };
+        let hint = observation.runtime_handle.clone();
         qualify_ok(
             deadline,
             "reconcile deadline exhausted after observation",
-            Some(handle),
+            Some(&hint),
             observation,
         )
     }
@@ -863,6 +1005,591 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
 // =============================================================================
 // Windows: restricted-token spawn
 // =============================================================================
+
+/// Non-impersonating locator witness: the per-Execution restricting SID is
+/// present in the live process's restricted-SID list. This proves the numeric
+/// PID still names the process this adapter created, without opening a control
+/// handle or claiming a complete pin.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterResult<Option<bool>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
+    const TOKEN_QUERY: Dword = 0x0008;
+    const TOKEN_RESTRICTED_SIDS: Dword = 11;
+    const ERROR_ACCESS_DENIED: Dword = 5;
+    const ERROR_INVALID_PARAMETER: Dword = 87;
+    const ERROR_INSUFFICIENT_BUFFER: Dword = 122;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: Handle,
+        attributes: Dword,
+    }
+
+    #[repr(C)]
+    struct TokenGroups {
+        count: Dword,
+        groups: [SidAndAttributes; 1],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
+        fn CloseHandle(handle: Handle) -> Bool;
+        fn GetLastError() -> Dword;
+        fn LocalFree(mem: Handle) -> Handle;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: Handle, access: Dword, token: *mut Handle) -> Bool;
+        fn GetTokenInformation(
+            token: Handle,
+            class: Dword,
+            info: *mut core::ffi::c_void,
+            len: Dword,
+            needed: *mut Dword,
+        ) -> Bool;
+        fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut Handle) -> Bool;
+        fn EqualSid(a: Handle, b: Handle) -> Bool;
+    }
+
+    // SAFETY: OpenProcess is a pure query; a null result is an error value.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        let err = unsafe { GetLastError() };
+        return match err {
+            ERROR_INVALID_PARAMETER => Ok(None),
+            ERROR_ACCESS_DENIED => Err(AdapterError::unavailable(
+                "cannot open process for locator witness",
+            )),
+            _ => Err(AdapterError::other(
+                "OpenProcess failed for locator witness",
+            )),
+        };
+    }
+    let mut token: Handle = std::ptr::null_mut();
+    // SAFETY: process is a live handle and token is an out parameter.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        unsafe {
+            CloseHandle(process);
+        }
+        return Err(AdapterError::unavailable(
+            "cannot open process token for locator witness",
+        ));
+    }
+    unsafe {
+        CloseHandle(process);
+    }
+
+    let mut needed: Dword = 0;
+    // SAFETY: size probe with a null buffer.
+    let sized = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_RESTRICTED_SIDS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let sized_err = unsafe { GetLastError() };
+    if sized == 0 && sized_err != ERROR_INSUFFICIENT_BUFFER {
+        unsafe {
+            CloseHandle(token);
+        }
+        return Err(AdapterError::other("cannot size process restricted SIDs"));
+    }
+    if needed == 0 {
+        unsafe {
+            CloseHandle(token);
+        }
+        return Ok(Some(false));
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    // SAFETY: buffer has at least `needed` bytes; needed is an out parameter.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_RESTRICTED_SIDS,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            needed,
+            &mut needed,
+        )
+    };
+    let read_err = unsafe { GetLastError() };
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        return if read_err == ERROR_ACCESS_DENIED {
+            Err(AdapterError::unavailable(
+                "cannot read process restricted SIDs",
+            ))
+        } else {
+            Err(AdapterError::other(
+                "GetTokenInformation failed for locator witness",
+            ))
+        };
+    }
+
+    let sid_string: Vec<u16> = std::ffi::OsStr::new(restricting_sid)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut expected: Handle = std::ptr::null_mut();
+    // SAFETY: sid_string is NUL terminated; expected is an out parameter.
+    if unsafe { ConvertStringSidToSidW(sid_string.as_ptr(), &mut expected) } == 0 {
+        return Err(AdapterError::unavailable(
+            "cannot resolve the restricting SID for locator witness",
+        ));
+    }
+    let groups = buffer.as_ptr() as *const TokenGroups;
+    // SAFETY: GetTokenInformation filled a TOKEN_GROUPS whose count bounds the
+    // trailing SidAndAttributes array inside the same allocation.
+    let count = unsafe { (*groups).count } as usize;
+    let entries = unsafe { std::slice::from_raw_parts((*groups).groups.as_ptr(), count) };
+    let present = entries
+        .iter()
+        .any(|entry| unsafe { EqualSid(entry.sid, expected) } != 0);
+    unsafe {
+        LocalFree(expected);
+    }
+    Ok(Some(present))
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsTrusteeW {
+    multiple_trustee: *mut core::ffi::c_void,
+    multiple_trustee_operation: i32,
+    trustee_form: i32,
+    trustee_type: i32,
+    name: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsExplicitAccessW {
+    access_permissions: u32,
+    access_mode: i32,
+    inheritance: u32,
+    trustee: WindowsTrusteeW,
+}
+
+// One shared declaration for `SetEntriesInAclW`: the file and window-object
+// ACL paths must agree on the exact `EXPLICIT_ACCESS_W` layout, otherwise the
+// two function-local declarations conflict at link time.
+#[cfg(windows)]
+#[link(name = "advapi32")]
+extern "system" {
+    fn SetEntriesInAclW(
+        count: u32,
+        entries: *const WindowsExplicitAccessW,
+        old_acl: *const core::ffi::c_void,
+        new_acl: *mut *mut core::ffi::c_void,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn grant_window_object_access(
+    object: *mut core::ffi::c_void,
+    object_type: i32,
+    restricting_sid: &str,
+    access: u32,
+) -> AdapterResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
+    const GRANT_ACCESS: i32 = 1;
+    const TRUSTEE_IS_SID: i32 = 0;
+    const TRUSTEE_IS_UNKNOWN: i32 = 0;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: Handle) -> Handle;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut Handle) -> i32;
+        fn GetSecurityInfo(
+            handle: Handle,
+            object_type: i32,
+            security_info: Dword,
+            owner: *mut Handle,
+            group: *mut Handle,
+            dacl: *mut Handle,
+            sacl: *mut Handle,
+            descriptor: *mut Handle,
+        ) -> Dword;
+        fn SetSecurityInfo(
+            handle: Handle,
+            object_type: i32,
+            security_info: Dword,
+            owner: Handle,
+            group: Handle,
+            dacl: Handle,
+            sacl: Handle,
+        ) -> Dword;
+    }
+
+    let sid_string: Vec<u16> = std::ffi::OsStr::new(restricting_sid)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sid: Handle = std::ptr::null_mut();
+    // SAFETY: sid_string is NUL terminated; sid is an out parameter.
+    if unsafe { ConvertStringSidToSidW(sid_string.as_ptr(), &mut sid) } == 0 {
+        return Err(AdapterError::unavailable(
+            "cannot resolve the restricting SID for window object isolation",
+        ));
+    }
+    let entry = WindowsExplicitAccessW {
+        access_permissions: access,
+        access_mode: GRANT_ACCESS,
+        inheritance: 0,
+        trustee: WindowsTrusteeW {
+            multiple_trustee: std::ptr::null_mut(),
+            multiple_trustee_operation: 0,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_UNKNOWN,
+            name: sid.cast::<u16>(),
+        },
+    };
+    let mut old_dacl: Handle = std::ptr::null_mut();
+    let mut descriptor: Handle = std::ptr::null_mut();
+    // SAFETY: object is a live window-station/desktop handle; out pointers are
+    // owned by this frame.
+    let read = unsafe {
+        GetSecurityInfo(
+            object,
+            object_type,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != 0 {
+        unsafe {
+            LocalFree(sid);
+        }
+        return Err(AdapterError::unavailable(
+            "cannot read the window object DACL",
+        ));
+    }
+    let mut new_dacl: Handle = std::ptr::null_mut();
+    // SAFETY: entry and old_dacl are valid for the call; new_dacl is out.
+    let merged = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+    if merged != 0 {
+        unsafe {
+            LocalFree(descriptor);
+            LocalFree(sid);
+        }
+        return Err(AdapterError::unavailable(
+            "cannot merge the window object ACL",
+        ));
+    }
+    // SAFETY: new_dacl is a fresh merged ACL owned by this frame.
+    let applied = unsafe {
+        SetSecurityInfo(
+            object,
+            object_type,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(new_dacl);
+        LocalFree(descriptor);
+        LocalFree(sid);
+    }
+    if applied != 0 {
+        return Err(AdapterError::unavailable(
+            "cannot apply the window object ACL",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn CloseDesktop(desktop: *mut core::ffi::c_void) -> i32;
+}
+
+/// Owns a private-desktop handle. `usize` keeps the owning adapter `Send`; the
+/// handle is closed exactly once on drop.
+#[cfg(windows)]
+struct DesktopHandle(usize);
+
+#[cfg(windows)]
+impl DesktopHandle {
+    fn raw(&self) -> *mut core::ffi::c_void {
+        self.0 as *mut core::ffi::c_void
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DesktopHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            // SAFETY: this value owns the handle and closes it exactly once.
+            unsafe {
+                CloseDesktop(self.raw());
+            }
+        }
+    }
+}
+
+/// Handles for one Execution's private desktop. The child is started with
+/// `lpDesktop = "<desktop>"` on the caller's window station, but the desktop is
+/// a distinct object whose DACL is extended with `DESKTOP_ALL_ACCESS` for the
+/// Execution's restricting SID. The creating user's default ACEs remain, so
+/// this is per-Execution desktop confinement, not a same-user security
+/// boundary; a child on another SID still cannot attach to this desktop.
+#[cfg(windows)]
+struct PrivateWindowStation {
+    desktop: DesktopHandle,
+    desktop_path: Vec<u16>,
+}
+
+/// Create a private desktop for one Execution and grant the Execution's
+/// restricting SID access to it. The current window station is extended with
+/// the access required for Win32 initialization for that same SID; it never
+/// receives create-desktop or write authority. A new window station would be
+/// stronger, but `CreateWindowStationW` requires a host privilege that ordinary
+/// interactive users do not have, so this fails closed rather than silently
+/// using the interactive desktop. Any failure is fatal: the spawn must not fall
+/// back to the interactive desktop.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_private_desktop(
+    name: &str,
+    restricting_sid: &str,
+) -> AdapterResult<PrivateWindowStation> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    const WINSTA_REQUIRED_FOR_WIN32_INIT: Dword = 0x000F_037F;
+    const DESKTOP_ALL_ACCESS: Dword = 0x000F_01FF;
+    const SE_WINDOW_OBJECT: i32 = 7;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreateDesktopW(
+            desktop: *const u16,
+            device: *const u16,
+            devmode: *mut core::ffi::c_void,
+            flags: Dword,
+            desired_access: Dword,
+            security: *const core::ffi::c_void,
+        ) -> Handle;
+        fn GetProcessWindowStation() -> Handle;
+    }
+
+    let desktop_name = format!("agentype-desktop-{name}");
+    let desktop_wide: Vec<u16> = std::ffi::OsStr::new(&desktop_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: desktop is NUL terminated; a null security descriptor asks for
+    // the default DACL, which the restricting-SID ACE is merged into below. A
+    // null device selects the current window station.
+    let desktop = unsafe {
+        CreateDesktopW(
+            desktop_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            DESKTOP_ALL_ACCESS,
+            std::ptr::null(),
+        )
+    };
+    if desktop.is_null() {
+        return Err(AdapterError::unavailable(
+            "cannot create the per-execution jail desktop",
+        ));
+    }
+    if let Err(err) = grant_window_object_access(
+        desktop,
+        SE_WINDOW_OBJECT,
+        restricting_sid,
+        DESKTOP_ALL_ACCESS,
+    ) {
+        unsafe {
+            CloseDesktop(desktop);
+        }
+        return Err(err);
+    }
+    // SAFETY: GetProcessWindowStation returns a process-owned pseudo-handle.
+    let window_station = unsafe { GetProcessWindowStation() };
+    if window_station.is_null()
+        || grant_window_object_access(
+            window_station,
+            SE_WINDOW_OBJECT,
+            restricting_sid,
+            WINSTA_REQUIRED_FOR_WIN32_INIT,
+        )
+        .is_err()
+    {
+        unsafe {
+            CloseDesktop(desktop);
+        }
+        return Err(AdapterError::unavailable(
+            "cannot authorize the jail desktop on the current window station",
+        ));
+    }
+
+    Ok(PrivateWindowStation {
+        desktop: DesktopHandle(desktop as usize),
+        desktop_path: desktop_wide,
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TokenLuid {
+    low_part: u32,
+    high_part: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TokenLuidAndAttributes {
+    luid: TokenLuid,
+    attributes: u32,
+}
+
+/// Every privilege held by `token` except `SeChangeNotifyPrivilege`. The child
+/// keeps only that privilege (needed for directory traversal checks); shutdown,
+/// time-zone, undock, working-set and any other inherited host privileges are
+/// deleted from the restricted token. Failure is fatal: a token that cannot be
+/// proven minimal must not be used.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn privilege_deletions_for_token(
+    token: *mut core::ffi::c_void,
+) -> AdapterResult<Vec<TokenLuidAndAttributes>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+    const TOKEN_PRIVILEGES_CLASS: Dword = 3;
+    const ERROR_INSUFFICIENT_BUFFER: Dword = 122;
+
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: Dword,
+        privileges: [TokenLuidAndAttributes; 1],
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetTokenInformation(
+            token: Handle,
+            class: Dword,
+            info: *mut core::ffi::c_void,
+            len: Dword,
+            needed: *mut Dword,
+        ) -> Bool;
+        fn LookupPrivilegeValueW(
+            system: *const u16,
+            name: *const u16,
+            luid: *mut TokenLuid,
+        ) -> Bool;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLastError() -> Dword;
+    }
+
+    let mut needed: Dword = 0;
+    // SAFETY: size probe with a null buffer.
+    let sized = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_PRIVILEGES_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let sized_error = unsafe { GetLastError() };
+    if sized == 0 && sized_error != ERROR_INSUFFICIENT_BUFFER {
+        return Err(AdapterError::unavailable(
+            "cannot size the current process token privileges",
+        ));
+    }
+    if needed == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    // SAFETY: the buffer is at least `needed` bytes; `needed` is an out
+    // parameter.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_PRIVILEGES_CLASS,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(AdapterError::unavailable(
+            "cannot read the current process token privileges",
+        ));
+    }
+    let privileges = buffer.as_ptr() as *const TokenPrivileges;
+    // SAFETY: GetTokenInformation filled a TOKEN_PRIVILEGES whose count bounds
+    // the trailing LUID_AND_ATTRIBUTES array in the same allocation.
+    let count = unsafe { (*privileges).count } as usize;
+    let entries = unsafe { std::slice::from_raw_parts((*privileges).privileges.as_ptr(), count) };
+
+    let keep_name: Vec<u16> = std::ffi::OsStr::new("SeChangeNotifyPrivilege")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut keep = TokenLuid {
+        low_part: 0,
+        high_part: 0,
+    };
+    // SAFETY: keep_name is NUL terminated; keep is an out parameter.
+    if unsafe { LookupPrivilegeValueW(std::ptr::null(), keep_name.as_ptr(), &mut keep) } == 0 {
+        return Err(AdapterError::unavailable(
+            "cannot resolve SeChangeNotifyPrivilege",
+        ));
+    }
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry.luid.low_part != keep.low_part || entry.luid.high_part != keep.high_part
+        })
+        .map(|entry| TokenLuidAndAttributes {
+            luid: entry.luid,
+            attributes: 0,
+        })
+        .collect())
+}
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -1042,10 +1769,7 @@ fn spawn_jailed(
         out
     }
 
-    let exec_dir = std::env::temp_dir().join(format!(
-        "agentype-jail-exec-{}",
-        request.request_id().as_str()
-    ));
+    let exec_dir = super::jail_exec_dir(request.request_id().as_str());
     fs::create_dir_all(&exec_dir)
         .map_err(|_| AdapterError::unavailable("cannot create jailed execution dir"))?;
     let stdout_path = exec_dir.join("stdout.txt");
@@ -1103,17 +1827,28 @@ fn spawn_jailed(
         sid: restricted_sid,
         attributes: 0,
     };
+    let delete_privileges = match privilege_deletions_for_token(base_token) {
+        Ok(privileges) => privileges,
+        Err(err) => {
+            unsafe {
+                CloseHandle(base_token);
+                LocalFree(restricted_sid);
+            }
+            return Err(err);
+        }
+    };
     let mut restricted_token: Handle = std::ptr::null_mut();
     // SAFETY: base_token and restricted_sid are valid; the new token is an out
-    // parameter. CreateRestrictedToken copies the SID.
+    // parameter. CreateRestrictedToken copies the SID. Every host privilege
+    // except SeChangeNotifyPrivilege is deleted.
     let token_ok = unsafe {
         CreateRestrictedToken(
             base_token,
             WRITE_RESTRICTED,
             0,
             std::ptr::null(),
-            0,
-            std::ptr::null(),
+            delete_privileges.len() as Dword,
+            delete_privileges.as_ptr() as *const core::ffi::c_void,
             1,
             &restrict,
             &mut restricted_token,
@@ -1195,9 +1930,23 @@ fn spawn_jailed(
     startup.startup_info.std_error = raw_handles[2];
     startup.attribute_list = list;
 
+    let private_desktop =
+        match create_private_desktop(request.request_id().as_str(), restricting_sid) {
+            Ok(private) => private,
+            Err(err) => {
+                unsafe {
+                    DeleteProcThreadAttributeList(list);
+                    CloseHandle(restricted_token);
+                }
+                return Err(err);
+            }
+        };
+    startup.startup_info.desktop = private_desktop.desktop_path.as_ptr() as *mut u16;
+
     let mut process_info: ProcessInformation = unsafe { std::mem::zeroed() };
+    let spawn_after_ms = super::unix_ms();
     // SAFETY: all pointers reference live, correctly typed values for the
-    // duration of the call.
+    // duration of the call. The private desktop path outlives the call.
     let created = unsafe {
         CreateProcessAsUserW(
             restricted_token,
@@ -1232,6 +1981,28 @@ fn spawn_jailed(
     unsafe {
         CloseHandle(process_info.thread);
     }
+    let pid = process_info.process_id;
+    let locator = LocatorHandle {
+        pid,
+        birth: None,
+        inst: inst.to_string(),
+        request_id: request.request_id().as_str().to_string(),
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+        spawn_after_ms: Some(spawn_after_ms),
+    };
+    // Persist locator evidence *before* the identity probe. If the daemon dies
+    // in this window, RequestId recovery still has a physical witness.
+    let _ = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator);
+    let locator_hint = encode_locator_hint_with_kind(
+        JAIL_ADAPTER_KIND,
+        pid,
+        None,
+        inst,
+        request.request_id().as_str(),
+        &stdout_path,
+        &stderr_path,
+    );
     if deadline.is_expired() {
         unsafe {
             TerminateProcess(process_info.process, 1);
@@ -1239,7 +2010,8 @@ fn spawn_jailed(
         }
         return Err(AdapterError::deadline_exceeded(
             "workspace jail spawn deadline exhausted before identity probe",
-        ));
+        )
+        .with_handle_hint(locator_hint));
     }
 
     let birth = match super::pin::creation_from_handle(process_info.process) {
@@ -1249,7 +2021,7 @@ fn spawn_jailed(
                 TerminateProcess(process_info.process, 1);
                 CloseHandle(process_info.process);
             }
-            return Err(err);
+            return Err(err.with_handle_hint(locator_hint));
         }
     };
     let mut code = STILL_ACTIVE;
@@ -1260,27 +2032,48 @@ fn spawn_jailed(
             TerminateProcess(process_info.process, 1);
             CloseHandle(process_info.process);
         }
-        return Err(AdapterError::other("GetExitCodeProcess failed after spawn"));
+        return Err(AdapterError::other("GetExitCodeProcess failed after spawn")
+            .with_handle_hint(locator_hint));
     }
     if deadline.is_expired() {
         unsafe {
             TerminateProcess(process_info.process, 1);
             CloseHandle(process_info.process);
         }
-        return Err(AdapterError::deadline_exceeded(
-            "workspace jail spawn deadline exhausted",
-        ));
+        return Err(
+            AdapterError::deadline_exceeded("workspace jail spawn deadline exhausted")
+                .with_handle_hint(encode_handle_with_kind(
+                    &ParsedHandle {
+                        pid,
+                        birth,
+                        inst: inst.to_string(),
+                        request_id: request.request_id().as_str().to_string(),
+                        stdout_path: stdout_path.clone(),
+                        stderr_path: stderr_path.clone(),
+                    },
+                    JAIL_ADAPTER_KIND,
+                )),
+        );
     }
     unsafe {
         CloseHandle(process_info.process);
     }
+    let _ = write_locator_record(
+        &exec_dir,
+        JAIL_ADAPTER_KIND,
+        &LocatorHandle {
+            birth: Some(birth),
+            ..locator
+        },
+    );
 
     Ok(Spawned {
-        pid: process_info.process_id,
+        pid,
         birth,
         stdout_path,
         stderr_path,
         running: code == STILL_ACTIVE,
+        desktop: private_desktop.desktop,
     })
 }
 
@@ -1364,23 +2157,6 @@ fn grant_restricted_write(
     // the direct-ACL equivalent of icacls' `(M)`.
     const FILE_MODIFY: Dword = 0x0013_01BF;
 
-    #[repr(C)]
-    struct TrusteeW {
-        multiple_trustee: *mut TrusteeW,
-        multiple_trustee_operation: i32,
-        trustee_form: i32,
-        trustee_type: i32,
-        name: *mut u16,
-    }
-
-    #[repr(C)]
-    struct ExplicitAccessW {
-        access_permissions: Dword,
-        access_mode: i32,
-        inheritance: Dword,
-        trustee: TrusteeW,
-    }
-
     #[link(name = "advapi32")]
     extern "system" {
         fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut Handle) -> Bool;
@@ -1393,12 +2169,6 @@ fn grant_restricted_write(
             dacl: *mut Handle,
             sacl: *mut Handle,
             descriptor: *mut Handle,
-        ) -> Dword;
-        fn SetEntriesInAclW(
-            count: u32,
-            entries: *const ExplicitAccessW,
-            old_acl: *const core::ffi::c_void,
-            new_acl: *mut Handle,
         ) -> Dword;
         fn SetNamedSecurityInfoW(
             object_name: *mut u16,
@@ -1431,11 +2201,11 @@ fn grant_restricted_write(
         ));
     }
 
-    let entry = ExplicitAccessW {
+    let entry = WindowsExplicitAccessW {
         access_permissions: FILE_MODIFY,
         access_mode: GRANT_ACCESS,
         inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-        trustee: TrusteeW {
+        trustee: WindowsTrusteeW {
             multiple_trustee: std::ptr::null_mut(),
             multiple_trustee_operation: 0,
             trustee_form: TRUSTEE_IS_SID,
@@ -1582,10 +2352,7 @@ fn spawn_jailed(
         "workspace jail spawn deadline already expired",
         None,
     )?;
-    let exec_dir = std::env::temp_dir().join(format!(
-        "agentype-jail-exec-{}",
-        request.request_id().as_str()
-    ));
+    let exec_dir = super::jail_exec_dir(request.request_id().as_str());
     fs::create_dir_all(&exec_dir)
         .map_err(|_| AdapterError::unavailable("cannot create jailed execution dir"))?;
     require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
@@ -1626,15 +2393,37 @@ fn spawn_jailed(
         command.pre_exec(move || apply_landlock(&jail_root, mode));
     }
     require_deadline(deadline, "workspace jail spawn deadline exhausted", None)?;
+    let spawn_after_ms = super::unix_ms();
     let mut child = command
         .spawn()
         .map_err(|_| AdapterError::unavailable("workspace jail spawn failed"))?;
     let pid = child.id();
+    let locator = LocatorHandle {
+        pid,
+        birth: None,
+        inst: inst.to_string(),
+        request_id: request.request_id().as_str().to_string(),
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+        spawn_after_ms: Some(spawn_after_ms),
+    };
+    // Persist locator evidence before the birth probe. If the daemon is killed
+    // in the spawn -> identity window, RequestId recovery still has a witness.
+    let _ = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator);
+    let locator_hint = encode_locator_hint_with_kind(
+        JAIL_ADAPTER_KIND,
+        pid,
+        None,
+        inst,
+        request.request_id().as_str(),
+        &stdout_path,
+        &stderr_path,
+    );
     let birth = match super::process_birth(pid, deadline) {
         Ok(birth) => birth,
         Err(err) => {
             reap_after_kill(child, deadline);
-            return Err(err);
+            return Err(err.with_handle_hint(locator_hint));
         }
     };
     let running = match child.try_wait() {
@@ -1642,15 +2431,36 @@ fn spawn_jailed(
         Ok(None) => true,
         Err(_) => {
             reap_after_kill(child, deadline);
-            return Err(AdapterError::other("child wait failed after spawn"));
+            return Err(
+                AdapterError::other("child wait failed after spawn").with_handle_hint(locator_hint)
+            );
         }
     };
     if deadline.is_expired() {
         reap_after_kill(child, deadline);
-        return Err(AdapterError::deadline_exceeded(
-            "workspace jail spawn deadline exhausted",
-        ));
+        return Err(
+            AdapterError::deadline_exceeded("workspace jail spawn deadline exhausted")
+                .with_handle_hint(encode_handle_with_kind(
+                    &ParsedHandle {
+                        pid,
+                        birth,
+                        inst: inst.to_string(),
+                        request_id: request.request_id().as_str().to_string(),
+                        stdout_path: stdout_path.clone(),
+                        stderr_path: stderr_path.clone(),
+                    },
+                    JAIL_ADAPTER_KIND,
+                )),
+        );
     }
+    let _ = write_locator_record(
+        &exec_dir,
+        JAIL_ADAPTER_KIND,
+        &LocatorHandle {
+            birth: Some(birth),
+            ..locator
+        },
+    );
     Ok(Spawned {
         pid,
         birth,

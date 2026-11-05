@@ -220,6 +220,8 @@ transport, worker authentication, delivery retry, or a worker-originated ACK
 path; those remain out of scope with B.5 credentials and a worker data plane.
 The covered boundary is the durable Kernel ACK contract (lease-epoch validation,
 ReadOnly completion, Write quiescence refusal, late physical end as history).
+The accepted scope label is **typed physical execution → durable ACK interface**;
+the ADR does not claim worker-originated end-to-end execution.
 
 ExecutionLaunchSnapshot now carries the optional committed descriptor. The
 trusted unchecked constructor gains this argument because an Execution-only

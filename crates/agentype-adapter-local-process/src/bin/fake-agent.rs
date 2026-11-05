@@ -211,6 +211,217 @@ fn env_probe(name: &str) {
     );
 }
 
+/// Report the worker's effective token privileges and window desktop, and
+/// attempt to open the interactive `Default` and input desktops. A restricted
+/// token must not retain host privileges and must not reach either desktop.
+#[cfg(windows)]
+fn isolation_probe() {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+
+    #[repr(C)]
+    struct Luid {
+        low: Dword,
+        high: i32,
+    }
+
+    #[repr(C)]
+    struct LuidAndAttributes {
+        luid: Luid,
+        attributes: Dword,
+    }
+
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: Dword,
+        privileges: [LuidAndAttributes; 1],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn GetCurrentThreadId() -> Dword;
+        fn CloseHandle(handle: Handle) -> Bool;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: Handle, access: Dword, token: *mut Handle) -> Bool;
+        fn GetTokenInformation(
+            token: Handle,
+            class: Dword,
+            info: *mut core::ffi::c_void,
+            len: Dword,
+            needed: *mut Dword,
+        ) -> Bool;
+        fn LookupPrivilegeNameW(
+            system: *const u16,
+            luid: *const Luid,
+            name: *mut u16,
+            len: *mut Dword,
+        ) -> Bool;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetThreadDesktop(thread_id: Dword) -> Handle;
+        fn GetProcessWindowStation() -> Handle;
+        fn GetUserObjectInformationW(
+            object: Handle,
+            index: i32,
+            info: *mut core::ffi::c_void,
+            len: Dword,
+            needed: *mut Dword,
+        ) -> Bool;
+        fn OpenDesktopW(
+            name: *const u16,
+            flags: Dword,
+            desired_access: Dword,
+            inherit: Bool,
+        ) -> Handle;
+        fn OpenInputDesktop(flags: Dword, inherit: Bool, desired_access: Dword) -> Handle;
+        fn CloseDesktop(desktop: Handle) -> Bool;
+    }
+
+    const TOKEN_QUERY: Dword = 0x0008;
+    const TOKEN_PRIVILEGES_CLASS: Dword = 3;
+    const UOI_NAME: i32 = 2;
+    const DESKTOP_READOBJECTS: Dword = 0x0001;
+
+    let user_object_name = |handle: Handle| -> Option<String> {
+        if handle.is_null() {
+            return None;
+        }
+        let mut needed: Dword = 0;
+        // SAFETY: size probe with a null buffer.
+        unsafe {
+            GetUserObjectInformationW(handle, UOI_NAME, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u16; (needed as usize).div_ceil(2)];
+        // SAFETY: buffer has at least `needed` bytes.
+        let ok = unsafe {
+            GetUserObjectInformationW(
+                handle,
+                UOI_NAME,
+                buffer.as_mut_ptr() as *mut core::ffi::c_void,
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = buffer
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..len]))
+    };
+
+    let mut privileges = Vec::new();
+    let mut token: Handle = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess is a pseudo-handle; token is an out parameter.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0 {
+        let mut needed: Dword = 0;
+        // SAFETY: size probe with a null buffer.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TOKEN_PRIVILEGES_CLASS,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        if needed > 0 {
+            let mut buffer = vec![0u8; needed as usize];
+            // SAFETY: buffer has at least `needed` bytes.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    TOKEN_PRIVILEGES_CLASS,
+                    buffer.as_mut_ptr() as *mut core::ffi::c_void,
+                    needed,
+                    &mut needed,
+                )
+            };
+            if ok != 0 {
+                let groups = buffer.as_ptr() as *const TokenPrivileges;
+                // SAFETY: GetTokenInformation filled a TOKEN_PRIVILEGES whose
+                // count bounds the trailing array in the same allocation.
+                let count = unsafe { (*groups).count } as usize;
+                let entries =
+                    unsafe { std::slice::from_raw_parts((*groups).privileges.as_ptr(), count) };
+                for entry in entries {
+                    let mut name = vec![0u16; 256];
+                    let mut len = name.len() as Dword;
+                    // SAFETY: name is a valid out buffer; entry.luid is valid.
+                    if unsafe {
+                        LookupPrivilegeNameW(
+                            std::ptr::null(),
+                            &entry.luid,
+                            name.as_mut_ptr(),
+                            &mut len,
+                        )
+                    } != 0
+                    {
+                        let end = name
+                            .iter()
+                            .position(|&unit| unit == 0)
+                            .unwrap_or(len as usize);
+                        privileges.push(String::from_utf16_lossy(&name[..end]));
+                    }
+                }
+            }
+        }
+        // SAFETY: token is owned by this frame.
+        unsafe {
+            CloseHandle(token);
+        }
+    }
+
+    let desktop = user_object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) });
+    let winsta = user_object_name(unsafe { GetProcessWindowStation() });
+    let default_name: Vec<u16> = std::ffi::OsStr::new("Default")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: default_name is NUL terminated; a failed open is the expected
+    // isolation result rather than an error to report.
+    let default_desktop = unsafe { OpenDesktopW(default_name.as_ptr(), 0, DESKTOP_READOBJECTS, 0) };
+    let default_desktop_open = !default_desktop.is_null();
+    if default_desktop_open {
+        unsafe {
+            CloseDesktop(default_desktop);
+        }
+    }
+    // SAFETY: a failed open is the expected isolation result.
+    let input_desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
+    let input_desktop_open = !input_desktop.is_null();
+    if input_desktop_open {
+        unsafe {
+            CloseDesktop(input_desktop);
+        }
+    }
+
+    let privileges_json = privileges
+        .iter()
+        .map(|privilege| format!("\"{}\"", json_escape(privilege)))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        r#"{{"probe":{{"label":"isolation","ok":true,"privileges":[{privileges_json}],"desktop":"{}","winsta":"{}","default_desktop_open":{default_desktop_open},"input_desktop_open":{input_desktop_open}}}}}"#,
+        json_escape(desktop.as_deref().unwrap_or("")),
+        json_escape(winsta.as_deref().unwrap_or("")),
+    );
+}
+
 fn main() {
     if flag("FAKE_AGENT_TRAP_INT") || arg_flag("--trap-int") {
         trap_interrupt();
@@ -221,6 +432,10 @@ fn main() {
         thread::sleep(Duration::from_millis(ms));
     } else {
         sleep_ms_from_env();
+    }
+
+    if let Some(path) = arg_value("--ready-probe") {
+        write_probe(&path, "ready");
     }
 
     if flag("FAKE_AGENT_HANG") || arg_flag("--hang") {
@@ -263,6 +478,11 @@ fn main() {
 
     if let Some(path) = arg_value("--remove-probe") {
         remove_probe(Path::new(&path), "remove");
+    }
+
+    #[cfg(windows)]
+    if arg_flag("--isolation-probe") {
+        isolation_probe();
     }
 
     if flag("FAKE_AGENT_MALFORMED") || arg_flag("--malformed") {

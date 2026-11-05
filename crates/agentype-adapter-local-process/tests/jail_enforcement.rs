@@ -6,14 +6,15 @@
 //! write, so the test fails closed rather than trusting a declared capability.
 
 use agentype_adapter_api::{
-    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter,
+    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter, RuntimeHandle,
 };
 use agentype_adapter_local_process::{
     JailLaunchDescriptor, JailedProcessAgentAdapter, JAIL_ADAPTER_KIND,
 };
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, BatchId, CommittedContinuitySnapshot, ExecutionId,
-    IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId, WorkspaceMode,
+    ExecutionState, IncarnationId, LeaseEpoch, LeaseId, LogicalAgentId, RequestId, TaskId,
+    WorkspaceMode,
 };
 use agentype_execution_config::{
     resolve_execution_environment, ExecutionLaunchSnapshot, ExecutionProfileConfig,
@@ -141,7 +142,8 @@ fn run_probes(request: &EnvironmentStartRequest) -> (Option<String>, Vec<Value>,
         .collect();
     assert!(
         !probes.is_empty(),
-        "no probe line in captured stdout: {out_text:?} stderr: {err_text:?}"
+        "no probe line in captured stdout: {out_text:?} stderr: {err_text:?} exit: {:?}",
+        outcome.exit_status
     );
     (
         Some(start.runtime_handle.0.to_string()),
@@ -261,6 +263,64 @@ fn non_enabled_network_is_rejected_not_weakened() {
         .start_execution(&request, &long_deadline())
         .expect_err("a jail that cannot enforce the network policy must be unavailable");
     assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+}
+
+#[cfg(windows)]
+#[test]
+fn worker_token_is_minimal_and_desktop_is_private() {
+    let jail_root = unique_dir("token-isolation");
+    let descriptor = descriptor(&jail_root, &["--isolation-probe"]);
+    let request = request_with(
+        WorkspaceMode::ReadOnly,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+
+    let (_handle, probe, out, err) = run_probe(&request);
+    let probe = probe.get("probe").expect("isolation probe object");
+    assert_eq!(probe.get("ok").and_then(Value::as_bool), Some(true));
+    let privileges: Vec<&str> = probe
+        .get("privileges")
+        .and_then(Value::as_array)
+        .expect("privileges array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        privileges.contains(&"SeChangeNotifyPrivilege"),
+        "the traversal privilege must survive: {privileges:?}"
+    );
+    for host in [
+        "SeShutdownPrivilege",
+        "SeUndockPrivilege",
+        "SeIncreaseWorkingSetPrivilege",
+        "SeTimeZonePrivilege",
+    ] {
+        assert!(
+            !privileges.contains(&host),
+            "host privilege {host} leaked into the worker token: {privileges:?} stdout={out:?} stderr={err:?}"
+        );
+    }
+
+    let desktop = probe
+        .get("desktop")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        desktop.starts_with("agentype-desktop-"),
+        "worker must run on the per-execution desktop, got {desktop:?}"
+    );
+    assert_eq!(
+        probe.get("default_desktop_open").and_then(Value::as_bool),
+        Some(false),
+        "worker must not open the interactive Default desktop"
+    );
+    assert_eq!(
+        probe.get("input_desktop_open").and_then(Value::as_bool),
+        Some(false),
+        "worker must not open the input desktop"
+    );
 }
 
 #[test]
@@ -510,4 +570,216 @@ fn linux_write_allows_truncate_inside_jail() {
     );
     let written = jail_workspace(&jail_root, &request).join("inside.txt");
     assert_eq!(fs::metadata(&written).unwrap().len(), 0);
+}
+
+fn jail_exec_dir(request: &EnvironmentStartRequest) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "agentype-jail-exec-{}",
+        request.request_id().as_str()
+    ))
+}
+
+fn read_locator(request: &EnvironmentStartRequest) -> Value {
+    let path = jail_exec_dir(request).join("locator.json");
+    serde_json::from_str(
+        &fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display())),
+    )
+    .expect("locator.json is JSON")
+}
+
+fn start_hanging(request: &EnvironmentStartRequest) -> (JailedProcessAgentAdapter, RuntimeHandle) {
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let start = adapter
+        .start_execution(request, &long_deadline())
+        .expect("jail start must succeed");
+    assert_eq!(start.state, ExecutionState::Running);
+    (adapter, start.runtime_handle)
+}
+
+#[test]
+fn reconcile_without_persisted_handle_recovers_running_instance() {
+    let jail_root = unique_dir("reconcile-running");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let (_first, started) = start_hanging(&request);
+
+    // A restarted daemon has no in-memory child map and no persisted handle.
+    // The durable locator written immediately after spawn is the only evidence.
+    // Keep the original adapter alive so the parent-side desktop handle does not
+    // destroy the live desktop during this in-process restart simulation.
+    let second = JailedProcessAgentAdapter::try_new().unwrap();
+    let observation = second
+        .reconcile_start(request.request_id(), None, &long_deadline())
+        .expect("reconcile must use the durable locator");
+    assert_eq!(observation.state, ExecutionState::Running);
+    assert!(!observation.ambiguous);
+    let handle = &observation.runtime_handle.0;
+    assert_eq!(
+        handle.get("pid").and_then(Value::as_u64),
+        started.0.get("pid").and_then(Value::as_u64),
+        "reconcile must recover the same physical pid"
+    );
+    assert!(
+        handle.get("birth").and_then(Value::as_u64).is_some(),
+        "reconcile must observe the real birth identity instead of leaving a locator: {handle}"
+    );
+    let terminated = second
+        .terminate_execution(&observation.runtime_handle, &long_deadline())
+        .expect("the recovered instance must be controllable");
+    assert_eq!(terminated.state, ExecutionState::Terminated);
+}
+
+#[test]
+fn durable_locator_controls_the_process_after_adapter_restart() {
+    let jail_root = unique_dir("locator-control");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let (_first, _started) = start_hanging(&request);
+
+    let locator = read_locator(&request);
+    assert_eq!(
+        locator.get("identity_complete").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        locator.get("reconnectable").and_then(Value::as_bool),
+        Some(false)
+    );
+    let locator_handle = RuntimeHandle(locator);
+
+    let second = JailedProcessAgentAdapter::try_new().unwrap();
+    let observed = second
+        .observe_execution(&locator_handle, &long_deadline())
+        .expect("a locator is enough to observe the physical instance");
+    assert_eq!(observed.state, ExecutionState::Running);
+    let terminated = second
+        .terminate_execution(&locator_handle, &long_deadline())
+        .expect("a locator is enough to terminate the physical instance");
+    assert_eq!(terminated.state, ExecutionState::Terminated);
+}
+
+#[test]
+fn born_less_locator_is_recovered_after_the_spawn_identity_window() {
+    let jail_root = unique_dir("locator-no-birth");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let (_first, _started) = start_hanging(&request);
+    // Keep the original adapter alive so the parent-side private-desktop handle
+    // stays open while the second adapter performs the recovery.
+    // A crash between spawn and the birth probe leaves exactly this durable
+    // state: the locator exists, but the identity upgrade has not happened.
+    let mut locator = read_locator(&request);
+    locator
+        .as_object_mut()
+        .expect("locator object")
+        .remove("birth");
+    fs::write(
+        jail_exec_dir(&request).join("locator.json"),
+        locator.to_string(),
+    )
+    .unwrap();
+
+    let second = JailedProcessAgentAdapter::try_new().unwrap();
+    let observation = second
+        .reconcile_start(request.request_id(), None, &long_deadline())
+        .expect("the locator must survive the missing birth identity");
+    assert_eq!(observation.state, ExecutionState::Running);
+    assert!(
+        observation
+            .runtime_handle
+            .0
+            .get("birth")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "recovery must persist the observed birth identity: {}",
+        observation.runtime_handle.0
+    );
+    let terminated = second
+        .terminate_execution(&observation.runtime_handle, &long_deadline())
+        .expect("recovered born-less instance must be controllable");
+    assert_eq!(terminated.state, ExecutionState::Terminated);
+}
+
+#[test]
+fn reconcile_without_any_physical_evidence_is_ambiguous_not_respawned() {
+    let jail_root = unique_dir("reconcile-none");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let observation = adapter
+        .reconcile_start(request.request_id(), None, &long_deadline())
+        .expect("a missing witness is an ambiguous observation, not an error");
+    assert_eq!(observation.state, ExecutionState::Unknown);
+    assert!(observation.ambiguous);
+    assert!(
+        observation.runtime_handle.0.is_null()
+            || observation
+                .runtime_handle
+                .0
+                .as_object()
+                .map(|object| object.is_empty())
+                .unwrap_or(false),
+        "no synthetic handle may be minted without physical evidence"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn born_less_locator_cannot_impersonate_an_unrelated_pid() {
+    let jail_root = unique_dir("locator-impersonation");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let exec_dir = jail_exec_dir(&request);
+    fs::create_dir_all(&exec_dir).unwrap();
+    let request_id = request.request_id().as_str();
+    let locator = json!({
+        "v": 1,
+        "kind": JAIL_ADAPTER_KIND,
+        "pid": std::process::id(),
+        "inst": "not-this-execution",
+        "request_id": request_id,
+        "stdout": exec_dir.join("stdout.txt").to_string_lossy(),
+        "stderr": exec_dir.join("stderr.txt").to_string_lossy(),
+        "identity_complete": false,
+        "reconnectable": false,
+        "spawn_after_ms": 1,
+    });
+    fs::write(exec_dir.join("locator.json"), locator.to_string()).unwrap();
+
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let observation = adapter
+        .reconcile_start(request.request_id(), None, &long_deadline())
+        .expect("a mismatched witness is a terminal physical observation");
+    assert_eq!(
+        observation.state,
+        ExecutionState::Terminated,
+        "a numeric pid without the per-execution restricting SID must not be adopted: {:?}",
+        observation.detail
+    );
 }
