@@ -283,10 +283,13 @@ V0.1 capacity amendment: only UNBOUND population counts toward legacy capacity;
 BOUND agents cannot be chosen as legacy excess. The full typed topology model
 remains deferred.
 
-M6-B.4's library slice is implemented; the milestone is incomplete, not frozen.
-Typed daemon dispatch, concrete production
-source integration, B.5 credential/security import, cold/revivable matching,
-full typed topology and database migration remain pending. The
+M6-B.4's library slice and the end-to-end typed execution loop are implemented on
+PR #24: production `ControlLoopService` typed dispatch, a concrete
+`SourceConfigIntegration` (`agentype-source-workspace-jail`) and a
+provisioning-capable adapter with real OS enforcement
+(`JailedProcessAgentAdapter`). B.5 credential/security import, cold/revivable
+matching, full typed topology, executed-WARM replacement and database migration
+remain pending and fail closed. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)
 owns scope and verification evidence.
 This PR's deployment scope is explicitly fresh schema-v8 databases only, plus

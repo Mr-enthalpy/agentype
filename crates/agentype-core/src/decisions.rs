@@ -84,10 +84,33 @@ pub fn claim_task_ready(
 /// Frozen task order for claiming: highest priority, oldest submission, then
 /// lowest Task ID. Returns ids in deterministic visiting order.
 pub fn order_claim_tasks(tasks: &[ClaimTaskSnapshot], now: f64) -> Vec<String> {
-    let mut eligible: Vec<&ClaimTaskSnapshot> = tasks
-        .iter()
-        .filter(|t| claim_task_eligible(t, now))
-        .collect();
+    order_tasks_by_frozen_rank(tasks.iter().filter(|t| claim_task_eligible(t, now)))
+}
+
+/// Frozen dispatch order for an already-qualified Task set.
+///
+/// This is the same rank function as [`order_claim_tasks`], minus the
+/// legacy-only `typed` filter. It exists for typed dispatch, which enumerates
+/// typed Tasks with its own authority-free read path; ordering must remain the
+/// one frozen `priority DESC, created_at ASC, id ASC` relation. Callers are
+/// still required to apply their own readiness pre-filter; readiness is
+/// re-applied here so query text alone cannot change the order.
+pub fn order_ready_tasks(tasks: &[ClaimTaskSnapshot], now: f64) -> Vec<String> {
+    order_tasks_by_frozen_rank(tasks.iter().filter(|t| {
+        claim_task_ready(
+            t.state,
+            t.batch_state,
+            t.partition_active,
+            t.next_eligible_at,
+            now,
+        )
+    }))
+}
+
+fn order_tasks_by_frozen_rank<'a>(
+    eligible: impl Iterator<Item = &'a ClaimTaskSnapshot>,
+) -> Vec<String> {
+    let mut eligible: Vec<&ClaimTaskSnapshot> = eligible.collect();
     eligible.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)

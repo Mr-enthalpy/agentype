@@ -1,8 +1,15 @@
-//! Test fixture external agent environment. Behavior is selected by env vars.
-//! This is not a model, provider, or harness.
+//! Test fixture external agent environment. Behavior is selected by arguments
+//! or, for legacy fixtures, by env vars. This is not a model, provider, or
+//! harness.
+//!
+//! Argument-selected behavior exists because a restricted-token workspace jail
+//! inherits the parent environment on Windows: parallel tests cannot safely
+//! select behavior through process-global env vars.
 
 use std::env;
+use std::fs;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +18,20 @@ fn flag(name: &str) -> bool {
         env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
+}
+
+fn arg_flag(name: &str) -> bool {
+    env::args().skip(1).any(|arg| arg == name)
+}
+
+fn arg_value(name: &str) -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+    }
+    None
 }
 
 fn sleep_ms_from_env() {
@@ -56,15 +77,72 @@ fn trap_interrupt() {
     }
 }
 
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Attempt one write and report the outcome as a single JSON line. Tests read
+/// this from the adapter-captured stdout, so a denial is observable without
+/// relying on exit codes or diagnostics.
+fn write_probe(path: &str, label: &str) {
+    let target = PathBuf::from(path);
+    let result = fs::write(&target, b"agentype-write-probe");
+    match result {
+        Ok(()) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":true}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy())
+        ),
+        Err(err) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":false,"kind":"{}"}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy()),
+            json_escape(&format!("{:?}", err.kind()))
+        ),
+    }
+}
+
+fn remove_probe(path: &Path, label: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":true}}}}"#,
+            json_escape(label),
+            json_escape(&path.to_string_lossy())
+        ),
+        Err(err) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":false,"kind":"{}"}}}}"#,
+            json_escape(label),
+            json_escape(&path.to_string_lossy()),
+            json_escape(&format!("{:?}", err.kind()))
+        ),
+    }
+}
+
 fn main() {
-    if flag("FAKE_AGENT_TRAP_INT") {
+    if flag("FAKE_AGENT_TRAP_INT") || arg_flag("--trap-int") {
         trap_interrupt();
     }
 
     // Optional delay after process creation (pid already assigned).
-    sleep_ms_from_env();
+    if let Some(ms) = arg_value("--sleep-ms").and_then(|raw| raw.parse::<u64>().ok()) {
+        thread::sleep(Duration::from_millis(ms));
+    } else {
+        sleep_ms_from_env();
+    }
 
-    if flag("FAKE_AGENT_HANG") {
+    if flag("FAKE_AGENT_HANG") || arg_flag("--hang") {
         hang();
     }
 
@@ -85,20 +163,30 @@ fn main() {
         eprintln!("{secret}");
     }
 
-    if flag("FAKE_AGENT_MALFORMED") {
-        println!("this is not json {{{{{{");
+    if let Some(path) = arg_value("--write-probe") {
+        write_probe(&path, "write");
+    }
+
+    if let Some(path) = arg_value("--remove-probe") {
+        remove_probe(Path::new(&path), "remove");
+    }
+
+    if flag("FAKE_AGENT_MALFORMED") || arg_flag("--malformed") {
+        println!("this is not json {{{{{{{{");
         return;
     }
 
-    if let Ok(stdout) = env::var("FAKE_AGENT_STDOUT") {
+    if let Some(stdout) = arg_value("--stdout") {
+        println!("{stdout}");
+    } else if let Ok(stdout) = env::var("FAKE_AGENT_STDOUT") {
         println!("{stdout}");
     } else {
         println!(r#"{{"ok":true,"payload":{{"echo":true}},"summary":"fake-agent"}}"#);
     }
 
-    let code = env::var("FAKE_AGENT_EXIT_CODE")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
+    let code = arg_value("--exit-code")
+        .or_else(|| env::var("FAKE_AGENT_EXIT_CODE").ok())
+        .and_then(|raw| raw.parse::<i32>().ok())
         .unwrap_or(0);
     std::process::exit(code);
 }

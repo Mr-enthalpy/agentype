@@ -22,7 +22,7 @@ pub use decisions::{
     claim_task_eligible, claim_task_ready, claim_tiebreak, cross_target_cutover_safety,
     dependency_release_decision, durable_quiescence, excess_disposition, excess_rank_key,
     incarnation_presence, is_cross_target_execution_safe, move_candidate_eligible, move_rank_key,
-    order_claim_tasks, partition_cutover_plan, plan_dependency_releases,
+    order_claim_tasks, order_ready_tasks, partition_cutover_plan, plan_dependency_releases,
     plan_escalation_resolution, plan_move_cutover, post_safety_agent_disposition, retry_allowed,
     retry_backoff_seconds, select_claim_agent, sort_excess_candidates, sort_move_candidates,
     suspension_failure_class, AgentReleaseDisposition, BlockedTaskSnapshot, ClaimAgentSnapshot,

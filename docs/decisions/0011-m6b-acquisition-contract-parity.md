@@ -208,7 +208,10 @@ The internal typed launch result now owns the resolved adapter instance and its
 deadline policy alongside the request. Dispatch consumes this pair without
 registry re-selection, so keeping kind/key while swapping an instance cannot
 change a previously validated launch. The public legacy launch interface is
-unchanged; actual typed daemon dispatch remains pending.
+unchanged. Production typed daemon dispatch is now wired through
+`ControlLoopService`; the
+[implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)
+owns scope and evidence.
 
 ExecutionLaunchSnapshot now carries the optional committed descriptor. The
 trusted unchecked constructor gains this argument because an Execution-only

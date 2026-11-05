@@ -16,11 +16,14 @@ name = "agentype-adapter-local-process"
 version = "0.2.0"
 dependencies = [
  "agentype-adapter-api",
+ "agentype-agent-contract",
  "agentype-core",
  "agentype-execution-config",
  "agentype-runtime",
+ "agentype-source-workspace-jail",
  "agentype-storage-sqlite",
  "libc",
+ "rusqlite",
  "serde_json",
 ]
 
@@ -93,6 +96,19 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "agentype-source-workspace-jail"
+version = "0.2.0"
+dependencies = [
+ "agentype-adapter-api",
+ "agentype-adapter-local-process",
+ "agentype-agent-contract",
+ "agentype-core",
+ "agentype-runtime",
+ "agentype-storage-sqlite",
+ "serde_json",
 ]
 
 [[package]]

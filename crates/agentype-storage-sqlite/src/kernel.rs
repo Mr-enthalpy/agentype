@@ -1963,6 +1963,72 @@ impl Kernel {
         })
     }
 
+    /// Authority-free enumeration of typed Tasks that are dispatchable now.
+    ///
+    /// This read exists only so the typed control-loop branch can learn *which*
+    /// Task ids deserve the authority-bearing `acquire_typed_task` call. It
+    /// returns no claim, Attempt, Lease, binding, or adapter authority, and it
+    /// mutates nothing. The frozen `priority DESC, created_at ASC, id ASC`
+    /// order and the shared readiness predicate are reused from Core, so SQL
+    /// text alone cannot change typed dispatch order.
+    ///
+    /// `limit` bounds the work a single cycle may probe; 0 returns nothing.
+    pub fn list_typed_dispatch_candidates(&self, limit: usize) -> Result<Vec<TaskId>, Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = self.clock.now();
+        let rows = self.store.query(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.id,t.state,b.state,p.active,t.next_eligible_at,t.priority,t.created_at
+                     FROM tasks t JOIN batches b ON b.id=t.batch_id
+                     JOIN pool_partitions p ON p.name=t.partition_name
+                     WHERE t.state='QUEUED'
+                       AND (t.agent_requirement_mode <> 'LEGACY' OR EXISTS (
+                           SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+                       ))",
+                )
+                .map_err(map_sqlite)?;
+            let mapped = stmt
+                .query_map(params![], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                        r.get::<_, Option<f64>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, f64>(6)?,
+                    ))
+                })
+                .map_err(map_sqlite)?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row.map_err(map_sqlite)?);
+            }
+            Ok(out)
+        })?;
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for (id, state, batch_state, active, next_eligible_at, priority, created_at) in rows {
+            snapshots.push(ClaimTaskSnapshot {
+                id,
+                state: TaskState::parse_sql(&state)?,
+                batch_state: BatchState::parse_sql(&batch_state)?,
+                partition_active: active,
+                next_eligible_at,
+                priority,
+                created_at,
+                typed: true,
+            });
+        }
+        Ok(order_ready_tasks(&snapshots, now)
+            .into_iter()
+            .take(limit)
+            .map(TaskId::from_string)
+            .collect())
+    }
+
     /// Validate claim authority in a short transaction and derive the durable
     /// execution binding used as the configuration-resolution key.
     ///

@@ -27,7 +27,12 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod jail;
 mod pin;
+
+pub use jail::{
+    JailLaunchDescriptor, JailedProcessAgentAdapter, JAIL_ADAPTER_KIND, JAIL_PROVISIONING_PROTOCOL,
+};
 
 /// Hidden helper for the Linux pidfd PID-recycle regression binary.
 #[cfg(target_os = "linux")]
@@ -284,13 +289,13 @@ struct ProcessSpec {
 }
 
 #[derive(Debug)]
-struct ParsedHandle {
-    pid: u32,
-    birth: u64,
-    inst: String,
-    request_id: String,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+pub(crate) struct ParsedHandle {
+    pub(crate) pid: u32,
+    pub(crate) birth: u64,
+    pub(crate) inst: String,
+    pub(crate) request_id: String,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
 }
 
 fn spec_from_options(options: &Value) -> AdapterResult<ProcessSpec> {
@@ -358,9 +363,13 @@ fn spec_from_options(options: &Value) -> AdapterResult<ProcessSpec> {
 }
 
 fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
+    encode_handle_with_kind(parsed, ADAPTER_KIND)
+}
+
+pub(crate) fn encode_handle_with_kind(parsed: &ParsedHandle, kind: &str) -> RuntimeHandle {
     RuntimeHandle(json!({
         "v": HANDLE_VERSION,
-        "kind": ADAPTER_KIND,
+        "kind": kind,
         "pid": parsed.pid,
         "birth": parsed.birth,
         "inst": parsed.inst,
@@ -392,20 +401,25 @@ fn encode_locator_hint(
 }
 
 fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
+    parse_handle_with_kind(handle, ADAPTER_KIND)
+}
+
+pub(crate) fn parse_handle_with_kind(
+    handle: &RuntimeHandle,
+    expected_kind: &str,
+) -> AdapterResult<ParsedHandle> {
     let obj = handle
         .0
         .as_object()
-        .ok_or_else(|| AdapterError::protocol("local_process handle must be a JSON object"))?;
+        .ok_or_else(|| AdapterError::protocol("process handle must be a JSON object"))?;
     let v = obj.get("v").and_then(Value::as_i64).unwrap_or(0);
     if v != HANDLE_VERSION {
-        return Err(AdapterError::protocol(
-            "unsupported local_process handle version",
-        ));
+        return Err(AdapterError::protocol("unsupported process handle version"));
     }
     let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
-    if kind != ADAPTER_KIND {
+    if kind != expected_kind {
         return Err(AdapterError::protocol(
-            "handle kind is not local_process; no adapter fallback",
+            "handle kind does not match the exact adapter; no adapter fallback",
         ));
     }
     if obj.get("identity_complete").and_then(Value::as_bool) == Some(false)

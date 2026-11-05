@@ -45,10 +45,11 @@ pub use semantic_control::RootSemanticControl;
 pub use provisioning_admin::ProvisioningAdmin;
 // The authority-bearing typed acquisition (`acquire_typed_task`) and the
 // candidate resolution mechanics are daemon-internal: they accept the mechanical
-// `Kernel` and are owned by the (not-yet-wired) ControlLoopService. Only the
+// `Kernel` and are owned by the production `ControlLoopService`. Only the
 // source-integration SPI and the diagnostic candidate value are public here.
 pub use provisioning_resolver::{
-    ProvisioningResolutionError, SourceConfigIntegration, SourceProvisioningCandidate,
+    PreparedSource, ProvisioningResolutionError, SourceConfigIntegration,
+    SourceIntegrationRegistry, SourceProvisioningCandidate,
 };
 // M6-B operator catalog administration: publish the immutable B.2 capability /
 // AgentType revisions that typed admission and binding require.
@@ -91,17 +92,19 @@ pub use supervision::{SupervisionRegistry, SupervisionRunner};
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 
 use agentype_adapter_api::{
-    AdapterError, EnvironmentStartRequest, ExecutionAdapter, ImportableAdapter, StartObservation,
+    AdapterDeadline, AdapterError, EnvironmentStartRequest, ExecutionAdapter, ImportableAdapter,
+    StartObservation,
 };
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskState, UnixTime,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskId, TaskState, UnixTime,
 };
 use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Source-integration protocol identity used by test/composition helpers that
 /// assemble a binding without a real `ImportableAdapter`.
@@ -847,6 +850,11 @@ pub enum DispatchError {
     AdapterInvocation(AdapterError),
     /// A post-start authoritative persistence step failed.
     Persistence(Error),
+    /// A typed preparation step reached a confirmed fatal control-plane fault.
+    /// The durable preparation fence (when one could be written) is already
+    /// committed; this is never a Task-level failure class and never an
+    /// invitation to retry through the legacy path.
+    TypedPreparation(String),
 }
 
 impl DispatchError {
@@ -855,7 +863,7 @@ impl DispatchError {
     /// invocation failures map to a class.
     pub fn standard_failure_class(&self) -> Option<FailureClass> {
         match self {
-            Self::Authority(_) | Self::Persistence(_) => None,
+            Self::Authority(_) | Self::Persistence(_) | Self::TypedPreparation(_) => None,
             Self::Configuration(_) | Self::AdapterAvailability(_) => {
                 Some(FailureClass::ResourceUnavailable)
             }
@@ -872,6 +880,7 @@ impl std::fmt::Display for DispatchError {
             Self::AdapterAvailability(e) => write!(f, "dispatch adapter unavailable: {e}"),
             Self::AdapterInvocation(e) => write!(f, "dispatch adapter invocation failed: {e}"),
             Self::Persistence(e) => write!(f, "dispatch persistence failed: {e}"),
+            Self::TypedPreparation(e) => write!(f, "typed dispatch preparation failed: {e}"),
         }
     }
 }
@@ -991,16 +1000,15 @@ pub fn resolve_physical_execution_environment(
 /// Typed provisioning handoff: commit the snapshot-bearing Execution for a
 /// durably committed typed acquisition and assemble the physical start request.
 ///
-/// Daemon-internal. This closes the otherwise-missing data-flow between the
-/// acquisition facade (`acquire_typed_task`, which commits the
-/// Attempt/Lease/ProvisioningBinding) and the Execution commitment, using the
-/// exact winner candidate the authority transaction proved. It deliberately does
-/// NOT start the adapter: the physical `start_execution` plus the immediate
-/// observation commit belong to the daemon dispatch step (not yet wired), so this
-/// stops at the assembled `EnvironmentStartRequest`. The exact physical domain
+/// Daemon-internal. This closes the data-flow between the acquisition facade
+/// (`acquire_typed_task`, which commits the Attempt/Lease/ProvisioningBinding)
+/// and the Execution commitment, using the exact winner candidate the authority
+/// transaction proved. It deliberately does NOT start the adapter: the physical
+/// `start_execution` plus the immediate observation commit belong to
+/// `Dispatcher::start_prepared`, reached only from the production
+/// `ControlLoopService` typed branch. The exact physical domain
 /// (`adapter_kind`/`adapter_binding_key`) comes from the acquisition, never from
 /// `resolve_unique` or a caller-supplied key.
-#[allow(dead_code)]
 pub(crate) fn prepare_typed_execution_launch(
     kernel: &Kernel,
     outcome: crate::provisioning_resolver::TypedAcquisitionOutcome,
@@ -1067,8 +1075,7 @@ pub(crate) fn prepare_typed_execution_launch(
 
 /// Internal typed dispatch handoff. It retains the exact adapter instance and
 /// operation policy validated before Execution commitment. Dispatch consumes
-/// these parts together and must never select an adapter again from a registry.
-#[allow(dead_code)] // Typed daemon wiring remains a separate acceptance gate.
+/// these parts together and never selects an adapter again from a registry.
 pub(crate) struct PreparedTypedExecutionLaunch {
     launch: PreparedExecutionLaunch,
     adapter_binding: ResolvedAdapterBinding,
@@ -1087,12 +1094,15 @@ impl std::fmt::Debug for PreparedTypedExecutionLaunch {
     }
 }
 
-#[allow(dead_code)]
 impl PreparedTypedExecutionLaunch {
+    // Used by the daemon dispatch integration and its conformance tests; the
+    // non-test build only needs `into_dispatch`.
+    #[allow(dead_code)]
     pub(crate) fn snapshot(&self) -> &ExecutionLaunchSnapshot {
         self.launch.snapshot()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn request(&self) -> &EnvironmentStartRequest {
         self.launch.request()
     }
@@ -1412,6 +1422,12 @@ pub enum DispatchOneOutcome {
         request_id: RequestId,
         failure_class: Option<FailureClass>,
     },
+    /// A typed Task was enumerated but could not acquire provisioning
+    /// authority this cycle. No Attempt, Lease, ProvisioningBinding, or
+    /// Execution was fabricated and no NACK was written: the Task stays QUEUED
+    /// and the typed branch applies a bounded re-probe cooldown. This is the
+    /// typed counterpart of `NoWork`, not a Task failure.
+    TypedDeferred { detail: String },
 }
 
 /// Fenced authority consequence. Stale authority is visible to the caller
@@ -1459,6 +1475,148 @@ pub(crate) fn persist_physical_end_then_nack(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Runtime-local policy for the typed control-loop branch.
+///
+/// These values are deliberately not durable: typed eligibility is re-proved
+/// from the catalog, authority, and adaptive catalog frontier every cycle.
+/// The cooldowns exist only to bound how often one QUEUED Task may be
+/// re-attested while it has no eligible physical candidate; they never grant
+/// or preserve authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedDispatchConfig {
+    probe_limit: usize,
+    candidate_cooldown: Duration,
+    ambiguous_cooldown: Duration,
+    attest_budget: Duration,
+    prepare_budget: Duration,
+}
+
+impl TypedDispatchConfig {
+    pub fn new(
+        probe_limit: usize,
+        candidate_cooldown: Duration,
+        ambiguous_cooldown: Duration,
+        attest_budget: Duration,
+        prepare_budget: Duration,
+    ) -> Result<Self, agentype_adapter_api::DeadlineConfigError> {
+        if probe_limit == 0 {
+            return Err(agentype_adapter_api::DeadlineConfigError::NonPositive);
+        }
+        // Reuse the absolute-deadline validator for both budgets.
+        AdapterDeadline::after(attest_budget)?;
+        AdapterDeadline::after(prepare_budget)?;
+        Ok(Self {
+            probe_limit,
+            candidate_cooldown,
+            ambiguous_cooldown,
+            attest_budget,
+            prepare_budget,
+        })
+    }
+
+    pub fn probe_limit(&self) -> usize {
+        self.probe_limit
+    }
+
+    pub fn candidate_cooldown(&self) -> Duration {
+        self.candidate_cooldown
+    }
+
+    pub fn ambiguous_cooldown(&self) -> Duration {
+        self.ambiguous_cooldown
+    }
+
+    pub fn attest_budget(&self) -> Duration {
+        self.attest_budget
+    }
+
+    pub fn prepare_budget(&self) -> Duration {
+        self.prepare_budget
+    }
+}
+
+impl Default for TypedDispatchConfig {
+    fn default() -> Self {
+        Self {
+            probe_limit: 8,
+            candidate_cooldown: Duration::from_secs(1),
+            ambiguous_cooldown: Duration::from_secs(30),
+            attest_budget: Duration::from_secs(5),
+            prepare_budget: Duration::from_secs(5),
+        }
+    }
+}
+
+/// In-memory re-probe state for the typed control-loop branch.
+///
+/// The cooldown map is keyed by Task and invalidated as a whole whenever the
+/// adaptive catalog frontier changes, so a publish that could make a Task
+/// eligible again is observed immediately instead of waiting for a timer.
+/// `prefer_typed` implements alternating fairness between the typed and the
+/// legacy queue; a deferred typed probe still yields the rest of the cycle to
+/// legacy work.
+#[derive(Debug)]
+pub(crate) struct TypedDispatchState {
+    inner: Mutex<TypedDispatchStateInner>,
+}
+
+#[derive(Debug)]
+struct TypedDispatchStateInner {
+    frontier: Option<String>,
+    cooldowns: HashMap<TaskId, Instant>,
+    prefer_typed: bool,
+}
+
+impl TypedDispatchState {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(TypedDispatchStateInner {
+                frontier: None,
+                cooldowns: HashMap::new(),
+                prefer_typed: true,
+            }),
+        }
+    }
+
+    /// Return the side that should be tried first this cycle and flip the
+    /// preference for the next cycle.
+    pub(crate) fn next_preferred_typed(&self) -> bool {
+        let mut inner = self.inner.lock().expect("typed dispatch state");
+        let preferred = inner.prefer_typed;
+        inner.prefer_typed = !preferred;
+        preferred
+    }
+
+    fn is_cooling(&self, frontier: &str, task_id: &TaskId, now: Instant) -> bool {
+        let mut inner = self.inner.lock().expect("typed dispatch state");
+        if inner.frontier.as_deref() != Some(frontier) {
+            inner.frontier = Some(frontier.to_string());
+            inner.cooldowns.clear();
+        }
+        match inner.cooldowns.get(task_id) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                inner.cooldowns.remove(task_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn defer(&self, task_id: TaskId, until: Instant) {
+        self.inner
+            .lock()
+            .expect("typed dispatch state")
+            .cooldowns
+            .insert(task_id, until);
+    }
+}
+
+fn cooldown_until(now: Instant, budget: Duration) -> Instant {
+    now.checked_add(budget)
+        .unwrap_or_else(|| now + Duration::from_secs(3600))
 }
 
 /// Minimal dispatch service (task §9): take one eligible Scheduler claim and
@@ -1633,6 +1791,210 @@ impl<'a> Dispatcher<'a> {
             &request_id,
             observation,
         )
+    }
+
+    /// Dispatch at most one durably committed typed Task.
+    ///
+    /// The whole path is Scheduler-owned: an authority-free enumeration only
+    /// selects *which* Task ids are worth the authority-bearing acquisition,
+    /// then `acquire_typed_task` re-proves B.3 matching and B.4 eligibility
+    /// inside its own transaction. A Task with no eligible physical candidate
+    /// leaves QUEUED with no Attempt, Lease, Binding, Execution, or NACK.
+    ///
+    /// The physical start still happens behind the same `DispatchGate` permit
+    /// as the legacy path, before acquisition can create an Attempt.
+    pub(crate) fn dispatch_typed_one(
+        &self,
+        integrations: &SourceIntegrationRegistry,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        let _start_permit = if let Some(gate) = self.gate {
+            match gate.try_begin_physical_start() {
+                Some(permit) => Some(permit),
+                None => return Ok(DispatchOneOutcome::NoWork),
+            }
+        } else {
+            None
+        };
+        let frontier = self
+            .kernel
+            .catalog_frontier_digest()
+            .map_err(DispatchError::Persistence)?;
+        let candidates = self
+            .kernel
+            .list_typed_dispatch_candidates(config.probe_limit())
+            .map_err(DispatchError::Persistence)?;
+        if candidates.is_empty() {
+            return Ok(DispatchOneOutcome::NoWork);
+        }
+        let now = Instant::now();
+        let mut deferred: Option<String> = None;
+        for task_id in candidates {
+            if state.is_cooling(&frontier, &task_id, now) {
+                continue;
+            }
+            match self.dispatch_typed_candidate(&task_id, integrations, config, state)? {
+                Some(outcome) => return Ok(outcome),
+                None => deferred = Some("typed candidate is not currently provisionable".into()),
+            }
+        }
+        Ok(match deferred {
+            Some(detail) => DispatchOneOutcome::TypedDeferred { detail },
+            None => DispatchOneOutcome::NoWork,
+        })
+    }
+
+    /// Try one enumerated typed Task. `Ok(None)` means the Task is deferred
+    /// without fabricating authority or a Task failure; `Err` is a confirmed
+    /// control-plane fault that must fail closed.
+    fn dispatch_typed_candidate(
+        &self,
+        task_id: &TaskId,
+        integrations: &SourceIntegrationRegistry,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+        let attest = AdapterDeadline::after(config.attest_budget()).map_err(|_| {
+            DispatchError::Persistence(Error::invariant(
+                "validated typed attest budget became invalid",
+            ))
+        })?;
+        let prepare = AdapterDeadline::after(config.prepare_budget()).map_err(|_| {
+            DispatchError::Persistence(Error::invariant(
+                "validated typed prepare budget became invalid",
+            ))
+        })?;
+        let outcome = match crate::provisioning_resolver::acquire_typed_task(
+            self.kernel,
+            task_id,
+            self.adapters,
+            self.execution_registry,
+            integrations,
+            &attest,
+            &prepare,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return self.defer_or_fail_typed(task_id, err, config, state);
+            }
+        };
+        let claim = outcome.acquisition.claim.clone();
+        let prepared = match prepare_typed_execution_launch(
+            self.kernel,
+            outcome,
+            self.execution_registry,
+            self.adapters,
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let detail = err.to_string();
+                if err.disposition() == TypedLaunchDisposition::Fatal {
+                    // The durable preparation fence was already attempted.
+                    // Never downgrade a control-plane fault to a Task NACK.
+                    return Err(DispatchError::TypedPreparation(
+                        "confirmed fatal typed preparation fault".into(),
+                    ));
+                }
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                return Ok(Some(DispatchOneOutcome::TypedDeferred { detail }));
+            }
+        };
+        let (launch, adapter_binding) = prepared.into_dispatch();
+        self.start_prepared(&claim, &adapter_binding, launch)
+            .map(Some)
+    }
+
+    /// Classify a pre-start typed acquisition error.
+    ///
+    /// Only explicitly candidate-local ineligibility and the ADR-0010
+    /// task-terminal `SelectionAmbiguous` state are deferrals. Everything else
+    /// is a control-plane/corruption fault and MUST terminate the cycle.
+    fn defer_or_fail_typed(
+        &self,
+        task_id: &TaskId,
+        err: ProvisioningResolutionError,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+        use ProvisioningResolutionError as P;
+        match &err {
+            // The authority transaction committed a claim, then pure
+            // preparation reported unavailability or authority loss. The
+            // settlement/recovery consequence already belongs to that claim.
+            P::PostCommitPreparationFailed(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            // ADR-0010: a tie in the frozen selection order is a resolution
+            // failure for this Task, never permission to skip to a lower-ranked
+            // agent or source. Probe again only after a long cooldown or a
+            // catalog-frontier change.
+            P::SelectionAmbiguous(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.ambiguous_cooldown()),
+                );
+                Ok(None)
+            }
+            // The authority-free enumeration raced a Task/Batch/partition
+            // readiness change. No authority was created.
+            P::Storage(Error::InvalidTransition(_)) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            _ if err.is_candidate_local_for_dispatch() => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            _ => Err(DispatchError::TypedPreparation(
+                "confirmed fatal typed provisioning fault".into(),
+            )),
+        }
+    }
+
+    /// Execute exactly one already-prepared physical start and persist its
+    /// authoritative consequence. Shared by the legacy and typed paths so the
+    /// two cannot drift in observation classification or failure semantics.
+    fn start_prepared(
+        &self,
+        claim: &Claim,
+        adapter: &ResolvedAdapterBinding,
+        launch: PreparedExecutionLaunch,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        let execution_id = launch.snapshot().execution_id().clone();
+        let request_id = launch.snapshot().request_id().clone();
+        let observation = match adapter.start_execution(launch.request()) {
+            Ok(observation) => observation,
+            Err(err) => {
+                let failure_class = adapter_invocation_failure_class(&err);
+                let hint = err.runtime_handle_hint().map(|h| h.0.clone());
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    &execution_id,
+                    failure_class,
+                    hint.as_ref(),
+                )?;
+                return Ok(DispatchOneOutcome::StartIndeterminate {
+                    execution_id,
+                    request_id,
+                    failure_class: Some(failure_class),
+                });
+            }
+        };
+        self.commit_start_observation(claim, adapter, &execution_id, &request_id, observation)
     }
 
     /// Classify and durably persist the immediate start observation using

@@ -1022,9 +1022,8 @@ pub(crate) struct TypedAcquisitionOutcome {
 /// LogicalAgent from an eligible SpawnSource. The `existing` vs `new` decision is
 /// therefore a deterministic Scheduler control, not an integration choice.
 ///
-/// Daemon-internal: owned by the (not-yet-wired) ControlLoopService. It is
-/// `pub(crate)` and currently unused outside tests until that integration lands.
-#[allow(clippy::too_many_arguments, dead_code)]
+/// Daemon-internal: owned by the production `ControlLoopService` typed branch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn acquire_typed_task(
     kernel: &Kernel,
     task_id: &TaskId,
@@ -1349,6 +1348,16 @@ fn require_materialization_receipt(
         ));
     }
     Ok(())
+}
+
+/// Whether this pre-Attempt error explicitly means "this candidate set is
+/// ineligible right now", which the typed control loop may defer without
+/// fabricating authority. Control-plane, corruption, and authority-loss
+/// failures are deliberately excluded: they must fail closed.
+impl ProvisioningResolutionError {
+    pub(crate) fn is_candidate_local_for_dispatch(&self) -> bool {
+        is_candidate_local(self)
+    }
 }
 
 /// Whether an error is a candidate-local ineligibility that may be skipped while
