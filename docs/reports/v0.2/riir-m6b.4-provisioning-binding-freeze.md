@@ -1,7 +1,7 @@
-# RIIR M6-B.4 — Provisioning Binding and End-to-End Typed Execution Record
+# RIIR M6-B.4 — Provisioning Binding and Typed Physical Execution Record
 
 Status: Implementation and acceptance record
-Implementation status: M6-B.4 end-to-end typed execution loop implemented on PR #24
+Implementation status: M6-B.4 typed physical execution → durable ACK interface implemented on PR #24
 Date: 2026-11-06
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert a wider freeze.
@@ -158,9 +158,11 @@ optional `birth`, optional `spawn_after_ms`, plus
 ### Windows minimum privilege and private desktop (P1-3)
 
 The Windows child token keeps only `SeChangeNotifyPrivilege`. A per-Execution
-desktop is created and its DACL grants `DESKTOP_ALL_ACCESS` only to that
-Execution's restricting SID; the current window station is granted the access
-required for Win32 initialization. The parent-side desktop handle is retained
+desktop is created and its DACL is extended with `DESKTOP_ALL_ACCESS` for that
+Execution's restricting SID; the creating user's default ACEs remain, so this
+is per-Execution desktop confinement, not a same-user security boundary. The
+current window station is extended with the access required for Win32
+initialization. The parent-side desktop handle is retained
 until `collect_outcome` observes process exit, because closing it while the
 child is still initializing user32 causes `STATUS_DLL_INIT_FAILED`. If either
 the privilege reduction or the private desktop/ACL step fails, the spawn fails
