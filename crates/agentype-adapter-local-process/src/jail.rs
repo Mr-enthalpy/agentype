@@ -1463,6 +1463,7 @@ fn create_private_desktop(
     })
 }
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TokenLuid {
@@ -1470,6 +1471,7 @@ struct TokenLuid {
     high_part: i32,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TokenLuidAndAttributes {
