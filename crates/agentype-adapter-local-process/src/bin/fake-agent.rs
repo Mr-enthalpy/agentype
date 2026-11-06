@@ -463,6 +463,10 @@ fn main() {
         write_probe(&path, "write");
     }
 
+    if arg_flag("--hang-after-write") {
+        hang();
+    }
+
     if let Some(path) = arg_value("--truncate-probe") {
         truncate_probe(&path, "truncate");
     }

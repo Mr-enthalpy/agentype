@@ -933,8 +933,12 @@ fn typed_write_task_writes_inside_the_jail_and_cannot_fake_quiescence() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut harness = Harness::start("write", Arc::new(WorkspaceJailSourceIntegration::new()));
-    let pin =
-        harness.publish_workspace_jail("writer", false, "primary", &["--write-probe", "probe.txt"]);
+    let pin = harness.publish_workspace_jail(
+        "writer",
+        false,
+        "primary",
+        &["--write-probe", "probe.txt", "--hang-after-write"],
+    );
     let agent = harness.kernel.ready_agent("general").unwrap();
     harness
         .kernel
