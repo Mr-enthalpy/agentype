@@ -993,6 +993,106 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
 // Windows: restricted-token spawn
 // =============================================================================
 
+/// Word-aligned storage for `GetTokenInformation` output.
+///
+/// `Vec<u8>` only guarantees byte alignment, while the token APIs return
+/// `#[repr(C)]` structures that embed pointers and `LUID`s. Reading such a
+/// structure out of a byte buffer is only sound when the allocation satisfies
+/// the structure's alignment; eight-byte words are stricter than every field
+/// alignment used below, and the call sites assert that at runtime.
+#[cfg(windows)]
+const TOKEN_INFO_WORD_BYTES: usize = 8;
+
+#[cfg(windows)]
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct TokenInfoWord([u8; TOKEN_INFO_WORD_BYTES]);
+
+#[cfg(windows)]
+struct TokenInfoBuffer {
+    words: Vec<TokenInfoWord>,
+}
+
+#[cfg(windows)]
+impl TokenInfoBuffer {
+    /// Allocate at least `needed` bytes, rounded up to whole words.
+    fn new(needed: u32) -> AdapterResult<Self> {
+        let bytes = usize::try_from(needed)
+            .map_err(|_| AdapterError::other("token information size does not fit in usize"))?;
+        let words = bytes
+            .checked_add(TOKEN_INFO_WORD_BYTES - 1)
+            .ok_or_else(|| AdapterError::other("token information size overflows usize"))?
+            / TOKEN_INFO_WORD_BYTES;
+        if words == 0 {
+            return Err(AdapterError::other("token information size is zero"));
+        }
+        Ok(Self {
+            words: vec![TokenInfoWord([0; TOKEN_INFO_WORD_BYTES]); words],
+        })
+    }
+
+    fn capacity(&self) -> usize {
+        self.words.len() * TOKEN_INFO_WORD_BYTES
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+        self.words.as_mut_ptr().cast()
+    }
+
+    fn base(&self) -> *const u8 {
+        self.words.as_ptr().cast()
+    }
+
+    /// Validate the buffer length and element count reported by the API before
+    /// any structure or slice is formed. `header` is the byte offset of the
+    /// trailing variable-length array inside the Win32 structure.
+    fn validate(
+        &self,
+        written: u32,
+        header: usize,
+        count: u32,
+        entry: usize,
+    ) -> AdapterResult<usize> {
+        let written = usize::try_from(written)
+            .map_err(|_| AdapterError::other("token information length does not fit in usize"))?;
+        if written > self.capacity() {
+            return Err(AdapterError::other(
+                "token information exceeded the allocated buffer",
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| AdapterError::other("token information count does not fit in usize"))?;
+        let array = count
+            .checked_mul(entry)
+            .ok_or_else(|| AdapterError::other("token information array overflows usize"))?;
+        let required = header
+            .checked_add(array)
+            .ok_or_else(|| AdapterError::other("token information array overflows usize"))?;
+        if required > written {
+            return Err(AdapterError::other(
+                "token information count exceeds the returned buffer",
+            ));
+        }
+        Ok(count)
+    }
+
+    /// Whether `ptr` names at least `min_bytes` inside the written region.
+    fn contains(&self, ptr: *const core::ffi::c_void, min_bytes: usize, written: u32) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        let start = self.base() as usize;
+        let Some(end) = start.checked_add(written as usize) else {
+            return false;
+        };
+        let address = ptr as usize;
+        address >= start
+            && address
+                .checked_add(min_bytes)
+                .is_some_and(|end_address| end_address <= end)
+    }
+}
+
 /// Non-impersonating locator witness: the per-Execution restricting SID is
 /// present in the live process's restricted-SID list. This proves the numeric
 /// PID still names the process this adapter created, without opening a control
@@ -1098,14 +1198,24 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
         }
         return Ok(Some(false));
     }
-    let mut buffer = vec![0u8; needed as usize];
-    // SAFETY: buffer has at least `needed` bytes; needed is an out parameter.
+    let mut buffer = match TokenInfoBuffer::new(needed) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            unsafe {
+                CloseHandle(token);
+            }
+            return Err(err);
+        }
+    };
+    let capacity = u32::try_from(buffer.capacity()).unwrap_or(u32::MAX);
+    // SAFETY: buffer is word-aligned and has at least `needed` bytes; `needed`
+    // is an out parameter that receives the updated length.
     let ok = unsafe {
         GetTokenInformation(
             token,
             TOKEN_RESTRICTED_SIDS,
-            buffer.as_mut_ptr() as *mut core::ffi::c_void,
-            needed,
+            buffer.as_mut_ptr(),
+            capacity,
             &mut needed,
         )
     };
@@ -1136,14 +1246,34 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
             "cannot resolve the restricting SID for locator witness",
         ));
     }
-    let groups = buffer.as_ptr() as *const TokenGroups;
-    // SAFETY: GetTokenInformation filled a TOKEN_GROUPS whose count bounds the
-    // trailing SidAndAttributes array inside the same allocation.
-    let count = unsafe { (*groups).count } as usize;
-    let entries = unsafe { std::slice::from_raw_parts((*groups).groups.as_ptr(), count) };
-    let present = entries
-        .iter()
-        .any(|entry| unsafe { EqualSid(entry.sid, expected) } != 0);
+    // The returned structure starts at the aligned base of the allocation.
+    assert!(
+        std::mem::align_of::<TokenGroups>() <= std::mem::align_of::<TokenInfoWord>(),
+        "the token buffer word alignment must satisfy TOKEN_GROUPS alignment"
+    );
+    // SAFETY: the buffer is at least `needed` bytes and word-aligned, and the
+    // API wrote a TOKEN_GROUPS header at its base.
+    let groups = unsafe { &*buffer.base().cast::<TokenGroups>() };
+    let count = match buffer.validate(
+        needed,
+        std::mem::size_of::<TokenGroups>() - std::mem::size_of::<SidAndAttributes>(),
+        groups.count,
+        std::mem::size_of::<SidAndAttributes>(),
+    ) {
+        Ok(count) => count,
+        Err(err) => {
+            unsafe {
+                LocalFree(expected);
+            }
+            return Err(err);
+        }
+    };
+    // SAFETY: `validate` proved the array ends inside the written region.
+    let entries = unsafe { std::slice::from_raw_parts(groups.groups.as_ptr(), count) };
+    let present = entries.iter().any(|entry| {
+        buffer.contains(entry.sid.cast(), 8, needed)
+            && unsafe { EqualSid(entry.sid, expected) } != 0
+    });
     unsafe {
         LocalFree(expected);
     }
@@ -1355,34 +1485,17 @@ struct PrivateWindowStation {
     desktop_path: Vec<u16>,
 }
 
-/// Window-station access actually granted to the per-Execution restricting SID
-/// so a write-restricted child can attach to a desktop in the current station
-/// and initialize USER32. This is deliberately not `WINSTA_ALL_ACCESS` or
-/// `STANDARD_RIGHTS_REQUIRED`. The token is created with `WRITE_RESTRICTED`, so
-/// this ACE governs write-shaped access: the worker cannot create desktops,
-/// write station attributes, use the clipboard, or change the security
-/// descriptor. Read-shaped rights (including `ACCESSGLOBALATOMS`,
-/// `EXITWINDOWS`, and `READSCREEN`) are evaluated with the token's normal SIDs
-/// against the station's pre-existing DACL; they are outside this grant and are
-/// recorded honestly by `isolation_probe`. Empirical enforcement is covered by
-/// the real access checks and the mask unit test.
-#[cfg(windows)]
-const WINSTA_ENUMDESKTOPS: u32 = 0x0001;
-#[cfg(windows)]
-const WINSTA_READATTRIBUTES: u32 = 0x0002;
-#[cfg(windows)]
-const WINSTA_ENUMERATE: u32 = 0x0100;
-#[cfg(windows)]
-const WINSTA_REQUIRED_FOR_WIN32_INIT: u32 =
-    WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE;
-
 /// Create a private desktop for one Execution and grant the Execution's
-/// restricting SID access to it. The current window station is extended with
-/// only [`WINSTA_REQUIRED_FOR_WIN32_INIT`] for that same SID; the adapter never
-/// grants it create-desktop, station-write, clipboard, exit, global-atom, or
-/// security-descriptor access. Read-shaped station rights remain governed by the
-/// station's pre-existing DACL and are not claimed as a confidentiality
-/// boundary. A new window station would be stronger, but `CreateWindowStationW`
+/// restricting SID access to it. The adapter never modifies the shared window
+/// station's DACL: a per-Execution ACE there would accumulate for the lifetime
+/// of the scheduler because the station outlives every Execution, and there is
+/// no safe revocation point while other workers may still be running.
+///
+/// The write-restricted child still attaches to the private desktop because the
+/// station's pre-existing DACL already grants the interactive session the
+/// read-shaped station rights needed for USER32 initialization. The allowed and
+/// denied station capabilities are measured by `isolation_probe` rather than
+/// assumed. A new window station would be stronger, but `CreateWindowStationW`
 /// requires a host privilege that ordinary interactive users do not have, so
 /// this fails closed rather than silently using the interactive desktop. Any
 /// failure is fatal: the spawn must not fall back to the interactive desktop.
@@ -1409,7 +1522,6 @@ fn create_private_desktop(
             desired_access: Dword,
             security: *const core::ffi::c_void,
         ) -> Handle;
-        fn GetProcessWindowStation() -> Handle;
     }
 
     let desktop_name = format!("agentype-desktop-{name}");
@@ -1446,24 +1558,6 @@ fn create_private_desktop(
             CloseDesktop(desktop);
         }
         return Err(err);
-    }
-    // SAFETY: GetProcessWindowStation returns a process-owned pseudo-handle.
-    let window_station = unsafe { GetProcessWindowStation() };
-    if window_station.is_null()
-        || grant_window_object_access(
-            window_station,
-            SE_WINDOW_OBJECT,
-            restricting_sid,
-            WINSTA_REQUIRED_FOR_WIN32_INIT,
-        )
-        .is_err()
-    {
-        unsafe {
-            CloseDesktop(desktop);
-        }
-        return Err(AdapterError::unavailable(
-            "cannot authorize the jail desktop on the current window station",
-        ));
     }
 
     Ok(PrivateWindowStation {
@@ -1553,15 +1647,16 @@ fn privilege_deletions_for_token(
     if needed == 0 {
         return Ok(Vec::new());
     }
-    let mut buffer = vec![0u8; needed as usize];
-    // SAFETY: the buffer is at least `needed` bytes; `needed` is an out
-    // parameter.
+    let mut buffer = TokenInfoBuffer::new(needed)?;
+    let capacity = u32::try_from(buffer.capacity()).unwrap_or(u32::MAX);
+    // SAFETY: buffer is word-aligned and has at least `needed` bytes; `needed`
+    // is an out parameter that receives the updated length.
     let ok = unsafe {
         GetTokenInformation(
             token,
             TOKEN_PRIVILEGES_CLASS,
-            buffer.as_mut_ptr() as *mut core::ffi::c_void,
-            needed,
+            buffer.as_mut_ptr(),
+            capacity,
             &mut needed,
         )
     };
@@ -1570,11 +1665,22 @@ fn privilege_deletions_for_token(
             "cannot read the current process token privileges",
         ));
     }
-    let privileges = buffer.as_ptr() as *const TokenPrivileges;
-    // SAFETY: GetTokenInformation filled a TOKEN_PRIVILEGES whose count bounds
-    // the trailing LUID_AND_ATTRIBUTES array in the same allocation.
-    let count = unsafe { (*privileges).count } as usize;
-    let entries = unsafe { std::slice::from_raw_parts((*privileges).privileges.as_ptr(), count) };
+    // The returned structure starts at the aligned base of the allocation.
+    assert!(
+        std::mem::align_of::<TokenPrivileges>() <= std::mem::align_of::<TokenInfoWord>(),
+        "the token buffer word alignment must satisfy TOKEN_PRIVILEGES alignment"
+    );
+    // SAFETY: the buffer is at least `needed` bytes and word-aligned, and the
+    // API wrote a TOKEN_PRIVILEGES header at its base.
+    let privileges = unsafe { &*buffer.base().cast::<TokenPrivileges>() };
+    let count = buffer.validate(
+        needed,
+        std::mem::size_of::<TokenPrivileges>() - std::mem::size_of::<TokenLuidAndAttributes>(),
+        privileges.count,
+        std::mem::size_of::<TokenLuidAndAttributes>(),
+    )?;
+    // SAFETY: `validate` proved the array ends inside the written region.
+    let entries = unsafe { std::slice::from_raw_parts(privileges.privileges.as_ptr(), count) };
 
     let keep_name: Vec<u16> = std::ffi::OsStr::new("SeChangeNotifyPrivilege")
         .encode_wide()
@@ -2910,45 +3016,207 @@ mod tests {
             .expect("a per-execution SID must be grantable without account lookup");
     }
 
-    /// The window-station mask must be the minimal initialization set, never
-    /// `WINSTA_ALL_ACCESS | STANDARD_RIGHTS_REQUIRED` (the previous value
-    /// `0x000F_037F`).
     #[cfg(windows)]
     #[test]
-    fn window_station_mask_excludes_nonessential_rights() {
-        const WINSTA_ACCESSCLIPBOARD: u32 = 0x0004;
-        const WINSTA_CREATEDESKTOP: u32 = 0x0008;
-        const WINSTA_WRITEATTRIBUTES: u32 = 0x0010;
-        const WINSTA_ACCESSGLOBALATOMS: u32 = 0x0020;
-        const WINSTA_EXITWINDOWS: u32 = 0x0040;
-        const WINSTA_READSCREEN: u32 = 0x0200;
-        const WINSTA_ALL_ACCESS: u32 = 0x037F;
-        const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
-        const FORBIDDEN: u32 = WINSTA_ACCESSCLIPBOARD
-            | WINSTA_CREATEDESKTOP
-            | WINSTA_WRITEATTRIBUTES
-            | WINSTA_ACCESSGLOBALATOMS
-            | WINSTA_EXITWINDOWS
-            | WINSTA_READSCREEN
-            | STANDARD_RIGHTS_REQUIRED;
+    fn token_information_buffer_is_aligned_and_bounds_checked() {
+        for needed in [1_u32, 7, 8, 9, 17, 4096] {
+            let buffer = TokenInfoBuffer::new(needed).unwrap();
+            assert_eq!(
+                buffer.base() as usize % std::mem::align_of::<TokenInfoWord>(),
+                0,
+                "the token buffer must be word-aligned for needed={needed}"
+            );
+            assert!(buffer.capacity() >= needed as usize);
+            assert_eq!(buffer.capacity() % TOKEN_INFO_WORD_BYTES, 0);
+        }
+        assert!(
+            TokenInfoBuffer::new(0).is_err(),
+            "an empty token buffer cannot hold a header"
+        );
 
+        let buffer = TokenInfoBuffer::new(32).unwrap();
+        assert!(buffer.validate(24, 8, 1, 16).is_ok());
+        assert!(
+            buffer.validate(24, 8, 2, 16).is_err(),
+            "the reported count must not exceed the returned bytes"
+        );
+        assert!(
+            buffer.validate(33, 8, 1, 16).is_err(),
+            "the returned length must not exceed the allocation"
+        );
+        assert!(
+            buffer.validate(32, 8, u32::MAX, 16).is_err(),
+            "an overflowing array size must fail closed"
+        );
+
+        assert!(buffer.contains(buffer.base().cast(), 8, 32));
+        assert!(!buffer.contains(buffer.base().cast(), 16, 8));
+        assert!(!buffer.contains(std::ptr::null(), 8, 32));
+        let outside = (buffer.base() as usize + 64) as *const core::ffi::c_void;
+        assert!(!buffer.contains(outside, 8, 32));
+    }
+
+    /// The shared window station outlives every Execution, so a per-Execution
+    /// ACE there could never be revoked at a point where no other worker still
+    /// needs it. The adapter therefore must not modify the station DACL at all;
+    /// this drives the real desktop-creation path for several distinct SIDs and
+    /// proves the live WinSta0 ACL is unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn private_desktops_do_not_accrue_window_station_aces() {
+        let before = window_station_ace_sids();
+        for index in 0..3 {
+            let sid = restricting_sid(&RequestId::new());
+            let desktop = create_private_desktop(&format!("station-dacl-{index}"), &sid)
+                .expect("private desktop creation must succeed");
+            let during = window_station_ace_sids();
+            assert!(
+                !during.iter().any(|ace| ace == &sid),
+                "the restricting SID must never be granted on the shared window station"
+            );
+            drop(desktop);
+        }
+        let after = window_station_ace_sids();
         assert_eq!(
-            WINSTA_REQUIRED_FOR_WIN32_INIT,
-            WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE
+            after, before,
+            "creating and dropping private desktops must not change the shared window station DACL"
         );
-        assert_eq!(
-            WINSTA_REQUIRED_FOR_WIN32_INIT & FORBIDDEN,
-            0,
-            "the initialization mask must not contain any nonessential right"
+    }
+
+    #[cfg(windows)]
+    fn window_station_ace_sids() -> Vec<String> {
+        type Handle = *mut core::ffi::c_void;
+        type Dword = u32;
+        type Bool = i32;
+        const SE_WINDOW_OBJECT: i32 = 7;
+        const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
+        const ACL_SIZE_INFORMATION: i32 = 2;
+
+        #[repr(C)]
+        struct AclSizeInformation {
+            ace_count: Dword,
+            acl_bytes_in_use: Dword,
+            acl_bytes_free: Dword,
+        }
+
+        #[repr(C)]
+        struct AceHeader {
+            ace_type: u8,
+            ace_flags: u8,
+            ace_size: u16,
+        }
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetProcessWindowStation() -> Handle;
+        }
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetSecurityInfo(
+                handle: Handle,
+                object_type: i32,
+                security_info: Dword,
+                owner: *mut Handle,
+                group: *mut Handle,
+                dacl: *mut Handle,
+                sacl: *mut Handle,
+                descriptor: *mut Handle,
+            ) -> Dword;
+            fn GetAclInformation(
+                acl: *mut core::ffi::c_void,
+                info: *mut core::ffi::c_void,
+                len: Dword,
+                class: i32,
+            ) -> Bool;
+            fn GetAce(acl: Handle, ace_index: Dword, ace: *mut Handle) -> Bool;
+            fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LocalFree(mem: Handle) -> Handle;
+        }
+
+        // SAFETY: GetProcessWindowStation returns a process-owned handle.
+        let station = unsafe { GetProcessWindowStation() };
+        assert!(
+            !station.is_null(),
+            "the test process must have a window station"
         );
-        assert_eq!(
-            WINSTA_REQUIRED_FOR_WIN32_INIT & !WINSTA_ALL_ACCESS,
-            0,
-            "every requested right must be a defined WINSTA_* right"
-        );
-        assert_ne!(
-            WINSTA_REQUIRED_FOR_WIN32_INIT, WINSTA_ALL_ACCESS,
-            "the mask must not be the all-access shortcut"
-        );
+        let mut dacl: Handle = std::ptr::null_mut();
+        let mut descriptor: Handle = std::ptr::null_mut();
+        // SAFETY: station is live; the out pointers are owned by this frame.
+        let read = unsafe {
+            GetSecurityInfo(
+                station,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(read, 0, "cannot read the shared window station DACL");
+        assert!(!dacl.is_null(), "the window station must have a DACL");
+        let mut size = AclSizeInformation {
+            ace_count: 0,
+            acl_bytes_in_use: 0,
+            acl_bytes_free: 0,
+        };
+        // SAFETY: dacl is a valid ACL; size is an out parameter.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut size as *mut AclSizeInformation).cast(),
+                std::mem::size_of::<AclSizeInformation>() as Dword,
+                ACL_SIZE_INFORMATION,
+            )
+        };
+        assert_ne!(ok, 0, "cannot size the shared window station DACL");
+
+        let mut sids = Vec::with_capacity(size.ace_count as usize);
+        for index in 0..size.ace_count {
+            let mut ace: Handle = std::ptr::null_mut();
+            // SAFETY: index is within ace_count; ace is an out parameter.
+            let ok = unsafe { GetAce(dacl, index, &mut ace) };
+            assert_ne!(ok, 0, "cannot enumerate window station ACE {index}");
+            assert!(!ace.is_null());
+            // SAFETY: GetAce returned the ACE header for this index.
+            let header = unsafe { &*(ace.cast::<AceHeader>()) };
+            if (header.ace_type == 0 || header.ace_type == 1) && header.ace_size >= 16 {
+                // ALLOWED/DENIED ACEs store ACCESS_MASK then the SID.
+                // SAFETY: the ACE is at least 16 bytes, so the SID pointer is
+                // inside the ACE.
+                let sid = unsafe { ace.cast::<u8>().add(8) }.cast::<core::ffi::c_void>();
+                let mut text: *mut u16 = std::ptr::null_mut();
+                // SAFETY: sid points at a SID inside the ACE; text is out.
+                if unsafe { ConvertSidToStringSidW(sid, &mut text) } != 0 {
+                    let mut len = 0;
+                    // SAFETY: text is a NUL-terminated wide string owned by
+                    // this frame.
+                    while unsafe { *text.add(len) } != 0 {
+                        len += 1;
+                    }
+                    // SAFETY: the loop measured the NUL-terminated string.
+                    let value = unsafe { std::slice::from_raw_parts(text, len) };
+                    sids.push(String::from_utf16_lossy(value));
+                    // SAFETY: ConvertSidToStringSidW memory is LocalFree'd.
+                    unsafe {
+                        LocalFree(text.cast());
+                    }
+                    continue;
+                }
+            }
+            sids.push(format!(
+                "ace-type-{}-size-{}",
+                header.ace_type, header.ace_size
+            ));
+        }
+        // SAFETY: GetSecurityInfo returned this descriptor for LocalFree.
+        unsafe {
+            LocalFree(descriptor);
+        }
+        sids
     }
 }

@@ -358,8 +358,8 @@ fn worker_token_is_minimal_and_desktop_is_private() {
     );
     // These rights are read-shaped. A write-restricted token evaluates them
     // with the normal SIDs against WinSta0's existing DACL, so the interactive
-    // session's default ACEs allow them. The adapter's minimal ACE (0x0103) is
-    // not their source, and this adapter does not claim same-user read
+    // session's default ACEs allow them. The adapter adds no ACE for the
+    // restricting SID, and this adapter does not claim same-user read
     // confidentiality. The probe records them so the documented claim stays
     // honest instead of implying the adapter denies them.
     for preexisting in [
@@ -982,4 +982,124 @@ fn locator_write_failure_leaves_the_started_process_unknown_but_controllable() {
         .terminate_execution(&hint, &long_deadline())
         .expect("the locator hint must let a fresh adapter terminate the live process");
     assert_eq!(terminated.state, ExecutionState::Terminated);
+}
+
+/// The adapter creates a private desktop per Execution but must never write to
+/// the shared window station's DACL: the station outlives every Execution, so
+/// per-Execution ACEs would accumulate for the scheduler's lifetime with no
+/// revocation point that is safe for still-running workers. This runs three
+/// complete Execution lifecycles and compares the live WinSta0 ACL.
+#[cfg(windows)]
+#[test]
+fn shared_window_station_acl_does_not_grow_across_execution_lifecycles() {
+    let before = window_station_ace_count();
+    for index in 0..3 {
+        let jail_root = unique_dir(&format!("station-acl-{index}"));
+        let descriptor = descriptor(&jail_root, &["--isolation-probe"]);
+        let request = request_with(
+            WorkspaceMode::ReadOnly,
+            NetworkEnforcement::Enabled,
+            false,
+            Some(descriptor.encode()),
+        );
+        let (_handle, probe, out, err) = run_probe(&request);
+        assert!(
+            probe_ok(&probe),
+            "execution {index} must run inside the jail: {out:?} {err:?}"
+        );
+    }
+    let after = window_station_ace_count();
+    assert_eq!(
+        after, before,
+        "starting and ending Executions must not change the shared window station DACL"
+    );
+}
+
+#[cfg(windows)]
+fn window_station_ace_count() -> u32 {
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+    const SE_WINDOW_OBJECT: i32 = 7;
+    const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
+    const ACL_SIZE_INFORMATION: i32 = 2;
+
+    #[repr(C)]
+    struct AclSizeInformation {
+        ace_count: Dword,
+        acl_bytes_in_use: Dword,
+        acl_bytes_free: Dword,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetProcessWindowStation() -> Handle;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetSecurityInfo(
+            handle: Handle,
+            object_type: i32,
+            security_info: Dword,
+            owner: *mut Handle,
+            group: *mut Handle,
+            dacl: *mut Handle,
+            sacl: *mut Handle,
+            descriptor: *mut Handle,
+        ) -> Dword;
+        fn GetAclInformation(
+            acl: *mut core::ffi::c_void,
+            info: *mut core::ffi::c_void,
+            len: Dword,
+            class: i32,
+        ) -> Bool;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: Handle) -> Handle;
+    }
+
+    // SAFETY: GetProcessWindowStation returns a process-owned handle.
+    let station = unsafe { GetProcessWindowStation() };
+    assert!(
+        !station.is_null(),
+        "the test process must have a window station"
+    );
+    let mut dacl: Handle = std::ptr::null_mut();
+    let mut descriptor: Handle = std::ptr::null_mut();
+    // SAFETY: station is live; the out pointers are owned by this frame.
+    let read = unsafe {
+        GetSecurityInfo(
+            station,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(read, 0, "cannot read the shared window station DACL");
+    assert!(!dacl.is_null(), "the window station must have a DACL");
+    let mut size = AclSizeInformation {
+        ace_count: 0,
+        acl_bytes_in_use: 0,
+        acl_bytes_free: 0,
+    };
+    // SAFETY: dacl is a valid ACL; size is an out parameter.
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut AclSizeInformation).cast(),
+            std::mem::size_of::<AclSizeInformation>() as Dword,
+            ACL_SIZE_INFORMATION,
+        )
+    };
+    assert_ne!(ok, 0, "cannot size the shared window station DACL");
+    // SAFETY: GetSecurityInfo returned this descriptor for LocalFree.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    size.ace_count
 }

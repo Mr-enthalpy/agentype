@@ -148,11 +148,13 @@ of the same kind MUST fail closed. M6-B.4 DEFINES a source-resolved exact-bindin
 launch path: it resolves the exact installed binding from the
 `AdapterBindingPolicy`'s stable `binding_ref` (within the policy's
 `adapter_kind`), freezes `(adapter_kind, adapter_binding_key)` at Execution
-creation, and MUST NOT use `resolve_unique`. **That typed path is not yet wired
-into the production dispatch composition**, which continues to use
-`resolve_unique` until the daemon integration lands; the typed library path
-already carries the exact binding into the `ProvisioningBinding` and
-`BindingSnapshot`. Recovery for either path MUST `resolve_exact(kind, key)`.
+creation, and MUST NOT use `resolve_unique`. **This typed path is wired into
+production dispatch**: `ControlLoopService::cycle` prepares typed candidates
+through that exact-binding path and hands them to the same physical start
+boundary as legacy work, and `SchedulerDaemonBuilder::typed_dispatch` is the
+daemon composition entry point that enables it. The typed path carries the exact
+binding into the `ProvisioningBinding` and `BindingSnapshot`. Recovery for
+either path MUST `resolve_exact(kind, key)`.
 
 An imported source owns its kind, binding key, and enforceable physical
 capabilities. It MAY optionally declare a **provisioning protocol identity**

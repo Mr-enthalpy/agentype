@@ -301,6 +301,12 @@ fn isolation_probe() {
         privileges: [LuidAndAttributes; 1],
     }
 
+    /// `Vec<u8>` only guarantees byte alignment; TOKEN_PRIVILEGES must be read
+    /// from storage aligned for its fields. Eight-byte words cover that.
+    #[repr(C, align(8))]
+    #[derive(Clone, Copy)]
+    struct TokenWord([u8; 8]);
+
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentProcess() -> Handle;
@@ -414,42 +420,59 @@ fn isolation_probe() {
             );
         }
         if needed > 0 {
-            let mut buffer = vec![0u8; needed as usize];
-            // SAFETY: buffer has at least `needed` bytes.
+            let bytes = needed as usize;
+            let words = bytes.div_ceil(8);
+            let mut buffer = vec![TokenWord([0u8; 8]); words];
+            let capacity = u32::try_from(words.saturating_mul(8)).unwrap_or(u32::MAX);
+            // SAFETY: buffer is word-aligned and at least `needed` bytes;
+            // `needed` is an out parameter.
             let ok = unsafe {
                 GetTokenInformation(
                     token,
                     TOKEN_PRIVILEGES_CLASS,
-                    buffer.as_mut_ptr() as *mut core::ffi::c_void,
-                    needed,
+                    buffer.as_mut_ptr().cast(),
+                    capacity,
                     &mut needed,
                 )
             };
             if ok != 0 {
-                let groups = buffer.as_ptr() as *const TokenPrivileges;
-                // SAFETY: GetTokenInformation filled a TOKEN_PRIVILEGES whose
-                // count bounds the trailing array in the same allocation.
-                let count = unsafe { (*groups).count } as usize;
-                let entries =
-                    unsafe { std::slice::from_raw_parts((*groups).privileges.as_ptr(), count) };
-                for entry in entries {
-                    let mut name = vec![0u16; 256];
-                    let mut len = name.len() as Dword;
-                    // SAFETY: name is a valid out buffer; entry.luid is valid.
-                    if unsafe {
-                        LookupPrivilegeNameW(
-                            std::ptr::null(),
-                            &entry.luid,
-                            name.as_mut_ptr(),
-                            &mut len,
-                        )
-                    } != 0
-                    {
-                        let end = name
-                            .iter()
-                            .position(|&unit| unit == 0)
-                            .unwrap_or(len as usize);
-                        privileges.push(String::from_utf16_lossy(&name[..end]));
+                assert!(
+                    std::mem::align_of::<TokenPrivileges>() <= std::mem::align_of::<TokenWord>(),
+                    "the token buffer word alignment must satisfy TOKEN_PRIVILEGES alignment"
+                );
+                // SAFETY: the buffer is at least `needed` bytes and word
+                // aligned; the API wrote a TOKEN_PRIVILEGES header at its base.
+                let token_privileges = unsafe { &*buffer.as_ptr().cast::<TokenPrivileges>() };
+                let count = token_privileges.count as usize;
+                let header = std::mem::size_of::<TokenPrivileges>()
+                    - std::mem::size_of::<LuidAndAttributes>();
+                let entry = std::mem::size_of::<LuidAndAttributes>();
+                let required = header.saturating_add(count.saturating_mul(entry));
+                if required <= needed as usize && required <= capacity as usize {
+                    // SAFETY: the count was validated against the bytes the
+                    // API actually returned inside this allocation.
+                    let entries = unsafe {
+                        std::slice::from_raw_parts(token_privileges.privileges.as_ptr(), count)
+                    };
+                    for entry in entries {
+                        let mut name = vec![0u16; 256];
+                        let mut len = name.len() as Dword;
+                        // SAFETY: name is a valid out buffer; entry.luid is valid.
+                        if unsafe {
+                            LookupPrivilegeNameW(
+                                std::ptr::null(),
+                                &entry.luid,
+                                name.as_mut_ptr(),
+                                &mut len,
+                            )
+                        } != 0
+                        {
+                            let end = name
+                                .iter()
+                                .position(|&unit| unit == 0)
+                                .unwrap_or(len as usize);
+                            privileges.push(String::from_utf16_lossy(&name[..end]));
+                        }
                     }
                 }
             }
@@ -487,8 +510,8 @@ fn isolation_probe() {
     // A real access check against the current window station DACL. The token is
     // write-restricted: the restricting SIDs are applied to write-shaped access
     // checks, while read-shaped rights are evaluated with the token's normal
-    // SIDs against the station's pre-existing DACL. The adapter's own ACE grants
-    // only the minimal initialization mask, so it cannot be the source of a
+    // SIDs against the station's pre-existing DACL. The adapter grants the
+    // restricting SID no station ACE at all, so it cannot be the source of a
     // write grant such as CREATEDESKTOP, WRITEATTRIBUTES, ACCESSCLIPBOARD,
     // EXITWINDOWS, or ACCESSGLOBALATOMS. A combined request proves that adding a
     // read right does not smuggle in a write right.

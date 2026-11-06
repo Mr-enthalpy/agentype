@@ -222,12 +222,17 @@ The covered boundary is the durable Kernel ACK contract (lease-epoch validation,
 ReadOnly completion, Write quiescence refusal, late physical end as history).
 The accepted scope label is **typed physical execution → durable ACK interface**;
 the ADR does not claim worker-originated end-to-end execution.
+[ADR-0012](0012-m6b4-scope-typed-physical-execution-ack.md) records this
+boundary as a normative scope decision.
 
 The physical enforcement behind that boundary is also scoped: Windows means a
-per-Execution restricting SID with `WRITE_RESTRICTED`, a minimal
-`0x0103` window-station ACE, and a per-Execution desktop; Linux means a Landlock
-ABI >= 3 **content-write** boundary that does not mediate `chmod`,
-`utimensat`, or `setxattr`. Locator durability is part of the interface: the
+per-Execution restricting SID with `WRITE_RESTRICTED` and a per-Execution
+desktop whose DACL is extended for that SID; the adapter never modifies the
+shared window station DACL, so no per-Execution station ACE accumulates and the
+station's pre-existing read-shaped rights remain outside this adapter's
+control; Linux means a Landlock ABI >= 3 **content-write** boundary that does
+not mediate `chmod`, `utimensat`, or `setxattr`. Locator durability is part of
+the interface: the
 record is atomically replaced and fsynced, the canonical locator root is bound
 into the adapter binding key, and a persistence failure is reported as unknown
 physical state with the in-memory locator rather than a clean start.

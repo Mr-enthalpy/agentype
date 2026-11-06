@@ -3,6 +3,7 @@
 Status: Implementation and acceptance record
 Implementation status: M6-B.4 typed physical execution → durable ACK interface implemented on PR #24
 Date: 2026-11-06
+Updated: 2026-11-07
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert a wider freeze.
 
@@ -14,7 +15,10 @@ exact adapter start → observation/recovery → durable Result ACK boundary, wi
 real source integration and a real OS-enforced workspace jail. A production
 worker-originated Result transport, worker authentication, delivery retry, and
 network ingress are **not** part of this scope (see *Harness-injected ACK
-boundary*); the suite does not claim worker-originated end-to-end ACK. B.5
+boundary*); the suite does not claim worker-originated end-to-end ACK. That
+boundary is now a normative decision in
+[ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md),
+not only a PR note. B.5
 credentials, cold/revivable matching, full typed topology, executed-WARM
 replacement and v7→v8 migration remain out of scope and fail closed (see
 *Remaining limits*).
@@ -33,14 +37,32 @@ three gaps recorded there:
    (`JailedProcessAgentAdapter`).
 
 This revision starts from the independently re-audited head
-`bf4963370f65cf0c8e20b3869b445d080d6af35d` and closes the follow-up P1/P2
-findings: the Windows window-station ACE is reduced to a verified minimal mask
-with real `OpenWindowStationW` negatives for the write-shaped rights, the Linux
-enforcement claim is contracted to a content-write boundary with real
-`chmod`/`utimensat` counterexamples, and locator persistence is now atomic and
-fsynced with a canonical locator root bound into the physical domain identity.
+`bf4963370f65cf0c8e20b3869b445d080d6af35d` and closed the follow-up P1/P2
+findings of that round: the Windows window-station ACE was reduced to a verified
+minimal mask with real `OpenWindowStationW` negatives for the write-shaped
+rights, the Linux enforcement claim was contracted to a content-write boundary
+with real `chmod`/`utimensat` counterexamples, and locator persistence was made
+atomic and fsynced with a canonical locator root bound into the physical domain
+identity.
+
+The current revision starts from head `8864ed2` and closes the second re-audit's
+P1-1, P1-2 and P2-1:
+
+- Windows `GetTokenInformation` output is read from a word-aligned allocation
+  with validated returned length, array count and allocation bounds, instead of
+  casting a byte vector to `#[repr(C)]` structures (P1-1);
+- the adapter no longer grants any ACE on the shared window station. Only the
+  per-Execution private desktop DACL is extended, so repeated Execution
+  lifecycles cannot accumulate station grants (P1-2);
+- spec 07 now states that the typed exact-binding path is production-wired
+  through `ControlLoopService::cycle` and `SchedulerDaemonBuilder::typed_dispatch`
+  (P2-1);
+- [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md)
+  records the accepted `typed physical execution → durable ACK interface` scope,
+  and the deferred worker-originated Result data plane inside it, as a normative
+  decision rather than a PR comment.
+
 The prior round's closure of P1-1, P1-2, P1-3, P2-2 and P2-3 remains in place:
-the accepted scope is **typed physical execution → durable ACK interface**,
 locator evidence survives the `spawn → identity` window, Windows children keep
 only `SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed
 daemon restart test uses a real process crash over the same store, a mixed
@@ -88,22 +110,29 @@ provisioned.
   process-global `S-1-5-12` is never used. The restricted token deletes every
   host privilege except `SeChangeNotifyPrivilege`; shutdown, undock,
   time-zone, working-set and any other inherited privilege are absent, and the
-  spawn fails closed if the privilege set cannot be proven minimal. Each
-  Execution runs on a per-Execution desktop (`agentype-desktop-<request_id>`)
-  whose DACL is extended with `DESKTOP_ALL_ACCESS` for that Execution's
-  restricting SID; the creating user's default ACEs remain, so this is
-  per-Execution desktop confinement, not a same-user security boundary. The
-  current window station receives only the minimal Win32-initialization grant
-  `WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE` (`0x0103`)
-  for that Execution's restricting SID. Because the token is
-  `WRITE_RESTRICTED`, that ACE governs write-shaped station access: the worker
-  is denied `WINSTA_CREATEDESKTOP`, `WINSTA_WRITEATTRIBUTES`,
+  spawn fails closed if the privilege set cannot be proven minimal. Token
+  information is read from a word-aligned allocation whose returned length,
+  array count and allocation bounds are validated before any `#[repr(C)]`
+  structure or slice is formed; a count or length outside the written region is
+  an error, not an unchecked cast.
+  Each Execution runs on a per-Execution desktop
+  (`agentype-desktop-<request_id>`) whose DACL is extended with
+  `DESKTOP_ALL_ACCESS` for that Execution's restricting SID; the creating
+  user's default ACEs remain, so this is per-Execution desktop confinement, not
+  a same-user security boundary. The adapter **never modifies the shared window
+  station DACL**. A per-Execution ACE there could not be revoked safely while
+  other workers may still be running, and it would accumulate for the
+  scheduler's lifetime; the desktop is therefore the only object granted to the
+  restricting SID. Because the token is `WRITE_RESTRICTED`, write-shaped station
+  access is evaluated against the restricting SIDs, which hold no station ACE,
+  so the worker is denied `WINSTA_CREATEDESKTOP`, `WINSTA_WRITEATTRIBUTES`,
   `WINSTA_ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, and `WINSTA_ALL_ACCESS`
   by real `OpenWindowStationW` access checks inside the worker. Read-shaped
   rights (`ENUMDESKTOPS`, `READATTRIBUTES`, `ENUMERATE`, `ACCESSGLOBALATOMS`,
   `EXITWINDOWS`, `READSCREEN`) are evaluated with the token's normal SIDs
-  against WinSta0's pre-existing DACL; they are not granted by this ACE and are
-  reported honestly by the probe rather than claimed as denied. This adapter
+  against WinSta0's pre-existing DACL; the adapter neither grants nor removes
+  them, and the probe reports them honestly rather than claiming they are
+  denied. This adapter
   therefore claims per-Execution write containment and desktop confinement, not
   same-user read confidentiality or a hostile-code sandbox.
   A new window station is attempted only if the host privilege exists;
@@ -200,23 +229,40 @@ Persistence is not best effort:
   a terminal physical candidate; a terminal candidate without a quiescence
   witness keeps writer safety closed.
 
-### Windows minimum privilege and private desktop (P1-3)
+### Windows token parsing, minimum privilege and private desktop (P1-1, P1-2, P1-3)
 
-The Windows child token keeps only `SeChangeNotifyPrivilege`. A per-Execution
-desktop is created and its DACL is extended with `DESKTOP_ALL_ACCESS` for that
-Execution's restricting SID; the creating user's default ACEs remain, so this
-is per-Execution desktop confinement, not a same-user security boundary. The
-current window station receives only the minimal initialization mask (`0x0103`).
-The `WRITE_RESTRICTED` access check denies the restricting SID every
-write-shaped station right; the probe records both the denied rights and the
-read-shaped rights inherited from the station's existing DACL, so the report
-does not overclaim. The parent-side desktop handle is retained
-until `collect_outcome` observes process exit, because closing it while the
-child is still initializing user32 causes `STATUS_DLL_INIT_FAILED`. If either
-the privilege reduction or the private desktop/ACL step fails, the spawn fails
-closed; there is no fallback to the interactive `Default` desktop. These are
-declared as workspace/desktop confinement properties, not as a general sandbox
-for arbitrary malicious code.
+The Windows child token keeps only `SeChangeNotifyPrivilege`. Token information
+from `GetTokenInformation` (`TOKEN_RESTRICTED_SIDS` and `TOKEN_PRIVILEGES`) is
+read from an explicitly word-aligned allocation, not from `Vec<u8>`. Before any
+pointer cast, the code validates that the returned length fits the allocation
+and that `count * element_size + header_offset` fits the returned bytes; the
+restricted-SID witness additionally checks that each SID pointer lies inside
+the written region. `token_information_buffer_is_aligned_and_bounds_checked`
+covers alignment, over-count, over-length, overflow and out-of-buffer pointers.
+The real-locator tests still exercise the SID witness against a live process.
+
+A per-Execution desktop is created and its DACL is extended with
+`DESKTOP_ALL_ACCESS` for that Execution's restricting SID; the creating user's
+default ACEs remain, so this is per-Execution desktop confinement, not a
+same-user security boundary. The adapter **does not modify the shared window
+station DACL at all**; granting a per-Execution ACE there had no safe revocation
+point while other workers could still be running and grew the station ACL for
+the scheduler's lifetime. The `WRITE_RESTRICTED` access check therefore denies
+the restricting SID every write-shaped station right, while read-shaped rights
+remain governed by the station's pre-existing DACL. The probe records both
+groups, so the report does not overclaim.
+`private_desktops_do_not_accrue_window_station_aces` creates and drops real
+private desktops for several distinct SIDs and compares the live WinSta0 DACL
+before/after, including an assertion that no restricting SID appears in it; the
+E2E-level
+`shared_window_station_acl_does_not_grow_across_execution_lifecycles` runs three
+complete Execution lifecycles and compares the real station ACE count. The
+parent-side desktop handle is retained until `collect_outcome` observes process
+exit, because closing it while the child is still initializing user32 causes
+`STATUS_DLL_INIT_FAILED`. If either the privilege reduction or the private
+desktop/ACL step fails, the spawn fails closed; there is no fallback to the
+interactive `Default` desktop. These are declared as workspace/desktop
+confinement properties, not as a general sandbox for arbitrary malicious code.
 
 ## Invariant checklist
 
@@ -235,13 +281,16 @@ for arbitrary malicious code.
 | Worker environment isolation | Preserved | Explicit allowlist on both platforms; `worker_does_not_inherit_daemon_secrets_but_keeps_runtime_variables` |
 | Per-Execution write authorization | Preserved | RequestId-derived restricting SID granted only on that jail; Windows `write_a_cannot_write_read_only_b_jail` and `write_a_cannot_write_write_b_jail` |
 | Recoverable locator after spawn | Preserved | `locator.json` written before the birth probe with an atomic temp-file + fsync + rename (+ Unix directory fsync); locator root bound into the binding key; `born_less_locator_is_recovered_after_the_spawn_identity_window`, `durable_locator_controls_the_process_after_adapter_restart`, `interrupted_locator_rewrite_cannot_destroy_the_previous_record`, `locator_write_failure_leaves_the_started_process_unknown_but_controllable`, `domain_key_binds_the_locator_root_across_processes`, impersonation negative |
-| Windows minimum privilege and private desktop | Preserved | `worker_token_is_minimal_and_desktop_is_private`; only `SeChangeNotifyPrivilege` survives; `Default`/input desktop opens fail; real `OpenWindowStationW` checks deny `CREATEDESKTOP`, `WRITEATTRIBUTES`, `ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, `ALL_ACCESS`; `window_station_mask_excludes_nonessential_rights` proves the adapter mask is `0x0103` |
+| Windows minimum privilege and private desktop | Preserved | `worker_token_is_minimal_and_desktop_is_private`; only `SeChangeNotifyPrivilege` survives; `Default`/input desktop opens fail; real `OpenWindowStationW` checks deny `CREATEDESKTOP`, `WRITEATTRIBUTES`, `ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, `ALL_ACCESS` |
+| Windows token buffer alignment and bounds | Preserved | `token_information_buffer_is_aligned_and_bounds_checked` proves word alignment plus returned-length, count, overflow and in-buffer SID-pointer validation; the real restricted-SID witness still runs in the locator tests |
+| Shared window station DACL has no per-Execution growth | Preserved | `private_desktops_do_not_accrue_window_station_aces` compares the live WinSta0 DACL before/after several distinct SIDs; `shared_window_station_acl_does_not_grow_across_execution_lifecycles` compares the ACE count across three complete Executions |
 | Real daemon-crash restart with same physical instance | Preserved | `typed_daemon_restart_recovers_the_same_physical_instance` (separate child process aborts; parent reopens same DB) |
 | Legacy and typed queues share the control loop without starvation | Preserved | `legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue` |
 | Linux truncate enforcement | Preserved | Landlock ABI >= 3 gate; `legacy_landlock_abis_are_not_enforceable`; Linux `ftruncate`/`open(O_TRUNC)` denial outside the jail and truncate allowance inside a Write jail |
 | Linux enforcement boundary is content writes, not metadata | Contracted | `linux_read_only_landlock_is_a_content_write_boundary_not_metadata_immutability` and `linux_write_landlock_is_a_content_write_boundary_not_metadata_immutability` assert the outside content write is denied while `chmod`/`utimensat` (and `setxattr` when supported) succeed |
 | Exact `(adapter_kind, adapter_binding_key)` recovery | Preserved | M5 recovery tests; retention of resolved adapter instance in typed handoff |
 | M5 writer safety and absolute deadlines | Preserved | Write E2E refuses ACK without quiescence; runtime deadline/writer suites |
+| Accepted scope is typed physical execution → durable ACK interface | Normative | [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md); E2E ACK remains harness-injected and no worker transport/auth/retry is claimed |
 | Process lock, ReadyPermit, recover-before-dispatch | Preserved | Daemon startup unchanged; full process-lock/supervision suites |
 | WARM replacement blocked without physical witness | Preserved | B.4 `warm_resident_provenance_change_requires_physical_lifecycle_evidence`; no new replacement path |
 | v7→v8 migration out of scope | Preserved | schema remains fresh-v8 / existing-v8 only |
@@ -300,6 +349,9 @@ ReadOnly completion, Write quiescence refusal, late-physical-end history), not a
 complete worker-originated ACK path. Any wider claim would be unsupported. The
 accepted scope label is therefore **typed physical execution → durable ACK
 interface**; this record does not claim worker-originated end-to-end execution.
+[ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md)
+records that boundary and the deferred worker data plane as a normative scope
+decision.
 
 Additional real-process evidence in this revision:
 
@@ -340,11 +392,13 @@ fatal preparation fault that fails the daemon and produces exactly one
 | Fatal prepare escalation | `confirmed_fatal_preparation_survives_restart_without_execution_lost_retry`; `preparation_fault_is_immutable_and_fences_execution_and_worker_settlement`; fatal-prep E2E |
 | Root retry / cancel races | `retry_wait_is_promoted_then_redispatched`; `cancel_task_releases_a_prepared_claim`; `cancel_batch_releases_a_prepared_claim` |
 | Typed unavailable / ambiguous before Attempt | `target_isolation_filters_incapable_source_before_attest_and_selection`; `credential_config_is_filtered_before_attestation_and_cannot_hide_valid_config`; E2E negative cases |
+| Windows token parse boundary | `token_information_buffer_is_aligned_and_bounds_checked`; the real restricted-SID witness still runs in the locator tests; no unchecked `Vec<u8>` to `#[repr(C)]` cast remains |
+| Repeated Execution lifecycles | `shared_window_station_acl_does_not_grow_across_execution_lifecycles` (three real Executions) and `private_desktops_do_not_accrue_window_station_aces` (several distinct SIDs) |
 | Write success without quiescence | `writer_safety_suspension_is_distinct_from_task_completed`; Write E2E (`ack_success` returns `None`) |
 
 ## Verification
 
-Local checks on 2026-11-06:
+Local checks on 2026-11-07 (Windows):
 
 | Check | Result |
 |---|---|
@@ -352,8 +406,9 @@ Local checks on 2026-11-06:
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
 | `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed |
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
-| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 16 passed (real OS enforcement, including token/desktop and locator recovery) |
+| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 18 passed (real OS enforcement, including token/desktop, station-DACL lifecycle and locator recovery) |
 | `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 10 passed (including real daemon restart and mixed legacy/typed queue) |
+| `cargo test -p agentype-adapter-local-process --lib` | 37 passed (including token-buffer alignment/bounds and station-DACL unit tests) |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
 workspace directory because the sandboxed test process cannot create the
@@ -392,7 +447,10 @@ reverts to NOT FROZEN.
   new window station requires a privilege ordinary interactive users do not
   have (`CreateWindowStationW` → `ERROR_ACCESS_DENIED`). The adapter therefore
   fails closed on any private-desktop/ACL failure and never falls back to the
-  interactive desktop. `WRITE_RESTRICTED` denies the restricting SID every
+  interactive desktop. The shared station DACL is never modified, so the adapter
+  owns no station ACE and has nothing to revoke after a crash or a normal
+  Execution end; several Execution lifecycles were shown not to grow the ACL.
+  `WRITE_RESTRICTED` denies the restricting SID every
   write-shaped station right, but read-shaped rights (`ENUMDESKTOPS`,
   `READATTRIBUTES`, `ENUMERATE`, `ACCESSGLOBALATOMS`, `EXITWINDOWS`,
   `READSCREEN`) are evaluated against WinSta0's pre-existing DACL and are not
