@@ -5,9 +5,10 @@
 //! real write attempt. A missing enforcement mechanism shows up as a successful
 //! write, so the test fails closed rather than trusting a declared capability.
 
+#[cfg(windows)]
+use agentype_adapter_api::PhysicalState;
 use agentype_adapter_api::{
-    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter, PhysicalState,
-    RuntimeHandle,
+    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter, RuntimeHandle,
 };
 use agentype_adapter_local_process::{
     JailLaunchDescriptor, JailedProcessAgentAdapter, JAIL_ADAPTER_KIND,
