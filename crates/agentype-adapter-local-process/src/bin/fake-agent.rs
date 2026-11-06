@@ -201,6 +201,67 @@ fn open_truncate_probe(path: &str, label: &str) {
     }
 }
 
+/// Exercise metadata syscalls that Landlock does not mediate: `chmod`,
+/// `utimensat`, and `setxattr`. Used by real Linux tests to keep the
+/// content-write enforcement claim honest: the documentation states that
+/// metadata changes are not restricted, so a positive result here is expected.
+#[cfg(target_os = "linux")]
+fn metadata_probe(path: &str) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = PathBuf::from(path);
+    let Ok(raw) = CString::new(target.as_os_str().as_bytes()) else {
+        return;
+    };
+    let report = |label: &str, result: io::Result<()>| match result {
+        Ok(()) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":true,"errno":0}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy())
+        ),
+        Err(err) => println!(
+            r#"{{"probe":{{"label":"{}","path":"{}","ok":false,"errno":{}}}}}"#,
+            json_escape(label),
+            json_escape(&target.to_string_lossy()),
+            err.raw_os_error().unwrap_or(0)
+        ),
+    };
+    let syscall = |rc: i32| -> io::Result<()> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+
+    // SAFETY: raw is a valid NUL-terminated path.
+    report("chmod", unsafe {
+        syscall(libc::chmod(raw.as_ptr(), 0o600))
+    });
+    // SAFETY: raw is valid; a null times pointer requests the current time.
+    report("utimensat", unsafe {
+        syscall(libc::utimensat(
+            libc::AT_FDCWD,
+            raw.as_ptr(),
+            std::ptr::null(),
+            0,
+        ))
+    });
+    let name = b"user.agentype_probe\0";
+    // SAFETY: raw and name are valid NUL-terminated byte strings; the value
+    // buffer is valid for the given length.
+    report("setxattr", unsafe {
+        syscall(libc::setxattr(
+            raw.as_ptr(),
+            name.as_ptr().cast(),
+            b"1".as_ptr().cast(),
+            1,
+            0,
+        ))
+    });
+}
+
 /// Report whether an environment variable is visible. The value is never
 /// printed so a sentinel secret cannot leak into the captured artifact.
 fn env_probe(name: &str) {
@@ -283,13 +344,26 @@ fn isolation_probe() {
             inherit: Bool,
         ) -> Handle;
         fn OpenInputDesktop(flags: Dword, inherit: Bool, desired_access: Dword) -> Handle;
+        fn OpenWindowStationW(name: *const u16, inherit: Bool, access: Dword) -> Handle;
         fn CloseDesktop(desktop: Handle) -> Bool;
+        fn CloseWindowStation(station: Handle) -> Bool;
     }
 
     const TOKEN_QUERY: Dword = 0x0008;
     const TOKEN_PRIVILEGES_CLASS: Dword = 3;
     const UOI_NAME: i32 = 2;
     const DESKTOP_READOBJECTS: Dword = 0x0001;
+    const WINSTA_ENUMDESKTOPS: Dword = 0x0001;
+    const WINSTA_READATTRIBUTES: Dword = 0x0002;
+    const WINSTA_ACCESSCLIPBOARD: Dword = 0x0004;
+    const WINSTA_CREATEDESKTOP: Dword = 0x0008;
+    const WINSTA_WRITEATTRIBUTES: Dword = 0x0010;
+    const WINSTA_ACCESSGLOBALATOMS: Dword = 0x0020;
+    const WINSTA_EXITWINDOWS: Dword = 0x0040;
+    const WINSTA_ENUMERATE: Dword = 0x0100;
+    const WINSTA_READSCREEN: Dword = 0x0200;
+    const WINSTA_ALL_ACCESS: Dword = 0x037F;
+    const STANDARD_RIGHTS_REQUIRED: Dword = 0x000F_0000;
 
     let user_object_name = |handle: Handle| -> Option<String> {
         if handle.is_null() {
@@ -410,13 +484,57 @@ fn isolation_probe() {
         }
     }
 
+    // A real access check against the current window station DACL. The token is
+    // write-restricted: the restricting SIDs are applied to write-shaped access
+    // checks, while read-shaped rights are evaluated with the token's normal
+    // SIDs against the station's pre-existing DACL. The adapter's own ACE grants
+    // only the minimal initialization mask, so it cannot be the source of a
+    // write grant such as CREATEDESKTOP, WRITEATTRIBUTES, ACCESSCLIPBOARD,
+    // EXITWINDOWS, or ACCESSGLOBALATOMS. A combined request proves that adding a
+    // read right does not smuggle in a write right.
+    let window_station_access = |access: Dword| -> bool {
+        let Some(name) = winsta.as_deref() else {
+            return false;
+        };
+        let name: Vec<u16> = std::ffi::OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: name is NUL terminated. A failed open is the expected result
+        // for rights the adapter deliberately did not grant.
+        let station = unsafe { OpenWindowStationW(name.as_ptr(), 0, access) };
+        if station.is_null() {
+            return false;
+        }
+        unsafe {
+            CloseWindowStation(station);
+        }
+        true
+    };
+    let can_enum_desktops = window_station_access(WINSTA_ENUMDESKTOPS);
+    let can_read_attributes = window_station_access(WINSTA_READATTRIBUTES);
+    let can_enumerate = window_station_access(WINSTA_ENUMERATE);
+    let can_create_desktop = window_station_access(WINSTA_CREATEDESKTOP);
+    let can_write_attributes = window_station_access(WINSTA_WRITEATTRIBUTES);
+    let can_access_clipboard = window_station_access(WINSTA_ACCESSCLIPBOARD);
+    let can_access_global_atoms = window_station_access(WINSTA_ACCESSGLOBALATOMS);
+    let can_exit_windows = window_station_access(WINSTA_EXITWINDOWS);
+    // READSCREEN is a read-shaped right: under a write-restricted token it is
+    // governed by the station's existing DACL (which grants the interactive
+    // session read access), not by the adapter's minimal write ACE.
+    let can_read_screen = window_station_access(WINSTA_READSCREEN);
+    let readscreen_plus_create_desktop =
+        window_station_access(WINSTA_READSCREEN | WINSTA_CREATEDESKTOP);
+    let has_standard_rights = window_station_access(STANDARD_RIGHTS_REQUIRED);
+    let has_all_access = window_station_access(WINSTA_ALL_ACCESS);
+
     let privileges_json = privileges
         .iter()
         .map(|privilege| format!("\"{}\"", json_escape(privilege)))
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        r#"{{"probe":{{"label":"isolation","ok":true,"privileges":[{privileges_json}],"desktop":"{}","winsta":"{}","default_desktop_open":{default_desktop_open},"input_desktop_open":{input_desktop_open}}}}}"#,
+        r#"{{"probe":{{"label":"isolation","ok":true,"privileges":[{privileges_json}],"desktop":"{}","winsta":"{}","default_desktop_open":{default_desktop_open},"input_desktop_open":{input_desktop_open},"winsta_access":{{"enumdesktops":{can_enum_desktops},"readattributes":{can_read_attributes},"enumerate":{can_enumerate},"createdesktop":{can_create_desktop},"writeattributes":{can_write_attributes},"accessclipboard":{can_access_clipboard},"accessglobalatoms":{can_access_global_atoms},"exitwindows":{can_exit_windows},"readscreen":{can_read_screen},"readscreen_plus_createdesktop":{readscreen_plus_create_desktop},"standard_rights_required":{has_standard_rights},"all_access":{has_all_access}}}}}}}"#,
         json_escape(desktop.as_deref().unwrap_or("")),
         json_escape(winsta.as_deref().unwrap_or("")),
     );
@@ -474,6 +592,11 @@ fn main() {
     #[cfg(target_os = "linux")]
     if let Some(path) = arg_value("--open-truncate-probe") {
         open_truncate_probe(&path, "open-truncate");
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(path) = arg_value("--metadata-probe") {
+        metadata_probe(&path);
     }
 
     for name in arg_values("--env-probe") {

@@ -18,7 +18,9 @@
 //!   handles every write-class filesystem right including `TRUNCATE` (Landlock
 //!   ABI >= 3 is required; older ABIs cannot deny `truncate(2)` and are refused).
 //!   `ReadOnly` adds no path rule; `Write` adds one rule for the per-execution
-//!   jail root.
+//!   jail root. This is a **content-write** boundary: Landlock does not mediate
+//!   metadata syscalls, so `chmod`, `utimensat`, and `setxattr` are explicitly
+//!   not confined by this adapter.
 //!
 //! The worker never inherits the daemon environment. Both platforms pass only a
 //! minimal, explicit allowlist of non-sensitive runtime variables plus a
@@ -591,21 +593,6 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
             .lock()
             .expect("jail desktop map")
             .insert(spawned.pid, spawned.desktop);
-        // The locator was written immediately after spawn (before the birth
-        // probe). Upgrade it now that the exact birth identity is known.
-        let _ = write_locator_record(
-            &super::jail_exec_dir(request.request_id().as_str()),
-            JAIL_ADAPTER_KIND,
-            &LocatorHandle {
-                pid: spawned.pid,
-                birth: Some(spawned.birth),
-                inst: inst.clone(),
-                request_id: request.request_id().as_str().to_string(),
-                stdout_path: spawned.stdout_path.clone(),
-                stderr_path: spawned.stderr_path.clone(),
-                spawn_after_ms: None,
-            },
-        );
         let parsed = ParsedHandle {
             pid: spawned.pid,
             birth: spawned.birth,
@@ -1368,14 +1355,37 @@ struct PrivateWindowStation {
     desktop_path: Vec<u16>,
 }
 
+/// Window-station access actually granted to the per-Execution restricting SID
+/// so a write-restricted child can attach to a desktop in the current station
+/// and initialize USER32. This is deliberately not `WINSTA_ALL_ACCESS` or
+/// `STANDARD_RIGHTS_REQUIRED`. The token is created with `WRITE_RESTRICTED`, so
+/// this ACE governs write-shaped access: the worker cannot create desktops,
+/// write station attributes, use the clipboard, or change the security
+/// descriptor. Read-shaped rights (including `ACCESSGLOBALATOMS`,
+/// `EXITWINDOWS`, and `READSCREEN`) are evaluated with the token's normal SIDs
+/// against the station's pre-existing DACL; they are outside this grant and are
+/// recorded honestly by `isolation_probe`. Empirical enforcement is covered by
+/// the real access checks and the mask unit test.
+#[cfg(windows)]
+const WINSTA_ENUMDESKTOPS: u32 = 0x0001;
+#[cfg(windows)]
+const WINSTA_READATTRIBUTES: u32 = 0x0002;
+#[cfg(windows)]
+const WINSTA_ENUMERATE: u32 = 0x0100;
+#[cfg(windows)]
+const WINSTA_REQUIRED_FOR_WIN32_INIT: u32 =
+    WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE;
+
 /// Create a private desktop for one Execution and grant the Execution's
 /// restricting SID access to it. The current window station is extended with
-/// the access required for Win32 initialization for that same SID; it never
-/// receives create-desktop or write authority. A new window station would be
-/// stronger, but `CreateWindowStationW` requires a host privilege that ordinary
-/// interactive users do not have, so this fails closed rather than silently
-/// using the interactive desktop. Any failure is fatal: the spawn must not fall
-/// back to the interactive desktop.
+/// only [`WINSTA_REQUIRED_FOR_WIN32_INIT`] for that same SID; the adapter never
+/// grants it create-desktop, station-write, clipboard, exit, global-atom, or
+/// security-descriptor access. Read-shaped station rights remain governed by the
+/// station's pre-existing DACL and are not claimed as a confidentiality
+/// boundary. A new window station would be stronger, but `CreateWindowStationW`
+/// requires a host privilege that ordinary interactive users do not have, so
+/// this fails closed rather than silently using the interactive desktop. Any
+/// failure is fatal: the spawn must not fall back to the interactive desktop.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn create_private_desktop(
@@ -1386,7 +1396,6 @@ fn create_private_desktop(
 
     type Handle = *mut core::ffi::c_void;
     type Dword = u32;
-    const WINSTA_REQUIRED_FOR_WIN32_INIT: Dword = 0x000F_037F;
     const DESKTOP_ALL_ACCESS: Dword = 0x000F_01FF;
     const SE_WINDOW_OBJECT: i32 = 7;
 
@@ -1994,8 +2003,9 @@ fn spawn_jailed(
         spawn_after_ms: Some(spawn_after_ms),
     };
     // Persist locator evidence *before* the identity probe. If the daemon dies
-    // in this window, RequestId recovery still has a physical witness.
-    let _ = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator);
+    // in this window, RequestId recovery still has a physical witness. A write
+    // failure means the process exists but its evidence is not durable: report
+    // unknown state with the in-memory locator instead of a clean start.
     let locator_hint = encode_locator_hint_with_kind(
         JAIL_ADAPTER_KIND,
         pid,
@@ -2005,6 +2015,12 @@ fn spawn_jailed(
         &stdout_path,
         &stderr_path,
     );
+    if let Err(err) = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator) {
+        unsafe {
+            CloseHandle(process_info.process);
+        }
+        return Err(err.with_handle_hint(locator_hint));
+    }
     if deadline.is_expired() {
         unsafe {
             TerminateProcess(process_info.process, 1);
@@ -2060,14 +2076,26 @@ fn spawn_jailed(
     unsafe {
         CloseHandle(process_info.process);
     }
-    let _ = write_locator_record(
+    if let Err(err) = write_locator_record(
         &exec_dir,
         JAIL_ADAPTER_KIND,
         &LocatorHandle {
             birth: Some(birth),
             ..locator
         },
-    );
+    ) {
+        return Err(err.with_handle_hint(encode_handle_with_kind(
+            &ParsedHandle {
+                pid,
+                birth,
+                inst: inst.to_string(),
+                request_id: request.request_id().as_str().to_string(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+            },
+            JAIL_ADAPTER_KIND,
+        )));
+    }
 
     Ok(Spawned {
         pid,
@@ -2411,7 +2439,8 @@ fn spawn_jailed(
     };
     // Persist locator evidence before the birth probe. If the daemon is killed
     // in the spawn -> identity window, RequestId recovery still has a witness.
-    let _ = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator);
+    // A failure is not a clean start: the process exists, so the locator must
+    // travel through the handle-hint channel as genuinely unknown state.
     let locator_hint = encode_locator_hint_with_kind(
         JAIL_ADAPTER_KIND,
         pid,
@@ -2421,6 +2450,10 @@ fn spawn_jailed(
         &stdout_path,
         &stderr_path,
     );
+    if let Err(err) = write_locator_record(&exec_dir, JAIL_ADAPTER_KIND, &locator) {
+        detach_reaper(child);
+        return Err(err.with_handle_hint(locator_hint));
+    }
     let birth = match super::process_birth(pid, deadline) {
         Ok(birth) => birth,
         Err(err) => {
@@ -2455,14 +2488,28 @@ fn spawn_jailed(
                 )),
         );
     }
-    let _ = write_locator_record(
+    if let Err(err) = write_locator_record(
         &exec_dir,
         JAIL_ADAPTER_KIND,
         &LocatorHandle {
             birth: Some(birth),
             ..locator
         },
-    );
+    ) {
+        let handle = encode_handle_with_kind(
+            &ParsedHandle {
+                pid,
+                birth,
+                inst: inst.to_string(),
+                request_id: request.request_id().as_str().to_string(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+            },
+            JAIL_ADAPTER_KIND,
+        );
+        detach_reaper(child);
+        return Err(err.with_handle_hint(handle));
+    }
     Ok(Spawned {
         pid,
         birth,
@@ -2471,6 +2518,13 @@ fn spawn_jailed(
         running,
         child,
     })
+}
+
+#[cfg(unix)]
+fn detach_reaper(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Kill and reap a child without ever blocking past the absolute deadline.
@@ -2854,5 +2908,47 @@ mod tests {
         let deadline = AdapterDeadline::after(std::time::Duration::from_secs(10)).unwrap();
         grant_restricted_write(&root, &workspace, "S-1-5-21-11-22-33-44", &deadline)
             .expect("a per-execution SID must be grantable without account lookup");
+    }
+
+    /// The window-station mask must be the minimal initialization set, never
+    /// `WINSTA_ALL_ACCESS | STANDARD_RIGHTS_REQUIRED` (the previous value
+    /// `0x000F_037F`).
+    #[cfg(windows)]
+    #[test]
+    fn window_station_mask_excludes_nonessential_rights() {
+        const WINSTA_ACCESSCLIPBOARD: u32 = 0x0004;
+        const WINSTA_CREATEDESKTOP: u32 = 0x0008;
+        const WINSTA_WRITEATTRIBUTES: u32 = 0x0010;
+        const WINSTA_ACCESSGLOBALATOMS: u32 = 0x0020;
+        const WINSTA_EXITWINDOWS: u32 = 0x0040;
+        const WINSTA_READSCREEN: u32 = 0x0200;
+        const WINSTA_ALL_ACCESS: u32 = 0x037F;
+        const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
+        const FORBIDDEN: u32 = WINSTA_ACCESSCLIPBOARD
+            | WINSTA_CREATEDESKTOP
+            | WINSTA_WRITEATTRIBUTES
+            | WINSTA_ACCESSGLOBALATOMS
+            | WINSTA_EXITWINDOWS
+            | WINSTA_READSCREEN
+            | STANDARD_RIGHTS_REQUIRED;
+
+        assert_eq!(
+            WINSTA_REQUIRED_FOR_WIN32_INIT,
+            WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE
+        );
+        assert_eq!(
+            WINSTA_REQUIRED_FOR_WIN32_INIT & FORBIDDEN,
+            0,
+            "the initialization mask must not contain any nonessential right"
+        );
+        assert_eq!(
+            WINSTA_REQUIRED_FOR_WIN32_INIT & !WINSTA_ALL_ACCESS,
+            0,
+            "every requested right must be a defined WINSTA_* right"
+        );
+        assert_ne!(
+            WINSTA_REQUIRED_FOR_WIN32_INIT, WINSTA_ALL_ACCESS,
+            "the mask must not be the all-access shortcut"
+        );
     }
 }

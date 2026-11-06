@@ -293,18 +293,27 @@ provisioning-capable adapter with real OS enforcement
 (`JailedProcessAgentAdapter`). The adapter's current enforcement claims are:
 per-Execution Windows restricting SID (never the global `S-1-5-12`) with a
 minimal token (only `SeChangeNotifyPrivilege` survives) and a private
-per-Execution desktop, with a direct-ACL write grant only on that jail; Linux
-Landlock ABI >= 3 required so `truncate(2)`/`O_TRUNC` cannot bypass the ruleset;
-one absolute deadline carried through jail creation, ACL, spawn, identity probe
-and cleanup; a durable `locator.json` written immediately after spawn and before
-the identity probe so a crash in that window remains recoverable; and an
-explicit minimal worker environment allowlist instead of daemon inheritance.
-Candidate cooldown is excluded before the probe limit, and the winner's prepare
-budget is created only after winner commit. The E2E Result ACK is
-harness-injected through the durable Kernel command boundary; no production
-worker transport/auth/retry is claimed. The accepted scope label is **typed
-physical execution → durable ACK interface**, not worker-originated end-to-end
-execution. B.5 credential/security import, cold/revivable
+per-Execution desktop, with a direct-ACL write grant only on that jail; the
+current window station receives only the minimal `0x0103` initialization ACE,
+and the write-restricted access check denies `CREATEDESKTOP`,
+`WRITEATTRIBUTES`, `ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, and
+`ALL_ACCESS` (read-shaped station rights remain governed by the station's
+pre-existing DACL and are not claimed as denied); Linux Landlock ABI >= 3
+required so `truncate(2)`/`O_TRUNC` cannot bypass the ruleset, with the boundary
+explicitly limited to **content writes** because Landlock does not mediate
+`chmod`/`utimensat`/`setxattr`; one absolute deadline carried through jail
+creation, ACL, spawn, identity probe and cleanup; a durable `locator.json`
+written immediately after spawn and before the identity probe via an atomic
+temp-file + fsync + rename (+ Unix directory fsync), with the canonical locator
+root bound into the binding key so a `TMPDIR` change cannot silently lose
+recovery, and a failed persistence reported as unknown physical state rather
+than a clean start; and an explicit minimal worker environment allowlist instead
+of daemon inheritance. Candidate cooldown is excluded before the probe limit,
+and the winner's prepare budget is created only after winner commit. The E2E
+Result ACK is harness-injected through the durable Kernel command boundary; no
+production worker transport/auth/retry is claimed. The accepted scope label is
+**typed physical execution → durable ACK interface**, not worker-originated
+end-to-end execution. B.5 credential/security import, cold/revivable
 matching, full typed topology, executed-WARM replacement and database migration
 remain pending and fail closed. The
 [implementation record](../reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md)

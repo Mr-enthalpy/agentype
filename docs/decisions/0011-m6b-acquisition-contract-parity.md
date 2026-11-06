@@ -223,6 +223,15 @@ ReadOnly completion, Write quiescence refusal, late physical end as history).
 The accepted scope label is **typed physical execution → durable ACK interface**;
 the ADR does not claim worker-originated end-to-end execution.
 
+The physical enforcement behind that boundary is also scoped: Windows means a
+per-Execution restricting SID with `WRITE_RESTRICTED`, a minimal
+`0x0103` window-station ACE, and a per-Execution desktop; Linux means a Landlock
+ABI >= 3 **content-write** boundary that does not mediate `chmod`,
+`utimensat`, or `setxattr`. Locator durability is part of the interface: the
+record is atomically replaced and fsynced, the canonical locator root is bound
+into the adapter binding key, and a persistence failure is reported as unknown
+physical state with the in-memory locator rather than a clean start.
+
 ExecutionLaunchSnapshot now carries the optional committed descriptor. The
 trusted unchecked constructor gains this argument because an Execution-only
 capability could not constrain a later free String to immutable provenance.

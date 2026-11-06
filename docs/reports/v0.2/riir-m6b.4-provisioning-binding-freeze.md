@@ -33,14 +33,19 @@ three gaps recorded there:
    (`JailedProcessAgentAdapter`).
 
 This revision starts from the independently re-audited head
-`12a7c0374654a34fb0788023063d538ed4a5fbc1` and closes P1-1, P1-2, P1-3, P2-2
-and P2-3 of that audit: the accepted scope is contracted to **typed physical
-execution → durable ACK interface**, physical locator evidence survives the
-`spawn → identity` window, Windows children keep only
-`SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed daemon
-restart test uses a real process crash over the same store, a mixed legacy/typed
-queue test proves no starvation, and the PR description is re-synchronized with
-the actual head.
+`bf4963370f65cf0c8e20b3869b445d080d6af35d` and closes the follow-up P1/P2
+findings: the Windows window-station ACE is reduced to a verified minimal mask
+with real `OpenWindowStationW` negatives for the write-shaped rights, the Linux
+enforcement claim is contracted to a content-write boundary with real
+`chmod`/`utimensat` counterexamples, and locator persistence is now atomic and
+fsynced with a canonical locator root bound into the physical domain identity.
+The prior round's closure of P1-1, P1-2, P1-3, P2-2 and P2-3 remains in place:
+the accepted scope is **typed physical execution → durable ACK interface**,
+locator evidence survives the `spawn → identity` window, Windows children keep
+only `SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed
+daemon restart test uses a real process crash over the same store, a mixed
+legacy/typed queue test proves no starvation, and the PR description is
+re-synchronized with the actual head.
 
 Deployment remains restricted to fresh schema-v8 databases and reopening
 existing v8 databases. v7→v8 migration is not implemented. The frozen specs
@@ -88,7 +93,19 @@ provisioned.
   whose DACL is extended with `DESKTOP_ALL_ACCESS` for that Execution's
   restricting SID; the creating user's default ACEs remain, so this is
   per-Execution desktop confinement, not a same-user security boundary. The
-  current window station receives the access required for Win32 initialization.
+  current window station receives only the minimal Win32-initialization grant
+  `WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ENUMERATE` (`0x0103`)
+  for that Execution's restricting SID. Because the token is
+  `WRITE_RESTRICTED`, that ACE governs write-shaped station access: the worker
+  is denied `WINSTA_CREATEDESKTOP`, `WINSTA_WRITEATTRIBUTES`,
+  `WINSTA_ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, and `WINSTA_ALL_ACCESS`
+  by real `OpenWindowStationW` access checks inside the worker. Read-shaped
+  rights (`ENUMDESKTOPS`, `READATTRIBUTES`, `ENUMERATE`, `ACCESSGLOBALATOMS`,
+  `EXITWINDOWS`, `READSCREEN`) are evaluated with the token's normal SIDs
+  against WinSta0's pre-existing DACL; they are not granted by this ACE and are
+  reported honestly by the probe rather than claimed as denied. This adapter
+  therefore claims per-Execution write containment and desktop confinement, not
+  same-user read confidentiality or a hostile-code sandbox.
   A new window station is attempted only if the host privilege exists;
   `CreateWindowStationW` returns `ERROR_ACCESS_DENIED` for ordinary interactive
   users, so the adapter fails closed rather than silently using the interactive
@@ -108,7 +125,12 @@ provisioned.
   which bypasses `WRITE_FILE`. `start_execution` and the child ruleset both
   reject older ABIs rather than claiming enforcement. `ReadOnly` installs no
   path rule; `Write` installs one path-beneath rule for the per-execution jail
-  root covering write-class rights including `TRUNCATE`.
+  root covering write-class rights including `TRUNCATE`. This is a
+  **content-write boundary**: Landlock does not mediate metadata syscalls, so
+  `chmod`, `utimensat`, and `setxattr` outside the jail are explicitly not
+  confined. The two Linux counterexample tests assert both the denied content
+  write and the succeeding metadata change in `ReadOnly` and `Write`; no claim
+  here says the jail makes the rest of the filesystem immutable.
 - Other hosts: the enforceable-workspace set is empty, so B.4 rejects the
   adapter; `start_execution` also fails closed.
 
@@ -134,12 +156,35 @@ against another physical installation.
 between OS spawn and that probe previously left no durable physical evidence.
 The adapters now write `locator.json` **immediately after spawn and before the
 identity probe** under
-`<temp>/agentype-jail-exec-<request_id>/locator.json` (jail) or
-`<temp>/agentype-exec-<request_id>/locator.json` (legacy local process). The
-record carries `v`, `kind`, `pid`, `inst`, `request_id`, stdout/stderr paths,
+`<locator_root>/agentype-jail-exec-<request_id>/locator.json` (jail) or
+`<locator_root>/agentype-exec-<request_id>/locator.json` (legacy local process).
+The record carries `v`, `kind`, `pid`, `inst`, `request_id`, stdout/stderr paths,
 optional `birth`, optional `spawn_after_ms`, plus
 `identity_complete=false` and `reconnectable=false`.
 
+`locator_root` is `std::env::temp_dir()` canonicalized exactly once per process
+and is bound into the binding key as `:locroot=<path>`. A restarted Scheduler
+that resolves a different `TMPDIR`/`TEMP` therefore computes a different
+`adapter_binding_key` and cannot mistake the old physical domain for a domain it
+can still recover; the cross-process test
+`domain_key_binds_the_locator_root_across_processes` proves the key changes and
+stays stable per root.
+
+Persistence is not best effort:
+
+- The record is written to a unique `.locator.<pid>.<n>.tmp` file with
+  `create_new`, `write_all`, and `sync_all`, then atomically renamed over
+  `locator.json`; Unix also fsyncs the containing directory. An interrupted
+  overwrite leaves either the previous whole record or the new whole record,
+  never a truncated one. `interrupted_locator_rewrite_cannot_destroy_the_previous_record`
+  and the Unix `failed_locator_write_preserves_the_previous_record` cover this.
+- A failed initial or upgrade write after a real spawn is not reported as a
+  clean start and not retried blindly. The adapter returns `Unavailable` with
+  the in-memory locator as `runtime_handle_hint`; the runtime records genuinely
+  unknown physical state, and
+  `locator_write_failure_leaves_the_started_process_unknown_but_controllable`
+  proves a fresh adapter can still observe and terminate that exact process
+  from the hint.
 - `reconcile_start` accepts the locator and, when `birth` is absent, verifies a
   non-impersonating physical witness before adopting a numeric pid. On Windows
   the witness is the per-Execution restricting SID on the process token; on
@@ -148,7 +193,7 @@ optional `birth`, optional `spawn_after_ms`, plus
 - `observe_execution`, `interrupt_execution`, `terminate_execution`, and
   `collect_outcome` resolve a locator directly, so the process remains
   controllable after the daemon restarts without a persisted pinned handle.
-- Once the birth identity is known, the locator is upgraded in place. A crash
+- Once the birth identity is known, the locator is upgraded atomically. A crash
   after spawn but before the upgrade still yields a recoverable locator, never a
   blind respawn.
 - No path treats "kill was called" as quiescence. Absence of a process produces
@@ -161,8 +206,11 @@ The Windows child token keeps only `SeChangeNotifyPrivilege`. A per-Execution
 desktop is created and its DACL is extended with `DESKTOP_ALL_ACCESS` for that
 Execution's restricting SID; the creating user's default ACEs remain, so this
 is per-Execution desktop confinement, not a same-user security boundary. The
-current window station is extended with the access required for Win32
-initialization. The parent-side desktop handle is retained
+current window station receives only the minimal initialization mask (`0x0103`).
+The `WRITE_RESTRICTED` access check denies the restricting SID every
+write-shaped station right; the probe records both the denied rights and the
+read-shaped rights inherited from the station's existing DACL, so the report
+does not overclaim. The parent-side desktop handle is retained
 until `collect_outcome` observes process exit, because closing it while the
 child is still initializing user32 causes `STATUS_DLL_INIT_FAILED`. If either
 the privilege reduction or the private desktop/ACL step fails, the spawn fails
@@ -186,11 +234,12 @@ for arbitrary malicious code.
 | Absolute deadlines across physical phases | Preserved | One `AdapterDeadline` is carried through jail creation, ACL, spawn, identity probe and cleanup; `expired_start_deadline_creates_no_jail_directory`, `expired_prepare_deadline_creates_no_directory`, `deadline_expiring_between_phases_stops_before_the_next_phase`, and Linux `cleanup_never_blocks_past_an_expired_deadline` |
 | Worker environment isolation | Preserved | Explicit allowlist on both platforms; `worker_does_not_inherit_daemon_secrets_but_keeps_runtime_variables` |
 | Per-Execution write authorization | Preserved | RequestId-derived restricting SID granted only on that jail; Windows `write_a_cannot_write_read_only_b_jail` and `write_a_cannot_write_write_b_jail` |
-| Recoverable locator after spawn | Preserved | `locator.json` written before the birth probe; `born_less_locator_is_recovered_after_the_spawn_identity_window`, `durable_locator_controls_the_process_after_adapter_restart`, impersonation negative |
-| Windows minimum privilege and private desktop | Preserved | `worker_token_is_minimal_and_desktop_is_private`; only `SeChangeNotifyPrivilege` survives; `Default`/input desktop opens fail |
+| Recoverable locator after spawn | Preserved | `locator.json` written before the birth probe with an atomic temp-file + fsync + rename (+ Unix directory fsync); locator root bound into the binding key; `born_less_locator_is_recovered_after_the_spawn_identity_window`, `durable_locator_controls_the_process_after_adapter_restart`, `interrupted_locator_rewrite_cannot_destroy_the_previous_record`, `locator_write_failure_leaves_the_started_process_unknown_but_controllable`, `domain_key_binds_the_locator_root_across_processes`, impersonation negative |
+| Windows minimum privilege and private desktop | Preserved | `worker_token_is_minimal_and_desktop_is_private`; only `SeChangeNotifyPrivilege` survives; `Default`/input desktop opens fail; real `OpenWindowStationW` checks deny `CREATEDESKTOP`, `WRITEATTRIBUTES`, `ACCESSCLIPBOARD`, `STANDARD_RIGHTS_REQUIRED`, `ALL_ACCESS`; `window_station_mask_excludes_nonessential_rights` proves the adapter mask is `0x0103` |
 | Real daemon-crash restart with same physical instance | Preserved | `typed_daemon_restart_recovers_the_same_physical_instance` (separate child process aborts; parent reopens same DB) |
 | Legacy and typed queues share the control loop without starvation | Preserved | `legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue` |
 | Linux truncate enforcement | Preserved | Landlock ABI >= 3 gate; `legacy_landlock_abis_are_not_enforceable`; Linux `ftruncate`/`open(O_TRUNC)` denial outside the jail and truncate allowance inside a Write jail |
+| Linux enforcement boundary is content writes, not metadata | Contracted | `linux_read_only_landlock_is_a_content_write_boundary_not_metadata_immutability` and `linux_write_landlock_is_a_content_write_boundary_not_metadata_immutability` assert the outside content write is denied while `chmod`/`utimensat` (and `setxattr` when supported) succeed |
 | Exact `(adapter_kind, adapter_binding_key)` recovery | Preserved | M5 recovery tests; retention of resolved adapter instance in typed handoff |
 | M5 writer safety and absolute deadlines | Preserved | Write E2E refuses ACK without quiescence; runtime deadline/writer suites |
 | Process lock, ReadyPermit, recover-before-dispatch | Preserved | Daemon startup unchanged; full process-lock/supervision suites |
@@ -211,14 +260,14 @@ cargo test -p agentype-adapter-local-process --test typed_e2e \
 Captured:
 
 ```text
-typed-e2e trace: task=task_4437df37a9994db6b05f33389be0786b
-  execution=exec_6f252b30b8ca468c9dad77ad6610d6c8
-  request=request_53696691a4e647a597f3259309e3e99d
-  adapter=jailed_process/win:UFO:79922a1d-4f10-11f0-b487-b0f7f68c8b54
+typed-e2e trace: task=task_1eb730a572a64f1280b95e953de1c640
+  execution=exec_a56a49b407d14cb0815fe80fdf4a201b
+  request=request_78a0ac7e64924981926597c1c75ffb46
+  adapter=jailed_process/win:UFO:79922a1d-4f10-11f0-b487-b0f7f68c8b54:locroot=\\?\C:\Users\hanni\Desktop\agentype\target\test-tmp
   protocol=agentype.workspace-jail/v1
-  jail=...\jail-base\agentype-jail-request_53696691a4e647a597f3259309e3e99d
-  agent=agent_02c38861449d4209ac0e97e30758858e
-typed-e2e ack: task=Completed result=result_7ce9214bc9a24769b2120db395535e3b physical_state=Succeeded
+  jail=...\jail-base\agentype-jail-request_78a0ac7e64924981926597c1c75ffb46
+  agent=agent_46b385b4deb042869d6fc6faa1de9dad
+typed-e2e ack: task=Completed result=result_184bb188081545468e1f00d4386448a8 physical_state=Succeeded
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 filtered out
 ```
 
@@ -343,9 +392,16 @@ reverts to NOT FROZEN.
   new window station requires a privilege ordinary interactive users do not
   have (`CreateWindowStationW` → `ERROR_ACCESS_DENIED`). The adapter therefore
   fails closed on any private-desktop/ACL failure and never falls back to the
-  interactive desktop. The result is workspace/desktop confinement, not a
-  general malicious-code sandbox or a claim of resistance to every adversarial
-  window-message attack.
+  interactive desktop. `WRITE_RESTRICTED` denies the restricting SID every
+  write-shaped station right, but read-shaped rights (`ENUMDESKTOPS`,
+  `READATTRIBUTES`, `ENUMERATE`, `ACCESSGLOBALATOMS`, `EXITWINDOWS`,
+  `READSCREEN`) are evaluated against WinSta0's pre-existing DACL and are not
+  removed by this adapter. They are recorded by `isolation_probe`; the claim is
+  workspace/desktop write confinement, not same-user read confidentiality or a
+  general malicious-code sandbox.
+- **Linux metadata**: Landlock does not mediate `chmod`, `utimensat`, or
+  `setxattr`. The Linux claim is therefore a content-write boundary, proven by
+  the two metadata counterexample tests, not filesystem immutability.
 - **Windows ACL mechanism**: direct security APIs replace `icacls`, which
   cannot map an arbitrary per-execution SID (error 1332). The ACE is applied to
   the jail root and workspace, not recursively to pre-existing content.

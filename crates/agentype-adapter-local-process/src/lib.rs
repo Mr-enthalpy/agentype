@@ -19,7 +19,8 @@ use agentype_core::{ExecutionState, RequestId};
 use agentype_execution_config::AdapterBindingKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -192,6 +193,7 @@ fn capture_domain_key() -> AdapterResult<AdapterBindingKey> {
 }
 
 fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
+    let locator_root = locator_root();
     #[cfg(target_os = "linux")]
     {
         let boot = read_trimmed("/proc/sys/kernel/random/boot_id")
@@ -205,6 +207,7 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
             &mnt_ns,
             &root_dev.to_string(),
             &root_ino.to_string(),
+            &locator_root,
         )
     }
     #[cfg(windows)]
@@ -216,8 +219,7 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
             .ok_or_else(|| AdapterError::unavailable("windows COMPUTERNAME unavailable"))?;
         let boot = windows_boot_identifier()
             .ok_or_else(|| AdapterError::unavailable("windows boot identifier unavailable"))?;
-        AdapterBindingKey::new(format!("win:{host}:{boot}"))
-            .map_err(|_| AdapterError::unavailable("windows domain key invalid"))
+        windows_domain_key(&host, &boot, &locator_root)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -227,6 +229,24 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
     }
 }
 
+/// The directory that holds durable locator records.
+///
+/// It is resolved exactly once per process. Every execution directory and the
+/// adapter binding key are derived from this same value, so a later `TMPDIR`
+/// or `TEMP` change cannot redirect this adapter to a different locator tree
+/// while the domain key still claims the old physical identity. A restarted
+/// adapter with a different configured temporary directory therefore computes
+/// a different binding key and is treated as a different physical domain
+/// instead of silently losing recovery evidence.
+pub(crate) fn locator_root() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let configured = std::env::temp_dir();
+        fs::canonicalize(&configured).unwrap_or(configured)
+    })
+    .clone()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn linux_domain_key(
     boot: &str,
@@ -234,6 +254,7 @@ fn linux_domain_key(
     mnt_ns: &str,
     root_dev: &str,
     root_ino: &str,
+    locator_root: &Path,
 ) -> AdapterResult<AdapterBindingKey> {
     let parts = [boot, pid_ns, mnt_ns, root_dev, root_ino];
     if parts.iter().any(|p| p.trim().is_empty()) {
@@ -246,10 +267,37 @@ fn linux_domain_key(
             "linux domain identity cannot use unknown placeholders",
         ));
     }
+    let locator_root = locator_root.to_string_lossy();
+    if locator_root.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "linux locator root cannot be empty",
+        ));
+    }
     AdapterBindingKey::new(format!(
-        "linux:{boot}:{pid_ns}:{mnt_ns}:{root_dev}:{root_ino}"
+        "linux:{boot}:{pid_ns}:{mnt_ns}:{root_dev}:{root_ino}:locroot={locator_root}"
     ))
     .map_err(|_| AdapterError::unavailable("linux domain key invalid"))
+}
+
+#[cfg(windows)]
+fn windows_domain_key(
+    host: &str,
+    boot: &str,
+    locator_root: &Path,
+) -> AdapterResult<AdapterBindingKey> {
+    if host.trim().is_empty() || boot.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "windows domain identity components cannot be empty",
+        ));
+    }
+    let locator_root = locator_root.to_string_lossy();
+    if locator_root.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "windows locator root cannot be empty",
+        ));
+    }
+    AdapterBindingKey::new(format!("win:{host}:{boot}:locroot={locator_root}"))
+        .map_err(|_| AdapterError::unavailable("windows domain key invalid"))
 }
 
 #[cfg(target_os = "linux")]
@@ -537,17 +585,22 @@ pub(crate) fn locator_record_path(exec_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn legacy_exec_dir(request_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("agentype-exec-{request_id}"))
+    locator_root().join(format!("agentype-exec-{request_id}"))
 }
 
 pub(crate) fn jail_exec_dir(request_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("agentype-jail-exec-{request_id}"))
+    locator_root().join(format!("agentype-jail-exec-{request_id}"))
 }
 
-/// Persist locator evidence before the identity probe. This is best effort only
-/// for pure I/O failure; callers must still attach the in-memory locator to the
-/// returned error so a surviving daemon can persist it through the normal
-/// handle-hint channel.
+/// Persist locator evidence before the identity probe.
+///
+/// The record is written to a unique temporary file in the execution
+/// directory, flushed, and atomically renamed over `locator.json`. A crash
+/// during an overwrite therefore leaves either the previous complete record or
+/// the new complete record, never a truncated one. Callers must treat a
+/// failure as a real unknown-state boundary: the process already exists, so
+/// the error carries the in-memory locator for the daemon's handle-hint
+/// channel; it must not be reported as a clean start.
 pub(crate) fn write_locator_record(
     exec_dir: &Path,
     kind: &str,
@@ -571,8 +624,53 @@ pub(crate) fn write_locator_record(
     if let Some(spawn_after_ms) = locator.spawn_after_ms {
         value["spawn_after_ms"] = json!(spawn_after_ms);
     }
-    fs::write(&path, value.to_string())
+    write_locator_atomically(&path, value.to_string().as_bytes())
         .map_err(|_| AdapterError::unavailable("cannot persist process locator record"))
+}
+
+fn write_locator_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "locator path has no parent directory",
+        )
+    })?;
+    let mut attempt = 0u32;
+    let temp = loop {
+        let candidate = parent.join(format!(".locator.{}.{}.tmp", std::process::id(), attempt));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                break candidate;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 32 => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    // `std::fs::rename` replaces the destination on Unix and on Windows
+    // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), so the canonical
+    // record is never truncated in place.
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        // Make the directory entry durable too; otherwise a crash after the
+        // rename may still leave the previous name on some filesystems.
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn read_locator_record(
@@ -1384,9 +1482,14 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         };
         // Durable evidence exists before the identity probe. If the daemon is
         // killed in the spawn -> identity window, RequestId recovery can still
-        // find the physical process (or prove it is gone).
-        let _ = write_locator_record(&exec_dir, ADAPTER_KIND, &locator_before_identity);
+        // find the physical process (or prove it is gone). A failure here is
+        // not a clean start: the process exists, so the locator must travel
+        // through the handle-hint channel and the runtime must record unknown
+        // physical state.
         let hint = locator_before_identity.to_runtime_handle(ADAPTER_KIND);
+        if let Err(err) = write_locator_record(&exec_dir, ADAPTER_KIND, &locator_before_identity) {
+            return Err(err.with_handle_hint(hint));
+        }
         if let Err(err) = require_deadline(
             deadline,
             "start deadline exhausted after spawn",
@@ -1413,7 +1516,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             stderr_path: stderr_path.clone(),
         };
         let handle = encode_handle(&parsed);
-        let _ = write_locator_record(
+        if let Err(err) = write_locator_record(
             &exec_dir,
             ADAPTER_KIND,
             &LocatorHandle {
@@ -1425,7 +1528,13 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                 stderr_path: stderr_path.clone(),
                 spawn_after_ms: Some(spawn_after_ms),
             },
-        );
+        ) {
+            // The pre-birth locator is still intact (atomic replacement), so
+            // recovery is not lost; but the upgrade failure is not silently
+            // ignored. Returning the exact pin keeps the process controllable
+            // while the runtime records an unresolved start.
+            return Err(err.with_handle_hint(handle));
+        }
         require_deadline(
             deadline,
             "start deadline exhausted after spawn",
@@ -2061,6 +2170,7 @@ mod tests {
 
     #[test]
     fn domain_key_rejects_empty_or_unknown_placeholders() {
+        let locator_root = Path::new("/var/tmp/agentype");
         for (boot, pid, mnt, root_dev, root_ino) in [
             ("", "pid:[1]", "mnt:[1]", "1", "2"),
             ("boot", "", "mnt:[1]", "1", "2"),
@@ -2070,17 +2180,37 @@ mod tests {
             ("unknown-boot", "pid:[1]", "mnt:[1]", "1", "2"),
             ("boot", "unknown-ns", "mnt:[1]", "1", "2"),
         ] {
-            let err = linux_domain_key(boot, pid, mnt, root_dev, root_ino).unwrap_err();
+            let err =
+                linux_domain_key(boot, pid, mnt, root_dev, root_ino, locator_root).unwrap_err();
             assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
         }
-        let key = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "1").unwrap();
-        assert_eq!(key.as_str(), "linux:boot-id:pid:[1]:mnt:[2]:8:1");
+        let key =
+            linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "1", locator_root).unwrap();
+        assert_eq!(
+            key.as_str(),
+            "linux:boot-id:pid:[1]:mnt:[2]:8:1:locroot=/var/tmp/agentype"
+        );
         assert!(!key.as_str().contains("unknown"));
-        let other = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "99").unwrap();
+        let other =
+            linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "99", locator_root).unwrap();
         assert_ne!(
             key.as_str(),
             other.as_str(),
             "same ns with different root must not share a binding key"
+        );
+        let other_root = linux_domain_key(
+            "boot-id",
+            "pid:[1]",
+            "mnt:[2]",
+            "8",
+            "1",
+            Path::new("/other"),
+        )
+        .unwrap();
+        assert_ne!(
+            key.as_str(),
+            other_root.as_str(),
+            "a different locator root must not share a binding key"
         );
     }
 
@@ -2144,6 +2274,84 @@ mod tests {
         assert!(
             read_locator_record(&root, ADAPTER_KIND, &RequestId::new()).is_none(),
             "a locator must never cross RequestId identities"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interrupted_locator_rewrite_cannot_destroy_the_previous_record() {
+        let root = std::env::temp_dir().join(format!("agentype-locator-atomic-{}", unix_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let request_id = RequestId::new();
+        let first = LocatorHandle {
+            pid: 4242,
+            birth: None,
+            inst: "instance".into(),
+            request_id: request_id.as_str().to_string(),
+            stdout_path: root.join("stdout.txt"),
+            stderr_path: root.join("stderr.txt"),
+            spawn_after_ms: Some(1234),
+        };
+        write_locator_record(&root, ADAPTER_KIND, &first).unwrap();
+        // Simulate a crash between temp-file creation/write and the atomic
+        // rename: a truncated temp file exists beside the canonical record.
+        fs::write(root.join(".locator.9999.0.tmp"), b"{\"v\":1,\"pid\":trunc").unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(first.clone()),
+            "a partial temp file must never replace or corrupt the canonical record"
+        );
+
+        let second = LocatorHandle {
+            birth: Some(99),
+            ..first.clone()
+        };
+        write_locator_record(&root, ADAPTER_KIND, &second).unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(second),
+            "a completed overwrite is a whole-record replacement"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_locator_write_preserves_the_previous_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("agentype-locator-fail-{}", unix_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let request_id = RequestId::new();
+        let first = LocatorHandle {
+            pid: 4242,
+            birth: None,
+            inst: "instance".into(),
+            request_id: request_id.as_str().to_string(),
+            stdout_path: root.join("stdout.txt"),
+            stderr_path: root.join("stderr.txt"),
+            spawn_after_ms: Some(1234),
+        };
+        write_locator_record(&root, ADAPTER_KIND, &first).unwrap();
+
+        let mut perms = fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&root, perms).unwrap();
+        let second = LocatorHandle {
+            birth: Some(99),
+            ..first.clone()
+        };
+        let err = write_locator_record(&root, ADAPTER_KIND, &second)
+            .expect_err("a read-only directory must fail the atomic replace");
+        assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+
+        let mut perms = fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&root, perms).unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(first),
+            "a failed overwrite must leave the previous durable record intact"
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -321,6 +321,61 @@ fn worker_token_is_minimal_and_desktop_is_private() {
         Some(false),
         "worker must not open the input desktop"
     );
+
+    let access = probe
+        .get("winsta_access")
+        .expect("the isolation probe reports real window-station access checks");
+    for allowed in ["enumdesktops", "readattributes", "enumerate"] {
+        assert_eq!(
+            access.get(allowed).and_then(Value::as_bool),
+            Some(true),
+            "the worker must retain {allowed} for Win32 initialization: {out:?} {err:?}"
+        );
+    }
+    // The token is write-restricted: the restricting SID controls write-shaped
+    // window-station access. None of these may be openable.
+    for forbidden in [
+        "createdesktop",
+        "writeattributes",
+        "accessclipboard",
+        "standard_rights_required",
+        "all_access",
+    ] {
+        assert_eq!(
+            access.get(forbidden).and_then(Value::as_bool),
+            Some(false),
+            "the restricting SID must not be able to open the window station with {forbidden}: {out:?} {err:?}"
+        );
+    }
+    // A write right must stay denied even when requested together with a
+    // read right the interactive session already holds.
+    assert_eq!(
+        access
+            .get("readscreen_plus_createdesktop")
+            .and_then(Value::as_bool),
+        Some(false),
+        "requesting a read right must not smuggle in createdesktop: {out:?} {err:?}"
+    );
+    // These rights are read-shaped. A write-restricted token evaluates them
+    // with the normal SIDs against WinSta0's existing DACL, so the interactive
+    // session's default ACEs allow them. The adapter's minimal ACE (0x0103) is
+    // not their source, and this adapter does not claim same-user read
+    // confidentiality. The probe records them so the documented claim stays
+    // honest instead of implying the adapter denies them.
+    for preexisting in [
+        "enumdesktops",
+        "readattributes",
+        "enumerate",
+        "accessglobalatoms",
+        "exitwindows",
+        "readscreen",
+    ] {
+        assert_eq!(
+            access.get(preexisting).and_then(Value::as_bool),
+            Some(true),
+            "the probe must record the station's pre-existing {preexisting} capability so the claim stays honest: {out:?} {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -572,6 +627,96 @@ fn linux_write_allows_truncate_inside_jail() {
     assert_eq!(fs::metadata(&written).unwrap().len(), 0);
 }
 
+/// Landlock mediates content writes, creation, deletion, rename, and truncate,
+/// but it does not mediate metadata syscalls such as `chmod`, `utimensat`, or
+/// `setxattr`. The report and ADR therefore contract the Linux jail to a
+/// content-write boundary rather than full filesystem immutability. This test
+/// keeps that contract honest with a real OS counterexample: while the content
+/// write outside the jail is denied, the metadata change succeeds.
+#[cfg(target_os = "linux")]
+fn assert_metadata_outside_is_not_landlock_mediated(mode: WorkspaceMode, tag: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let jail_root = unique_dir(tag);
+    let outside_dir = unique_dir(&format!("{tag}-target"));
+    let outside = outside_dir.join("owned.txt");
+    fs::write(&outside, b"do-not-change").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+    let outside_arg = outside.to_string_lossy().into_owned();
+    let descriptor = descriptor(
+        &jail_root,
+        &[
+            "--write-probe",
+            &outside_arg,
+            "--metadata-probe",
+            &outside_arg,
+        ],
+    );
+    let request = request_with(
+        mode,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+
+    let (_handle, probes, out, err) = run_probes(&request);
+    let label = |name: &str| {
+        probes
+            .iter()
+            .find(|probe| probe["probe"]["label"] == name)
+            .unwrap_or_else(|| panic!("{name} probe did not run: {out:?} {err:?}"))
+    };
+
+    let write = label("write");
+    assert!(
+        !probe_ok(write),
+        "{mode:?} must still deny content writes outside the jail: {write}"
+    );
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"do-not-change",
+        "the content write must not have modified the outside file"
+    );
+
+    let chmod = label("chmod");
+    assert!(
+        probe_ok(chmod),
+        "{mode:?} Landlock does not mediate chmod; the documented content-write boundary expects this metadata change to succeed: {chmod}"
+    );
+    assert_eq!(
+        fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the counterexample must actually observe the metadata change"
+    );
+
+    let utimensat = label("utimensat");
+    assert!(
+        probe_ok(utimensat),
+        "{mode:?} Landlock does not mediate utimensat; the documented content-write boundary expects this metadata change to succeed: {utimensat}"
+    );
+
+    let setxattr = label("setxattr");
+    if !probe_ok(setxattr) {
+        let errno = setxattr["probe"]["errno"].as_i64().unwrap_or(0);
+        assert!(
+            errno == 95 || errno == 38,
+            "{mode:?} setxattr failed for an unexpected reason, which would hide the documented gap: {setxattr}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_read_only_landlock_is_a_content_write_boundary_not_metadata_immutability() {
+    assert_metadata_outside_is_not_landlock_mediated(WorkspaceMode::ReadOnly, "ro-metadata");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_write_landlock_is_a_content_write_boundary_not_metadata_immutability() {
+    assert_metadata_outside_is_not_landlock_mediated(WorkspaceMode::Write, "wr-metadata");
+}
+
 fn jail_exec_dir(request: &EnvironmentStartRequest) -> PathBuf {
     std::env::temp_dir().join(format!(
         "agentype-jail-exec-{}",
@@ -782,4 +927,59 @@ fn born_less_locator_cannot_impersonate_an_unrelated_pid() {
         "a numeric pid without the per-execution restricting SID must not be adopted: {:?}",
         observation.detail
     );
+}
+
+/// A process that was really started but whose locator cannot be persisted must
+/// not be reported as a clean start or assumed absent. The adapter returns an
+/// unknown-state boundary carrying the in-memory locator, and a restarted
+/// adapter can still observe and terminate that exact process through the hint.
+#[test]
+fn locator_write_failure_leaves_the_started_process_unknown_but_controllable() {
+    let jail_root = unique_dir("locator-write-failure");
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    let request = request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    );
+    let exec_dir = jail_exec_dir(&request);
+    fs::create_dir_all(&exec_dir).unwrap();
+    // A real write failure after spawn: the atomic replacement cannot rename a
+    // regular file over a directory. The child is already running at this point.
+    fs::create_dir(exec_dir.join("locator.json")).unwrap();
+
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let err = adapter
+        .start_execution(&request, &long_deadline())
+        .expect_err("an unpersistable locator cannot be reported as a clean start");
+    assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+    let hint = err
+        .runtime_handle_hint()
+        .expect("the in-memory locator must travel with the unknown-state error")
+        .clone();
+    let locator = hint.0.as_object().expect("locator object");
+    assert_eq!(
+        locator.get("request_id").and_then(Value::as_str),
+        Some(request.request_id().as_str())
+    );
+    assert_eq!(
+        locator.get("identity_complete").and_then(Value::as_bool),
+        Some(false)
+    );
+    let pid = locator
+        .get("pid")
+        .and_then(Value::as_u64)
+        .expect("locator pid") as u32;
+    assert_ne!(pid, 0);
+
+    let second = JailedProcessAgentAdapter::try_new().unwrap();
+    let observed = second
+        .observe_execution(&hint, &long_deadline())
+        .expect("the locator hint must let a fresh adapter observe the live process");
+    assert_eq!(observed.state, ExecutionState::Running);
+    let terminated = second
+        .terminate_execution(&hint, &long_deadline())
+        .expect("the locator hint must let a fresh adapter terminate the live process");
+    assert_eq!(terminated.state, ExecutionState::Terminated);
 }
