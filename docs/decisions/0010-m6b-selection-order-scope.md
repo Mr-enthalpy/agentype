@@ -27,10 +27,13 @@ This ADR scopes what B.4 actually implements and what remains deferred.
 2. **Availability and cost/resource ranking are not implemented and are not
    replaced by an invented rule.** The durable model has no availability or cost
    fact for a candidate, so when more than one candidate is tied on continuity
-   the selection is **unresolved and fails closed** (`SelectionAmbiguous`, mapped
-   to `RESOURCE_UNAVAILABLE`). A stable-identity tie-break is deliberately NOT
-   used: deterministic ordering is not the frozen selection semantics, and a
-   B.4 milestone MUST NOT silently rewrite spec 07's MUST.
+   the selection is **unresolved and fails closed** (`SelectionAmbiguous`).
+   Because this is resolved before acquisition, the Scheduler defers the Task:
+   no Attempt is created and no `RESOURCE_UNAVAILABLE` NACK is emitted; the Task
+   stays QUEUED and is re-probed after the ambiguity cooldown or a frontier
+   change. A stable-identity tie-break is deliberately NOT used: deterministic
+   ordering is not the frozen selection semantics, and a B.4 milestone MUST NOT
+   silently rewrite spec 07's MUST.
 
 3. **Selection is part of the authority path.** The authority-bearing runtime
    facade re-enumerates the eligible candidate set, selects the winner, and

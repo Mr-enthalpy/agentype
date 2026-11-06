@@ -326,6 +326,61 @@ impl JailedProcessAgentAdapter {
         }
     }
 
+    /// Resolve a durable locator into control authority.
+    ///
+    /// On Windows a locator without a recorded birth has no creation-time
+    /// identity. The per-Execution restricting SID is the only non-impersonating
+    /// witness, so it is proved from one open process handle that is retained in
+    /// the result. A failed witness is `unproven`, never a PID-derived identity.
+    fn resolve_locator(
+        &self,
+        locator: LocatorHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ControlResolution> {
+        let stdout_path = locator.stdout_path.clone();
+        let stderr_path = locator.stderr_path.clone();
+        #[cfg(windows)]
+        if locator.birth.is_none() {
+            let sid = restricting_sid(&locator.request_id);
+            return match super::pin::prove_windows_instance(
+                locator.pid,
+                None,
+                Some(&sid),
+                deadline,
+            )? {
+                super::pin::ProvenOutcome::Proven(proven) => Ok(ControlResolution {
+                    parsed: Some(locator.into_parsed(proven.birth())),
+                    stdout_path,
+                    stderr_path,
+                    unproven: false,
+                    proven: Some(proven),
+                }),
+                super::pin::ProvenOutcome::Gone => Ok(ControlResolution {
+                    parsed: None,
+                    stdout_path,
+                    stderr_path,
+                    unproven: false,
+                    proven: None,
+                }),
+                super::pin::ProvenOutcome::Mismatch => Ok(ControlResolution {
+                    parsed: None,
+                    stdout_path,
+                    stderr_path,
+                    unproven: true,
+                    proven: None,
+                }),
+            };
+        }
+        Ok(ControlResolution {
+            parsed: resolve_locator_to_parsed(locator, deadline)?,
+            stdout_path,
+            stderr_path,
+            unproven: false,
+            #[cfg(windows)]
+            proven: None,
+        })
+    }
+
     fn control_parsed(
         &self,
         handle: &RuntimeHandle,
@@ -336,16 +391,33 @@ impl JailedProcessAgentAdapter {
                 stdout_path: parsed.stdout_path.clone(),
                 stderr_path: parsed.stderr_path.clone(),
                 parsed: Some(parsed),
+                unproven: false,
+                #[cfg(windows)]
+                proven: None,
             }),
-            PhysicalControlHandle::Locator(locator) => {
-                let stdout_path = locator.stdout_path.clone();
-                let stderr_path = locator.stderr_path.clone();
-                Ok(ControlResolution {
-                    parsed: resolve_locator_to_parsed(locator, deadline)?,
-                    stdout_path,
-                    stderr_path,
-                })
-            }
+            PhysicalControlHandle::Locator(locator) => self.resolve_locator(locator, deadline),
+        }
+    }
+
+    /// Presence for an already-resolved control identity. A Windows proof
+    /// handle is used directly, so liveness cannot be observed on a recycled
+    /// PID after the witness was checked.
+    fn presence_for_resolution(
+        &self,
+        resolution: &ControlResolution,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<InstancePresence> {
+        #[cfg(windows)]
+        if let Some(proven) = &resolution.proven {
+            return Ok(if proven.is_alive(deadline)? {
+                InstancePresence::Running
+            } else {
+                InstancePresence::Ended
+            });
+        }
+        match &resolution.parsed {
+            Some(parsed) => self.presence_for(parsed, deadline),
+            None => Ok(InstancePresence::Ended),
         }
     }
 }
@@ -456,7 +528,7 @@ fn safe_component(value: &str) -> String {
 /// never authorize another Execution (which carries a different SID).
 /// `S-1-5-12` is deliberately not used: it is a well-known, process-global code
 /// SID shared by every restricted token.
-fn restricting_sid(request_id: &RequestId) -> String {
+fn restricting_sid(request_id: &str) -> String {
     fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
         let mut hash = seed;
         for byte in bytes {
@@ -465,7 +537,7 @@ fn restricting_sid(request_id: &RequestId) -> String {
         }
         hash
     }
-    let raw = request_id.as_str().as_bytes();
+    let raw = request_id.as_bytes();
     let a = fnv1a(0xcbf2_9ce4_8422_2325, raw) as u32 | 1;
     let b = (fnv1a(0x9e37_79b9_7f4a_7c15, raw) >> 32) as u32 | 1;
     let c = fnv1a(0x85eb_ca6b, raw) as u32 | 1;
@@ -570,7 +642,7 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
                 "Landlock ABI 3 or newer is required to deny truncate(2)",
             ));
         }
-        let sid = restricting_sid(request.request_id());
+        let sid = restricting_sid(request.request_id().as_str());
         let (root, workspace) = prepare_jail(
             &descriptor,
             request.request_id(),
@@ -634,15 +706,16 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "observe deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
             return qualify_ok(
                 deadline,
                 "observe deadline exhausted",
                 Some(handle),
-                liveness_observation(InstancePresence::Ended),
+                liveness_observation(InstancePresence::Absent),
             );
-        };
-        let presence = self.presence_for(&parsed, deadline)?;
+        }
+        let presence = self.presence_for_resolution(&resolution, deadline)?;
         require_deadline(deadline, "observe deadline exhausted", Some(handle))?;
         Ok(liveness_observation(presence))
     }
@@ -653,7 +726,23 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            return qualify_ok(
+                deadline,
+                "interrupt deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        #[cfg(windows)]
+        if let Some(proven) = &resolution.proven {
+            // Windows interrupt is not identity-bound (see PinnedInstance), so
+            // this remains Unavailable and never falls back to a PID signal.
+            proven.interrupt(deadline)?;
+            return self.observe_execution(handle, deadline);
+        }
+        let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
                 "interrupt deadline exhausted after locator resolution",
@@ -685,7 +774,32 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "terminate deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            return qualify_ok(
+                deadline,
+                "terminate deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        #[cfg(windows)]
+        if let Some(proven) = resolution.proven {
+            proven.kill(deadline)?;
+            if proven.wait_exit(deadline)? {
+                require_deadline(
+                    deadline,
+                    "terminate deadline exhausted after wait",
+                    Some(handle),
+                )?;
+                return Ok(terminated_observation());
+            }
+            return Err(deadline_exceeded_hint(
+                "terminate wait exhausted; kill sent is not quiescence",
+                handle.clone(),
+            ));
+        }
+        let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
                 "terminate deadline exhausted after locator resolution",
@@ -777,6 +891,48 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
     ) -> AdapterResult<PhysicalExecutionOutcome> {
         require_deadline(deadline, "collect deadline already expired", None)?;
         let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // The locator's PID names a process that is not this Execution. The
+            // physical state of the real instance is unknown, and treating the
+            // occupant as our ended process would collect foreign evidence.
+            return qualify_ok(
+                deadline,
+                "collect deadline exhausted after locator proof",
+                Some(handle),
+                PhysicalExecutionOutcome {
+                    physical_state: PhysicalState::Unknown,
+                    exit_status: None,
+                    artifact_refs: None,
+                    diagnostic: Some(
+                        "durable locator identity could not be proven; physical outcome unknown"
+                            .into(),
+                    ),
+                },
+            );
+        }
+        #[cfg(windows)]
+        if let Some(proven) = resolution.proven {
+            if !proven.wait_exit(deadline)? {
+                return Err(deadline_exceeded_hint(
+                    "collect deadline exhausted before process exit",
+                    handle.clone(),
+                ));
+            }
+            require_deadline(
+                deadline,
+                "collect deadline exhausted after process exit",
+                Some(handle),
+            )?;
+            return Ok(PhysicalExecutionOutcome {
+                physical_state: PhysicalState::Terminated,
+                exit_status: None,
+                artifact_refs: Some(serde_json::json!({
+                    "stdout": resolution.stdout_path.to_string_lossy(),
+                    "stderr": resolution.stderr_path.to_string_lossy(),
+                })),
+                diagnostic: Some("jailed physical process exited".into()),
+            });
+        }
         let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
@@ -908,14 +1064,24 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
                 }
             }
         };
-        let (parsed, observed_handle) = match control {
+        let (resolution, observed_handle) = match control {
             PhysicalControlHandle::Pinned(parsed) => {
                 if parsed.request_id != request_id.as_str() {
                     return Err(AdapterError::protocol(
                         "persisted handle request_id does not match reconcile identity",
                     ));
                 }
-                (parsed, None)
+                (
+                    ControlResolution {
+                        parsed: Some(parsed),
+                        stdout_path: PathBuf::new(),
+                        stderr_path: PathBuf::new(),
+                        unproven: false,
+                        #[cfg(windows)]
+                        proven: None,
+                    },
+                    None,
+                )
             }
             PhysicalControlHandle::Locator(locator) => {
                 if locator.request_id != request_id.as_str() {
@@ -924,41 +1090,43 @@ impl ExecutionAdapter for JailedProcessAgentAdapter {
                     ));
                 }
                 let locator_handle = locator.to_runtime_handle(JAIL_ADAPTER_KIND);
-                // On Windows the per-execution restricting SID is the
-                // non-impersonating witness. A locator without a recorded birth
-                // must prove that SID before a numeric PID can be treated as
-                // this Execution's physical instance.
-                #[cfg(windows)]
-                if locator.birth.is_none() {
-                    match windows_restricted_sid_present(locator.pid, &restricting_sid(request_id))?
-                    {
-                        Some(true) => {}
-                        Some(false) | None => {
-                            let hint = locator_handle.clone();
-                            return qualify_ok(
-                                deadline,
-                                "reconcile deadline exhausted after locator witness",
-                                Some(&hint),
-                                super::ended_start_observation(locator_handle),
-                            );
-                        }
-                    }
+                // The same proof flow as every control entry point: on Windows
+                // the birth and the restricting-SID witness come from one open
+                // handle that is retained through the observation.
+                let resolution = self.resolve_locator(locator, deadline)?;
+                if resolution.unproven {
+                    let hint = locator_handle.clone();
+                    return qualify_ok(
+                        deadline,
+                        "reconcile deadline exhausted after locator proof",
+                        Some(&hint),
+                        StartObservation {
+                            state: ExecutionState::Unknown,
+                            runtime_handle: locator_handle,
+                            ambiguous: true,
+                            detail: Some(
+                                "durable locator identity could not be proven; not this Execution"
+                                    .into(),
+                            ),
+                            terminal_confirmed: false,
+                            quiescent_confirmed: false,
+                        },
+                    );
                 }
-                match resolve_locator_to_parsed(locator, deadline)? {
-                    Some(parsed) => (parsed, Some(locator_handle)),
-                    None => {
-                        let hint = locator_handle.clone();
-                        return qualify_ok(
-                            deadline,
-                            "reconcile deadline exhausted after locator resolution",
-                            Some(&hint),
-                            super::ended_start_observation(locator_handle),
-                        );
-                    }
-                }
+                (resolution, Some(locator_handle))
             }
         };
-        let presence = self.presence_for(&parsed, deadline)?;
+        let presence = self.presence_for_resolution(&resolution, deadline)?;
+        let Some(parsed) = resolution.parsed else {
+            let hint = observed_handle.unwrap_or_default();
+            let observation = super::ended_start_observation(hint.clone());
+            return qualify_ok(
+                deadline,
+                "reconcile deadline exhausted after locator resolution",
+                Some(&hint),
+                observation,
+            );
+        };
         let full_handle = encode_handle_with_kind(&parsed, JAIL_ADAPTER_KIND);
         let observation = match presence {
             InstancePresence::Running => StartObservation {
@@ -1094,18 +1262,23 @@ impl TokenInfoBuffer {
 }
 
 /// Non-impersonating locator witness: the per-Execution restricting SID is
-/// present in the live process's restricted-SID list. This proves the numeric
-/// PID still names the process this adapter created, without opening a control
-/// handle or claiming a complete pin.
+/// present in the restricted-SID list of the token attached to `process`.
+///
+/// The caller supplies the already-open process handle; this function never
+/// re-resolves a numeric PID. `pin::prove_windows_instance` uses the same handle
+/// for the birth read and for this check, then retains it for control, so the
+/// two proofs cannot be separated by a PID recycle.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterResult<Option<bool>> {
+pub(crate) fn restricted_sid_present_on_process(
+    process: *mut core::ffi::c_void,
+    restricting_sid: &str,
+) -> AdapterResult<bool> {
     use std::os::windows::ffi::OsStrExt;
 
     type Handle = *mut core::ffi::c_void;
     type Dword = u32;
     type Bool = i32;
-    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
     const TOKEN_QUERY: Dword = 0x0008;
     const TOKEN_RESTRICTED_SIDS: Dword = 11;
     const ERROR_ACCESS_DENIED: Dword = 5;
@@ -1126,7 +1299,6 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
         fn CloseHandle(handle: Handle) -> Bool;
         fn GetLastError() -> Dword;
         fn LocalFree(mem: Handle) -> Handle;
@@ -1146,32 +1318,16 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
         fn EqualSid(a: Handle, b: Handle) -> Bool;
     }
 
-    // SAFETY: OpenProcess is a pure query; a null result is an error value.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        let err = unsafe { GetLastError() };
-        return match err {
-            ERROR_INVALID_PARAMETER => Ok(None),
-            ERROR_ACCESS_DENIED => Err(AdapterError::unavailable(
-                "cannot open process for locator witness",
-            )),
-            _ => Err(AdapterError::other(
-                "OpenProcess failed for locator witness",
-            )),
-        };
-    }
+    #[cfg(test)]
+    super::pin::proof_probe::record_sid(process);
     let mut token: Handle = std::ptr::null_mut();
-    // SAFETY: process is a live handle and token is an out parameter.
+    // SAFETY: `process` is a live handle owned by the caller and token is an
+    // out parameter. The caller keeps `process` open for its own birth proof
+    // and control act; this function only closes the token it opened.
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
-        unsafe {
-            CloseHandle(process);
-        }
         return Err(AdapterError::unavailable(
             "cannot open process token for locator witness",
         ));
-    }
-    unsafe {
-        CloseHandle(process);
     }
 
     let mut needed: Dword = 0;
@@ -1190,13 +1346,20 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
         unsafe {
             CloseHandle(token);
         }
-        return Err(AdapterError::other("cannot size process restricted SIDs"));
+        // A token without restricted SIDs is not a restricted token; that is a
+        // negative witness, not a read failure. It must stay `false` so the
+        // caller classifies the identity as unproven instead of erroring out.
+        return if sized_err == ERROR_INVALID_PARAMETER {
+            Ok(false)
+        } else {
+            Err(AdapterError::other("cannot size process restricted SIDs"))
+        };
     }
     if needed == 0 {
         unsafe {
             CloseHandle(token);
         }
-        return Ok(Some(false));
+        return Ok(false);
     }
     let mut buffer = match TokenInfoBuffer::new(needed) {
         Ok(buffer) => buffer,
@@ -1277,7 +1440,7 @@ fn windows_restricted_sid_present(pid: u32, restricting_sid: &str) -> AdapterRes
     unsafe {
         LocalFree(expected);
     }
-    Ok(Some(present))
+    Ok(present)
 }
 
 #[cfg(windows)]
@@ -2873,10 +3036,10 @@ mod tests {
     fn restricting_sid_is_unique_and_deterministic_per_request() {
         let a = RequestId::new();
         let b = RequestId::new();
-        assert_eq!(restricting_sid(&a), restricting_sid(&a));
-        assert_ne!(restricting_sid(&a), restricting_sid(&b));
-        assert!(restricting_sid(&a).starts_with("S-1-5-21-"));
-        assert_ne!(restricting_sid(&a), "S-1-5-12");
+        assert_eq!(restricting_sid(a.as_str()), restricting_sid(a.as_str()));
+        assert_ne!(restricting_sid(a.as_str()), restricting_sid(b.as_str()));
+        assert!(restricting_sid(a.as_str()).starts_with("S-1-5-21-"));
+        assert_ne!(restricting_sid(a.as_str()), "S-1-5-12");
     }
 
     #[test]
@@ -3066,7 +3229,7 @@ mod tests {
     fn private_desktops_do_not_accrue_window_station_aces() {
         let before = window_station_ace_sids();
         for index in 0..3 {
-            let sid = restricting_sid(&RequestId::new());
+            let sid = restricting_sid(RequestId::new().as_str());
             let desktop = create_private_desktop(&format!("station-dacl-{index}"), &sid)
                 .expect("private desktop creation must succeed");
             let during = window_station_ace_sids();

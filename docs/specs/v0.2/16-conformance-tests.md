@@ -297,8 +297,10 @@ M6-B.4 provisioning binding and exact launch MUST cover:
   candidate-local `ContractError` set; an `InvariantViolation` surfaced through
   evidence, a storage failure, or a recovery-required error terminates the
   acquisition
-- an ambiguous selection is task-terminal (it never falls through to a
-  lower-ranked agent or a new agent)
+- an ambiguous selection is a pre-acquisition resolution deferral: it creates no
+  Attempt and emits no `RESOURCE_UNAVAILABLE` NACK, stays QUEUED for re-probe,
+  and never falls through to a lower-ranked agent or a new agent in the same
+  resolution
 - the selected winner is prepared only AFTER its claim/binding is durably
   committed; losers are never prepared, and neither `attest` nor `prepare` creates
   a physical resource (no side effect precedes the Execution)

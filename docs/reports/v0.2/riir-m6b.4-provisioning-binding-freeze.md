@@ -62,6 +62,39 @@ P1-1, P1-2 and P2-1:
   and the deferred worker-originated Result data plane inside it, as a normative
   decision rather than a PR comment.
 
+The head after this revision started from the third independently audited commit
+`d2499c71c6edffa18918a44d04630b89fec58452` and closes its P1 and both new P2
+findings:
+
+- Windows birthless-locator identity is proved by **one** flow
+  (`pin::prove_windows_instance`): one open `PROCESS` handle yields the birth
+  time and the per-Execution restricting-SID witness, and the same handle is
+  retained in `ProvenInstance` for the subsequent control act. Every
+  locator-to-control entry point (`observe_execution`, `interrupt_execution`,
+  `terminate_execution`, `collect_outcome`, `reconcile_start`) reuses that flow;
+  a failed SID witness is `unproven`, which stays `Unknown`/`Absent` and never
+  interrupts, terminates, or collects. The reused M5
+  `LocalProcessAgentAdapter` has no OS witness on Windows, so it treats any
+  birthless Windows locator as unproven rather than deriving identity from a
+  PID.
+- The typed dispatch enumeration is bounded in SQL: readiness, cooldown
+  exclusion, the frozen `priority DESC, created_at ASC, id ASC` order, and
+  `LIMIT` are all applied by the database, and Core's `order_ready_tasks`
+  remains the authoritative re-check. A blocked head of 30 Tasks no longer
+  forces an O(N) load/sort to find the ready Tasks behind it.
+- Spec 07 (and the matching conformance note in spec 16) now separates a
+  pre-acquisition `SelectionAmbiguous` deferral — no Attempt, no
+  `RESOURCE_UNAVAILABLE` NACK, re-probe after cooldown/frontier change — from a
+  post-acquisition Task failure.
+
+The new negative tests point a birthless locator at the test process's own PID
+without that Execution's restricting SID and assert that `observe_execution`,
+`interrupt_execution`, `terminate_execution`, and `collect_outcome` all refuse to
+act (`Unknown`, no artifacts). `sid_and_birth_proof_come_from_the_same_open_handle`
+is the deterministic race injection: the test-only probe records the handle used
+for each phase and asserts they are identical, so reopening the PID between the
+two proofs fails the test without needing a real PID recycle.
+
 The prior round's closure of P1-1, P1-2, P1-3, P2-2 and P2-3 remains in place:
 locator evidence survives the `spawn → identity` window, Windows children keep
 only `SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed
@@ -82,7 +115,7 @@ retains the unresolved availability/cost ranking question.
 
 | Phase | Committed facts and checks |
 |---|---|
-| Enumerate | `Kernel::list_typed_dispatch_candidates_excluding` performs one authority-free read using the shared Core readiness predicate and the frozen `priority DESC, created_at ASC, id ASC` order. A runtime-local cooldown exclusion is applied to the ordered candidates **before** `probe_limit`/`take`, so cooling Tasks cannot occupy the probe window and permanently starve Task N+1; it returns no claim and mutates nothing |
+| Enumerate | `Kernel::list_typed_dispatch_candidates_excluding` performs one authority-free, DB-bounded read: the shared readiness predicate, the runtime-local cooldown exclusion, the frozen `priority DESC, created_at ASC, id ASC` order, and `LIMIT probe_limit` are all applied in SQL, so a large blocked or cooling head does not force an O(N) load/sort. Core's `order_ready_tasks` re-checks readiness and order on the returned bounded page. It returns no claim and mutates nothing |
 | Resolve | Validate partition target/profile; apply known hard filters before bounded, read-only source-local attestation; rank eligible candidates and capture the catalog frontier |
 | Acquire | Transactionally reload and re-prove Task, actual bound AgentType, placement, source/config/policy, realized retention and exact imported safety; commit Attempt/Lease/assignment and per-Incarnation ProvisioningBinding; leave `Attempt.incarnation_id` unset |
 | Prepare | After winner selection/commit, create the winner's **fresh** prepare deadline; re-resolve the explicitly registered exact source; fence claim authority and integration protocol before/after pure preparation; require the attested digest; return a secret-free descriptor |
@@ -216,12 +249,20 @@ Persistence is not best effort:
   from the hint.
 - `reconcile_start` accepts the locator and, when `birth` is absent, verifies a
   non-impersonating physical witness before adopting a numeric pid. On Windows
-  the witness is the per-Execution restricting SID on the process token; on
+  the witness is the per-Execution restricting SID on the same open process
+  handle that yields the birth, and that handle is retained for control; on
   Linux it is birth/instance-token verification. A locator cannot impersonate an
-  unrelated pid.
+  unrelated pid, and a failed witness stays `Unknown` rather than becoming a
+  PID-derived identity.
 - `observe_execution`, `interrupt_execution`, `terminate_execution`, and
-  `collect_outcome` resolve a locator directly, so the process remains
-  controllable after the daemon restarts without a persisted pinned handle.
+  `collect_outcome` all use the same resolution flow, so the process remains
+  controllable after the daemon restarts without a persisted pinned handle and
+  no entry point can upgrade a locator with a weaker proof than
+  `reconcile_start`. A Windows birthless locator that fails the restricting-SID
+  proof is `unproven`: observation is `Unknown`, collect is
+  `PhysicalState::Unknown` with no artifacts, and interrupt/terminate do not act.
+  The reused `LocalProcessAgentAdapter` has no OS witness on Windows and
+  therefore treats every birthless Windows locator as unproven.
 - Once the birth identity is known, the locator is upgraded atomically. A crash
   after spawn but before the upgrade still yields a recoverable locator, never a
   blind respawn.
@@ -382,7 +423,9 @@ fatal preparation fault that fails the daemon and produces exactly one
 | `COMMIT → start` real crash | `typed_daemon_restart_recovers_the_same_physical_instance` (child daemon aborts; parent reopens the same store) |
 | `spawn → identity` crash window | `born_less_locator_is_recovered_after_the_spawn_identity_window`; `reconcile_without_persisted_handle_recovers_running_instance` |
 | `identity → observation persistence` crash window | `durable_locator_controls_the_process_after_adapter_restart`; locator-aware `observe`/`terminate`/`collect` |
-| Locator impersonation | `born_less_locator_cannot_impersonate_an_unrelated_pid` (restricting-SID witness) |
+| Locator impersonation (all entry points) | `born_less_locator_cannot_impersonate_an_unrelated_pid` and `born_less_locator_without_the_restricting_sid_has_no_control_authority` (observe/interrupt/terminate/collect leave the target alive and report `Unknown`) |
+| SID/birth proof substitution | `sid_and_birth_proof_come_from_the_same_open_handle` (test-only probe records the handle each phase used; inequality fails deterministically) |
+| Blocked typed queue head | `bounded_typed_enumeration_skips_a_large_blocked_head` (30 ineligible high-priority Tasks, bounded page still finds the ready Tasks) |
 | Missing locator/handle after restart | `reconcile_without_any_physical_evidence_is_ambiguous_not_respawned` |
 | Unknown Execution COMMIT | `uncertain COMMIT` counterparts in the resolver suite; `kernel_faults_are_never_classified_as_authority` |
 | Ambiguous process start | `dispatch_ambiguous_start_is_persisted_and_never_restarted`; `dispatch_ambiguous_write_start_never_gains_quiescence` |
@@ -406,9 +449,10 @@ Local checks on 2026-11-07 (Windows):
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
 | `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed |
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
-| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 18 passed (real OS enforcement, including token/desktop, station-DACL lifecycle and locator recovery) |
+| `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 19 passed (real OS enforcement, including token/desktop, station-DACL lifecycle, locator recovery and the birthless-locator negative control tests) |
 | `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 10 passed (including real daemon restart and mixed legacy/typed queue) |
-| `cargo test -p agentype-adapter-local-process --lib` | 37 passed (including token-buffer alignment/bounds and station-DACL unit tests) |
+| `cargo test -p agentype-adapter-local-process --lib` | 38 passed (including the deterministic SID/birth same-handle probe, token-buffer alignment/bounds and station-DACL unit tests) |
+| `cargo test -p agentype-storage-sqlite --test b3_typed_admission bounded_typed_enumeration_skips_a_large_blocked_head` | passed (30 blocked high-priority Tasks, bounded page still finds the ready ones) |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
 workspace directory because the sandboxed test process cannot create the

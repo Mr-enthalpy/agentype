@@ -139,14 +139,34 @@ impl LocalProcessAgentAdapter {
                 stdout_path: parsed.stdout_path.clone(),
                 stderr_path: parsed.stderr_path.clone(),
                 parsed: Some(parsed),
+                unproven: false,
+                #[cfg(windows)]
+                proven: None,
             }),
             PhysicalControlHandle::Locator(locator) => {
                 let stdout_path = locator.stdout_path.clone();
                 let stderr_path = locator.stderr_path.clone();
+                // This adapter has no per-Execution OS witness. On Windows a
+                // locator without a recorded birth therefore has only a numeric
+                // PID, and a PID is never an identity proof. Keep it Unknown
+                // instead of upgrading it to control authority.
+                #[cfg(windows)]
+                if locator.birth.is_none() {
+                    return Ok(ControlResolution {
+                        parsed: None,
+                        stdout_path,
+                        stderr_path,
+                        unproven: true,
+                        proven: None,
+                    });
+                }
                 Ok(ControlResolution {
                     parsed: resolve_locator_to_parsed(locator, deadline)?,
                     stdout_path,
                     stderr_path,
+                    unproven: false,
+                    #[cfg(windows)]
+                    proven: None,
                 })
             }
         }
@@ -157,6 +177,14 @@ pub(crate) struct ControlResolution {
     pub(crate) parsed: Option<ParsedHandle>,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
+    /// The locator's live identity could not be proven. `parsed` is `None` and
+    /// no interrupt, terminate or collect authority may be derived from it.
+    pub(crate) unproven: bool,
+    /// Windows birthless-locator proof: the same open process handle that
+    /// produced the birth and the restricting-SID witness. Keeping it alive
+    /// closes the proof-to-control TOCTOU window.
+    #[cfg(windows)]
+    pub(crate) proven: Option<pin::ProvenInstance>,
 }
 
 impl ImportableAdapter for LocalProcessAgentAdapter {
@@ -1606,7 +1634,18 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "observe deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // A Windows birthless locator has only a numeric PID, and this
+            // adapter has no OS-level witness to prove that PID is ours.
+            return qualify_ok(
+                deadline,
+                "observe deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
             // A durable locator proves spawn succeeded; no live birth identity
             // means the process is gone, not that the adapter may retry.
             return qualify_ok(
@@ -1668,7 +1707,17 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // No proven identity: never signal a PID that may be a stranger.
+            return qualify_ok(
+                deadline,
+                "interrupt deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
                 "interrupt deadline exhausted after locator resolution",
@@ -1710,7 +1759,17 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "terminate deadline already expired", None)?;
-        let Some(parsed) = self.control_parsed(handle, deadline)?.parsed else {
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // No proven identity: never terminate a PID that may be a stranger.
+            return qualify_ok(
+                deadline,
+                "terminate deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
                 "terminate deadline exhausted after locator resolution",
@@ -1815,6 +1874,24 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
     ) -> AdapterResult<PhysicalExecutionOutcome> {
         require_deadline(deadline, "collect deadline already expired", None)?;
         let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // The PID belongs to some other process; the real instance's
+            // physical state is unknown. Never collect foreign evidence.
+            return qualify_ok(
+                deadline,
+                "collect deadline exhausted after locator proof",
+                Some(handle),
+                PhysicalExecutionOutcome {
+                    physical_state: agentype_adapter_api::PhysicalState::Unknown,
+                    exit_status: None,
+                    artifact_refs: None,
+                    diagnostic: Some(
+                        "durable locator identity could not be proven; physical outcome unknown"
+                            .into(),
+                    ),
+                },
+            );
+        }
         let Some(parsed) = resolution.parsed else {
             return qualify_ok(
                 deadline,
@@ -1929,7 +2006,29 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
                     ));
                 }
                 let locator_handle = locator.to_runtime_handle(ADAPTER_KIND);
-                match resolve_locator_to_parsed(locator, deadline)? {
+                // Reuse the same resolution as every control entry point so a
+                // Windows birthless locator cannot be upgraded here either.
+                let resolution = self.control_parsed(&locator_handle, deadline)?;
+                if resolution.unproven {
+                    let observation = StartObservation {
+                        state: ExecutionState::Unknown,
+                        runtime_handle: locator_handle.clone(),
+                        ambiguous: true,
+                        detail: Some(
+                            "durable locator identity could not be proven; not this Execution"
+                                .into(),
+                        ),
+                        terminal_confirmed: false,
+                        quiescent_confirmed: false,
+                    };
+                    return qualify_ok(
+                        deadline,
+                        "reconcile deadline exhausted after locator proof",
+                        Some(&locator_handle),
+                        observation,
+                    );
+                }
+                match resolution.parsed {
                     Some(parsed) => (parsed, Some(locator_handle)),
                     None => {
                         // Spawn succeeded (the locator is written after spawn)

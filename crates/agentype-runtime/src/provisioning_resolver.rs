@@ -1398,8 +1398,8 @@ fn is_candidate_local(error: &ProvisioningResolutionError) -> bool {
         | ProvisioningResolutionError::ExactBindingChanged(_)
         | ProvisioningResolutionError::CredentialUnavailable(_) => true,
         // Only the narrow candidate-local `ContractError`s are skippable; a
-        // `SelectionAmbiguous` is a task-terminal resolution failure (ADR-0010),
-        // never an agent/source fallback.
+        // `SelectionAmbiguous` is a pre-acquisition resolution deferral
+        // (ADR-0010), never an agent/source fallback and never a Task NACK.
         ProvisioningResolutionError::Evidence(error) => evidence_is_candidate_local(error),
         // Per-candidate storage rejections from the acquisition re-proof (agent
         // not placeable, policy/kind/type mismatch, agent not READY) are local.
@@ -4716,8 +4716,9 @@ mod tests {
                 capability: "x".into()
             }
         )));
-        // An ambiguous selection is a task-terminal resolution failure, never an
-        // agent/source fallback.
+        // An ambiguous selection is a pre-acquisition resolution deferral; it is
+        // not candidate-local (never an agent/source fallback) and, because no
+        // Attempt exists yet, it is not a Task NACK either.
         assert!(!is_candidate_local(
             &ProvisioningResolutionError::SelectionAmbiguous("a vs b".into())
         ));

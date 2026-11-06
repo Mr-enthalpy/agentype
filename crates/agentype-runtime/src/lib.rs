@@ -1909,8 +1909,14 @@ impl<'a> Dispatcher<'a> {
     /// Classify a pre-start typed acquisition error.
     ///
     /// Only explicitly candidate-local ineligibility and the ADR-0010
-    /// task-terminal `SelectionAmbiguous` state are deferrals. Everything else
+    /// pre-acquisition `SelectionAmbiguous` state are deferrals. Everything else
     /// is a control-plane/corruption fault and MUST terminate the cycle.
+    ///
+    /// `SelectionAmbiguous` is resolved before an Attempt exists. Deferring it
+    /// therefore creates no Task failure and emits no `RESOURCE_UNAVAILABLE`
+    /// NACK; the Task stays QUEUED and is re-probed after the ambiguity
+    /// cooldown or a catalog-frontier change. A post-acquisition failure is a
+    /// different outcome handled by the Attempt's ACK/NACK path.
     fn defer_or_fail_typed(
         &self,
         task_id: &TaskId,
@@ -1930,10 +1936,11 @@ impl<'a> Dispatcher<'a> {
                 );
                 Ok(None)
             }
-            // ADR-0010: a tie in the frozen selection order is a resolution
-            // failure for this Task, never permission to skip to a lower-ranked
-            // agent or source. Probe again only after a long cooldown or a
-            // catalog-frontier change.
+            // ADR-0010: a tie in the frozen selection order is a pre-acquisition
+            // resolution deferral, never permission to skip to a lower-ranked
+            // agent or source and never a Task NACK: no Attempt exists yet.
+            // Probe again only after a long cooldown or a catalog-frontier
+            // change.
             P::SelectionAmbiguous(_) => {
                 state.defer(
                     task_id.clone(),

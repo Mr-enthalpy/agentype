@@ -1977,7 +1977,7 @@ impl Kernel {
         self.list_typed_dispatch_candidates_excluding(limit, &[])
     }
 
-    /// Authority-free enumeration that excludes runtime-local cooldown
+    /// Authority-free, bounded enumeration that excludes runtime-local cooldown
     /// candidates **before** applying `limit`.
     ///
     /// The typed control loop owns cooldown state and never persists it. This
@@ -1985,6 +1985,13 @@ impl Kernel {
     /// consume one of the `limit` slots and starve every Task behind it. The
     /// frozen `priority DESC, created_at ASC, id ASC` order is unchanged for
     /// the remaining candidates. `limit == 0` returns nothing.
+    ///
+    /// Readiness, cooldown exclusion, ordering and `LIMIT` all happen in SQL, so
+    /// a queue with many unavailable Tasks at its head costs at most one bounded
+    /// page rather than an O(N) load and sort. The SQL predicate duplicates the
+    /// frozen [`claim_task_ready`] gate as a coarse pre-filter; Core's
+    /// [`order_ready_tasks`] still re-applies it, so query text alone cannot
+    /// change eligibility or order.
     pub fn list_typed_dispatch_candidates_excluding(
         &self,
         limit: usize,
@@ -1994,20 +2001,41 @@ impl Kernel {
             return Ok(Vec::new());
         }
         let now = self.clock.now();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut sql = String::from(
+            "SELECT t.id,t.state,b.state,p.active,t.next_eligible_at,t.priority,t.created_at
+             FROM tasks t JOIN batches b ON b.id=t.batch_id
+             JOIN pool_partitions p ON p.name=t.partition_name
+             WHERE t.state='QUEUED'
+               AND b.state='ACTIVE'
+               AND p.active=1
+               AND (t.next_eligible_at IS NULL OR t.next_eligible_at <= ?1)
+               AND (t.agent_requirement_mode <> 'LEGACY' OR EXISTS (
+                   SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
+               ))",
+        );
+        let mut values: Vec<rusqlite::types::Value> = vec![now.into(), limit.into()];
+        if !excluded.is_empty() {
+            sql.push_str(" AND t.id NOT IN (");
+            for index in 0..excluded.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                sql.push_str(&(index + 3).to_string());
+            }
+            sql.push(')');
+            values.extend(
+                excluded
+                    .iter()
+                    .map(|task| rusqlite::types::Value::Text(task.as_str().to_string())),
+            );
+        }
+        sql.push_str(" ORDER BY t.priority DESC, t.created_at ASC, t.id ASC LIMIT ?2");
         let rows = self.store.query(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT t.id,t.state,b.state,p.active,t.next_eligible_at,t.priority,t.created_at
-                     FROM tasks t JOIN batches b ON b.id=t.batch_id
-                     JOIN pool_partitions p ON p.name=t.partition_name
-                     WHERE t.state='QUEUED'
-                       AND (t.agent_requirement_mode <> 'LEGACY' OR EXISTS (
-                           SELECT 1 FROM task_agent_requirements r WHERE r.task_id=t.id
-                       ))",
-                )
-                .map_err(map_sqlite)?;
+            let mut stmt = conn.prepare(&sql).map_err(map_sqlite)?;
             let mapped = stmt
-                .query_map(params![], |r| {
+                .query_map(rusqlite::params_from_iter(values.iter()), |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
@@ -2038,12 +2066,9 @@ impl Kernel {
                 typed: true,
             });
         }
-        let excluded: std::collections::HashSet<&str> =
-            excluded.iter().map(|task| task.as_str()).collect();
         Ok(order_ready_tasks(&snapshots, now)
             .into_iter()
-            .filter(|id| !excluded.contains(id.as_str()))
-            .take(limit)
+            .take(limit as usize)
             .map(TaskId::from_string)
             .collect())
     }

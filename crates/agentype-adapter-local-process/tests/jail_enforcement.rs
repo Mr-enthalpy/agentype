@@ -6,7 +6,8 @@
 //! write, so the test fails closed rather than trusting a declared capability.
 
 use agentype_adapter_api::{
-    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter, RuntimeHandle,
+    AdapterDeadline, AdapterErrorKind, EnvironmentStartRequest, ExecutionAdapter, PhysicalState,
+    RuntimeHandle,
 };
 use agentype_adapter_local_process::{
     JailLaunchDescriptor, JailedProcessAgentAdapter, JAIL_ADAPTER_KIND,
@@ -889,26 +890,24 @@ fn reconcile_without_any_physical_evidence_is_ambiguous_not_respawned() {
     );
 }
 
+/// Write a durable locator with no birth, pointing at `pid`. On Windows this
+/// leaves only the numeric PID plus the request-derived restricting SID as a
+/// possible witness, so it models a crash between spawn and the identity
+/// upgrade.
 #[cfg(windows)]
-#[test]
-fn born_less_locator_cannot_impersonate_an_unrelated_pid() {
-    let jail_root = unique_dir("locator-impersonation");
-    let descriptor = descriptor(&jail_root, &["--hang"]);
-    let request = request_with(
-        WorkspaceMode::Write,
-        NetworkEnforcement::Enabled,
-        false,
-        Some(descriptor.encode()),
-    );
-    let exec_dir = jail_exec_dir(&request);
+fn write_birthless_locator(
+    request: &EnvironmentStartRequest,
+    pid: u32,
+    instance: &str,
+) -> RuntimeHandle {
+    let exec_dir = jail_exec_dir(request);
     fs::create_dir_all(&exec_dir).unwrap();
-    let request_id = request.request_id().as_str();
     let locator = json!({
         "v": 1,
         "kind": JAIL_ADAPTER_KIND,
-        "pid": std::process::id(),
-        "inst": "not-this-execution",
-        "request_id": request_id,
+        "pid": pid,
+        "inst": instance,
+        "request_id": request.request_id().as_str(),
         "stdout": exec_dir.join("stdout.txt").to_string_lossy(),
         "stderr": exec_dir.join("stderr.txt").to_string_lossy(),
         "identity_complete": false,
@@ -916,17 +915,87 @@ fn born_less_locator_cannot_impersonate_an_unrelated_pid() {
         "spawn_after_ms": 1,
     });
     fs::write(exec_dir.join("locator.json"), locator.to_string()).unwrap();
+    RuntimeHandle(locator)
+}
+
+#[cfg(windows)]
+fn impersonation_request(tag: &str) -> EnvironmentStartRequest {
+    let jail_root = unique_dir(tag);
+    let descriptor = descriptor(&jail_root, &["--hang"]);
+    request_with(
+        WorkspaceMode::Write,
+        NetworkEnforcement::Enabled,
+        false,
+        Some(descriptor.encode()),
+    )
+}
+
+#[cfg(windows)]
+#[test]
+fn born_less_locator_cannot_impersonate_an_unrelated_pid() {
+    let request = impersonation_request("locator-impersonation");
+    write_birthless_locator(&request, std::process::id(), "not-this-execution");
 
     let adapter = JailedProcessAgentAdapter::try_new().unwrap();
     let observation = adapter
         .reconcile_start(request.request_id(), None, &long_deadline())
-        .expect("a mismatched witness is a terminal physical observation");
+        .expect("a mismatched witness is an unknown identity, not an error");
     assert_eq!(
         observation.state,
-        ExecutionState::Terminated,
+        ExecutionState::Unknown,
         "a numeric pid without the per-execution restricting SID must not be adopted: {:?}",
         observation.detail
     );
+    assert!(observation.ambiguous);
+}
+
+/// The audit's P1 reproduction: a birthless locator names the test process's own
+/// PID but carries no matching restricting SID. Observation, interrupt,
+/// terminate and collect must all refuse to act, and none may touch the target.
+#[cfg(windows)]
+#[test]
+fn born_less_locator_without_the_restricting_sid_has_no_control_authority() {
+    let request = impersonation_request("locator-control-impersonation");
+    let handle = write_birthless_locator(&request, std::process::id(), "not-this-execution");
+    let adapter = JailedProcessAgentAdapter::try_new().unwrap();
+    let me = std::process::id();
+
+    let observed = adapter
+        .observe_execution(&handle, &long_deadline())
+        .expect("an unproven identity is an Unknown observation, not an error");
+    assert_eq!(
+        observed.state,
+        ExecutionState::Unknown,
+        "observation must not adopt a foreign PID: {:?}",
+        observed.detail
+    );
+
+    let interrupted = adapter
+        .interrupt_execution(&handle, &long_deadline())
+        .expect("an unproven identity must not be interrupted");
+    assert_eq!(interrupted.state, ExecutionState::Unknown);
+
+    let terminated = adapter
+        .terminate_execution(&handle, &long_deadline())
+        .expect("an unproven identity must not be terminated");
+    assert_eq!(
+        terminated.state,
+        ExecutionState::Unknown,
+        "terminate must refuse an unproven pid, not report it terminated"
+    );
+
+    let outcome = adapter
+        .collect_outcome(&handle, &long_deadline())
+        .expect("an unproven identity has no physical outcome to collect");
+    assert_eq!(outcome.physical_state, PhysicalState::Unknown);
+    assert!(
+        outcome.artifact_refs.is_none(),
+        "collect must not return artifacts from a foreign process"
+    );
+
+    // If any of the calls above had acted on the PID, this process would be
+    // gone and the test could not reach or report its own liveness.
+    assert_eq!(std::process::id(), me);
 }
 
 /// A process that was really started but whose locator cannot be persisted must

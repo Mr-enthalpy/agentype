@@ -68,10 +68,19 @@ A source that cannot enforce the required sandbox MUST be ineligible.
 M6-B.4 implements the hard filters (1-3) as eligibility and the continuity
 dimension (4). Availability (5) and cost/resource (6) have no durable model yet,
 so when more than one candidate is tied on continuity the selection is
-**unresolved and fails closed** (`RESOURCE_UNAVAILABLE`) rather than via an
-invented tie-break; this order is unchanged and the gap is recorded in
+**unresolved and fails closed** rather than via an invented tie-break; this order
+is unchanged and the gap is recorded in
 [ADR-0010](../../decisions/0010-m6b-selection-order-scope.md). Selection is part
 of the authority path.
+
+`SelectionAmbiguous` is resolved **before** acquisition. Because no Attempt,
+Lease, Binding, or Execution has been created at that point, the Scheduler
+defers the Task: it does not create an Attempt and does not emit a
+`RESOURCE_UNAVAILABLE` NACK. It re-probes only after the configured ambiguity
+cooldown or a catalog-frontier change. This is distinct from a Task failure
+**after** acquisition, which follows the normal Attempt and ACK/NACK path; an
+implementation that turns a pre-acquisition ambiguity into a Task NACK is
+wrong.
 
 ## ExecutionAdapter (correctness required)
 
