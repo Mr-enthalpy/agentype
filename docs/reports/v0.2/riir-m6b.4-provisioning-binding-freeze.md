@@ -3,12 +3,13 @@
 Status: Implementation and acceptance record
 Implementation status: M6-B.4 typed physical execution → durable ACK interface implemented on PR #24
 Date: 2026-11-06
-Updated: 2026-11-07
+Updated: 2026-11-08
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
 Not a specification. The retained filename does not assert a wider freeze.
 
-Verdict: **NOT FROZEN — revised implementation awaiting independent re-audit and
-final-SHA CI**. The accepted scope is **typed physical execution → durable ACK
+Verdict: **NOT FROZEN — fifth independent audit returned `CLOSED WITH STATED
+SCOPE` for the ADR-0012 boundary; the freeze decision belongs to the repository
+maintainer**. The accepted scope is **typed physical execution → durable ACK
 interface**: typed Task → B.3 matching → B.4 physical eligibility →
 Attempt/Lease/ProvisioningBinding → pure prepare → Execution/BindingSnapshot →
 exact adapter start → observation/recovery → durable Result ACK boundary, with a
@@ -121,6 +122,32 @@ only `SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed
 daemon restart test uses a real process crash over the same store, a mixed
 legacy/typed queue test proves no starvation, and the PR description is
 re-synchronized with the actual head.
+
+### Fifth independent audit (`ec093753f3`, 2026-11-08)
+
+The fifth independent audit found no new P0/P1 implementation blocker and
+returned `CLOSED WITH STATED SCOPE` for the ADR-0012 boundary. It restated three
+limits rather than requesting code changes:
+
+- **F1 — worker-originated Result E2E is a scope gap, not a code error.** The
+  suite proves the durable ACK interface (the harness reads the committed
+  Attempt/Lease/Execution and calls `Kernel::ack_success`), not a worker that
+  transports an authenticated semantic Result through retry and ingress. The
+  audit explicitly refuses to call this full worker-to-Result closure. No code
+  change is implied, because ADR-0012 already excludes that data plane.
+- **F2 — physical Execution artifacts have no explicit retention/safe-GC
+  contract.** Per-RequestId jail/workspace directories, stdout/stderr and the
+  locator are created on the start path and are retained across termination,
+  collect and restart. This is a deployment/long-running limitation, recorded
+  below; deleting potentially live artifacts without a retention owner would be
+  unsafe, so this revision intentionally adds no aggressive deletion.
+- **F3 — equal-continuity `SelectionAmbiguous` liveness limit.** Two equally
+  ranked SourceConfigs still defer rather than picking a winner. ADR-0010 already
+  accepts this fail-closed deferral; this record does not invent an ID tie-break.
+
+Because this outcome is a scope-limited acceptance rather than a freeze, the
+verdict stays `NOT FROZEN`: the repository maintainer decides the freeze after
+this review, not the implementation round.
 
 Deployment remains restricted to fresh schema-v8 databases and reopening
 existing v8 databases. v7→v8 migration is not implemented. The frozen specs
@@ -412,7 +439,9 @@ accepted scope label is therefore **typed physical execution → durable ACK
 interface**; this record does not claim worker-originated end-to-end execution.
 [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md)
 records that boundary and the deferred worker data plane as a normative scope
-decision.
+decision. The fifth independent audit grades this as **F1: a scope gap, not an
+implementation fault** — the durable ACK interface is proven, the
+worker-originated Result loop is explicitly not.
 
 Additional real-process evidence in this revision:
 
@@ -457,6 +486,7 @@ fatal preparation fault that fails the daemon and produces exactly one
 | Typed unavailable / ambiguous before Attempt | `target_isolation_filters_incapable_source_before_attest_and_selection`; `credential_config_is_filtered_before_attestation_and_cannot_hide_valid_config`; E2E negative cases |
 | Windows token parse boundary | `token_information_buffer_is_aligned_and_bounds_checked` and `variable_length_token_header_is_validated_before_any_typed_access` (zero entries, short header, huge count, length beyond allocation all fail before any typed access); the real restricted-SID witness still runs in the locator tests; neither the adapter nor `fake-agent` forms a variable-length typed reference before validating the returned length |
 | Cooldown filter size | `large_cooldown_set_cannot_exhaust_sqlite_parameters` (a probe proves this build rejects a 40,000-variable statement; the Kernel query with a 40,000-id cooldown set still returns the ready page and still applies exclusion) |
+| Execution artifact lifetime | No production deletion/GC path exists: `prepare_jail` creates the per-RequestId jail root/workspace, stdout/stderr and locator, and termination/collection retain them; only test code calls `remove_dir_all`. Retention, safe-GC ownership and disk-growth control are recorded as an explicit remaining limit (fifth audit F2), not silently handled |
 | Repeated Execution lifecycles | `shared_window_station_acl_does_not_grow_across_execution_lifecycles` (three real Executions) and `private_desktops_do_not_accrue_window_station_aces` (several distinct SIDs) |
 | Write success without quiescence | `writer_safety_suspension_is_distinct_from_task_completed`; Write E2E (`ack_success` returns `None`) |
 
@@ -484,8 +514,11 @@ production code was changed for it, and CI does not use that workaround.
 Remote CI is the acceptance gate. The final PR head check run (fmt, clippy,
 workspace tests, public-API boundary) is recorded on PR #24; the head SHA is
 reported with the completion summary so the evidence is tied to the exact
-tested commit. If remote CI fails, this record is not a freeze and the verdict
-reverts to NOT FROZEN.
+tested commit. The fifth audit independently read the job logs at
+`ec093753f30e81771d36fe555fbf1c509a6c77ee` and confirmed 6/6 jobs on both the
+push and pull-request runs, with Windows jail 19, Linux jail 20, typed E2E 10 per
+platform and the public-API boundary 35. If remote CI fails, this record is not a
+freeze and the verdict reverts to NOT FROZEN.
 
 ## Remaining limits
 
@@ -500,7 +533,17 @@ reverts to NOT FROZEN.
 - **Worker Result transport/auth/retry**: not implemented. E2E invokes the
   durable `Kernel::ack_success` command from the harness; there is no production
   worker data plane, worker authentication, delivery retry, or worker-originated
-  ACK claim. See *Harness-injected ACK boundary*.
+  ACK claim. See *Harness-injected ACK boundary*. The fifth audit records this as
+  a scope gap (F1): the suite supports `typed physical execution → durable ACK
+  interface`, not a worker-originated semantic Result loop.
+- **Execution artifact retention / GC**: per-RequestId jail roots and workspaces,
+  stdout/stderr files and the recoverable locator are created on the start path
+  and are retained after terminate, collect and restart. There is no durable
+  retention owner, no safe-GC authority and no disk-growth control yet (fifth
+  audit F2). Immediate deletion is deliberately not attempted: evidence,
+  unresolved writers and restart reconciliation may still depend on those
+  artifacts. Until an artifact-owner contract exists, long-running deployments
+  must treat jail-root growth as an operational responsibility.
 - **Platform coverage**: Windows enforcement is executed locally. Linux
   Landlock is implemented and compiled here but must be executed by the Linux CI
   runner; ABI 1/2 rejection and `ftruncate`/`open(O_TRUNC)` counterexamples are
