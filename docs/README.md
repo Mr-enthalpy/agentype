@@ -23,13 +23,13 @@ semantic frontier kernel, the M6-B.1 AgentType ontology, the M6-B.2 durable Agen
 Contract catalog (schema v6), and M6-B.3 typed semantic commitment and
 existing-agent preselection (schema v7) are frozen. M6-B.4 provisioning binding
 and exact launch (schema v8) is implemented through production typed daemon
-dispatch and real OS-enforced physical execution, and is **FREEZE READY** at the
+dispatch and real OS-enforced physical execution, and is **FROZEN** within the
 [ADR-0012](decisions/0012-m6b4-scope-typed-physical-execution-ack.md) scope
 **typed physical execution → durable ACK interface**. A worker-originated Result
 data plane (transport, authentication, delivery retry, ingress) is deferred and
 outside that scope; this milestone does not claim a worker-originated
-end-to-end Result. The FROZEN label is the maintainer's decision and is recorded
-in the [M6-B.4 freeze record](reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md);
+end-to-end Result. The maintainer authorized the freeze on 2026-11-08; it is
+recorded in the [M6-B.4 freeze record](reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md);
 accepted limits are tracked in
 [spec 17](specs/v0.2/17-deferred-open-questions.md).
 Its inherited-contract corrections are recorded in the

@@ -4,14 +4,15 @@ Status: Historical Report
 Applies to: V0.2 / M6-B.4 closure (PR #24, merge `5808783`)
 Date: 2026-11-06
 Updated: 2026-11-08
-Freeze state: **FREEZE READY — awaiting maintainer decision**
+Freeze state: **FROZEN — 2026-11-08 (ADR-0012 scope)**
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
-Not a specification. The frozen scope, if approved, is only ADR-0012's.
+Not a specification. The frozen scope is only ADR-0012's.
 
-Verdict: **FREEZE READY — implementation, evidence and scope are closed within
-ADR-0012; the FROZEN label is the repository maintainer's decision**. The fifth
-independent audit returned `CLOSED WITH STATED
-SCOPE` for the ADR-0012 boundary with no new P0/P1 blocker. The accepted scope
+Verdict: **FROZEN — M6-B.4 typed physical execution → durable ACK interface
+(ADR-0012 scope), authorized by the repository maintainer on 2026-11-08**. The
+fifth independent audit returned `CLOSED WITH STATED SCOPE` for the ADR-0012
+boundary with no new P0/P1 blocker, and the closure PR #25 passed its own
+Linux and Windows CI. The accepted scope
 is **typed physical execution → durable ACK
 interface**: typed Task → B.3 matching → B.4 physical eligibility →
 Attempt/Lease/ProvisioningBinding → pure prepare → Execution/BindingSnapshot →
@@ -37,14 +38,16 @@ IMPLEMENTED                 production typed dispatch, source integration and
 CLOSED WITH STATED SCOPE    fifth independent audit accepted the ADR-0012
                             boundary with no new P0/P1 blocker
 FREEZE READY                implementation, evidence, normative text, deferred
-                            ownership and CI are reconciled at this record
-FROZEN                      the maintainer accepts the freeze; not asserted here
+                            ownership and CI reconciled at closure PR #25
+FROZEN                      maintainer authorized the freeze on 2026-11-08
+                            within ADR-0012
 ```
 
-`FREEZE READY` is a statement about evidence completeness, not a substitute for
-the maintainer's decision. This record does **not** freeze the worker-originated
-semantic Result data plane: that data plane is outside ADR-0012 and remains
-deferred.
+`FREEZE READY` was the pre-authorization state: a statement about evidence
+completeness, not a substitute for the maintainer's decision. On 2026-11-08 the
+maintainer reviewed PR #25 and authorized `FROZEN`. Even so, this record does
+**not** freeze the worker-originated semantic Result data plane: that data plane
+is outside ADR-0012 and remains deferred.
 
 ## Scope and acceptance baseline
 
@@ -182,9 +185,9 @@ These three findings are closed for the freeze decision as follows:
   implicit fallback is added. Not a blocker. Tracking: `D-SELECTION-POLICY` in
   [spec 17](../../specs/v0.2/17-deferred-open-questions.md).
 
-The implementation round therefore hands over a **FREEZE READY** record. The
-`FROZEN` label is not asserted here: it requires the maintainer's explicit
-decision after reviewing this closure PR.
+The implementation round handed over a **FREEZE READY** record; the
+maintainer then authorized **FROZEN** on 2026-11-08 after reviewing closure
+PR #25, whose own push and pull-request CI passed on the exact closure HEAD.
 
 Deployment remains restricted to fresh schema-v8 databases and reopening
 existing v8 databases. v7→v8 migration is not implemented. The frozen specs
@@ -446,15 +449,16 @@ Windows compile.
 | ReadOnly durable ACK succeeds | `kernel.rs` | `typed_read_only_task_runs_end_to_end_and_acks_through_the_daemon` | PASS (local, CI) | PASS (CI) | PASS | ACK is harness-injected (F1) |
 | Write without quiescence refuses ACK | `kernel.rs` | Write E2E, `writer_safety_suspension_is_distinct_from_task_completed` | PASS (local, CI) | PASS (CI) | PASS | — |
 | Physical termination creates no Result and no quiescence | `runtime/src/lib.rs`, `kernel.rs` | `dispatch_ambiguous_write_start_never_gains_quiescence`, `unisolated_writer_expiry_without_quiescence_suspends` | PASS (local, CI) | PASS (CI) | PASS | Direct process only; no process tree |
-| v7 store rejected; existing v8 store reopens | `storage-sqlite/src/store.rs` | `schema_v7_database_is_rejected_after_b4_tables`, `prior_v8_database_reopen_installs_additive_preparation_fault_guards` | PASS (local) | PASS (closure CI) | PASS | No v7→v8 migration (`D-DB-MIGRATE`) |
+| v7 store rejected; existing v8 store reopens | `storage-sqlite/src/store.rs` | `schema_v7_database_is_rejected_after_b4_tables`, `prior_v8_database_reopen_installs_additive_preparation_fault_guards` | PASS (local, CI) | PASS (CI) | PASS | No v7→v8 migration (`D-DB-MIGRATE`) |
 | Worker-originated Result transport/auth/retry/ingress (F1) | none — excluded by ADR-0012 | Harness calls `Kernel::ack_success`; no worker transport | n/a | n/a | DEFERRED | `D-WORKER-RESULT-DP` |
 | Artifact retention and safe GC (F2) | none — no production deletion authority | `prepare_jail` retains jail/workspace/stdout/stderr/locator; only test code deletes | n/a | n/a | DEFERRED | `D-ARTIFACT-GC` |
 | Equal-continuity selection policy (F3) | `provisioning_resolver.rs` | `ambiguous_selection_fails_closed`, `a_new_equal_continuity_config_blocks_warm_reuse_until_the_tie_is_removed` | PASS (local, CI) | PASS (CI) | DEFERRED (liveness) | `D-SELECTION-POLICY` / ADR-0010 |
 
 `PASS (CI)` for Linux refers to the ubuntu job of run `42404395365` (20 jail
 enforcement tests, 10 typed E2E, 35 public-API probes). The newly added v7
-schema-gate test is not part of that run; its Linux execution is the closure
-PR's ubuntu job, and the PR record binds the result to the exact closure SHA.
+schema-gate test is not part of that run; its Linux execution is the ubuntu job
+of closure run `42407760818` (PR #25), which also re-ran jail 20 and typed E2E 10
+on the closure HEAD.
 
 ## E2E trace (real run, Windows)
 
@@ -612,12 +616,17 @@ implementation SHA with green Linux and Windows CI.
 | Audited → merge delta | `git diff --stat ec09375 5808783` = one file, this report; documentation only, no implementation change |
 | CI at the audited head | push `42402482506` PASS, PR `42402487742` PASS |
 | CI at the merge commit | `42404395365` PASS, 6/6 jobs |
-| Closure PR | documentation + one schema-gate test; requires its own green CI |
+| Closure PR | PR #25: documentation + one schema-gate test; no production code change |
+| Closure HEAD after P2 fix | `026725b7910115ed8a1b95ab239756e24f3b3529` |
+| CI at the closure HEAD | push `42407756516` PASS 6/6, PR `42407760818` PASS 6/6 (Linux `rust` job ran the v7 gate test, 20 jail tests and 10 typed E2E) |
+| Freeze authorization | Maintainer reviewed PR #25 (`GO WITH MINOR FIX`, P2 fixed at `026725b`) and authorized `FROZEN` on 2026-11-08 |
 
 The audit evidence therefore covers the implementation content that is present
 at the merge commit. It is not described as an audit executed against the merge
 SHA itself, and no later closure commit inherits that evidence without the
-documentation-only delta being stated.
+documentation-only delta being stated. The `FROZEN` wording commit is
+documentation-only and must pass its own push and pull-request CI before merge;
+a green run on `026725b` is not reused as proof for that later commit.
 
 ## Baseline and evidence mapping
 
@@ -628,7 +637,10 @@ Audited implementation head:       ec093753f30e81771d36fe555fbf1c509a6c77ee
 Merge commit (PR #24):             58087836ea690c010bc2d7152b646a16ca1066be
 CI @ audited head:                 push 42402482506 / PR 42402487742   PASS
 CI @ merge commit:                 42404395365                        PASS 6/6
+Closure head (PR #25):             026725b7910115ed8a1b95ab239756e24f3b3529
+CI @ closure head:                 push 42407756516 / PR 42407760818   PASS 6/6
 Closure branch:                    agent/m6b4-freeze-closure
+Freeze state:                      FROZEN (maintainer, 2026-11-08)
 ```
 
 The third, fourth and fifth audit revisions and their findings remain recorded
@@ -638,12 +650,12 @@ in the sections above; no failed revision is removed to manufacture a pass.
 
 | Document | Statement at merge | Reconciliation |
 |---|---|---|
-| `docs/README.md` | M6-B.4 "incomplete and not frozen" because the worker data plane is deferred | Corrected: that data plane is outside ADR-0012; the milestone is FREEZE READY within the stated scope |
-| This record | Verdict `NOT FROZEN` | Updated to FREEZE READY with the evidence mapping above |
+| `docs/README.md` | M6-B.4 "incomplete and not frozen" because the worker data plane is deferred | Corrected: that data plane is outside ADR-0012; the milestone is FROZEN within the stated scope |
+| This record | Verdict `NOT FROZEN` | Updated to `FREEZE READY`, then to `FROZEN` after maintainer authorization on 2026-11-08 |
 | [ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) | Status: "not a milestone freeze" | Describes the ADR's own status; the milestone state is owned here |
 | [ADR-0010](../../decisions/0010-m6b-selection-order-scope.md) | Equal-continuity selection fails closed | Unchanged and still governs F3 |
 | [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md) | Status: "not a milestone freeze"; "unfrozen v8 schema" | Describes the correction's own status and the pre-freeze state; the v8 shape is recorded here |
-| [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md) | Freeze requires independent re-audit at an exact SHA with green CI | Condition satisfied by the mapping above; the ADR text is not rewritten |
+| [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md) | Freeze requires independent re-audit at an exact SHA with green CI; the record "remains `NOT FROZEN` until" that happens | Condition satisfied by the mapping above; the ADR text is not rewritten |
 | [spec 13](../../specs/v0.2/13-storage-and-transactions.md) | "During this unfrozen PR" | Editorial change to bring-up wording; behavior unchanged |
 | [contract parity report](riir-m6b.4-contract-parity.md) | "milestone freeze remain separate gates" | True when written; the gate is now tracked here and its witnesses are unchanged |
 

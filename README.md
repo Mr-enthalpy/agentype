@@ -10,8 +10,8 @@ notifications. Physical execution belongs to replaceable adapters.
 - The Python package `local-agent-scheduler` 0.1.3 is the current packaged
   product line.
 - The Rust V0.2 mainline has a frozen M5 execution/runtime substrate, a frozen
-  M6-A semantic frontier kernel, and frozen M6-B.1–M6-B.3 milestones. M6-B.4
-  (schema v8) is FREEZE READY at the ADR-0012 scope
+  M6-A semantic frontier kernel, and frozen M6-B.1–M6-B.4 milestones. M6-B.4
+  (schema v8) is FROZEN at the ADR-0012 scope
   `typed physical execution → durable ACK interface`; see
   [docs/README.md](docs/README.md) and the
   [M6-B.4 freeze record](docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md).

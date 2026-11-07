@@ -78,5 +78,5 @@ are not claims of production physical cleanup or enforcement.
 > now tracked in the
 > [M6-B.4 freeze record](riir-m6b.4-provisioning-binding-freeze.md), which
 > records the merge baseline `5808783`, the fifth audit at `ec09375`, and the
-> `FREEZE READY` state within ADR-0012. The witnesses in this report are
-> unchanged.
+> `FROZEN` state within ADR-0012 (maintainer authorization, 2026-11-08). The
+> witnesses in this report are unchanged.
