@@ -73,6 +73,9 @@ therefore has to be a normative decision rather than a descriptive note.
   confinement; Linux claims a content-write boundary.
 - No v7→v8 migration, B.5 credential/security import, cold/revivable matching,
   full typed topology, or executed-WARM replacement is included.
+- Termination covers the proven direct process, not an OS process tree. No
+  process group/cgroup/Job Object is created, so worker-spawned descendants are
+  not part of this control claim; process death is still not quiescence proof.
 
 ## Consequences
 

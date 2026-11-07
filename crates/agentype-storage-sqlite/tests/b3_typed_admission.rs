@@ -1903,3 +1903,82 @@ fn bounded_typed_enumeration_skips_a_large_blocked_head() {
 
     assert!(kernel.list_typed_dispatch_candidates(0).unwrap().is_empty());
 }
+
+/// P2: the cooldown filter must not scale the SQLite bind-parameter count with
+/// the number of cooling Tasks. A long-lived daemon can accumulate far more
+/// cooling ids than `SQLITE_MAX_VARIABLE_NUMBER`; the query must stay bounded
+/// and still find ready Tasks behind them instead of turning an ordinary
+/// deferral into a fatal persistence error.
+#[test]
+fn large_cooldown_set_cannot_exhaust_sqlite_parameters() {
+    let path = file_path("typed-cooldown-parameters");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+    let kernel = Kernel::open(&path, clock, 10.0, MAX_BYTES).unwrap();
+    kernel
+        .upsert_partition(&PartitionSpec::new(
+            "general",
+            1,
+            Retention::Resident,
+            "local",
+            "default",
+        ))
+        .unwrap();
+    let pin = publish_agent_type(&kernel, "cooldown-parameters-reviewer", 1);
+    let tasks: Vec<TaskId> = (0..3)
+        .map(|index| {
+            let gen = kernel.create_generation(json!({})).unwrap();
+            let mut spec = TaskSpec::new(format!("cooldown-{index}"), json!({}));
+            spec.partition = PartitionId::new("general");
+            spec.priority = i64::from(3 - index);
+            let intent = RawWorkIntent {
+                raw_intent_key: format!("cooldown-intent-{index}"),
+                objective: "cooldown parameter bound".into(),
+                information_function: InformationFunction::Expand,
+                semantic_input_set: SemanticInputSet::new(),
+                rationale: None,
+                suggested_task_spec: Some(spec),
+            };
+            let proposal = kernel
+                .compile_root_intent(&gen.generation_id, intent, "session", 1)
+                .unwrap();
+            kernel
+                .admit_typed_proposal(&proposal.proposal_id, 0, None, draft(pin.clone()))
+                .unwrap()
+        })
+        .collect();
+
+    // Prove this SQLite build really rejects a statement with one variable per
+    // cooling id, so the Kernel call below is meaningful evidence rather than
+    // a tautology.
+    let probe = rusqlite::Connection::open_in_memory().unwrap();
+    let placeholders = (1..=40_000)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        probe
+            .prepare(&format!("SELECT 1 WHERE 1 NOT IN ({placeholders})"))
+            .is_err(),
+        "this build must reject a 40,000-variable statement"
+    );
+
+    let cooling: Vec<TaskId> = (0..40_000)
+        .map(|index| TaskId::from_string(format!("cooling-{index:06}")))
+        .collect();
+    let page = kernel
+        .list_typed_dispatch_candidates_excluding(2, &cooling)
+        .unwrap();
+    assert_eq!(
+        page,
+        tasks[..2].to_vec(),
+        "an unrelated cooldown set must not hide ready Tasks or fail the query"
+    );
+
+    // Exclusion still applies inside the same fixed parameter set.
+    let mut cooling_with_head = cooling;
+    cooling_with_head[0] = tasks[0].clone();
+    let page = kernel
+        .list_typed_dispatch_candidates_excluding(2, &cooling_with_head)
+        .unwrap();
+    assert_eq!(page, tasks[1..].to_vec());
+}

@@ -95,6 +95,26 @@ is the deterministic race injection: the test-only probe records the handle used
 for each phase and asserts they are identical, so reopening the PID between the
 two proofs fails the test without needing a real PID recycle.
 
+The head after this revision started from the fourth independently audited commit
+`3e51c4b8b9daa342d814c73c0e2c415c0ef2c938` and closes its P1 and both new P2
+findings:
+
+- The variable-length `TOKEN_GROUPS`/`TOKEN_PRIVILEGES` result is no longer read
+  through a Rust reference formed before the length check. `TokenInfoBuffer`
+  first bounds-checks and reads only the four-byte count, then validates the
+  array extent, and only then forms a typed slice. A short header (including a
+  zero-entry return), a count beyond the returned bytes, and a returned length
+  beyond the allocation all fail before any typed access. The `fake-agent`
+  privilege probe follows the same order. P1.
+- The cooldown filter is a single JSON-array parameter consumed by `json_each`,
+  so the bind-parameter count is fixed at three however many Tasks are cooling.
+  A 40,000-id cooldown set no longer risks `SQLITE_MAX_VARIABLE_NUMBER` and a
+  fatal persistence error, while exclusion still happens before `LIMIT`. P2.
+- Process-tree lifecycle is now an explicit boundary: termination covers the
+  proven direct process, no process group/cgroup/Job Object is created, and
+  process death remains non-quiescence. Managing descendants and its conformance
+  are deferred. P2 boundary, not a correctness fix.
+
 The prior round's closure of P1-1, P1-2, P1-3, P2-2 and P2-3 remains in place:
 locator evidence survives the `spawn → identity` window, Windows children keep
 only `SeChangeNotifyPrivilege` and run on a per-Execution desktop, the typed
@@ -115,7 +135,7 @@ retains the unresolved availability/cost ranking question.
 
 | Phase | Committed facts and checks |
 |---|---|
-| Enumerate | `Kernel::list_typed_dispatch_candidates_excluding` performs one authority-free, DB-bounded read: the shared readiness predicate, the runtime-local cooldown exclusion, the frozen `priority DESC, created_at ASC, id ASC` order, and `LIMIT probe_limit` are all applied in SQL, so a large blocked or cooling head does not force an O(N) load/sort. Core's `order_ready_tasks` re-checks readiness and order on the returned bounded page. It returns no claim and mutates nothing |
+| Enumerate | `Kernel::list_typed_dispatch_candidates_excluding` performs one authority-free, DB-bounded read: the shared readiness predicate, the runtime-local cooldown exclusion, the frozen `priority DESC, created_at ASC, id ASC` order, and `LIMIT probe_limit` are all applied in SQL, so a large blocked or cooling head does not force an O(N) load/sort. The cooldown set is one JSON-array parameter evaluated by `json_each`, so the bind-parameter count stays fixed however many Tasks are cooling. Core's `order_ready_tasks` re-checks readiness and order on the returned bounded page. It returns no claim and mutates nothing |
 | Resolve | Validate partition target/profile; apply known hard filters before bounded, read-only source-local attestation; rank eligible candidates and capture the catalog frontier |
 | Acquire | Transactionally reload and re-prove Task, actual bound AgentType, placement, source/config/policy, realized retention and exact imported safety; commit Attempt/Lease/assignment and per-Incarnation ProvisioningBinding; leave `Attempt.incarnation_id` unset |
 | Prepare | After winner selection/commit, create the winner's **fresh** prepare deadline; re-resolve the explicitly registered exact source; fence claim authority and integration protocol before/after pure preparation; require the attested digest; return a secret-free descriptor |
@@ -435,13 +455,14 @@ fatal preparation fault that fails the daemon and produces exactly one
 | Fatal prepare escalation | `confirmed_fatal_preparation_survives_restart_without_execution_lost_retry`; `preparation_fault_is_immutable_and_fences_execution_and_worker_settlement`; fatal-prep E2E |
 | Root retry / cancel races | `retry_wait_is_promoted_then_redispatched`; `cancel_task_releases_a_prepared_claim`; `cancel_batch_releases_a_prepared_claim` |
 | Typed unavailable / ambiguous before Attempt | `target_isolation_filters_incapable_source_before_attest_and_selection`; `credential_config_is_filtered_before_attestation_and_cannot_hide_valid_config`; E2E negative cases |
-| Windows token parse boundary | `token_information_buffer_is_aligned_and_bounds_checked`; the real restricted-SID witness still runs in the locator tests; no unchecked `Vec<u8>` to `#[repr(C)]` cast remains |
+| Windows token parse boundary | `token_information_buffer_is_aligned_and_bounds_checked` and `variable_length_token_header_is_validated_before_any_typed_access` (zero entries, short header, huge count, length beyond allocation all fail before any typed access); the real restricted-SID witness still runs in the locator tests; neither the adapter nor `fake-agent` forms a variable-length typed reference before validating the returned length |
+| Cooldown filter size | `large_cooldown_set_cannot_exhaust_sqlite_parameters` (a probe proves this build rejects a 40,000-variable statement; the Kernel query with a 40,000-id cooldown set still returns the ready page and still applies exclusion) |
 | Repeated Execution lifecycles | `shared_window_station_acl_does_not_grow_across_execution_lifecycles` (three real Executions) and `private_desktops_do_not_accrue_window_station_aces` (several distinct SIDs) |
 | Write success without quiescence | `writer_safety_suspension_is_distinct_from_task_completed`; Write E2E (`ack_success` returns `None`) |
 
 ## Verification
 
-Local checks on 2026-11-07 (Windows):
+Local checks on 2026-11-08 (Windows):
 
 | Check | Result |
 |---|---|
@@ -451,8 +472,9 @@ Local checks on 2026-11-07 (Windows):
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
 | `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 19 passed (real OS enforcement, including token/desktop, station-DACL lifecycle, locator recovery and the birthless-locator negative control tests) |
 | `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 10 passed (including real daemon restart and mixed legacy/typed queue) |
-| `cargo test -p agentype-adapter-local-process --lib` | 38 passed (including the deterministic SID/birth same-handle probe, token-buffer alignment/bounds and station-DACL unit tests) |
+| `cargo test -p agentype-adapter-local-process --lib` | 39 passed (including the variable-length token header negative cases, the deterministic SID/birth same-handle probe, token-buffer alignment/bounds and station-DACL unit tests) |
 | `cargo test -p agentype-storage-sqlite --test b3_typed_admission bounded_typed_enumeration_skips_a_large_blocked_head` | passed (30 blocked high-priority Tasks, bounded page still finds the ready ones) |
+| `cargo test -p agentype-storage-sqlite --test b3_typed_admission large_cooldown_set_cannot_exhaust_sqlite_parameters` | passed (40,000 cooling ids exceed this build's variable limit yet the query stays bounded) |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
 workspace directory because the sandboxed test process cannot create the
@@ -507,6 +529,13 @@ reverts to NOT FROZEN.
 - **Windows ACL mechanism**: direct security APIs replace `icacls`, which
   cannot map an arbitrary per-execution SID (error 1332). The ACE is applied to
   the jail root and workspace, not recursively to pre-existing content.
+- **Process-tree lifecycle**: `terminate_execution` acts on the proven direct
+  process only. The jail does not create a Linux process group/cgroup or a
+  Windows Job Object, so descendants spawned by the worker or harness can
+  outlive the direct child. This is not a quiescence claim — M5 never derives
+  `quiescent_confirmed` from process death — and it does not reopen writer
+  authority. Process-tree lifetime management and its conformance remain a
+  follow-up capability with an explicit boundary.
 - **Network enforcement**: the jail supports `Enabled` only; other policies are
   rejected as Unavailable rather than weakened.
 - **Attempt isolation**: not provided by a per-execution workspace and never

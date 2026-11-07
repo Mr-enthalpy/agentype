@@ -1992,6 +1992,12 @@ impl Kernel {
     /// frozen [`claim_task_ready`] gate as a coarse pre-filter; Core's
     /// [`order_ready_tasks`] still re-applies it, so query text alone cannot
     /// change eligibility or order.
+    ///
+    /// The cooldown set is passed as a single JSON array parameter evaluated by
+    /// `json_each`, so the bind-parameter count is fixed at three regardless of
+    /// how many Tasks are cooling. Building one `?N` per excluded Task would
+    /// eventually exceed the SQLite variable limit and turn an ordinary
+    /// deferral into a fatal persistence error.
     pub fn list_typed_dispatch_candidates_excluding(
         &self,
         limit: usize,
@@ -2016,20 +2022,12 @@ impl Kernel {
         );
         let mut values: Vec<rusqlite::types::Value> = vec![now.into(), limit.into()];
         if !excluded.is_empty() {
-            sql.push_str(" AND t.id NOT IN (");
-            for index in 0..excluded.len() {
-                if index > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                sql.push_str(&(index + 3).to_string());
-            }
-            sql.push(')');
-            values.extend(
-                excluded
-                    .iter()
-                    .map(|task| rusqlite::types::Value::Text(task.as_str().to_string())),
-            );
+            let ids: Vec<&str> = excluded.iter().map(TaskId::as_str).collect();
+            let encoded = serde_json::to_string(&ids).map_err(|err| {
+                Error::StorageFailure(format!("cannot encode the typed cooldown filter: {err}"))
+            })?;
+            sql.push_str(" AND t.id NOT IN (SELECT value FROM json_each(?3))");
+            values.push(rusqlite::types::Value::Text(encoded));
         }
         sql.push_str(" ORDER BY t.priority DESC, t.created_at ASC, t.id ASC LIMIT ?2");
         let rows = self.store.query(|conn| {

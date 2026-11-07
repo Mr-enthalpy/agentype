@@ -33,6 +33,12 @@
 //! Control (`observe`/`interrupt`/`terminate`/`collect`/`reconcile`) is
 //! deliberately shared with the local-process adapter's pinned-identity model:
 //! no action is ever taken on a bare numeric PID.
+//!
+//! Termination is scoped to the proven **direct** process. This adapter does not
+//! create a process group, cgroup, or Windows Job Object, so descendants the
+//! worker spawns are outside this control claim; process death is still never
+//! treated as quiescence (the M5 invariant). Process-tree lifetime management is
+//! a separate, deferred capability.
 
 #![allow(unsafe_code)]
 
@@ -1211,6 +1217,36 @@ impl TokenInfoBuffer {
         self.words.as_ptr().cast()
     }
 
+    /// Read the leading `count` field only after proving the fixed header was
+    /// actually written.
+    ///
+    /// Win32 returns `TOKEN_GROUPS`/`TOKEN_PRIVILEGES` as variable-length
+    /// structures. Forming a Rust reference to the whole structure before the
+    /// returned length is checked would create a reference past the written
+    /// region whenever the API returns a short header (for example zero
+    /// entries). This helper reads only the four-byte count through a
+    /// bounds-checked raw read; typed slices are formed later, after
+    /// [`Self::validate`] has proved the array extent.
+    fn count_field(&self, written: u32, header: usize) -> AdapterResult<u32> {
+        let written = usize::try_from(written)
+            .map_err(|_| AdapterError::other("token information length does not fit in usize"))?;
+        if written > self.capacity() {
+            return Err(AdapterError::other(
+                "token information exceeded the allocated buffer",
+            ));
+        }
+        if header < std::mem::size_of::<u32>() || written < header {
+            return Err(AdapterError::other(
+                "token information is shorter than its fixed header",
+            ));
+        }
+        // SAFETY: the base is word-aligned, `count` is the first field, and the
+        // checks above proved the four bytes lie inside both the written region
+        // and this allocation. No reference to the variable-length structure is
+        // formed before this point.
+        Ok(unsafe { self.base().cast::<u32>().read() })
+    }
+
     /// Validate the buffer length and element count reported by the API before
     /// any structure or slice is formed. `header` is the byte offset of the
     /// trailing variable-length array inside the Win32 structure.
@@ -1414,15 +1450,19 @@ pub(crate) fn restricted_sid_present_on_process(
         std::mem::align_of::<TokenGroups>() <= std::mem::align_of::<TokenInfoWord>(),
         "the token buffer word alignment must satisfy TOKEN_GROUPS alignment"
     );
-    // SAFETY: the buffer is at least `needed` bytes and word-aligned, and the
-    // API wrote a TOKEN_GROUPS header at its base.
-    let groups = unsafe { &*buffer.base().cast::<TokenGroups>() };
-    let count = match buffer.validate(
-        needed,
-        std::mem::size_of::<TokenGroups>() - std::mem::size_of::<SidAndAttributes>(),
-        groups.count,
-        std::mem::size_of::<SidAndAttributes>(),
-    ) {
+    let header = std::mem::size_of::<TokenGroups>() - std::mem::size_of::<SidAndAttributes>();
+    let parsed = (|| -> AdapterResult<usize> {
+        // Read only the count first: a short header must fail before any typed
+        // reference to the variable-length structure exists.
+        let raw_count = buffer.count_field(needed, header)?;
+        buffer.validate(
+            needed,
+            header,
+            raw_count,
+            std::mem::size_of::<SidAndAttributes>(),
+        )
+    })();
+    let count = match parsed {
         Ok(count) => count,
         Err(err) => {
             unsafe {
@@ -1431,8 +1471,16 @@ pub(crate) fn restricted_sid_present_on_process(
             return Err(err);
         }
     };
-    // SAFETY: `validate` proved the array ends inside the written region.
-    let entries = unsafe { std::slice::from_raw_parts(groups.groups.as_ptr(), count) };
+    debug_assert_eq!(
+        header % std::mem::align_of::<SidAndAttributes>(),
+        0,
+        "the TOKEN_GROUPS array offset must be aligned for its entries"
+    );
+    // SAFETY: `count_field` proved the fixed header was written and `validate`
+    // proved the variable-length array ends inside the written region.
+    let entries = unsafe {
+        std::slice::from_raw_parts(buffer.base().add(header).cast::<SidAndAttributes>(), count)
+    };
     let present = entries.iter().any(|entry| {
         buffer.contains(entry.sid.cast(), 8, needed)
             && unsafe { EqualSid(entry.sid, expected) } != 0
@@ -1833,17 +1881,30 @@ fn privilege_deletions_for_token(
         std::mem::align_of::<TokenPrivileges>() <= std::mem::align_of::<TokenInfoWord>(),
         "the token buffer word alignment must satisfy TOKEN_PRIVILEGES alignment"
     );
-    // SAFETY: the buffer is at least `needed` bytes and word-aligned, and the
-    // API wrote a TOKEN_PRIVILEGES header at its base.
-    let privileges = unsafe { &*buffer.base().cast::<TokenPrivileges>() };
+    let header =
+        std::mem::size_of::<TokenPrivileges>() - std::mem::size_of::<TokenLuidAndAttributes>();
+    // Read only the count first: a short header must fail before any typed
+    // reference to the variable-length structure exists.
+    let raw_count = buffer.count_field(needed, header)?;
     let count = buffer.validate(
         needed,
-        std::mem::size_of::<TokenPrivileges>() - std::mem::size_of::<TokenLuidAndAttributes>(),
-        privileges.count,
+        header,
+        raw_count,
         std::mem::size_of::<TokenLuidAndAttributes>(),
     )?;
-    // SAFETY: `validate` proved the array ends inside the written region.
-    let entries = unsafe { std::slice::from_raw_parts(privileges.privileges.as_ptr(), count) };
+    debug_assert_eq!(
+        header % std::mem::align_of::<TokenLuidAndAttributes>(),
+        0,
+        "the TOKEN_PRIVILEGES array offset must be aligned for its entries"
+    );
+    // SAFETY: `count_field` proved the fixed header was written and `validate`
+    // proved the variable-length array ends inside the written region.
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            buffer.base().add(header).cast::<TokenLuidAndAttributes>(),
+            count,
+        )
+    };
 
     let keep_name: Vec<u16> = std::ffi::OsStr::new("SeChangeNotifyPrivilege")
         .encode_wide()
@@ -3217,6 +3278,50 @@ mod tests {
         assert!(!buffer.contains(std::ptr::null(), 8, 32));
         let outside = (buffer.base() as usize + 64) as *const core::ffi::c_void;
         assert!(!buffer.contains(outside, 8, 32));
+    }
+
+    /// Win32 returns `TOKEN_GROUPS`/`TOKEN_PRIVILEGES` as variable-length
+    /// structs. A count must never be read through a reference to the whole
+    /// struct: a short return would make that reference out of bounds before
+    /// the length check runs. These are the negative lengths the audit asked
+    /// for (zero entries, short header, huge count, length beyond allocation).
+    #[cfg(windows)]
+    #[test]
+    fn variable_length_token_header_is_validated_before_any_typed_access() {
+        // TOKEN_PRIVILEGES: 4-byte header, 12-byte entries.
+        let mut buffer = TokenInfoBuffer::new(16).unwrap();
+        let header = 4usize;
+        let entry = 12usize;
+        // SAFETY: the buffer is at least four bytes and word-aligned.
+        unsafe {
+            buffer.as_mut_ptr().cast::<u32>().write(1);
+        }
+        assert_eq!(buffer.count_field(16, header).unwrap(), 1);
+        assert_eq!(buffer.validate(16, header, 1, entry).unwrap(), 1);
+
+        // Zero entries: the return is exactly the fixed header, and a zero
+        // count yields a valid empty array extent.
+        // SAFETY: the buffer is at least four bytes and word-aligned.
+        unsafe {
+            buffer.as_mut_ptr().cast::<u32>().write(0);
+        }
+        assert_eq!(buffer.count_field(header as u32, header).unwrap(), 0);
+        assert_eq!(buffer.validate(header as u32, header, 0, entry).unwrap(), 0);
+
+        // Short header: fewer bytes than the count field must fail before the
+        // count is read, including a header offset larger than the return.
+        assert!(buffer.count_field(2, header).is_err());
+        assert!(buffer.count_field(0, header).is_err());
+        assert!(buffer.count_field(7, 8).is_err());
+
+        // Returned length beyond the allocation and huge counts must fail.
+        assert!(buffer.count_field(17, header).is_err());
+        for count in [u32::MAX, 1 << 31, 2] {
+            assert!(
+                buffer.validate(16, header, count, entry).is_err(),
+                "count {count} must not fit the returned region"
+            );
+        }
     }
 
     /// The shared window station outlives every Execution, so a per-Execution

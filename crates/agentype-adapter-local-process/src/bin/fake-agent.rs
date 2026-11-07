@@ -440,38 +440,61 @@ fn isolation_probe() {
                     std::mem::align_of::<TokenPrivileges>() <= std::mem::align_of::<TokenWord>(),
                     "the token buffer word alignment must satisfy TOKEN_PRIVILEGES alignment"
                 );
-                // SAFETY: the buffer is at least `needed` bytes and word
-                // aligned; the API wrote a TOKEN_PRIVILEGES header at its base.
-                let token_privileges = unsafe { &*buffer.as_ptr().cast::<TokenPrivileges>() };
-                let count = token_privileges.count as usize;
                 let header = std::mem::size_of::<TokenPrivileges>()
                     - std::mem::size_of::<LuidAndAttributes>();
                 let entry = std::mem::size_of::<LuidAndAttributes>();
-                let required = header.saturating_add(count.saturating_mul(entry));
-                if required <= needed as usize && required <= capacity as usize {
-                    // SAFETY: the count was validated against the bytes the
-                    // API actually returned inside this allocation.
-                    let entries = unsafe {
-                        std::slice::from_raw_parts(token_privileges.privileges.as_ptr(), count)
-                    };
-                    for entry in entries {
-                        let mut name = vec![0u16; 256];
-                        let mut len = name.len() as Dword;
-                        // SAFETY: name is a valid out buffer; entry.luid is valid.
-                        if unsafe {
-                            LookupPrivilegeNameW(
-                                std::ptr::null(),
-                                &entry.luid,
-                                name.as_mut_ptr(),
-                                &mut len,
+                let written = needed as usize;
+                // Read only the count, and only after proving the fixed header
+                // and the allocation cover it. A short return must never form a
+                // typed reference to the variable-length structure.
+                if header >= std::mem::size_of::<u32>()
+                    && written >= header
+                    && written <= capacity as usize
+                {
+                    // SAFETY: the buffer is word-aligned and the checks above
+                    // prove the four-byte count field lies inside the written
+                    // region and this allocation.
+                    let count = unsafe {
+                        (buffer.as_ptr() as *const u8)
+                            .cast::<u32>()
+                            .read_unaligned()
+                    } as usize;
+                    let required = header.saturating_add(count.saturating_mul(entry));
+                    if required <= written && required <= capacity as usize {
+                        debug_assert_eq!(
+                            header % std::mem::align_of::<LuidAndAttributes>(),
+                            0,
+                            "the TOKEN_PRIVILEGES array offset must be aligned"
+                        );
+                        // SAFETY: the count was validated against the bytes the
+                        // API actually returned inside this allocation.
+                        let entries = unsafe {
+                            std::slice::from_raw_parts(
+                                (buffer.as_ptr() as *const u8)
+                                    .add(header)
+                                    .cast::<LuidAndAttributes>(),
+                                count,
                             )
-                        } != 0
-                        {
-                            let end = name
-                                .iter()
-                                .position(|&unit| unit == 0)
-                                .unwrap_or(len as usize);
-                            privileges.push(String::from_utf16_lossy(&name[..end]));
+                        };
+                        for entry in entries {
+                            let mut name = vec![0u16; 256];
+                            let mut len = name.len() as Dword;
+                            // SAFETY: name is a valid out buffer; entry.luid is valid.
+                            if unsafe {
+                                LookupPrivilegeNameW(
+                                    std::ptr::null(),
+                                    &entry.luid,
+                                    name.as_mut_ptr(),
+                                    &mut len,
+                                )
+                            } != 0
+                            {
+                                let end = name
+                                    .iter()
+                                    .position(|&unit| unit == 0)
+                                    .unwrap_or(len as usize);
+                                privileges.push(String::from_utf16_lossy(&name[..end]));
+                            }
                         }
                     }
                 }
