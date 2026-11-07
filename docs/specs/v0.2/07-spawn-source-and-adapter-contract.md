@@ -108,10 +108,11 @@ authority center ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-
   defined but unsupported in v1 production. Broker unreachable is not
   credential absent.
 - For `SECURITY_V1`, start and reconcile return a `SecuredStartObservation`
-  carrying the applied-security receipt and a `SecuredStartPhase`
-  (`HELD` / `RELEASED` / `UNKNOWN` / `TERMINAL`). A start without a valid receipt,
-  or a release without Kernel authority revalidation for the exact `RequestId`
-  and instance witness, cannot become RUNNING. The frozen base
+  carrying a `SecuredStartPhase` (`HELD` / `RELEASED` / `UNKNOWN` / `TERMINAL`)
+  and an optional `AppliedSecurityReceipt` that is required for `HELD` and
+  `RELEASED`. A start without a valid receipt where the phase requires one, or a
+  release without Kernel authority revalidation for the exact `RequestId` and
+  instance witness, cannot become RUNNING. The frozen base
   `ExecutionAdapter` is unchanged for `COARSE_V1`; the secured behavior is a
   versioned `SecuredExecutionAdapter` extension adding
   `start_secured_execution`, `reconcile_secured_start`, and

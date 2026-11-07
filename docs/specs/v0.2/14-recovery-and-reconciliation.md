@@ -49,27 +49,32 @@ The positive RUNNING transition and first Lease renewal MUST commit in one
 fenced Core transaction before daemon admission ([13](13-storage-and-transactions.md)).
 
 **M6-B.5 (`SECURITY_V1`):** a `start` or `reconcile_start` observation carries an
-`AppliedSecurityReceipt` and an explicit `SecuredStartPhase` (`HELD`,
-`RELEASED`, `UNKNOWN`, `TERMINAL`). Physical start MUST hold worker code at a
-controlled pre-exec boundary until the receipt and its directory metadata are
-durable. The observation, the validated receipt, the positive RUNNING transition
-and the first renewal MUST commit in the same fenced transaction; no separate
+explicit `SecuredStartPhase` (`HELD`, `RELEASED`, `UNKNOWN`, `TERMINAL`) and an
+**optional** `AppliedSecurityReceipt`. `HELD` and `RELEASED` require a valid,
+verified receipt; `UNKNOWN` permits it to be missing; `TERMINAL` may occur before
+a receipt exists. Physical start MUST hold worker code at a controlled pre-exec
+boundary until the receipt and its directory metadata are durable. The
+observation, the validated receipt, the positive RUNNING transition and the first
+renewal MUST commit in the same fenced transaction; no separate
 security-confirmation state exists.
 
-On restart, `reconcile_start` MUST recover the phase and the receipt for the same
-`RequestId` and the same physical instance. A `HELD` instance MUST NOT be released
-until the Kernel revalidates current Scheduler/Task authority and issues a proof
-for that exact `RequestId` and instance witness. Release MUST be idempotent for
-the same instance; a reused PID MUST NOT confer release authority; if authority
-is invalid the worker stays held and follows physical cleanup plus M5 recovery;
-if the release result is uncertain no second worker may be created. Receipt
-presence alone MUST NOT confirm RUNNING. If the receipt or the instance relation
-cannot be recovered, the Execution MUST NOT be admitted as RUNNING, a receipt
-MUST NOT be synthesized, and the legacy RUNNING path MUST NOT be used. The
-receipt artifact is stored in a daemon-owned state directory outside the
-worker-writable jail root/workspace, separately from the SQLite identity/digest
-row; the row remains authority-bearing and the artifact is verified physical
-evidence
+On restart, `reconcile_start` MUST recover the phase and, when the phase requires
+one, the receipt for the same `RequestId` and the same physical instance. A
+`HELD` instance MUST NOT be released until the Kernel revalidates current
+Scheduler/Task authority and issues a proof for that exact `RequestId` and
+instance witness. Release MUST be idempotent for the same instance; a reused PID
+MUST NOT confer release authority; if authority is invalid the worker stays held
+and follows physical cleanup plus M5 recovery; if the release result is uncertain
+no second worker may be created. Receipt presence alone MUST NOT confirm RUNNING.
+If the receipt or the instance relation cannot be recovered, the Execution MUST
+NOT be admitted as RUNNING, a receipt MUST NOT be synthesized, and the legacy
+RUNNING path MUST NOT be used. A controlled process created before the receipt
+was persisted is `UNKNOWN`: reconciliation must not release it, must not
+synthesize a receipt, and must leave it to M5 physical recovery; the
+crash-injection suite covers this window. The receipt artifact is stored in a
+daemon-owned state directory outside the worker-writable jail root/workspace,
+separately from the SQLite identity/digest row; the row remains authority-bearing
+and the artifact is verified physical evidence
 ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md)).
 
 **M5:** configuration MUST satisfy

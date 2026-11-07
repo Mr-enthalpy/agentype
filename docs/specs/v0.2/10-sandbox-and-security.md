@@ -97,8 +97,10 @@ In `SECURITY_V1`:
   recorded with `TaskSecurityBinding`, and a `SECURITY_V1` Task requires both its
   Generation and the actual bound AgentType to support `SECURITY_V1`. It MUST
   NOT be downgraded at matching, provisioning or recovery. A `COARSE_V1`
-  AgentType cannot execute a `SECURITY_V1` Task; a `SECURITY_V1` AgentType may
-  execute a `COARSE_V1` Task only through the explicit `COARSE_V1` path.
+  AgentType cannot execute a `SECURITY_V1` Task, and in B.5 v1 a `SECURITY_V1`
+  AgentType cannot execute a `COARSE_V1` Task either: the coarse path cannot
+  prove its authored fine restrictions, so its coarse projection is not a
+  substitute for the full contract.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. `TaskSecurityBinding` persists the admission-stage
@@ -124,10 +126,13 @@ In `SECURITY_V1`:
 - The policy-only implementation target is
   `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
   ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md) §14).
-  Its supported set and explicit non-claims are normative: a dimension outside
-  the profile is ineligible, not partially enforced, and a capability is claimed
-  only when both supported platforms prove it. B5.5 classifies every dimension
-  against this profile.
+  It is a minimum target to be empirically proven by B5.4/B5.5, not a claim about
+  the current B.4 jail. Its supported set and explicit non-claims are normative: a
+  dimension outside the profile is ineligible, not partially enforced, and a
+  capability is claimed only when both supported platforms prove it. B5.4 must
+  publish an OS enforcement-mechanism design note, including why the daemon-owned
+  receipt directory stays inaccessible when daemon and worker share a user
+  identity. B5.5 classifies every dimension against this profile.
 - Credential-bearing configs remain fail-closed unless the exact binding
   declares the corresponding imported gate. B.5 v1 production enables only
   `security_execution_v1.policy` and `credential_brokered`;

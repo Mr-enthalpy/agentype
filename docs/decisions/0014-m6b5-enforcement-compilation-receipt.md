@@ -169,19 +169,34 @@ the old physical host.
 
 ### 7. Secured start observation and receipt
 
-For `SECURITY_V1`, a missing valid `AppliedSecurityReceipt` forbids the positive
-RUNNING transition. A versioned secured start result is required:
+For `SECURITY_V1`, a start can become RUNNING only with a valid
+`AppliedSecurityReceipt` and a proven secured phase. The receipt is optional in
+the observation because the physical instance may exist before the receipt is
+durable:
 
 ```text
 SecuredStartObservation
     physical StartObservation
-    AppliedSecurityReceipt
+    phase: SecuredStartPhase
+    receipt: Option<AppliedSecurityReceipt>
 ```
 
+Phase invariants:
+
+- `HELD` and `RELEASED` require a valid, verified receipt; without it the phase
+  is not a proven security phase.
+- `UNKNOWN` permits a missing receipt and preserves physical uncertainty; it
+  MUST NOT enter RUNNING.
+- `TERMINAL` may occur before a receipt exists; a missing receipt MUST NOT be
+  used to fabricate success.
+- if a physical observation exists but the receipt cannot be recovered, the
+  runtime MUST NOT enter RUNNING and MUST NOT use the legacy path to synthesize
+  acceptance.
+
 Both `start` and `reconcile_start` MUST return or recover the same Execution's
-trusted receipt. The legacy `ExecutionAdapter` interface remains available for
-`COARSE_V1`; `SECURITY_V1` uses a versioned extension instead of changing the
-frozen B.4 trait:
+trusted receipt whenever the phase proves one. The legacy `ExecutionAdapter`
+interface remains available for `COARSE_V1`; `SECURITY_V1` uses a versioned
+extension instead of changing the frozen B.4 trait:
 
 ```text
 SecuredExecutionAdapter : ExecutionAdapter
@@ -191,9 +206,9 @@ SecuredExecutionAdapter : ExecutionAdapter
                                                  → SecuredStartObservation
 ```
 
-`SecuredStartObservation` extends `StartObservation` with the receipt and an
-explicit `SecuredStartPhase`. An adapter that cannot implement the extension
-cannot provide `SECURITY_V1` for that binding. `COARSE_V1` continues to use the
+`SecuredStartObservation` extends `StartObservation` with the explicit phase and
+the optional receipt. An adapter that cannot implement the extension cannot
+provide `SECURITY_V1` for that binding. `COARSE_V1` continues to use the
 unchanged base trait.
 
 The receipt binds at least:
@@ -254,6 +269,20 @@ it from `RELEASED`. `reconcile_start` recovers the phase for the same RequestId
 and the same physical instance; it MUST NOT confirm RUNNING from the receipt
 alone.
 
+There is also a pre-receipt crash window:
+
+```text
+controlled process created
+daemon crashed
+receipt not persisted
+restart finds the instance
+```
+
+This is `UNKNOWN`, not `HELD` and not `TERMINAL`. `reconcile_start` MUST NOT
+synthesize a receipt, MUST NOT release the worker, and MUST NOT infer RUNNING.
+The Execution remains physically uncertain and follows M5 recovery. The
+crash-injection suite MUST cover this window explicitly.
+
 A `HELD` instance is released only through an authority-bearing path:
 
 ```text
@@ -271,6 +300,23 @@ still holds authority. That decision belongs to the Kernel and MUST be proven fo
 the exact `RequestId` and instance before the release call. The release result is
 then part of the evidence consumed by the RUNNING transaction; it is not a second
 security authority.
+
+When the policy requires credential delivery, the order is:
+
+```text
+HELD physical recipient
+    → credential authorization/delivery
+    → applied-security + delivery receipt durable
+    → Kernel authority revalidation
+    → RELEASED
+```
+
+The applied-security receipt's secret-free credential delivery scope receipt MUST
+describe the session that was actually established. A receipt MUST NOT be
+persisted as covering a scope that is delivered later or with a different scope.
+If delivery changes the scope, the receipt MUST be updated before release, or the
+delivery MUST use a separate, independently recoverable receipt chain. A missing
+or mismatched delivery receipt keeps the phase at most `HELD`/`UNKNOWN`.
 
 The following are mandatory:
 
@@ -397,9 +443,13 @@ cannot drift apart.
 ### 14. `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
 
 B5.0 freezes a minimum positive reference profile so B5.2/B5.4 have a concrete
-target and B5.5 has a profile to verify. It is a **positive** claim: a dimension
-not listed as supported is unsupported for this profile, even when it exists in
-the policy grammar.
+target and B5.5 has a profile to verify. It is a **positive** claim and a
+**minimum implementation target**, not evidence that the current B.4 jail
+already provides it. B5.4 MUST publish an OS enforcement-mechanism design note
+for every claimed item, and B5.5 MUST verify it with positive and negative tests
+before the profile is cited in a freeze record. It is a positive claim in the
+further sense that a dimension not listed as supported is unsupported for this
+profile, even when it exists in the policy grammar.
 
 Claimed supported:
 
@@ -430,6 +480,14 @@ Windows can prove it for the exact binding. A platform-specific matrix may be
 stricter, never looser. B.4's content-write confinement is an input to this
 profile, not evidence for any B.5 claim above it.
 
+The receipt-directory claim is specifically **not** implied by the B.4 jail.
+Linux content-write confinement is not general read isolation, and a Windows
+restricted token does not establish same-user read confidentiality. The B5.4
+design note MUST explain and demonstrate why the daemon-owned directory is
+unreadable, unwritable, undeletable, and unreplaceable by the worker even when
+daemon and worker share a user identity. This is a requirement on the evidence
+store itself, not a claim of a general read sandbox.
+
 A `SECURITY_V1` Task whose policy needs a non-claimed dimension is ineligible
 under this profile; it MUST NOT be partially enforced. The B5.5 enforcement
 matrix MUST classify every spec-10 dimension against this profile as proven,
@@ -454,9 +512,14 @@ limited, or unsupported.
   trustworthy input while keeping the same frozen transaction shape.
 - Secured start has an explicit phase and a release operation bound to the exact
   RequestId and instance, so crash recovery never blindly launches a second
-  worker or releases an instance whose authority has lapsed.
+  worker or releases an instance whose authority has lapsed. The receipt is
+  optional in the observation, so a process created before receipt durability is
+  `UNKNOWN` instead of a fabricated success.
+- Credential delivery is ordered inside `HELD` and before `RELEASED`, so the
+  receipt cannot claim a delivery scope that has not been established.
 - `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` fixes the minimum supported set and its
-  non-claims, so B.4's write confinement cannot be read as a full B.5 claim.
+  non-claims as a proof obligation, so B.4's write confinement cannot be read as
+  a full B.5 claim.
 - Adding the receipt artifact class expands the retained-artifact limitation and
   is recorded for the deferred GC design.
 

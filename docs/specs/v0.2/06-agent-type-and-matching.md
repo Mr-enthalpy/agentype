@@ -71,7 +71,9 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   satisfiability through one staged `satisfies_requirement` relation, and
   candidate-level guarantee/placement satisfaction. A `SECURITY_V1` Task is
   never downgraded to `COARSE_V1`, and the mode is never inferred from policy
-  presence. Authored policies are catalogued; intersection products are inline
+  presence. A `SECURITY_V1` AgentType is excluded from `COARSE_V1` Tasks, because
+  its coarse projection cannot replace the authored fine contract. Authored
+  policies are catalogued; intersection products are inline
   and content-addressed. `COARSE_V1` replay keeps the
   exact-reference rule;
   `D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION` remain the registry pointers

@@ -256,6 +256,25 @@ second worker to escape uncertainty. A broker may keep a non-secret delivery
 ledger under its own recovery responsibility; Core does not become a secret
 store.
 
+Delivery is ordered against the secured start phase. A credential-bearing
+Execution MUST establish the delivery session while the physical recipient is
+`HELD` and before `RELEASED`:
+
+```text
+HELD physical recipient
+    → credential authorization/delivery
+    → applied-security + delivery receipt durable
+    → authority revalidation
+    → RELEASED
+```
+
+The secret-free delivery scope in the applied-security receipt MUST describe the
+same session that was established. A later asynchronous delivery with a different
+scope MUST NOT be treated as covered by the earlier receipt; it needs its own
+recoverable receipt chain, and the applied-security receipt cannot be retroactively
+widened. A missing or mismatched delivery receipt keeps the phase at most
+`HELD`/`UNKNOWN`.
+
 ### 11. Scoped freeze ladder
 
 The freeze status ladder is:
@@ -329,13 +348,15 @@ B5.5 MUST treat these as mandatory regression categories:
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
-| Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker |
-| Admission mode | the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery; a `COARSE_V1` AgentType cannot execute it |
+| Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD`/`RELEASED` require a verified receipt, `UNKNOWN` permits a missing receipt and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker |
+| Cross-mode exclusion | a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task; its coarse projection cannot replace the authored fine contract |
+| Admission mode | the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery; a `COARSE_V1` AgentType cannot execute it, and a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task |
 | Stage separation | `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
 | `R_min` typing | permission floors use `RequiredAccess ⊆ ProjectAccess`; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
-| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it |
+| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it, and B5.4 must prove the same-user receipt-directory isolation mechanism |
+| Credential ordering | delivery is established while `HELD`, its receipt is durable before `RELEASED`, and a later different-scope delivery cannot retroactively satisfy the earlier receipt |
 | RUNNING atomicity | observation, receipt, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |

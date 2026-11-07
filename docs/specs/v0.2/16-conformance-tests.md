@@ -551,7 +551,9 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   assumed to support `A ∩ B`;
 - reference profile: `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` claims and non-claims
   are tested on both Linux and Windows; a non-claimed dimension makes a candidate
-  ineligible rather than partially enforced;
+  ineligible rather than partially enforced; B5.4 publishes the OS
+  enforcement-mechanism design note and proves the receipt directory remains
+  inaccessible when daemon and worker share a user identity;
 - enforcement matrix completeness: every spec-10 dimension is classified
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;
@@ -573,9 +575,19 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   distinguishes awaiting-release from actually started; a receipt alone does not
   confirm RUNNING;
 - secured start phase: `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are
-  exact; release requires a Kernel authority proof for the same RequestId and
-  instance witness; PID reuse cannot authorize release; uncertain release cannot
-  create a second worker;
+  exact; `HELD`/`RELEASED` require a verified receipt, `UNKNOWN` permits a missing
+  receipt and cannot enter RUNNING; a crash-injection test where the controlled
+  process is created but the receipt is not yet persisted MUST yield `UNKNOWN`,
+  never `HELD`, `RELEASED`, or RUNNING, and the instance is never released or
+  acknowledged; release requires a
+  Kernel authority proof for the same RequestId and instance witness; PID reuse
+  cannot authorize release; uncertain release cannot create a second worker;
+- cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
+  Task, because the coarse path cannot prove its authored fine restrictions;
+- credential ordering: a credential-bearing `SECURITY_V1` Execution establishes
+  delivery while `HELD`, persists the applied-security and delivery receipts, then
+  revalidates authority before `RELEASED`; a later delivery with a different scope
+  cannot retroactively satisfy an earlier receipt;
 - receipt durability: file and directory metadata are durable before release, an
   existing different receipt is never replaced, and the worker inherits no
   receipt file/directory handle;

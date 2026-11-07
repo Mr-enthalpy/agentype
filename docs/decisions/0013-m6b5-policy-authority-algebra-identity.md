@@ -370,9 +370,12 @@ Consequently:
 - it also requires the actual bound AgentType to support `SECURITY_V1`; otherwise
   that candidate is ineligible;
 - a `COARSE_V1` AgentType MUST NOT execute a `SECURITY_V1` Task;
-- a `SECURITY_V1` AgentType MAY execute a `COARSE_V1` Task, but only through the
-  explicit `COARSE_V1` path and its frozen semantics. Its `SECURITY_V1` policy is
-  not silently applied and no B.5 claim attaches to that Execution;
+- in B.5 v1 a `SECURITY_V1` AgentType MUST NOT execute a `COARSE_V1` Task. The
+  coarse path cannot prove that the AgentType's authored fine restrictions (for
+  example a command allowlist) are enforced, and its coarse projection is not a
+  substitute for the full contract. A future dual-mode AgentType with two
+  independently versioned mode-specific contracts is possible only through a new
+  ADR that proves coarse execution does not exceed the mode's declared ceiling;
 - `SECURITY_V1` MUST NOT fall back to `COARSE_V1` once the mode is durable — not
   at matching, provisioning, or recovery. A missing security child is corruption,
   not a downgrade opportunity.
