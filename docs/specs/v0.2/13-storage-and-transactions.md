@@ -208,24 +208,37 @@ surface designed in
   content, and Core-computed digests. Intersection products are canonical inline
   bytes plus a digest; they are never inserted as catalog rows.
 - `task_security_bindings` is immutable and write-once, created inside the
-  typed-admission transaction: inline admitted policy bytes, policy digest,
-  authored input refs/digests, and `normalization_version` /
-  `meet_algorithm_version`. A `SECURITY_V1` Task without its row is corruption.
+  typed-admission transaction: the explicit `SecurityContractMode`
+  (`COARSE_V1` / `SECURITY_V1`), inline admitted policy bytes, policy digest,
+  authored input refs/digests, `normalization_version` /
+  `meet_algorithm_version`, and the explicit set of `Pending` `R_min`
+  obligations deferred to candidate matching. A `SECURITY_V1` Task without its
+  row is corruption.
 - `execution_security_snapshots` is immutable, one per Execution, created in the
   same transaction as the Execution and `BindingSnapshot`: inline effective
   policy bytes and digest, derivation identity, enforcement profile/digest,
-  security plan/digest, bootstrap manifest digest, secret-free credential plan,
-  actual bound `AgentTypeRef` (or digest), and Task derivation digest.
-- `applied_security_receipts` is immutable, write-once, instance-bound, and
-  stored outside the worker-writable jail root/workspace. It is consumed by the
-  RUNNING + first-renewal transaction, never by a separate security state
-  machine. The durable row records the validated receipt identity/digest; the
-  receipt file is recoverable physical evidence. Recovery MUST distinguish a
-  controlled instance awaiting release from one that has started, and receipt
-  presence alone MUST NOT confirm RUNNING.
-- `SECURITY_V1` is a positive parent-side marker; a missing child is corruption
-  and MUST NOT degrade to `COARSE_V1`. The same write-once, same-identity
-  `INSERT OR REPLACE`, and authoritative-read coherence guards apply.
+  security plan/digest, bootstrap manifest digest, secret-free credential plan
+  including proof identity, broker epoch, issuer version, validity bound and
+  subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task
+  derivation digest.
+- `applied_security_receipts` is immutable, write-once, and instance-bound. The
+  SQLite row is the authority-bearing record; the daemon-owned receipt artifact
+  outside the worker-writable jail root/workspace is separate recoverable
+  physical evidence. The two MUST NOT be conflated. After a pre-RUNNING crash the
+  artifact may reconstruct and verify the receipt identity only under the full
+  relation (same ExecutionId/RequestId, binding and plan digest, instance
+  witness, proven release phase); a missing artifact cannot be synthesized from
+  the row, and an artifact alone cannot produce RUNNING. The row is consumed by
+  the RUNNING + first-renewal transaction, never by a separate security state
+  machine. Recovery MUST distinguish `HELD` from `RELEASED`, and receipt presence
+  alone MUST NOT confirm RUNNING.
+- `SECURITY_V1` is a positive parent-side mode marker recorded on the same row
+  that owns the admission record (`TaskAgentRequirement` /
+  `GenerationTaskBinding`), never inferred from `sandbox_policy` presence. The
+  parent must not lack its security child. It is corruption and MUST NOT degrade
+  to `COARSE_V1`, and the mode cannot be changed after admission. The same
+  write-once, same-identity `INSERT OR REPLACE`, and authoritative-read coherence
+  guards apply.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
@@ -353,7 +366,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. For `SECURITY_V1`, the same transaction also writes the immutable `TaskSecurityBinding`, runs the Task-local coarse/fine validation before any cross-object meet, and rejects admission unless `satisfies_requirement(R_min(T), meet(P_generation, P_task))`. |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. The explicit `SecurityContractMode` is part of the transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

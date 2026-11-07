@@ -29,7 +29,7 @@ production secret-delivery mechanism.
 
 | Object | Meaning | Durable? |
 |---|---|---|
-| `CredentialEligibilityEvidence` | non-secret, non-authorizing observation that a credential is currently eligible for an exact subject | yes, as evidence |
+| `CredentialEligibilityEvidence` | non-secret, non-authorizing observation that a credential is currently eligible for an exact subject | transient; its non-secret identity fields are carried into the Execution snapshot |
 | `CredentialAccessPlan` | secret-free use plan committed with the Execution security snapshot | yes |
 | `CredentialDeliverySession` | short-lived, execution-bound delivery object created after commitment | no, never in SQLite or the public control API |
 
@@ -37,6 +37,15 @@ The eligibility subject binds broker identity/registration epoch, exact
 source/config/domain, the credential-reference set digest, credential version
 identifiers, requested scope digest, delivery mode, and observation validity. At
 this stage there is no ExecutionId, so no Execution-bound grant may be invented.
+
+`CredentialEligibilityEvidence` is a transient observation, not a durable
+standalone row. At commitment, the selected proof's non-secret identity is copied
+into the `CredentialAccessPlan` and therefore into the
+`ExecutionSecuritySnapshot`: proof identity, broker identity plus observation
+epoch, issuer/protocol version, validity/expiry bound, subject digest, and
+requested-scope digest. Core never persists the broker's raw response. A field
+not carried into that snapshot has no durable meaning and MUST NOT be cited as
+durable evidence.
 
 The access plan binds broker identity, credential-reference digest, pinned
 version identifiers, allowed use/audience/delivery mode, effective security
@@ -126,6 +135,12 @@ freshness of proofs that were already obtained. External broker state cannot be
 made atomic with SQLite, so a final delivery-authorization gate remains after
 commit.
 
+A `CredentialRef`, its requested use, and its requested scope MUST already belong
+to the secret scope of `P_eff` and stay within the exact Source ceiling. Listing
+a reference in `SourceConfig` is a request, not an authorization. A requested
+scope outside `P_eff` or outside the source ceiling makes the candidate
+ineligible; it MUST NOT be silently truncated or widened.
+
 If the winner's eligibility becomes invalid before commit, the default is defer,
 not reselection. Only a new complete observation epoch may select again, with a
 bounded retry/backoff limit.
@@ -213,7 +228,7 @@ the complete policy commit/start/receipt/recovery protocol.
 | Support | Allowed behavior |
 |---|---|
 | no `policy` | `SECURITY_V1` Task is ineligible |
-| `policy` only | credential-free `SECURITY_V1` may execute |
+| `policy` only | credential-free `SECURITY_V1` may execute within `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` |
 | `policy` + `credential_brokered` | credential tasks satisfying the brokered contract may execute |
 | `policy` + `credential_transient_raw` | raw delivery only where explicitly allowed (not enabled in v1 production) |
 | config has credential refs but no delivery capability | B.4 fail-closed behavior; no Attempt is created |
@@ -262,6 +277,7 @@ M6-B.4
 
 M6-B.5 / policy-only
     independent restricted freeze point after its acceptance
+    scope = SECURITY_V1_POLICY_ONLY_REFERENCE_V1
 
 M6-B.5 / credential-bound
     independent restricted freeze point after its acceptance
@@ -303,8 +319,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Policy algebra | `meet` is the greatest lower bound; order is transitive; normalize is idempotent; digest is permutation-stable |
 | Equality regression | every contract accepted by the old exact-equality relation is still accepted by the pure policy order; new physical eligibility is not thereby granted |
 | Coarse projection | every `SECURITY_V1` coarse/fine conflict is rejected |
-| Task-local consistency | a Task coarse/fine conflict is rejected locally even when another ceiling would hide it; `sandbox_policy = None` follows the `SECURITY_V1` rule |
-| `R_min` typing | permission floors use `RequiredAccess ⊆ ProjectAccess`; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| Task-local consistency | a Task coarse/fine conflict is rejected locally even when another ceiling would hide it; `sandbox_policy = None` follows the `SECURITY_V1` rule, and validation runs before normalization |
 | Imported coverage | a policy using an unsupported dimension is ineligible even when the protocol gate is open; supporting A and B does not imply supporting `A ∩ B` |
 | Enforcement matrix completeness | every spec-10 dimension is classified proven/limited/unsupported for the exact binding, and an unclassified dimension fails the suite |
 | Canonical golden vectors | each schema/algorithm version pins byte-level input/output and digest |
@@ -314,6 +329,13 @@ B5.5 MUST treat these as mandatory regression categories:
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
+| Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker |
+| Admission mode | the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery; a `COARSE_V1` AgentType cannot execute it |
+| Stage separation | `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
+| `R_min` typing | permission floors use `RequiredAccess ⊆ ProjectAccess`; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
+| Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
+| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it |
 | RUNNING atomicity | observation, receipt, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |
@@ -333,6 +355,8 @@ ineligible; that is a legitimate security tightening, not a regression.
   external revocation are atomic.
 - No claim that the policy-only slice completes credential-bound provisioning or
   the whole M6-B aggregate.
+- No claim that `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` covers a dimension outside
+  its positive list; such a dimension makes the candidate ineligible.
 - No reclassification of `D-TOPOLOGY` or other deferred semantic-layer items.
 
 ## Consequences
@@ -342,7 +366,7 @@ ineligible; that is a legitimate security tightening, not a regression.
 - Credential-bearing configs stay fail-closed until both their qualification and
   delivery gates are proven for the exact binding.
 - Broker outage cannot be converted into candidate absence, and an unknown
-  earlier candidate forces a whole-round defer.
+  candidate not proven continuity-non-decisive forces a whole-round defer.
 - The registry no longer implies that defining the relation means every backend
   implements it.
 

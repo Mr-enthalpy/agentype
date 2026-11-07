@@ -64,12 +64,15 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   M6-B.5 defines ordering and intersection for `SECURITY_V1` only
   ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md)):
   four security objects, no `P_config`, typed positive `R_min`
-  (`RequiredAccess` / `RequiredGuarantees` / `PlacementConstraints`) drawn from
-  existing structured fields, per-object coarse relations (AgentType equality,
-  Generation projection, Task consistency), Task-local coarse/fine validation,
-  admission satisfiability
-  `satisfies_requirement(R_min(T), meet(P_generation, P_task))`, and authored
-  catalog versus inline derived policies. `COARSE_V1` replay keeps the
+  (`RequiredAccess` / `RequiredGuarantees` / `CoarseExecutionModes` /
+  `PlacementConstraints`), explicit durable admission mode, per-object coarse
+  relations (AgentType equality, Generation projection, Task consistency),
+  Task-local coarse/fine validation before normalization, admission-level
+  satisfiability through one staged `satisfies_requirement` relation, and
+  candidate-level guarantee/placement satisfaction. A `SECURITY_V1` Task is
+  never downgraded to `COARSE_V1`, and the mode is never inferred from policy
+  presence. Authored policies are catalogued; intersection products are inline
+  and content-addressed. `COARSE_V1` replay keeps the
   exact-reference rule;
   `D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION` remain the registry pointers
   until B5.5 verifies backend coverage.
@@ -298,7 +301,9 @@ Typedness is a positive durable fact: the Task carries an
 `agent_requirement_mode` (`LEGACY`/`TYPED`) fixed at admission, and any Task that
 is not `LEGACY` MUST be invisible to the legacy untyped consumer/claim path. A
 lost requirement row is therefore corruption, never a silent downgrade to a
-legacy Task. Symmetrically, a LogicalAgent that carries a
+legacy Task. `SecurityContractMode` (B.5) is a separate durable axis: a `TYPED`
+Task can be `COARSE_V1` or `SECURITY_V1`, and neither field implies the other.
+Symmetrically, a LogicalAgent that carries a
 `logical_agent_type_bindings` row MUST be excluded from the legacy
 consumer/claim pool, so a legacy Task can never acquire a type-bound agent
 without passing `can_execute`; when only bound READY agents remain, the legacy

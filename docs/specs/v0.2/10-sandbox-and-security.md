@@ -71,22 +71,34 @@ In `SECURITY_V1`:
   matching anchor. SourceConfig is not an authored ceiling and there is no
   `P_config`; a physical config effect is admissible only through source
   integration and imported evidence.
-- `R_min` is a typed positive obligation product: `RequiredAccess` (permission
-  floors drawn from existing structured fields), `RequiredGuarantees`
-  (isolation/continuity), and `PlacementConstraints` (frozen M5 predicate). Only
-  `RequiredAccess` uses set inclusion; the other components use
-  `satisfies_requirement`, never `⊆`. Negative constraints such as `ReadOnly` or
-  `Disabled` are ceilings, not floors. B.5 v1 makes no path-level minimum claim
-  and MUST NOT infer one from natural-language input.
+- `R_min` is a typed positive obligation product: `RequiredAccess` (positive
+  permission floors), `RequiredGuarantees` (isolation/continuity),
+  `CoarseExecutionModes` (workspace/network mode), and `PlacementConstraints`
+  (frozen M5 predicate). Only `RequiredAccess` uses set inclusion; workspace and
+  network use their existing dimension predicates, not `⊆`; guarantees and
+  placement use `satisfies_requirement`, never `⊆`. Negative constraints such as
+  `ReadOnly` or `Disabled` are ceilings, not floors. B.5 v1 makes no path-level
+  minimum claim and MUST NOT infer one from natural-language input.
 - Coarse and fine fields are never two independent grants. AgentType uses
   `project_agent(P) == SecurityContract`; Generation projects
   `(max_workspace, max_network)` and entails its isolation guarantee; Task uses
-  consistency (`Write ⇒ P_task allows write`, `ReadOnly ⇒ P_eff has no write`,
-  network by existing rank/polarity, isolation guarantee carried in `P_eff`).
-  A Task coarse/fine conflict MUST be rejected locally, before any cross-object
-  meet, even if a stricter ceiling would hide it. Typed admission MUST reject
-  when `satisfies_requirement(R_min(T), meet(P_generation, P_task))` fails;
-  provisioning then adds the actual AgentType and SpawnSource ceiling.
+  consistency. Define `P_task = TaskSpec coarse policy ∩ optional Task fine
+  policy`. A Task coarse/fine conflict MUST be rejected locally, before any
+  cross-object meet and before normalization, even if a stricter ceiling would
+  hide it; `None` and an explicit authored policy remain distinguishable until
+  validation completes. Typed admission evaluates `RequiredAccess` and
+  `CoarseExecutionModes` against `meet(P_generation, P_task)`;
+  `PlacementConstraints` and candidate-dependent guarantees are `Pending` at
+  admission and MUST be discharged during candidate matching. Provisioning then
+  adds the actual AgentType and SpawnSource ceiling.
+- The admission mode is explicit and durable:
+  `COARSE_V1 | SECURITY_V1` is an input, never inferred from
+  `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
+  recorded with `TaskSecurityBinding`, and a `SECURITY_V1` Task requires both its
+  Generation and the actual bound AgentType to support `SECURITY_V1`. It MUST
+  NOT be downgraded at matching, provisioning or recovery. A `COARSE_V1`
+  AgentType cannot execute a `SECURITY_V1` Task; a `SECURITY_V1` AgentType may
+  execute a `COARSE_V1` Task only through the explicit `COARSE_V1` path.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. `TaskSecurityBinding` persists the admission-stage
@@ -104,7 +116,18 @@ In `SECURITY_V1`:
   bound AgentType, and an applied-security receipt MUST reach physical start.
   The receipt binds policy, profile, plan, root and proven instance, and joins
   the existing RUNNING + first-renewal transaction. It is stored outside the
-  worker-writable jail root/workspace.
+  worker-writable jail root/workspace. Physical start holds worker code until the
+  receipt is durable: `SecuredStartPhase` is `HELD`, `RELEASED`, `UNKNOWN`, or
+  `TERMINAL`. A `HELD` instance is released only after the Kernel revalidates
+  authority for the exact `RequestId` and instance witness; a reused PID never
+  grants release, and an uncertain release never creates a second worker.
+- The policy-only implementation target is
+  `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
+  ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md) §14).
+  Its supported set and explicit non-claims are normative: a dimension outside
+  the profile is ineligible, not partially enforced, and a capability is claimed
+  only when both supported platforms prove it. B5.5 classifies every dimension
+  against this profile.
 - Credential-bearing configs remain fail-closed unless the exact binding
   declares the corresponding imported gate. B.5 v1 production enables only
   `security_execution_v1.policy` and `credential_brokered`;

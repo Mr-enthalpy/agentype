@@ -82,8 +82,12 @@ enforcement_profile_digest
 compiler_protocol_version
 ```
 
-The key is scoped to a verifiable profile version and exact physical domain; a
-proof is never reused across a changed profile, source disposition, or binding.
+The key is scoped to a verifiable profile version and exact physical domain. The
+cache memoizes **only** the pure compile result. It is not an eligibility proof:
+source disposition, attestation, credential eligibility, lifecycle and every
+other candidate-qualification fact are re-read and revalidated in every
+acquisition round. A proof is never reused across a changed profile or binding,
+and no cache key is allowed to make a stale disposition look current.
 
 Each acquisition has a bounded candidate count, compile count, and absolute
 time budget. If any relevant candidate still has undetermined eligibility,
@@ -145,7 +149,7 @@ required-access digest
 enforcement profile identity + profile digest
 security plan bytes + digest
 bootstrap manifest digest
-credential access plan (secret-free)
+credential access plan (secret-free, with proof identity/epoch/issuer/validity)
 security protocol version
 actual bound AgentTypeRef or digest
 Task derivation digest
@@ -176,7 +180,21 @@ SecuredStartObservation
 
 Both `start` and `reconcile_start` MUST return or recover the same Execution's
 trusted receipt. The legacy `ExecutionAdapter` interface remains available for
-`COARSE_V1`.
+`COARSE_V1`; `SECURITY_V1` uses a versioned extension instead of changing the
+frozen B.4 trait:
+
+```text
+SecuredExecutionAdapter : ExecutionAdapter
+    start_secured_execution(plan, launch)        → SecuredStartObservation
+    reconcile_secured_start(request_id, witness) → SecuredStartObservation
+    release_held_execution(request_id, witness, authority_proof)
+                                                 → SecuredStartObservation
+```
+
+`SecuredStartObservation` extends `StartObservation` with the receipt and an
+explicit `SecuredStartPhase`. An adapter that cannot implement the extension
+cannot provide `SECURITY_V1` for that binding. `COARSE_V1` continues to use the
+unchanged base trait.
 
 The receipt binds at least:
 
@@ -194,7 +212,7 @@ secret-free credential delivery scope receipt
 
 It is a physical fact, not Task success and not a new authority source.
 
-### 8. Start hold/release and recoverable receipt state
+### 8. Secured start phase machine, hold/release, and recovery
 
 The receipt is only useful if it is durable before untrusted worker code can run.
 Physical start MUST provide a trusted hold/release barrier:
@@ -211,8 +229,18 @@ The worker MUST NOT execute before the receipt is durable. A source whose proces
 model cannot hold the worker at a pre-exec boundary must provide an equivalent
 controlled-start mechanism, or the candidate is unsupported.
 
-A persisted receipt does not by itself mean the worker was released. The crash
-window
+A persisted receipt does not by itself mean the worker was released. Secured start
+therefore has an explicit phase:
+
+```text
+SecuredStartPhase:
+    HELD       // controlled instance, restrictions applied, receipt durable, not executing
+    RELEASED   // worker authorized to execute
+    UNKNOWN    // instance exists, release state cannot be proven
+    TERMINAL   // instance ended before or at release; cannot advance
+```
+
+The crash window
 
 ```text
 sandbox applied
@@ -221,10 +249,48 @@ daemon crashed
 worker not yet released
 ```
 
-is a real state. Recovery MUST distinguish a controlled instance awaiting
-release from an instance that has actually started. `reconcile_start` recovers
-the start phase for the same RequestId and the same physical instance; it MUST
-NOT confirm RUNNING from the receipt alone.
+is the `HELD` state and is a real durable possibility. Recovery MUST distinguish
+it from `RELEASED`. `reconcile_start` recovers the phase for the same RequestId
+and the same physical instance; it MUST NOT confirm RUNNING from the receipt
+alone.
+
+A `HELD` instance is released only through an authority-bearing path:
+
+```text
+Runtime
+    → reconcile exact physical instance
+    → phase = HELD?
+    → yes
+    → Kernel revalidates current Scheduler/Task authority
+    → release_held_execution(RequestId, exact instance witness, authority proof)
+    → worker executes
+```
+
+The adapter performs the mechanical release; it MUST NOT decide whether the Task
+still holds authority. That decision belongs to the Kernel and MUST be proven for
+the exact `RequestId` and instance before the release call. The release result is
+then part of the evidence consumed by the RUNNING transaction; it is not a second
+security authority.
+
+The following are mandatory:
+
+1. `reconcile_start` MUST NOT release a `HELD` worker without Runtime/Kernel
+   authority revalidation.
+2. Release MUST bind the original `RequestId` and the original physical instance
+   witness. A bare PID is not identity.
+3. A reused PID MUST NOT give an old instance release authority.
+4. If authority is no longer valid, the old worker MUST NOT be released; the path
+   is physical cleanup and M5 recovery.
+5. If the release result is uncertain, no second worker may be created.
+
+Receipt crash durability covers more than file bytes:
+
+- the file and its containing directory metadata MUST be durable before release;
+- the atomic rename MUST NOT replace an existing different receipt;
+- the worker MUST NOT inherit the receipt file or directory handle, nor inherit
+  read, write, delete or replace access to it;
+- the receipt directory MUST be daemon-owned and explicitly inaccessible to the
+  worker on both platforms, verified with negative tests.
 
 The durable record is the validated receipt identity/digest committed by the
 RUNNING transaction; the receipt file is recoverable physical evidence. The
@@ -234,7 +300,7 @@ instance witness, and a write order that cannot present an unverified file as
 applied. If that relation cannot be established after a crash, the Execution
 remains physically uncertain and follows M5 recovery.
 
-The policy-only reference profile also depends on this protection. The
+The policy-only reference profile (§14) also depends on this protection. The
 daemon-owned receipt directory MUST have real read/write/delete/replace
 isolation tests before the profile is declared; B.4's content-write confinement
 is not evidence of confidentiality or of protection for daemon-owned state.
@@ -256,6 +322,19 @@ temporary file → fsync → atomic rename → only then release user code
 Windows ACLs and Linux confinement must deny worker read/write/delete/replace of
 that directory explicitly, with negative tests for each. The access check is a
 positive requirement, not an inference from the jail's write restriction.
+
+Two durable objects are deliberately distinct and MUST NOT be conflated:
+
+- the SQLite `applied_security_receipts` row (identity/digest, consumed by the
+  RUNNING transaction and authority-bearing);
+- the daemon-owned receipt artifact (recoverable physical evidence).
+
+After a crash before the RUNNING transaction, the artifact may be used to
+reconstruct and verify the receipt identity, but only under the full relation:
+same ExecutionId/RequestId, same binding and plan digest, same instance witness,
+and a proven release phase. A missing artifact cannot be synthesized from the row;
+an artifact alone cannot produce RUNNING without authority revalidation and the
+validated transaction.
 
 The receipt is added to the retained-artifact class tracked by
 `D-ARTIFACT-GC`. A B.5 freeze record MUST state this limitation explicitly; the
@@ -315,6 +394,47 @@ ineligible. The profile digest is part of the evidence subject and is
 revalidated inside the acquisition transaction, so gate and profile version
 cannot drift apart.
 
+### 14. `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
+
+B5.0 freezes a minimum positive reference profile so B5.2/B5.4 have a concrete
+target and B5.5 has a profile to verify. It is a **positive** claim: a dimension
+not listed as supported is unsupported for this profile, even when it exists in
+the policy grammar.
+
+Claimed supported:
+
+- per-Execution workspace content-write confinement;
+- an explicit worker environment allowlist with no ambient inheritance;
+- exact physical instance identity;
+- a daemon-owned receipt directory with verified read/write/delete/replace
+  isolation;
+- receipt ↔ Execution binding and crash recovery, including the hold/release
+  phase machine;
+- credential-free execution.
+
+Explicit non-claims:
+
+- same-user general read confidentiality;
+- arbitrary read-root or visibility isolation;
+- network egress restriction (the network dimension remains a policy concept, but
+  this profile does not claim it is enforceable);
+- tool/command allowlisting;
+- OS resource limits;
+- attempt isolation (the current jail adapter does not provide it);
+- process-tree termination or quiescence;
+- general malicious-code isolation;
+- arbitrary metadata immutability, including known Linux Landlock limitations.
+
+The profile is platform-common: a capability is claimed only when both Linux and
+Windows can prove it for the exact binding. A platform-specific matrix may be
+stricter, never looser. B.4's content-write confinement is an input to this
+profile, not evidence for any B.5 claim above it.
+
+A `SECURITY_V1` Task whose policy needs a non-claimed dimension is ineligible
+under this profile; it MUST NOT be partially enforced. The B5.5 enforcement
+matrix MUST classify every spec-10 dimension against this profile as proven,
+limited, or unsupported.
+
 ## Non-claims
 
 - No B.5 implementation exists at this baseline.
@@ -332,6 +452,11 @@ cannot drift apart.
 - A failed winner compile cannot silently promote a weaker candidate.
 - A receipt outside the worker-writable jail gives the RUNNING transaction a
   trustworthy input while keeping the same frozen transaction shape.
+- Secured start has an explicit phase and a release operation bound to the exact
+  RequestId and instance, so crash recovery never blindly launches a second
+  worker or releases an instance whose authority has lapsed.
+- `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` fixes the minimum supported set and its
+  non-claims, so B.4's write confinement cannot be read as a full B.5 claim.
 - Adding the receipt artifact class expands the retained-artifact limitation and
   is recorded for the deferred GC design.
 

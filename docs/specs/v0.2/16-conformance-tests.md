@@ -531,9 +531,17 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   Generation meet, is rejected at the correct stage; a Task-local coarse/fine
   conflict is rejected even when another ceiling would hide it, and
   `sandbox_policy = None` follows the `SECURITY_V1` rule;
-- `R_min` typing: only `RequiredAccess` uses set inclusion; `RequiredGuarantees`
-  and `PlacementConstraints` go through the single `satisfies_requirement`
-  relation;
+- `R_min` typing: only `RequiredAccess` uses set inclusion; `CoarseExecutionModes`
+  use workspace/network predicates; `RequiredGuarantees` and
+  `PlacementConstraints` go through the single staged `satisfies_requirement`
+  relation, and `Pending` is never treated as satisfied;
+- stage separation: `PlacementConstraints` are not evaluated at admission; a
+  candidate that fails them is ineligible, and admission never assumes a
+  candidate Agent exists;
+- admission mode: explicit `COARSE_V1 | SECURITY_V1` is durable and never
+  inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
+  a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
+  legal;
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial
@@ -541,6 +549,9 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - imported coverage: a policy using an unsupported dimension is ineligible even
   when the protocol gate is open, and a source that supports A and B is not
   assumed to support `A ∩ B`;
+- reference profile: `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` claims and non-claims
+  are tested on both Linux and Windows; a non-claimed dimension makes a candidate
+  ineligible rather than partially enforced;
 - enforcement matrix completeness: every spec-10 dimension is classified
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;
@@ -548,6 +559,10 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   proofs are rejected, and epochs are not mixed; an unknown candidate in the
   winner's continuity tier defers, and only a proven continuity-non-decisive
   candidate may be ignored;
+- credential evidence durability and scope: proof identity/epoch/issuer
+  version/validity/subject digests reach the Execution snapshot, no raw broker
+  response is persisted, and a requested scope outside `P_eff` or the Source
+  ceiling is rejected;
 - secret sentinel: no raw secret material in durable JSON, logs, control errors,
   snapshots, or launch descriptors;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
@@ -557,6 +572,13 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - hold/release: worker code does not run before receipt durability; recovery
   distinguishes awaiting-release from actually started; a receipt alone does not
   confirm RUNNING;
+- secured start phase: `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are
+  exact; release requires a Kernel authority proof for the same RequestId and
+  instance witness; PID reuse cannot authorize release; uncertain release cannot
+  create a second worker;
+- receipt durability: file and directory metadata are durable before release, an
+  existing different receipt is never replaced, and the worker inherits no
+  receipt file/directory handle;
 - RUNNING atomicity: observation, receipt, RUNNING and first renewal all commit
   or all roll back;
 - schema gate: a v8 database is rejected at v9 open and no implicit upgrade

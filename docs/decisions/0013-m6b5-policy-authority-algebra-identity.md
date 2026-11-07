@@ -65,31 +65,37 @@ meaning it did not have at publication.
 ### 2. `R_min` is a typed requirement, not one permission set
 
 B5.0 uses only structured fields that already exist and does **not** change
-M6-A `TaskSpec` canonicalization, digests, or replay. `R_min` is a product:
+M6-A `TaskSpec` canonicalization, digests, or replay. `R_min` is a product of
+four typed components:
 
 ```text
-RequiredAccess(T)        // permission-dimension floors
-RequiredGuarantees(T)    // isolation, continuity, ...
-PlacementConstraints(T)  // M5 placement predicate
+RequiredAccess(T)          // positive permission floors
+RequiredGuarantees(T)      // isolation, continuity, ...
+CoarseExecutionModes(T)    // workspace mode, network mode
+PlacementConstraints(T)    // M5 placement predicate
 ```
 
-- `RequiredAccess` is the only component compared by set inclusion. It is
-  projected from existing structured permission fields (`required_workspace`,
-  `required_network`, and the capability values that map to access dimensions),
-  preserving the existing `Ability`/`Restriction` polarity.
+- `RequiredAccess` is the only component compared by set inclusion. It contains
+  positive operation requirements and capabilities with a genuine `Ability`
+  floor meaning, preserving the existing `Ability`/`Restriction` polarity. It
+  MUST NOT be constructed from `required_workspace`, `required_network`, or
+  `Restriction` values.
+- `CoarseExecutionModes` carries the workspace and network modes. They are
+  compared by the existing dimension-specific predicates (workspace rank and
+  network polarity/enforcement mode), never by set inclusion. `ReadOnly` is an
+  upper bound on write authority, `Disabled` is a network restriction, and
+  `Restricted` is an execution mode; none of them is a positive access
+  requirement.
 - `RequiredGuarantees` carries guarantees that are not allowed-operation sets:
   `required_attempt_isolation`, continuity, and any other execution guarantee.
   It is checked by the corresponding guarantee predicate, not by `⊆`.
 - `PlacementConstraints` continues to be checked by the frozen M5 placement
-  predicate.
+  predicate, and only when a candidate Agent exists (see §5).
 
-`R_min` contains **positive obligations only**. `ReadOnly` means "this Execution
-must not use write authority"; `Write` is the value that requires the
-corresponding write execution capability. `Disabled` and `Restricted` network
-follow the existing coarse contract; they are not a simple "amount of network
-access" set. Negative constraints (`ReadOnly`, `Disabled`, no-widening) are
-covered by `P_eff ⊆ every ceiling` and by the coarse-consistency checks, not by
-`RequiredAccess`.
+`R_min` contains **positive obligations only**. `Write` is the value that
+requires the corresponding write execution capability. Negative constraints
+(`ReadOnly`, `Disabled`, no-widening) are covered by `P_eff ⊆ every ceiling` and
+by the coarse-consistency checks, not by `RequiredAccess`.
 
 `CredentialRef` lives in SourceConfig, not in `TaskRequirement`. It creates a
 credential qualification obligation on the selected config; it is not a Task
@@ -119,23 +125,34 @@ For a Task, `required_workspace` is fixed by the TaskSpec before
 `into_requirement`, while `sandbox_policy` comes from the requirement draft. They
 are independent authored inputs. Demanding `project_task(P) == required_workspace`
 would either violate TaskSpec's single-authority rule or be unimplementable.
-`SECURITY_V1` instead requires:
+Define
 
 ```text
-required_workspace = Write   ⇒ P_task allows write and satisfies_requirement(R_min, P_eff)
-required_workspace = ReadOnly ⇒ P_eff contains no write
+P_task = TaskSpec coarse policy ∩ optional Task fine policy
+```
+
+and require:
+
+```text
+required_workspace = Write    ⇒ P_task allows write
+required_workspace = ReadOnly ⇒ P_task contains no write
 required_network follows the existing rank/polarity
-required_attempt_isolation  ⇒ P_eff carries the isolation guarantee
+required_attempt_isolation    ⇒ the candidate carries the isolation guarantee
 ```
 
 Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine
 write root MUST be rejected.
 
-The Task-local check runs before any cross-object meet:
+The Task-local check runs before any cross-object meet and before normalization:
 
 ```text
 validate_task_local_coarse_fine(TaskSpec, TaskPolicy)
 ```
+
+It MUST run on the un-normalized authored inputs, so `None` and an explicit
+authored policy remain distinguishable. Validation MUST NOT be deferred to the
+normalized meet, where `ReadOnly + None` and `ReadOnly + explicit write policy`
+could produce indistinguishable bytes.
 
 A conflict between the TaskSpec coarse fields and the Task policy MUST be
 rejected even when a stricter Generation/AgentType/SpawnSource ceiling would
@@ -145,12 +162,13 @@ policy that allows `write Workspace/src` is invalid on its own; a Generation
 when this check fails.
 
 `sandbox_policy = None` in `SECURITY_V1` means "no additional Task-level fine
-restriction", normalized to the explicit top for the Task policy layer. It never
-widens another ceiling, and the TaskSpec coarse fields remain authoritative.
-AgentType and Generation `SECURITY_V1` contracts MUST carry an authored policy;
-an absent policy there would make `project_agent`/`project_gen` undefined.
-`COARSE_V1` keeps its frozen `None` semantics and replay. `SECURITY_V1` MUST NOT
-bypass the projection/consistency check to enter the old dispatch path.
+restriction", so the Task policy layer is the explicit top and
+`P_task` reduces to the TaskSpec coarse policy. It never widens another ceiling,
+and the TaskSpec coarse fields remain authoritative. AgentType and Generation
+`SECURITY_V1` contracts MUST carry an authored policy; an absent policy there
+would make `project_agent`/`project_gen` undefined. `COARSE_V1` keeps its frozen
+`None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
+projection/consistency check to enter the old dispatch path.
 
 When a capability and a policy dimension express the same restriction, there is
 exactly one authoritative value. A formally mapped capability is derived from
@@ -191,34 +209,44 @@ separately, not one vague "derivation version". Golden vectors are keyed by
 `(canonical_version, algebra_version)`. Existing rows are read under the version
 recorded with them and MUST NOT be reinterpreted by a newer algorithm.
 
-### 5. Admission must prove satisfiability
+### 5. Admission proves satisfiability; candidates prove satisfaction
 
-At typed admission, the kernel MUST check
+There is exactly one `satisfies_requirement` relation. It is total over `R_min`
+and returns `Satisfied`, `Unsatisfied`, or `Pending(component)` for a component
+whose subject does not exist yet. A caller MUST NOT treat `Pending` as
+`Satisfied`.
 
 ```text
-satisfies_requirement(
-    R_min(T),
-    meet(P_generation, P_task),
-    guarantees = effective guarantees,
-    placement = frozen M5 placement predicate
-)
+satisfies_requirement(R_min, P, stage, candidate?)
+    stage = Admission | Candidate | Commitment
 ```
 
-and reject admission when it fails. Only the `RequiredAccess` component is a set
-inclusion (`RequiredAccess ⊆ ProjectAccess(P)`); `RequiredGuarantees` and
-`PlacementConstraints` use their own predicates. There MUST be exactly one
-`satisfies_requirement` relation, not two implementations that disagree about
-which `R_min` dimensions are set-like.
+| Stage | Evaluated | Deliberately deferred |
+|---|---|---|
+| Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `PlacementConstraints`; guarantees that require a physical candidate |
+| Candidate matching/acquisition | `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy enforceability | — |
+| Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot | — |
 
-This matches the existing coarse rejection of
-`workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
-fail at the same stage, not later during provisioning. An unsatisfiable Task
-must never become a durable semantic commitment.
+Only `Unsatisfied` rejects. `Pending` components are recorded in
+`TaskSecurityBinding` as an explicit obligation set and MUST be discharged at the
+candidate stage. Admission MUST NOT assume that a candidate Agent exists: a Task
+may name a workstream that no future Agent matches, and that is a candidate
+ineligibility, not an admission contradiction.
+
+Only the `RequiredAccess` component is a set inclusion. `RequiredGuarantees`,
+`CoarseExecutionModes`, and `PlacementConstraints` use their own predicates.
+There MUST be exactly one relation, not two implementations that disagree about
+which `R_min` dimensions are set-like or about which stage owns placement.
 
 Admission checks only `Generation ∩ Task`. Provisioning adds the actual
 AgentType and the SpawnSource ceiling, and its failure is a different class
 (candidate ineligibility / typed unavailability) rather than an admission
 rejection.
+
+This matches the existing coarse rejection of
+`workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
+fail at the same stage, not later during provisioning. An unsatisfiable Task
+must never become a durable semantic commitment.
 
 ### 6. Dimension rules for `meet`
 
@@ -311,17 +339,46 @@ The exact equality tuple and receipt rules are fixed in
 conditions state that the committed restrictions were enforced on the same
 physical instance, not merely that an adapter *could* enforce them.
 
-### 11. Durable identity, schema v9, and version gates
+### 11. Durable identity, explicit admission mode, schema v9, and version gates
 
-The full-security mode is recorded by a positive presence marker:
+The full-security mode is selected **explicitly** at typed admission. It MUST NOT
+be inferred from `sandbox_policy.is_some()`, because
+`SECURITY_V1 + sandbox_policy = None` is a legal combination.
 
 ```text
-COARSE_V1
-SECURITY_V1
+SecurityContractMode = COARSE_V1 | SECURITY_V1
 ```
 
-A `SECURITY_V1` parent without its security child is corruption and MUST NOT
-degrade to `COARSE_V1`.
+The admission request carries the requested mode. When it is absent the result is
+`COARSE_V1`, preserving frozen compatibility. The selected mode is part of the
+durable Task contract and is recorded with the immutable `TaskSecurityBinding`;
+the positive parent-side presence marker is written on the same parent row that
+owns the admission record (`TaskAgentRequirement` / `GenerationTaskBinding`), not
+on a child policy row.
+
+Contract-version declarations are per object:
+
+- every Generation revision declares the `SecurityContractMode` set it supports;
+- every AgentType revision declares the `SecurityContractMode` set it supports;
+- every SpawnSource revision declares the enforcement protocol/profile versions
+  its integration can import.
+
+Consequently:
+
+- a `SECURITY_V1` Task requires its exact Generation to support `SECURITY_V1`;
+  otherwise admission rejects before any durable commitment;
+- it also requires the actual bound AgentType to support `SECURITY_V1`; otherwise
+  that candidate is ineligible;
+- a `COARSE_V1` AgentType MUST NOT execute a `SECURITY_V1` Task;
+- a `SECURITY_V1` AgentType MAY execute a `COARSE_V1` Task, but only through the
+  explicit `COARSE_V1` path and its frozen semantics. Its `SECURITY_V1` policy is
+  not silently applied and no B.5 claim attaches to that Execution;
+- `SECURITY_V1` MUST NOT fall back to `COARSE_V1` once the mode is durable — not
+  at matching, provisioning, or recovery. A missing security child is corruption,
+  not a downgrade opportunity.
+
+The same rule applies to compatibility: a `SECURITY_V1` parent without its
+security child is corruption and MUST NOT degrade to `COARSE_V1`.
 
 B5.1 may introduce schema v9 (final numbering follows the actual table freeze).
 The `D-DB-MIGRATE` discipline is unchanged:
@@ -365,6 +422,11 @@ or algorithm version was added.
 - A Task that cannot satisfy its own minimum under the Generation ceiling is
   rejected at admission; a Task that can satisfy it there may still be excluded
   at provisioning when the actual AgentType or source ceiling is narrower.
+- `PlacementConstraints` and candidate-dependent guarantees stay `Pending` at
+  admission and are discharged by candidate matching; admission never invents a
+  candidate Agent.
+- The admission mode is durable and explicit, so a Task cannot be silently
+  downgraded when a later stage finds the security path inconvenient.
 - The catalog stays small and auditable; derived policies are content-addressed
   facts, not a second mutable policy namespace.
 - Two policies with the same canonical bytes share a digest but retain separate

@@ -107,13 +107,20 @@ authority center ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-
   `security_execution_v1.credential_brokered`. `credential_transient_raw` is
   defined but unsupported in v1 production. Broker unreachable is not
   credential absent.
-- For `SECURITY_V1`, start and reconcile return a secured observation carrying
-  the applied-security receipt; a start without a valid receipt cannot become
-  RUNNING. The legacy adapter interface remains valid for `COARSE_V1`.
+- For `SECURITY_V1`, start and reconcile return a `SecuredStartObservation`
+  carrying the applied-security receipt and a `SecuredStartPhase`
+  (`HELD` / `RELEASED` / `UNKNOWN` / `TERMINAL`). A start without a valid receipt,
+  or a release without Kernel authority revalidation for the exact `RequestId`
+  and instance witness, cannot become RUNNING. The frozen base
+  `ExecutionAdapter` is unchanged for `COARSE_V1`; the secured behavior is a
+  versioned `SecuredExecutionAdapter` extension adding
+  `start_secured_execution`, `reconcile_secured_start`, and
+  `release_held_execution`. An adapter that cannot implement the extension cannot
+  provide `SECURITY_V1` for that binding.
 
 ## ExecutionAdapter (correctness required)
 
-Narrow interface, UNCHANGED from V0.1:
+Narrow base interface, UNCHANGED from V0.1 and used by `COARSE_V1`:
 
 - `start_execution`
 - `observe_execution`
