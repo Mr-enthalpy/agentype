@@ -8,6 +8,7 @@ use crate::supervision::SupervisionError;
 use crate::timing::RuntimeTimingConfig;
 use crate::{
     AdapterRegistry, DispatchError, DispatchOneOutcome, Dispatcher, ExecutionId, ExecutionRegistry,
+    SourceIntegrationRegistry, TypedDispatchConfig, TypedDispatchState,
 };
 use agentype_core::Error;
 use agentype_core::FailureClass;
@@ -195,6 +196,9 @@ pub(crate) enum ControlDispatch {
     ConfigurationUnavailable {
         detail: String,
     },
+    TypedDeferred {
+        detail: String,
+    },
 }
 
 /// One control cycle's outcome. The daemon does not read `dispatch` (it acts
@@ -249,6 +253,13 @@ pub(crate) struct ControlLoopService<S> {
     poll: Duration,
     _permit: ReadyPermit,
     gate: DispatchGate,
+    typed: Option<TypedControl>,
+}
+
+struct TypedControl {
+    integrations: SourceIntegrationRegistry,
+    config: TypedDispatchConfig,
+    state: TypedDispatchState,
 }
 
 impl<S: AdmissionSink> ControlLoopService<S> {
@@ -269,7 +280,24 @@ impl<S: AdmissionSink> ControlLoopService<S> {
             poll: timing.dispatcher_poll_interval(),
             _permit: permit,
             gate,
+            typed: None,
         }
+    }
+
+    /// Enable the typed dispatch branch. Without an explicit source-integration
+    /// registry typed Tasks are never dispatched (and the legacy claim path
+    /// already quarantines them), so this is fail-closed by default.
+    pub(crate) fn with_typed_dispatch(
+        mut self,
+        integrations: SourceIntegrationRegistry,
+        config: TypedDispatchConfig,
+    ) -> Self {
+        self.typed = Some(TypedControl {
+            integrations,
+            config,
+            state: TypedDispatchState::new(),
+        });
+        self
     }
 
     #[allow(dead_code)] // test-facing accessor on a narrowed mechanical type
@@ -293,11 +321,63 @@ impl<S: AdmissionSink> ControlLoopService<S> {
         }
         let dispatcher = Dispatcher::new(&self.kernel, &self.execution_registry, &self.adapters)
             .with_gate(&self.gate);
-        let dispatch = match dispatcher.dispatch_one()? {
+        let dispatch = match &self.typed {
+            None => self.consume_dispatch(dispatcher.dispatch_one()?)?,
+            Some(typed) => {
+                // Alternating fairness: the preferred side is tried first each
+                // cycle. A deferral/no-work on that side still gives the other
+                // queue this cycle, so neither typed nor legacy work can be
+                // starved by the other.
+                let preferred_typed = typed.state.next_preferred_typed();
+                let mut yielded: Option<ControlDispatch> = None;
+                let mut chosen: Option<ControlDispatch> = None;
+                for typed_side in [preferred_typed, !preferred_typed] {
+                    let outcome = if typed_side {
+                        dispatcher.dispatch_typed_one(
+                            &typed.integrations,
+                            &typed.config,
+                            &typed.state,
+                        )?
+                    } else {
+                        dispatcher.dispatch_one()?
+                    };
+                    let is_yield = matches!(
+                        &outcome,
+                        DispatchOneOutcome::NoWork | DispatchOneOutcome::TypedDeferred { .. }
+                    );
+                    let dispatch = self.consume_dispatch(outcome)?;
+                    if is_yield {
+                        if yielded.is_none() {
+                            yielded = Some(dispatch);
+                        }
+                    } else {
+                        chosen = Some(dispatch);
+                        break;
+                    }
+                }
+                chosen.or(yielded).unwrap_or(ControlDispatch::NoWork)
+            }
+        };
+        Ok(ControlCycleReport {
+            dispatch,
+            wait: self.poll,
+        })
+    }
+
+    /// Turn a dispatcher outcome into the control-loop consequence, consuming
+    /// supervision admission exactly as the legacy path always has.
+    fn consume_dispatch(
+        &self,
+        outcome: DispatchOneOutcome,
+    ) -> Result<ControlDispatch, ControlError> {
+        Ok(match outcome {
             DispatchOneOutcome::NoWork => ControlDispatch::NoWork,
             DispatchOneOutcome::AuthorityRejected => ControlDispatch::AuthorityRejected,
             DispatchOneOutcome::ConfigurationUnavailable { detail } => {
                 ControlDispatch::ConfigurationUnavailable { detail }
+            }
+            DispatchOneOutcome::TypedDeferred { detail } => {
+                ControlDispatch::TypedDeferred { detail }
             }
             DispatchOneOutcome::StartIndeterminate {
                 execution_id,
@@ -317,10 +397,6 @@ impl<S: AdmissionSink> ControlLoopService<S> {
                     Err(err) => return Err(ControlError::Fatal(err)),
                 }
             }
-        };
-        Ok(ControlCycleReport {
-            dispatch,
-            wait: self.poll,
         })
     }
 }

@@ -30,3 +30,8 @@ Until D-TOPOLOGY is resolved:
 - Exact distinction among type refinement, partition capacity change, MOVE,
   MERGE, and TRANSFORM remainder is DEFERRED (D-TOPOLOGY). Frozen now:
   MOVE/MERGE preserve identity; TRANSFORM does not mutate identity in place.
+- M6-B.4 fixes the capacity seam explicitly: V0.1 `reconcile_pool` counts and
+  retires only untyped (`UNBOUND`) agents; typed (`BOUND`) population is governed
+  by typed provisioning, not V0.1 `desired_capacity`
+  ([ADR-0009](../../decisions/0009-m6b-topology-capacity-seam.md)). Full typed
+  population targets remain deferred.

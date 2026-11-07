@@ -19,6 +19,7 @@ pub mod observation;
 pub mod observer;
 pub mod process_lock;
 pub mod provisioning_admin;
+pub mod provisioning_resolver;
 pub mod recovery;
 pub mod scheduler_control;
 pub mod semantic_control;
@@ -42,6 +43,14 @@ pub use semantic_control::RootSemanticControl;
 // AgentType revisions and read typed requirements / match results. Deliberately
 // separate from `RootSemanticControl`.
 pub use provisioning_admin::ProvisioningAdmin;
+// The authority-bearing typed acquisition (`acquire_typed_task`) and the
+// candidate resolution mechanics are daemon-internal: they accept the mechanical
+// `Kernel` and are owned by the production `ControlLoopService`. Only the
+// source-integration SPI and the diagnostic candidate value are public here.
+pub use provisioning_resolver::{
+    PreparedSource, ProvisioningResolutionError, SourceConfigIntegration,
+    SourceIntegrationRegistry, SourceProvisioningCandidate,
+};
 // M6-B operator catalog administration: publish the immutable B.2 capability /
 // AgentType revisions that typed admission and binding require.
 pub use catalog_admin::CatalogAdmin;
@@ -83,17 +92,24 @@ pub use supervision::{SupervisionRegistry, SupervisionRunner};
 pub use timing::{RuntimeTimingConfig, TimingConfigError};
 
 use agentype_adapter_api::{
-    AdapterError, EnvironmentStartRequest, ExecutionAdapter, ImportableAdapter, StartObservation,
+    AdapterDeadline, AdapterError, EnvironmentStartRequest, ExecutionAdapter, ImportableAdapter,
+    StartObservation,
 };
 use agentype_core::{
     AttemptId, AuthoritativeExecutionBinding, Claim, Error, ExecutionId, ExecutionState,
-    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskState, UnixTime,
+    ExpireReport, FailureClass, LeaseEpoch, RequestId, TaskId, TaskState, UnixTime,
 };
 use agentype_storage_sqlite::{Kernel, RunningAuthorityGrant};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Source-integration protocol identity used by test/composition helpers that
+/// assemble a binding without a real `ImportableAdapter`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const TEST_PROVISIONING_PROTOCOL: &str = "agentype-test-source/1";
 
 /// Preparation failure of the canonical launch façade.
 ///
@@ -145,6 +161,121 @@ impl std::fmt::Display for ExecutionPreparationError {
 }
 
 impl std::error::Error for ExecutionPreparationError {}
+
+/// Failure of the typed provisioning handoff ([`prepare_typed_execution_launch`]).
+///
+/// Provisioning is prepare-only (no physical side effect before the Execution),
+/// so the only Task-level settlement is a pre-start availability failure
+/// (`RESOURCE_UNAVAILABLE`); authority loss is left to recovery and durable
+/// corruption/persistence is fatal. There is deliberately no
+/// `standard_failure_class`, so a future caller cannot mechanically re-classify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypedLaunchError {
+    Configuration(ResolutionError),
+    InvalidBinding(ConfigurationError),
+    Adapter(AdapterUnavailable),
+    /// The installed adapter no longer accepts the committed descriptor protocol
+    /// or no longer enforces the committed capability — a pre-start availability
+    /// failure (`RESOURCE_UNAVAILABLE`).
+    Weakened(String),
+    /// The acquired candidate disagrees with the authoritative partition target
+    /// or the committed binding — durable inconsistency, never a candidate choice.
+    Inconsistent(String),
+    Kernel(Error),
+    /// The pre-start settlement itself failed with a persistence/invariant fault:
+    /// fatal control-plane fault, surfaced rather than swallowed.
+    SettlementFailed(Error),
+    /// A confirmed pure-phase fault could not establish its durable fence.
+    /// Remains fatal even if the claim was concurrently closed or replaced.
+    FaultPersistenceFailed(Error),
+}
+
+/// How a typed-handoff failure must be treated. Only a pre-start availability
+/// failure is settled as the Task-level `RESOURCE_UNAVAILABLE`; everything else
+/// is left to recovery (authority loss) or propagated fatally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedLaunchDisposition {
+    PreStartUnavailable,
+    AuthorityLoss,
+    Fatal,
+}
+
+impl TypedLaunchError {
+    pub(crate) fn disposition(&self) -> TypedLaunchDisposition {
+        match self {
+            Self::Configuration(_)
+            | Self::InvalidBinding(_)
+            | Self::Adapter(_)
+            | Self::Weakened(_) => TypedLaunchDisposition::PreStartUnavailable,
+            Self::Kernel(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {
+                TypedLaunchDisposition::AuthorityLoss
+            }
+            Self::Inconsistent(_)
+            | Self::Kernel(_)
+            | Self::SettlementFailed(_)
+            | Self::FaultPersistenceFailed(_) => TypedLaunchDisposition::Fatal,
+        }
+    }
+}
+
+impl std::fmt::Display for TypedLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(e) => write!(f, "typed execution configuration unavailable: {e}"),
+            Self::InvalidBinding(e) => write!(f, "typed execution binding invalid: {e}"),
+            Self::Adapter(e) => write!(f, "typed execution adapter unavailable: {e}"),
+            Self::Weakened(m) => write!(f, "typed execution adapter weakened: {m}"),
+            Self::Inconsistent(m) => write!(f, "typed execution inconsistent: {m}"),
+            Self::Kernel(e) => write!(f, "typed execution launch rejected: {e}"),
+            Self::SettlementFailed(e) => {
+                write!(f, "typed execution pre-start settlement failed: {e}")
+            }
+            Self::FaultPersistenceFailed(e) => write!(f, "typed execution fault fence failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TypedLaunchError {}
+
+/// Preparation includes the pure launch-composition phase. Persist a confirmed
+/// fatal before returning it, using the existing ownership/no-Execution fence.
+/// A failed write never establishes a fact or turns the error into a Task NACK.
+fn persist_typed_launch_fault(
+    kernel: &Kernel,
+    claim: &Claim,
+    error: &TypedLaunchError,
+) -> Result<(), TypedLaunchError> {
+    use agentype_core::PreparationFaultKind as F;
+    let kind = match error {
+        TypedLaunchError::Inconsistent(_) => F::InvariantViolation,
+        TypedLaunchError::Kernel(e) | TypedLaunchError::SettlementFailed(e) => match e {
+            Error::InvariantViolation(_) | Error::Conflict(_) => F::InvariantViolation,
+            Error::StorageFailure(_) => F::StorageFailure,
+            Error::RecoveryRequired(_) => F::RecoveryRequired,
+            Error::InvalidTransition(_) => F::InvalidContract,
+            _ => F::Other,
+        },
+        _ => return Ok(()),
+    };
+    if error.disposition() == TypedLaunchDisposition::Fatal {
+        kernel
+            .record_preparation_fault(claim, kind)
+            .map_err(TypedLaunchError::FaultPersistenceFailed)?;
+    }
+    Ok(())
+}
+
+fn typed_execution_commit_error(kernel: &Kernel, claim: &Claim, error: Error) -> TypedLaunchError {
+    let commit_outcome_unknown =
+        matches!(error, Error::StorageFailure(_) | Error::RecoveryRequired(_));
+    let error = TypedLaunchError::Kernel(error);
+    if !commit_outcome_unknown {
+        if let Err(fence_error) = persist_typed_launch_fault(kernel, claim, &error) {
+            return fence_error;
+        }
+    }
+    error
+}
 
 /// Authoritative launch snapshot, the runtime-assembled worker request, and
 /// the resolved environment that minted the persisted safety proof — bound to
@@ -245,10 +376,12 @@ pub fn prepare_execution_launch(
 pub enum AdapterRegistryError {
     InvalidKind(String),
     InvalidBindingKey(String),
+    InvalidBindingRef(String),
     DuplicateBinding {
         adapter_kind: String,
         adapter_binding_key: String,
     },
+    DuplicateBindingRef(String),
 }
 
 impl std::fmt::Display for AdapterRegistryError {
@@ -256,12 +389,17 @@ impl std::fmt::Display for AdapterRegistryError {
         match self {
             Self::InvalidKind(m) => write!(f, "invalid adapter kind: {m}"),
             Self::InvalidBindingKey(m) => write!(f, "invalid adapter binding key: {m}"),
+            Self::InvalidBindingRef(m) => write!(f, "invalid adapter binding_ref: {m}"),
             Self::DuplicateBinding {
                 adapter_kind,
                 adapter_binding_key,
             } => write!(
                 f,
                 "duplicate adapter binding registration: kind '{adapter_kind}' key '{adapter_binding_key}'"
+            ),
+            Self::DuplicateBindingRef(binding_ref) => write!(
+                f,
+                "duplicate adapter binding_ref registration: '{binding_ref}'"
             ),
         }
     }
@@ -276,9 +414,19 @@ impl std::error::Error for AdapterRegistryError {}
 /// same driver family fail closed until the caller uses `resolve_exact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterUnavailable {
-    Missing { adapter_kind: String },
-    Ambiguous { adapter_kind: String },
-    IsolationNotEnforceable { adapter_kind: String },
+    Missing {
+        adapter_kind: String,
+    },
+    Ambiguous {
+        adapter_kind: String,
+    },
+    IsolationNotEnforceable {
+        adapter_kind: String,
+    },
+    BindingRefUnresolved {
+        adapter_kind: String,
+        binding_ref: String,
+    },
 }
 
 impl AdapterUnavailable {
@@ -286,7 +434,8 @@ impl AdapterUnavailable {
         match self {
             Self::Missing { adapter_kind }
             | Self::Ambiguous { adapter_kind }
-            | Self::IsolationNotEnforceable { adapter_kind } => adapter_kind,
+            | Self::IsolationNotEnforceable { adapter_kind }
+            | Self::BindingRefUnresolved { adapter_kind, .. } => adapter_kind,
         }
     }
 }
@@ -306,6 +455,13 @@ impl std::fmt::Display for AdapterUnavailable {
                 f,
                 "installed adapter for kind '{adapter_kind}' cannot enforce attempt_isolation"
             ),
+            Self::BindingRefUnresolved {
+                adapter_kind,
+                binding_ref,
+            } => write!(
+                f,
+                "binding_ref '{binding_ref}' does not resolve to an installed '{adapter_kind}' binding"
+            ),
         }
     }
 }
@@ -322,14 +478,28 @@ impl std::error::Error for AdapterUnavailable {}
 #[derive(Clone, Default)]
 pub struct AdapterRegistry {
     adapters: HashMap<String, HashMap<AdapterBindingKey, ResolvedAdapterBinding>>,
+    /// Stable operator alias -> exact imported binding key, scoped by
+    /// `adapter_kind` (the frozen contract resolves `binding_ref` *within* the
+    /// policy's `adapter_kind`). Populated only from `ImportedExecutionBinding`s
+    /// that declare an alias, so the same alias may name distinct bindings of
+    /// different kinds without collision.
+    binding_refs: HashMap<(String, String), AdapterBindingKey>,
 }
 
 /// Kind, domain key, and enforceable safety produced together by an importer.
 /// Composition cannot assemble a mismatched key or isolation claim.
+///
+/// `binding_ref` is the optional stable operator alias (the
+/// `AdapterBindingPolicy.binding_ref`). When present it resolves to exactly one
+/// imported `(adapter_kind, adapter_binding_key)`. It is composition intent, not
+/// adapter vocabulary, so it is supplied explicitly rather than derived from the
+/// adapter.
 pub struct ImportedExecutionBinding {
     adapter_kind: String,
     adapter_binding_key: AdapterBindingKey,
+    binding_ref: Option<String>,
     safety: AdapterSafetyEnvelope,
+    provisioning_protocol: Option<String>,
     adapter: Arc<dyn ExecutionAdapter>,
 }
 
@@ -338,13 +508,30 @@ impl ImportedExecutionBinding {
         let adapter_kind = adapter.import_kind().to_string();
         let adapter_binding_key = adapter.import_binding_key();
         let safety = AdapterSafetyEnvelope::unenforceable()
-            .with_attempt_isolation(adapter.import_attempt_isolation());
+            .with_attempt_isolation(adapter.import_attempt_isolation())
+            .with_enforceable_workspace(adapter.import_enforceable_workspace())
+            .with_enforceable_network(adapter.import_enforceable_network());
+        let provisioning_protocol = adapter.import_provisioning_protocol().map(str::to_string);
         let exec: Arc<dyn ExecutionAdapter> = adapter.clone();
         Self {
             adapter_kind,
             adapter_binding_key,
+            binding_ref: None,
             safety,
+            provisioning_protocol,
             adapter: exec,
+        }
+    }
+
+    /// Import an adapter with a stable operator alias. The alias resolves to
+    /// exactly one imported binding; a blank alias is rejected at registration.
+    pub fn from_importable_with_binding_ref(
+        adapter: Arc<dyn ImportableAdapter>,
+        binding_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            binding_ref: Some(binding_ref.into()),
+            ..Self::from_importable(adapter)
         }
     }
 
@@ -357,9 +544,17 @@ impl ImportedExecutionBinding {
         Self {
             adapter_kind: adapter_kind.into(),
             adapter_binding_key: AdapterBindingKey::for_tests(),
+            binding_ref: None,
             safety,
+            provisioning_protocol: Some(TEST_PROVISIONING_PROTOCOL.to_string()),
             adapter,
         }
+    }
+
+    /// The source-integration protocol this imported binding accepts, if it is
+    /// provisioning-capable.
+    pub fn provisioning_protocol(&self) -> Option<&str> {
+        self.provisioning_protocol.as_deref()
     }
 
     pub fn adapter_kind(&self) -> &str {
@@ -368,6 +563,10 @@ impl ImportedExecutionBinding {
 
     pub fn adapter_binding_key(&self) -> &AdapterBindingKey {
         &self.adapter_binding_key
+    }
+
+    pub fn binding_ref(&self) -> Option<&str> {
+        self.binding_ref.as_deref()
     }
 }
 
@@ -384,9 +583,11 @@ impl AdapterRegistry {
         self.insert_binding(
             binding.adapter_kind,
             binding.adapter_binding_key,
+            binding.binding_ref,
             binding.adapter,
             deadlines,
             binding.safety,
+            binding.provisioning_protocol,
         )
     }
 
@@ -397,6 +598,20 @@ impl AdapterRegistry {
     ) -> Result<(), AdapterRegistryError> {
         self.import(
             ImportedExecutionBinding::from_importable(adapter),
+            deadlines,
+        )
+    }
+
+    /// Import an adapter under a stable operator alias so an
+    /// `AdapterBindingPolicy.binding_ref` resolves to it.
+    pub fn import_source_with_binding_ref(
+        &mut self,
+        adapter: Arc<dyn ImportableAdapter>,
+        binding_ref: impl Into<String>,
+        deadlines: AdapterDeadlinePolicy,
+    ) -> Result<(), AdapterRegistryError> {
+        self.import(
+            ImportedExecutionBinding::from_importable_with_binding_ref(adapter, binding_ref),
             deadlines,
         )
     }
@@ -439,21 +654,54 @@ impl AdapterRegistry {
                 "adapter binding key cannot be empty".into(),
             ));
         }
-        self.insert_binding(kind, adapter_binding_key, adapter, deadlines, safety)
+        self.insert_binding(
+            kind,
+            adapter_binding_key,
+            None,
+            adapter,
+            deadlines,
+            safety,
+            Some(TEST_PROVISIONING_PROTOCOL.to_string()),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_binding(
         &mut self,
         kind: String,
         adapter_binding_key: AdapterBindingKey,
+        binding_ref: Option<String>,
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
         safety: AdapterSafetyEnvelope,
+        provisioning_protocol: Option<String>,
     ) -> Result<(), AdapterRegistryError> {
         if kind.trim().is_empty() {
             return Err(AdapterRegistryError::InvalidKind(
                 "adapter kind cannot be empty".into(),
             ));
+        }
+        if let Some(protocol) = &provisioning_protocol {
+            if protocol.trim().is_empty() {
+                return Err(AdapterRegistryError::InvalidBindingRef(
+                    "adapter provisioning protocol cannot be blank".into(),
+                ));
+            }
+        }
+        if let Some(alias) = &binding_ref {
+            if alias.trim().is_empty() {
+                return Err(AdapterRegistryError::InvalidBindingRef(
+                    "adapter binding_ref cannot be empty".into(),
+                ));
+            }
+        }
+        if let Some(alias) = &binding_ref {
+            if self
+                .binding_refs
+                .contains_key(&(kind.clone(), alias.clone()))
+            {
+                return Err(AdapterRegistryError::DuplicateBindingRef(alias.clone()));
+            }
         }
         let by_key = self.adapters.entry(kind.clone()).or_default();
         if by_key.contains_key(&adapter_binding_key) {
@@ -464,9 +712,43 @@ impl AdapterRegistry {
         }
         by_key.insert(
             adapter_binding_key.clone(),
-            ResolvedAdapterBinding::new(kind, adapter_binding_key, adapter, deadlines, safety),
+            ResolvedAdapterBinding::new(
+                kind.clone(),
+                adapter_binding_key.clone(),
+                adapter,
+                deadlines,
+                safety,
+                provisioning_protocol,
+            ),
         );
+        if let Some(alias) = binding_ref {
+            self.binding_refs.insert((kind, alias), adapter_binding_key);
+        }
         Ok(())
+    }
+
+    /// Test helper: register an installed binding under a stable operator alias
+    /// so `resolve_binding_ref` can be exercised without a real importer.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_safety_and_ref(
+        &mut self,
+        adapter_kind: impl Into<String>,
+        binding_ref: impl Into<String>,
+        adapter_binding_key: AdapterBindingKey,
+        adapter: Arc<dyn ExecutionAdapter>,
+        deadlines: AdapterDeadlinePolicy,
+        safety: AdapterSafetyEnvelope,
+    ) -> Result<(), AdapterRegistryError> {
+        self.insert_binding(
+            adapter_kind.into(),
+            adapter_binding_key,
+            Some(binding_ref.into()),
+            adapter,
+            deadlines,
+            safety,
+            Some(TEST_PROVISIONING_PROTOCOL.to_string()),
+        )
     }
 
     /// Test helper: register with `AdapterBindingKey::for_tests()`.
@@ -519,6 +801,28 @@ impl AdapterRegistry {
                 adapter_kind: adapter_kind.to_string(),
             })
     }
+
+    /// M6-B.4 typed launch lookup: resolve the stable operator `binding_ref`
+    /// (the `AdapterBindingPolicy.binding_ref`) to the exact imported binding of
+    /// the policy's `adapter_kind`. The alias is scoped to `adapter_kind`, so the
+    /// same alias names distinct bindings of different kinds; an alias missing
+    /// within this kind fails closed with no fallback to another source.
+    pub fn resolve_binding_ref(
+        &self,
+        adapter_kind: &str,
+        binding_ref: &str,
+    ) -> Result<ResolvedAdapterBinding, AdapterUnavailable> {
+        match self
+            .binding_refs
+            .get(&(adapter_kind.to_string(), binding_ref.to_string()))
+        {
+            Some(key) => self.resolve_exact(adapter_kind, key),
+            None => Err(AdapterUnavailable::BindingRefUnresolved {
+                adapter_kind: adapter_kind.to_string(),
+                binding_ref: binding_ref.to_string(),
+            }),
+        }
+    }
 }
 
 /// Failure to compose or execute the dispatch path.
@@ -546,6 +850,11 @@ pub enum DispatchError {
     AdapterInvocation(AdapterError),
     /// A post-start authoritative persistence step failed.
     Persistence(Error),
+    /// A typed preparation step reached a confirmed fatal control-plane fault.
+    /// The durable preparation fence (when one could be written) is already
+    /// committed; this is never a Task-level failure class and never an
+    /// invitation to retry through the legacy path.
+    TypedPreparation(String),
 }
 
 impl DispatchError {
@@ -554,7 +863,7 @@ impl DispatchError {
     /// invocation failures map to a class.
     pub fn standard_failure_class(&self) -> Option<FailureClass> {
         match self {
-            Self::Authority(_) | Self::Persistence(_) => None,
+            Self::Authority(_) | Self::Persistence(_) | Self::TypedPreparation(_) => None,
             Self::Configuration(_) | Self::AdapterAvailability(_) => {
                 Some(FailureClass::ResourceUnavailable)
             }
@@ -571,6 +880,7 @@ impl std::fmt::Display for DispatchError {
             Self::AdapterAvailability(e) => write!(f, "dispatch adapter unavailable: {e}"),
             Self::AdapterInvocation(e) => write!(f, "dispatch adapter invocation failed: {e}"),
             Self::Persistence(e) => write!(f, "dispatch persistence failed: {e}"),
+            Self::TypedPreparation(e) => write!(f, "typed dispatch preparation failed: {e}"),
         }
     }
 }
@@ -684,6 +994,266 @@ pub fn resolve_physical_execution_environment(
         binding,
         environment,
         adapter_binding,
+    })
+}
+
+/// Typed provisioning handoff: commit the snapshot-bearing Execution for a
+/// durably committed typed acquisition and assemble the physical start request.
+///
+/// Daemon-internal. This closes the data-flow between the acquisition facade
+/// (`acquire_typed_task`, which commits the Attempt/Lease/ProvisioningBinding)
+/// and the Execution commitment, using the exact winner candidate the authority
+/// transaction proved. It deliberately does NOT start the adapter: the physical
+/// `start_execution` plus the immediate observation commit belong to
+/// `Dispatcher::start_prepared`, reached only from the production
+/// `ControlLoopService` typed branch. The exact physical domain
+/// (`adapter_kind`/`adapter_binding_key`) comes from the acquisition, never from
+/// `resolve_unique` or a caller-supplied key.
+pub(crate) fn prepare_typed_execution_launch(
+    kernel: &Kernel,
+    outcome: crate::provisioning_resolver::TypedAcquisitionOutcome,
+    execution_registry: &ExecutionRegistry,
+    adapters: &AdapterRegistry,
+) -> Result<PreparedTypedExecutionLaunch, TypedLaunchError> {
+    let claim = outcome.acquisition.claim.clone();
+    // PHASE 1 — all fallible pre-start composition checks, BEFORE any Execution
+    // is committed. Only a pre-start availability failure is a Task-level
+    // `RESOURCE_UNAVAILABLE`; authority loss is left to recovery and a durable
+    // corruption/persistence fault is fatal (never disguised as a Task failure).
+    let plan = match plan_typed_execution_launch(kernel, &outcome, execution_registry, adapters) {
+        Ok(plan) => plan,
+        Err(mut err) => {
+            if matches!(
+                err.disposition(),
+                TypedLaunchDisposition::PreStartUnavailable
+            ) {
+                match kernel.report_configuration_unavailable(
+                    &claim.attempt_id,
+                    claim.lease_epoch,
+                    &err.to_string(),
+                ) {
+                    Ok(_) => {}
+                    Err(Error::StaleAuthority(_) | Error::InvalidAuthority(_)) => {}
+                    Err(e) => err = TypedLaunchError::SettlementFailed(e),
+                }
+            }
+            persist_typed_launch_fault(kernel, &claim, &err)?;
+            return Err(err);
+        }
+    };
+    // PHASE 2 — commit the snapshot-bearing Execution. A failure here is an
+    // authority loss or a fatal persistence fault, NEVER a Task-level
+    // configuration failure. Definite validation/constraint rejection can
+    // establish the same pure-phase fact in a fresh ownership-fenced transaction.
+    // StorageFailure/RecoveryRequired may have an unknown COMMIT outcome: leave
+    // those to M5 reconciliation and never assert that Execution is absent.
+    let snapshot = match kernel.create_execution_with_snapshot(
+        &claim,
+        plan.physical_binding,
+        &plan.snapshot_record,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(typed_execution_commit_error(kernel, &claim, error));
+        }
+    };
+    // PHASE 3 — assemble the physical start request. This is infallible by
+    // construction (the environment matches the committed binding), and even if
+    // it failed here the Execution already exists and recovery reconciles it, so
+    // no Task-level nack is fabricated.
+    let request = EnvironmentStartRequest::from_committed_launch(&snapshot, &plan.environment)
+        .map_err(|m| TypedLaunchError::Kernel(Error::invalid_authority(m.detail)))?;
+    Ok(PreparedTypedExecutionLaunch {
+        launch: PreparedExecutionLaunch {
+            snapshot,
+            request,
+            resolved_environment: plan.environment,
+        },
+        adapter_binding: plan.adapter_binding,
+    })
+}
+
+/// Internal typed dispatch handoff. It retains the exact adapter instance and
+/// operation policy validated before Execution commitment. Dispatch consumes
+/// these parts together and never selects an adapter again from a registry.
+pub(crate) struct PreparedTypedExecutionLaunch {
+    launch: PreparedExecutionLaunch,
+    adapter_binding: ResolvedAdapterBinding,
+}
+
+impl std::fmt::Debug for PreparedTypedExecutionLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTypedExecutionLaunch")
+            .field("launch", &self.launch)
+            .field("adapter_kind", &self.adapter_binding.adapter_kind())
+            .field(
+                "adapter_binding_key",
+                &self.adapter_binding.adapter_binding_key(),
+            )
+            .finish()
+    }
+}
+
+impl PreparedTypedExecutionLaunch {
+    // Used by the daemon dispatch integration and its conformance tests; the
+    // non-test build only needs `into_dispatch`.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot(&self) -> &ExecutionLaunchSnapshot {
+        self.launch.snapshot()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn request(&self) -> &EnvironmentStartRequest {
+        self.launch.request()
+    }
+
+    pub(crate) fn into_dispatch(self) -> (PreparedExecutionLaunch, ResolvedAdapterBinding) {
+        (self.launch, self.adapter_binding)
+    }
+}
+
+/// The fully validated, still-uncommitted typed launch plan.
+struct TypedLaunchPlan {
+    environment: ResolvedExecutionEnvironment,
+    adapter_binding: ResolvedAdapterBinding,
+    physical_binding: FrozenPhysicalExecutionBinding,
+    snapshot_record: agentype_agent_contract::BindingSnapshot,
+}
+
+/// Map the agent-contract `NetworkPolicy` to the provider-neutral
+/// `NetworkEnforcement` (identical variants).
+fn network_enforcement(policy: agentype_agent_contract::NetworkPolicy) -> NetworkEnforcement {
+    match policy {
+        agentype_agent_contract::NetworkPolicy::Disabled => NetworkEnforcement::Disabled,
+        agentype_agent_contract::NetworkPolicy::Restricted => NetworkEnforcement::Restricted,
+        agentype_agent_contract::NetworkPolicy::Enabled => NetworkEnforcement::Enabled,
+    }
+}
+
+fn plan_typed_execution_launch(
+    kernel: &Kernel,
+    outcome: &crate::provisioning_resolver::TypedAcquisitionOutcome,
+    execution_registry: &ExecutionRegistry,
+    adapters: &AdapterRegistry,
+) -> Result<TypedLaunchPlan, TypedLaunchError> {
+    let claim = &outcome.acquisition.claim;
+    let candidate = &outcome.candidate;
+    let binding = kernel
+        .resolve_execution_binding(claim)
+        .map_err(TypedLaunchError::Kernel)?;
+    let environment = resolve_execution_environment(
+        ExecutionResolutionMode::Authoritative(execution_registry),
+        &binding,
+    )
+    .map_err(TypedLaunchError::Configuration)?;
+    // The acquisition froze one exact physical domain; the resolved partition
+    // target must run the same adapter kind. A mismatch is durable
+    // inconsistency, never a candidate choice, so it is not candidate-local.
+    if environment.target().adapter_kind != candidate.adapter_kind {
+        return Err(TypedLaunchError::Inconsistent(format!(
+            "partition target adapter kind '{}' does not match the acquired candidate '{}'",
+            environment.target().adapter_kind,
+            candidate.adapter_kind
+        )));
+    }
+    let adapter_binding_key = AdapterBindingKey::new(candidate.adapter_binding_key.clone())
+        .map_err(TypedLaunchError::InvalidBinding)?;
+    let adapter_binding = adapters
+        .resolve_exact(&candidate.adapter_kind, &adapter_binding_key)
+        .map_err(TypedLaunchError::Adapter)?;
+    // The current adapter binding must accept the exact provisioning protocol the
+    // acquisition froze, so a descriptor produced for one adapter can never be
+    // launched here.
+    if adapter_binding.provisioning_protocol()
+        != Some(
+            outcome
+                .acquisition
+                .provisioning_binding
+                .provisioning_protocol
+                .as_str(),
+        )
+    {
+        return Err(TypedLaunchError::Weakened(format!(
+            "the installed adapter {}:{} does not accept the committed provisioning protocol '{}'",
+            candidate.adapter_kind,
+            candidate.adapter_binding_key,
+            outcome
+                .acquisition
+                .provisioning_binding
+                .provisioning_protocol
+        )));
+    }
+    // Re-qualify the CURRENT imported enforceability against the capability the
+    // acquisition froze. Exact `(kind, key)` identity is not enough: an importer
+    // that kept the key but weakened its workspace/network/isolation capability
+    // must not launch (frozen M5.1: a stale safety proof cannot authorize a
+    // later launch after registry reconfiguration). Any weakening is a pre-start
+    // handoff failure, never committed as an Execution.
+    let frozen = &outcome.acquisition.provisioning_binding.effective_security;
+    let envelope = adapter_binding.safety_envelope();
+    let mut weakened: Vec<&'static str> = Vec::new();
+    if (frozen.attempt_isolation() && !envelope.attempt_isolation())
+        || validate_attempt_isolation(
+            environment.attempt_isolation(),
+            false,
+            envelope.attempt_isolation(),
+        )
+        .is_err()
+    {
+        weakened.push("attempt_isolation");
+    }
+    if frozen
+        .enforceable_workspace_modes()
+        .iter()
+        .any(|mode| !envelope.enforces_workspace(*mode))
+    {
+        weakened.push("workspace");
+    }
+    if frozen
+        .enforceable_network_modes()
+        .iter()
+        .any(|policy| !envelope.enforces_network(network_enforcement(*policy)))
+    {
+        weakened.push("network");
+    }
+    if !weakened.is_empty() {
+        return Err(TypedLaunchError::Weakened(format!(
+            "the installed adapter {}:{} no longer enforces the committed capability ({weakened:?})",
+            candidate.adapter_kind, candidate.adapter_binding_key
+        )));
+    }
+    let physical_binding = environment
+        .physical_binding(adapter_binding_key)
+        .map_err(TypedLaunchError::InvalidBinding)?;
+    // Freeze the provenance snapshot from the SAME evidence the authority
+    // transaction proved; only the Execution id is newly minted here. The
+    // durable `ProvisioningBinding` is authority here, so the transient candidate
+    // is cross-checked against it (a drift is durable inconsistency, never a
+    // silent physical choice).
+    let pb = &outcome.acquisition.provisioning_binding;
+    if candidate.adapter_kind != pb.adapter_kind
+        || candidate.adapter_binding_key != pb.adapter_binding_key
+        || candidate.provisioning_protocol != pb.provisioning_protocol
+    {
+        return Err(TypedLaunchError::Inconsistent(
+            "resolver candidate disagrees with the committed provisioning binding".into(),
+        ));
+    }
+    let execution_id = ExecutionId::new();
+    let snapshot_record = candidate.binding_snapshot(
+        &execution_id,
+        &outcome.acquisition.provisioning_binding,
+        &claim.execution_target,
+        &claim.execution_profile,
+        environment.attempt_isolation(),
+        None,
+        &outcome.launch_descriptor,
+    );
+    Ok(TypedLaunchPlan {
+        environment,
+        adapter_binding,
+        physical_binding,
+        snapshot_record,
     })
 }
 
@@ -852,6 +1422,12 @@ pub enum DispatchOneOutcome {
         request_id: RequestId,
         failure_class: Option<FailureClass>,
     },
+    /// A typed Task was enumerated but could not acquire provisioning
+    /// authority this cycle. No Attempt, Lease, ProvisioningBinding, or
+    /// Execution was fabricated and no NACK was written: the Task stays QUEUED
+    /// and the typed branch applies a bounded re-probe cooldown. This is the
+    /// typed counterpart of `NoWork`, not a Task failure.
+    TypedDeferred { detail: String },
 }
 
 /// Fenced authority consequence. Stale authority is visible to the caller
@@ -899,6 +1475,147 @@ pub(crate) fn persist_physical_end_then_nack(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Runtime-local policy for the typed control-loop branch.
+///
+/// These values are deliberately not durable: typed eligibility is re-proved
+/// from the catalog, authority, and adaptive catalog frontier every cycle.
+/// The cooldowns exist only to bound how often one QUEUED Task may be
+/// re-attested while it has no eligible physical candidate; they never grant
+/// or preserve authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedDispatchConfig {
+    probe_limit: usize,
+    candidate_cooldown: Duration,
+    ambiguous_cooldown: Duration,
+    attest_budget: Duration,
+    prepare_budget: Duration,
+}
+
+impl TypedDispatchConfig {
+    pub fn new(
+        probe_limit: usize,
+        candidate_cooldown: Duration,
+        ambiguous_cooldown: Duration,
+        attest_budget: Duration,
+        prepare_budget: Duration,
+    ) -> Result<Self, agentype_adapter_api::DeadlineConfigError> {
+        if probe_limit == 0 {
+            return Err(agentype_adapter_api::DeadlineConfigError::NonPositive);
+        }
+        // Reuse the absolute-deadline validator for both budgets.
+        AdapterDeadline::after(attest_budget)?;
+        AdapterDeadline::after(prepare_budget)?;
+        Ok(Self {
+            probe_limit,
+            candidate_cooldown,
+            ambiguous_cooldown,
+            attest_budget,
+            prepare_budget,
+        })
+    }
+
+    pub fn probe_limit(&self) -> usize {
+        self.probe_limit
+    }
+
+    pub fn candidate_cooldown(&self) -> Duration {
+        self.candidate_cooldown
+    }
+
+    pub fn ambiguous_cooldown(&self) -> Duration {
+        self.ambiguous_cooldown
+    }
+
+    pub fn attest_budget(&self) -> Duration {
+        self.attest_budget
+    }
+
+    pub fn prepare_budget(&self) -> Duration {
+        self.prepare_budget
+    }
+}
+
+impl Default for TypedDispatchConfig {
+    fn default() -> Self {
+        Self {
+            probe_limit: 8,
+            candidate_cooldown: Duration::from_secs(1),
+            ambiguous_cooldown: Duration::from_secs(30),
+            attest_budget: Duration::from_secs(5),
+            prepare_budget: Duration::from_secs(5),
+        }
+    }
+}
+
+/// In-memory re-probe state for the typed control-loop branch.
+///
+/// The cooldown map is keyed by Task and invalidated as a whole whenever the
+/// adaptive catalog frontier changes, so a publish that could make a Task
+/// eligible again is observed immediately instead of waiting for a timer.
+/// `prefer_typed` implements alternating fairness between the typed and the
+/// legacy queue; a deferred typed probe still yields the rest of the cycle to
+/// legacy work.
+#[derive(Debug)]
+pub(crate) struct TypedDispatchState {
+    inner: Mutex<TypedDispatchStateInner>,
+}
+
+#[derive(Debug)]
+struct TypedDispatchStateInner {
+    frontier: Option<String>,
+    cooldowns: HashMap<TaskId, Instant>,
+    prefer_typed: bool,
+}
+
+impl TypedDispatchState {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(TypedDispatchStateInner {
+                frontier: None,
+                cooldowns: HashMap::new(),
+                prefer_typed: true,
+            }),
+        }
+    }
+
+    /// Return the side that should be tried first this cycle and flip the
+    /// preference for the next cycle.
+    pub(crate) fn next_preferred_typed(&self) -> bool {
+        let mut inner = self.inner.lock().expect("typed dispatch state");
+        let preferred = inner.prefer_typed;
+        inner.prefer_typed = !preferred;
+        preferred
+    }
+
+    /// Return the Task ids currently in a live cooldown and purge expired
+    /// entries. The returned set is only a query filter; it never grants or
+    /// persists authority. A catalog-frontier change clears the whole map.
+    fn cooling_ids(&self, frontier: &str, now: Instant) -> Vec<TaskId> {
+        let mut inner = self.inner.lock().expect("typed dispatch state");
+        if inner.frontier.as_deref() != Some(frontier) {
+            inner.frontier = Some(frontier.to_string());
+            inner.cooldowns.clear();
+        }
+        inner.cooldowns.retain(|_, until| *until > now);
+        let mut ids: Vec<TaskId> = inner.cooldowns.keys().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
+    fn defer(&self, task_id: TaskId, until: Instant) {
+        self.inner
+            .lock()
+            .expect("typed dispatch state")
+            .cooldowns
+            .insert(task_id, until);
+    }
+}
+
+fn cooldown_until(now: Instant, budget: Duration) -> Instant {
+    now.checked_add(budget)
+        .unwrap_or_else(|| now + Duration::from_secs(3600))
 }
 
 /// Minimal dispatch service (task §9): take one eligible Scheduler claim and
@@ -1073,6 +1790,216 @@ impl<'a> Dispatcher<'a> {
             &request_id,
             observation,
         )
+    }
+
+    /// Dispatch at most one durably committed typed Task.
+    ///
+    /// The whole path is Scheduler-owned: an authority-free enumeration only
+    /// selects *which* Task ids are worth the authority-bearing acquisition,
+    /// then `acquire_typed_task` re-proves B.3 matching and B.4 eligibility
+    /// inside its own transaction. A Task with no eligible physical candidate
+    /// leaves QUEUED with no Attempt, Lease, Binding, Execution, or NACK.
+    ///
+    /// The physical start still happens behind the same `DispatchGate` permit
+    /// as the legacy path, before acquisition can create an Attempt.
+    pub(crate) fn dispatch_typed_one(
+        &self,
+        integrations: &SourceIntegrationRegistry,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        let _start_permit = if let Some(gate) = self.gate {
+            match gate.try_begin_physical_start() {
+                Some(permit) => Some(permit),
+                None => return Ok(DispatchOneOutcome::NoWork),
+            }
+        } else {
+            None
+        };
+        let frontier = self
+            .kernel
+            .catalog_frontier_digest()
+            .map_err(DispatchError::Persistence)?;
+        let now = Instant::now();
+        // Cooldown is runtime-local and is applied as an enumeration filter
+        // *before* `probe_limit`, so a cooling Task cannot occupy a probe slot
+        // and permanently starve the Tasks ordered behind it.
+        let excluded = state.cooling_ids(&frontier, now);
+        let candidates = self
+            .kernel
+            .list_typed_dispatch_candidates_excluding(config.probe_limit(), &excluded)
+            .map_err(DispatchError::Persistence)?;
+        if candidates.is_empty() {
+            return Ok(DispatchOneOutcome::NoWork);
+        }
+        let mut deferred: Option<String> = None;
+        for task_id in candidates {
+            match self.dispatch_typed_candidate(&task_id, integrations, config, state)? {
+                Some(outcome) => return Ok(outcome),
+                None => deferred = Some("typed candidate is not currently provisionable".into()),
+            }
+        }
+        Ok(match deferred {
+            Some(detail) => DispatchOneOutcome::TypedDeferred { detail },
+            None => DispatchOneOutcome::NoWork,
+        })
+    }
+
+    /// Try one enumerated typed Task. `Ok(None)` means the Task is deferred
+    /// without fabricating authority or a Task failure; `Err` is a confirmed
+    /// control-plane fault that must fail closed.
+    fn dispatch_typed_candidate(
+        &self,
+        task_id: &TaskId,
+        integrations: &SourceIntegrationRegistry,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+        let attest = AdapterDeadline::after(config.attest_budget()).map_err(|_| {
+            DispatchError::Persistence(Error::invariant(
+                "validated typed attest budget became invalid",
+            ))
+        })?;
+        // The winner's pure-preparation budget starts *after* acquisition
+        // selects and commits a winner. Creating it here would let candidate
+        // probing consume the winner's prepare budget.
+        let outcome = match crate::provisioning_resolver::acquire_typed_task(
+            self.kernel,
+            task_id,
+            self.adapters,
+            self.execution_registry,
+            integrations,
+            &attest,
+            config.prepare_budget(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return self.defer_or_fail_typed(task_id, err, config, state);
+            }
+        };
+        let claim = outcome.acquisition.claim.clone();
+        let prepared = match prepare_typed_execution_launch(
+            self.kernel,
+            outcome,
+            self.execution_registry,
+            self.adapters,
+        ) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let detail = err.to_string();
+                if err.disposition() == TypedLaunchDisposition::Fatal {
+                    // The durable preparation fence was already attempted.
+                    // Never downgrade a control-plane fault to a Task NACK.
+                    return Err(DispatchError::TypedPreparation(
+                        "confirmed fatal typed preparation fault".into(),
+                    ));
+                }
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                return Ok(Some(DispatchOneOutcome::TypedDeferred { detail }));
+            }
+        };
+        let (launch, adapter_binding) = prepared.into_dispatch();
+        self.start_prepared(&claim, &adapter_binding, launch)
+            .map(Some)
+    }
+
+    /// Classify a pre-start typed acquisition error.
+    ///
+    /// Only explicitly candidate-local ineligibility and the ADR-0010
+    /// pre-acquisition `SelectionAmbiguous` state are deferrals. Everything else
+    /// is a control-plane/corruption fault and MUST terminate the cycle.
+    ///
+    /// `SelectionAmbiguous` is resolved before an Attempt exists. Deferring it
+    /// therefore creates no Task failure and emits no `RESOURCE_UNAVAILABLE`
+    /// NACK; the Task stays QUEUED and is re-probed after the ambiguity
+    /// cooldown or a catalog-frontier change. A post-acquisition failure is a
+    /// different outcome handled by the Attempt's ACK/NACK path.
+    fn defer_or_fail_typed(
+        &self,
+        task_id: &TaskId,
+        err: ProvisioningResolutionError,
+        config: &TypedDispatchConfig,
+        state: &TypedDispatchState,
+    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+        use ProvisioningResolutionError as P;
+        match &err {
+            // The authority transaction committed a claim, then pure
+            // preparation reported unavailability or authority loss. The
+            // settlement/recovery consequence already belongs to that claim.
+            P::PostCommitPreparationFailed(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            // ADR-0010: a tie in the frozen selection order is a pre-acquisition
+            // resolution deferral, never permission to skip to a lower-ranked
+            // agent or source and never a Task NACK: no Attempt exists yet.
+            // Probe again only after a long cooldown or a catalog-frontier
+            // change.
+            P::SelectionAmbiguous(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.ambiguous_cooldown()),
+                );
+                Ok(None)
+            }
+            // The authority-free enumeration raced a Task/Batch/partition
+            // readiness change. No authority was created.
+            P::Storage(Error::InvalidTransition(_)) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            _ if err.is_candidate_local_for_dispatch() => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.candidate_cooldown()),
+                );
+                Ok(None)
+            }
+            _ => Err(DispatchError::TypedPreparation(
+                "confirmed fatal typed provisioning fault".into(),
+            )),
+        }
+    }
+
+    /// Execute exactly one already-prepared physical start and persist its
+    /// authoritative consequence. Shared by the legacy and typed paths so the
+    /// two cannot drift in observation classification or failure semantics.
+    fn start_prepared(
+        &self,
+        claim: &Claim,
+        adapter: &ResolvedAdapterBinding,
+        launch: PreparedExecutionLaunch,
+    ) -> Result<DispatchOneOutcome, DispatchError> {
+        let execution_id = launch.snapshot().execution_id().clone();
+        let request_id = launch.snapshot().request_id().clone();
+        let observation = match adapter.start_execution(launch.request()) {
+            Ok(observation) => observation,
+            Err(err) => {
+                let failure_class = adapter_invocation_failure_class(&err);
+                let hint = err.runtime_handle_hint().map(|h| h.0.clone());
+                self.persist_unresolved_physical_then_nack(
+                    claim,
+                    &execution_id,
+                    failure_class,
+                    hint.as_ref(),
+                )?;
+                return Ok(DispatchOneOutcome::StartIndeterminate {
+                    execution_id,
+                    request_id,
+                    failure_class: Some(failure_class),
+                });
+            }
+        };
+        self.commit_start_observation(claim, adapter, &execution_id, &request_id, observation)
     }
 
     /// Classify and durably persist the immediate start observation using
@@ -1410,6 +2337,62 @@ mod tests {
     }
 
     #[test]
+    fn binding_ref_is_scoped_by_adapter_kind() {
+        let mut registry = AdapterRegistry::new();
+        let deadlines = m56_policy();
+        registry
+            .register_with_safety_and_ref(
+                "local_process",
+                "primary",
+                AdapterBindingKey::new("local-domain").unwrap(),
+                Arc::new(FakeAdapter::new()),
+                deadlines,
+                AdapterSafetyEnvelope::unenforceable(),
+            )
+            .unwrap();
+        // A different kind may reuse the same operator alias without collision;
+        // the frozen contract resolves `binding_ref` within the policy's kind.
+        let container_key = AdapterBindingKey::new("container-domain").unwrap();
+        registry
+            .register_with_safety_and_ref(
+                "container",
+                "primary",
+                container_key.clone(),
+                Arc::new(FakeAdapter::new()),
+                deadlines,
+                AdapterSafetyEnvelope::unenforceable(),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .resolve_binding_ref("container", "primary")
+                .unwrap()
+                .adapter_binding_key(),
+            &container_key
+        );
+        assert_eq!(
+            registry
+                .resolve_binding_ref("local_process", "primary")
+                .unwrap()
+                .adapter_binding_key(),
+            &AdapterBindingKey::new("local-domain").unwrap()
+        );
+        // Within one kind the alias remains unique: a second registration of the
+        // same alias under the same kind still fails closed.
+        let dup = registry.register_with_safety_and_ref(
+            "container",
+            "primary",
+            AdapterBindingKey::new("container-domain-2").unwrap(),
+            Arc::new(FakeAdapter::new()),
+            deadlines,
+            AdapterSafetyEnvelope::unenforceable(),
+        );
+        assert!(
+            matches!(dup, Err(AdapterRegistryError::DuplicateBindingRef(ref a)) if a == "primary")
+        );
+    }
+
+    #[test]
     fn end_to_end_launch_preserves_registry_isolation_fact() {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
         let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
@@ -1672,7 +2655,10 @@ mod tests {
             TaskState::Suspended
         );
         let esc = kernel.open_escalation_for_task(&claim.task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
 
         // Backoff time passing does not resurrect a suspended writer.
         clock.advance(60.0);
@@ -3174,7 +4160,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(!exec.quiescent_confirmed);
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -3362,7 +4351,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // replacement — the writer-safety suspension stands.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -3480,7 +4472,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // writer: the task suspends instead of retrying.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -3633,7 +4628,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         // quiescence-proven: suspension, never a replacement writer.
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
         assert_eq!(fake.start_call_count(), 1);
     }
 
@@ -3785,7 +4783,10 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
         assert!(kernel.result_for_task(&task_id).is_err());
         assert_eq!(kernel.task(&task_id).unwrap().state, TaskState::Suspended);
         let esc = kernel.open_escalation_for_task(&task_id).unwrap();
-        assert_eq!(esc.failure_class, FailureClass::WriterQuiescenceUnknown);
+        assert_eq!(
+            esc.failure_class(),
+            Some(FailureClass::WriterQuiescenceUnknown)
+        );
     }
 
     /// Test adapter whose collect_outcome corrupts one durable column below
@@ -5209,5 +6210,141 @@ The current workspace is authoritative. Inspect assignment-scoped state and diff
             handle_before,
             kernel.execution_runtime_handle(&execution_id).unwrap()
         );
+    }
+
+    fn publish_cooldown_type(kernel: &Kernel) -> agentype_agent_contract::AgentTypeRef {
+        use agentype_agent_contract::{
+            AffinityConstraint, AgentType, AgentTypeContract, AgentTypeRef, Budget, ContinuityMode,
+            LifecycleMode, NetworkPolicy, SecurityContract,
+        };
+        use agentype_core::WorkspaceMode;
+        use std::collections::BTreeMap;
+        let pin = AgentTypeRef::new("cooldown-reviewer", 1).unwrap();
+        kernel
+            .publish_agent_type(&AgentType {
+                type_ref: pin.clone(),
+                based_on: None,
+                contract: AgentTypeContract {
+                    allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                    required_capabilities: BTreeMap::new(),
+                    affinity: AffinityConstraint::Any,
+                    budget_ceiling: Budget::new(100.0).unwrap(),
+                    security: SecurityContract {
+                        workspace: WorkspaceMode::ReadOnly,
+                        network: NetworkPolicy::Disabled,
+                        requires_attempt_isolation: false,
+                    },
+                    lifecycle: [LifecycleMode::Resident].into_iter().collect(),
+                    continuity: ContinuityMode::Logical,
+                    sandbox_policy: None,
+                    anchor_constraint: None,
+                },
+            })
+            .unwrap();
+        pin
+    }
+
+    fn admit_cooldown_tasks(
+        kernel: &Kernel,
+        pin: &agentype_agent_contract::AgentTypeRef,
+        count: usize,
+    ) -> Vec<TaskId> {
+        use agentype_agent_contract::{
+            AgentRequirementDraft, AgentTypeSelector, Budget, NetworkPolicy,
+        };
+        use agentype_core::{
+            InformationFunction, PartitionId, RawWorkIntent, SemanticInputSet, TaskSpec,
+        };
+        use std::collections::BTreeMap;
+        (0..count)
+            .map(|index| {
+                let generation = kernel.create_generation(serde_json::json!({})).unwrap();
+                let mut spec = TaskSpec::new(format!("cooldown-{index}"), serde_json::json!({}));
+                spec.partition = PartitionId::new("general");
+                // Distinct descending priorities make the frozen order exactly
+                // `tasks[0], tasks[1], ...`, independent of wall-clock time.
+                spec.priority = i64::try_from(count - index).unwrap();
+                let intent = RawWorkIntent {
+                    raw_intent_key: format!("cooldown-intent-{index}"),
+                    objective: "cooldown starvation".into(),
+                    information_function: InformationFunction::Expand,
+                    semantic_input_set: SemanticInputSet::new(),
+                    rationale: None,
+                    suggested_task_spec: Some(spec),
+                };
+                let proposal = kernel
+                    .compile_root_intent(&generation.generation_id, intent, "session", 1)
+                    .unwrap();
+                kernel
+                    .admit_typed_proposal(
+                        &proposal.proposal_id,
+                        0,
+                        None,
+                        AgentRequirementDraft {
+                            required_type: AgentTypeSelector::Exact(pin.clone()),
+                            required_capabilities: BTreeMap::new(),
+                            required_network: NetworkPolicy::Disabled,
+                            required_attempt_isolation: false,
+                            sandbox_policy: None,
+                            required_anchor: None,
+                            budget: Budget::new(50.0).unwrap(),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// P1-1: a cooling Task must be excluded **before** `probe_limit`, or the
+    /// first N cooling Tasks permanently occupy the window and Task N+1 is
+    /// never enumerated. This uses the exact production state and read path
+    /// that `dispatch_typed_one` composes.
+    #[test]
+    fn cooling_typed_tasks_do_not_consume_the_probe_window() {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_000.0));
+        let kernel = Kernel::open_memory(clock, 10.0, 16_384).unwrap();
+        kernel
+            .upsert_partition(&PartitionSpec::new(
+                "general",
+                1,
+                Retention::Resident,
+                "local",
+                "default",
+            ))
+            .unwrap();
+        let pin = publish_cooldown_type(&kernel);
+        let tasks = admit_cooldown_tasks(&kernel, &pin, 9);
+
+        let state = TypedDispatchState::new();
+        let frontier = kernel.catalog_frontier_digest().unwrap();
+        let now = Instant::now();
+        // Establish the frontier before recording cooldowns; a frontier change
+        // intentionally clears runtime-local cooldown state.
+        let _ = state.cooling_ids(&frontier, now);
+        for task in &tasks[..8] {
+            state.defer(task.clone(), now + Duration::from_secs(60));
+        }
+
+        let excluded = state.cooling_ids(&frontier, now);
+        assert_eq!(excluded.len(), 8);
+        let filtered = kernel
+            .list_typed_dispatch_candidates_excluding(8, &excluded)
+            .unwrap();
+        assert_eq!(
+            filtered,
+            vec![tasks[8].clone()],
+            "the ninth Task must be visible when the first eight are cooling"
+        );
+
+        let unfiltered = kernel.list_typed_dispatch_candidates(8).unwrap();
+        assert_eq!(
+            unfiltered,
+            tasks[..8].to_vec(),
+            "without filtering, the cooling Tasks would fill the whole probe window"
+        );
+        assert!(kernel
+            .list_typed_dispatch_candidates_excluding(0, &excluded)
+            .unwrap()
+            .is_empty());
     }
 }

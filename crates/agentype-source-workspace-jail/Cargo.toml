@@ -1,0 +1,17 @@
+[package]
+name = "agentype-source-workspace-jail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Real SourceConfigIntegration for the workspace-jail adapter: pure attest/prepare of a secret-free launch descriptor"
+
+[dependencies]
+agentype-adapter-api.workspace = true
+agentype-adapter-local-process.workspace = true
+agentype-agent-contract.workspace = true
+agentype-runtime.workspace = true
+agentype-storage-sqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agentype-core.workspace = true

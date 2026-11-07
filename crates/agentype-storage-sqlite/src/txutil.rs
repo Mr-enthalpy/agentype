@@ -75,6 +75,32 @@ pub fn validate_authority_tx(
     lease_epoch: u64,
     now: UnixTime,
 ) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
+    let records = validate_claim_tx(tx, attempt_id, lease_epoch, Some(now))?;
+    if crate::preparation::get_fault(tx, &AttemptId::from_string(attempt_id))?.is_some() {
+        return Err(Error::RecoveryRequired(
+            "confirmed preparation fault fences claim operations".into(),
+        ));
+    }
+    Ok(records)
+}
+
+/// Persisting a confirmed fault cannot grant activity. An elapsed lease may
+/// still be fenced while its exact claim is ACTIVE and has not been replaced.
+#[cfg(any(test, feature = "runtime-internal"))]
+pub(crate) fn validate_preparation_fact_tx(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    lease_epoch: u64,
+) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
+    validate_claim_tx(tx, attempt_id, lease_epoch, None)
+}
+
+fn validate_claim_tx(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    lease_epoch: u64,
+    now: Option<UnixTime>,
+) -> Result<(AttemptRow, LeaseRow, TaskRow), Error> {
     let attempt = required_attempt(tx, attempt_id)?;
     let task = required_task(tx, &attempt.task_id)?;
     let lease = query_opt(
@@ -93,7 +119,10 @@ pub fn validate_authority_tx(
         task_current_attempt_id: task.current_attempt_id.as_ref().map(AttemptId::from_string),
         task_fencing_epoch: LeaseEpoch(task.fencing_epoch),
     };
-    validate_authority(&snap, LeaseEpoch(lease_epoch), now)?;
+    match now {
+        Some(now) => validate_authority(&snap, LeaseEpoch(lease_epoch), now)?,
+        None => agentype_core::validate_claim_ownership(&snap, LeaseEpoch(lease_epoch))?,
+    }
     if lease.epoch != lease_epoch {
         return Err(Error::stale(
             "attempt no longer owns authoritative task state",
@@ -181,6 +210,13 @@ pub fn unsafe_cross_target_execution(
     target_execution_target: &str,
     now: UnixTime,
 ) -> Result<bool, Error> {
+    if crate::provisioning::cross_target_provisioned_host_requires_closure(
+        tx,
+        agent_id,
+        target_execution_target,
+    )? {
+        return Ok(true);
+    }
     let mut stmt = tx
         .prepare(
             "SELECT e.attempt_isolation,e.terminal_confirmed,e.quiescent_confirmed,a.state AS attempt_state,
@@ -334,6 +370,24 @@ pub fn release_agent(tx: &Transaction<'_>, agent_id: &str, now: UnixTime) -> Res
         .pending_partition
         .clone()
         .unwrap_or_else(|| agent.partition.clone());
+    let destination = canonical_partition(tx, &target_name)?;
+    if crate::provisioning::cross_target_provisioned_host_requires_closure(
+        tx,
+        agent_id,
+        &destination.execution_target,
+    )? {
+        // An earlier PR-era pending intent may predate the topology guard.
+        // Close the claim without committing that unsafe move or losing its
+        // host. Keep the original partition/retention and the pending intent;
+        // no new claim can use this agent until actual lifecycle closure.
+        tx.execute(
+            "UPDATE logical_agents SET state='SUSPENDED',current_task_id=NULL,
+             pending_partition_name=?1,available_since=NULL,updated_at=?2 WHERE id=?3",
+            params![destination.name, now, agent_id],
+        )
+        .map_err(map_sqlite)?;
+        return Ok(());
+    }
     let target = commit_partition_cutover(tx, &agent, &target_name, now)?;
     let target_retention = Retention::parse_sql(&target.retention)?;
     let disposition = agent_release_disposition(false, target_retention);
@@ -543,20 +597,75 @@ pub fn create_escalation(
     detail: Option<&str>,
     now: UnixTime,
 ) -> Result<String, Error> {
+    create_escalation_with_cause(
+        tx,
+        task_id,
+        batch_id,
+        logical_agent_id,
+        workstream_id,
+        &EscalationCause::TaskFailure(failure_class),
+        signature,
+        detail,
+        now,
+    )
+}
+
+pub(crate) fn create_escalation_with_cause(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    batch_id: &str,
+    logical_agent_id: Option<&str>,
+    workstream_id: Option<&str>,
+    cause: &EscalationCause,
+    signature: Option<&str>,
+    detail: Option<&str>,
+    now: UnixTime,
+) -> Result<String, Error> {
     if let Some(existing) = query_opt(
         tx,
         "SELECT id FROM escalations WHERE task_id=?1 AND state='OPEN'",
         params![task_id],
         |r| r.get::<_, String>(0),
     )? {
+        let tag: String = tx
+            .query_row(
+                "SELECT failure_class FROM escalations WHERE id=?1",
+                [&existing],
+                |r| r.get(0),
+            )
+            .map_err(map_sqlite)?;
+        let actual = crate::preparation::escalation_cause(tx, &existing, task_id, &tag)?;
+        if (matches!(cause, EscalationCause::PreparationFault { .. })
+            || matches!(actual, EscalationCause::PreparationFault { .. }))
+            && actual != *cause
+        {
+            return Err(Error::invariant(
+                "open escalation has a different control-plane cause",
+            ));
+        }
         return Ok(existing);
     }
+    let (tag, cause_kind, cause_json, failure_class) = match cause {
+        EscalationCause::TaskFailure(class) => (
+            class.as_sql(),
+            "TASK_FAILURE",
+            serde_json::json!({"kind":"TASK_FAILURE","failure_class":class.as_sql()}),
+            Some(class.as_sql()),
+        ),
+        EscalationCause::PreparationFault { attempt_id, kind } => (
+            crate::preparation::PREPARATION_ESCALATION,
+            "PREPARATION_FAULT",
+            serde_json::json!({"kind":"PREPARATION_FAULT","attempt_id":attempt_id.as_str(),"fault_kind":kind.as_sql()}),
+            None,
+        ),
+    };
     let escalation_id = EscalationId::new().to_string();
     let snapshot = serde_json::json!({
         "task_id": task_id,
         "logical_agent_id": logical_agent_id,
         "workstream_id": workstream_id,
-        "failure_class": failure_class.as_sql(),
+        "failure_class": failure_class,
+        "cause": cause_json,
         "normalized_failure_signature": signature,
         "detail": detail,
     });
@@ -570,7 +679,7 @@ pub fn create_escalation(
             batch_id,
             logical_agent_id,
             workstream_id,
-            failure_class.as_sql(),
+            tag,
             signature,
             json_dump(&snapshot),
             "Root must choose an explicit recovery primitive",
@@ -578,6 +687,9 @@ pub fn create_escalation(
         ],
     )
     .map_err(map_sqlite)?;
+    if let EscalationCause::PreparationFault { attempt_id, kind } = cause {
+        crate::preparation::attach_escalation(tx, &escalation_id, task_id, attempt_id, *kind)?;
+    }
     enqueue_event(
         tx,
         DECISION_REQUIRED,
@@ -586,7 +698,8 @@ pub fn create_escalation(
         &serde_json::json!({
             "escalation_id": escalation_id,
             "task_id": task_id,
-            "batch_id": batch_id
+            "batch_id": batch_id,
+            "cause_kind": cause_kind
         }),
         now,
     )?;

@@ -14,7 +14,7 @@ use crate::process_lock::{
 use crate::recovery::{recover_runtime_with_gate, RecoveryError};
 use crate::supervision::SupervisionRunner;
 use crate::timing::RuntimeTimingConfig;
-use crate::{AdapterRegistry, ExecutionRegistry};
+use crate::{AdapterRegistry, ExecutionRegistry, SourceIntegrationRegistry, TypedDispatchConfig};
 use agentype_core::{Clock, Error, SystemClock};
 use agentype_storage_sqlite::Kernel;
 use std::fmt;
@@ -104,6 +104,7 @@ pub struct SchedulerDaemonBuilder {
     adapters: AdapterRegistry,
     notifier: NotifierBinding,
     clock: Arc<dyn Clock>,
+    typed_dispatch: Option<(SourceIntegrationRegistry, TypedDispatchConfig)>,
 }
 
 impl SchedulerDaemonBuilder {
@@ -135,7 +136,21 @@ impl SchedulerDaemonBuilder {
             adapters,
             notifier,
             clock: Arc::new(SystemClock),
+            typed_dispatch: None,
         })
+    }
+
+    /// Enable production typed dispatch with the composition-root-owned
+    /// exact-source integration routing. Without this call typed Tasks remain
+    /// QUEUED (never claimed by the legacy path), which is the fail-closed
+    /// default.
+    pub fn typed_dispatch(
+        mut self,
+        integrations: SourceIntegrationRegistry,
+        config: TypedDispatchConfig,
+    ) -> Self {
+        self.typed_dispatch = Some((integrations, config));
+        self
     }
 
     /// Test clock injection. Production startup uses [`SystemClock`].
@@ -214,7 +229,8 @@ impl SchedulerDaemonBuilder {
         }
         let freshness = self.observer.freshness_limit();
         let permit = ReadyPermit::mint();
-        let control_service = ControlLoopService::new(
+        let typed_dispatch = self.typed_dispatch;
+        let mut control_service = ControlLoopService::new(
             kernel.clone(),
             self.execution_registry,
             self.adapters,
@@ -227,6 +243,9 @@ impl SchedulerDaemonBuilder {
             permit,
             gate.clone(),
         );
+        if let Some((integrations, config)) = typed_dispatch {
+            control_service = control_service.with_typed_dispatch(integrations, config);
+        }
         // Workers start PAUSED behind the READY publication boundary
         // (M5.8 audit round 3, P1-1). Neither observation nor maintenance may
         // run between the readiness validation and the gate flip, because

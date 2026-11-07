@@ -20,13 +20,20 @@ Layout notes and remaining documentation debt: [docs/development/repo-normalizat
 
 V0.2 implementation status: the M5 execution/runtime substrate, the M6-A
 semantic frontier kernel, the M6-B.1 AgentType ontology, the M6-B.2 durable Agent
-Contract catalog (schema v6), and M6-B.3 typed semantic commitment and
-existing-agent preselection (schema v7) are frozen. See the
+Contract catalog (schema v6), M6-B.3 typed semantic commitment and existing-agent
+preselection (schema v7) are frozen. M6-B.4 provisioning binding and exact launch
+(schema v8) are implemented through production typed daemon dispatch and real
+OS-enforced physical execution, up to the durable ACK interface; the milestone is
+incomplete and not frozen because the worker-originated Result data plane is
+deferred ([ADR-0012](decisions/0012-m6b4-scope-typed-physical-execution-ack.md)).
+Its inherited-contract corrections are recorded in the
+[contract parity report](reports/v0.2/riir-m6b.4-contract-parity.md). See the
 [M5 runtime freeze and M6 handoff report](reports/v0.2/riir-m5-runtime-freeze.md),
 the [M6-A semantic frontier freeze report](reports/v0.2/m6a-semantic-frontier-freeze.md),
 the [M6-A result-carried intent re-freeze](reports/v0.2/m6a-result-carried-intent-binding.md),
 the [M6-B.2 agent catalog freeze report](reports/v0.2/riir-m6b.2-agent-catalog-freeze.md),
 the [M6-B.3 typed admission freeze report](reports/v0.2/riir-m6b.3-typed-admission-freeze.md),
+the [M6-B.4 provisioning binding freeze report](reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md),
 and the [M6-B agent contract and spawn resolution note](architecture/v0.2/m6b-agent-contract-and-spawn-resolution.md).
 
 ## Taxonomy (where a new file goes)

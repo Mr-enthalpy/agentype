@@ -398,6 +398,43 @@ pub enum FailureClass {
     WriterQuiescenceUnknown,
 }
 
+/// Payload-free fatal preparation categories, outside worker retry classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationFaultKind {
+    StorageFailure,
+    InvariantViolation,
+    RecoveryRequired,
+    MissingRevision,
+    InvalidContract,
+    Other,
+}
+
+impl PreparationFaultKind {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::StorageFailure => "STORAGE_FAILURE",
+            Self::InvariantViolation => "INVARIANT_VIOLATION",
+            Self::RecoveryRequired => "RECOVERY_REQUIRED",
+            Self::MissingRevision => "MISSING_REVISION",
+            Self::InvalidContract => "INVALID_CONTRACT",
+            Self::Other => "OTHER",
+        }
+    }
+    pub fn parse_sql(value: &str) -> Result<Self, Error> {
+        match value {
+            "STORAGE_FAILURE" => Ok(Self::StorageFailure),
+            "INVARIANT_VIOLATION" => Ok(Self::InvariantViolation),
+            "RECOVERY_REQUIRED" => Ok(Self::RecoveryRequired),
+            "MISSING_REVISION" => Ok(Self::MissingRevision),
+            "INVALID_CONTRACT" => Ok(Self::InvalidContract),
+            "OTHER" => Ok(Self::Other),
+            _ => Err(Error::invariant(
+                "invalid durable preparation fault category",
+            )),
+        }
+    }
+}
+
 impl FailureClass {
     pub fn as_sql(self) -> &'static str {
         match self {

@@ -760,7 +760,7 @@ pub fn get_spawn_source(
     load_spawn_source(tx, reference)
 }
 
-fn load_spawn_source(
+pub(crate) fn load_spawn_source(
     tx: &Transaction<'_>,
     reference: &SpawnSourceRef,
 ) -> Result<Option<SpawnSource>, Error> {

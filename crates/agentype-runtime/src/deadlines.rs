@@ -6,10 +6,10 @@
 
 use agentype_adapter_api::{
     AdapterDeadline, AdapterError, AdapterOperation, AdapterResult, DeadlineConfigError,
-    EnvironmentStartRequest, ExecutionAdapter, ExecutionObservation, PhysicalExecutionOutcome,
-    RuntimeHandle, StartObservation,
+    EnvironmentStartRequest, ExecutionAdapter, ExecutionObservation, NetworkEnforcement,
+    PhysicalExecutionOutcome, RuntimeHandle, StartObservation,
 };
-use agentype_core::RequestId;
+use agentype_core::{RequestId, WorkspaceMode};
 use agentype_execution_config::AdapterBindingKey;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,9 +73,16 @@ impl AdapterDeadlinePolicy {
 /// Physical safety the installed execution source can actually enforce.
 /// Target configuration may *require* isolation; this envelope says whether
 /// the imported binding can back that claim.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// M6-B.4 additively extends the envelope with the enforceable workspace modes
+/// and network policies imported from the adapter. These are imported facts
+/// (`ImportableAdapter`), never caller-assembled; the composition cannot mint an
+/// enforcement claim the adapter did not report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdapterSafetyEnvelope {
     attempt_isolation: bool,
+    enforceable_workspace: Vec<WorkspaceMode>,
+    enforceable_network: Vec<NetworkEnforcement>,
 }
 
 impl AdapterSafetyEnvelope {
@@ -88,8 +95,60 @@ impl AdapterSafetyEnvelope {
         self
     }
 
+    /// Replace the enforceable workspace-mode set (canonicalized, deduped).
+    pub fn with_enforceable_workspace(
+        mut self,
+        modes: impl IntoIterator<Item = WorkspaceMode>,
+    ) -> Self {
+        let mut modes: Vec<WorkspaceMode> = modes.into_iter().collect();
+        modes.sort_by_key(|m| workspace_rank(*m));
+        modes.dedup();
+        self.enforceable_workspace = modes;
+        self
+    }
+
+    /// Replace the enforceable network-policy set (canonicalized, deduped).
+    pub fn with_enforceable_network(
+        mut self,
+        policies: impl IntoIterator<Item = NetworkEnforcement>,
+    ) -> Self {
+        let mut policies: Vec<NetworkEnforcement> = policies.into_iter().collect();
+        policies.sort();
+        policies.dedup();
+        self.enforceable_network = policies;
+        self
+    }
+
     pub fn attempt_isolation(&self) -> bool {
         self.attempt_isolation
+    }
+
+    /// Whether this domain can mechanically enforce `mode`.
+    ///
+    /// Exact-set membership, matching the frozen M6-B.1 `PhysicalSafety`
+    /// algebra: B.4 imports enforceability facts and MUST NOT infer one workspace
+    /// mode from another. An importer that can enforce both must import both.
+    pub fn enforces_workspace(&self, mode: WorkspaceMode) -> bool {
+        self.enforceable_workspace.contains(&mode)
+    }
+
+    pub fn enforceable_workspace(&self) -> &[WorkspaceMode] {
+        &self.enforceable_workspace
+    }
+
+    pub fn enforces_network(&self, policy: NetworkEnforcement) -> bool {
+        self.enforceable_network.contains(&policy)
+    }
+
+    pub fn enforceable_network(&self) -> &[NetworkEnforcement] {
+        &self.enforceable_network
+    }
+}
+
+fn workspace_rank(mode: WorkspaceMode) -> u8 {
+    match mode {
+        WorkspaceMode::ReadOnly => 0,
+        WorkspaceMode::Write => 1,
     }
 }
 
@@ -103,6 +162,7 @@ pub struct ResolvedAdapterBinding {
     adapter: Arc<dyn ExecutionAdapter>,
     deadlines: AdapterDeadlinePolicy,
     safety: AdapterSafetyEnvelope,
+    provisioning_protocol: Option<String>,
 }
 
 impl ResolvedAdapterBinding {
@@ -112,6 +172,7 @@ impl ResolvedAdapterBinding {
         adapter: Arc<dyn ExecutionAdapter>,
         deadlines: AdapterDeadlinePolicy,
         safety: AdapterSafetyEnvelope,
+        provisioning_protocol: Option<String>,
     ) -> Self {
         Self {
             adapter_kind,
@@ -119,11 +180,23 @@ impl ResolvedAdapterBinding {
             adapter,
             deadlines,
             safety,
+            provisioning_protocol,
         }
+    }
+
+    /// The source-integration protocol this exact adapter binding accepts, if it
+    /// is provisioning-capable.
+    pub fn provisioning_protocol(&self) -> Option<&str> {
+        self.provisioning_protocol.as_deref()
     }
 
     pub fn enforces_attempt_isolation(&self) -> bool {
         self.safety.attempt_isolation()
+    }
+
+    /// The imported enforceable-safety envelope (read-only).
+    pub fn safety_envelope(&self) -> &AdapterSafetyEnvelope {
+        &self.safety
     }
 
     pub fn adapter_kind(&self) -> &str {
@@ -301,6 +374,20 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn workspace_enforceability_is_an_exact_set() {
+        // A domain that can enforce `Write` does NOT thereby claim `ReadOnly`;
+        // an importer that can enforce both must report both.
+        let write_only = AdapterSafetyEnvelope::unenforceable()
+            .with_enforceable_workspace([WorkspaceMode::Write]);
+        assert!(write_only.enforces_workspace(WorkspaceMode::Write));
+        assert!(!write_only.enforces_workspace(WorkspaceMode::ReadOnly));
+        let both = AdapterSafetyEnvelope::unenforceable()
+            .with_enforceable_workspace([WorkspaceMode::ReadOnly, WorkspaceMode::Write]);
+        assert!(both.enforces_workspace(WorkspaceMode::ReadOnly));
+        assert!(both.enforces_workspace(WorkspaceMode::Write));
+    }
+
+    #[test]
     fn registration_policy_selects_per_operation_budget() {
         let start = Duration::from_secs(1);
         let recon = Duration::from_secs(2);
@@ -339,6 +426,7 @@ mod tests {
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(9)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         // No request: just mint via a dummy? start needs ExecutionRequest.
         // Endpoint inspection: call observe with empty handle after we have
@@ -473,6 +561,7 @@ mod tests {
             Arc::new(LateHintAdapter),
             AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let h1 = RuntimeHandle(serde_json::json!({"locator": "H1"}));
         let err = binding.collect_outcome(&h1).unwrap_err();
@@ -494,6 +583,7 @@ mod tests {
             Arc::new(LateOkAdapter),
             AdapterDeadlinePolicy::uniform(Duration::from_millis(1)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let err = binding
             .collect_outcome(&RuntimeHandle(serde_json::json!({"h": 1})))
@@ -525,6 +615,7 @@ mod tests {
             fake.clone(),
             policy,
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let handle = RuntimeHandle(serde_json::json!({"h": 1}));
 
@@ -627,6 +718,7 @@ mod tests {
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let err = binding
             .observe_execution(&RuntimeHandle(serde_json::json!({})))
@@ -659,6 +751,7 @@ mod tests {
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let err = binding
             .interrupt_execution(&RuntimeHandle(serde_json::json!({})))
@@ -688,6 +781,7 @@ mod tests {
             fake.clone(),
             AdapterDeadlinePolicy::uniform(Duration::from_secs(5)).unwrap(),
             AdapterSafetyEnvelope::unenforceable(),
+            Some("test-proto".into()),
         );
         let err = binding
             .terminate_execution(&RuntimeHandle(serde_json::json!({})))

@@ -50,6 +50,89 @@ pub(crate) enum PinOutcome {
     Mismatch,
 }
 
+/// A Windows instance proven from one open process handle.
+///
+/// `birth` and the optional restricting-SID witness were both read through the
+/// same `PROCESS` handle that stays open here. Control acts on that handle, so a
+/// PID recycle cannot separate the proof from the operation. This is the only
+/// way a birthless locator becomes control authority on Windows.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct ProvenInstance {
+    pinned: PinnedInstance,
+    birth: u64,
+}
+
+#[cfg(windows)]
+impl ProvenInstance {
+    pub(crate) fn birth(&self) -> u64 {
+        self.birth
+    }
+
+    pub(crate) fn is_alive(&self, deadline: &AdapterDeadline) -> AdapterResult<bool> {
+        self.pinned.is_alive(deadline)
+    }
+
+    pub(crate) fn interrupt(&self, deadline: &AdapterDeadline) -> AdapterResult<()> {
+        self.pinned.interrupt(deadline)
+    }
+
+    pub(crate) fn kill(&self, deadline: &AdapterDeadline) -> AdapterResult<()> {
+        self.pinned.kill(deadline)
+    }
+
+    pub(crate) fn wait_exit(&self, deadline: &AdapterDeadline) -> AdapterResult<bool> {
+        self.pinned.wait_exit(deadline)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum ProvenOutcome {
+    Proven(ProvenInstance),
+    /// The PID does not exist: the identified instance has ended.
+    Gone,
+    /// A process exists at this PID but it is not this instance.
+    Mismatch,
+}
+
+/// Test-only observation of the proof sequence.
+///
+/// The birth read and the restricting-SID witness must be performed through the
+/// same retained `PROCESS` handle. Recording the raw handle each step uses turns
+/// that invariant into a deterministic assertion: any future edit that reopens
+/// the PID between the two checks (the PID-recycle window this fix closes) makes
+/// the two values differ and fails the test, without needing to win a timing
+/// race against the OS.
+#[cfg(all(windows, test))]
+pub(crate) mod proof_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static BIRTH_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    static SID_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn reset() {
+        BIRTH_HANDLE.store(0, Ordering::SeqCst);
+        SID_HANDLE.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_birth(handle: *mut core::ffi::c_void) {
+        BIRTH_HANDLE.store(handle as usize, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_sid(handle: *mut core::ffi::c_void) {
+        SID_HANDLE.store(handle as usize, Ordering::SeqCst);
+    }
+
+    pub(crate) fn birth_handle() -> usize {
+        BIRTH_HANDLE.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sid_handle() -> usize {
+        SID_HANDLE.load(Ordering::SeqCst)
+    }
+}
+
 /// Result of classifying a Windows `OpenProcess` return + `GetLastError`.
 /// Compiled on Windows production and on every-OS tests.
 #[cfg(any(windows, test))]
@@ -453,13 +536,15 @@ fn pidfd_task_exited(pidfd: i32, timeout: Duration) -> AdapterResult<bool> {
     Ok((pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
 }
 
+/// Open the one process handle every Windows identity proof and control action
+/// must share. `None` is positive PID absence; access and unknown failures stay
+/// errors.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn pin_windows(
+fn open_windows_process(
     pid: u32,
-    expected_birth: u64,
     deadline: &AdapterDeadline,
-) -> AdapterResult<PinOutcome> {
+) -> AdapterResult<Option<*mut core::ffi::c_void>> {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -477,16 +562,84 @@ fn pin_windows(
     if handle.is_null() {
         let last = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return match classify_open_process(true, last)? {
-            WindowsOpen::Gone => Ok(PinOutcome::Gone),
+            WindowsOpen::Gone => Ok(None),
             WindowsOpen::Present => unreachable!("null OpenProcess is not Present"),
         };
     }
+    Ok(Some(handle))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn pin_windows(
+    pid: u32,
+    expected_birth: u64,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<PinOutcome> {
+    let Some(handle) = open_windows_process(pid, deadline)? else {
+        return Ok(PinOutcome::Gone);
+    };
     let pinned = PinnedInstance { pid, handle };
     let birth = windows_creation(handle)?;
     if birth != expected_birth {
         return Ok(PinOutcome::Mismatch);
     }
     Ok(PinOutcome::Pinned(pinned))
+}
+
+/// Prove a Windows instance from one retained process handle.
+///
+/// A birthless durable locator has no creation-time identity of its own. This
+/// function opens the PID once, reads that handle's creation time, and (when
+/// requested) proves the per-Execution restricting SID from a token opened
+/// through the *same* handle. The returned [`ProvenInstance`] retains the handle
+/// so the caller's control act cannot race a PID recycle between the SID check
+/// and the birth query.
+///
+/// `expected_birth == None` is the birthless-locator case; the handle's own
+/// creation time becomes the resolved birth. `expected_sid == None` is the
+/// ordinary born-locator case, where birth alone is the M5 identity witness.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn prove_windows_instance(
+    pid: u32,
+    expected_birth: Option<u64>,
+    expected_sid: Option<&str>,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<ProvenOutcome> {
+    require_deadline(
+        deadline,
+        "deadline exhausted before proving process identity",
+        None,
+    )?;
+    let Some(handle) = open_windows_process(pid, deadline)? else {
+        return Ok(ProvenOutcome::Gone);
+    };
+    let pinned = PinnedInstance { pid, handle };
+    let birth = windows_creation(handle)?;
+    #[cfg(test)]
+    proof_probe::record_birth(handle);
+    if let Some(expected) = expected_birth {
+        if birth != expected {
+            return Ok(ProvenOutcome::Mismatch);
+        }
+    }
+    if let Some(sid) = expected_sid {
+        require_deadline(
+            deadline,
+            "deadline exhausted after reading process birth",
+            None,
+        )?;
+        if !super::jail::restricted_sid_present_on_process(handle, sid)? {
+            return Ok(ProvenOutcome::Mismatch);
+        }
+    }
+    require_deadline(
+        deadline,
+        "deadline exhausted after proving process identity",
+        None,
+    )?;
+    Ok(ProvenOutcome::Proven(ProvenInstance { pinned, birth }))
 }
 
 #[cfg(windows)]
@@ -670,6 +823,40 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The PID-recycle window this fix closes is between the birth read and the
+    /// restricting-SID witness. Both must use the one handle opened for this
+    /// proof; reopening the PID for either phase is precisely the race.
+    ///
+    /// This is deterministic: the probe records the handle each phase used, so
+    /// a regression that re-resolves the PID fails on value inequality instead
+    /// of requiring a real recycle to occur at the wrong microsecond.
+    #[cfg(windows)]
+    #[test]
+    fn sid_and_birth_proof_come_from_the_same_open_handle() {
+        proof_probe::reset();
+        let long = AdapterDeadline::after(Duration::from_secs(5)).unwrap();
+        // The test process itself is a live PID with no per-Execution
+        // restricting SID, so the proof must reject it as `Mismatch`.
+        let outcome = prove_windows_instance(
+            std::process::id(),
+            None,
+            Some("S-1-5-21-111-222-333-444"),
+            &long,
+        )
+        .expect("a non-restricted token is a negative witness, not an error");
+        assert!(matches!(outcome, ProvenOutcome::Mismatch));
+
+        let birth_handle = proof_probe::birth_handle();
+        let sid_handle = proof_probe::sid_handle();
+        assert_ne!(birth_handle, 0, "the birth phase must have used a handle");
+        assert_ne!(sid_handle, 0, "the SID phase must have used a handle");
+        assert_eq!(
+            birth_handle, sid_handle,
+            "birth and SID witness must be read through the same retained handle; \
+             reopening the PID between them is the recycle race"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -34,3 +34,10 @@ agentype-runtime = { workspace = true, features = ["test-support"] }
 # unification with the runtime crate.
 agentype-storage-sqlite = { workspace = true, features = ["runtime-internal"] }
 agentype-execution-config = { workspace = true, features = ["test-support"] }
+agentype-agent-contract.workspace = true
+# The typed E2E test composes the *real* source integration with the *real*
+# daemon. This dev-dependency cycle (source -> adapter -> source) is legal
+# because one edge is dev-only, and it is what lets the test exercise the
+# production grammar instead of a test copy of it.
+agentype-source-workspace-jail.workspace = true
+rusqlite.workspace = true

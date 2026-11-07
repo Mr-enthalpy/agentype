@@ -255,6 +255,17 @@ impl FrozenExecutionSafety {
     }
 }
 
+/// Provider-neutral effective network policy carried to the physical execution
+/// request. Neutral M5 vocabulary: it MUST NOT be interpreted as a vendor enum.
+/// Defined in this crate so the ExecutionLaunchSnapshot and the adapter request
+/// share one type without adapter-api depending on agent-contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetworkEnforcement {
+    Disabled,
+    Restricted,
+    Enabled,
+}
+
 /// Opaque, provider-neutral identity of one concrete execution domain
 /// (host/boot/pid-namespace/installation). Core MUST NOT interpret it.
 /// `adapter_kind` is the driver family; this key is the installed instance.
@@ -450,25 +461,11 @@ pub fn resolve_execution_environment(
     let profile_name = binding.execution_profile.as_str();
     match mode {
         ExecutionResolutionMode::Authoritative(reg) => {
-            let target = reg
-                .get_target(target_name)
-                .ok_or_else(|| ResolutionError::TargetNotFound(target_name.to_string()))?;
-            let profile = reg
-                .get_profile(profile_name)
-                .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?;
-
-            if let Some(allowed) = &profile.allowed_targets {
-                if !allowed.contains(target_name) {
-                    return Err(ResolutionError::Incompatible(format!(
-                        "profile '{profile_name}' is not compatible with target '{target_name}'"
-                    )));
-                }
-            }
-
+            let (target, profile) = resolve_target_profile(reg, target_name, profile_name)?;
             let attempt_isolation = target.attempt_isolation;
             Ok(ResolvedExecutionEnvironment::new(
-                target.clone(),
-                profile.clone(),
+                target,
+                profile,
                 attempt_isolation,
                 binding.clone(),
             ))
@@ -480,6 +477,60 @@ pub fn resolve_execution_environment(
             binding.clone(),
         )),
     }
+}
+
+/// Pure target/profile validation against the authoritative registry.
+///
+/// Missing target/profile, or a profile whose `allowed_targets` excludes the
+/// target, is an authoritative configuration failure (`RESOURCE_UNAVAILABLE` in
+/// M5 terms). Unlike [`resolve_execution_environment`] this needs no Attempt
+/// identity, so a caller can reject a purely static misconfiguration BEFORE it
+/// commits authority or performs any physical work (used by the M6-B.4 typed
+/// acquisition, whose pure preparation and authority commitment must not begin
+/// against an environment the M5 composition would reject).
+pub fn resolve_target_profile(
+    registry: &ExecutionRegistry,
+    target_name: &str,
+    profile_name: &str,
+) -> Result<(ExecutionTargetConfig, ExecutionProfileConfig), ResolutionError> {
+    let target = registry
+        .get_target(target_name)
+        .ok_or_else(|| ResolutionError::TargetNotFound(target_name.to_string()))?
+        .clone();
+    let profile = registry
+        .get_profile(profile_name)
+        .ok_or_else(|| ResolutionError::ProfileNotFound(profile_name.to_string()))?
+        .clone();
+    if let Some(allowed) = &profile.allowed_targets {
+        if !allowed.contains(target_name) {
+            return Err(ResolutionError::Incompatible(format!(
+                "profile '{profile_name}' is not compatible with target '{target_name}'"
+            )));
+        }
+    }
+    Ok((target, profile))
+}
+
+/// Check both sides of the M4 isolation contract before granting authority:
+/// semantic requirements must fit the configured target, and every isolation
+/// guarantee configured on that target must be enforceable by the exact adapter.
+/// Imported capability alone never changes the effective target policy.
+pub fn validate_attempt_isolation(
+    target_isolation: bool,
+    contract_requires_isolation: bool,
+    adapter_enforces_isolation: bool,
+) -> Result<(), ResolutionError> {
+    if contract_requires_isolation && !target_isolation {
+        return Err(ResolutionError::Incompatible(
+            "execution target cannot satisfy the required attempt isolation".into(),
+        ));
+    }
+    if target_isolation && !adapter_enforces_isolation {
+        return Err(ResolutionError::Incompatible(
+            "adapter cannot enforce the execution target's attempt isolation".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Authoritative launch snapshot reconstructed from durable Scheduler state.
@@ -511,12 +562,15 @@ pub struct ExecutionLaunchSnapshot {
     execution_target: String,
     execution_profile: String,
     workspace_mode: WorkspaceMode,
+    required_network: NetworkEnforcement,
     task_name: String,
     payload: Value,
     acceptance: Value,
     workstream_id: Option<WorkstreamId>,
     continuity: CommittedContinuitySnapshot,
     safety: FrozenExecutionSafety,
+    /// None for legacy; Some for an immutable typed BindingSnapshot descriptor.
+    committed_launch_descriptor: Option<String>,
 }
 
 impl ExecutionLaunchSnapshot {
@@ -529,6 +583,8 @@ impl ExecutionLaunchSnapshot {
     /// which has atomically validated the Attempt, Lease, Task, Agent, and
     /// Incarnation records from durable storage, so that every field reflects
     /// durable authority.
+    /// `committed_launch_descriptor` MUST equal the validated BindingSnapshot's
+    /// nonblank descriptor for a typed Execution and MUST be None for legacy.
     ///
     /// This `unsafe` marker is a **procedural contract, not an access-control
     /// mechanism**: Rust memory safety does not enforce the kernel-only
@@ -553,12 +609,14 @@ impl ExecutionLaunchSnapshot {
         execution_target: String,
         execution_profile: String,
         workspace_mode: WorkspaceMode,
+        required_network: NetworkEnforcement,
         task_name: String,
         payload: Value,
         acceptance: Value,
         workstream_id: Option<WorkstreamId>,
         continuity: CommittedContinuitySnapshot,
         safety: FrozenExecutionSafety,
+        committed_launch_descriptor: Option<String>,
     ) -> Self {
         Self {
             execution_id,
@@ -576,17 +634,25 @@ impl ExecutionLaunchSnapshot {
             execution_target,
             execution_profile,
             workspace_mode,
+            required_network,
             task_name,
             payload,
             acceptance,
             workstream_id,
             continuity,
             safety,
+            committed_launch_descriptor,
         }
     }
 
     pub fn execution_id(&self) -> &ExecutionId {
         &self.execution_id
+    }
+
+    /// Exact opaque descriptor frozen in the same transaction as this Execution.
+    /// The trusted constructor must supply None only for legacy Executions.
+    pub fn committed_launch_descriptor(&self) -> Option<&str> {
+        self.committed_launch_descriptor.as_deref()
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -643,6 +709,12 @@ impl ExecutionLaunchSnapshot {
 
     pub fn workspace_mode(&self) -> WorkspaceMode {
         self.workspace_mode
+    }
+
+    /// The effective (stricter) network policy the Task requires, carried to the
+    /// physical execution request so no layer widens it.
+    pub fn required_network(&self) -> NetworkEnforcement {
+        self.required_network
     }
 
     /// Durable human-readable Task label. Never send this to a worker as the

@@ -19,7 +19,8 @@ use agentype_core::{ExecutionState, RequestId};
 use agentype_execution_config::AdapterBindingKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +28,12 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod jail;
 mod pin;
+
+pub use jail::{
+    JailLaunchDescriptor, JailedProcessAgentAdapter, JAIL_ADAPTER_KIND, JAIL_PROVISIONING_PROTOCOL,
+};
 
 /// Hidden helper for the Linux pidfd PID-recycle regression binary.
 #[cfg(target_os = "linux")]
@@ -84,6 +90,101 @@ impl LocalProcessAgentAdapter {
     pub fn binding_key(&self) -> &AdapterBindingKey {
         &self.binding_key
     }
+
+    fn presence_for(
+        &self,
+        parsed: &ParsedHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<InstancePresence> {
+        let mut live = self.live.lock().expect("live map");
+        if let Some(proc) = live.get_mut(&parsed.pid) {
+            if proc.birth != parsed.birth || proc.inst != parsed.inst {
+                drop(live);
+                instance_presence(
+                    parsed.pid,
+                    parsed.birth,
+                    &parsed.inst,
+                    &parsed.stdout_path,
+                    deadline,
+                )
+            } else {
+                match proc.child.try_wait() {
+                    Ok(Some(_)) => {
+                        live.remove(&parsed.pid);
+                        Ok(InstancePresence::Ended)
+                    }
+                    Ok(None) => Ok(InstancePresence::Running),
+                    Err(_) => Err(AdapterError::other("reconcile wait failed")),
+                }
+            }
+        } else {
+            drop(live);
+            instance_presence(
+                parsed.pid,
+                parsed.birth,
+                &parsed.inst,
+                &parsed.stdout_path,
+                deadline,
+            )
+        }
+    }
+
+    fn control_parsed(
+        &self,
+        handle: &RuntimeHandle,
+        deadline: &AdapterDeadline,
+    ) -> AdapterResult<ControlResolution> {
+        match parse_control_handle(handle, ADAPTER_KIND)? {
+            PhysicalControlHandle::Pinned(parsed) => Ok(ControlResolution {
+                stdout_path: parsed.stdout_path.clone(),
+                stderr_path: parsed.stderr_path.clone(),
+                parsed: Some(parsed),
+                unproven: false,
+                #[cfg(windows)]
+                proven: None,
+            }),
+            PhysicalControlHandle::Locator(locator) => {
+                let stdout_path = locator.stdout_path.clone();
+                let stderr_path = locator.stderr_path.clone();
+                // This adapter has no per-Execution OS witness. On Windows a
+                // locator without a recorded birth therefore has only a numeric
+                // PID, and a PID is never an identity proof. Keep it Unknown
+                // instead of upgrading it to control authority.
+                #[cfg(windows)]
+                if locator.birth.is_none() {
+                    return Ok(ControlResolution {
+                        parsed: None,
+                        stdout_path,
+                        stderr_path,
+                        unproven: true,
+                        proven: None,
+                    });
+                }
+                Ok(ControlResolution {
+                    parsed: resolve_locator_to_parsed(locator, deadline)?,
+                    stdout_path,
+                    stderr_path,
+                    unproven: false,
+                    #[cfg(windows)]
+                    proven: None,
+                })
+            }
+        }
+    }
+}
+
+pub(crate) struct ControlResolution {
+    pub(crate) parsed: Option<ParsedHandle>,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
+    /// The locator's live identity could not be proven. `parsed` is `None` and
+    /// no interrupt, terminate or collect authority may be derived from it.
+    pub(crate) unproven: bool,
+    /// Windows birthless-locator proof: the same open process handle that
+    /// produced the birth and the restricting-SID witness. Keeping it alive
+    /// closes the proof-to-control TOCTOU window.
+    #[cfg(windows)]
+    pub(crate) proven: Option<pin::ProvenInstance>,
 }
 
 impl ImportableAdapter for LocalProcessAgentAdapter {
@@ -98,6 +199,20 @@ impl ImportableAdapter for LocalProcessAgentAdapter {
     fn import_attempt_isolation(&self) -> bool {
         false
     }
+
+    fn import_provisioning_protocol(&self) -> Option<&str> {
+        // This adapter launches a plain OS process from `target_options`; it does
+        // NOT consume a typed provisioning descriptor, so it is not
+        // provisioning-capable. It MUST NOT claim a descriptor grammar it ignores.
+        None
+    }
+
+    // This adapter does not sandbox: `start_execution` launches a plain OS
+    // process and does not confine the filesystem or network. It therefore
+    // declares NO enforceable workspace mode or network policy (the conservative
+    // `ImportableAdapter` default), rather than claiming an enforcement it does
+    // not provide. A typed Task requiring any workspace/network mode is
+    // ineligible for this source until a real sandboxed adapter exists.
 }
 
 fn capture_domain_key() -> AdapterResult<AdapterBindingKey> {
@@ -106,6 +221,7 @@ fn capture_domain_key() -> AdapterResult<AdapterBindingKey> {
 }
 
 fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
+    let locator_root = locator_root();
     #[cfg(target_os = "linux")]
     {
         let boot = read_trimmed("/proc/sys/kernel/random/boot_id")
@@ -119,6 +235,7 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
             &mnt_ns,
             &root_dev.to_string(),
             &root_ino.to_string(),
+            &locator_root,
         )
     }
     #[cfg(windows)]
@@ -130,8 +247,7 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
             .ok_or_else(|| AdapterError::unavailable("windows COMPUTERNAME unavailable"))?;
         let boot = windows_boot_identifier()
             .ok_or_else(|| AdapterError::unavailable("windows boot identifier unavailable"))?;
-        AdapterBindingKey::new(format!("win:{host}:{boot}"))
-            .map_err(|_| AdapterError::unavailable("windows domain key invalid"))
+        windows_domain_key(&host, &boot, &locator_root)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -141,6 +257,24 @@ fn compute_domain_key() -> AdapterResult<AdapterBindingKey> {
     }
 }
 
+/// The directory that holds durable locator records.
+///
+/// It is resolved exactly once per process. Every execution directory and the
+/// adapter binding key are derived from this same value, so a later `TMPDIR`
+/// or `TEMP` change cannot redirect this adapter to a different locator tree
+/// while the domain key still claims the old physical identity. A restarted
+/// adapter with a different configured temporary directory therefore computes
+/// a different binding key and is treated as a different physical domain
+/// instead of silently losing recovery evidence.
+pub(crate) fn locator_root() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let configured = std::env::temp_dir();
+        fs::canonicalize(&configured).unwrap_or(configured)
+    })
+    .clone()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn linux_domain_key(
     boot: &str,
@@ -148,6 +282,7 @@ fn linux_domain_key(
     mnt_ns: &str,
     root_dev: &str,
     root_ino: &str,
+    locator_root: &Path,
 ) -> AdapterResult<AdapterBindingKey> {
     let parts = [boot, pid_ns, mnt_ns, root_dev, root_ino];
     if parts.iter().any(|p| p.trim().is_empty()) {
@@ -160,10 +295,37 @@ fn linux_domain_key(
             "linux domain identity cannot use unknown placeholders",
         ));
     }
+    let locator_root = locator_root.to_string_lossy();
+    if locator_root.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "linux locator root cannot be empty",
+        ));
+    }
     AdapterBindingKey::new(format!(
-        "linux:{boot}:{pid_ns}:{mnt_ns}:{root_dev}:{root_ino}"
+        "linux:{boot}:{pid_ns}:{mnt_ns}:{root_dev}:{root_ino}:locroot={locator_root}"
     ))
     .map_err(|_| AdapterError::unavailable("linux domain key invalid"))
+}
+
+#[cfg(windows)]
+fn windows_domain_key(
+    host: &str,
+    boot: &str,
+    locator_root: &Path,
+) -> AdapterResult<AdapterBindingKey> {
+    if host.trim().is_empty() || boot.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "windows domain identity components cannot be empty",
+        ));
+    }
+    let locator_root = locator_root.to_string_lossy();
+    if locator_root.trim().is_empty() {
+        return Err(AdapterError::unavailable(
+            "windows locator root cannot be empty",
+        ));
+    }
+    AdapterBindingKey::new(format!("win:{host}:{boot}:locroot={locator_root}"))
+        .map_err(|_| AdapterError::unavailable("windows domain key invalid"))
 }
 
 #[cfg(target_os = "linux")]
@@ -270,13 +432,13 @@ struct ProcessSpec {
 }
 
 #[derive(Debug)]
-struct ParsedHandle {
-    pid: u32,
-    birth: u64,
-    inst: String,
-    request_id: String,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+pub(crate) struct ParsedHandle {
+    pub(crate) pid: u32,
+    pub(crate) birth: u64,
+    pub(crate) inst: String,
+    pub(crate) request_id: String,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
 }
 
 fn spec_from_options(options: &Value) -> AdapterResult<ProcessSpec> {
@@ -344,9 +506,13 @@ fn spec_from_options(options: &Value) -> AdapterResult<ProcessSpec> {
 }
 
 fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
+    encode_handle_with_kind(parsed, ADAPTER_KIND)
+}
+
+pub(crate) fn encode_handle_with_kind(parsed: &ParsedHandle, kind: &str) -> RuntimeHandle {
     RuntimeHandle(json!({
         "v": HANDLE_VERSION,
-        "kind": ADAPTER_KIND,
+        "kind": kind,
         "pid": parsed.pid,
         "birth": parsed.birth,
         "inst": parsed.inst,
@@ -357,16 +523,36 @@ fn encode_handle(parsed: &ParsedHandle) -> RuntimeHandle {
 }
 
 /// Locator evidence after spawn, before birth is known. Not pin authority.
-fn encode_locator_hint(
+///
+/// A locator is deliberately marked `identity_complete=false` and
+/// `reconnectable=false`: it is not a stable process pin and must never be
+/// treated as one. It exists so a recovery path can find the physical process
+/// after a crash that happened between `spawn(2)` and the first successful
+/// birth/instance-token observation.
+#[cfg(test)]
+pub(crate) fn encode_locator_hint(
     pid: u32,
+    birth: Option<u64>,
     inst: &str,
     request_id: &str,
     stdout: &Path,
     stderr: &Path,
 ) -> RuntimeHandle {
-    RuntimeHandle(json!({
+    encode_locator_hint_with_kind(ADAPTER_KIND, pid, birth, inst, request_id, stdout, stderr)
+}
+
+pub(crate) fn encode_locator_hint_with_kind(
+    kind: &str,
+    pid: u32,
+    birth: Option<u64>,
+    inst: &str,
+    request_id: &str,
+    stdout: &Path,
+    stderr: &Path,
+) -> RuntimeHandle {
+    let mut value = json!({
         "v": HANDLE_VERSION,
-        "kind": ADAPTER_KIND,
+        "kind": kind,
         "pid": pid,
         "inst": inst,
         "request_id": request_id,
@@ -374,24 +560,292 @@ fn encode_locator_hint(
         "stderr": stderr.to_string_lossy(),
         "identity_complete": false,
         "reconnectable": false,
-    }))
+    });
+    if let Some(birth) = birth {
+        value["birth"] = json!(birth);
+    }
+    RuntimeHandle(value)
 }
 
-fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
+/// Durable, non-impersonating locator evidence for one physically created
+/// process. It is persisted next to the execution's stdout/stderr before the
+/// birth identity probe so a crash in the `spawn -> identity` window is still
+/// recoverable by RequestId.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocatorHandle {
+    pub(crate) pid: u32,
+    pub(crate) birth: Option<u64>,
+    pub(crate) inst: String,
+    pub(crate) request_id: String,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
+    /// Wall-clock lower bound recorded immediately before `spawn(2)`.
+    pub(crate) spawn_after_ms: Option<u64>,
+}
+
+impl LocatorHandle {
+    pub(crate) fn to_runtime_handle(&self, kind: &str) -> RuntimeHandle {
+        encode_locator_hint_with_kind(
+            kind,
+            self.pid,
+            self.birth,
+            &self.inst,
+            &self.request_id,
+            &self.stdout_path,
+            &self.stderr_path,
+        )
+    }
+
+    pub(crate) fn into_parsed(self, birth: u64) -> ParsedHandle {
+        ParsedHandle {
+            pid: self.pid,
+            birth,
+            inst: self.inst,
+            request_id: self.request_id,
+            stdout_path: self.stdout_path,
+            stderr_path: self.stderr_path,
+        }
+    }
+}
+
+pub(crate) fn locator_record_path(exec_dir: &Path) -> PathBuf {
+    exec_dir.join("locator.json")
+}
+
+pub(crate) fn legacy_exec_dir(request_id: &str) -> PathBuf {
+    locator_root().join(format!("agentype-exec-{request_id}"))
+}
+
+pub(crate) fn jail_exec_dir(request_id: &str) -> PathBuf {
+    locator_root().join(format!("agentype-jail-exec-{request_id}"))
+}
+
+/// Persist locator evidence before the identity probe.
+///
+/// The record is written to a unique temporary file in the execution
+/// directory, flushed, and atomically renamed over `locator.json`. A crash
+/// during an overwrite therefore leaves either the previous complete record or
+/// the new complete record, never a truncated one. Callers must treat a
+/// failure as a real unknown-state boundary: the process already exists, so
+/// the error carries the in-memory locator for the daemon's handle-hint
+/// channel; it must not be reported as a clean start.
+pub(crate) fn write_locator_record(
+    exec_dir: &Path,
+    kind: &str,
+    locator: &LocatorHandle,
+) -> AdapterResult<()> {
+    let path = locator_record_path(exec_dir);
+    let mut value = json!({
+        "v": HANDLE_VERSION,
+        "kind": kind,
+        "pid": locator.pid,
+        "inst": locator.inst,
+        "request_id": locator.request_id,
+        "stdout": locator.stdout_path.to_string_lossy(),
+        "stderr": locator.stderr_path.to_string_lossy(),
+        "identity_complete": false,
+        "reconnectable": false,
+    });
+    if let Some(birth) = locator.birth {
+        value["birth"] = json!(birth);
+    }
+    if let Some(spawn_after_ms) = locator.spawn_after_ms {
+        value["spawn_after_ms"] = json!(spawn_after_ms);
+    }
+    write_locator_atomically(&path, value.to_string().as_bytes())
+        .map_err(|_| AdapterError::unavailable("cannot persist process locator record"))
+}
+
+fn write_locator_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "locator path has no parent directory",
+        )
+    })?;
+    let mut attempt = 0u32;
+    let temp = loop {
+        let candidate = parent.join(format!(".locator.{}.{}.tmp", std::process::id(), attempt));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                break candidate;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 32 => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    // `std::fs::rename` replaces the destination on Unix and on Windows
+    // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), so the canonical
+    // record is never truncated in place.
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        // Make the directory entry durable too; otherwise a crash after the
+        // rename may still leave the previous name on some filesystems.
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_locator_record(
+    exec_dir: &Path,
+    expected_kind: &str,
+    request_id: &RequestId,
+) -> Option<LocatorHandle> {
+    let raw = fs::read_to_string(locator_record_path(exec_dir)).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let handle = RuntimeHandle(value);
+    let locator = parse_locator_with_kind(&handle, expected_kind).ok()?;
+    (locator.request_id == request_id.as_str()).then_some(locator)
+}
+
+/// Parse a non-pin locator handle. This deliberately rejects a handle that
+/// claims to be a complete pin: callers must use `parse_handle_with_kind` for
+/// control authority and only use this for recovery evidence.
+pub(crate) fn parse_locator_with_kind(
+    handle: &RuntimeHandle,
+    expected_kind: &str,
+) -> AdapterResult<LocatorHandle> {
     let obj = handle
         .0
         .as_object()
-        .ok_or_else(|| AdapterError::protocol("local_process handle must be a JSON object"))?;
+        .ok_or_else(|| AdapterError::protocol("process locator must be a JSON object"))?;
     let v = obj.get("v").and_then(Value::as_i64).unwrap_or(0);
     if v != HANDLE_VERSION {
         return Err(AdapterError::protocol(
-            "unsupported local_process handle version",
+            "unsupported process locator version",
         ));
     }
     let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
-    if kind != ADAPTER_KIND {
+    if kind != expected_kind {
         return Err(AdapterError::protocol(
-            "handle kind is not local_process; no adapter fallback",
+            "locator kind does not match the exact adapter; no adapter fallback",
+        ));
+    }
+    if obj.get("identity_complete").and_then(Value::as_bool) != Some(false)
+        || obj.get("reconnectable").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(AdapterError::protocol(
+            "handle is not a non-authoritative locator",
+        ));
+    }
+    let pid = obj
+        .get("pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AdapterError::protocol("locator.pid missing"))?;
+    let pid = u32::try_from(pid).map_err(|_| AdapterError::protocol("locator.pid out of range"))?;
+    let birth = match obj.get("birth") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| AdapterError::protocol("locator.birth must be an integer"))?,
+        ),
+    };
+    let inst = obj
+        .get("inst")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AdapterError::protocol("locator.inst missing"))?
+        .to_string();
+    let request_id = obj
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AdapterError::protocol("locator.request_id missing"))?
+        .to_string();
+    let stdout = obj
+        .get("stdout")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::protocol("locator.stdout missing"))?;
+    let stderr = obj
+        .get("stderr")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::protocol("locator.stderr missing"))?;
+    let spawn_after_ms = obj.get("spawn_after_ms").and_then(Value::as_u64);
+    Ok(LocatorHandle {
+        pid,
+        birth,
+        inst,
+        request_id,
+        stdout_path: PathBuf::from(stdout),
+        stderr_path: PathBuf::from(stderr),
+        spawn_after_ms,
+    })
+}
+
+/// Resolve a locator to a full `ParsedHandle` by querying the live process
+/// birth identity. `Ok(None)` means the process is gone (the locator is still
+/// valid evidence that a process was created).
+pub(crate) fn resolve_locator_to_parsed(
+    locator: LocatorHandle,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<Option<ParsedHandle>> {
+    let birth = match locator.birth {
+        Some(birth) => Some(birth),
+        None => process_birth_by_pid(locator.pid, deadline)?,
+    };
+    Ok(birth.map(|birth| locator.into_parsed(birth)))
+}
+
+pub(crate) enum PhysicalControlHandle {
+    Pinned(ParsedHandle),
+    Locator(LocatorHandle),
+}
+
+/// Accept either a complete pin or a non-pin locator for control/recovery.
+/// Locators are resolved to a pin only when the live birth identity can be
+/// observed; they are never silently upgraded without that observation.
+pub(crate) fn parse_control_handle(
+    handle: &RuntimeHandle,
+    expected_kind: &str,
+) -> AdapterResult<PhysicalControlHandle> {
+    match parse_handle_with_kind(handle, expected_kind) {
+        Ok(parsed) => Ok(PhysicalControlHandle::Pinned(parsed)),
+        Err(pinned_err) => match parse_locator_with_kind(handle, expected_kind) {
+            Ok(locator) => Ok(PhysicalControlHandle::Locator(locator)),
+            Err(_) => Err(pinned_err),
+        },
+    }
+}
+
+#[cfg(test)]
+fn parse_handle(handle: &RuntimeHandle) -> AdapterResult<ParsedHandle> {
+    parse_handle_with_kind(handle, ADAPTER_KIND)
+}
+
+pub(crate) fn parse_handle_with_kind(
+    handle: &RuntimeHandle,
+    expected_kind: &str,
+) -> AdapterResult<ParsedHandle> {
+    let obj = handle
+        .0
+        .as_object()
+        .ok_or_else(|| AdapterError::protocol("process handle must be a JSON object"))?;
+    let v = obj.get("v").and_then(Value::as_i64).unwrap_or(0);
+    if v != HANDLE_VERSION {
+        return Err(AdapterError::protocol("unsupported process handle version"));
+    }
+    let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
+    if kind != expected_kind {
+        return Err(AdapterError::protocol(
+            "handle kind does not match the exact adapter; no adapter fallback",
         ));
     }
     if obj.get("identity_complete").and_then(Value::as_bool) == Some(false)
@@ -702,6 +1156,28 @@ pub(crate) fn process_birth(pid: u32, deadline: &AdapterDeadline) -> AdapterResu
         .ok_or_else(|| AdapterError::unavailable("cannot read process birth identity"))
 }
 
+/// Production birth query for a numeric PID. Used only by the durable locator
+/// recovery path, never as ordinary control authority: a locator is not a pin
+/// until this observation succeeds.
+pub(crate) fn process_birth_by_pid(
+    pid: u32,
+    deadline: &AdapterDeadline,
+) -> AdapterResult<Option<u64>> {
+    require_deadline(
+        deadline,
+        "deadline exhausted before process birth probe",
+        None,
+    )?;
+    #[cfg(windows)]
+    {
+        process_birth_windows(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        process_stat(pid, deadline).map(|stat| stat.map(|(_, birth)| birth))
+    }
+}
+
 fn instance_token() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
@@ -711,6 +1187,13 @@ fn instance_token() -> String {
         .unwrap_or(0);
     let pid = std::process::id() as u128;
     format!("{seq:016x}{t:016x}{pid:08x}")
+}
+
+pub(crate) fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn process_birth_from_child(child: &Child, deadline: &AdapterDeadline) -> AdapterResult<u64> {
@@ -772,7 +1255,7 @@ fn process_stat(pid: u32, deadline: &AdapterDeadline) -> AdapterResult<Option<(c
     }
 }
 
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn process_birth_windows(pid: u32) -> AdapterResult<Option<u64>> {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -1005,8 +1488,7 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         require_deadline(deadline, "start deadline already expired", None)?;
         let mut spec = spec_from_options(request.target_options())?;
         require_deadline(deadline, "start deadline exhausted before spawn", None)?;
-        let exec_dir =
-            std::env::temp_dir().join(format!("agentype-exec-{}", request.request_id().as_str()));
+        let exec_dir = legacy_exec_dir(request.request_id().as_str());
         fs::create_dir_all(&exec_dir).map_err(|_| diagnostic("cannot create execution dir"))?;
         let stdout_path = exec_dir.join("stdout.txt");
         let stderr_path = exec_dir.join("stderr.txt");
@@ -1014,15 +1496,28 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         let token = instance_token();
         spec.env.retain(|(k, _)| k != INSTANCE_ENV);
         spec.env.push((INSTANCE_ENV.to_string(), token.clone()));
+        let spawn_after_ms = unix_ms();
         let mut child = spawn_child(&spec, &stdout_path, &stderr_path, deadline)?;
         let pid = child.id();
-        let hint = encode_locator_hint(
+        let locator_before_identity = LocatorHandle {
             pid,
-            &token,
-            request.request_id().as_str(),
-            &stdout_path,
-            &stderr_path,
-        );
+            birth: None,
+            inst: token.clone(),
+            request_id: request.request_id().as_str().to_string(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            spawn_after_ms: Some(spawn_after_ms),
+        };
+        // Durable evidence exists before the identity probe. If the daemon is
+        // killed in the spawn -> identity window, RequestId recovery can still
+        // find the physical process (or prove it is gone). A failure here is
+        // not a clean start: the process exists, so the locator must travel
+        // through the handle-hint channel and the runtime must record unknown
+        // physical state.
+        let hint = locator_before_identity.to_runtime_handle(ADAPTER_KIND);
+        if let Err(err) = write_locator_record(&exec_dir, ADAPTER_KIND, &locator_before_identity) {
+            return Err(err.with_handle_hint(hint));
+        }
         if let Err(err) = require_deadline(
             deadline,
             "start deadline exhausted after spawn",
@@ -1049,6 +1544,25 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
             stderr_path: stderr_path.clone(),
         };
         let handle = encode_handle(&parsed);
+        if let Err(err) = write_locator_record(
+            &exec_dir,
+            ADAPTER_KIND,
+            &LocatorHandle {
+                pid,
+                birth: Some(birth),
+                inst: parsed.inst.clone(),
+                request_id: parsed.request_id.clone(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+                spawn_after_ms: Some(spawn_after_ms),
+            },
+        ) {
+            // The pre-birth locator is still intact (atomic replacement), so
+            // recovery is not lost; but the upgrade failure is not silently
+            // ignored. Returning the exact pin keeps the process controllable
+            // while the runtime records an unresolved start.
+            return Err(err.with_handle_hint(handle));
+        }
         require_deadline(
             deadline,
             "start deadline exhausted after spawn",
@@ -1120,7 +1634,27 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "observe deadline already expired", None)?;
-        let parsed = parse_handle(handle)?;
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // A Windows birthless locator has only a numeric PID, and this
+            // adapter has no OS-level witness to prove that PID is ours.
+            return qualify_ok(
+                deadline,
+                "observe deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
+            // A durable locator proves spawn succeeded; no live birth identity
+            // means the process is gone, not that the adapter may retry.
+            return qualify_ok(
+                deadline,
+                "observe deadline exhausted",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
         let mut live = self.live.lock().expect("live map");
         if let Some(proc) = live.get_mut(&parsed.pid) {
             if proc.birth != parsed.birth || proc.inst != parsed.inst {
@@ -1173,7 +1707,24 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "interrupt deadline already expired", None)?;
-        let parsed = parse_handle(handle)?;
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // No proven identity: never signal a PID that may be a stranger.
+            return qualify_ok(
+                deadline,
+                "interrupt deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
+            return qualify_ok(
+                deadline,
+                "interrupt deadline exhausted after locator resolution",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
         let trusted_live = {
             let live = self.live.lock().expect("live map");
             live.get(&parsed.pid)
@@ -1208,7 +1759,24 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<ExecutionObservation> {
         require_deadline(deadline, "terminate deadline already expired", None)?;
-        let parsed = parse_handle(handle)?;
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // No proven identity: never terminate a PID that may be a stranger.
+            return qualify_ok(
+                deadline,
+                "terminate deadline exhausted after locator proof",
+                Some(handle),
+                liveness_observation(InstancePresence::Absent),
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
+            return qualify_ok(
+                deadline,
+                "terminate deadline exhausted after locator resolution",
+                Some(handle),
+                liveness_observation(InstancePresence::Ended),
+            );
+        };
         let proc = {
             let mut live = self.live.lock().expect("live map");
             match live.remove(&parsed.pid) {
@@ -1305,7 +1873,44 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<PhysicalExecutionOutcome> {
         require_deadline(deadline, "collect deadline already expired", None)?;
-        let parsed = parse_handle(handle)?;
+        let resolution = self.control_parsed(handle, deadline)?;
+        if resolution.unproven {
+            // The PID belongs to some other process; the real instance's
+            // physical state is unknown. Never collect foreign evidence.
+            return qualify_ok(
+                deadline,
+                "collect deadline exhausted after locator proof",
+                Some(handle),
+                PhysicalExecutionOutcome {
+                    physical_state: agentype_adapter_api::PhysicalState::Unknown,
+                    exit_status: None,
+                    artifact_refs: None,
+                    diagnostic: Some(
+                        "durable locator identity could not be proven; physical outcome unknown"
+                            .into(),
+                    ),
+                },
+            );
+        }
+        let Some(parsed) = resolution.parsed else {
+            return qualify_ok(
+                deadline,
+                "collect deadline exhausted after locator resolution",
+                Some(handle),
+                PhysicalExecutionOutcome {
+                    physical_state: agentype_adapter_api::PhysicalState::Terminated,
+                    exit_status: None,
+                    artifact_refs: Some(json!({
+                        "stdout": resolution.stdout_path.to_string_lossy(),
+                        "stderr": resolution.stderr_path.to_string_lossy(),
+                    })),
+                    diagnostic: Some(
+                        "durable locator witness: spawned process is absent; not a blind retry"
+                            .into(),
+                    ),
+                },
+            );
+        };
         let proc = {
             let mut live = self.live.lock().expect("live map");
             match live.remove(&parsed.pid) {
@@ -1360,87 +1965,114 @@ impl ExecutionAdapter for LocalProcessAgentAdapter {
         deadline: &AdapterDeadline,
     ) -> AdapterResult<StartObservation> {
         require_deadline(deadline, "reconcile deadline already expired", None)?;
-        let Some(handle) = persisted_handle else {
-            return Ok(StartObservation {
-                state: ExecutionState::Unknown,
-                runtime_handle: RuntimeHandle::default(),
-                ambiguous: true,
-                detail: Some("no persisted handle; identity is request_id only".into()),
-                terminal_confirmed: false,
-                quiescent_confirmed: false,
-            });
-        };
-        let parsed = match parse_handle(handle) {
-            Ok(p) => p,
-            Err(err) => {
-                return Err(AdapterError::protocol(
-                    err.diagnostic().unwrap_or("invalid persisted handle"),
-                ));
-            }
-        };
-        if parsed.request_id != request_id.as_str() {
-            return Err(AdapterError::protocol(
-                "persisted handle request_id does not match reconcile identity",
-            ));
-        }
-        let presence = {
-            let mut live = self.live.lock().expect("live map");
-            if let Some(proc) = live.get_mut(&parsed.pid) {
-                if proc.birth != parsed.birth || proc.inst != parsed.inst {
-                    drop(live);
-                    instance_presence(
-                        parsed.pid,
-                        parsed.birth,
-                        &parsed.inst,
-                        &parsed.stdout_path,
-                        deadline,
-                    )?
-                } else {
-                    match proc.child.try_wait() {
-                        Ok(Some(_)) => {
-                            live.remove(&parsed.pid);
-                            InstancePresence::Ended
-                        }
-                        Ok(None) => InstancePresence::Running,
-                        Err(_) => {
-                            return Err(AdapterError::other("reconcile wait failed"));
-                        }
+        let control = match persisted_handle {
+            Some(handle) => parse_control_handle(handle, ADAPTER_KIND)?,
+            None => {
+                // Durable RequestId physical query: a daemon killed after
+                // spawn but before persisting a handle still leaves locator
+                // evidence beside the execution's stdout/stderr.
+                let exec_dir = legacy_exec_dir(request_id.as_str());
+                match read_locator_record(&exec_dir, ADAPTER_KIND, request_id) {
+                    Some(locator) => PhysicalControlHandle::Locator(locator),
+                    None => {
+                        return Ok(StartObservation {
+                            state: ExecutionState::Unknown,
+                            runtime_handle: RuntimeHandle::default(),
+                            ambiguous: true,
+                            detail: Some(
+                                "no persisted handle and no durable locator; identity is request_id only"
+                                    .into(),
+                            ),
+                            terminal_confirmed: false,
+                            quiescent_confirmed: false,
+                        });
                     }
                 }
-            } else {
-                drop(live);
-                instance_presence(
-                    parsed.pid,
-                    parsed.birth,
-                    &parsed.inst,
-                    &parsed.stdout_path,
-                    deadline,
-                )?
             }
         };
+        let (parsed, observed_handle) = match control {
+            PhysicalControlHandle::Pinned(parsed) => {
+                if parsed.request_id != request_id.as_str() {
+                    return Err(AdapterError::protocol(
+                        "persisted handle request_id does not match reconcile identity",
+                    ));
+                }
+                (parsed, None)
+            }
+            PhysicalControlHandle::Locator(locator) => {
+                if locator.request_id != request_id.as_str() {
+                    return Err(AdapterError::protocol(
+                        "persisted locator request_id does not match reconcile identity",
+                    ));
+                }
+                let locator_handle = locator.to_runtime_handle(ADAPTER_KIND);
+                // Reuse the same resolution as every control entry point so a
+                // Windows birthless locator cannot be upgraded here either.
+                let resolution = self.control_parsed(&locator_handle, deadline)?;
+                if resolution.unproven {
+                    let observation = StartObservation {
+                        state: ExecutionState::Unknown,
+                        runtime_handle: locator_handle.clone(),
+                        ambiguous: true,
+                        detail: Some(
+                            "durable locator identity could not be proven; not this Execution"
+                                .into(),
+                        ),
+                        terminal_confirmed: false,
+                        quiescent_confirmed: false,
+                    };
+                    return qualify_ok(
+                        deadline,
+                        "reconcile deadline exhausted after locator proof",
+                        Some(&locator_handle),
+                        observation,
+                    );
+                }
+                match resolution.parsed {
+                    Some(parsed) => (parsed, Some(locator_handle)),
+                    None => {
+                        // Spawn succeeded (the locator is written after spawn)
+                        // but the process is gone. This is a terminal physical
+                        // candidate, never a blind retry.
+                        let hint = locator_handle.clone();
+                        return qualify_ok(
+                            deadline,
+                            "reconcile deadline exhausted after locator resolution",
+                            Some(&hint),
+                            ended_start_observation(locator_handle),
+                        );
+                    }
+                }
+            }
+        };
+        let presence = self.presence_for(&parsed, deadline)?;
+        let full_handle = encode_handle(&parsed);
         let observation = match presence {
             InstancePresence::Running => StartObservation {
                 state: ExecutionState::Running,
-                runtime_handle: handle.clone(),
+                // Always replace a locator with the exact pin once the live
+                // birth identity has actually been observed.
+                runtime_handle: full_handle,
                 ambiguous: false,
                 detail: None,
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
             },
-            InstancePresence::Ended => ended_start_observation(handle.clone()),
+            InstancePresence::Ended => ended_start_observation(full_handle),
             InstancePresence::Absent => StartObservation {
                 state: ExecutionState::Unknown,
-                runtime_handle: handle.clone(),
+                runtime_handle: observed_handle.unwrap_or(full_handle),
                 ambiguous: true,
                 detail: Some("process instance not found".into()),
                 terminal_confirmed: false,
                 quiescent_confirmed: false,
             },
         };
+        let hint = observation.runtime_handle.clone();
         qualify_ok(
             deadline,
             "reconcile deadline exhausted after observation",
-            Some(handle),
+            Some(&hint),
             observation,
         )
     }
@@ -1637,6 +2269,7 @@ mod tests {
 
     #[test]
     fn domain_key_rejects_empty_or_unknown_placeholders() {
+        let locator_root = Path::new("/var/tmp/agentype");
         for (boot, pid, mnt, root_dev, root_ino) in [
             ("", "pid:[1]", "mnt:[1]", "1", "2"),
             ("boot", "", "mnt:[1]", "1", "2"),
@@ -1646,17 +2279,37 @@ mod tests {
             ("unknown-boot", "pid:[1]", "mnt:[1]", "1", "2"),
             ("boot", "unknown-ns", "mnt:[1]", "1", "2"),
         ] {
-            let err = linux_domain_key(boot, pid, mnt, root_dev, root_ino).unwrap_err();
+            let err =
+                linux_domain_key(boot, pid, mnt, root_dev, root_ino, locator_root).unwrap_err();
             assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
         }
-        let key = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "1").unwrap();
-        assert_eq!(key.as_str(), "linux:boot-id:pid:[1]:mnt:[2]:8:1");
+        let key =
+            linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "1", locator_root).unwrap();
+        assert_eq!(
+            key.as_str(),
+            "linux:boot-id:pid:[1]:mnt:[2]:8:1:locroot=/var/tmp/agentype"
+        );
         assert!(!key.as_str().contains("unknown"));
-        let other = linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "99").unwrap();
+        let other =
+            linux_domain_key("boot-id", "pid:[1]", "mnt:[2]", "8", "99", locator_root).unwrap();
         assert_ne!(
             key.as_str(),
             other.as_str(),
             "same ns with different root must not share a binding key"
+        );
+        let other_root = linux_domain_key(
+            "boot-id",
+            "pid:[1]",
+            "mnt:[2]",
+            "8",
+            "1",
+            Path::new("/other"),
+        )
+        .unwrap();
+        assert_ne!(
+            key.as_str(),
+            other_root.as_str(),
+            "a different locator root must not share a binding key"
         );
     }
 
@@ -1673,6 +2326,7 @@ mod tests {
     fn incomplete_locator_hint_is_protocol_not_control() {
         let hint = encode_locator_hint(
             9,
+            None,
             "tok",
             "req-1",
             Path::new("stdout.txt"),
@@ -1692,6 +2346,131 @@ mod tests {
         );
         assert_eq!(
             parse_handle(&hint).unwrap_err().kind(),
+            AdapterErrorKind::Protocol
+        );
+        let locator = parse_locator_with_kind(&hint, ADAPTER_KIND).unwrap();
+        assert_eq!(locator.pid, 9);
+        assert_eq!(locator.birth, None);
+    }
+
+    #[test]
+    fn locator_record_round_trips_and_is_request_bound() {
+        let root = std::env::temp_dir().join(format!("agentype-locator-record-{}", unix_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let request_id = RequestId::new();
+        let locator = LocatorHandle {
+            pid: 4242,
+            birth: Some(99),
+            inst: "instance".into(),
+            request_id: request_id.as_str().to_string(),
+            stdout_path: root.join("stdout.txt"),
+            stderr_path: root.join("stderr.txt"),
+            spawn_after_ms: Some(1234),
+        };
+        write_locator_record(&root, ADAPTER_KIND, &locator).unwrap();
+        let read = read_locator_record(&root, ADAPTER_KIND, &request_id).unwrap();
+        assert_eq!(read, locator);
+        assert!(
+            read_locator_record(&root, ADAPTER_KIND, &RequestId::new()).is_none(),
+            "a locator must never cross RequestId identities"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interrupted_locator_rewrite_cannot_destroy_the_previous_record() {
+        let root = std::env::temp_dir().join(format!("agentype-locator-atomic-{}", unix_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let request_id = RequestId::new();
+        let first = LocatorHandle {
+            pid: 4242,
+            birth: None,
+            inst: "instance".into(),
+            request_id: request_id.as_str().to_string(),
+            stdout_path: root.join("stdout.txt"),
+            stderr_path: root.join("stderr.txt"),
+            spawn_after_ms: Some(1234),
+        };
+        write_locator_record(&root, ADAPTER_KIND, &first).unwrap();
+        // Simulate a crash between temp-file creation/write and the atomic
+        // rename: a truncated temp file exists beside the canonical record.
+        fs::write(root.join(".locator.9999.0.tmp"), b"{\"v\":1,\"pid\":trunc").unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(first.clone()),
+            "a partial temp file must never replace or corrupt the canonical record"
+        );
+
+        let second = LocatorHandle {
+            birth: Some(99),
+            ..first.clone()
+        };
+        write_locator_record(&root, ADAPTER_KIND, &second).unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(second),
+            "a completed overwrite is a whole-record replacement"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_locator_write_preserves_the_previous_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("agentype-locator-fail-{}", unix_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let request_id = RequestId::new();
+        let first = LocatorHandle {
+            pid: 4242,
+            birth: None,
+            inst: "instance".into(),
+            request_id: request_id.as_str().to_string(),
+            stdout_path: root.join("stdout.txt"),
+            stderr_path: root.join("stderr.txt"),
+            spawn_after_ms: Some(1234),
+        };
+        write_locator_record(&root, ADAPTER_KIND, &first).unwrap();
+
+        let mut perms = fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&root, perms).unwrap();
+        let second = LocatorHandle {
+            birth: Some(99),
+            ..first.clone()
+        };
+        let err = write_locator_record(&root, ADAPTER_KIND, &second)
+            .expect_err("a read-only directory must fail the atomic replace");
+        assert_eq!(err.kind(), AdapterErrorKind::Unavailable);
+
+        let mut perms = fs::metadata(&root).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&root, perms).unwrap();
+        assert_eq!(
+            read_locator_record(&root, ADAPTER_KIND, &request_id),
+            Some(first),
+            "a failed overwrite must leave the previous durable record intact"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_pin_is_rejected_as_a_locator() {
+        let handle = RuntimeHandle(json!({
+            "v": HANDLE_VERSION,
+            "kind": ADAPTER_KIND,
+            "pid": 1,
+            "birth": 2,
+            "inst": "tok",
+            "request_id": "req",
+            "stdout": "a",
+            "stderr": "b",
+        }));
+        assert_eq!(
+            parse_locator_with_kind(&handle, ADAPTER_KIND)
+                .unwrap_err()
+                .kind(),
             AdapterErrorKind::Protocol
         );
     }

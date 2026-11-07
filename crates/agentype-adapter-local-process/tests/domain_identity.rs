@@ -2,8 +2,21 @@
 //! evidence that a restarted Scheduler on the same boot recomputes the
 //! same domain key.
 
+use agentype_adapter_api::ImportableAdapter;
 use agentype_adapter_local_process::LocalProcessAgentAdapter;
 use std::process::Command;
+
+#[test]
+fn unsandboxed_local_process_imports_no_enforcement() {
+    let adapter = LocalProcessAgentAdapter::new();
+    // `start_execution` launches a plain OS process and does not confine the
+    // filesystem or network, so it MUST NOT claim any enforceable workspace mode
+    // or network policy. Claiming `Write` would be an enforcement proof a
+    // required_workspace=Write Task must not be able to consume.
+    assert!(adapter.import_enforceable_workspace().is_empty());
+    assert!(adapter.import_enforceable_network().is_empty());
+    assert!(!adapter.import_attempt_isolation());
+}
 
 #[test]
 fn domain_key_is_stable_across_processes() {
@@ -65,7 +78,14 @@ fn windows_domain_key_uses_boot_guid_not_tick_epoch() {
         key.starts_with("win:"),
         "windows key must start with win:, got {key}"
     );
-    let boot = key.rsplit(':').next().expect("boot token");
+    let (prefix, locator_root) = key
+        .rsplit_once(":locroot=")
+        .unwrap_or_else(|| panic!("windows key must bind the locator root: {key}"));
+    assert!(
+        !locator_root.is_empty(),
+        "windows key must not have an empty locator root"
+    );
+    let boot = prefix.rsplit(':').next().expect("boot token");
     assert_eq!(
         boot.len(),
         36,
@@ -84,4 +104,63 @@ fn windows_domain_key_uses_boot_guid_not_tick_epoch() {
     assert_eq!(parts[2].len(), 4);
     assert_eq!(parts[3].len(), 4);
     assert_eq!(parts[4].len(), 12);
+}
+
+/// A restarted Scheduler that resolves a different temporary directory must
+/// compute a different binding key. Otherwise the old key would still claim
+/// the old physical domain while locator recovery looked under the new root,
+/// silently losing the process witness. The key is resolved once per process,
+/// so a later environment change inside one process cannot split it.
+#[test]
+fn domain_key_binds_the_locator_root_across_processes() {
+    let parent = LocalProcessAgentAdapter::new()
+        .binding_key()
+        .as_str()
+        .to_string();
+    assert!(
+        parent.contains(":locroot="),
+        "binding key must bind the durable locator root: {parent}"
+    );
+
+    let alternate =
+        std::env::temp_dir().join(format!("agentype-locator-root-{}", std::process::id()));
+    std::fs::create_dir_all(&alternate).unwrap();
+    let expected_root = std::fs::canonicalize(&alternate).unwrap();
+
+    let child_key = |root: &std::path::Path| -> String {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_print-binding-key"));
+        command
+            .env("TMPDIR", root)
+            .env("TMP", root)
+            .env("TEMP", root);
+        let output = command.output().expect("spawn print-binding-key");
+        assert!(
+            output.status.success(),
+            "print-binding-key failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf-8 domain key")
+    };
+
+    let relocated = child_key(&alternate);
+    assert_ne!(
+        parent, relocated,
+        "a different locator root must not share the parent's physical domain key"
+    );
+    assert_eq!(
+        child_key(&alternate),
+        relocated,
+        "the relocated key must be stable across processes"
+    );
+    let bound = relocated
+        .rsplit_once(":locroot=")
+        .expect("relocated key binds the locator root")
+        .1;
+    assert_eq!(
+        std::path::Path::new(bound),
+        expected_root.as_path(),
+        "the bound locator root must be the canonicalized temporary directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&alternate);
 }

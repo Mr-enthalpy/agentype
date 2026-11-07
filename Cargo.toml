@@ -7,6 +7,7 @@ members = [
     "crates/agentype-storage-sqlite",
     "crates/agentype-adapter-api",
     "crates/agentype-adapter-local-process",
+    "crates/agentype-source-workspace-jail",
     "crates/agentype-root-bridge",
     "crates/agentype-runtime",
     "crates/agentype-nlink",
@@ -28,6 +29,7 @@ agentype-agent-contract = { path = "crates/agentype-agent-contract" }
 agentype-execution-config = { path = "crates/agentype-execution-config" }
 agentype-adapter-api = { path = "crates/agentype-adapter-api" }
 agentype-adapter-local-process = { path = "crates/agentype-adapter-local-process" }
+agentype-source-workspace-jail = { path = "crates/agentype-source-workspace-jail" }
 agentype-root-bridge = { path = "crates/agentype-root-bridge" }
 agentype-runtime = { path = "crates/agentype-runtime" }
 agentype-storage-sqlite = { path = "crates/agentype-storage-sqlite" }

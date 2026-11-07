@@ -430,8 +430,28 @@ pub struct EscalationRecord {
     pub task_id: TaskId,
     pub batch_id: BatchId,
     pub logical_agent_id: Option<LogicalAgentId>,
-    pub failure_class: FailureClass,
+    pub cause: EscalationCause,
     pub state: EscalationState,
+}
+
+/// Root decisions include Task failure and pre-Execution control-plane faults.
+/// Preparation faults carry no Task FailureClass or physical-safety assertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscalationCause {
+    TaskFailure(FailureClass),
+    PreparationFault {
+        attempt_id: AttemptId,
+        kind: PreparationFaultKind,
+    },
+}
+
+impl EscalationRecord {
+    pub fn failure_class(&self) -> Option<FailureClass> {
+        match self.cause {
+            EscalationCause::TaskFailure(class) => Some(class),
+            EscalationCause::PreparationFault { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
