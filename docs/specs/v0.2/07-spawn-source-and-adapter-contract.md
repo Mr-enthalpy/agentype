@@ -100,8 +100,9 @@ authority center ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-
   profile coverage → bounded root-relative compile → read-only attestation →
   credential probe (when needed) → complete eligible candidate set →
   deterministic selection. Compilation is per candidate and root-relative; a
-  budget shortfall or unknown earlier candidate defers the whole round, and a
-  failed winner never falls back to a weaker candidate.
+  budget shortfall or any unknown candidate not proven continuity-non-decisive
+  defers the whole round, and a failed winner never falls back to a weaker
+  candidate.
 - Credential-bearing configs are eligible only when the exact binding declares
   `security_execution_v1.credential_brokered`. `credential_transient_raw` is
   defined but unsupported in v1 production. Broker unreachable is not

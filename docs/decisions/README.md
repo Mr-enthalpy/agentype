@@ -42,6 +42,10 @@ choice is made (expected during V0.2 design, not this layout change).
 | [ADR-0014](0014-m6b5-enforcement-compilation-receipt.md) | M6-B.5 enforcement compilation is root-relative and bounded; winner failure never falls back; the Execution security snapshot carries the actual AgentType; the applied-security receipt lives outside the worker-writable jail and joins the RUNNING + first-renewal transaction. |
 | [ADR-0015](0015-m6b5-credentials-feature-gates-scope-freeze.md) | M6-B.5 credential eligibility uses a per-acquisition observation epoch with explicit failure classes; v1 production enables only `BrokeredAccess`; three independent imported gates; the policy-only, credential-bound and M6-B aggregate freeze scopes are separate. |
 
+ADR-0013/0014/0015 are `Proposed` pending the B5.0 maintainer audit. They become
+`Accepted` only when the maintainer authorizes the B5.0 design baseline at an
+exact final SHA; this does not freeze M6-B.5.
+
 Template for a new ADR:
 
 - title

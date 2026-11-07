@@ -71,17 +71,21 @@ In `SECURITY_V1`:
   matching anchor. SourceConfig is not an authored ceiling and there is no
   `P_config`; a physical config effect is admissible only through source
   integration and imported evidence.
-- `R_min` contains only positive Task obligations drawn from existing structured
-  fields (`required_workspace`, `required_network`, `required_capabilities`,
-  `required_attempt_isolation`, continuity/placement). Negative constraints such
-  as `ReadOnly` or `Disabled` are ceilings, not floors. B.5 v1 makes no
-  path-level minimum claim and MUST NOT infer one from natural-language input.
+- `R_min` is a typed positive obligation product: `RequiredAccess` (permission
+  floors drawn from existing structured fields), `RequiredGuarantees`
+  (isolation/continuity), and `PlacementConstraints` (frozen M5 predicate). Only
+  `RequiredAccess` uses set inclusion; the other components use
+  `satisfies_requirement`, never `⊆`. Negative constraints such as `ReadOnly` or
+  `Disabled` are ceilings, not floors. B.5 v1 makes no path-level minimum claim
+  and MUST NOT infer one from natural-language input.
 - Coarse and fine fields are never two independent grants. AgentType uses
   `project_agent(P) == SecurityContract`; Generation projects
   `(max_workspace, max_network)` and entails its isolation guarantee; Task uses
   consistency (`Write ⇒ P_task allows write`, `ReadOnly ⇒ P_eff has no write`,
   network by existing rank/polarity, isolation guarantee carried in `P_eff`).
-  Typed admission MUST reject when `R_min(T) ⊄ meet(P_generation, P_task)`;
+  A Task coarse/fine conflict MUST be rejected locally, before any cross-object
+  meet, even if a stricter ceiling would hide it. Typed admission MUST reject
+  when `satisfies_requirement(R_min(T), meet(P_generation, P_task))` fails;
   provisioning then adds the actual AgentType and SpawnSource ceiling.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be

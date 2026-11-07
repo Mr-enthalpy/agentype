@@ -1,6 +1,6 @@
 # ADR-0015 — M6-B.5 credential observations, feature gates, and the scoped freeze
 
-Status: Accepted (M6-B.5 / B5.0 normative design; not a milestone freeze)
+Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
 Date: 2026-11-08
 Canonical path: `docs/decisions/0015-m6b5-credentials-feature-gates-scope-freeze.md`
 
@@ -93,17 +93,31 @@ Failure taxonomy:
 An unreachable broker must not be allowed to push credential-bearing candidates
 out of the set by pretending they are absent.
 
-### 4. Unknown-broker candidates use the B.4 deterministic order
+### 4. Unknown-broker candidates are judged by continuity dominance, not enumeration position
 
-Selection in B.4 is a deterministic order, not a priority ranking. The rule is:
+Selection in B.4 is a continuity comparison, not a priority order over
+enumeration positions. When the highest continuity tier contains more than one
+eligible candidate, the result is `SelectionAmbiguous`, not the first one
+listed. An unknown candidate that appears later in enumeration but has the same
+continuity as the current winner can therefore still change the outcome.
 
-- if an unknown candidate precedes the current winner in that order, its result
-  could change the winner → defer;
-- if it follows the winner, it cannot change the winner → selection may
-  continue;
+The rule is:
+
+- an unknown candidate may be ignored only when trusted static eligibility and
+  its continuity upper bound prove that its resolution cannot change the
+  selected result;
+- otherwise the whole round defers;
+- enumeration position is not evidence of preference and MUST NOT be used as a
+  tie-break;
 - retries are bounded, with backoff and diagnostics.
 
-This deliberately trades availability for fail-closed behavior.
+For example, an unknown candidate already known to have strictly lower
+continuity than a confirmed winner can be proven non-decisive once all other
+qualifications are complete. An unknown candidate in the winner's continuity
+tier is decisive regardless of where it appears in the enumeration.
+
+This deliberately trades availability for fail-closed behavior and preserves
+[ADR-0010](0010-m6b-selection-order-scope.md).
 
 ### 5. Transaction validation and post-commit authorization
 
@@ -289,14 +303,17 @@ B5.5 MUST treat these as mandatory regression categories:
 | Policy algebra | `meet` is the greatest lower bound; order is transitive; normalize is idempotent; digest is permutation-stable |
 | Equality regression | every contract accepted by the old exact-equality relation is still accepted by the pure policy order; new physical eligibility is not thereby granted |
 | Coarse projection | every `SECURITY_V1` coarse/fine conflict is rejected |
+| Task-local consistency | a Task coarse/fine conflict is rejected locally even when another ceiling would hide it; `sandbox_policy = None` follows the `SECURITY_V1` rule |
+| `R_min` typing | permission floors use `RequiredAccess ⊆ ProjectAccess`; guarantees and placement use `satisfies_requirement`, never set inclusion |
 | Imported coverage | a policy using an unsupported dimension is ineligible even when the protocol gate is open; supporting A and B does not imply supporting `A ∩ B` |
 | Enforcement matrix completeness | every spec-10 dimension is classified proven/limited/unsupported for the exact binding, and an unclassified dimension fails the suite |
 | Canonical golden vectors | each schema/algorithm version pins byte-level input/output and digest |
-| Compile budget | exhausting the budget mid-round cannot produce partial selection |
-| Credential probe | broker down is not absent; different epochs and wrong scope are not mixed |
+| Compile budget | exhausting the budget mid-round, or an unknown candidate not proven continuity-non-decisive, cannot produce partial selection |
+| Credential probe | broker down is not absent; different epochs and wrong scope are not mixed; an unknown candidate in the winner's continuity tier defers, and only a proven non-decisive candidate may be ignored |
 | Secret sentinel | no raw secret sentinel in durable JSON, logs, control errors, snapshots, or descriptors |
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
+| Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
 | RUNNING atomicity | observation, receipt, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |

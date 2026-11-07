@@ -219,7 +219,10 @@ surface designed in
 - `applied_security_receipts` is immutable, write-once, instance-bound, and
   stored outside the worker-writable jail root/workspace. It is consumed by the
   RUNNING + first-renewal transaction, never by a separate security state
-  machine.
+  machine. The durable row records the validated receipt identity/digest; the
+  receipt file is recoverable physical evidence. Recovery MUST distinguish a
+  controlled instance awaiting release from one that has started, and receipt
+  presence alone MUST NOT confirm RUNNING.
 - `SECURITY_V1` is a positive parent-side marker; a missing child is corruption
   and MUST NOT degrade to `COARSE_V1`. The same write-once, same-identity
   `INSERT OR REPLACE`, and authoritative-read coherence guards apply.
@@ -350,7 +353,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. For `SECURITY_V1`, the same transaction also writes the immutable `TaskSecurityBinding` and rejects admission unless `R_min(T) ⊆ meet(P_generation, P_task)`. |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. For `SECURITY_V1`, the same transaction also writes the immutable `TaskSecurityBinding`, runs the Task-local coarse/fine validation before any cross-object meet, and rejects admission unless `satisfies_requirement(R_min(T), meet(P_generation, P_task))`. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

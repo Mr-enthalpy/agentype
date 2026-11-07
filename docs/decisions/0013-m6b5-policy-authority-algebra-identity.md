@@ -1,6 +1,6 @@
 # ADR-0013 — M6-B.5 policy authority, sandbox algebra, and durable security identity
 
-Status: Accepted (M6-B.5 / B5.0 normative design; not a milestone freeze)
+Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
 Date: 2026-11-08
 Canonical path: `docs/decisions/0013-m6b5-policy-authority-algebra-identity.md`
 
@@ -62,24 +62,34 @@ Adding an authored ceiling to a SpawnSource requires publishing a new versioned
 source contract. An existing immutable source revision MUST NOT gain a security
 meaning it did not have at publication.
 
-### 2. `R_min` is the conservative option A
+### 2. `R_min` is a typed requirement, not one permission set
 
 B5.0 uses only structured fields that already exist and does **not** change
-M6-A `TaskSpec` canonicalization, digests, or replay. `R_min` covers:
+M6-A `TaskSpec` canonicalization, digests, or replay. `R_min` is a product:
 
-- `required_workspace` and `required_network`;
-- `required_capabilities`, preserving the existing `Ability`/`Restriction`
-  polarity;
-- `required_attempt_isolation`;
-- existing continuity and placement obligations.
+```text
+RequiredAccess(T)        // permission-dimension floors
+RequiredGuarantees(T)    // isolation, continuity, ...
+PlacementConstraints(T)  // M5 placement predicate
+```
 
-These fields are not all pure permission floors. `ReadOnly` means "this
-Execution must not use write authority"; `Write` is the value that requires the
+- `RequiredAccess` is the only component compared by set inclusion. It is
+  projected from existing structured permission fields (`required_workspace`,
+  `required_network`, and the capability values that map to access dimensions),
+  preserving the existing `Ability`/`Restriction` polarity.
+- `RequiredGuarantees` carries guarantees that are not allowed-operation sets:
+  `required_attempt_isolation`, continuity, and any other execution guarantee.
+  It is checked by the corresponding guarantee predicate, not by `⊆`.
+- `PlacementConstraints` continues to be checked by the frozen M5 placement
+  predicate.
+
+`R_min` contains **positive obligations only**. `ReadOnly` means "this Execution
+must not use write authority"; `Write` is the value that requires the
 corresponding write execution capability. `Disabled` and `Restricted` network
 follow the existing coarse contract; they are not a simple "amount of network
-access" set. B5.0 therefore defines `R_min` as **positive obligations only**.
-Negative constraints (`ReadOnly`, `Disabled`, no-widening) are covered by
-`P_eff ⊆ every ceiling` and by the coarse-consistency checks, not by `R_min`.
+access" set. Negative constraints (`ReadOnly`, `Disabled`, no-widening) are
+covered by `P_eff ⊆ every ceiling` and by the coarse-consistency checks, not by
+`RequiredAccess`.
 
 `CredentialRef` lives in SourceConfig, not in `TaskRequirement`. It creates a
 credential qualification obligation on the selected config; it is not a Task
@@ -112,7 +122,7 @@ would either violate TaskSpec's single-authority rule or be unimplementable.
 `SECURITY_V1` instead requires:
 
 ```text
-required_workspace = Write   ⇒ P_task allows write and R_min ⊆ P_eff
+required_workspace = Write   ⇒ P_task allows write and satisfies_requirement(R_min, P_eff)
 required_workspace = ReadOnly ⇒ P_eff contains no write
 required_network follows the existing rank/polarity
 required_attempt_isolation  ⇒ P_eff carries the isolation guarantee
@@ -121,7 +131,25 @@ required_attempt_isolation  ⇒ P_eff carries the isolation guarantee
 Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine
 write root MUST be rejected.
 
-`COARSE_V1` keeps its frozen semantics and replay. `SECURITY_V1` MUST NOT
+The Task-local check runs before any cross-object meet:
+
+```text
+validate_task_local_coarse_fine(TaskSpec, TaskPolicy)
+```
+
+A conflict between the TaskSpec coarse fields and the Task policy MUST be
+rejected even when a stricter Generation/AgentType/SpawnSource ceiling would
+hide it in `P_eff`. For example, `required_workspace = ReadOnly` with a Task
+policy that allows `write Workspace/src` is invalid on its own; a Generation
+`ReadOnly` ceiling does not repair it. `SECURITY_V1` admission MUST fail closed
+when this check fails.
+
+`sandbox_policy = None` in `SECURITY_V1` means "no additional Task-level fine
+restriction", normalized to the explicit top for the Task policy layer. It never
+widens another ceiling, and the TaskSpec coarse fields remain authoritative.
+AgentType and Generation `SECURITY_V1` contracts MUST carry an authored policy;
+an absent policy there would make `project_agent`/`project_gen` undefined.
+`COARSE_V1` keeps its frozen `None` semantics and replay. `SECURITY_V1` MUST NOT
 bypass the projection/consistency check to enter the old dispatch path.
 
 When a capability and a policy dimension express the same restriction, there is
@@ -168,11 +196,22 @@ recorded with them and MUST NOT be reinterpreted by a newer algorithm.
 At typed admission, the kernel MUST check
 
 ```text
-R_min(T) ⊆ meet(P_generation, P_task)
+satisfies_requirement(
+    R_min(T),
+    meet(P_generation, P_task),
+    guarantees = effective guarantees,
+    placement = frozen M5 placement predicate
+)
 ```
 
-and reject admission when it fails. This matches the existing coarse rejection
-of `workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
+and reject admission when it fails. Only the `RequiredAccess` component is a set
+inclusion (`RequiredAccess ⊆ ProjectAccess(P)`); `RequiredGuarantees` and
+`PlacementConstraints` use their own predicates. There MUST be exactly one
+`satisfies_requirement` relation, not two implementations that disagree about
+which `R_min` dimensions are set-like.
+
+This matches the existing coarse rejection of
+`workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
 fail at the same stage, not later during provisioning. An unsatisfiable Task
 must never become a durable semantic commitment.
 

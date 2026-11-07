@@ -63,11 +63,14 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   In M6-B.1 the sandbox policy is pinned by **exact reference** (equality).
   M6-B.5 defines ordering and intersection for `SECURITY_V1` only
   ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md)):
-  four security objects, no `P_config`, positive `R_min` drawn from existing
-  structured fields, per-object coarse relations (AgentType equality,
-  Generation projection, Task consistency), admission satisfiability
-  `R_min(T) ⊆ meet(P_generation, P_task)`, and authored catalog versus inline
-  derived policies. `COARSE_V1` replay keeps the exact-reference rule;
+  four security objects, no `P_config`, typed positive `R_min`
+  (`RequiredAccess` / `RequiredGuarantees` / `PlacementConstraints`) drawn from
+  existing structured fields, per-object coarse relations (AgentType equality,
+  Generation projection, Task consistency), Task-local coarse/fine validation,
+  admission satisfiability
+  `satisfies_requirement(R_min(T), meet(P_generation, P_task))`, and authored
+  catalog versus inline derived policies. `COARSE_V1` replay keeps the
+  exact-reference rule;
   `D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION` remain the registry pointers
   until B5.5 verifies backend coverage.
 - `can_provision` checks that the config belongs to the exact source revision,

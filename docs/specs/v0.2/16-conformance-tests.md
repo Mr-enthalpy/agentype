@@ -528,11 +528,16 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   eligibility is thereby granted;
 - coarse projection/consistency: every `SECURITY_V1` coarse/fine conflict,
   including `ReadOnly` plus a write root and Task minimums unmet by the
-  Generation meet, is rejected at the correct stage;
+  Generation meet, is rejected at the correct stage; a Task-local coarse/fine
+  conflict is rejected even when another ceiling would hide it, and
+  `sandbox_policy = None` follows the `SECURITY_V1` rule;
+- `R_min` typing: only `RequiredAccess` uses set inclusion; `RequiredGuarantees`
+  and `PlacementConstraints` go through the single `satisfies_requirement`
+  relation;
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
-- compile budget: exhausting the budget mid-round, or an unknown earlier
-  credential candidate, cannot produce partial selection; a failed winner does
-  not fall back;
+- compile budget: exhausting the budget mid-round, or an unknown credential
+  candidate not proven continuity-non-decisive, cannot produce partial
+  selection; a failed winner does not fall back;
 - imported coverage: a policy using an unsupported dimension is ineligible even
   when the protocol gate is open, and a source that supports A and B is not
   assumed to support `A ∩ B`;
@@ -540,13 +545,18 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;
 - credential probe: broker unreachable is not absent, stale or wrong-scope
-  proofs are rejected, and epochs are not mixed;
+  proofs are rejected, and epochs are not mixed; an unknown candidate in the
+  winner's continuity tier defers, and only a proven continuity-non-decisive
+  candidate may be ignored;
 - secret sentinel: no raw secret material in durable JSON, logs, control errors,
   snapshots, or launch descriptors;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
   cross-Execution delivery are rejected;
 - receipt replay: Execution A's receipt cannot confirm B; a missing receipt
   cannot enter RUNNING;
+- hold/release: worker code does not run before receipt durability; recovery
+  distinguishes awaiting-release from actually started; a receipt alone does not
+  confirm RUNNING;
 - RUNNING atomicity: observation, receipt, RUNNING and first renewal all commit
   or all roll back;
 - schema gate: a v8 database is rejected at v9 open and no implicit upgrade

@@ -1,6 +1,6 @@
 # ADR-0014 — M6-B.5 enforcement compilation, physical binding, and the applied-security receipt
 
-Status: Accepted (M6-B.5 / B5.0 normative design; not a milestone freeze)
+Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
 Date: 2026-11-08
 Canonical path: `docs/decisions/0014-m6b5-enforcement-compilation-receipt.md`
 
@@ -194,7 +194,52 @@ secret-free credential delivery scope receipt
 
 It is a physical fact, not Task success and not a new authority source.
 
-### 8. Receipt location and write discipline
+### 8. Start hold/release and recoverable receipt state
+
+The receipt is only useful if it is durable before untrusted worker code can run.
+Physical start MUST provide a trusted hold/release barrier:
+
+```text
+create controlled instance
+    → establish instance witness
+    → apply and verify restrictions
+    → persist recoverable receipt (temp → fsync → rename)
+    → release worker code
+```
+
+The worker MUST NOT execute before the receipt is durable. A source whose process
+model cannot hold the worker at a pre-exec boundary must provide an equivalent
+controlled-start mechanism, or the candidate is unsupported.
+
+A persisted receipt does not by itself mean the worker was released. The crash
+window
+
+```text
+sandbox applied
+receipt persisted
+daemon crashed
+worker not yet released
+```
+
+is a real state. Recovery MUST distinguish a controlled instance awaiting
+release from an instance that has actually started. `reconcile_start` recovers
+the start phase for the same RequestId and the same physical instance; it MUST
+NOT confirm RUNNING from the receipt alone.
+
+The durable record is the validated receipt identity/digest committed by the
+RUNNING transaction; the receipt file is recoverable physical evidence. The
+relation among receipt file, durable record, and physical instance MUST be
+verifiable: same ExecutionId/RequestId, same binding and plan digest, same
+instance witness, and a write order that cannot present an unverified file as
+applied. If that relation cannot be established after a crash, the Execution
+remains physically uncertain and follows M5 recovery.
+
+The policy-only reference profile also depends on this protection. The
+daemon-owned receipt directory MUST have real read/write/delete/replace
+isolation tests before the profile is declared; B.4's content-write confinement
+is not evidence of confidentiality or of protection for daemon-owned state.
+
+### 9. Receipt location and write discipline
 
 The Windows `prepare_jail` path grants the restricting SID `FILE_MODIFY` on the
 jail root and workspace. Any file under `agentype-jail-<request_id>` is therefore
@@ -216,7 +261,7 @@ The receipt is added to the retained-artifact class tracked by
 `D-ARTIFACT-GC`. A B.5 freeze record MUST state this limitation explicitly; the
 frozen M6-B.4 report's F2 scope remains historically limited to B.4 artifacts.
 
-### 9. Recipient and instance identity
+### 10. Recipient and instance identity
 
 Receipt identity reuses the B.4 witness and MUST NOT rely on a bare PID:
 
@@ -228,7 +273,7 @@ Receipt identity reuses the B.4 witness and MUST NOT rely on a bare PID:
 A receipt for Execution A cannot confirm Execution B, and a missing receipt
 cannot be synthesized.
 
-### 10. One fenced RUNNING transaction
+### 11. One fenced RUNNING transaction
 
 After a start or reconcile observation, the runtime commits in one fenced Core
 transaction:
@@ -246,7 +291,7 @@ NOT synthesize one and MUST NOT downgrade to the legacy RUNNING path. Physical
 uncertainty remains owned by M5 recovery, preserving the frozen
 RUNNING/renewal atomicity without a second supervision authority.
 
-### 11. `AppliedPlan ≡ CommittedPlan` is a digest tuple
+### 12. `AppliedPlan ≡ CommittedPlan` is a digest tuple
 
 The equality is defined over:
 
@@ -259,7 +304,7 @@ root and process-instance identity are bound separately by the receipt, so a
 plan can be compared without embedding environment-specific paths. Byte-level
 agreement is required; "compatible" is not equality.
 
-### 12. A feature gate is not per-dimension coverage
+### 13. A feature gate is not per-dimension coverage
 
 `security_execution_v1.policy` (defined in
 [ADR-0015](0015-m6b5-credentials-feature-gates-scope-freeze.md)) means the
