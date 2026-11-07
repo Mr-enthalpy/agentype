@@ -516,6 +516,46 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - an earlier credential-bearing config and a wrong-kind source whose attestation
   would fail the whole search are skipped without invoking that attestation.
 
+### M6-B.5 effective security and credential gates
+
+`SECURITY_V1` MUST add:
+
+- policy algebra properties: `meet` is the greatest lower bound, the order is
+  transitive, `normalize` is idempotent, and canonical digests are stable under
+  permutation and duplicate removal;
+- equality regression: every contract accepted by the B.1–B.4 exact-reference
+  relation remains accepted by the pure policy order, while no new physical
+  eligibility is thereby granted;
+- coarse projection/consistency: every `SECURITY_V1` coarse/fine conflict,
+  including `ReadOnly` plus a write root and Task minimums unmet by the
+  Generation meet, is rejected at the correct stage;
+- canonical golden vectors keyed by `(canonical_version, algebra_version)`;
+- compile budget: exhausting the budget mid-round, or an unknown earlier
+  credential candidate, cannot produce partial selection; a failed winner does
+  not fall back;
+- imported coverage: a policy using an unsupported dimension is ineligible even
+  when the protocol gate is open, and a source that supports A and B is not
+  assumed to support `A ∩ B`;
+- enforcement matrix completeness: every spec-10 dimension is classified
+  proven/limited/unsupported for the exact binding, and an unclassified
+  dimension fails the suite;
+- credential probe: broker unreachable is not absent, stale or wrong-scope
+  proofs are rejected, and epochs are not mixed;
+- secret sentinel: no raw secret material in durable JSON, logs, control errors,
+  snapshots, or launch descriptors;
+- recipient identity: wrong SID/birth, wrong pinned instance, and
+  cross-Execution delivery are rejected;
+- receipt replay: Execution A's receipt cannot confirm B; a missing receipt
+  cannot enter RUNNING;
+- RUNNING atomicity: observation, receipt, RUNNING and first renewal all commit
+  or all roll back;
+- schema gate: a v8 database is rejected at v9 open and no implicit upgrade
+  occurs;
+- feature gating: without a declared policy/credential capability, behavior
+  remains at B.4 fail-closed;
+- crash recovery: an uncertain physical start keeps the original RequestId and
+  does not create a second security fact.
+
 These supplement, rather than replace, M4 writer-safety/recovery, M6-A frontier,
 B.3 admission/matching and default-feature API-boundary tests (ADR-0011).
 

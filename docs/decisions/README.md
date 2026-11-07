@@ -38,6 +38,9 @@ choice is made (expected during V0.2 design, not this layout change).
 | [ADR-0010](0010-m6b-selection-order-scope.md) | M6-B.4 applies spec 07's hard filters and continuity ranking, and defers availability/cost ranking (no durable model yet); selection is part of the authority path. |
 | [ADR-0011](0011-m6b-acquisition-contract-parity.md) | Shared frozen placement/isolation decisions; provisioning reservation stays separate from the M5 Attempt→Incarnation execution association; known hard filters precede attestation. |
 | [ADR-0012](0012-m6b4-scope-typed-physical-execution-ack.md) | M6-B.4 ends at typed physical execution and the durable ACK interface; the worker-originated Result data plane (transport, authentication, retry, ingress) is explicitly deferred. |
+| [ADR-0013](0013-m6b5-policy-authority-algebra-identity.md) | M6-B.5 policy authority: four security objects, no `P_config`, `R_min` restricted to existing positive Task obligations, per-object coarse projection/consistency, authored catalog vs inline derived policies, admission satisfiability, and schema v9 identity. |
+| [ADR-0014](0014-m6b5-enforcement-compilation-receipt.md) | M6-B.5 enforcement compilation is root-relative and bounded; winner failure never falls back; the Execution security snapshot carries the actual AgentType; the applied-security receipt lives outside the worker-writable jail and joins the RUNNING + first-renewal transaction. |
+| [ADR-0015](0015-m6b5-credentials-feature-gates-scope-freeze.md) | M6-B.5 credential eligibility uses a per-acquisition observation epoch with explicit failure classes; v1 production enables only `BrokeredAccess`; three independent imported gates; the policy-only, credential-bound and M6-B aggregate freeze scopes are separate. |
 
 Template for a new ADR:
 

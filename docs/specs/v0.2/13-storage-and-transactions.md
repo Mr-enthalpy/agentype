@@ -39,6 +39,11 @@ shape. Existing worker escalations retain their format; preparation causes use a
 tagged child. Recovery repairs latest already-suspended faults missing their Root
 decision exactly once.
 
+M6-B.5 uses fresh schema v9 (final number fixed with the B5.1 table shape) and
+rejects any v8 database at open; it MUST NOT silently reinterpret a v8
+`sandbox_policy` reference or synthesize missing security rows. There is no
+v8 -> v9 in-place upgrade while `D-DB-MIGRATE` is unresolved.
+
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:
 
@@ -194,6 +199,31 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   V0.1 capacity; a marker/child mismatch is corruption that aborts the whole
   reconcile transaction, never a silent exclusion.
 
+M6-B.5 (schema v9, when B5.1 freezes the table shape) adds the effective-security
+surface designed in
+[ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md) and
+[ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md):
+
+- An immutable authored sandbox-policy catalog stores exact revisions, canonical
+  content, and Core-computed digests. Intersection products are canonical inline
+  bytes plus a digest; they are never inserted as catalog rows.
+- `task_security_bindings` is immutable and write-once, created inside the
+  typed-admission transaction: inline admitted policy bytes, policy digest,
+  authored input refs/digests, and `normalization_version` /
+  `meet_algorithm_version`. A `SECURITY_V1` Task without its row is corruption.
+- `execution_security_snapshots` is immutable, one per Execution, created in the
+  same transaction as the Execution and `BindingSnapshot`: inline effective
+  policy bytes and digest, derivation identity, enforcement profile/digest,
+  security plan/digest, bootstrap manifest digest, secret-free credential plan,
+  actual bound `AgentTypeRef` (or digest), and Task derivation digest.
+- `applied_security_receipts` is immutable, write-once, instance-bound, and
+  stored outside the worker-writable jail root/workspace. It is consumed by the
+  RUNNING + first-renewal transaction, never by a separate security state
+  machine.
+- `SECURITY_V1` is a positive parent-side marker; a missing child is corruption
+  and MUST NOT degrade to `COARSE_V1`. The same write-once, same-identity
+  `INSERT OR REPLACE`, and authoritative-read coherence guards apply.
+
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
 change never alters a revision content digest:
@@ -305,8 +335,9 @@ cannot construct a record that merely looks validated.
 | Batch submit | Batch + Task graph + dependencies + initial BLOCKED/QUEUED |
 | Claim | fencing epoch increment + Attempt + Lease + LogicalAgent ASSIGNED |
 | Execution create | Execution associated with Attempt and Incarnation |
+| Execution security commitment | For `SECURITY_V1`, the Execution + `BindingSnapshot` transaction also writes the immutable `ExecutionSecuritySnapshot`, carrying the inline effective policy, the actual bound AgentType identity, the enforcement profile and the security plan digest. The snapshot MUST NOT be created or repaired later. |
 | Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
-| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. |
+| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, the validated `AppliedSecurityReceipt` is an input to the same transaction; a missing or invalid receipt cannot produce RUNNING. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |
 | Suspend | Task SUSPENDED, Lease REVOKED, Escalation, Batch SUSPENDED, and the decision/control outbox event in the **same** transaction |
@@ -319,7 +350,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. For `SECURITY_V1`, the same transaction also writes the immutable `TaskSecurityBinding` and rejects admission unless `R_min(T) ⊆ meet(P_generation, P_task)`. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

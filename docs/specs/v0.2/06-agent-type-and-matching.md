@@ -60,11 +60,16 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   look like security but have no enforcement path. A security/authority
   restriction MUST NOT exist without a proof path, and a derived type MUST NOT
   become narrower without an equal-or-narrower mechanically enforceable policy.
-  In M6-B.1 the sandbox policy is pinned by **exact reference** (equality);
-  ordering two policy references and intersecting AgentType with Task policy is
-  deferred (`D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION`), so the coarse
-  workspace/network/isolation fields and restriction capabilities are the
-  B.1-composable restrictions.
+  In M6-B.1 the sandbox policy is pinned by **exact reference** (equality).
+  M6-B.5 defines ordering and intersection for `SECURITY_V1` only
+  ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md)):
+  four security objects, no `P_config`, positive `R_min` drawn from existing
+  structured fields, per-object coarse relations (AgentType equality,
+  Generation projection, Task consistency), admission satisfiability
+  `R_min(T) ⊆ meet(P_generation, P_task)`, and authored catalog versus inline
+  derived policies. `COARSE_V1` replay keeps the exact-reference rule;
+  `D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION` remain the registry pointers
+  until B5.5 verifies backend coverage.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle coverage and the continuity minimum against
   the **effective** envelope (a config may narrow, never widen, the source's
@@ -97,7 +102,10 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   requires an active adapter policy, satisfied `required_safety`, a coherent
   adapter kind/binding, and a currently resolvable exact binding (M6-B.4); the
   availability of required credential refs is a B.5 conjunct, and B.4 records
-  only a secret-free credential-reference digest. No second implicit eligibility
+  only a secret-free credential-reference digest. B.5 fixes that conjunct in
+  [ADR-0015](../../decisions/0015-m6b5-credentials-feature-gates-scope-freeze.md)
+  (per-acquisition observation epoch, independent feature gates, v1
+  `BrokeredAccess` only). No second implicit eligibility
   relation may be introduced for these. For `Restriction` capabilities the
   effective value is the deterministic join of the AgentType and Task values
   (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality). `Bool`

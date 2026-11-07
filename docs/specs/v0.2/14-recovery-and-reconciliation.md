@@ -48,6 +48,16 @@ Execution itself to be RUNNING.
 The positive RUNNING transition and first Lease renewal MUST commit in one
 fenced Core transaction before daemon admission ([13](13-storage-and-transactions.md)).
 
+**M6-B.5 (`SECURITY_V1`):** a `start` or `reconcile_start` observation carries an
+`AppliedSecurityReceipt`. The observation, the validated receipt, the positive
+RUNNING transition and the first renewal MUST commit in the same fenced
+transaction; no separate security-confirmation state exists. On restart,
+`reconcile_start` MUST recover the receipt for the same physical instance. If it
+cannot, the Execution MUST NOT be admitted as RUNNING, a receipt MUST NOT be
+synthesized, and the legacy RUNNING path MUST NOT be used. The receipt is stored
+in a daemon-owned state directory outside the worker-writable jail
+root/workspace ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md)).
+
 **M5:** configuration MUST satisfy
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`.
 
