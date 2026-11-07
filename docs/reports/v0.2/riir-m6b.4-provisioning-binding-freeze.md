@@ -534,8 +534,9 @@ reverts to NOT FROZEN.
   Windows Job Object, so descendants spawned by the worker or harness can
   outlive the direct child. This is not a quiescence claim — M5 never derives
   `quiescent_confirmed` from process death — and it does not reopen writer
-  authority. Process-tree lifetime management and its conformance remain a
-  follow-up capability with an explicit boundary.
+  authority. Process-tree lifetime management remains a follow-up capability; the
+  adapter docs, ADR-0012 non-claims and spec 16's conformance list state the
+  boundary explicitly.
 - **Network enforcement**: the jail supports `Enabled` only; other policies are
   rejected as Unavailable rather than weakened.
 - **Attempt isolation**: not provided by a per-execution workspace and never

@@ -304,6 +304,9 @@ M6-B.4 provisioning binding and exact launch MUST cover:
 - the selected winner is prepared only AFTER its claim/binding is durably
   committed; losers are never prepared, and neither `attest` nor `prepare` creates
   a physical resource (no side effect precedes the Execution)
+- adapter termination is scoped to the proven direct process: no process group,
+  cgroup or Windows Job Object is created, so descendant lifetime and process-tree
+  cleanup are not claimed, and process death remains non-quiescence
 - `attest` and `prepare` each receive one absolute `AdapterDeadline`; the
   enumeration deadline and the winner-preparation deadline are distinct, so
   candidate probes cannot consume the preparation budget
