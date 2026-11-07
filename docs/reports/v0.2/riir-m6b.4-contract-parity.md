@@ -73,3 +73,10 @@ These witnesses establish the library boundaries above. Actual typed daemon
 start/recovery, real source lifecycle and security conformance, v7 migration and
 milestone freeze remain separate gates. Stored WARM state and fake-adapter calls
 are not claims of production physical cleanup or enforcement.
+
+> Post-merge addendum (2026-11-08): the separate milestone gate named above is
+> now tracked in the
+> [M6-B.4 freeze record](riir-m6b.4-provisioning-binding-freeze.md), which
+> records the merge baseline `5808783`, the fifth audit at `ec09375`, and the
+> `FROZEN` state within ADR-0012 (maintainer authorization, 2026-11-08). The
+> witnesses in this report are unchanged.

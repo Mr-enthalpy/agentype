@@ -32,11 +32,12 @@ at its own version.
 
 M6-B.4 deployment is restricted to fresh schema-v8 databases and reopening
 existing v8 databases. An existing v7 database MUST be rejected; passing v8
-conformance does not claim safe upgrade of frozen B.3 data. During this unfrozen
-PR, additive v8 preparation-fault/decision DDL is installed by idempotent
-initialization when reopening earlier PR-era v8 stores. Existing worker
-escalations retain their format; preparation causes use a tagged child. Recovery
-repairs latest already-suspended faults missing their Root decision exactly once.
+conformance does not claim safe upgrade of frozen B.3 data. During M6-B.4
+bring-up, additive v8 preparation-fault/decision DDL is installed by idempotent
+initialization when reopening earlier v8 stores created before the final v8
+shape. Existing worker escalations retain their format; preparation causes use a
+tagged child. Recovery repairs latest already-suspended faults missing their Root
+decision exactly once.
 
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:

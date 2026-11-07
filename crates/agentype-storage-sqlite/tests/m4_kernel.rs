@@ -2032,3 +2032,40 @@ fn schema_v6_database_is_rejected_after_typed_tables() {
         "the rejection must be the schema-version gate: {err:?}"
     );
 }
+
+/// Schema v7 (M6-B.3 typed admission, no M6-B.4 provisioning bindings,
+/// binding snapshots or preparation-fault tables) is rejected at open:
+/// D-DB-MIGRATE is unresolved, so there is deliberately no v7->v8 upgrade.
+/// A fresh v8 database and reopening an existing v8 database remain the only
+/// supported deployments.
+#[test]
+fn schema_v7_database_is_rejected_after_b4_tables() {
+    let db = FixtureDb::new("schema-v7-old");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=7", [])
+        .unwrap();
+    // Drop the v8-only child tables in foreign-key-safe order. The version gate
+    // rejects an old file before inspecting its physical shape.
+    conn.execute("DROP TABLE binding_snapshots", []).unwrap();
+    conn.execute("DROP TABLE preparation_escalations", [])
+        .unwrap();
+    conn.execute("DROP TABLE preparation_faults", []).unwrap();
+    conn.execute("DROP TABLE provisioning_bindings", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v7 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+}
