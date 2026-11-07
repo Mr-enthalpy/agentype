@@ -1,15 +1,18 @@
-# RIIR M6-B.4 — Provisioning Binding and Typed Physical Execution Record
+# RIIR M6-B.4 — Provisioning Binding and Typed Physical Execution Freeze Record
 
-Status: Implementation and acceptance record
-Implementation status: M6-B.4 typed physical execution → durable ACK interface implemented on PR #24
+Status: Historical Report
+Applies to: V0.2 / M6-B.4 closure (PR #24, merge `5808783`)
 Date: 2026-11-06
 Updated: 2026-11-08
+Freeze state: **FREEZE READY — awaiting maintainer decision**
 Canonical path: `docs/reports/v0.2/riir-m6b.4-provisioning-binding-freeze.md`
-Not a specification. The retained filename does not assert a wider freeze.
+Not a specification. The frozen scope, if approved, is only ADR-0012's.
 
-Verdict: **NOT FROZEN — fifth independent audit returned `CLOSED WITH STATED
-SCOPE` for the ADR-0012 boundary; the freeze decision belongs to the repository
-maintainer**. The accepted scope is **typed physical execution → durable ACK
+Verdict: **FREEZE READY — implementation, evidence and scope are closed within
+ADR-0012; the FROZEN label is the repository maintainer's decision**. The fifth
+independent audit returned `CLOSED WITH STATED
+SCOPE` for the ADR-0012 boundary with no new P0/P1 blocker. The accepted scope
+is **typed physical execution → durable ACK
 interface**: typed Task → B.3 matching → B.4 physical eligibility →
 Attempt/Lease/ProvisioningBinding → pure prepare → Execution/BindingSnapshot →
 exact adapter start → observation/recovery → durable Result ACK boundary, with a
@@ -23,6 +26,25 @@ not only a PR note. B.5
 credentials, cold/revivable matching, full typed topology, executed-WARM
 replacement and v7→v8 migration remain out of scope and fail closed (see
 *Remaining limits*).
+
+## Closure states
+
+This record separates four states that earlier text used interchangeably:
+
+```text
+IMPLEMENTED                 production typed dispatch, source integration and
+                            real OS-enforced execution exist (PR #24)
+CLOSED WITH STATED SCOPE    fifth independent audit accepted the ADR-0012
+                            boundary with no new P0/P1 blocker
+FREEZE READY                implementation, evidence, normative text, deferred
+                            ownership and CI are reconciled at this record
+FROZEN                      the maintainer accepts the freeze; not asserted here
+```
+
+`FREEZE READY` is a statement about evidence completeness, not a substitute for
+the maintainer's decision. This record does **not** freeze the worker-originated
+semantic Result data plane: that data plane is outside ADR-0012 and remains
+deferred.
 
 ## Scope and acceptance baseline
 
@@ -145,9 +167,24 @@ limits rather than requesting code changes:
   ranked SourceConfigs still defer rather than picking a winner. ADR-0010 already
   accepts this fail-closed deferral; this record does not invent an ID tie-break.
 
-Because this outcome is a scope-limited acceptance rather than a freeze, the
-verdict stays `NOT FROZEN`: the repository maintainer decides the freeze after
-this review, not the implementation round.
+These three findings are closed for the freeze decision as follows:
+
+- **F1** — accepted scope exclusion. ADR-0012 already excludes the
+  worker-originated data plane; the durable Kernel ACK interface remains proven
+  by the harness-injected E2E. Not a blocker. Tracking:
+  `D-WORKER-RESULT-DP` in [spec 17](../../specs/v0.2/17-deferred-open-questions.md).
+- **F2** — accepted operational limitation. No production deletion path exists
+  for jail roots, workspaces, stdout/stderr or locators; immediate deletion
+  without a durable positive safety witness would be unsafe. Not a blocker.
+  Tracking: `D-ARTIFACT-GC` in [spec 17](../../specs/v0.2/17-deferred-open-questions.md).
+- **F3** — accepted liveness limit. Equal-continuity selection continues to
+  defer as `SelectionAmbiguous` under ADR-0010; no tie-break, random choice or
+  implicit fallback is added. Not a blocker. Tracking: `D-SELECTION-POLICY` in
+  [spec 17](../../specs/v0.2/17-deferred-open-questions.md).
+
+The implementation round therefore hands over a **FREEZE READY** record. The
+`FROZEN` label is not asserted here: it requires the maintainer's explicit
+decision after reviewing this closure PR.
 
 Deployment remains restricted to fresh schema-v8 databases and reopening
 existing v8 databases. v7→v8 migration is not implemented. The frozen specs
@@ -384,6 +421,40 @@ confinement properties, not as a general sandbox for arbitrary malicious code.
 | v7→v8 migration out of scope | Preserved | schema remains fresh-v8 / existing-v8 only |
 | B.5 credentials / cold/revivable / typed topology fail closed | Preserved | credential-ref acquisition rejection; no new code path |
 
+## Post-merge acceptance matrix
+
+Baseline: merge commit `5808783` (PR #24), schema v8. `PASS (local)` means the
+named Rust test was executed on this Windows host; `PASS (CI)` means the named
+platform's CI job executed it. Linux-only enforcement is never claimed from a
+Windows compile.
+
+| Contract / invariant | Production code | Test witness | Windows | Linux | Result | Limit / owner |
+|---|---|---|---|---|---|---|
+| Typed and legacy tasks share the control loop without starvation | `agentype-runtime/src/control.rs`, `lib.rs` | `legacy_and_typed_tasks_are_both_dispatched_from_a_shared_queue` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Pre-acquisition unavailability creates no authority and no NACK | `runtime/src/lib.rs` (`defer_or_fail_typed`), `provisioning_resolver.rs` | `unprovisionable_typed_task_creates_no_authority_and_no_nack`, `typed_task_requires_the_exact_adapter_binding_alias` | PASS (local, CI) | PASS (CI) | PASS | Credentials are B.5; fail closed |
+| `attest`/`prepare` are pure; no physical creation before Execution | `agentype-source-workspace-jail`, `provisioning_resolver.rs` | `expired_prepare_deadline_creates_no_directory`, `deadline_expiring_between_phases_stops_before_the_next_phase`, `acquisition_reproves_the_mandatory_conjuncts` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Attempt/Lease/ProvisioningBinding and Execution/BindingSnapshot commit atomically | `agentype-storage-sqlite/src/kernel.rs` | `typed_acquisition_and_atomic_binding_snapshot_round_trip`, `typed_acquisition_handoff_commits_snapshot_bearing_execution` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Exact `(adapter_kind, adapter_binding_key)` binding; no fallback after commitment | `provisioning_resolver.rs`, `runtime/src/lib.rs` | `physical_composition_never_falls_back_to_another_installed_adapter`, `dispatch_missing_adapter_creates_no_writer_ambiguity` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Prepare failure settles; confirmed fatal preparation fault escalates once | `provisioning_resolver.rs`, `kernel.rs` | `post_commit_prepare_failure_settles_unavailable`, `confirmed_fatal_preparation_survives_restart_without_execution_lost_retry`, fatal-prep E2E | PASS (local, CI) | PASS (CI) | PASS | — |
+| No blind restart after an ambiguous start or missing evidence | `runtime/src/lib.rs`, `recovery.rs` | `dispatch_ambiguous_start_is_persisted_and_never_restarted`, `reconcile_without_any_physical_evidence_is_ambiguous_not_respawned` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Daemon crash/restart adopts the same physical instance | `typed_e2e.rs` | `typed_daemon_restart_recovers_the_same_physical_instance` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Birthless locator cannot impersonate or act without the SID witness | `agentype-adapter-local-process/src/lib.rs` | `born_less_locator_cannot_impersonate_an_unrelated_pid`, `born_less_locator_without_the_restricting_sid_has_no_control_authority`, `sid_and_birth_proof_come_from_the_same_open_handle` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Windows restricting SID/token/desktop and cross-jail write denial | `adapter-local-process/src/jail.rs` | `worker_token_is_minimal_and_desktop_is_private`, `write_a_cannot_write_read_only_b_jail`, `token_information_buffer_is_aligned_and_bounds_checked` | PASS (local, CI) | n/a | PASS | Same-user read confidentiality not claimed |
+| Shared window station DACL does not accumulate per-Execution ACEs | `jail.rs` | `private_desktops_do_not_accrue_window_station_aces`, `shared_window_station_acl_does_not_grow_across_execution_lifecycles` | PASS (local, CI) | n/a | PASS | Read-shaped station rights remain |
+| Linux Landlock ABI gate and content-write boundary | `jail.rs` | `legacy_landlock_abis_are_not_enforceable`, `linux_read_only_landlock_is_a_content_write_boundary_not_metadata_immutability`, `linux_write_landlock_is_a_content_write_boundary_not_metadata_immutability` | n/a | PASS (CI) | PASS | Metadata syscalls unconfined |
+| ReadOnly durable ACK succeeds | `kernel.rs` | `typed_read_only_task_runs_end_to_end_and_acks_through_the_daemon` | PASS (local, CI) | PASS (CI) | PASS | ACK is harness-injected (F1) |
+| Write without quiescence refuses ACK | `kernel.rs` | Write E2E, `writer_safety_suspension_is_distinct_from_task_completed` | PASS (local, CI) | PASS (CI) | PASS | — |
+| Physical termination creates no Result and no quiescence | `runtime/src/lib.rs`, `kernel.rs` | `dispatch_ambiguous_write_start_never_gains_quiescence`, `unisolated_writer_expiry_without_quiescence_suspends` | PASS (local, CI) | PASS (CI) | PASS | Direct process only; no process tree |
+| v7 store rejected; existing v8 store reopens | `storage-sqlite/src/store.rs` | `schema_v7_database_is_rejected_after_b4_tables`, `prior_v8_database_reopen_installs_additive_preparation_fault_guards` | PASS (local) | PASS (closure CI) | PASS | No v7→v8 migration (`D-DB-MIGRATE`) |
+| Worker-originated Result transport/auth/retry/ingress (F1) | none — excluded by ADR-0012 | Harness calls `Kernel::ack_success`; no worker transport | n/a | n/a | DEFERRED | `D-WORKER-RESULT-DP` |
+| Artifact retention and safe GC (F2) | none — no production deletion authority | `prepare_jail` retains jail/workspace/stdout/stderr/locator; only test code deletes | n/a | n/a | DEFERRED | `D-ARTIFACT-GC` |
+| Equal-continuity selection policy (F3) | `provisioning_resolver.rs` | `ambiguous_selection_fails_closed`, `a_new_equal_continuity_config_blocks_warm_reuse_until_the_tie_is_removed` | PASS (local, CI) | PASS (CI) | DEFERRED (liveness) | `D-SELECTION-POLICY` / ADR-0010 |
+
+`PASS (CI)` for Linux refers to the ubuntu job of run `42404395365` (20 jail
+enforcement tests, 10 typed E2E, 35 public-API probes). The newly added v7
+schema-gate test is not part of that run; its Linux execution is the closure
+PR's ubuntu job, and the PR record binds the result to the exact closure SHA.
+
 ## E2E trace (real run, Windows)
 
 Command:
@@ -498,27 +569,82 @@ Local checks on 2026-11-08 (Windows):
 |---|---|
 | `cargo fmt --all --check` | passed |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
-| `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary` | passed (adapter-local-process lib 39, conformance 26, daemon acceptance 4, jail 19, typed E2E 10, runtime 298, storage m4 72, B.3 42, B.4 56, frontier 49, catalog 32) |
 | `cargo test -p agentype-public-api-boundary` | 35 passed |
 | `cargo test -p agentype-adapter-local-process --test jail_enforcement -- --test-threads=1` | 19 passed (real OS enforcement, including token/desktop, station-DACL lifecycle, locator recovery and the birthless-locator negative control tests) |
 | `cargo test -p agentype-adapter-local-process --test typed_e2e -- --test-threads=1` | 10 passed (including real daemon restart and mixed legacy/typed queue) |
 | `cargo test -p agentype-adapter-local-process --lib` | 39 passed (including the variable-length token header negative cases, the deterministic SID/birth same-handle probe, token-buffer alignment/bounds and station-DACL unit tests) |
-| `cargo test -p agentype-storage-sqlite --test b3_typed_admission bounded_typed_enumeration_skips_a_large_blocked_head` | passed (30 blocked high-priority Tasks, bounded page still finds the ready ones) |
-| `cargo test -p agentype-storage-sqlite --test b3_typed_admission large_cooldown_set_cannot_exhaust_sqlite_parameters` | passed (40,000 cooling ids exceed this build's variable limit yet the query stays bounded) |
+| `cargo test -p agentype-storage-sqlite --all-features --test m4_kernel schema_v7_database_is_rejected_after_b4_tables` | passed (a v7 fixture is rejected by the schema-version gate) |
+| `cargo test -p agentype-storage-sqlite --all-features --test b3_typed_admission bounded_typed_enumeration_skips_a_large_blocked_head` | passed (30 blocked high-priority Tasks, bounded page still finds the ready ones) |
+| `cargo test -p agentype-storage-sqlite --all-features --test b3_typed_admission large_cooldown_set_cannot_exhaust_sqlite_parameters` | passed (40,000 cooling ids exceed this build's variable limit yet the query stays bounded) |
 
 The local Windows run needed `C:\ProgramData\agentype` to be a junction to a
 workspace directory because the sandboxed test process cannot create the
 production machine-lock directory. This is a local harness constraint; no
 production code was changed for it, and CI does not use that workaround.
 
-Remote CI is the acceptance gate. The final PR head check run (fmt, clippy,
-workspace tests, public-API boundary) is recorded on PR #24; the head SHA is
-reported with the completion summary so the evidence is tied to the exact
-tested commit. The fifth audit independently read the job logs at
-`ec093753f30e81771d36fe555fbf1c509a6c77ee` and confirmed 6/6 jobs on both the
-push and pull-request runs, with Windows jail 19, Linux jail 20, typed E2E 10 per
-platform and the public-API boundary 35. If remote CI fails, this record is not a
-freeze and the verdict reverts to NOT FROZEN.
+Remote CI is the acceptance gate.
+
+```text
+push @ ec093753f30e81771d36fe555fbf1c509a6c77ee
+    https://github.com/Mr-enthalpy/agentype/actions/runs/42402482506  PASS
+pull_request @ ec093753f30e81771d36fe555fbf1c509a6c77ee
+    https://github.com/Mr-enthalpy/agentype/actions/runs/42402487742  PASS
+push @ 58087836ea690c010bc2d7152b646a16ca1066be (main, PR #24 squash merge)
+    https://github.com/Mr-enthalpy/agentype/actions/runs/42404395365  PASS 6/6
+```
+
+This closure PR changes documentation and adds one schema-gate test only; it
+must pass its own push and pull-request CI before merge. A green run on
+`5808783` is **not** cited as proof for a later closure HEAD.
+
+## Freeze gate resolution
+
+ADR-0012 Decision 5 requires an independent re-audit at an exact final
+implementation SHA with green Linux and Windows CI.
+
+| Gate | Evidence |
+|---|---|
+| Independent audit | Fifth audit returned `CLOSED WITH STATED SCOPE`, no new P0/P1 |
+| Audit subject | `ec093753f30e81771d36fe555fbf1c509a6c77ee` (PR #24 head), **not** a distinct audit of `5808783` |
+| Merge | `58087836ea690c010bc2d7152b646a16ca1066be` (squash merge of PR #24) |
+| Audited → merge delta | `git diff --stat ec09375 5808783` = one file, this report; documentation only, no implementation change |
+| CI at the audited head | push `42402482506` PASS, PR `42402487742` PASS |
+| CI at the merge commit | `42404395365` PASS, 6/6 jobs |
+| Closure PR | documentation + one schema-gate test; requires its own green CI |
+
+The audit evidence therefore covers the implementation content that is present
+at the merge commit. It is not described as an audit executed against the merge
+SHA itself, and no later closure commit inherits that evidence without the
+documentation-only delta being stated.
+
+## Baseline and evidence mapping
+
+```text
+SCHEMA_VERSION = 8
+Frozen base (main before M6-B.4):  cbd5a7518395247dc7abfef996eb307e7a526f25
+Audited implementation head:       ec093753f30e81771d36fe555fbf1c509a6c77ee
+Merge commit (PR #24):             58087836ea690c010bc2d7152b646a16ca1066be
+CI @ audited head:                 push 42402482506 / PR 42402487742   PASS
+CI @ merge commit:                 42404395365                        PASS 6/6
+Closure branch:                    agent/m6b4-freeze-closure
+```
+
+The third, fourth and fifth audit revisions and their findings remain recorded
+in the sections above; no failed revision is removed to manufacture a pass.
+
+## Post-merge document reconciliation
+
+| Document | Statement at merge | Reconciliation |
+|---|---|---|
+| `docs/README.md` | M6-B.4 "incomplete and not frozen" because the worker data plane is deferred | Corrected: that data plane is outside ADR-0012; the milestone is FREEZE READY within the stated scope |
+| This record | Verdict `NOT FROZEN` | Updated to FREEZE READY with the evidence mapping above |
+| [ADR-0008](../../decisions/0008-m6b-typed-provisioning-acquisition.md) | Status: "not a milestone freeze" | Describes the ADR's own status; the milestone state is owned here |
+| [ADR-0010](../../decisions/0010-m6b-selection-order-scope.md) | Equal-continuity selection fails closed | Unchanged and still governs F3 |
+| [ADR-0011](../../decisions/0011-m6b-acquisition-contract-parity.md) | Status: "not a milestone freeze"; "unfrozen v8 schema" | Describes the correction's own status and the pre-freeze state; the v8 shape is recorded here |
+| [ADR-0012](../../decisions/0012-m6b4-scope-typed-physical-execution-ack.md) | Freeze requires independent re-audit at an exact SHA with green CI | Condition satisfied by the mapping above; the ADR text is not rewritten |
+| [spec 13](../../specs/v0.2/13-storage-and-transactions.md) | "During this unfrozen PR" | Editorial change to bring-up wording; behavior unchanged |
+| [contract parity report](riir-m6b.4-contract-parity.md) | "milestone freeze remain separate gates" | True when written; the gate is now tracked here and its witnesses are unchanged |
 
 ## Remaining limits
 
@@ -530,20 +656,24 @@ freeze and the verdict reverts to NOT FROZEN.
   durable fencing is not physical termination. WARM equal-continuity priority
   remains unresolved (ADR-0010).
 - **v7→v8 migration**: not implemented; fresh-v8 or existing-v8 only.
-- **Worker Result transport/auth/retry**: not implemented. E2E invokes the
+- **Worker Result transport/auth/retry (F1)**: not implemented. E2E invokes the
   durable `Kernel::ack_success` command from the harness; there is no production
   worker data plane, worker authentication, delivery retry, or worker-originated
-  ACK claim. See *Harness-injected ACK boundary*. The fifth audit records this as
-  a scope gap (F1): the suite supports `typed physical execution → durable ACK
-  interface`, not a worker-originated semantic Result loop.
-- **Execution artifact retention / GC**: per-RequestId jail roots and workspaces,
-  stdout/stderr files and the recoverable locator are created on the start path
-  and are retained after terminate, collect and restart. There is no durable
-  retention owner, no safe-GC authority and no disk-growth control yet (fifth
-  audit F2). Immediate deletion is deliberately not attempted: evidence,
-  unresolved writers and restart reconciliation may still depend on those
-  artifacts. Until an artifact-owner contract exists, long-running deployments
-  must treat jail-root growth as an operational responsibility.
+  ACK claim. See *Harness-injected ACK boundary*. Disposition: **accepted scope
+  exclusion, not an M6-B.4 freeze blocker**. Owner/tracking:
+  `D-WORKER-RESULT-DP` in [spec 17](../../specs/v0.2/17-deferred-open-questions.md);
+  a later milestone or ADR must define the transport/auth/retry/ingress contract.
+- **Execution artifact retention / GC (F2)**: per-RequestId jail roots and
+  workspaces, stdout/stderr files and the recoverable locator are created on the
+  start path and are retained after terminate, collect and restart. There is no
+  durable retention owner, no safe-GC authority and no disk-growth control yet.
+  No production deletion path exists: immediate deletion is deliberately not
+  attempted because evidence, unresolved writers and restart reconciliation may
+  still depend on those artifacts. Disposition: **accepted operational
+  limitation, not an M6-B.4 freeze blocker**. Owner/tracking: `D-ARTIFACT-GC` in
+  [spec 17](../../specs/v0.2/17-deferred-open-questions.md); until that design
+  exists, long-running deployments must treat jail-root growth as an operational
+  responsibility and monitor disk usage.
 - **Platform coverage**: Windows enforcement is executed locally. Linux
   Landlock is implemented and compiled here but must be executed by the Linux CI
   runner; ABI 1/2 rejection and `ftruncate`/`open(O_TRUNC)` counterexamples are
