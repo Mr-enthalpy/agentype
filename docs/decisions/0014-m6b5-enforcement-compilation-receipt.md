@@ -177,7 +177,8 @@ required-access digest
 enforcement profile identity + profile digest
 security plan bytes + digest
 bootstrap manifest digest
-credential access plan (secret-free, with proof identity/epoch/issuer/validity)
+credential access plan (secret-free; canonical request digest,
+    proof identity/epoch/issuer/validity)
 security protocol version
 actual bound AgentTypeRef or digest
 Task derivation digest
@@ -203,9 +204,17 @@ been cleared. When two Tasks differ in write scope, secret scope, or execution
 guarantees, reusing one physical host across them requires a fresh per-Execution
 isolation proof, or an explicit reset/quiescence witness that covers exactly the
 state the earlier Task could have written. Without one of those the reuse fails
-closed and the Task does not start on that host. The B.4 per-`RequestId` jail is a
-reference implementation of such a proof for its own adapter; it MUST NOT be
-generalized into a default guarantee for every adapter.
+closed and the Task does not start on that host.
+
+The B.4 per-`RequestId` jail proves exactly one dimension — content-write
+confinement — inside its own adapter, so it is a reference implementation for
+that dimension only. A fresh per-Execution write jail is not complete cross-Task
+security-context isolation: it does not prove same-user read confidentiality,
+that an old credential capability cannot be reused, descendant-process
+confinement, or attempt isolation. For a credential-bound WARM reuse the runtime
+needs, in addition, an execution-bound verification of the broker capability,
+proof that the previous capability cannot be inherited or continued, or a
+physically verified reset witness; if none is available the reuse is refused.
 
 ### 7. Secured start observation and receipt
 
@@ -435,6 +444,17 @@ own durable protocol in a later ADR, and B5.1 MUST NOT invent a delivery sequenc
 on its own. A missing or mismatched credential receipt keeps the phase at most
 `HELD`/`UNKNOWN`. A policy-only Execution has `credential_delivery = None` and
 does not need a credential receipt.
+
+The single receipt covers the whole plan, not one reference at a time. When the
+plan requests several credential references, the receipt MUST prove that the
+entire requested set was delivered exactly, with the committed
+use/scope/audience/delivery mode. Partial delivery is not a successful receipt, and
+an Execution with a partially delivered plan MUST NOT reach `RELEASED`: if some
+references are established and another fails,
+the phase stays at most `HELD`/`UNKNOWN`, the runtime reconciles the broker
+delivery and closes the partial capabilities, and when closure cannot be proven it
+records `UNKNOWN` and follows M5 recovery rather than treating the delivered
+subset as harmless. The next attempt is a new Execution with a new plan and chain.
 
 The following are mandatory:
 

@@ -55,6 +55,10 @@ usable bearer token.
 A delivery session targets the exact execution request and the proven recipient
 environment, never merely "this PID" or "this SourceConfig".
 
+The canonical `CredentialRequest` (section 2) is an input derivation, not a
+fourth credential object: it is secret-free, never authorizes anything on its own,
+and only its digest is carried into the eligibility evidence and the access plan.
+
 ### 2. Broker interface
 
 ```text
@@ -74,6 +78,26 @@ revoke_or_close(delivery_identity, deadline)
 
 `probe_availability` is read-only. The other three belong to post-commit
 physical start and recovery.
+
+The broker never invents the request. The request is derived before the probe,
+from the exact `SourceConfig` revision, by the trusted source-local resolver:
+
+```text
+SourceConfig exact revision
+    → trusted source-local request resolver
+    → canonical secret-free CredentialRequest
+    → validate_within(P_eff)
+    → broker probe
+```
+
+`CredentialRequest` is canonical and secret-free. It fixes at least the
+credential-reference set, use, scope, audience, delivery mode, and a canonical
+digest. It can only request; it never grants. Runtime validates the whole request
+against `P_eff` (the AgentType grant and any narrowing Generation/source ceilings)
+before any broker probe, so a scope cannot be learned from the broker and then
+authorized. The request digest enters winner qualification and the
+`CredentialAccessPlan`; a request that changes after qualification belongs to a
+new observation epoch and cannot be merged into the committed plan.
 
 Broker routes bind the exact SpawnSource revision; a new source revision does
 not automatically inherit an old route. Registration/installation belongs to
@@ -155,6 +179,11 @@ interchangeable with broker availability:
 - a ref/use/scope/audience/delivery mode outside the granted set makes the
   candidate ineligible before any broker call, and it is never truncated,
   widened, or satisfied by a later gate.
+
+The request validated here is the canonical `CredentialRequest` produced by the
+trusted source-local resolver from the exact `SourceConfig` revision (section 2).
+B5.3 MUST NOT derive scope, audience, use, or delivery mode from a broker
+response, and MUST NOT treat a successful probe as authorization.
 
 If the winner's eligibility becomes invalid before commit, the default is defer,
 not reselection. Only a new complete observation epoch may select again, with a
@@ -306,6 +335,16 @@ a versioned delivery identity and a new durable protocol in a later ADR. A missi
 or mismatched delivery receipt keeps the phase at most `HELD`/`UNKNOWN`. A
 policy-only Execution has no credential receipt and does not need one.
 
+The single receipt covers the whole plan, not one reference at a time. A plan may
+request several references; its receipt MUST prove the entire requested set was
+delivered exactly, with the committed use/scope/audience/delivery mode. Partial
+delivery is not a successful receipt and never reaches `RELEASED`. If some
+references succeed and another fails, the Execution stays at most
+`HELD`/`UNKNOWN`; recovery calls `reconcile_delivery`, closes the partial
+capabilities with `revoke_or_close`, and if closure cannot be proven records
+`UNKNOWN` and follows M5 recovery instead of assuming the delivered subset is
+harmless. The next attempt is a new Execution with a new plan and chain.
+
 ### 11. Scoped freeze ladder
 
 The freeze status ladder is:
@@ -436,8 +475,10 @@ B5.5 MUST treat these as mandatory regression categories:
 | `P_source` top | a `SECURITY_V1` SpawnSource revision without an authored fine ceiling has `P_source = Top` and adds no restriction, but still requires complete imported-enforcement coverage, the feature gate and credential qualification; `Top` never bypasses eligibility |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | credential authorization is positive and deny-by-default: the AgentType `SECURITY_V1` ceiling must explicitly grant ref, use, scope, audience and delivery mode; an omitted declaration grants nothing and is never `Top`; Generation and source ceilings may only narrow; a request outside the grant is rejected before any broker call, never truncated or widened, and broker `Available` plus adapter support cannot substitute for the grant |
+| Credential request provenance | the request is produced only by the trusted source-local resolver from the exact `SourceConfig` revision as a canonical secret-free `CredentialRequest` (ref set, use, scope, audience, delivery mode, canonical digest), validated as a whole against `P_eff` before any probe; the digest enters winner qualification and the `CredentialAccessPlan`; no scope may be derived from a broker response, so "probe then authorize" is a rejected ordering |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
-| Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain |
+| Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain; the single receipt must prove the whole requested set was delivered exactly, and partial delivery never reaches `RELEASED` |
+| WARM credential reuse | a fresh per-Execution write jail proves content-write confinement only, not complete cross-Task security-context isolation; credential-bound WARM reuse additionally needs execution-bound broker verification, proof the old capability cannot be inherited or continued, or a physically verified reset witness, and is refused otherwise |
 | RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |

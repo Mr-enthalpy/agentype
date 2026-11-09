@@ -237,7 +237,8 @@ surface designed in
   same transaction as the Execution and `BindingSnapshot`: inline effective
   policy bytes and digest, derivation identity, enforcement profile/digest,
   security plan/digest, bootstrap manifest digest, secret-free credential plan
-  including proof identity, broker epoch, issuer version, validity bound and
+  including the canonical credential-request digest, proof identity, broker
+  epoch, issuer version, validity bound and
   subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task
   derivation digest.
 - `applied_security_receipts` is an immutable, write-once, append-only receipt
@@ -250,7 +251,10 @@ surface designed in
   at most one `SandboxAppliedReceipt` and at most one `CredentialDeliveryReceipt`
   per Execution. A second delivery request for the same Execution is rejected
   before delivery, and a second row of the same kind is corruption, never an
-  upsert or append. After a pre-RUNNING crash the artifacts may reconstruct and verify
+  upsert or append. A receipt covers the whole plan rather than one reference:
+  the requested set must be delivered exactly, and a partially delivered set
+  yields no receipt and cannot reach `RELEASED`. After a pre-RUNNING crash the
+  artifacts may reconstruct and verify
   the chain only under the full relation (same ExecutionId/RequestId, binding and
   plan digest, instance witness, matching sandbox receipt digest, proven release
   phase); a missing artifact cannot be synthesized from the rows, and an artifact

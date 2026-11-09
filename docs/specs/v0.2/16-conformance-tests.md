@@ -477,7 +477,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   itself authorize reusing a WARM host for a Task with a different write scope,
   secret scope, or execution guarantee; reuse requires a fresh per-Execution
   isolation proof or a reset/quiescence witness covering the earlier Task's
-  possible writes, and otherwise fails closed before any physical start;
+  possible writes, and otherwise fails closed before any physical start; a fresh
+  per-Execution write jail proves write confinement only, so credential-bound
+  reuse additionally needs execution-bound broker verification, proof the old
+  capability cannot be inherited or continued, or a verified physical reset
+  witness;
 - after pure prepare failure or cancellation, a STARTING reservation with a
   validated ProvisioningBinding and no Execution history can transactionally
   roll to another config/source once its claim closes; tests MUST cover
@@ -641,6 +645,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   proofs are rejected, and epochs are not mixed; an unknown candidate in the
   winner's continuity tier defers, and only a proven continuity-non-decisive
   candidate may be ignored;
+- credential request provenance: the request comes from the exact `SourceConfig`
+  revision through the trusted resolver as a canonical secret-free
+  `CredentialRequest`, is validated as a whole against `P_eff` before the first
+  probe, and its digest reaches qualification and the `CredentialAccessPlan`; a
+  scope learned from a broker response, or a request changed during the same
+  observation epoch, is rejected as probe-then-authorize;
 - credential evidence durability and scope: proof identity/epoch/issuer
   version/validity/subject digests reach the Execution snapshot, no raw broker
   response is persisted, and a requested scope outside `P_eff` or the Source
@@ -692,6 +702,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   because the committed plan is immutable and one Execution carries at most one
   credential receipt — the different scope needs a new Execution with its own
   qualification, snapshot, and chain;
+- partial credential delivery: a plan requesting several references that
+  establishes only a subset produces no `CredentialDeliveryReceipt`, never reaches
+  `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus
+  closure of the partial capabilities; when closure cannot be proven the state is
+  `UNKNOWN` and M5 recovery applies, never a "mostly delivered" success;
 - receipt durability: file and directory metadata are durable before release, an
   existing different receipt is never replaced, and the worker inherits no
   receipt file/directory handle and no write/delete/replace access; read

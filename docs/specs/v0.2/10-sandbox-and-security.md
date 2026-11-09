@@ -150,7 +150,10 @@ In `SECURITY_V1`:
   grants nothing and is never normalized to `Top`. A Generation or source ceiling
   may narrow that grant but never create one, and `SourceConfig.credential_refs`
   is only a request. Broker availability and adapter brokered-delivery support
-  are facts, not grants. When no credential is requested there is no obligation.
+  are facts, not grants. The request itself is resolved from the exact
+  `SourceConfig` revision into a canonical secret-free `CredentialRequest` and
+  validated as a whole before any probe; a broker response never supplies or
+  widens the scope. When no credential is requested there is no obligation.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. A `SECURITY_V1` Task's `TaskSecurityBinding`
