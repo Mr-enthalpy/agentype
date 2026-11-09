@@ -141,6 +141,21 @@ a reference in `SourceConfig` is a request, not an authorization. A requested
 scope outside `P_eff` or outside the source ceiling makes the candidate
 ineligible; it MUST NOT be silently truncated or widened.
 
+Credential authorization is positive and deny-by-default, and it is never
+interchangeable with broker availability:
+
+- the bound AgentType `SECURITY_V1` ceiling MUST explicitly grant the exact
+  `CredentialRef` together with its use, scope, audience, and delivery mode; an
+  omitted secret-scope dimension in that ceiling grants nothing and is never
+  normalized to `Top`;
+- a `Generation` or source ceiling that declares the dimension may narrow that
+  grant, but cannot create or widen one;
+- `SourceConfig.credential_refs` remains a request; broker `Available` evidence
+  and adapter brokered-delivery support are facts, not authorizations;
+- a ref/use/scope/audience/delivery mode outside the granted set makes the
+  candidate ineligible before any broker call, and it is never truncated,
+  widened, or satisfied by a later gate.
+
 If the winner's eligibility becomes invalid before commit, the default is defer,
 not reselection. Only a new complete observation epoch may select again, with a
 bounded retry/backoff limit.
@@ -354,6 +369,17 @@ the contract. After the spike, B5.3 implements the broker and credential
 delivery, and B5.4 integrates them into the physical handoff already proven by
 the spike; the numbering does not authorize starting B5.3 first.
 
+Narrowing the profile never means deleting a condition that `SECURITY_V1` needs
+in order to be trustworthy. If the gap is in the fail-closed hold, receipt
+integrity/non-replaceability/identity binding, or crash and
+control-channel-loss recovery, the spike result MUST NOT be converted into a
+policy-only freeze by dropping that condition. Only non-core enforcement features
+may be removed from the claimed set. Otherwise the platform is recorded as not
+supporting `security_execution_v1.policy`, or a new ADR redefines the supported
+scope. A profile without a trustworthy receipt MUST NOT be described as
+supporting policy-only `SECURITY_V1`, because that would turn an engineering
+failure in B5.4 into a scope reinterpretation in B5.5.
+
 `D-TOPOLOGY` remains `BLOCKS_SEMANTIC_LAYER (remainder)` and is not silently
 reclassified as an M6-B aggregate blocker. Whether full typed topology belongs
 in the aggregate freeze is a maintainer decision requiring an ADR change, not an
@@ -395,6 +421,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
+| Secured SPI deadline | the three secured operations take one absolute deadline, the hold/receipt-publication/release stages share it with no per-stage reset, an expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery instead of `RELEASED`/RUNNING, and a later `reconcile_secured_start` gets a new bounded deadline without changing the `RequestId` or creating a second instance |
 | Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
 | Receipt chain | receipts are append-only, write-once, and bounded to one per kind per Execution; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a second row of the same kind is corruption, not an append; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
@@ -408,7 +435,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; projection accepts only a `Set` through the versioned member map, so `Bool(true)` projects to nothing and an unmapped member fails closed; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
 | `P_source` top | a `SECURITY_V1` SpawnSource revision without an authored fine ceiling has `P_source = Top` and adds no restriction, but still requires complete imported-enforcement coverage, the feature gate and credential qualification; `Top` never bypasses eligibility |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
-| Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
+| Secret scope containment | credential authorization is positive and deny-by-default: the AgentType `SECURITY_V1` ceiling must explicitly grant ref, use, scope, audience and delivery mode; an omitted declaration grants nothing and is never `Top`; Generation and source ceilings may only narrow; a request outside the grant is rejected before any broker call, never truncated or widened, and broker `Available` plus adapter support cannot substitute for the grant |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
 | Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain |
 | RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |

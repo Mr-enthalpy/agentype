@@ -645,6 +645,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   version/validity/subject digests reach the Execution snapshot, no raw broker
   response is persisted, and a requested scope outside `P_eff` or the Source
   ceiling is rejected;
+- credential authorization default: a credential-bearing `SourceConfig` whose
+  requested ref, use, scope, audience, or delivery mode is not explicitly granted
+  by the bound AgentType `SECURITY_V1` ceiling is ineligible even when the broker
+  reports `Available`, delivery is brokered, and the adapter supports it; an
+  AgentType ceiling that omits the secret-scope dimension grants nothing and is
+  never `Top`, while a Generation or source ceiling can only narrow a grant;
 - secret sentinel: no raw secret material in durable JSON, logs, control errors,
   snapshots, or launch descriptors;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
@@ -656,6 +662,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   and a parent-death-released pipe is rejected; recovery distinguishes
   awaiting-release from actually started; a receipt alone does not confirm
   RUNNING;
+- secured SPI deadline: all three secured operations take one absolute deadline,
+  the hold/receipt-publication/release stages share it with no per-stage reset, an
+  expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery
+  rather than `RELEASED` or RUNNING, and a later `reconcile_secured_start` may
+  take a new bounded deadline but cannot change the `RequestId` or create a
+  second physical instance;
 - secured start phase: `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are
   exact; `HELD` requires a verified sandbox receipt, a credential-bound
   `RELEASED` requires both receipts, `UNKNOWN` permits a missing chain and cannot

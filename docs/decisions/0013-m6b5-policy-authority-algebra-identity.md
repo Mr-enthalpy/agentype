@@ -416,7 +416,7 @@ not sufficient:
 | tools, commands | allowed-set intersection |
 | network endpoints/protocols/ports | meet in that dimension |
 | environment variables | allowed-name intersection; conflicting required values reject |
-| credential scope | refs, use, delivery mode and audience all narrow |
+| credential scope | refs, use, delivery mode and audience all narrow; an omitted grant in the AgentType ceiling is empty, not `Top`, and other ceilings can only narrow |
 | resource ceilings | stricter value within the same unit and scope |
 | working directory | validate as a launch constraint; conflict rejects rather than choosing one |
 | execution guarantees (`requires_attempt_isolation`) | **disjunction, not intersection**: `I_required = I_AgentType ∨ I_Requirement ∨ I_SourceRequirement`; any true disjunct makes isolation required, and no meet can remove it |
@@ -424,6 +424,19 @@ not sufficient:
 `P_eff` covers allowed operations and ceilings only. Guarantees live beside it:
 meeting two policies can never clear an isolation requirement, and an
 `EnforcementSupport` capability cannot create one (see §3).
+
+The credential dimension is the one dimension where absence is not `Top`. A
+`SECURITY_V1` AgentType ceiling that does not explicitly grant a secret scope
+authorizes no credential use at all, because the alternative would let an
+unrelated `SourceConfig` request — not an authored security contract — decide
+which sensitive credential enters the execution chain. A `Generation` or source
+ceiling that declares the dimension may only narrow the grant, never create or
+widen one, and `SourceConfig.credential_refs` stays a request. This is ordinary
+meet behavior: an absent AgentType grant is a legal empty allowed set, so `meet`
+returns `Ok` and the credential obligation is `Unsatisfied`, which makes the
+candidate ineligible. It adds no `P_config` term and no `TaskSpec` field. When no
+credential is requested, the dimension imposes no obligation and policy-only
+execution is unaffected.
 
 `meet` is **partially defined** over the grammar, not total:
 

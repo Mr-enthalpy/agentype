@@ -121,16 +121,19 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
-  and pinned sandbox policy, not merely the AgentType ceiling. Effective attempt
-  isolation is a requirement union, not an intersection:
+  and pinned sandbox policy, not merely the AgentType ceiling. In the frozen
+  M6-B.4 contract, effective attempt isolation is the two-term union
   `AgentTypeContract.security.requires_attempt_isolation OR
-  TaskAgentRequirement.hard.required_attempt_isolation OR
-  SourceRequirement.requires_attempt_isolation` (the Generation term enters
-  through `fold_generation_policy`, so a Task or Generation may tighten it, and
-  the SpawnSource term exists only when that source contract explicitly requires
-  isolation). An adapter's ability to *support* isolation is not a request. When
-  effective it MUST be physically enforceable by the exact binding, and the
-  committed execution MUST request it. Full eligibility additionally
+  TaskAgentRequirement.hard.required_attempt_isolation`. B.5 extends that
+  requirement with a third disjunct,
+  `SourceRequirement.requires_attempt_isolation`; the Generation term enters the
+  Task term through `fold_generation_policy`, so a Task or Generation may tighten
+  it. The frozen schema v8 carries no source isolation field, so the third term
+  evaluates to `false` for every v1 source and changes no stored value until a
+  versioned source contract defines it. An adapter's ability to *support*
+  isolation is not a request. When effective it MUST be physically enforceable
+  by the exact binding, and the committed execution MUST request it. Full
+  eligibility additionally
   requires an active adapter policy, satisfied `required_safety`, a coherent
   adapter kind/binding, and a currently resolvable exact binding (M6-B.4); the
   availability of required credential refs is a B.5 conjunct, and B.4 records

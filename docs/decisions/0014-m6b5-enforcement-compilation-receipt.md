@@ -264,6 +264,22 @@ the optional receipt chain. An adapter that cannot implement the extension canno
 provide `SECURITY_V1` for that binding. `COARSE_V1` continues to use the
 unchanged base trait.
 
+The secured operations inherit the frozen M5 deadline contract in spec 07, and
+the versioned extension MUST NOT become a way around it:
+
+- all three operations take a single absolute deadline from the caller; none of
+  them derives its own per-stage timeout or fresh wait budget;
+- within one physical start, the hold, receipt publication and release share that
+  budget; an adapter MUST NOT reset it between stages to extend the start;
+- when the deadline expires with physical state unknown, the outcome is `UNKNOWN`
+  and M5 recovery, never a synthesized `RELEASED` or RUNNING;
+- `reconcile_secured_start` may later run as an independent recovery call with a
+  new bounded deadline, but it MUST NOT change the original `RequestId` or create
+  a second physical instance;
+- Runtime re-qualifies the same deadline after the last evidence-producing
+  operation; evidence obtained after the endpoint is `DeadlineExceeded` and never
+  a successful observation.
+
 `SandboxAppliedReceipt` binds at least:
 
 ```text

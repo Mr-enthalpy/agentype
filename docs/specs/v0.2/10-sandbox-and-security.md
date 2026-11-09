@@ -113,9 +113,11 @@ In `SECURITY_V1`:
   TaskAgentRequirement.hard.required_attempt_isolation OR
   SourceRequirement.requires_attempt_isolation`, and it must then reach
   `ExecutionTarget.attempt_isolation = true`, be proven enforceable by the exact
-  adapter, and be requested by the committed execution. An `EnforcementSupport`
-  capability that merely *supports* isolation MUST NOT create a requirement, and
-  no policy meet may clear one. Any failed step makes the candidate ineligible.
+  adapter, and be requested by the committed execution. The source term is a B.5
+  extension that stays `false` for every v1 source because no versioned source
+  contract defines it. An `EnforcementSupport` capability that merely *supports*
+  isolation MUST NOT create a requirement, and no policy meet may clear one. Any
+  failed step makes the candidate ineligible.
 - The admission mode is explicit and durable:
   `COARSE_V1 | SECURITY_V1` is an input, never inferred from
   `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
@@ -142,6 +144,13 @@ In `SECURITY_V1`:
   `P_source = Top`: it adds no restriction, but it still MUST pass complete
   imported-enforcement coverage, the feature gate and credential qualification;
   `Top` is never an eligibility bypass.
+- Credential authorization is positive and deny-by-default. The bound AgentType
+  `SECURITY_V1` ceiling MUST explicitly grant the exact credential reference with
+  its use, scope, audience, and delivery mode; an omitted secret-scope dimension
+  grants nothing and is never normalized to `Top`. A Generation or source ceiling
+  may narrow that grant but never create one, and `SourceConfig.credential_refs`
+  is only a request. Broker availability and adapter brokered-delivery support
+  are facts, not grants. When no credential is requested there is no obligation.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. A `SECURITY_V1` Task's `TaskSecurityBinding`

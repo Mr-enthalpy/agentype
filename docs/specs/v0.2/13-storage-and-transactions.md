@@ -176,12 +176,15 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   positive marker. The commitment MUST be coherent: the snapshot's adapter
   key/kind, target/profile, provisioning-binding provenance (same Incarnation and
   same source/config), and validated config digest MUST all agree with the
-  Execution and its ProvisioningBinding, or the transaction fails. The
-  effective attempt-isolation requirement is a union, not an intersection
-  (`AgentTypeContract.security.requires_attempt_isolation OR
-  TaskAgentRequirement.hard.required_attempt_isolation OR
-  SourceRequirement.requires_attempt_isolation`); the snapshot records it and the
-  frozen Execution MUST request it, re-proved at commitment. The M5
+  Execution and its ProvisioningBinding, or the transaction fails. The frozen
+  M6-B.4 effective attempt-isolation requirement is the two-term union
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation`; the snapshot records it
+  and the frozen Execution MUST request it, re-proved at commitment. B.5 adds a
+  third disjunct, `SourceRequirement.requires_attempt_isolation`, which is
+  `false` for every v1 source because no versioned source contract defines it;
+  the stored value and the frozen commitment are therefore unchanged until such a
+  contract exists. The M5
   reconciliation-candidate read MUST also validate this marker/child coherence,
   so restart recovery never reconciles a `SNAPSHOT` Execution without its
   provenance. Recovery MUST continue to `resolve_exact(kind, key)`; a missing
