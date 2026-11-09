@@ -109,8 +109,8 @@ In `SECURITY_V1`:
   actual AgentType and SpawnSource ceiling.
 - Execution guarantees are composed by disjunction, not intersection. `P_eff` is
   an authorization intersection; attempt isolation is
-  `I_required = AgentType.requires_attempt_isolation OR
-  TaskAgentRequirement.required_attempt_isolation OR
+  `I_required = AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation OR
   SourceRequirement.requires_attempt_isolation`, and it must then reach
   `ExecutionTarget.attempt_isolation = true`, be proven enforceable by the exact
   adapter, and be requested by the committed execution. An `EnforcementSupport`
@@ -119,11 +119,13 @@ In `SECURITY_V1`:
 - The admission mode is explicit and durable:
   `COARSE_V1 | SECURITY_V1` is an input, never inferred from
   `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
-  owned **solely** by the immutable `task_agent_requirements` row; a
-  `TaskSecurityBinding` exists exactly once per that row (same `task_id`, foreign
-  key) and carries no independent mode, and `generation_task_bindings` carries no
-  second mode marker. A mismatch or a one-sided child is corruption, not a
-  downgrade opportunity. A `SECURITY_V1` Task requires its Generation to be
+  owned **solely** by the immutable `task_agent_requirements` row. The
+  `TaskSecurityBinding` child is conditional and biconditional: present exactly
+  once when the mode is `SECURITY_V1`, absent when it is `COARSE_V1`; it uses the
+  same `task_id`, carries no independent mode, and `generation_task_bindings`
+  carries no second marker. A missing required child, an unexpected child on a
+  coarse row, or a mismatch is corruption, not a downgrade opportunity. A
+  `SECURITY_V1` Task requires its Generation to be
   `SECURITY_V1` and the actual bound AgentType to support `SECURITY_V1`. It MUST
   NOT be downgraded at matching, provisioning or recovery. Cross-mode exclusion
   is symmetric in B.5 v1: a `COARSE_V1` AgentType cannot execute a `SECURITY_V1`
@@ -132,14 +134,23 @@ In `SECURITY_V1`:
   revision carrying an authored `P_source` ceiling is reachable only through the
   full `SECURITY_V1` path. In each case the coarse path cannot prove the authored
   fine restrictions, so its coarse projection is not a substitute for the full
-  contract. Existing `COARSE_V1` objects keep their frozen contract.
+  contract. Existing `COARSE_V1` objects keep their frozen contract. A
+  `SECURITY_V1` source revision with no authored fine ceiling has
+  `P_source = Top`: it adds no restriction, but it still MUST pass complete
+  imported-enforcement coverage, the feature gate and credential qualification;
+  `Top` is never an eligibility bypass.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
-  published as catalog rows. `TaskSecurityBinding` persists the admission-stage
-  derivation; `ExecutionSecuritySnapshot` persists the Execution-stage result.
+  published as catalog rows. A `SECURITY_V1` Task's `TaskSecurityBinding`
+  persists the admission-stage derivation; `ExecutionSecuritySnapshot` persists
+  the Execution-stage result. A `COARSE_V1` Task has neither.
 - `meet` is defined per dimension. A combination that cannot be represented or
   proven MUST fail closed; it MUST NOT be made executable by dropping Task
-  requirements or by adding an unrestricted bootstrap exception.
+  requirements or by adding an unrestricted bootstrap exception. An empty
+  allowed-set intersection is a valid deny-all dimension and returns a normalized
+  policy; `PolicyConflict` is reserved for required launch/structural clashes
+  (for example conflicting required environment values or incompatible required
+  working directories), not for "no permission in a dimension".
 - Every candidate needs imported `EnforcementSupport` for the whole composite
   policy, not merely for its parts. Compilation is root-relative and bounded;
   whole-round defer is required when any relevant candidate is unqualified, and

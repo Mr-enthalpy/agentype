@@ -532,9 +532,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   conflict is rejected even when another ceiling would hide it, and
   `sandbox_policy = None` follows the `SECURITY_V1` rule;
 - `R_min` typing: `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped
-  security operation requirements; `RequiredCapabilities` are `Pending` at
-  admission and validated at the candidate stage against the actual AgentType
-  through their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers,
+  security operation requirements, and only a `Set` value projects through the
+  versioned member map (`Bool(true)` projects to nothing, an unmapped member
+  fails closed, `Set(∅)` is a legal empty floor); `RequiredCapabilities` are
+  `Pending` at admission and validated at the candidate stage against the actual
+  AgentType through their existing
+  `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers,
   never through `ProjectAccess`; `CoarseExecutionModes`
   use workspace/network predicates; `RequiredGuarantees` and
   `PlacementConstraints` go through the single staged `satisfies_requirement`
@@ -550,8 +553,8 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   directory or any location outside the committed logical workspace region does
   not satisfy `WorkspaceMode::Write`, even though some writable path exists;
 - guarantee composition: attempt isolation is the disjunction
-  `AgentType.requires_attempt_isolation OR
-  TaskAgentRequirement.required_attempt_isolation OR
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation OR
   SourceRequirement.requires_attempt_isolation`;
   no policy meet can clear it, an `EnforcementSupport` capability that merely
   supports isolation does not create it, and a required isolation without an
@@ -562,20 +565,34 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
   legal;
 - mode-marker ownership: `task_agent_requirements.security_contract_mode` is the
-  only mode authority; `task_security_bindings` has exactly one row per that
-  `task_id` and no independent mode; `generation_task_bindings` carries none. A
-  `SECURITY_V1` requirement without its binding, a binding without the
-  requirement, a `task_id` mismatch, and two candidate authority rows are all
-  rejected as corruption;
+  only mode authority; `task_security_bindings` exists exactly when the mode is
+  `SECURITY_V1` and is absent for `COARSE_V1` (no independent mode in either
+  case); `generation_task_bindings` carries none. A `SECURITY_V1` requirement
+  without its binding, a binding on a `COARSE_V1` requirement, a `task_id`
+  mismatch, more than one binding, and two candidate authority rows are all
+  rejected as corruption — and a legal `COARSE_V1` Task must be admitted with no
+  security row, so the biconditional is tested in both directions;
 - cross-mode symmetry: a `SECURITY_V1` Generation MUST reject a `COARSE_V1` Task
   at admission even when the Generation also lists `COARSE_V1` support, and a
   SpawnSource revision carrying an authored `P_source` ceiling MUST NOT be
   selected by the coarse path — both are negative cases, and a "supports both
   modes" label grants no execution;
+- `P_source` top: a `SECURITY_V1` SpawnSource revision with no authored fine
+  ceiling has `P_source = Top`, adds no restriction, and still fails the
+  candidate when imported enforcement coverage, the feature gate, or credential
+  qualification fails; `Top` is never a bypass;
 - policy algebra result type: `meet(P, Q) -> Result<NormalizedPolicy,
   PolicyConflict>`; the GLB property is tested only on `Ok`, and a conflicted meet
   is a deterministic unsatisfiability that is never surfaced as
   `RESOURCE_UNAVAILABLE` and never persisted as a `Bottom` policy;
+- empty-vs-conflict: an empty allowed-set intersection is `Ok` with a deny-all
+  dimension (a Task obligation may then be `Unsatisfied`), while `PolicyConflict`
+  is reserved for required launch/structural clashes such as two different
+  required working directories or conflicting required environment values; tests
+  must not accept one as the other;
+- `RequiredAccess` projection: only a catalog-mapped `Set` projects, through the
+  versioned member map; `Bool(true)` projects to nothing, an unmapped member fails
+  closed, and `Set(∅)` yields a legal empty floor;
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial

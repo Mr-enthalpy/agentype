@@ -107,7 +107,11 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   and config digest it was resolved for). A capability's matcher kind and
   security class are defined once by a canonical `CapabilityCatalog`; a
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
-  be inferred from a stronger capability.
+  be inferred from a stronger capability. A `SECURITY_V1` source revision that
+  authors no fine `P_source` ceiling contributes `Top` to the meet and therefore
+  adds no restriction; it still MUST pass every check above, including imported
+  enforcement coverage, the feature gate and credential qualification, so `Top`
+  is never an eligibility bypass.
 - `can_provision_task` is the contract/sandbox eligibility predicate and a
   **mandatory conjunct of any authority-bearing typed acquisition/provisioning
   decision** (M6-B.4/M6-B.5; see
@@ -119,8 +123,8 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
   and pinned sandbox policy, not merely the AgentType ceiling. Effective attempt
   isolation is a requirement union, not an intersection:
-  `AgentType.requires_attempt_isolation OR
-  TaskAgentRequirement.required_attempt_isolation OR
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation OR
   SourceRequirement.requires_attempt_isolation` (the requirement fold already
   covers Generation and Task; a Task or Generation may tighten it, and the
   SpawnSource term exists only when that source contract explicitly requires

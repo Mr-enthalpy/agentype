@@ -99,7 +99,33 @@ PlacementConstraints(T)    // M5 placement predicate
   polarity. A mapping is valid only when the capability's value shape denotes an
   allowed-operation set for that dimension; `Quantity`, `Ordered` and functional
   `Exact` values MUST NOT carry a `policy_projection`. Until B5.1 publishes it, no
-  capability-to-`RequiredAccess` projection is permitted. A quantity such as
+  capability-to-`RequiredAccess` projection is permitted.
+
+  The conversion is deterministic and exhaustive. For a mapped capability with
+  dimension `d`, the catalog also declares a versioned member map
+  `policy_member_map: member -> operation(d)`, and
+
+  ```text
+  ProjectAccess(ref, value) =
+      Some({ dimension = d, allowed = { map(m) | m ∈ value.members } })
+      iff policy_projection = Some(d) and value is a Set
+  ```
+
+  - `Set` is the only projecting value shape in v1. Every member MUST be present
+    in `policy_member_map` for that exact `(capability_id, revision)`; an
+    unmapped member, a member from another dimension, or a non-positive member
+    makes the catalog entry invalid and admission MUST reject. It MUST NOT be
+    silently dropped, because dropping would weaken the floor.
+  - `Bool` MUST NOT project. `Bool(true)` asserts that the capability is present;
+    it does not name allowed operations, so a dimension enum alone cannot
+    derive an access set. A capability that needs an operation floor must author
+    its members as a `Set`.
+  - `Set(∅)` projects to the empty allowed set, which is legal: it is a
+    zero-floor requirement, not a conflict.
+  - `Ordered`, `Quantity`, and functional/boolean `Exact` never project; their
+    obligation stays in `RequiredCapabilities`.
+
+  A quantity such as
   `memory_mb >= 4096`, an `Ordered` rank, or a functional `Exact` capability MUST
   NOT be projected into `ProjectAccess`. B.5 defines no generic
   capability-to-permission-set conversion; absent a catalog mapping, the
@@ -160,15 +186,20 @@ monotone requirement with an explicit disjunction:
 
 ```text
 I_required = I_AgentType ∨ I_Requirement ∨ I_SourceRequirement
-I_Requirement = GenerationPolicy.requires_attempt_isolation
-              ∨ TaskSpec.required_attempt_isolation
+I_Requirement = TaskAgentRequirement.hard.required_attempt_isolation
 ```
 
-- `I_AgentType` is `AgentType.requires_attempt_isolation` for the actually bound
-  revision. `I_Requirement` is the existing frozen fold
-  `TaskAgentRequirement.required_attempt_isolation`
-  (`GenerationPolicy.requires_attempt_isolation || TaskSpec.required_attempt_isolation`),
-  restated here so the composition rule is explicit.
+- `I_AgentType` is `AgentTypeContract.security.requires_attempt_isolation` for the
+  actually bound revision. `I_Requirement` is the durable
+  `TaskAgentRequirement.hard.required_attempt_isolation`
+  (`TaskRequirement.required_attempt_isolation`). `into_requirement` derives it as
+  `AgentRequirementDraft.required_attempt_isolation
+  || GenerationPolicy.requires_attempt_isolation`, so the Generation and
+  Task-authored terms are already folded into one field by the frozen path.
+- `required_attempt_isolation` is **not** a `TaskSpec` field. B5.0/B5.1 MUST NOT
+  add one to the frozen M6-A `TaskSpec` to match an ADR formula; the authored
+  value lives in `AgentRequirementDraft`, which becomes the durable
+  `TaskAgentRequirement.hard`.
 - `I_SourceRequirement` exists only when the SpawnSource contract for that
   provisioning explicitly requires isolation. No v1 source contract has such a
   field, so it is `false` at this baseline; adding one requires a new versioned
@@ -248,10 +279,9 @@ restriction", so the Task policy layer is the explicit top
 and `P_task` reduces to the two coarse terms — `TaskSpec.workspace_mode` and
 `requirement_draft.required_network` (see §3). It never widens another ceiling,
 and the coarse fields remain authoritative in their own sources. AgentType and
-Generation
-`SECURITY_V1` contracts MUST carry an authored policy; an absent policy there
-would make `project_agent`/`project_gen` undefined. `COARSE_V1` keeps its frozen
-`None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
+Generation `SECURITY_V1` contracts MUST carry an authored policy; an absent
+policy there would make `project_agent`/`project_gen` undefined. `COARSE_V1`
+keeps its frozen `None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
 projection/consistency check to enter the old dispatch path.
 
 When a capability and a policy dimension express the same restriction, there is
@@ -278,11 +308,12 @@ inserted into the catalog, and there is no API to "publish a derived policy".
 
 Two durable commitments are recorded:
 
-- `TaskSecurityBinding` at typed admission: inline admitted policy bytes,
+- `TaskSecurityBinding` at typed admission for a `SECURITY_V1` Task (a
+  `COARSE_V1` Task has no such row): inline admitted policy bytes,
   policy digest, authored input refs/digests, and derivation identity.
-- `ExecutionSecuritySnapshot` at Execution commitment: inline final effective
-  policy bytes, policy digest, exact source/binding provenance, security plan
-  bytes/digest, and the actual bound AgentType identity.
+- `ExecutionSecuritySnapshot` at `SECURITY_V1` Execution commitment: inline final
+  effective policy bytes, policy digest, exact source/binding provenance, security
+  plan bytes/digest, and the actual bound AgentType identity.
 
 The Task stage computes `Generation ∩ Task`; the Execution stage adds the actual
 AgentType and the SpawnSource ceiling. Neither stage invents a new authored
@@ -311,9 +342,10 @@ satisfies_requirement(R_min, P, stage, candidate?)
 | Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy enforceability, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
 | Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot, including every positive Task requirement and `CoarseExecutionModes` against the committed `P_eff` | — |
 
-Only `Unsatisfied` rejects. `Pending` components are recorded in
-`TaskSecurityBinding` as an explicit obligation set and MUST be discharged at the
-candidate stage. Admission MUST NOT assume that a candidate Agent exists: a Task
+Only `Unsatisfied` rejects. For a `SECURITY_V1` Task, `Pending` components are
+recorded in `TaskSecurityBinding` as an explicit obligation set and MUST be
+discharged at the candidate stage; a `COARSE_V1` Task has no binding and no such
+obligation set. Admission MUST NOT assume that a candidate Agent exists: a Task
 may name a workstream that no future Agent matches, and that is a candidate
 ineligibility, not an admission contradiction.
 
@@ -401,6 +433,24 @@ two contracts — not a compiler fault, not a transient unavailability, and not 
 candidate-scoring signal. It MUST NOT be reported as `RESOURCE_UNAVAILABLE`, and
 v1 does not persist a `Bottom`/`Unsatisfiable` policy; callers hold the error
 type in memory and reject the candidate or admission at their own stage.
+
+An **empty allowed set is not a conflict.** The two outcomes are different and
+MUST NOT be conflated:
+
+- an empty intersection in a permission dimension (`file`, `tool/command`,
+  `network endpoint`, ...) yields `Ok` with that dimension empty — a valid
+  deny-all sub-policy. It is the greatest lower bound, and a requirement-stage
+  check may later report the Task obligation `Unsatisfied` (for example,
+  `WorkspaceMode::Write` with no allowed write);
+- `PolicyConflict` is reserved for **required launch/structural constraints
+  that cannot both hold**: two different required working directories,
+  conflicting required environment values for the same name, incompatible
+  required resource scope or unit declarations, or a coarse/fine contradiction
+  within one object. It is not "no permission in a dimension".
+
+Consequently a conformance test must distinguish "meet produced deny-all" from
+"meet produced no representable lower bound", and GLB tests may not reinterpret
+an empty set as a conflict or vice versa.
 
 A resource ceiling's **scope is part of the contract**: a per-process memory
 limit and an execution-domain limit are different guarantees, and a semantic
@@ -495,11 +545,19 @@ competing authority sources:
 - `task_agent_requirements` is the **sole owner** of
   `SecurityContractMode` (`security_contract_mode` in schema v9). It is immutable
   and one row per Task;
-- `task_security_bindings` MUST have exactly one row per
-  `task_agent_requirements` row, keyed by the same `task_id` with a foreign key,
-  and MUST NOT carry an independent mode value; a mismatch, a
-  `SECURITY_V1` requirement without its binding, or a binding without a
-  `SECURITY_V1` requirement is corruption;
+- `task_security_bindings` existence is a **conditional biconditional**, not an
+  unconditional one-per-requirement rule:
+
+  ```text
+  security_contract_mode = SECURITY_V1  ⇔  exactly one TaskSecurityBinding
+  security_contract_mode = COARSE_V1    ⇔  no TaskSecurityBinding
+  ```
+
+  The binding is keyed by the same `task_id` with a foreign key and MUST NOT
+  carry an independent mode value. A `SECURITY_V1` requirement without its
+  binding, a binding whose requirement is `COARSE_V1`, a `task_id` mismatch, or
+  more than one binding is corruption. A `COARSE_V1` Task therefore never gets a
+  security row, which is what keeps the frozen coarse path unchanged;
 - `generation_task_bindings` is the Generation↔Task admission map and MUST NOT
   carry a second mode marker or act as an alternative authority source. A copy
   kept for readability, if any, is derived and constrained equal; it never
@@ -515,7 +573,13 @@ created or published — never a mutable "supports" label chosen at admission:
 - each SpawnSource **revision** declares whether it carries an authored
   `P_source` fine ceiling and which enforcement protocol/profile versions its
   integration can import. A source revision that carries an authored ceiling is a
-  `SECURITY_V1` source revision.
+  `SECURITY_V1` source revision. A `SECURITY_V1` source revision that declares
+  **no** authored fine ceiling has `P_source = Top` for the authorization meet:
+  it contributes no restriction, but it is still a `SECURITY_V1` source and MUST
+  pass the complete imported-enforcement coverage check and the feature gate.
+  `Top` MUST NOT be read as "skip eligibility", "skip profile coverage", or
+  "skip credential qualification"; it only means this object adds no authored
+  narrowing.
 
 Consequently:
 

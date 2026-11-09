@@ -175,8 +175,8 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   same source/config), and validated config digest MUST all agree with the
   Execution and its ProvisioningBinding, or the transaction fails. The
   effective attempt-isolation requirement is a union, not an intersection
-  (`AgentType.requires_attempt_isolation OR
-  TaskAgentRequirement.required_attempt_isolation OR
+  (`AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation OR
   SourceRequirement.requires_attempt_isolation`); the snapshot records it and the
   frozen Execution MUST request it, re-proved at commitment. The M5
   reconciliation-candidate read MUST also validate this marker/child coherence,
@@ -211,13 +211,22 @@ surface designed in
   content, and Core-computed digests. Intersection products are canonical inline
   bytes plus a digest; they are never inserted as catalog rows.
 - `task_security_bindings` is immutable and write-once, created inside the
-  typed-admission transaction, with **exactly one row per
-  `task_agent_requirements` row**: primary key `task_id`, foreign key to that row,
-  no independent mode value. It stores inline admitted policy bytes, policy
-  digest, authored input refs/digests, `normalization_version` /
-  `meet_algorithm_version`, and the explicit set of `Pending` `R_min` obligations
-  deferred to candidate matching. A `SECURITY_V1` requirement without its row, a
-  binding without that requirement, or a non-matching `task_id` is corruption.
+  typed-admission transaction only when the mode requires it. Its existence is a
+  conditional biconditional keyed by the parent mode:
+
+  ```text
+  security_contract_mode = SECURITY_V1  ⇔  exactly one TaskSecurityBinding
+  security_contract_mode = COARSE_V1    ⇔  no TaskSecurityBinding
+  ```
+
+  The row has primary key `task_id`, a foreign key to the same
+  `task_agent_requirements` row, and no independent mode value. It stores inline
+  admitted policy bytes, policy digest, authored input refs/digests,
+  `normalization_version` / `meet_algorithm_version`, and the explicit set of
+  `Pending` `R_min` obligations deferred to candidate matching. A `SECURITY_V1`
+  requirement without its row, a binding whose requirement is `COARSE_V1`, a
+  non-matching `task_id`, or more than one row is corruption. A `COARSE_V1` Task
+  therefore has no security row at all, preserving the frozen coarse path.
 - `execution_security_snapshots` is immutable, one per Execution, created in the
   same transaction as the Execution and `BindingSnapshot`: inline effective
   policy bytes and digest, derivation identity, enforcement profile/digest,
@@ -242,14 +251,15 @@ surface designed in
 - `task_agent_requirements.security_contract_mode` is the **sole** owner of the
   `SecurityContractMode` (`COARSE_V1` / `SECURITY_V1`) marker. It is immutable and
   write-once, one row per Task, and is never inferred from `sandbox_policy`
-  presence. `task_security_bindings` is a mandatory one-to-one child of that row
-  and carries no second marker; `generation_task_bindings` carries none either and
-  is never an alternative authority source. Any derived copy kept for readability
-  is constrained equal and never decides. A missing security child, a mode
-  mismatch, or two candidate authority rows are corruption and MUST NOT degrade
-  to `COARSE_V1`; the mode cannot be changed after admission. The same
-  write-once, same-identity `INSERT OR REPLACE`, and authoritative-read coherence
-  guards apply.
+  presence. `task_security_bindings` is a one-to-one child that exists exactly
+  when the mode is `SECURITY_V1` and is absent for `COARSE_V1`; it carries no
+  second marker. `generation_task_bindings` carries none either and is never an
+  alternative authority source. Any derived copy kept for readability is
+  constrained equal and never decides. A missing required child, an unexpected
+  child on a `COARSE_V1` row, a mode mismatch, or two candidate authority rows
+  are corruption and MUST NOT degrade to `COARSE_V1`; the mode cannot be changed
+  after admission. The same write-once, same-identity `INSERT OR REPLACE`, and
+  authoritative-read coherence guards apply.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
@@ -377,7 +387,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. `task_agent_requirements.security_contract_mode` is the sole explicit mode marker in that transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` as the exactly-one child of that requirement row (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `RequiredCapabilities`, `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. `task_agent_requirements.security_contract_mode` is the sole explicit mode marker in that transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` as the single child required by that mode (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `RequiredCapabilities`, `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. A `COARSE_V1` admission writes no `TaskSecurityBinding`. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

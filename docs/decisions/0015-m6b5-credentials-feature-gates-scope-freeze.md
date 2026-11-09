@@ -321,15 +321,23 @@ If only policy-only is completed, the record MUST freeze the policy-only slice
 and MUST NOT describe credential-bound acquisition as complete.
 
 B5.4 includes a **feasibility spike** that precedes broker/credential
-investment:
+investment. The slice numbers are work-item identifiers, not a chronological
+order; the implementation gate is dependency-based:
 
 ```text
-B5.4 spike (both Linux and Windows, before broker work):
-    hold boundary and worker cannot run before receipt durability
-    receipt publication and namespace durability
-    crash / control-channel-loss / OS-restart recovery
-    physical instance identity and release denial on PID/handle reuse
-    → then: broker interface, credential delivery, full credential-bound work
+B5.2 policy-only core
+    → B5.4 feasibility spike (both Linux and Windows)
+    → B5.3 credential implementation
+    → B5.4 physical handoff integration
+```
+
+The spike proves:
+
+```text
+hold boundary and worker cannot run before receipt durability
+receipt publication and namespace durability
+crash / control-channel-loss / OS-restart recovery
+physical instance identity and release denial on PID/handle reuse
 ```
 
 The spike MUST first prove that hold, publication and recovery satisfy this
@@ -338,7 +346,9 @@ and credential-delivery work MUST NOT be treated as the critical path ahead of
 that proof: a credential protocol built on an unproven hold/receipt mechanism
 would restate the same risk with more machinery. A spike that shows the contract
 is unattainable on a platform narrows the reference profile rather than relaxing
-the contract.
+the contract. After the spike, B5.3 implements the broker and credential
+delivery, and B5.4 integrates them into the physical handoff already proven by
+the spike; the numbering does not authorize starting B5.3 first.
 
 `D-TOPOLOGY` remains `BLOCKS_SEMANTIC_LAYER (remainder)` and is not silently
 reclassified as an M6-B aggregate blocker. Whether full typed topology belongs
@@ -368,7 +378,7 @@ B5.5 MUST treat these as mandatory regression categories:
 
 | Category | Assertion |
 |---|---|
-| Policy algebra | `meet` returns `Result<NormalizedPolicy, PolicyConflict>`; the greatest-lower-bound property holds only for `Ok`, a conflict is deterministic unsatisfiability (never a fault, transient unavailability or `RESOURCE_UNAVAILABLE`), and no `Bottom` policy is persisted; order is transitive; normalize is idempotent; digest is permutation-stable |
+| Policy algebra | `meet` returns `Result<NormalizedPolicy, PolicyConflict>`; the greatest-lower-bound property holds only for `Ok`, a conflict is deterministic unsatisfiability (never a fault, transient unavailability or `RESOURCE_UNAVAILABLE`), and no `Bottom` policy is persisted; an empty allowed-set intersection is `Ok` as a deny-all dimension, distinct from a required launch/structural clash; order is transitive; normalize is idempotent; digest is permutation-stable |
 | Equality regression | every contract accepted by the old exact-equality relation is still accepted by the pure policy order; new physical eligibility is not thereby granted |
 | Coarse projection | every `SECURITY_V1` coarse/fine conflict is rejected |
 | Task-local consistency | a Task coarse/fine conflict is rejected locally even when another ceiling would hide it; `sandbox_policy = None` follows the `SECURITY_V1` rule, and validation runs before normalization |
@@ -386,12 +396,13 @@ B5.5 MUST treat these as mandatory regression categories:
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |
 | Cross-mode exclusion | symmetric in B.5 v1: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource revision carrying an authored `P_source` ceiling is reachable only through the full `SECURITY_V1` path; in each case the coarse projection cannot replace the authored fine contract, and a "supports both modes" label grants no execution |
-| Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` is a mandatory one-to-one child with no independent mode and `generation_task_bindings` carries none; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
+| Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` exists exactly when the mode is `SECURITY_V1` and is absent for `COARSE_V1` (conditional biconditional), with no independent mode, and `generation_task_bindings` carries none; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
 | Delivery mode vs Task grammar | the credential delivery-mode dimension is outside the v1 Task policy grammar, so a v1 authored `sandbox_policy` cannot narrow it; the requirement is derived from the AgentType ceiling and credential eligibility subject; enabling `TransientRawDelivery` needs a new versioned Task grammar with its own `meet`/conflict rule |
 | Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
 | Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path; `Write` requires an allowed write inside the committed logical workspace region, not a writable temporary location |
-| Guarantee composition | attempt isolation is a disjunction (`AgentType.requires_attempt_isolation OR TaskAgentRequirement.required_attempt_isolation OR SourceRequirement.requires_attempt_isolation`), never a policy intersection; an `EnforcementSupport` capability that supports isolation does not create a requirement; a required isolation must reach an isolating target, exact-adapter proof and a committed isolation request, or the candidate is ineligible |
-| `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| Guarantee composition | attempt isolation is a disjunction (`AgentTypeContract.security.requires_attempt_isolation OR TaskAgentRequirement.hard.required_attempt_isolation OR SourceRequirement.requires_attempt_isolation`), never a policy intersection; an `EnforcementSupport` capability that supports isolation does not create a requirement; a required isolation must reach an isolating target, exact-adapter proof and a committed isolation request, or the candidate is ineligible |
+| `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; projection accepts only a `Set` through the versioned member map, so `Bool(true)` projects to nothing and an unmapped member fails closed; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| `P_source` top | a `SECURITY_V1` SpawnSource revision without an authored fine ceiling has `P_source = Top` and adds no restriction, but still requires complete imported-enforcement coverage, the feature gate and credential qualification; `Top` never bypasses eligibility |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
