@@ -179,6 +179,20 @@ by the coarse-consistency checks, not by `RequiredAccess`.
 credential qualification obligation on the selected config; it is not a Task
 floor and MUST NOT be presented as a Task-declared credential set.
 
+Credential authorization is namespaced. The frozen `CredentialRef` is an opaque,
+non-empty source-local string; it is not a global identifier and string equality
+does not establish that two references name the same credential. The AgentType
+ceiling grants a stable `CredentialAuthorizationId` = an explicit credential
+authority namespace plus a logical reference, resolved by the trusted source
+integration under the exact source/config revision. Two brokers that both use
+`prod-key` keep distinct identities, and a source-local ref MUST NOT gain
+AgentType authorization solely by matching another authority's string. Core does
+not interpret provider internals, and the namespace is not derived from adapter
+kind or mutable provisioning identity. Re-provisioning the same logical
+credential keeps the same id; a different logical credential requires a new
+AgentType revision rather than silent reuse. When no credential is requested the
+dimension adds no obligation.
+
 B.5 v1 does **not** claim path-level minimum requirements. `Task requires
 workspace Write` is mechanically checkable; `Task must write Workspace/src/main.rs`
 is not, without a new structured Task field, and MUST NOT be inferred from the

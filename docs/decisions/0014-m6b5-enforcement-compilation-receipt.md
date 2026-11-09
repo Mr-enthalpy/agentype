@@ -460,9 +460,33 @@ Runtime
 
 The adapter performs the mechanical release; it MUST NOT decide whether the Task
 still holds authority. That decision belongs to the Kernel and MUST be proven for
-the exact `RequestId` and instance before the release call. The release result is
-then part of the evidence consumed by the RUNNING transaction; it is not a second
-security authority.
+the exact `RequestId` and instance before the release call. The proof is not
+caller-authored and has an explicit shape:
+
+```text
+ReleaseAuthorityProof
+    ExecutionId
+    RequestId
+    Attempt/Lease fencing identity
+    exact physical instance witness
+    bounded validity
+    issuing authority identity
+```
+
+Only the trusted Kernel path may issue it; a caller cannot supply or extend it.
+Its validity is bounded and checked at the release call, and a proof that was
+valid earlier does not survive a Lease expiry or fencing-identity change. A stale,
+replayed, or mismatched proof leaves the instance `HELD`, never released. The
+adapter verifies only that the trusted release authorization names this exact
+instance and `RequestId` and is currently valid; it does not interpret Scheduler
+semantics. The release result is then part of the evidence consumed by the RUNNING
+transaction; it is not a second security authority.
+
+Kernel validation and the OS release cannot be made atomic across SQLite and the
+OS. A bounded race remains between the authority check and the physical release;
+it is owned by M5 fencing and recovery. B.5 does not claim an atomic release, and
+the design must fail closed rather than widen authority when that window is
+observed.
 
 When the policy requires credential delivery, the chain is ordered:
 

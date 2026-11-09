@@ -668,11 +668,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - credential request provenance: the request comes from the exact `SourceConfig`
   revision through the trusted resolver as a canonical secret-free
   `CredentialRequest`, is validated as a whole against `P_eff` before the first
-  probe, and its digest reaches qualification and the `CredentialAccessPlan`; a
-  scope learned from a broker response, or a request changed during the same
-  observation epoch, is rejected as probe-then-authorize; the resolver is pure,
-  read-only, secret-free, deterministic and deadline-bounded, and creates no
-  physical resource, broker call or delivery side effect;
+  probe, and its digest reaches qualification and the `CredentialAccessPlan`;
+  resolution runs during candidate qualification after source attestation, never
+  at M6-A semantic admission; a scope learned from a broker response, or a request
+  changed during the same observation epoch, is rejected as probe-then-authorize;
+  the resolver is pure, read-only, secret-free, deterministic and deadline-bounded,
+  and creates no physical resource, broker call or delivery side effect;
 - credential reference completeness: over canonicalized references,
   `Refs(request) == Refs(SourceConfig)`; a resolver that omits a ref, adds one,
   returns an empty set for a non-empty config, keeps a duplicate, or mixes
@@ -688,6 +689,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   reports `Available`, delivery is brokered, and the adapter supports it; an
   AgentType ceiling that omits the secret-scope dimension grants nothing and is
   never `Top`, while a Generation or source ceiling can only narrow a grant;
+- credential authorization namespace: two distinct credential authorities that
+  both use the string `prod-key` resolve to different
+  `CredentialAuthorizationId` values; a source-local ref cannot acquire an
+  AgentType grant by string equality across authorities, and a re-provisioned
+  source keeps the same logical identity while a different logical credential
+  requires a new AgentType revision;
 - secret sentinel: no raw secret material in durable JSON, logs, control errors,
   snapshots, or launch descriptors;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
@@ -714,6 +721,13 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   acknowledged; release requires a
   Kernel authority proof for the same RequestId and instance witness; PID reuse
   cannot authorize release; uncertain release cannot create a second worker;
+- release authority proof: the proof carries `ExecutionId`, `RequestId`, the
+  Attempt/Lease fencing identity, the exact physical instance witness, a bounded
+  validity and the issuing authority identity; only the trusted Kernel path may
+  issue it, a caller-filled or extended proof is rejected, and a stale or replayed
+  proof cannot release a still-`HELD` instance after a Lease expiry or fencing
+  change; the Kernel-check/OS-release race is not claimed atomic and fails closed
+  into M5 recovery;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
 - receipt chain: receipts are append-only, write-once, and bounded to one per
