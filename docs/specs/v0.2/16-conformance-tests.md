@@ -561,6 +561,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
   a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
   legal;
+- mode-marker ownership: `task_agent_requirements.security_contract_mode` is the
+  only mode authority; `task_security_bindings` has exactly one row per that
+  `task_id` and no independent mode; `generation_task_bindings` carries none. A
+  `SECURITY_V1` requirement without its binding, a binding without the
+  requirement, a `task_id` mismatch, and two candidate authority rows are all
+  rejected as corruption;
+- cross-mode symmetry: a `SECURITY_V1` Generation MUST reject a `COARSE_V1` Task
+  at admission even when the Generation also lists `COARSE_V1` support, and a
+  SpawnSource revision carrying an authored `P_source` ceiling MUST NOT be
+  selected by the coarse path — both are negative cases, and a "supports both
+  modes" label grants no execution;
+- policy algebra result type: `meet(P, Q) -> Result<NormalizedPolicy,
+  PolicyConflict>`; the GLB property is tested only on `Ok`, and a conflicted meet
+  is a deterministic unsatisfiability that is never surfaced as
+  `RESOURCE_UNAVAILABLE` and never persisted as a `Bottom` policy;
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial

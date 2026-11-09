@@ -88,8 +88,11 @@ In `SECURITY_V1`:
 - Coarse and fine fields are never two independent grants. AgentType uses
   `project_agent(P) == SecurityContract`; Generation projects
   `(max_workspace, max_network)` and entails its isolation guarantee; Task uses
-  consistency. Define `P_task = TaskSpec coarse policy ∩ optional Task fine
-  policy`. A Task coarse/fine conflict MUST be rejected locally, before any
+  consistency. Define `P_task = TaskSpec.workspace_mode ∩
+  requirement_draft.required_network ∩ optional requirement_draft.sandbox_policy`;
+  M6-A `TaskSpec` carries only `workspace_mode`, so `required_network` and the
+  fine policy come from the typed requirement draft. A Task coarse/fine conflict
+  MUST be rejected locally, before any
   cross-object meet and before normalization, even if a stricter ceiling would
   hide it; `None` and an explicit authored policy remain distinguishable until
   validation completes. Typed admission evaluates `RequiredAccess` and
@@ -116,13 +119,20 @@ In `SECURITY_V1`:
 - The admission mode is explicit and durable:
   `COARSE_V1 | SECURITY_V1` is an input, never inferred from
   `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
-  recorded with `TaskSecurityBinding`, and a `SECURITY_V1` Task requires both its
-  Generation and the actual bound AgentType to support `SECURITY_V1`. It MUST
-  NOT be downgraded at matching, provisioning or recovery. A `COARSE_V1`
-  AgentType cannot execute a `SECURITY_V1` Task, and in B.5 v1 a `SECURITY_V1`
-  AgentType cannot execute a `COARSE_V1` Task either: the coarse path cannot
-  prove its authored fine restrictions, so its coarse projection is not a
-  substitute for the full contract.
+  owned **solely** by the immutable `task_agent_requirements` row; a
+  `TaskSecurityBinding` exists exactly once per that row (same `task_id`, foreign
+  key) and carries no independent mode, and `generation_task_bindings` carries no
+  second mode marker. A mismatch or a one-sided child is corruption, not a
+  downgrade opportunity. A `SECURITY_V1` Task requires its Generation to be
+  `SECURITY_V1` and the actual bound AgentType to support `SECURITY_V1`. It MUST
+  NOT be downgraded at matching, provisioning or recovery. Cross-mode exclusion
+  is symmetric in B.5 v1: a `COARSE_V1` AgentType cannot execute a `SECURITY_V1`
+  Task, a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a
+  `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource
+  revision carrying an authored `P_source` ceiling is reachable only through the
+  full `SECURITY_V1` path. In each case the coarse path cannot prove the authored
+  fine restrictions, so its coarse projection is not a substitute for the full
+  contract. Existing `COARSE_V1` objects keep their frozen contract.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. `TaskSecurityBinding` persists the admission-stage

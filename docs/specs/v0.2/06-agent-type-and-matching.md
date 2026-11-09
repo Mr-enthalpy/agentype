@@ -76,8 +76,18 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   security operation requirements; other capabilities keep their existing
   `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matcher. A `SECURITY_V1` Task is
   never downgraded to `COARSE_V1`, and the mode is never inferred from policy
-  presence. A `SECURITY_V1` AgentType is excluded from `COARSE_V1` Tasks, because
-  its coarse projection cannot replace the authored fine contract. Authored
+  presence. Cross-mode exclusion is symmetric in B.5 v1: a `SECURITY_V1`
+  AgentType is excluded from `COARSE_V1` Tasks, a `SECURITY_V1` Generation cannot
+  admit a `COARSE_V1` Task, and a SpawnSource revision carrying an authored
+  `P_source` fine ceiling is usable only through the full `SECURITY_V1`
+  provisioning and launch path. The reason is the same for all three: the coarse
+  path does not evaluate the authored fine ceiling, so its coarse projection
+  cannot replace the authored fine contract, and executing anyway would exceed
+  the object's own author limit. A "supports both modes" label is not a proof; a
+  future dual-mode object needs independent mode-specific contracts and a new
+  ADR. Existing `COARSE_V1` Generations and Source revisions keep their frozen
+  contract, and the new semantics use new immutable records or revisions rather
+  than in-place reinterpretation. Authored
   policies are catalogued; intersection products are inline
   and content-addressed. `COARSE_V1` replay keeps the
   exact-reference rule;

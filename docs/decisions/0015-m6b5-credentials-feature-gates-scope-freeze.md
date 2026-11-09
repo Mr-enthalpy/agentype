@@ -167,6 +167,16 @@ If a future version enables transient raw delivery, delivery mode must become an
 AgentType `SECURITY_V1` ceiling, not a `TaskSpec` field, and a v1 Task cannot
 independently forbid raw delivery. That change needs its own decision.
 
+This is consistent with the `meet` dimension row that says credential "refs, use,
+delivery mode and audience all narrow" (ADR-0013 §6): that dimension exists in
+the general algebra but is **outside the v1 Task policy grammar**. A v1 Task
+cannot express a delivery-mode narrowing merely because `sandbox_policy` is
+authored, so there is no second, implicit authority competing with the AgentType
+ceiling. Enabling raw delivery therefore requires a new versioned Task grammar
+that includes the dimension *and* its `meet`/conflict rule; a v1 Task must not be
+reinterpreted as carrying one. Until then, the delivery-mode requirement is
+derived from the AgentType ceiling and the credential eligibility subject only.
+
 ### 7. Secret protection means exactly what it says
 
 Agentype's own control path MUST NOT place secret values in the catalog,
@@ -310,6 +320,26 @@ M6-B aggregate
 If only policy-only is completed, the record MUST freeze the policy-only slice
 and MUST NOT describe credential-bound acquisition as complete.
 
+B5.4 includes a **feasibility spike** that precedes broker/credential
+investment:
+
+```text
+B5.4 spike (both Linux and Windows, before broker work):
+    hold boundary and worker cannot run before receipt durability
+    receipt publication and namespace durability
+    crash / control-channel-loss / OS-restart recovery
+    physical instance identity and release denial on PID/handle reuse
+    → then: broker interface, credential delivery, full credential-bound work
+```
+
+The spike MUST first prove that hold, publication and recovery satisfy this
+contract on both platforms, or record the concrete gap that prevents it. Broker
+and credential-delivery work MUST NOT be treated as the critical path ahead of
+that proof: a credential protocol built on an unproven hold/receipt mechanism
+would restate the same risk with more machinery. A spike that shows the contract
+is unattainable on a platform narrows the reference profile rather than relaxing
+the contract.
+
 `D-TOPOLOGY` remains `BLOCKS_SEMANTIC_LAYER (remainder)` and is not silently
 reclassified as an M6-B aggregate blocker. Whether full typed topology belongs
 in the aggregate freeze is a maintainer decision requiring an ADR change, not an
@@ -338,7 +368,7 @@ B5.5 MUST treat these as mandatory regression categories:
 
 | Category | Assertion |
 |---|---|
-| Policy algebra | `meet` is the greatest lower bound; order is transitive; normalize is idempotent; digest is permutation-stable |
+| Policy algebra | `meet` returns `Result<NormalizedPolicy, PolicyConflict>`; the greatest-lower-bound property holds only for `Ok`, a conflict is deterministic unsatisfiability (never a fault, transient unavailability or `RESOURCE_UNAVAILABLE`), and no `Bottom` policy is persisted; order is transitive; normalize is idempotent; digest is permutation-stable |
 | Equality regression | every contract accepted by the old exact-equality relation is still accepted by the pure policy order; new physical eligibility is not thereby granted |
 | Coarse projection | every `SECURITY_V1` coarse/fine conflict is rejected |
 | Task-local consistency | a Task coarse/fine conflict is rejected locally even when another ceiling would hide it; `sandbox_policy = None` follows the `SECURITY_V1` rule, and validation runs before normalization |
@@ -355,8 +385,9 @@ B5.5 MUST treat these as mandatory regression categories:
 | Receipt chain | receipts are append-only and write-once; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |
-| Cross-mode exclusion | a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task; its coarse projection cannot replace the authored fine contract |
-| Admission mode | the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery; a `COARSE_V1` AgentType cannot execute it, and a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task |
+| Cross-mode exclusion | symmetric in B.5 v1: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource revision carrying an authored `P_source` ceiling is reachable only through the full `SECURITY_V1` path; in each case the coarse projection cannot replace the authored fine contract, and a "supports both modes" label grants no execution |
+| Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` is a mandatory one-to-one child with no independent mode and `generation_task_bindings` carries none; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
+| Delivery mode vs Task grammar | the credential delivery-mode dimension is outside the v1 Task policy grammar, so a v1 authored `sandbox_policy` cannot narrow it; the requirement is derived from the AgentType ceiling and credential eligibility subject; enabling `TransientRawDelivery` needs a new versioned Task grammar with its own `meet`/conflict rule |
 | Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
 | Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path; `Write` requires an allowed write inside the committed logical workspace region, not a writable temporary location |
 | Guarantee composition | attempt isolation is a disjunction (`AgentType.requires_attempt_isolation OR TaskAgentRequirement.required_attempt_isolation OR SourceRequirement.requires_attempt_isolation`), never a policy intersection; an `EnforcementSupport` capability that supports isolation does not create a requirement; a required isolation must reach an isolating target, exact-adapter proof and a committed isolation request, or the candidate is ineligible |

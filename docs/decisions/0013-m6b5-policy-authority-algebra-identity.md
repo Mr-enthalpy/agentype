@@ -202,10 +202,12 @@ would either violate TaskSpec's single-authority rule or be unimplementable.
 Define
 
 ```text
-P_task = TaskSpec coarse policy ∩ optional Task fine policy
+P_task = TaskSpec.workspace_mode            // coarse workspace, M6-A
+       ∩ requirement_draft.required_network // coarse network, typed draft
+       ∩ optional requirement_draft.sandbox_policy
 ```
 
-and require:
+`P_task` must then satisfy:
 
 ```text
 required_workspace = Write    ⇒ P_task allows write
@@ -213,6 +215,12 @@ required_workspace = ReadOnly ⇒ P_task contains no write
 required_network follows the existing rank/polarity
 required_attempt_isolation    ⇒ the candidate carries the isolation guarantee
 ```
+
+The two coarse terms have different sources: M6-A `TaskSpec` carries only
+`workspace_mode`; `required_network` comes from the typed requirement draft, and
+the fine policy is the draft's optional `sandbox_policy`. The spec MUST NOT
+attribute `required_network` to `TaskSpec`. `required_attempt_isolation` is also
+carried by the draft (and folded with the Generation policy, see §3).
 
 Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine
 write root MUST be rejected.
@@ -236,9 +244,11 @@ policy that allows `write Workspace/src` is invalid on its own; a Generation
 when this check fails.
 
 `sandbox_policy = None` in `SECURITY_V1` means "no additional Task-level fine
-restriction", so the Task policy layer is the explicit top and
-`P_task` reduces to the TaskSpec coarse policy. It never widens another ceiling,
-and the TaskSpec coarse fields remain authoritative. AgentType and Generation
+restriction", so the Task policy layer is the explicit top
+and `P_task` reduces to the two coarse terms — `TaskSpec.workspace_mode` and
+`requirement_draft.required_network` (see §3). It never widens another ceiling,
+and the coarse fields remain authoritative in their own sources. AgentType and
+Generation
 `SECURITY_V1` contracts MUST carry an authored policy; an absent policy there
 would make `project_agent`/`project_gen` undefined. `COARSE_V1` keeps its frozen
 `None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
@@ -377,6 +387,21 @@ not sufficient:
 meeting two policies can never clear an isolation requirement, and an
 `EnforcementSupport` capability cannot create one (see §3).
 
+`meet` is **partially defined** over the grammar, not total:
+
+```text
+meet(P, Q) -> Result<NormalizedPolicy, PolicyConflict>
+```
+
+A dimension rule that says "reject" or "conflict rejects" returns
+`PolicyConflict`. The greatest-lower-bound property holds only for the `Ok`
+case: if it returns `Ok(N)`, then `N` is the greatest representable policy below
+both inputs. `PolicyConflict` is a deterministic unsatisfiability result of the
+two contracts — not a compiler fault, not a transient unavailability, and not a
+candidate-scoring signal. It MUST NOT be reported as `RESOURCE_UNAVAILABLE`, and
+v1 does not persist a `Bottom`/`Unsatisfiable` policy; callers hold the error
+type in memory and reject the candidate or admission at their own stage.
+
 A resource ceiling's **scope is part of the contract**: a per-process memory
 limit and an execution-domain limit are different guarantees, and a semantic
 token budget is not an OS resource limit.
@@ -464,21 +489,37 @@ SecurityContractMode = COARSE_V1 | SECURITY_V1
 
 The admission request carries the requested mode. When it is absent the result is
 `COARSE_V1`, preserving frozen compatibility. The selected mode is part of the
-durable Task contract and is recorded with the immutable `TaskSecurityBinding`;
-the positive parent-side presence marker is written on the same parent row that
-owns the admission record (`TaskAgentRequirement` / `GenerationTaskBinding`), not
-on a child policy row.
+durable Task contract. Its ownership is fixed, so B5.1 cannot end up with two
+competing authority sources:
 
-Contract-version declarations are per object:
+- `task_agent_requirements` is the **sole owner** of
+  `SecurityContractMode` (`security_contract_mode` in schema v9). It is immutable
+  and one row per Task;
+- `task_security_bindings` MUST have exactly one row per
+  `task_agent_requirements` row, keyed by the same `task_id` with a foreign key,
+  and MUST NOT carry an independent mode value; a mismatch, a
+  `SECURITY_V1` requirement without its binding, or a binding without a
+  `SECURITY_V1` requirement is corruption;
+- `generation_task_bindings` is the Generation↔Task admission map and MUST NOT
+  carry a second mode marker or act as an alternative authority source. A copy
+  kept for readability, if any, is derived and constrained equal; it never
+  decides.
 
-- every Generation revision declares the `SecurityContractMode` set it supports;
-- every AgentType revision declares the `SecurityContractMode` set it supports;
-- every SpawnSource revision declares the enforcement protocol/profile versions
-  its integration can import.
+Mode declarations are per-object immutable facts, fixed when the object is
+created or published — never a mutable "supports" label chosen at admission:
+
+- each Generation fixes its `SecurityContractMode` in the immutable
+  `generation_policies` record written by `create_generation`; there is no
+  separate Generation revision mechanism, and the field is not editable;
+- each AgentType revision declares the `SecurityContractMode` it is authored for;
+- each SpawnSource **revision** declares whether it carries an authored
+  `P_source` fine ceiling and which enforcement protocol/profile versions its
+  integration can import. A source revision that carries an authored ceiling is a
+  `SECURITY_V1` source revision.
 
 Consequently:
 
-- a `SECURITY_V1` Task requires its exact Generation to support `SECURITY_V1`;
+- a `SECURITY_V1` Task requires its exact Generation to be `SECURITY_V1`;
   otherwise admission rejects before any durable commitment;
 - it also requires the actual bound AgentType to support `SECURITY_V1`; otherwise
   that candidate is ineligible;
@@ -489,6 +530,17 @@ Consequently:
   substitute for the full contract. A future dual-mode AgentType with two
   independently versioned mode-specific contracts is possible only through a new
   ADR that proves coarse execution does not exceed the mode's declared ceiling;
+- the same conservative rule is symmetric for the other two objects: a
+  `SECURITY_V1` Generation MUST NOT admit a `COARSE_V1` Task, because coarse
+  admission and dispatch do not evaluate its authored fine ceiling and would
+  exceed the Generation's own author limit; and a SpawnSource revision carrying an
+  authored `P_source` MUST NOT be selected through the coarse path — it may only be
+  used by the complete `SECURITY_V1` provisioning and launch path, which proves
+  its restriction. A "supports both modes" label is not a proof and never
+  substitutes for mode-specific contracts;
+- existing `COARSE_V1` Generations and Source revisions keep their frozen
+  contract; the new security semantics use new immutable records or revisions, not
+  an in-place reinterpretation;
 - `SECURITY_V1` MUST NOT fall back to `COARSE_V1` once the mode is durable — not
   at matching, provisioning, or recovery. A missing security child is corruption,
   not a downgrade opportunity.
