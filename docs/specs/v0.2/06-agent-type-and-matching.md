@@ -64,12 +64,17 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   M6-B.5 defines ordering and intersection for `SECURITY_V1` only
   ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md)):
   four security objects, no `P_config`, typed positive `R_min`
-  (`RequiredAccess` / `RequiredGuarantees` / `CoarseExecutionModes` /
-  `PlacementConstraints`), explicit durable admission mode, per-object coarse
-  relations (AgentType equality, Generation projection, Task consistency),
+  (`RequiredAccess` / `RequiredCapabilities` / `RequiredGuarantees` /
+  `CoarseExecutionModes` / `PlacementConstraints`), explicit durable admission
+  mode, per-object coarse relations (AgentType equality, Generation projection,
+  Task consistency),
   Task-local coarse/fine validation before normalization, admission-level
-  satisfiability through one staged `satisfies_requirement` relation, and
-  candidate-level guarantee/placement satisfaction. A `SECURITY_V1` Task is
+  satisfiability through one staged `satisfies_requirement` relation,
+  candidate-level capability/guarantee/placement satisfaction, and re-evaluation
+  of `CoarseExecutionModes` against the complete `P_eff` at candidate and
+  commitment stages. `RequiredAccess` is set-inclusion only for catalog-mapped
+  security operation requirements; other capabilities keep their existing
+  `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matcher. A `SECURITY_V1` Task is
   never downgraded to `COARSE_V1`, and the mode is never inferred from policy
   presence. A `SECURITY_V1` AgentType is excluded from `COARSE_V1` Tasks, because
   its coarse projection cannot replace the authored fine contract. Authored

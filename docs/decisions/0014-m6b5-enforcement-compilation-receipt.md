@@ -1,4 +1,4 @@
-# ADR-0014 — M6-B.5 enforcement compilation, physical binding, and the applied-security receipt
+# ADR-0014 — M6-B.5 enforcement compilation, physical binding, and the applied-security receipt chain
 
 Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
 Date: 2026-11-08
@@ -169,32 +169,43 @@ the old physical host.
 
 ### 7. Secured start observation and receipt
 
-For `SECURITY_V1`, a start can become RUNNING only with a valid
-`AppliedSecurityReceipt` and a proven secured phase. The receipt is optional in
-the observation because the physical instance may exist before the receipt is
-durable:
+For `SECURITY_V1`, a start can become RUNNING only with a valid receipt chain
+and a proven secured phase. The chain is optional in the observation because the
+physical instance may exist before any receipt is durable:
 
 ```text
 SecuredStartObservation
     physical StartObservation
     phase: SecuredStartPhase
-    receipt: Option<AppliedSecurityReceipt>
+    receipts: Option<SecuredReceiptChain>
+
+SecuredReceiptChain
+    sandbox: SandboxAppliedReceipt
+    credential_delivery: Option<CredentialDeliveryReceipt>
 ```
+
+`SandboxAppliedReceipt` establishes the sandbox-applied state; a credential-bound
+Execution adds a `CredentialDeliveryReceipt` that binds the sandbox receipt
+digest. Both are append-only and write-once. The sandbox receipt is never
+updated to describe a later delivery.
 
 Phase invariants:
 
-- `HELD` and `RELEASED` require a valid, verified receipt; without it the phase
-  is not a proven security phase.
-- `UNKNOWN` permits a missing receipt and preserves physical uncertainty; it
+- `HELD` requires a valid, persisted `SandboxAppliedReceipt`.
+- `RELEASED` requires the sandbox receipt and, for a credential-bound Execution,
+  a valid, persisted `CredentialDeliveryReceipt` that binds the sandbox receipt.
+- `UNKNOWN` permits the chain to be absent and preserves physical uncertainty; it
   MUST NOT enter RUNNING.
-- `TERMINAL` may occur before a receipt exists; a missing receipt MUST NOT be
+- `TERMINAL` may occur before any receipt exists; a missing receipt MUST NOT be
   used to fabricate success.
-- if a physical observation exists but the receipt cannot be recovered, the
-  runtime MUST NOT enter RUNNING and MUST NOT use the legacy path to synthesize
+- a policy-only Execution MUST have `credential_delivery = None`; a
+  credential-bound Execution MUST have it before `RELEASED`.
+- if a physical observation exists but the chain cannot be recovered, the runtime
+  MUST NOT enter RUNNING and MUST NOT use the legacy path to synthesize
   acceptance.
 
 Both `start` and `reconcile_start` MUST return or recover the same Execution's
-trusted receipt whenever the phase proves one. The legacy `ExecutionAdapter`
+receipt chain whenever the phase proves one. The legacy `ExecutionAdapter`
 interface remains available for `COARSE_V1`; `SECURITY_V1` uses a versioned
 extension instead of changing the frozen B.4 trait:
 
@@ -207,11 +218,11 @@ SecuredExecutionAdapter : ExecutionAdapter
 ```
 
 `SecuredStartObservation` extends `StartObservation` with the explicit phase and
-the optional receipt. An adapter that cannot implement the extension cannot
+the optional receipt chain. An adapter that cannot implement the extension cannot
 provide `SECURITY_V1` for that binding. `COARSE_V1` continues to use the
 unchanged base trait.
 
-The receipt binds at least:
+`SandboxAppliedReceipt` binds at least:
 
 ```text
 ExecutionId
@@ -222,38 +233,68 @@ enforcement plan digest
 actual root identity
 proven physical instance
 enforcement profile/protocol
-secret-free credential delivery scope receipt
 ```
 
-It is a physical fact, not Task success and not a new authority source.
+`CredentialDeliveryReceipt` binds at least:
+
+```text
+SandboxAppliedReceipt digest
+ExecutionId
+RequestId
+exact adapter binding
+secret-free credential access plan digest
+proven recipient identity / pinned instance
+delivered scope digest
+delivery mode, broker epoch, issuer version
+```
+
+The credential-delivery receipt is a separate proof, not a field that mutates the
+sandbox receipt. Its existence is required only when the Execution is
+credential-bound.
+
+The receipt chain is a physical fact, not Task success and not a new authority
+source.
 
 ### 8. Secured start phase machine, hold/release, and recovery
 
-The receipt is only useful if it is durable before untrusted worker code can run.
-Physical start MUST provide a trusted hold/release barrier:
+The sandbox receipt is only useful if it is durable before untrusted worker code
+can run. Physical start MUST provide a trusted hold/release barrier:
 
 ```text
 create controlled instance
     → establish instance witness
     → apply and verify restrictions
-    → persist recoverable receipt (temp → fsync → rename)
-    → release worker code
+    → persist SandboxAppliedReceipt (temp → fsync → rename)
+    → HELD
 ```
 
-The worker MUST NOT execute before the receipt is durable. A source whose process
-model cannot hold the worker at a pre-exec boundary must provide an equivalent
-controlled-start mechanism, or the candidate is unsupported.
+The worker MUST NOT execute before the sandbox receipt is durable. A source whose
+process model cannot hold the worker at a pre-exec boundary must provide an
+equivalent controlled-start mechanism, or the candidate is unsupported. The hold
+MUST remain closed on daemon crash or control-channel disconnect: it MUST NOT be
+implemented by a wait whose handle or pipe closes on parent death and thereby
+lets the worker continue. If the daemon cannot prove it still controls the
+instance, the worker stays stopped and the instance follows M5 recovery.
 
 A persisted receipt does not by itself mean the worker was released. Secured start
 therefore has an explicit phase:
 
 ```text
 SecuredStartPhase:
-    HELD       // controlled instance, restrictions applied, receipt durable, not executing
+    HELD       // controlled instance, restrictions applied, sandbox receipt durable, not executing
     RELEASED   // worker authorized to execute
     UNKNOWN    // instance exists, release state cannot be proven
     TERMINAL   // instance ended before or at release; cannot advance
 ```
+
+The phase constrains RUNNING, not merely whether a receipt is present:
+
+| Phase | RUNNING |
+|---|---|
+| `HELD` | MUST NOT confirm |
+| `RELEASED` | MAY confirm, only with positive physical observation |
+| `UNKNOWN` | MUST NOT confirm |
+| `TERMINAL` | MUST NOT confirm |
 
 The crash window
 
@@ -301,22 +342,25 @@ the exact `RequestId` and instance before the release call. The release result i
 then part of the evidence consumed by the RUNNING transaction; it is not a second
 security authority.
 
-When the policy requires credential delivery, the order is:
+When the policy requires credential delivery, the chain is ordered:
 
 ```text
-HELD physical recipient
-    → credential authorization/delivery
-    → applied-security + delivery receipt durable
+SandboxAppliedReceipt durable
+    → HELD
+    → [credential-bound only] credential authorization/delivery
+    → CredentialDeliveryReceipt durable, binding the sandbox receipt digest
     → Kernel authority revalidation
     → RELEASED
 ```
 
-The applied-security receipt's secret-free credential delivery scope receipt MUST
-describe the session that was actually established. A receipt MUST NOT be
-persisted as covering a scope that is delivered later or with a different scope.
-If delivery changes the scope, the receipt MUST be updated before release, or the
-delivery MUST use a separate, independently recoverable receipt chain. A missing
-or mismatched delivery receipt keeps the phase at most `HELD`/`UNKNOWN`.
+The initial `HELD` receipt cannot prove a delivery that has not happened yet, so
+the sandbox receipt MUST NOT claim the credential delivery scope. The credential
+receipt records the scope actually established. A later delivery with a different
+scope MUST NOT be treated as covered by the earlier chain: it needs its own
+recoverable receipt chain, and no earlier receipt is rewritten. A missing or
+mismatched credential receipt keeps the phase at most `HELD`/`UNKNOWN`. A
+policy-only Execution has `credential_delivery = None` and does not need a
+credential receipt.
 
 The following are mandatory:
 
@@ -328,15 +372,21 @@ The following are mandatory:
 4. If authority is no longer valid, the old worker MUST NOT be released; the path
    is physical cleanup and M5 recovery.
 5. If the release result is uncertain, no second worker may be created.
+6. The hold MUST fail closed on daemon crash or control-channel loss; a worker
+   that can self-release is not a valid held instance.
+7. Receipts are write-once and append-only; no receipt replaces a different
+   existing receipt, and the sandbox receipt is never edited to describe a later
+   credential delivery.
 
 Receipt crash durability covers more than file bytes:
 
 - the file and its containing directory metadata MUST be durable before release;
 - the atomic rename MUST NOT replace an existing different receipt;
 - the worker MUST NOT inherit the receipt file or directory handle, nor inherit
-  read, write, delete or replace access to it;
-- the receipt directory MUST be daemon-owned and explicitly inaccessible to the
-  worker on both platforms, verified with negative tests.
+  write, delete or replace access to it;
+- the receipt directory MUST be daemon-owned and MUST deny worker write, delete
+  and replace on both platforms, verified with negative tests. Read
+  confidentiality is not part of this requirement (see §14).
 
 The durable record is the validated receipt identity/digest committed by the
 RUNNING transaction; the receipt file is recoverable physical evidence. The
@@ -346,10 +396,11 @@ instance witness, and a write order that cannot present an unverified file as
 applied. If that relation cannot be established after a crash, the Execution
 remains physically uncertain and follows M5 recovery.
 
-The policy-only reference profile (§14) also depends on this protection. The
-daemon-owned receipt directory MUST have real read/write/delete/replace
-isolation tests before the profile is declared; B.4's content-write confinement
-is not evidence of confidentiality or of protection for daemon-owned state.
+The policy-only reference profile (§14) depends on the integrity of this
+protection, not on read confidentiality. The daemon-owned receipt directory MUST
+have real integrity, non-replacement, write/delete/replace-denial and crash
+recovery tests before the profile is declared. B.4's content-write confinement is
+not evidence of any of these, and it is not evidence of confidentiality.
 
 ### 9. Receipt location and write discipline
 
@@ -365,21 +416,26 @@ Write order:
 temporary file → fsync → atomic rename → only then release user code
 ```
 
-Windows ACLs and Linux confinement must deny worker read/write/delete/replace of
+Windows ACLs and Linux confinement must deny worker write, delete and replace of
 that directory explicitly, with negative tests for each. The access check is a
-positive requirement, not an inference from the jail's write restriction.
+positive requirement, not an inference from the jail's write restriction. Read
+access is not required to be denied by this profile; the security model MUST NOT
+depend on the worker being unable to read a non-secret receipt (see §14).
 
 Two durable objects are deliberately distinct and MUST NOT be conflated:
 
-- the SQLite `applied_security_receipts` row (identity/digest, consumed by the
-  RUNNING transaction and authority-bearing);
-- the daemon-owned receipt artifact (recoverable physical evidence).
+- the SQLite receipt rows (`SandboxAppliedReceipt` / `CredentialDeliveryReceipt`
+  identities and digests), consumed by the RUNNING transaction and
+  authority-bearing;
+- the daemon-owned receipt artifacts (recoverable physical evidence).
 
-After a crash before the RUNNING transaction, the artifact may be used to
-reconstruct and verify the receipt identity, but only under the full relation:
-same ExecutionId/RequestId, same binding and plan digest, same instance witness,
-and a proven release phase. A missing artifact cannot be synthesized from the row;
-an artifact alone cannot produce RUNNING without authority revalidation and the
+The chain is append-only: a `CredentialDeliveryReceipt` row references the
+`SandboxAppliedReceipt` digest and never replaces it. After a crash before the
+RUNNING transaction, the artifacts may be used to reconstruct and verify the chain,
+but only under the full relation: same ExecutionId/RequestId, same binding and
+plan digest, same instance witness, a matching sandbox receipt digest, and a
+proven release phase. A missing artifact cannot be synthesized from the rows; an
+artifact alone cannot produce RUNNING without authority revalidation and the
 validated transaction.
 
 The receipt is added to the retained-artifact class tracked by
@@ -405,15 +461,16 @@ transaction:
 
 ```text
 Execution observation
-+ validated AppliedSecurityReceipt
++ validated SandboxAppliedReceipt
++ CredentialDeliveryReceipt when the Execution is credential-bound
 + positive RUNNING transition
 + first Lease renewal
 ```
 
 This persists observations as inputs; OS calls do not run inside the SQLite
-transaction. If the receipt cannot be recovered after a crash, the runtime MUST
-NOT synthesize one and MUST NOT downgrade to the legacy RUNNING path. Physical
-uncertainty remains owned by M5 recovery, preserving the frozen
+transaction. If the required receipts cannot be recovered after a crash, the
+runtime MUST NOT synthesize them and MUST NOT downgrade to the legacy RUNNING
+path. Physical uncertainty remains owned by M5 recovery, preserving the frozen
 RUNNING/renewal atomicity without a second supervision authority.
 
 ### 12. `AppliedPlan ≡ CommittedPlan` is a digest tuple
@@ -456,15 +513,22 @@ Claimed supported:
 - per-Execution workspace content-write confinement;
 - an explicit worker environment allowlist with no ambient inheritance;
 - exact physical instance identity;
-- a daemon-owned receipt directory with verified read/write/delete/replace
-  isolation;
-- receipt ↔ Execution binding and crash recovery, including the hold/release
-  phase machine;
+- a daemon-owned receipt store with verified integrity, non-replaceability and
+  worker write/delete/replace denial;
+- an append-only `SandboxAppliedReceipt` bound to the exact Execution and
+  physical instance, with crash recovery and the hold/release phase machine;
 - credential-free execution.
+
+The credential-bound scope additionally requires a `CredentialDeliveryReceipt`
+that binds the sandbox receipt digest. That second receipt is not part of this
+policy-only profile, and a policy-only Execution MUST NOT fabricate one.
 
 Explicit non-claims:
 
 - same-user general read confidentiality;
+- receipt read confidentiality: a worker may be able to read non-secret receipt
+  content, and the security model MUST NOT depend on the receipt path, digest or
+  content being unknown to it;
 - arbitrary read-root or visibility isolation;
 - network egress restriction (the network dimension remains a policy concept, but
   this profile does not claim it is enforceable);
@@ -480,13 +544,25 @@ Windows can prove it for the exact binding. A platform-specific matrix may be
 stricter, never looser. B.4's content-write confinement is an input to this
 profile, not evidence for any B.5 claim above it.
 
-The receipt-directory claim is specifically **not** implied by the B.4 jail.
-Linux content-write confinement is not general read isolation, and a Windows
-restricted token does not establish same-user read confidentiality. The B5.4
-design note MUST explain and demonstrate why the daemon-owned directory is
-unreadable, unwritable, undeletable, and unreplaceable by the worker even when
-daemon and worker share a user identity. This is a requirement on the evidence
-store itself, not a claim of a general read sandbox.
+The receipt-store claim is specifically **not** implied by the B.4 jail. Linux
+content-write confinement is not evidence of integrity for daemon-owned state, and
+a Windows restricted token does not establish either integrity or same-user read
+confidentiality. B5.4 MUST publish an OS enforcement-mechanism design note that
+proves, for the exact binding:
+
+- the worker cannot write, delete or replace the receipt store;
+- receipts are integrity-protected, non-replaceable, identity-bound and
+  crash-recoverable;
+- concurrent writers or a stale writer cannot make an older receipt look current.
+
+Read confidentiality is deliberately not a minimum-profile claim. The receipts
+contain no secret, and replay is bound to the exact Execution and physical
+instance, so worker readability is acceptable if integrity and identity binding
+hold. The security model MUST NOT rely on the receipt path, digest or content
+being unknown to the worker. If a later scope decides that same-user read
+isolation is required, it MUST be recorded as a high-risk implementation
+dependency with its own OS mechanism and proof; it MUST NOT be assumed to follow
+from a small extension of the current jail.
 
 A `SECURITY_V1` Task whose policy needs a non-claimed dimension is ineligible
 under this profile; it MUST NOT be partially enforced. The B5.5 enforcement
@@ -512,11 +588,14 @@ limited, or unsupported.
   trustworthy input while keeping the same frozen transaction shape.
 - Secured start has an explicit phase and a release operation bound to the exact
   RequestId and instance, so crash recovery never blindly launches a second
-  worker or releases an instance whose authority has lapsed. The receipt is
+  worker or releases an instance whose authority has lapsed. The receipt chain is
   optional in the observation, so a process created before receipt durability is
   `UNKNOWN` instead of a fabricated success.
+- The receipt chain is append-only and monotonic: the sandbox receipt establishes
+  `HELD`, and a credential-bound Execution adds a delivery receipt that binds it.
+  No receipt has to pre-prove a future delivery, and no receipt is rewritten.
 - Credential delivery is ordered inside `HELD` and before `RELEASED`, so the
-  receipt cannot claim a delivery scope that has not been established.
+  receipt chain records only a scope that was actually established.
 - `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` fixes the minimum supported set and its
   non-claims as a proof obligation, so B.4's write confinement cannot be read as
   a full B.5 claim.

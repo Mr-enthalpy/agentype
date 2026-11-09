@@ -50,31 +50,50 @@ fenced Core transaction before daemon admission ([13](13-storage-and-transaction
 
 **M6-B.5 (`SECURITY_V1`):** a `start` or `reconcile_start` observation carries an
 explicit `SecuredStartPhase` (`HELD`, `RELEASED`, `UNKNOWN`, `TERMINAL`) and an
-**optional** `AppliedSecurityReceipt`. `HELD` and `RELEASED` require a valid,
-verified receipt; `UNKNOWN` permits it to be missing; `TERMINAL` may occur before
-a receipt exists. Physical start MUST hold worker code at a controlled pre-exec
-boundary until the receipt and its directory metadata are durable. The
-observation, the validated receipt, the positive RUNNING transition and the first
-renewal MUST commit in the same fenced transaction; no separate
-security-confirmation state exists.
+**optional** `SecuredReceiptChain`: a `SandboxAppliedReceipt` plus, for a
+credential-bound Execution, a `CredentialDeliveryReceipt` that binds the sandbox
+receipt digest. `HELD` requires a valid, verified sandbox receipt; a
+credential-bound `RELEASED` requires both receipts; `UNKNOWN` permits the chain to
+be missing; `TERMINAL` may occur before any receipt exists.
+
+The phase, not receipt presence, decides RUNNING:
+
+| Phase | RUNNING |
+|---|---|
+| `HELD` | MUST NOT confirm |
+| `RELEASED` | MAY confirm, only after positive physical observation |
+| `UNKNOWN` | MUST NOT confirm |
+| `TERMINAL` | MUST NOT confirm |
+
+Physical start MUST hold worker code at a controlled pre-exec boundary until the
+sandbox receipt and its directory metadata are durable. The hold MUST stay closed
+on daemon crash or control-channel loss; a wait mechanism that releases the worker
+when the parent's handle or pipe closes is invalid. Credential delivery happens
+while `HELD`, and its receipt is durable before authority revalidation and
+`RELEASED`. The observation, the required receipt chain, the positive RUNNING
+transition and the first renewal MUST commit in the same fenced transaction; no
+separate security-confirmation state exists.
 
 On restart, `reconcile_start` MUST recover the phase and, when the phase requires
-one, the receipt for the same `RequestId` and the same physical instance. A
+them, the receipts for the same `RequestId` and the same physical instance. A
 `HELD` instance MUST NOT be released until the Kernel revalidates current
 Scheduler/Task authority and issues a proof for that exact `RequestId` and
 instance witness. Release MUST be idempotent for the same instance; a reused PID
 MUST NOT confer release authority; if authority is invalid the worker stays held
 and follows physical cleanup plus M5 recovery; if the release result is uncertain
 no second worker may be created. Receipt presence alone MUST NOT confirm RUNNING.
-If the receipt or the instance relation cannot be recovered, the Execution MUST
-NOT be admitted as RUNNING, a receipt MUST NOT be synthesized, and the legacy
-RUNNING path MUST NOT be used. A controlled process created before the receipt
-was persisted is `UNKNOWN`: reconciliation must not release it, must not
+If a required receipt or the instance relation cannot be recovered, the Execution
+MUST NOT be admitted as RUNNING, a receipt MUST NOT be synthesized, and the legacy
+RUNNING path MUST NOT be used. A controlled process created before the sandbox
+receipt was persisted is `UNKNOWN`: reconciliation must not release it, must not
 synthesize a receipt, and must leave it to M5 physical recovery; the
-crash-injection suite covers this window. The receipt artifact is stored in a
+crash-injection suite covers this window. The receipt artifacts are stored in a
 daemon-owned state directory outside the worker-writable jail root/workspace,
-separately from the SQLite identity/digest row; the row remains authority-bearing
-and the artifact is verified physical evidence
+separately from the SQLite rows; the rows remain authority-bearing and the
+artifacts are verified physical evidence. The chain is append-only: the credential
+receipt binds the sandbox receipt digest and never replaces it. Receipt read
+confidentiality is not required; integrity, non-replaceability, identity binding
+and recoverability are
 ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md)).
 
 **M5:** configuration MUST satisfy

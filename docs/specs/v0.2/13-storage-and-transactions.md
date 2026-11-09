@@ -221,17 +221,20 @@ surface designed in
   including proof identity, broker epoch, issuer version, validity bound and
   subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task
   derivation digest.
-- `applied_security_receipts` is immutable, write-once, and instance-bound. The
-  SQLite row is the authority-bearing record; the daemon-owned receipt artifact
-  outside the worker-writable jail root/workspace is separate recoverable
-  physical evidence. The two MUST NOT be conflated. After a pre-RUNNING crash the
-  artifact may reconstruct and verify the receipt identity only under the full
-  relation (same ExecutionId/RequestId, binding and plan digest, instance
-  witness, proven release phase); a missing artifact cannot be synthesized from
-  the row, and an artifact alone cannot produce RUNNING. The row is consumed by
-  the RUNNING + first-renewal transaction, never by a separate security state
-  machine. Recovery MUST distinguish `HELD` from `RELEASED`, and receipt presence
-  alone MUST NOT confirm RUNNING.
+- `applied_security_receipts` is an immutable, write-once, append-only receipt
+  chain, keyed by Execution and receipt kind (`SandboxAppliedReceipt`,
+  `CredentialDeliveryReceipt`). The SQLite rows are the authority-bearing records;
+  the daemon-owned receipt artifacts outside the worker-writable jail
+  root/workspace are separate recoverable physical evidence. The two MUST NOT be
+  conflated. A credential-delivery row binds the sandbox receipt digest and never
+  replaces it. After a pre-RUNNING crash the artifacts may reconstruct and verify
+  the chain only under the full relation (same ExecutionId/RequestId, binding and
+  plan digest, instance witness, matching sandbox receipt digest, proven release
+  phase); a missing artifact cannot be synthesized from the rows, and an artifact
+  alone cannot produce RUNNING. The rows are consumed by the RUNNING +
+  first-renewal transaction, never by a separate security state machine. Recovery
+  MUST distinguish `HELD` from `RELEASED`, and receipt presence alone MUST NOT
+  confirm RUNNING.
 - `SECURITY_V1` is a positive parent-side mode marker recorded on the same row
   that owns the admission record (`TaskAgentRequirement` /
   `GenerationTaskBinding`), never inferred from `sandbox_policy` presence. The
@@ -353,7 +356,7 @@ cannot construct a record that merely looks validated.
 | Execution create | Execution associated with Attempt and Incarnation |
 | Execution security commitment | For `SECURITY_V1`, the Execution + `BindingSnapshot` transaction also writes the immutable `ExecutionSecuritySnapshot`, carrying the inline effective policy, the actual bound AgentType identity, the enforcement profile and the security plan digest. The snapshot MUST NOT be created or repaired later. |
 | Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
-| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, a `HELD`/`RELEASED` observation requires a validated `AppliedSecurityReceipt` as an input to the same transaction; an `UNKNOWN` observation may have no receipt and cannot produce RUNNING; a missing or invalid receipt where the phase requires one cannot produce RUNNING. |
+| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, `RELEASED` requires a validated `SandboxAppliedReceipt` and, when credential-bound, a `CredentialDeliveryReceipt` binding it, as inputs to the same transaction; `HELD` and `UNKNOWN` cannot produce RUNNING; a `TERMINAL` instance cannot produce RUNNING; a missing or invalid required receipt cannot produce RUNNING. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |
 | Suspend | Task SUSPENDED, Lease REVOKED, Escalation, Batch SUSPENDED, and the decision/control outbox event in the **same** transaction |
@@ -366,7 +369,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. The explicit `SecurityContractMode` is part of the transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. The explicit `SecurityContractMode` is part of the transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `RequiredCapabilities`, `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

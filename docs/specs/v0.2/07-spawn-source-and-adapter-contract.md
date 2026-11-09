@@ -109,10 +109,12 @@ authority center ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-
   credential absent.
 - For `SECURITY_V1`, start and reconcile return a `SecuredStartObservation`
   carrying a `SecuredStartPhase` (`HELD` / `RELEASED` / `UNKNOWN` / `TERMINAL`)
-  and an optional `AppliedSecurityReceipt` that is required for `HELD` and
-  `RELEASED`. A start without a valid receipt where the phase requires one, or a
-  release without Kernel authority revalidation for the exact `RequestId` and
-  instance witness, cannot become RUNNING. The frozen base
+  and an optional `SecuredReceiptChain` (`SandboxAppliedReceipt`, plus a
+  `CredentialDeliveryReceipt` for a credential-bound Execution). `HELD` requires
+  the sandbox receipt; a credential-bound `RELEASED` requires both receipts;
+  `UNKNOWN` permits absence and cannot become RUNNING. A release without Kernel
+  authority revalidation for the exact `RequestId` and instance witness cannot
+  become RUNNING. The frozen base
   `ExecutionAdapter` is unchanged for `COARSE_V1`; the secured behavior is a
   versioned `SecuredExecutionAdapter` extension adding
   `start_secured_execution`, `reconcile_secured_start`, and

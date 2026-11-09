@@ -531,13 +531,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   Generation meet, is rejected at the correct stage; a Task-local coarse/fine
   conflict is rejected even when another ceiling would hide it, and
   `sandbox_policy = None` follows the `SECURITY_V1` rule;
-- `R_min` typing: only `RequiredAccess` uses set inclusion; `CoarseExecutionModes`
+- `R_min` typing: `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped
+  security operation requirements; `RequiredCapabilities` are `Pending` at
+  admission and validated at the candidate stage against the actual AgentType
+  through their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers,
+  never through `ProjectAccess`; `CoarseExecutionModes`
   use workspace/network predicates; `RequiredGuarantees` and
   `PlacementConstraints` go through the single staged `satisfies_requirement`
   relation, and `Pending` is never treated as satisfied;
 - stage separation: `PlacementConstraints` are not evaluated at admission; a
   candidate that fails them is ineligible, and admission never assumes a
   candidate Agent exists;
+- composite mode re-check: constructing `P_eff` can leave no writable path even
+  though the Task and each ceiling individually allowed `Write`; candidate
+  matching and commitment MUST reject that candidate, and MUST NOT reuse the
+  admission-time `CoarseExecutionModes` verdict;
 - admission mode: explicit `COARSE_V1 | SECURITY_V1` is durable and never
   inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
   a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
@@ -552,8 +560,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - reference profile: `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` claims and non-claims
   are tested on both Linux and Windows; a non-claimed dimension makes a candidate
   ineligible rather than partially enforced; B5.4 publishes the OS
-  enforcement-mechanism design note and proves the receipt directory remains
-  inaccessible when daemon and worker share a user identity;
+  enforcement-mechanism design note and proves receipt integrity,
+  non-replaceability, identity binding, crash recovery and worker
+  write/delete/replace denial; receipt read confidentiality is tested as a
+  non-claim, and no behavior may depend on the receipt path, digest or content
+  being unknown to the worker;
 - enforcement matrix completeness: every spec-10 dimension is classified
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;
@@ -569,14 +580,17 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   snapshots, or launch descriptors;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
   cross-Execution delivery are rejected;
-- receipt replay: Execution A's receipt cannot confirm B; a missing receipt
-  cannot enter RUNNING;
-- hold/release: worker code does not run before receipt durability; recovery
-  distinguishes awaiting-release from actually started; a receipt alone does not
-  confirm RUNNING;
+- receipt replay: Execution A's receipt cannot confirm B; a missing required
+  receipt cannot enter RUNNING;
+- hold/release: worker code does not run before sandbox-receipt durability; the
+  hold stays closed when the daemon crashes or the control channel disconnects,
+  and a parent-death-released pipe is rejected; recovery distinguishes
+  awaiting-release from actually started; a receipt alone does not confirm
+  RUNNING;
 - secured start phase: `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are
-  exact; `HELD`/`RELEASED` require a verified receipt, `UNKNOWN` permits a missing
-  receipt and cannot enter RUNNING; a crash-injection test where the controlled
+  exact; `HELD` requires a verified sandbox receipt, a credential-bound
+  `RELEASED` requires both receipts, `UNKNOWN` permits a missing chain and cannot
+  enter RUNNING; a crash-injection test where the controlled
   process is created but the receipt is not yet persisted MUST yield `UNKNOWN`,
   never `HELD`, `RELEASED`, or RUNNING, and the instance is never released or
   acknowledged; release requires a
@@ -584,14 +598,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   cannot authorize release; uncertain release cannot create a second worker;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
+- receipt chain: receipts are append-only and write-once; the
+  `SandboxAppliedReceipt` establishes `HELD` and is never rewritten; a
+  `CredentialDeliveryReceipt` binds the sandbox receipt digest; a policy-only
+  Execution has no credential receipt, and a credential-bound Execution has both
+  before `RELEASED`;
 - credential ordering: a credential-bearing `SECURITY_V1` Execution establishes
-  delivery while `HELD`, persists the applied-security and delivery receipts, then
-  revalidates authority before `RELEASED`; a later delivery with a different scope
-  cannot retroactively satisfy an earlier receipt;
+  delivery while `HELD`, persists the sandbox and credential-delivery receipts,
+  then revalidates authority before `RELEASED`; a later delivery with a different
+  scope cannot retroactively satisfy an earlier receipt and needs its own chain;
 - receipt durability: file and directory metadata are durable before release, an
   existing different receipt is never replaced, and the worker inherits no
-  receipt file/directory handle;
-- RUNNING atomicity: observation, receipt, RUNNING and first renewal all commit
+  receipt file/directory handle and no write/delete/replace access; read
+  confidentiality is not claimed;
+- RUNNING atomicity: observation, required receipt chain, RUNNING and first
+  renewal all commit
   or all roll back;
 - schema gate: a v8 database is rejected at v9 open and no implicit upgrade
   occurs;

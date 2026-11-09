@@ -71,10 +71,16 @@ In `SECURITY_V1`:
   matching anchor. SourceConfig is not an authored ceiling and there is no
   `P_config`; a physical config effect is admissible only through source
   integration and imported evidence.
-- `R_min` is a typed positive obligation product: `RequiredAccess` (positive
-  permission floors), `RequiredGuarantees` (isolation/continuity),
+- `R_min` is a typed positive obligation product: `RequiredAccess` (formal
+  security operation floors), `RequiredCapabilities` (catalog-validated
+  capability obligations), `RequiredGuarantees` (isolation/continuity),
   `CoarseExecutionModes` (workspace/network mode), and `PlacementConstraints`
-  (frozen M5 predicate). Only `RequiredAccess` uses set inclusion; workspace and
+  (frozen M5 predicate). Only `RequiredAccess` uses set inclusion, and only for a
+  security-class capability with an explicit normative catalog mapping
+  (`CapabilityDefinition.policy_projection`) to a policy access dimension.
+  `Bool`, `Set`, `Ordered`, `Quantity` and `Exact`
+  capabilities do not thereby define an allowed-operation set; they stay in
+  `RequiredCapabilities` and use their existing catalog matchers. Workspace and
   network use their existing dimension predicates, not `⊆`; guarantees and
   placement use `satisfies_requirement`, never `⊆`. Negative constraints such as
   `ReadOnly` or `Disabled` are ceilings, not floors. B.5 v1 makes no path-level
@@ -88,9 +94,13 @@ In `SECURITY_V1`:
   hide it; `None` and an explicit authored policy remain distinguishable until
   validation completes. Typed admission evaluates `RequiredAccess` and
   `CoarseExecutionModes` against `meet(P_generation, P_task)`;
-  `PlacementConstraints` and candidate-dependent guarantees are `Pending` at
-  admission and MUST be discharged during candidate matching. Provisioning then
-  adds the actual AgentType and SpawnSource ceiling.
+  `RequiredCapabilities`, `PlacementConstraints` and candidate-dependent
+  guarantees are `Pending` at admission and MUST be discharged during candidate
+  matching. Candidate matching and commitment MUST re-evaluate
+  `CoarseExecutionModes` and every positive Task
+  requirement against the complete `P_eff`, because a later meet can remove every
+  writable path even though each ceiling allowed one. Provisioning then adds the
+  actual AgentType and SpawnSource ceiling.
 - The admission mode is explicit and durable:
   `COARSE_V1 | SECURITY_V1` is an input, never inferred from
   `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
@@ -115,12 +125,16 @@ In `SECURITY_V1`:
   combinations exclude the candidate; protocol/corruption faults are control
   plane failures.
 - The effective policy, an execution security snapshot containing the actual
-  bound AgentType, and an applied-security receipt MUST reach physical start.
-  The receipt binds policy, profile, plan, root and proven instance, and joins
-  the existing RUNNING + first-renewal transaction. It is stored outside the
+  bound AgentType, and an append-only receipt chain MUST reach physical start.
+  `SandboxAppliedReceipt` binds policy, profile, plan, root and proven instance
+  and establishes `HELD`; a credential-bound Execution adds a
+  `CredentialDeliveryReceipt` that binds the sandbox receipt digest. The chain
+  joins the existing RUNNING + first-renewal transaction and is stored outside the
   worker-writable jail root/workspace. Physical start holds worker code until the
-  receipt is durable: `SecuredStartPhase` is `HELD`, `RELEASED`, `UNKNOWN`, or
-  `TERMINAL`. A `HELD` instance is released only after the Kernel revalidates
+  sandbox receipt is durable, and the hold stays closed on daemon crash or
+  control-channel loss. `SecuredStartPhase` is `HELD`, `RELEASED`, `UNKNOWN`, or
+  `TERMINAL`; only a `RELEASED` instance with positive physical observation may
+  confirm RUNNING. A `HELD` instance is released only after the Kernel revalidates
   authority for the exact `RequestId` and instance witness; a reused PID never
   grants release, and an uncertain release never creates a second worker.
 - The policy-only implementation target is
@@ -130,9 +144,12 @@ In `SECURITY_V1`:
   the current B.4 jail. Its supported set and explicit non-claims are normative: a
   dimension outside the profile is ineligible, not partially enforced, and a
   capability is claimed only when both supported platforms prove it. B5.4 must
-  publish an OS enforcement-mechanism design note, including why the daemon-owned
-  receipt directory stays inaccessible when daemon and worker share a user
-  identity. B5.5 classifies every dimension against this profile.
+  publish an OS enforcement-mechanism design note that proves receipt integrity,
+  non-replaceability, identity binding, crash recovery and worker
+  write/delete/replace denial. Receipt read confidentiality is explicitly not a
+  minimum-profile claim and MUST NOT be assumed from the B.4 jail; the security
+  model never depends on the receipt path, digest or content being unknown to the
+  worker. B5.5 classifies every dimension against this profile.
 - Credential-bearing configs remain fail-closed unless the exact binding
   declares the corresponding imported gate. B.5 v1 production enables only
   `security_execution_v1.policy` and `credential_brokered`;

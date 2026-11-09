@@ -64,22 +64,50 @@ meaning it did not have at publication.
 
 ### 2. `R_min` is a typed requirement, not one permission set
 
-B5.0 uses only structured fields that already exist and does **not** change
-M6-A `TaskSpec` canonicalization, digests, or replay. `R_min` is a product of
-four typed components:
+B5.0 does **not** change M6-A `TaskSpec` canonicalization, digests, or replay.
+`R_min` is derived from existing structured Task fields; the only new catalog
+property is the explicit capability-to-policy projection below, which removes any
+implementer guess. `R_min` is a product of
+five typed components:
 
 ```text
-RequiredAccess(T)          // positive permission floors
+RequiredAccess(T)          // formal security operation floors only
+RequiredCapabilities(T)    // catalog-validated capability obligations
 RequiredGuarantees(T)      // isolation, continuity, ...
 CoarseExecutionModes(T)    // workspace mode, network mode
 PlacementConstraints(T)    // M5 placement predicate
 ```
 
-- `RequiredAccess` is the only component compared by set inclusion. It contains
-  positive operation requirements and capabilities with a genuine `Ability`
-  floor meaning, preserving the existing `Ability`/`Restriction` polarity. It
-  MUST NOT be constructed from `required_workspace`, `required_network`, or
-  `Restriction` values.
+- `RequiredAccess` is the only component compared by set inclusion. It is
+  constructed only from a security-class capability for which the capability
+  catalog provides an **explicit, normative mapping** to a policy access
+  dimension. The catalog property is
+
+  ```text
+  CapabilityDefinition.policy_projection: Option<PolicyAccessDimension>
+  PolicyAccessDimension = FileOperationClass | ToolCommandSet
+                        | NetworkEndpoint | EnvironmentName
+  ```
+
+  and only `Some(dimension)` permits inclusion in `RequiredAccess`. The mapping
+  is a catalog-owned, versioned property introduced with the B5.1 schema; it is
+  never inferred from `MatcherKind`, `SecurityClass`, identifier naming, or
+  polarity. A mapping is valid only when the capability's value shape denotes an
+  allowed-operation set for that dimension; `Quantity`, `Ordered` and functional
+  `Exact` values MUST NOT carry a `policy_projection`. Until B5.1 publishes it, no
+  capability-to-`RequiredAccess` projection is permitted. A quantity such as
+  `memory_mb >= 4096`, an `Ordered` rank, or a functional `Exact` capability MUST
+  NOT be projected into `ProjectAccess`. B.5 defines no generic
+  capability-to-permission-set conversion; absent a catalog mapping, the
+  obligation stays in `RequiredCapabilities`. An empty `RequiredAccess` is legal:
+  restrictions are still enforced by `P_eff ⊆ every ceiling` and by the capability
+  obligations themselves.
+- `RequiredCapabilities` is validated by the existing `CapabilityCatalog`
+  matcher for the exact `(capability_id, revision)`, preserving `Bool`, `Set`,
+  `Ordered`, `Quantity` and `Exact` semantics unchanged. It is never checked by
+  `⊆` and never projected into `ProjectAccess`.
+- `RequiredAccess` MUST NOT be constructed from `required_workspace`,
+  `required_network`, or `Restriction` values.
 - `CoarseExecutionModes` carries the workspace and network modes. They are
   compared by the existing dimension-specific predicates (workspace rank and
   network polarity/enforcement mode), never by set inclusion. `ReadOnly` is an
@@ -92,8 +120,9 @@ PlacementConstraints(T)    // M5 placement predicate
 - `PlacementConstraints` continues to be checked by the frozen M5 placement
   predicate, and only when a candidate Agent exists (see §5).
 
-`R_min` contains **positive obligations only**. `Write` is the value that
-requires the corresponding write execution capability. Negative constraints
+`R_min` contains **positive obligations only**. `WorkspaceMode::Write` is a
+`CoarseExecutionModes` requirement, and a security-class capability can enter
+`RequiredAccess` only through its catalog mapping. Negative constraints
 (`ReadOnly`, `Disabled`, no-widening) are covered by `P_eff ⊆ every ceiling` and
 by the coarse-consistency checks, not by `RequiredAccess`.
 
@@ -223,9 +252,9 @@ satisfies_requirement(R_min, P, stage, candidate?)
 
 | Stage | Evaluated | Deliberately deferred |
 |---|---|---|
-| Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `PlacementConstraints`; guarantees that require a physical candidate |
-| Candidate matching/acquisition | `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy enforceability | — |
-| Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot | — |
+| Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
+| Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy enforceability, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
+| Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot, including every positive Task requirement and `CoarseExecutionModes` against the committed `P_eff` | — |
 
 Only `Unsatisfied` rejects. `Pending` components are recorded in
 `TaskSecurityBinding` as an explicit obligation set and MUST be discharged at the
@@ -233,15 +262,40 @@ candidate stage. Admission MUST NOT assume that a candidate Agent exists: a Task
 may name a workstream that no future Agent matches, and that is a candidate
 ineligibility, not an admission contradiction.
 
-Only the `RequiredAccess` component is a set inclusion. `RequiredGuarantees`,
-`CoarseExecutionModes`, and `PlacementConstraints` use their own predicates.
-There MUST be exactly one relation, not two implementations that disagree about
-which `R_min` dimensions are set-like or about which stage owns placement.
+`RequiredCapabilities` is deferred at admission because admission has only the
+Generation and Task policy objects, while the existing M6-B.2 matcher compares a
+requirement against the actual AgentType's capability claims. Moving it earlier
+would require inventing a candidate, and collapsing it into `ProjectAccess` is
+exactly the quantity/rank/exact confusion this split forbids.
+
+Only the `RequiredAccess` component is a set inclusion. `RequiredCapabilities`
+use their catalog matchers, and `RequiredGuarantees`, `CoarseExecutionModes`, and
+`PlacementConstraints` use their own predicates. There MUST be exactly one
+relation, not two implementations that disagree about which `R_min` dimensions
+are set-like or about which stage owns placement.
 
 Admission checks only `Generation ∩ Task`. Provisioning adds the actual
 AgentType and the SpawnSource ceiling, and its failure is a different class
 (candidate ineligibility / typed unavailability) rather than an admission
 rejection.
+
+Satisfying a component at admission does **not** make it satisfied after a later
+meet. Intersection can remove the capability that a mode depended on:
+
+```text
+Task requires WorkspaceMode::Write
+AgentType allows writing Workspace/src
+SpawnSource allows writing Workspace/tests
+P_eff = four-way meet
+    → no writable path
+```
+
+The composite policy may still be physically enforceable, but it can no longer
+satisfy the Task's `Write` mode. Candidate matching and Execution commitment MUST
+therefore re-evaluate `CoarseExecutionModes` and every positive Task requirement
+against the complete `P_eff`; they MUST NOT reuse the admission-time verdict.
+This adds no path-level floor: it only prevents a satisfied coarse requirement
+from being silently erased by a later intersection.
 
 This matches the existing coarse rejection of
 `workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
@@ -448,6 +502,6 @@ or algorithm version was added.
 - [ADR-0012](0012-m6b4-scope-typed-physical-execution-ack.md) freezes the M6-B.4
   boundary this design extends.
 - [ADR-0014](0014-m6b5-enforcement-compilation-receipt.md) owns enforcement
-  compilation, physical binding, and the applied-security receipt.
+  compilation, physical binding, and the applied-security receipt chain.
 - [ADR-0015](0015-m6b5-credentials-feature-gates-scope-freeze.md) owns
   credential qualification, feature gates, and the scoped freeze ladder.

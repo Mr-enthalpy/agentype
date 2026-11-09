@@ -63,7 +63,7 @@ probe_availability(subject, deadline)
 
 authorize_and_deliver(committed_launch_authority, access_plan,
                       proven_recipient, deadline)
-    → delivery session / receipt
+    → delivery session + non-secret delivery result
 
 reconcile_delivery(request_identity, deadline)
     → observed delivery state
@@ -261,19 +261,21 @@ Execution MUST establish the delivery session while the physical recipient is
 `HELD` and before `RELEASED`:
 
 ```text
-HELD physical recipient
+SandboxAppliedReceipt durable
+    → HELD
     → credential authorization/delivery
-    → applied-security + delivery receipt durable
+    → CredentialDeliveryReceipt durable, binding the sandbox receipt digest
     → authority revalidation
     → RELEASED
 ```
 
-The secret-free delivery scope in the applied-security receipt MUST describe the
-same session that was established. A later asynchronous delivery with a different
-scope MUST NOT be treated as covered by the earlier receipt; it needs its own
-recoverable receipt chain, and the applied-security receipt cannot be retroactively
-widened. A missing or mismatched delivery receipt keeps the phase at most
-`HELD`/`UNKNOWN`.
+The sandbox receipt MUST NOT claim a delivery scope, because the delivery has not
+happened yet. The credential receipt records the scope actually established. A
+later delivery with a different scope MUST NOT be treated as covered by the
+earlier receipt; it needs its own recoverable receipt chain, and no earlier
+receipt is rewritten. A missing or mismatched delivery receipt keeps the phase at
+most `HELD`/`UNKNOWN`. A policy-only Execution has no credential receipt and does
+not need one.
 
 ### 11. Scoped freeze ladder
 
@@ -322,7 +324,8 @@ policy is enforceable on every adapter". The matrix is a B5.5 deliverable and is
 not a claim about any backend at this baseline.
 
 `D-DB-MIGRATE` records v9 as a fresh-database stage with no v8 → v9 in-place
-upgrade. The receipt artifact class is added to the `D-ARTIFACT-GC` limitation.
+upgrade. The receipt-chain artifact class is added to the `D-ARTIFACT-GC`
+limitation.
 
 The following remain outside B.5: `D-WORKER-RESULT-DP`, `D-ARTIFACT-GC`,
 `D-SELECTION-POLICY`, full typed topology, cold/revivable agent matching,
@@ -348,16 +351,18 @@ B5.5 MUST treat these as mandatory regression categories:
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
-| Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD`/`RELEASED` require a verified receipt, `UNKNOWN` permits a missing receipt and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker |
+| Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
+| Receipt chain | receipts are append-only and write-once; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Cross-mode exclusion | a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task; its coarse projection cannot replace the authored fine contract |
 | Admission mode | the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery; a `COARSE_V1` AgentType cannot execute it, and a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task |
-| Stage separation | `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
-| `R_min` typing | permission floors use `RequiredAccess ⊆ ProjectAccess`; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
+| Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path |
+| `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
-| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it, and B5.4 must prove the same-user receipt-directory isolation mechanism |
-| Credential ordering | delivery is established while `HELD`, its receipt is durable before `RELEASED`, and a later different-scope delivery cannot retroactively satisfy the earlier receipt |
-| RUNNING atomicity | observation, receipt, RUNNING, and first renewal all commit or all roll back |
+| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
+| Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; a later different-scope delivery cannot retroactively satisfy the earlier receipt and needs its own chain |
+| RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |
 | Crash recovery | an uncertain physical start keeps the original RequestId and does not create a second security fact |
@@ -378,6 +383,9 @@ ineligible; that is a legitimate security tightening, not a regression.
   the whole M6-B aggregate.
 - No claim that `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` covers a dimension outside
   its positive list; such a dimension makes the candidate ineligible.
+- No receipt read-confidentiality claim: the security model relies on receipt
+  integrity, non-replaceability, execution/instance binding and recoverability,
+  never on the receipt path, digest or content being unknown to the worker.
 - No reclassification of `D-TOPOLOGY` or other deferred semantic-layer items.
 
 ## Consequences
@@ -400,6 +408,6 @@ ineligible; that is a legitimate security tightening, not a regression.
 - [ADR-0013](0013-m6b5-policy-authority-algebra-identity.md) owns policy
   authority and algebra.
 - [ADR-0014](0014-m6b5-enforcement-compilation-receipt.md) owns enforcement
-  compilation and the applied-security receipt.
+  compilation and the applied-security receipt chain.
 - [Spec 17](../specs/v0.2/17-deferred-open-questions.md) is the registry updated
   by §12.
