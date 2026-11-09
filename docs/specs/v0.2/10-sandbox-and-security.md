@@ -127,7 +127,10 @@ In `SECURITY_V1`:
   coarse row, or a mismatch is corruption, not a downgrade opportunity. A
   `SECURITY_V1` Task requires its Generation to be
   `SECURITY_V1` and the actual bound AgentType to support `SECURITY_V1`. It MUST
-  NOT be downgraded at matching, provisioning or recovery. Cross-mode exclusion
+  NOT be downgraded at matching, provisioning or recovery. A Generation's mode
+  follows its immutable `policy_mode`: `POLICY` reads the `generation_policies`
+  row, while `NONE` is the derived `COARSE_V1`, owns no policy row, and therefore
+  cannot admit a `SECURITY_V1` Task. Cross-mode exclusion
   is symmetric in B.5 v1: a `COARSE_V1` AgentType cannot execute a `SECURITY_V1`
   Task, a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a
   `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource
@@ -161,8 +164,11 @@ In `SECURITY_V1`:
   bound AgentType, and an append-only receipt chain MUST reach physical start.
   `SandboxAppliedReceipt` binds policy, profile, plan, root and proven instance
   and establishes `HELD`; a credential-bound Execution adds a
-  `CredentialDeliveryReceipt` that binds the sandbox receipt digest. The chain
-  joins the existing RUNNING + first-renewal transaction and is stored outside the
+  `CredentialDeliveryReceipt` that binds the sandbox receipt digest. One Execution
+  carries at most one receipt of each kind, so a different credential scope is
+  rejected for that Execution and requires a new Execution with its own plan and
+  receipt chain. That chain joins the existing RUNNING + first-renewal transaction
+  and is stored outside the
   worker-writable jail root/workspace. Receipt publication is
   `durable contents → atomic no-replace publication → durable namespace update →
   verify published identity`, and the physical root MUST satisfy

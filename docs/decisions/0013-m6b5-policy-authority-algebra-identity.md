@@ -192,10 +192,16 @@ I_Requirement = TaskAgentRequirement.hard.required_attempt_isolation
 - `I_AgentType` is `AgentTypeContract.security.requires_attempt_isolation` for the
   actually bound revision. `I_Requirement` is the durable
   `TaskAgentRequirement.hard.required_attempt_isolation`
-  (`TaskRequirement.required_attempt_isolation`). `into_requirement` derives it as
-  `AgentRequirementDraft.required_attempt_isolation
-  || GenerationPolicy.requires_attempt_isolation`, so the Generation and
-  Task-authored terms are already folded into one field by the frozen path.
+  (`TaskRequirement.required_attempt_isolation`). The frozen path produces it in
+  two distinct stages, and the attribution matters:
+  `AgentRequirementDraft::into_requirement` only carries the Task-authored
+  `required_attempt_isolation` forward; `fold_generation_policy` performs the
+  disjunction `GenerationPolicy.requires_attempt_isolation
+  || TaskRequirement.required_attempt_isolation`, and the folded value is what
+  becomes durable in `TaskAgentRequirement.hard`. B5.1 MUST NOT change
+  `into_requirement` to fold the Generation term itself in order to "match" this
+  ADR; the Generation term belongs to the fold, and the stored requirement MUST
+  remain the exact fixed point of that fold.
 - `required_attempt_isolation` is **not** a `TaskSpec` field. B5.0/B5.1 MUST NOT
   add one to the frozen M6-A `TaskSpec` to match an ADR formula; the authored
   value lives in `AgentRequirementDraft`, which becomes the durable
@@ -566,9 +572,28 @@ competing authority sources:
 Mode declarations are per-object immutable facts, fixed when the object is
 created or published — never a mutable "supports" label chosen at admission:
 
-- each Generation fixes its `SecurityContractMode` in the immutable
-  `generation_policies` record written by `create_generation`; there is no
-  separate Generation revision mechanism, and the field is not editable;
+- each Generation's `SecurityContractMode` follows its immutable
+  `generations.policy_mode`, which the frozen schema restricts to `NONE` or
+  `POLICY`:
+
+  ```text
+  policy_mode = NONE
+      → COARSE_V1 only
+      → no generation_policies child row
+      → cannot admit a SECURITY_V1 Task
+
+  policy_mode = POLICY
+      → security_contract_mode owned by the immutable generation_policies
+        row written by create_generation (COARSE_V1 or SECURITY_V1, as authored)
+  ```
+
+  For a `NONE` Generation the effective mode is the derived `COARSE_V1`; it is
+  never stored as a second marker, and B5 MUST NOT backfill a `generation_policies`
+  row for an existing `NONE` Generation (the frozen trigger
+  `generation_policies_require_policy_mode` rejects one). `NONE` is never an
+  implicit unrestricted `SECURITY_V1` Generation. For a `POLICY` Generation the
+  policy row exists and there is no separate Generation revision mechanism, and
+  the mode is not editable;
 - each AgentType revision declares the `SecurityContractMode` it is authored for;
 - each SpawnSource **revision** declares whether it carries an authored
   `P_source` fine ceiling and which enforcement protocol/profile versions its

@@ -280,12 +280,16 @@ SandboxAppliedReceipt durable
 ```
 
 The sandbox receipt MUST NOT claim a delivery scope, because the delivery has not
-happened yet. The credential receipt records the scope actually established. A
-later delivery with a different scope MUST NOT be treated as covered by the
-earlier receipt; it needs its own recoverable receipt chain, and no earlier
-receipt is rewritten. A missing or mismatched delivery receipt keeps the phase at
-most `HELD`/`UNKNOWN`. A policy-only Execution has no credential receipt and does
-not need one.
+happened yet. The credential receipt records the scope actually established. B.5
+v1 allows at most one credential delivery per Execution: one immutable
+`CredentialAccessPlan` produces at most one `CredentialDeliveryReceipt`. A request
+for a different scope under the same Execution is rejected before any broker call
+and requires a new Execution with its own qualification, snapshot, and chain. No
+earlier receipt is ever rewritten, and a second row of the same receipt kind is
+corruption rather than an append. Multi-delivery inside one Execution would need
+a versioned delivery identity and a new durable protocol in a later ADR. A missing
+or mismatched delivery receipt keeps the phase at most `HELD`/`UNKNOWN`. A
+policy-only Execution has no credential receipt and does not need one.
 
 ### 11. Scoped freeze ladder
 
@@ -392,11 +396,11 @@ B5.5 MUST treat these as mandatory regression categories:
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
 | Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
-| Receipt chain | receipts are append-only and write-once; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
+| Receipt chain | receipts are append-only, write-once, and bounded to one per kind per Execution; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a second row of the same kind is corruption, not an append; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |
 | Cross-mode exclusion | symmetric in B.5 v1: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource revision carrying an authored `P_source` ceiling is reachable only through the full `SECURITY_V1` path; in each case the coarse projection cannot replace the authored fine contract, and a "supports both modes" label grants no execution |
-| Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` exists exactly when the mode is `SECURITY_V1` and is absent for `COARSE_V1` (conditional biconditional), with no independent mode, and `generation_task_bindings` carries none; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
+| Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` exists exactly when the mode is `SECURITY_V1` and is absent for `COARSE_V1` (conditional biconditional), with no independent mode, and `generation_task_bindings` carries none; a Generation's mode follows `policy_mode`: `POLICY` reads the immutable `generation_policies` row, `NONE` is the derived `COARSE_V1` with no row and cannot admit a `SECURITY_V1` Task; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
 | Delivery mode vs Task grammar | the credential delivery-mode dimension is outside the v1 Task policy grammar, so a v1 authored `sandbox_policy` cannot narrow it; the requirement is derived from the AgentType ceiling and credential eligibility subject; enabling `TransientRawDelivery` needs a new versioned Task grammar with its own `meet`/conflict rule |
 | Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
 | Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path; `Write` requires an allowed write inside the committed logical workspace region, not a writable temporary location |
@@ -406,7 +410,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | a requested credential scope outside `P_eff` or the Source ceiling is rejected, not truncated |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
-| Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; a later different-scope delivery cannot retroactively satisfy the earlier receipt and needs its own chain |
+| Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain |
 | RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
 | Feature gating | without a declared policy/credential capability, behavior stays at B.4 fail-closed |

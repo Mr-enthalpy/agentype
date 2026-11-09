@@ -195,6 +195,18 @@ physical enforceability allow it, but a tightening alone does not mint a new
 LogicalAgent; a real source/config/domain/enforceability change does not reuse
 the old physical host.
 
+Same-provenance WARM reuse is **not** sufficient proof of cross-Task
+security-context reuse. An unchanged `ProvisioningBinding` says the provenance is
+the same; it does not prove that resident physical state from the earlier Task
+(written paths, caches, mounted secrets, process state, descriptor tables) has
+been cleared. When two Tasks differ in write scope, secret scope, or execution
+guarantees, reusing one physical host across them requires a fresh per-Execution
+isolation proof, or an explicit reset/quiescence witness that covers exactly the
+state the earlier Task could have written. Without one of those the reuse fails
+closed and the Task does not start on that host. The B.4 per-`RequestId` jail is a
+reference implementation of such a proof for its own adapter; it MUST NOT be
+generalized into a default guarantee for every adapter.
+
 ### 7. Secured start observation and receipt
 
 For `SECURITY_V1`, a start can become RUNNING only with a valid receipt chain
@@ -214,8 +226,10 @@ SecuredReceiptChain
 
 `SandboxAppliedReceipt` establishes the sandbox-applied state; a credential-bound
 Execution adds a `CredentialDeliveryReceipt` that binds the sandbox receipt
-digest. Both are append-only and write-once. The sandbox receipt is never
-updated to describe a later delivery.
+digest. Both are append-only and write-once. The sandbox receipt is never updated
+or reused to describe a credential delivery; a credential delivery is a separate
+receipt of its own kind, and one Execution carries at most one receipt of each
+kind (see section 8).
 
 Phase invariants:
 
@@ -384,12 +398,27 @@ SandboxAppliedReceipt durable
 
 The initial `HELD` receipt cannot prove a delivery that has not happened yet, so
 the sandbox receipt MUST NOT claim the credential delivery scope. The credential
-receipt records the scope actually established. A later delivery with a different
-scope MUST NOT be treated as covered by the earlier chain: it needs its own
-recoverable receipt chain, and no earlier receipt is rewritten. A missing or
-mismatched credential receipt keeps the phase at most `HELD`/`UNKNOWN`. A
-policy-only Execution has `credential_delivery = None` and does not need a
-credential receipt.
+receipt records the scope actually established. B.5 v1 fixes the credential
+cardinality:
+
+```text
+one Execution
+    → one immutable CredentialAccessPlan
+    → at most one CredentialDeliveryReceipt
+```
+
+A request for a different credential scope under the same Execution MUST be
+rejected before any broker call or physical delivery. It is not a second delivery
+in the same chain and is never appended as a second row. Establishing a different
+or wider scope requires a new Execution with its own qualification, immutable
+plan, security snapshot, and receipt chain. A new Execution is not a new
+Incarnation: it may reuse the same WARM host under section 6, including that
+section's isolation or reset/quiescence witness. Multi-delivery inside one
+Execution is outside B.5 v1; it would need a versioned delivery identity and its
+own durable protocol in a later ADR, and B5.1 MUST NOT invent a delivery sequence
+on its own. A missing or mismatched credential receipt keeps the phase at most
+`HELD`/`UNKNOWN`. A policy-only Execution has `credential_delivery = None` and
+does not need a credential receipt.
 
 The following are mandatory:
 

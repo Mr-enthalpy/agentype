@@ -125,9 +125,9 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   isolation is a requirement union, not an intersection:
   `AgentTypeContract.security.requires_attempt_isolation OR
   TaskAgentRequirement.hard.required_attempt_isolation OR
-  SourceRequirement.requires_attempt_isolation` (the requirement fold already
-  covers Generation and Task; a Task or Generation may tighten it, and the
-  SpawnSource term exists only when that source contract explicitly requires
+  SourceRequirement.requires_attempt_isolation` (the Generation term enters
+  through `fold_generation_policy`, so a Task or Generation may tighten it, and
+  the SpawnSource term exists only when that source contract explicitly requires
   isolation). An adapter's ability to *support* isolation is not a request. When
   effective it MUST be physically enforceable by the exact binding, and the
   committed execution MUST request it. Full eligibility additionally

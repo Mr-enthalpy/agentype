@@ -74,7 +74,10 @@ catalog:
   fixed at generation creation and applied as the spec 10 intersection on each
   typed admission (a Task exceeding it fails closed). A policy row may only be
   inserted under a `POLICY` generation, and admission reads policy presence only
-  through the authoritative `get_generation_policy`.
+  through the authoritative `get_generation_policy`. A `NONE` generation has no
+  policy row and its security mode is the derived `COARSE_V1`: it cannot admit a
+  `SECURITY_V1` Task, and the absent row is never read as an unconstrained or
+  implicitly `SECURITY_V1` Generation.
 - `tasks.agent_requirement_mode` (`LEGACY`/`TYPED`) and
   `generations.policy_mode` (`NONE`/`POLICY`) are positive parent-side presence
   markers fixed at creation/admission and immutable thereafter. A missing child
@@ -240,7 +243,11 @@ surface designed in
   the daemon-owned receipt artifacts outside the worker-writable jail
   root/workspace are separate recoverable physical evidence. The two MUST NOT be
   conflated. A credential-delivery row binds the sandbox receipt digest and never
-  replaces it. After a pre-RUNNING crash the artifacts may reconstruct and verify
+  replaces it. The `(Execution, receipt kind)` key is also the cardinality bound:
+  at most one `SandboxAppliedReceipt` and at most one `CredentialDeliveryReceipt`
+  per Execution. A second delivery request for the same Execution is rejected
+  before delivery, and a second row of the same kind is corruption, never an
+  upsert or append. After a pre-RUNNING crash the artifacts may reconstruct and verify
   the chain only under the full relation (same ExecutionId/RequestId, binding and
   plan digest, instance witness, matching sandbox receipt digest, proven release
   phase); a missing artifact cannot be synthesized from the rows, and an artifact

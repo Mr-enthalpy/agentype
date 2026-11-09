@@ -473,6 +473,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   config failure, Task/Batch cancel, expiry, restart, NACK or ACK;
 - a fresh STARTING reservation never fabricates WARM/terminal physical evidence
   on pre-Execution cancellation and can be reused;
+- WARM security-context reuse: an unchanged `ProvisioningBinding` does not by
+  itself authorize reusing a WARM host for a Task with a different write scope,
+  secret scope, or execution guarantee; reuse requires a fresh per-Execution
+  isolation proof or a reset/quiescence witness covering the earlier Task's
+  possible writes, and otherwise fails closed before any physical start;
 - after pure prepare failure or cancellation, a STARTING reservation with a
   validated ProvisioningBinding and no Execution history can transactionally
   roll to another config/source once its claim closes; tests MUST cover
@@ -560,6 +565,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   supports isolation does not create it, and a required isolation without an
   isolating `ExecutionTarget`, exact-adapter enforceability, and a committed
   isolation request makes the candidate ineligible;
+- isolation source staging: `AgentRequirementDraft::into_requirement` carries only
+  the Task-authored `required_attempt_isolation`, and `fold_generation_policy`
+  performs the Generation disjunction into the durable
+  `TaskAgentRequirement.hard`; a test asserts the stored requirement is the exact
+  fixed point of the re-fold, so B5 cannot "fix" the ADR by changing the frozen
+  `into_requirement` behavior;
 - admission mode: explicit `COARSE_V1 | SECURITY_V1` is durable and never
   inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
   a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
@@ -572,6 +583,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   mismatch, more than one binding, and two candidate authority rows are all
   rejected as corruption — and a legal `COARSE_V1` Task must be admitted with no
   security row, so the biconditional is tested in both directions;
+- Generation mode coverage: a `NONE` Generation has no `generation_policies` row,
+  admits only `COARSE_V1` Tasks, rejects a `SECURITY_V1` Task at admission, and is
+  never read as unconstrained or implicitly `SECURITY_V1`; a `POLICY` Generation
+  derives its mode from the immutable row, and admission never backfills a row for
+  a `NONE` Generation;
 - cross-mode symmetry: a `SECURITY_V1` Generation MUST reject a `COARSE_V1` Task
   at admission even when the Generation also lists `COARSE_V1` support, and a
   SpawnSource revision carrying an authored `P_source` ceiling MUST NOT be
@@ -651,15 +667,19 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   cannot authorize release; uncertain release cannot create a second worker;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
-- receipt chain: receipts are append-only and write-once; the
-  `SandboxAppliedReceipt` establishes `HELD` and is never rewritten; a
-  `CredentialDeliveryReceipt` binds the sandbox receipt digest; a policy-only
-  Execution has no credential receipt, and a credential-bound Execution has both
-  before `RELEASED`;
+- receipt chain: receipts are append-only, write-once, and bounded to one per
+  kind per Execution; the `SandboxAppliedReceipt` establishes `HELD` and is never
+  rewritten; a `CredentialDeliveryReceipt` binds the sandbox receipt digest; a
+  policy-only Execution has no credential receipt, and a credential-bound
+  Execution has both before `RELEASED`; a second row of the same kind, or an
+  upsert over one, is corruption;
 - credential ordering: a credential-bearing `SECURITY_V1` Execution establishes
   delivery while `HELD`, persists the sandbox and credential-delivery receipts,
-  then revalidates authority before `RELEASED`; a later delivery with a different
-  scope cannot retroactively satisfy an earlier receipt and needs its own chain;
+  then revalidates authority before `RELEASED`; a request for a different
+  credential scope under the same Execution is rejected before any broker call,
+  because the committed plan is immutable and one Execution carries at most one
+  credential receipt — the different scope needs a new Execution with its own
+  qualification, snapshot, and chain;
 - receipt durability: file and directory metadata are durable before release, an
   existing different receipt is never replaced, and the worker inherits no
   receipt file/directory handle and no write/delete/replace access; read
