@@ -177,6 +177,8 @@ required-access digest
 enforcement profile identity + profile digest
 security plan bytes + digest
 bootstrap manifest digest
+bootstrap manifest canonical bytes, or a deterministic reconstruction
+    recipe over the committed exact launch descriptor
 credential access plan (secret-free; canonical request digest,
     proof identity/epoch/issuer/validity)
 security protocol version
@@ -206,6 +208,39 @@ applied bootstrap manifest digest. A mismatch, or a manifest that cannot be
 measured exactly, fails closed and never reaches `HELD`. The manifest digest is
 not assumed to be covered by `plan_semantics_digest`; it is separately enforced
 and receipt-bound.
+
+Integrity alone does not prove authorization: a faithfully committed manifest can
+still request more than the compiled plan allows. Before the execution security
+snapshot is committed, the runtime MUST therefore run
+
+```text
+validate_bootstrap(
+    committed_effective_policy,
+    compiled_enforcement_plan,
+    canonical_bootstrap_manifest,
+    exact_source_and_binding
+)
+    → ValidatedBootstrapEvidence
+```
+
+`validate_bootstrap` is a pure, deterministic check that proves the manifest does
+not widen what the worker can obtain: no environment name, inherited handle,
+start exemption, path, credential, or other dimension beyond the compiled plan
+and `P_eff`. Only launcher-only privileges that never reach the worker may be
+carried as launcher authority, and the manifest MUST prove they are
+non-inheritable and dropped before release; a privilege whose residual effect can
+reach the worker is not launcher-only. A manifest that fails validation is
+rejected before any physical work. `ValidatedBootstrapEvidence` is durable, and
+its digest enters the snapshot, so a manifest that was validated cannot be
+substituted later.
+
+The manifest content MUST be recoverable after a restart, either as canonical
+bytes persisted in the snapshot or by deterministic reconstruction from the
+committed exact launch descriptor and `exact_source_and_binding`. A digest alone
+is insufficient: a later reader cannot re-run `validate_bootstrap` or the
+`AppliedBootstrapManifest.digest` equality on content it cannot obtain. If neither
+recovery path is exact, the Execution fails closed rather than treating an
+unverifiable manifest as applied.
 
 A committed Execution's security contract is never changed by a later Task. A
 long-lived LogicalAgent may serve different Task policies when continuity and
@@ -315,6 +350,7 @@ exact adapter binding
 effective policy digest
 enforcement plan digest
 bootstrap manifest digest (applied manifest == committed snapshot)
+validated bootstrap evidence digest
 actual root identity
 proven physical instance
 enforcement profile/protocol

@@ -108,6 +108,27 @@ credential-delivery side effect. It runs under a fixed absolute deadline; a time
 is control-plane indeterminacy, never an empty or partial request. This keeps the
 new resolver inside the B.4 pure-preparation boundary.
 
+For B.5 v1 the resolver is not free to choose the set. Over the canonicalized
+references (sorted, deduplicated), the invariant is
+
+```text
+Refs(CredentialRequest) == Refs(SourceConfig)
+```
+
+The resolver MUST NOT omit, add, or deduplicate away a distinct reference, and a
+request produced from a different revision is invalid. Ordering is not significant
+after canonicalization, so a reordered request is still equal only when its
+canonical set is identical. An empty request for a non-empty `credential_refs` is
+a hard failure, never a credential-free Execution: it would silently bypass the
+brokered feature gate. A request that names a reference absent from the exact
+revision fails closed the same way.
+
+A future revision may distinguish source-side provisioning references from
+worker-delivered references, but only by an explicit typed classification that
+accounts for every reference and proves each one is authorized for its use; no
+reference may disappear by resolver discretion. Until such a classification
+exists, the equality above is the only legal rule.
+
 Broker routes bind the exact SpawnSource revision; a new source revision does
 not automatically inherit an old route. Registration/installation belongs to
 provisioning administration, not the Root semantic API.
@@ -384,6 +405,24 @@ M6-B aggregate
     frozen only after every item defined as an aggregate blocker is closed
 ```
 
+The aggregate blocker set is exactly enumerable, not inferred:
+
+```text
+1. M6-B.4 remains FROZEN
+2. M6-B.5 / policy-only is FREEZE READY
+3. M6-B.5 / credential-bound is FREEZE READY
+4. every registry item classified BLOCKS_M6B_FREEZE is closed
+```
+
+Credential-bound is therefore a mandatory prerequisite of the M6-B aggregate
+freeze, not an optional follow-up: an aggregate freeze while credential-bound is
+open is not permitted. `BLOCKS_M6B_B5_FREEZE` items block only their named slice
+and are not aggregate blockers by themselves. `D-TOPOLOGY` keeps its existing
+`BLOCKS_SEMANTIC_LAYER (remainder)` classification and is not added to this set by
+inference; moving it would require the maintainer ADR change described below.
+When only a slice freezes, the record MUST name that slice and MUST NOT describe
+the aggregate as frozen.
+
 If only policy-only is completed, the record MUST freeze the policy-only slice
 and MUST NOT describe credential-bound acquisition as complete.
 
@@ -489,11 +528,13 @@ B5.5 MUST treat these as mandatory regression categories:
 | Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage |
 | Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path; `Write` requires an allowed write inside the committed logical workspace region, not a writable temporary location |
 | Guarantee composition | attempt isolation is a disjunction (`AgentTypeContract.security.requires_attempt_isolation OR TaskAgentRequirement.hard.required_attempt_isolation OR SourceRequirement.requires_attempt_isolation`), never a policy intersection; an `EnforcementSupport` capability that supports isolation does not create a requirement; a required isolation must reach an isolating target, exact-adapter proof and a committed isolation request, or the candidate is ineligible |
-| `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; projection accepts only a `Set` through the versioned member map, so `Bool(true)` projects to nothing and an unmapped member fails closed; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion |
+| `R_min` typing | `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped security operation requirements; projection accepts only a `Set` whose `polarity` is `Ability` and whose `security_class` is `Authority`/`Sandbox` through the versioned member map, so `Bool(true)`, a `Restriction`, an ineligible class or an unmapped member fails closed; `RequiredCapabilities` use their existing `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers at the candidate stage; workspace/network use `CoarseExecutionModes` predicates; guarantees and placement use `satisfies_requirement`, never set inclusion; a `Restriction` ceiling relation is never converted into a positive floor |
 | `P_source` top | a `SECURITY_V1` SpawnSource revision without an authored fine ceiling has `P_source = Top` and adds no restriction, but still requires complete imported-enforcement coverage, the feature gate and credential qualification; `Top` never bypasses eligibility |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | credential authorization is positive and deny-by-default: the AgentType `SECURITY_V1` ceiling must explicitly grant ref, use, scope, audience and delivery mode; an omitted declaration grants nothing and is never `Top`; Generation and source ceilings may only narrow; a request outside the grant is rejected before any broker call, never truncated or widened, and broker `Available` plus adapter support cannot substitute for the grant |
-| Credential request provenance | the request is produced only by the trusted source-local resolver from the exact `SourceConfig` revision as a canonical secret-free `CredentialRequest` (ref set, use, scope, audience, delivery mode, canonical digest), validated as a whole against `P_eff` before any probe; the digest enters winner qualification and the `CredentialAccessPlan`; no scope may be derived from a broker response, so "probe then authorize" is a rejected ordering; the resolver is pure, read-only, secret-free, deterministic and deadline-bounded, with no physical or delivery side effect |
+| Credential request provenance | the request is produced only by the trusted source-local resolver from the exact `SourceConfig` revision as a canonical secret-free `CredentialRequest` (ref set, use, scope, audience, delivery mode, canonical digest), with canonical `Refs(request) == Refs(SourceConfig)` so no reference is silently omitted or added and an empty request for a non-empty config fails closed instead of bypassing the brokered gate, validated as a whole against `P_eff` before any probe; the digest enters winner qualification and the `CredentialAccessPlan`; no scope may be derived from a broker response, so "probe then authorize" is a rejected ordering; the resolver is pure, read-only, secret-free, deterministic and deadline-bounded, with no physical or delivery side effect |
+| Bootstrap authorization | `validate_bootstrap` proves the committed manifest does not widen worker environment, inherited handles, start exemptions, paths, credentials or any other dimension beyond the compiled plan and `P_eff`; launcher-only authority is non-inheritable and dropped before release; a digest-matching manifest that requests an over-broad exception is rejected before physical work; manifest content is recoverable as canonical bytes or by exact deterministic reconstruction, never digest-only |
+| Freeze scope | the M6-B aggregate freeze requires M6-B.4 frozen, policy-only `FREEZE READY`, credential-bound `FREEZE READY`, and every open `BLOCKS_M6B_FREEZE` item closed; `BLOCKS_M6B_B5_FREEZE` items block only their named slice, and a slice freeze is never reported as the aggregate |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding, crash recovery and restart-time HELD/RELEASED/UNKNOWN classification, with an unprovable release kept `UNKNOWN`; read confidentiality is a non-claim and is never assumed |
 | Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain; the single receipt must prove the whole requested set was delivered exactly, and partial delivery never reaches `RELEASED` |
 | WARM credential reuse | a fresh per-Execution write jail proves content-write confinement only, not complete cross-Task security-context isolation; credential-bound WARM reuse additionally needs execution-bound broker verification, proof the old capability cannot be inherited or continued, or a physically verified reset witness, and is refused otherwise |

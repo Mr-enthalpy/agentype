@@ -236,7 +236,9 @@ surface designed in
 - `execution_security_snapshots` is immutable, one per Execution, created in the
   same transaction as the Execution and `BindingSnapshot`: inline effective
   policy bytes and digest, derivation identity, enforcement profile/digest,
-  security plan/digest, bootstrap manifest digest, secret-free credential plan
+  security plan/digest, bootstrap manifest digest plus canonical manifest bytes
+  or a deterministic reconstruction recipe, validated bootstrap evidence digest,
+  secret-free credential plan
   including the canonical credential-request digest, proof identity, broker
   epoch, issuer version, validity bound and
   subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task

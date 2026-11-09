@@ -610,9 +610,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   is reserved for required launch/structural clashes such as two different
   required working directories or conflicting required environment values; tests
   must not accept one as the other;
-- `RequiredAccess` projection: only a catalog-mapped `Set` projects, through the
-  versioned member map; `Bool(true)` projects to nothing, an unmapped member fails
-  closed, and `Set(∅)` yields a legal empty floor;
+- `RequiredAccess` projection: only a catalog-mapped `Set` with `polarity = Ability`
+  and `security_class` in `Authority`/`Sandbox` projects, through the versioned
+  member map; `Bool(true)` projects to nothing, a `Restriction` or an ineligible
+  class projects to nothing even as a `Set`, an unmapped member fails closed, and
+  `Set(∅)` yields a legal empty floor; a `Restriction` ceiling is never converted
+  into a positive floor;
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial
@@ -639,6 +642,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   digest; a substituted or unmeasurable manifest fails closed and never reaches
   `HELD`, and a matching policy/profile/plan triple alone is not accepted as proof
   of the committed bootstrap;
+- bootstrap authorization: `validate_bootstrap` rejects a manifest whose digest
+  matches but whose content adds a worker-visible environment name, inherited
+  handle, start exemption, path, credential or any other dimension beyond the
+  compiled plan and `P_eff`; launcher-only privileges must be proven
+  non-inheritable and dropped, and manifest content must be recoverable as
+  canonical bytes or exact deterministic reconstruction rather than digest-only;
 - receipt publication: the platform proof covers durable contents, atomic
   no-replace publication, durable namespace update, and re-read verification of
   the published identity; a process killed after publication but before namespace
@@ -664,6 +673,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   observation epoch, is rejected as probe-then-authorize; the resolver is pure,
   read-only, secret-free, deterministic and deadline-bounded, and creates no
   physical resource, broker call or delivery side effect;
+- credential reference completeness: over canonicalized references,
+  `Refs(request) == Refs(SourceConfig)`; a resolver that omits a ref, adds one,
+  returns an empty set for a non-empty config, keeps a duplicate, or mixes
+  revisions fails closed, and an empty request never turns a credential-bearing
+  config into a credential-free Execution that bypasses the brokered gate;
 - credential evidence durability and scope: proof identity/epoch/issuer
   version/validity/subject digests reach the Execution snapshot, no raw broker
   response is persisted, and a requested scope outside `P_eff` or the Source

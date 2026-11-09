@@ -101,6 +101,24 @@ PlacementConstraints(T)    // M5 placement predicate
   `Exact` values MUST NOT carry a `policy_projection`. Until B5.1 publishes it, no
   capability-to-`RequiredAccess` projection is permitted.
 
+  Because `CapabilityPolarity` is independent of `MatcherKind` and
+  `SecurityClass`, a `Set` capability may be a `Restriction`, where a larger set
+  is a stronger limit rather than more ability. The v1 mapping validity condition
+  is therefore explicit:
+
+  ```text
+  policy_projection != None
+      ⇒ matcher_kind == Set
+      ∧ polarity == Ability
+      ∧ security_class ∈ {Authority, Sandbox}
+      ∧ every member has a valid operation mapping
+  ```
+
+  A `Restriction` never enters the positive `RequiredAccess` floor, even when its
+  value is a `Set`; its relation to a policy ceiling is a separate consistency
+  projection, never an implicit floor conversion. `Functional` and `Continuity`
+  capabilities likewise never project.
+
   The conversion is deterministic and exhaustive. For a mapped capability with
   dimension `d`, the catalog also declares a versioned member map
   `policy_member_map: member -> operation(d)`, and

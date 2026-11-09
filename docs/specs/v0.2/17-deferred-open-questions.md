@@ -12,7 +12,11 @@ Classification:
 - `BLOCKS_SEMANTIC_LAYER` — M6 cannot start
 - `BLOCKS_M6B_B3` — M6-B.1 may proceed; resolve before M6-B B.3 typed admission (does not retroactively block M6-A/B.1)
 - `BLOCKS_M6B_FREEZE` — M6-B.1 may proceed as a draft kernel, but M6-B MUST NOT be frozen/merged
-- `BLOCKS_M6B_B5_FREEZE` — M6-B.4 remains frozen; the item blocks only the named M6-B.5 slice freeze (policy-only, credential-bound, or both as stated)
+- `BLOCKS_M6B_B5_FREEZE` — M6-B.4 remains frozen; the item blocks only the named
+  M6-B.5 slice freeze (policy-only, credential-bound, or both as stated); the
+  M6-B aggregate freeze requires both slices plus every open
+  `BLOCKS_M6B_FREEZE` item (ADR-0015 §11), so a slice freeze is never reported as
+  the aggregate
 - `DOES_NOT_BLOCK_RIIR_KERNEL` — M4 may proceed; resolve before the named gate
 
 | ID | Question | Why unresolved | Blocks | Resolve by |
