@@ -50,6 +50,10 @@ where `P_actual_agent` MUST come from the AgentType revision actually bound to
 the LogicalAgent, not from the Task's matching anchor. There is **no**
 `P_config` term.
 
+`P_eff` is the authorization component only. `EffectiveExecutionSecurity` also
+carries the execution guarantees (notably `I_required` from §3), which are
+composed by disjunction and are never part of the policy intersection.
+
 A SourceConfig is not an independent authored `SecurityCeiling`. It may carry
 source-private non-secret configuration, functional capability declarations,
 lifecycle narrowing, and credential references. A physical effect of a config
@@ -115,7 +119,8 @@ PlacementConstraints(T)    // M5 placement predicate
   `Restricted` is an execution mode; none of them is a positive access
   requirement.
 - `RequiredGuarantees` carries guarantees that are not allowed-operation sets:
-  `required_attempt_isolation`, continuity, and any other execution guarantee.
+  `required_attempt_isolation` (the disjunction defined in §3, not a per-object
+  intersection), continuity, and any other execution guarantee.
   It is checked by the corresponding guarantee predicate, not by `⊆`.
 - `PlacementConstraints` continues to be checked by the frozen M5 placement
   predicate, and only when a candidate Agent exists (see §5).
@@ -149,6 +154,46 @@ The relation is defined per object, because they have different authorship:
 
 `requires_attempt_isolation` is an execution guarantee, not part of the
 file/network allowed set, so the normalized policy carries it explicitly.
+`P_eff` is an **authorization** intersection; execution guarantees are not
+intersected with it and MUST NOT be composed by `⊆`. Attempt isolation is a
+monotone requirement with an explicit disjunction:
+
+```text
+I_required = I_AgentType ∨ I_Requirement ∨ I_SourceRequirement
+I_Requirement = GenerationPolicy.requires_attempt_isolation
+              ∨ TaskSpec.required_attempt_isolation
+```
+
+- `I_AgentType` is `AgentType.requires_attempt_isolation` for the actually bound
+  revision. `I_Requirement` is the existing frozen fold
+  `TaskAgentRequirement.required_attempt_isolation`
+  (`GenerationPolicy.requires_attempt_isolation || TaskSpec.required_attempt_isolation`),
+  restated here so the composition rule is explicit.
+- `I_SourceRequirement` exists only when the SpawnSource contract for that
+  provisioning explicitly requires isolation. No v1 source contract has such a
+  field, so it is `false` at this baseline; adding one requires a new versioned
+  source contract, never an inference.
+- `EnforcementSupport` saying the adapter/domain *can enforce* isolation is a
+  capability, not a request. It MUST NOT set any `I_*`, and "supports isolation"
+  MUST NOT be read as "this execution has isolation enabled".
+- `I_required` is carried separately from `P_eff` in
+  `EffectiveExecutionSecurity`; it is not a policy dimension and cannot be
+  narrowed by meeting another policy.
+
+`I_required` discharges through one ordered chain at the candidate stage:
+
+```text
+I_required
+    → ExecutionTarget.attempt_isolation = true
+    → exact adapter proves enforceability for the binding
+    → committed execution requests isolation
+```
+
+Any failed step makes the candidate ineligible. It is never repaired by
+intersecting policies, by an AgentType claim, or by adapter self-assertion. An
+isolating `ExecutionTarget` alone does not discharge `I_required`: the committed
+execution must request isolation for the requirement to be met, and an
+`I_required = false` execution gains no semantic isolation claim from its target.
 
 For a Task, `required_workspace` is fixed by the TaskSpec before
 `into_requirement`, while `sandbox_policy` comes from the requirement draft. They
@@ -297,6 +342,15 @@ against the complete `P_eff`; they MUST NOT reuse the admission-time verdict.
 This adds no path-level floor: it only prevents a satisfied coarse requirement
 from being silently erased by a later intersection.
 
+`WorkspaceMode::Write` is satisfied only when the complete `P_eff` retains at
+least one allowed write operation **inside the committed logical workspace
+region** of this Task. A writable location that is unrelated to that workspace —
+a temporary directory, a bootstrap-manifest path outside the workspace, or any
+other writable area that the Task cannot use as its workspace — MUST NOT satisfy
+`Write`. This stays a coarse-mode predicate over the logical workspace region; it
+does not introduce a path-level `R_min` floor, and it MUST NOT be inferred from
+an adapter's ability to create files somewhere.
+
 This matches the existing coarse rejection of
 `workspace_rank(task) > generation.max_workspace`; the sandbox dimension MUST
 fail at the same stage, not later during provisioning. An unsatisfiable Task
@@ -317,6 +371,11 @@ not sufficient:
 | credential scope | refs, use, delivery mode and audience all narrow |
 | resource ceilings | stricter value within the same unit and scope |
 | working directory | validate as a launch constraint; conflict rejects rather than choosing one |
+| execution guarantees (`requires_attempt_isolation`) | **disjunction, not intersection**: `I_required = I_AgentType ∨ I_Requirement ∨ I_SourceRequirement`; any true disjunct makes isolation required, and no meet can remove it |
+
+`P_eff` covers allowed operations and ceilings only. Guarantees live beside it:
+meeting two policies can never clear an isolation requirement, and an
+`EnforcementSupport` capability cannot create one (see §3).
 
 A resource ceiling's **scope is part of the contract**: a per-process memory
 limit and an execution-domain limit are different guarantees, and a semantic
@@ -482,6 +541,9 @@ or algorithm version was added.
 - `PlacementConstraints` and candidate-dependent guarantees stay `Pending` at
   admission and are discharged by candidate matching; admission never invents a
   candidate Agent.
+- Attempt isolation is a union of authored requirements, not an intersection, so
+  meeting policies can never clear it and an adapter's support capability can
+  never create it.
 - The admission mode is durable and explicit, so a Task cannot be silently
   downgraded when a later stage finds the security path inconvenient.
 - The catalog stays small and auditable; derived policies are content-addressed

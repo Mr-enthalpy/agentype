@@ -108,10 +108,15 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
   and pinned sandbox policy, not merely the AgentType ceiling. Effective attempt
-  isolation is `AgentType.requires_attempt_isolation OR
-  Task.required_attempt_isolation` (a Task may tighten it; the AgentType flag
-  stays a per-task requirement), and when effective it MUST be physically
-  enforceable. Full eligibility additionally
+  isolation is a requirement union, not an intersection:
+  `AgentType.requires_attempt_isolation OR
+  TaskAgentRequirement.required_attempt_isolation OR
+  SourceRequirement.requires_attempt_isolation` (the requirement fold already
+  covers Generation and Task; a Task or Generation may tighten it, and the
+  SpawnSource term exists only when that source contract explicitly requires
+  isolation). An adapter's ability to *support* isolation is not a request. When
+  effective it MUST be physically enforceable by the exact binding, and the
+  committed execution MUST request it. Full eligibility additionally
   requires an active adapter policy, satisfied `required_safety`, a coherent
   adapter kind/binding, and a currently resolvable exact binding (M6-B.4); the
   availability of required credential refs is a B.5 conjunct, and B.4 records

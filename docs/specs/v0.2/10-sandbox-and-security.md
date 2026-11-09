@@ -99,8 +99,20 @@ In `SECURITY_V1`:
   matching. Candidate matching and commitment MUST re-evaluate
   `CoarseExecutionModes` and every positive Task
   requirement against the complete `P_eff`, because a later meet can remove every
-  writable path even though each ceiling allowed one. Provisioning then adds the
+  writable path even though each ceiling allowed one. `Write` is satisfied only
+  when the complete `P_eff` retains an allowed write inside the committed logical
+  workspace region; a writable temporary directory or any location the Task cannot
+  use as its workspace MUST NOT satisfy it. Provisioning then adds the
   actual AgentType and SpawnSource ceiling.
+- Execution guarantees are composed by disjunction, not intersection. `P_eff` is
+  an authorization intersection; attempt isolation is
+  `I_required = AgentType.requires_attempt_isolation OR
+  TaskAgentRequirement.required_attempt_isolation OR
+  SourceRequirement.requires_attempt_isolation`, and it must then reach
+  `ExecutionTarget.attempt_isolation = true`, be proven enforceable by the exact
+  adapter, and be requested by the committed execution. An `EnforcementSupport`
+  capability that merely *supports* isolation MUST NOT create a requirement, and
+  no policy meet may clear one. Any failed step makes the candidate ineligible.
 - The admission mode is explicit and durable:
   `COARSE_V1 | SECURITY_V1` is an input, never inferred from
   `sandbox_policy != None`, because `SECURITY_V1 + None` is legal. The mode is
@@ -130,8 +142,13 @@ In `SECURITY_V1`:
   and establishes `HELD`; a credential-bound Execution adds a
   `CredentialDeliveryReceipt` that binds the sandbox receipt digest. The chain
   joins the existing RUNNING + first-renewal transaction and is stored outside the
-  worker-writable jail root/workspace. Physical start holds worker code until the
-  sandbox receipt is durable, and the hold stays closed on daemon crash or
+  worker-writable jail root/workspace. Receipt publication is
+  `durable contents → atomic no-replace publication → durable namespace update →
+  verify published identity`, and the physical root MUST satisfy
+  `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` by
+  materialized filesystem identity, not by path-string equality. Physical start
+  holds worker code until the sandbox receipt is durable, and the hold stays
+  closed on daemon crash or
   control-channel loss. `SecuredStartPhase` is `HELD`, `RELEASED`, `UNKNOWN`, or
   `TERMINAL`; only a `RELEASED` instance with positive physical observation may
   confirm RUNNING. A `HELD` instance is released only after the Kernel revalidates

@@ -546,6 +546,17 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   though the Task and each ceiling individually allowed `Write`; candidate
   matching and commitment MUST reject that candidate, and MUST NOT reuse the
   admission-time `CoarseExecutionModes` verdict;
+- `Write` region: a composite policy whose only remaining write is a temporary
+  directory or any location outside the committed logical workspace region does
+  not satisfy `WorkspaceMode::Write`, even though some writable path exists;
+- guarantee composition: attempt isolation is the disjunction
+  `AgentType.requires_attempt_isolation OR
+  TaskAgentRequirement.required_attempt_isolation OR
+  SourceRequirement.requires_attempt_isolation`;
+  no policy meet can clear it, an `EnforcementSupport` capability that merely
+  supports isolation does not create it, and a required isolation without an
+  isolating `ExecutionTarget`, exact-adapter enforceability, and a committed
+  isolation request makes the candidate ineligible;
 - admission mode: explicit `COARSE_V1 | SECURITY_V1` is durable and never
   inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
   a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
@@ -565,6 +576,16 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   write/delete/replace denial; receipt read confidentiality is tested as a
   non-claim, and no behavior may depend on the receipt path, digest or content
   being unknown to the worker;
+- physical root binding: `ResolveRoot(committed descriptor, RequestId)` MUST equal
+  `receipt.actual_root` by materialized filesystem identity, not path string;
+  root substitution, symlink/reparse-point aliasing, and TOCTOU between
+  verification and rule application are negative cases, and a digest match with a
+  wrong root cannot confirm RUNNING;
+- receipt publication: the platform proof covers durable contents, atomic
+  no-replace publication, durable namespace update, and re-read verification of
+  the published identity; a process killed after publication but before namespace
+  durability MUST NOT be reported as `HELD` or `RELEASED`, and reconciliation
+  treats the receipt as not proven;
 - enforcement matrix completeness: every spec-10 dimension is classified
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;

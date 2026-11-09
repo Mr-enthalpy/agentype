@@ -174,8 +174,11 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   key/kind, target/profile, provisioning-binding provenance (same Incarnation and
   same source/config), and validated config digest MUST all agree with the
   Execution and its ProvisioningBinding, or the transaction fails. The
-  effective attempt-isolation requirement (`AgentType.requires OR Task.required`)
-  MUST be enforced by the frozen Execution, re-proved at commitment. The M5
+  effective attempt-isolation requirement is a union, not an intersection
+  (`AgentType.requires_attempt_isolation OR
+  TaskAgentRequirement.required_attempt_isolation OR
+  SourceRequirement.requires_attempt_isolation`); the snapshot records it and the
+  frozen Execution MUST request it, re-proved at commitment. The M5
   reconciliation-candidate read MUST also validate this marker/child coherence,
   so restart recovery never reconciles a `SNAPSHOT` Execution without its
   provenance. Recovery MUST continue to `resolve_exact(kind, key)`; a missing

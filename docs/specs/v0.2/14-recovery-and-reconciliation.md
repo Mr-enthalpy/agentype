@@ -66,7 +66,13 @@ The phase, not receipt presence, decides RUNNING:
 | `TERMINAL` | MUST NOT confirm |
 
 Physical start MUST hold worker code at a controlled pre-exec boundary until the
-sandbox receipt and its directory metadata are durable. The hold MUST stay closed
+sandbox receipt and its directory metadata are durable. Receipt publication is
+`durable contents → atomic no-replace publication → durable namespace update →
+verify published identity`; syncing only the file does not prove the published
+entry, and POSIX `fsync`/`rename` is not a cross-platform proof. The receipt's
+`actual_root` MUST equal `ResolveRoot(committed launch descriptor, RequestId)`,
+proven by materialized filesystem object identity through the trusted
+path-resolution rule, never by path-string equality. The hold MUST stay closed
 on daemon crash or control-channel loss; a wait mechanism that releases the worker
 when the parent's handle or pipe closes is invalid. Credential delivery happens
 while `HELD`, and its receipt is durable before authority revalidation and

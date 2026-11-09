@@ -51,6 +51,34 @@ physical root: at B.4 the per-request child does not exist yet. The adapter
 materializes it in `start_execution`, and the receipt records both the
 root-relative plan digest and the actual physical identity.
 
+Receipt binding is not enough on its own: the physical root itself MUST be the
+one the committed descriptor authorizes. Define the normative equality
+
+```text
+ResolveRoot(committed launch descriptor, RequestId) = receipt.actual_root
+```
+
+and require verification against the **materialized filesystem object identity**
+through the trusted path-resolution rule, never against string-path equality, a
+canonicalized path string, or the adapter's own claim. Two adapters can produce
+the same root-relative semantics and the same digests while binding a different
+physical directory; a receipt that faithfully describes its own wrong root is
+still wrong.
+
+B5.4 enforcement proof MUST verify the chain
+
+```text
+committed launch descriptor
+    → permitted root binding
+    → materialized filesystem identity
+    → actual applied rules
+    → receipt
+```
+
+and B5.5 MUST cover root substitution, symlink/reparse-point aliasing, and
+check-then-use (TOCTOU) races as negative cases. B5.0 does not implement path
+resolution; it makes the equality a normative MUST.
+
 ### 3. Fixed candidate-probing order
 
 ```text
@@ -264,7 +292,8 @@ can run. Physical start MUST provide a trusted hold/release barrier:
 create controlled instance
     → establish instance witness
     → apply and verify restrictions
-    → persist SandboxAppliedReceipt (temp → fsync → rename)
+    → publish SandboxAppliedReceipt (durable contents, no-replace
+      publication, durable namespace update, verified identity)
     → HELD
 ```
 
@@ -410,11 +439,23 @@ worker-modifiable. The receipt MUST live in a **daemon-owned state directory**
 outside the jail root and workspace; it MUST NOT rely on an implicit
 "parent directory is not writable" assumption.
 
-Write order:
+Write order (platform-neutral; the OS mechanism that proves each step belongs to
+the B5.4 design note):
 
 ```text
-temporary file → fsync → atomic rename → only then release user code
+write temporary receipt
+    → durable file contents
+    → atomic no-replace publication
+    → durable directory/namespace update
+    → verify published identity
+    → release user code
 ```
+
+Syncing file contents alone does not prove the published directory entry is
+durable, so the namespace step is an explicit requirement rather than an assumed
+consequence of the rename. Publication MUST NOT replace an existing different
+receipt, and the published identity MUST be re-read and matched before release;
+POSIX `fsync`/`rename` is not by itself a cross-platform proof.
 
 Windows ACLs and Linux confinement must deny worker write, delete and replace of
 that directory explicitly, with negative tests for each. The access check is a
@@ -486,6 +527,12 @@ root and process-instance identity are bound separately by the receipt, so a
 plan can be compared without embedding environment-specific paths. Byte-level
 agreement is required; "compatible" is not equality.
 
+This equality is necessary but not sufficient: identical digests do not prove the
+physical root is the committed one. RUNNING additionally requires the
+`ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` equality of
+§2, checked against materialized filesystem object identity. A digest match with a
+substituted, symlinked, or reparse-point-aliased root MUST NOT confirm RUNNING.
+
 ### 13. A feature gate is not per-dimension coverage
 
 `security_execution_v1.policy` (defined in
@@ -553,7 +600,10 @@ proves, for the exact binding:
 - the worker cannot write, delete or replace the receipt store;
 - receipts are integrity-protected, non-replaceable, identity-bound and
   crash-recoverable;
-- concurrent writers or a stale writer cannot make an older receipt look current.
+- concurrent writers or a stale writer cannot make an older receipt look current;
+- the receipt's `actual_root` is the root that the committed launch descriptor
+  authorizes, proven by materialized filesystem identity rather than path string
+  equality (§2).
 
 Read confidentiality is deliberately not a minimum-profile claim. The receipts
 contain no secret, and replay is bound to the exact Execution and physical
@@ -586,6 +636,9 @@ limited, or unsupported.
 - A failed winner compile cannot silently promote a weaker candidate.
 - A receipt outside the worker-writable jail gives the RUNNING transaction a
   trustworthy input while keeping the same frozen transaction shape.
+- The receipt is not self-validating: `actual_root` must equal the root resolved
+  from the committed descriptor by materialized identity, so a faithful receipt
+  for the wrong directory cannot confirm RUNNING.
 - Secured start has an explicit phase and a release operation bound to the exact
   RequestId and instance, so crash recovery never blindly launches a second
   worker or releases an instance whose authority has lapsed. The receipt chain is
