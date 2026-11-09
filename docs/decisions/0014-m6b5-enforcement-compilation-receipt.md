@@ -190,6 +190,23 @@ the actual bound AgentType (or its digest) and the Task derivation digest, or a
 later reader cannot verify that `P_agent` participated in the derivation. The
 receipt and plan subject include the same identity.
 
+The bootstrap manifest digest is part of the committed security contract, not an
+independent variable beside it. Because a bootstrap manifest can select the
+process environment, required paths, or start exemptions, verifying only policy,
+profile and plan digests does not prove that the bootstrap configuration actually
+used was the committed one. The trusted physical start path MUST therefore verify
+
+```text
+AppliedBootstrapManifest.digest
+    == ExecutionSecuritySnapshot.bootstrap_manifest_digest
+```
+
+before publishing the sandbox receipt, and `SandboxAppliedReceipt` binds the
+applied bootstrap manifest digest. A mismatch, or a manifest that cannot be
+measured exactly, fails closed and never reaches `HELD`. The manifest digest is
+not assumed to be covered by `plan_semantics_digest`; it is separately enforced
+and receipt-bound.
+
 A committed Execution's security contract is never changed by a later Task. A
 long-lived LogicalAgent may serve different Task policies when continuity and
 physical enforceability allow it, but a tightening alone does not mint a new
@@ -297,6 +314,7 @@ RequestId
 exact adapter binding
 effective policy digest
 enforcement plan digest
+bootstrap manifest digest (applied manifest == committed snapshot)
 actual root identity
 proven physical instance
 enforcement profile/protocol
@@ -591,6 +609,12 @@ The equality is defined over:
 root and process-instance identity are bound separately by the receipt, so a
 plan can be compared without embedding environment-specific paths. Byte-level
 agreement is required; "compatible" is not equality.
+
+The tuple does not include the bootstrap manifest. That is intentional: the
+manifest is not inferred from the plan equality but bound by the separate
+`AppliedBootstrapManifest.digest == snapshot.bootstrap_manifest_digest` check of
+§6 and recorded in the receipt. A reader MUST NOT treat a matching triple as
+proof that the committed bootstrap was applied.
 
 This equality is necessary but not sufficient: identical digests do not prove the
 physical root is the committed one. RUNNING additionally requires the

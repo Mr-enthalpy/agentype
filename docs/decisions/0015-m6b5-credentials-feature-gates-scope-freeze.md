@@ -99,6 +99,15 @@ authorized. The request digest enters winner qualification and the
 `CredentialAccessPlan`; a request that changes after qualification belongs to a
 new observation epoch and cannot be merged into the committed plan.
 
+`resolve_credential_request` is a pure, read-only, secret-free resolution that runs
+before admission/acquisition. Its input MUST bind the exact `SourceConfig`
+revision; its output MUST be a deterministic canonical secret-free
+`CredentialRequest`. It MUST NOT read, fetch, decrypt or hold secret material, and
+MUST NOT create physical resources, contact a broker, or produce any
+credential-delivery side effect. It runs under a fixed absolute deadline; a timeout
+is control-plane indeterminacy, never an empty or partial request. This keeps the
+new resolver inside the B.4 pure-preparation boundary.
+
 Broker routes bind the exact SpawnSource revision; a new source revision does
 not automatically inherit an old route. Registration/installation belongs to
 provisioning administration, not the Root semantic API.
@@ -395,8 +404,17 @@ The spike proves:
 hold boundary and worker cannot run before receipt durability
 receipt publication and namespace durability
 crash / control-channel-loss / OS-restart recovery
+restart-time classification of HELD / RELEASED / UNKNOWN
 physical instance identity and release denial on PID/handle reuse
 ```
+
+Restart-time classification is the first implementation gate of the policy-only
+profile, not a B5.5 finding. The spike MUST prove how a restart distinguishes
+`HELD`, `RELEASED` and `UNKNOWN`, including the window where release was reached
+but the RUNNING transaction was not committed. If the release state cannot be
+proven after restart, the phase MUST remain `UNKNOWN`; the spike MUST NOT infer
+`RELEASED` to improve recovery success. Policy-only `SECURITY_V1` is not claimed
+until this gate passes on both platforms.
 
 The spike MUST first prove that hold, publication and recovery satisfy this
 contract on both platforms, or record the concrete gap that prevents it. Broker
@@ -475,8 +493,8 @@ B5.5 MUST treat these as mandatory regression categories:
 | `P_source` top | a `SECURITY_V1` SpawnSource revision without an authored fine ceiling has `P_source = Top` and adds no restriction, but still requires complete imported-enforcement coverage, the feature gate and credential qualification; `Top` never bypasses eligibility |
 | Evidence durability | credential proof identity, epoch, issuer version, validity bound and subject/scope digests reach the Execution snapshot; the raw broker response never does |
 | Secret scope containment | credential authorization is positive and deny-by-default: the AgentType `SECURITY_V1` ceiling must explicitly grant ref, use, scope, audience and delivery mode; an omitted declaration grants nothing and is never `Top`; Generation and source ceilings may only narrow; a request outside the grant is rejected before any broker call, never truncated or widened, and broker `Available` plus adapter support cannot substitute for the grant |
-| Credential request provenance | the request is produced only by the trusted source-local resolver from the exact `SourceConfig` revision as a canonical secret-free `CredentialRequest` (ref set, use, scope, audience, delivery mode, canonical digest), validated as a whole against `P_eff` before any probe; the digest enters winner qualification and the `CredentialAccessPlan`; no scope may be derived from a broker response, so "probe then authorize" is a rejected ordering |
-| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding and crash recovery; read confidentiality is a non-claim and is never assumed |
+| Credential request provenance | the request is produced only by the trusted source-local resolver from the exact `SourceConfig` revision as a canonical secret-free `CredentialRequest` (ref set, use, scope, audience, delivery mode, canonical digest), validated as a whole against `P_eff` before any probe; the digest enters winner qualification and the `CredentialAccessPlan`; no scope may be derived from a broker response, so "probe then authorize" is a rejected ordering; the resolver is pure, read-only, secret-free, deterministic and deadline-bounded, with no physical or delivery side effect |
+| Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding, crash recovery and restart-time HELD/RELEASED/UNKNOWN classification, with an unprovable release kept `UNKNOWN`; read confidentiality is a non-claim and is never assumed |
 | Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain; the single receipt must prove the whole requested set was delivered exactly, and partial delivery never reaches `RELEASED` |
 | WARM credential reuse | a fresh per-Execution write jail proves content-write confinement only, not complete cross-Task security-context isolation; credential-bound WARM reuse additionally needs execution-bound broker verification, proof the old capability cannot be inherited or continued, or a physically verified reset witness, and is refused otherwise |
 | RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |

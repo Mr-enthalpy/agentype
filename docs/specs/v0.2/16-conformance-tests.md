@@ -633,11 +633,22 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   root substitution, symlink/reparse-point aliasing, and TOCTOU between
   verification and rule application are negative cases, and a digest match with a
   wrong root cannot confirm RUNNING;
+- bootstrap manifest binding: the trusted start path verifies
+  `AppliedBootstrapManifest.digest == snapshot.bootstrap_manifest_digest` before
+  publishing the sandbox receipt, and the receipt binds the applied manifest
+  digest; a substituted or unmeasurable manifest fails closed and never reaches
+  `HELD`, and a matching policy/profile/plan triple alone is not accepted as proof
+  of the committed bootstrap;
 - receipt publication: the platform proof covers durable contents, atomic
   no-replace publication, durable namespace update, and re-read verification of
   the published identity; a process killed after publication but before namespace
   durability MUST NOT be reported as `HELD` or `RELEASED`, and reconciliation
   treats the receipt as not proven;
+- restart-time phase classification: after a crash or OS restart the runtime MUST
+  distinguish `HELD`, `RELEASED` and `UNKNOWN`, including the window where release
+  was reached but the RUNNING transaction was not committed; unprovable release
+  state remains `UNKNOWN` and is never inferred as `RELEASED`, and this proof is
+  the first implementation gate of the policy-only profile, not a B5.5 finding;
 - enforcement matrix completeness: every spec-10 dimension is classified
   proven/limited/unsupported for the exact binding, and an unclassified
   dimension fails the suite;
@@ -650,7 +661,9 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   `CredentialRequest`, is validated as a whole against `P_eff` before the first
   probe, and its digest reaches qualification and the `CredentialAccessPlan`; a
   scope learned from a broker response, or a request changed during the same
-  observation epoch, is rejected as probe-then-authorize;
+  observation epoch, is rejected as probe-then-authorize; the resolver is pure,
+  read-only, secret-free, deterministic and deadline-bounded, and creates no
+  physical resource, broker call or delivery side effect;
 - credential evidence durability and scope: proof identity/epoch/issuer
   version/validity/subject digests reach the Execution snapshot, no raw broker
   response is persisted, and a requested scope outside `P_eff` or the Source

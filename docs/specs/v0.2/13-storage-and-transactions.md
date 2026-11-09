@@ -247,7 +247,10 @@ surface designed in
   the daemon-owned receipt artifacts outside the worker-writable jail
   root/workspace are separate recoverable physical evidence. The two MUST NOT be
   conflated. A credential-delivery row binds the sandbox receipt digest and never
-  replaces it. The `(Execution, receipt kind)` key is also the cardinality bound:
+  replaces it. The sandbox row binds the applied bootstrap manifest digest and is
+  written only after the trusted start path verified it equals the snapshot's
+  `bootstrap_manifest_digest`. The `(Execution, receipt kind)` key is also the
+  cardinality bound:
   at most one `SandboxAppliedReceipt` and at most one `CredentialDeliveryReceipt`
   per Execution. A second delivery request for the same Execution is rejected
   before delivery, and a second row of the same kind is corruption, never an
@@ -260,8 +263,10 @@ surface designed in
   phase); a missing artifact cannot be synthesized from the rows, and an artifact
   alone cannot produce RUNNING. The rows are consumed by the RUNNING +
   first-renewal transaction, never by a separate security state machine. Recovery
-  MUST distinguish `HELD` from `RELEASED`, and receipt presence alone MUST NOT
-  confirm RUNNING.
+  MUST distinguish `HELD`, `RELEASED` and `UNKNOWN`, including a restart where
+  release was reached but RUNNING was not committed; an unprovable release state
+  remains `UNKNOWN` and is never inferred as `RELEASED`, and receipt presence
+  alone MUST NOT confirm RUNNING.
 - `task_agent_requirements.security_contract_mode` is the **sole** owner of the
   `SecurityContractMode` (`COARSE_V1` / `SECURITY_V1`) marker. It is immutable and
   write-once, one row per Task, and is never inferred from `sandbox_policy`
