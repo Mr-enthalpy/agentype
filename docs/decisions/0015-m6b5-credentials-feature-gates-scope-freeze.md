@@ -272,6 +272,16 @@ Agentype's own control path MUST NOT place secret values in the catalog,
 command-line arguments, control errors, or ordinary control logs. Ambient daemon
 environment inheritance is forbidden.
 
+The catalog trust boundary is unchanged: `SourceConfigBody::OpaqueJson` is opaque
+to Core, and the source publisher is responsible for ensuring its payload contains
+no secret values. B.5 keeps that boundary rather than promising that Core can
+recognise a secret inside arbitrary source configuration. Credential material must
+be referenced through `CredentialRef`/the broker, never embedded in an opaque body.
+The secret-sentinel tests cover Agentype-produced artifacts and control surfaces,
+not the internal content of a publisher-supplied opaque body; a secret found there
+is a source-publisher contract violation, not evidence that Core can mechanically
+classify arbitrary configuration.
+
 Once a raw secret is delivered to a worker, Agentype cannot guarantee that the
 worker never copies, prints, or exfiltrates it. That is why `TransientRawDelivery`
 carries the explicit limitation above and is not the v1 production mode.
@@ -527,13 +537,14 @@ B5.5 MUST treat these as mandatory regression categories:
 | Canonical golden vectors | each schema/algorithm version pins byte-level input/output and digest |
 | Compile budget | exhausting the budget mid-round, or an unknown candidate not proven continuity-non-decisive, cannot produce partial selection |
 | Credential probe | broker down is not absent; different epochs and wrong scope are not mixed; an unknown candidate in the winner's continuity tier defers, and only a proven non-decisive candidate may be ignored |
-| Secret sentinel | no raw secret sentinel in durable JSON, logs, control errors, snapshots, or descriptors |
+| Secret sentinel | no raw secret sentinel in Agentype-produced durable JSON, logs, control errors, snapshots, or descriptors; `SourceConfigBody::OpaqueJson` remains publisher-opaque, so the sentinel does not claim Core can identify secrets inside arbitrary publisher payload — that is a source-publisher contract violation |
+| Compile cache | the cache key includes `effective_policy_digest`, `normalization_version`, `meet_algorithm_version`, adapter identity, enforcement profile and compiler protocol; the policy digest does not implicitly commit to either algorithm version, and a version change cannot reuse an older compile result |
 | Recipient identity | wrong SID/birth, wrong pinned instance, and cross-Execution delivery are rejected |
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
 | Secured SPI deadline | the three secured operations take one absolute deadline, the hold/receipt-publication/release stages share it with no per-stage reset, an expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery instead of `RELEASED`/RUNNING, and a later `reconcile_secured_start` gets a new bounded deadline without changing the `RequestId` or creating a second instance |
 | Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
-| Release authority proof | the proof carries ExecutionId, RequestId, Attempt/Lease fencing identity, exact instance witness, bounded validity and issuer; only the trusted Kernel path issues it, callers cannot supply or extend it, and a stale or replayed proof cannot release a `HELD` instance after Lease expiry or fencing change; the adapter verifies instance correspondence only, and the residual Kernel/OS race is owned by M5 recovery rather than claimed atomic |
+| Release authority proof | the proof carries ExecutionId, RequestId, Attempt/Lease fencing identity, exact instance witness, bounded validity and issuer; only the trusted Kernel path issues it, callers cannot supply or extend it, and a stale or replayed proof cannot release a `HELD` instance after Lease expiry or fencing change; a repeated call after durable `RELEASED` returns that recorded state idempotently without a second OS release, while a still-`HELD` instance needs a fresh valid proof; the adapter verifies instance correspondence only, and the residual Kernel/OS race is owned by M5 recovery rather than claimed atomic |
 | Receipt chain | receipts are append-only, write-once, and bounded to one per kind per Execution; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a second row of the same kind is corruption, not an append; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |

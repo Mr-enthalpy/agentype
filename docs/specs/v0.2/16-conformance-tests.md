@@ -620,6 +620,9 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial
   selection; a failed winner does not fall back;
+- compile cache identity: the key includes normalization and meet algorithm
+  versions explicitly; a different algorithm version cannot reuse a cached plan
+  even when the effective-policy bytes digest matches;
 - imported coverage: a policy using an unsupported dimension is ineligible even
   when the protocol gate is open, and a source that supports A and B is not
   assumed to support `A ∩ B`;
@@ -695,8 +698,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   AgentType grant by string equality across authorities, and a re-provisioned
   source keeps the same logical identity while a different logical credential
   requires a new AgentType revision;
-- secret sentinel: no raw secret material in durable JSON, logs, control errors,
-  snapshots, or launch descriptors;
+- secret sentinel: no raw secret material in Agentype-produced durable JSON,
+  logs, control errors, snapshots, or launch descriptors; the test covers the Core
+  control path and does not assert that Core can detect a secret inside an opaque
+  publisher-supplied `SourceConfigBody::OpaqueJson` payload, which remains a
+  source-publisher responsibility;
 - recipient identity: wrong SID/birth, wrong pinned instance, and
   cross-Execution delivery are rejected;
 - receipt replay: Execution A's receipt cannot confirm B; a missing required
@@ -726,7 +732,9 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   validity and the issuing authority identity; only the trusted Kernel path may
   issue it, a caller-filled or extended proof is rejected, and a stale or replayed
   proof cannot release a still-`HELD` instance after a Lease expiry or fencing
-  change; the Kernel-check/OS-release race is not claimed atomic and fails closed
+  change; after durable `RELEASED`, a repeated call returns the recorded state
+  without a second OS release, while a `HELD` instance requires a fresh valid
+  proof; the Kernel-check/OS-release race is not claimed atomic and fails closed
   into M5 recovery;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;

@@ -104,11 +104,20 @@ Compilation cache key:
 
 ```text
 effective_policy_digest
+normalization_version
+meet_algorithm_version
 adapter_kind
 adapter_binding_key
 enforcement_profile_digest
 compiler_protocol_version
 ```
+
+The effective-policy digest commits to canonical bytes, not by itself to the
+normalization and meet algorithm versions that produced them. Both versions are
+therefore explicit key components: an algorithm change cannot reuse a compile
+result produced under different semantics even when the resulting bytes happen to
+match. The derivation identity recorded in the snapshot and the cache key agree on
+the same two versions.
 
 The key is scoped to a verifiable profile version and exact physical domain. The
 cache memoizes **only** the pure compile result. It is not an eligibility proof:
@@ -487,6 +496,18 @@ OS. A bounded race remains between the authority check and the physical release;
 it is owned by M5 fencing and recovery. B.5 does not claim an atomic release, and
 the design must fail closed rather than widen authority when that window is
 observed.
+
+Replay rejection and retry idempotency are different cases. Once the release result
+is durable and the phase is proven `RELEASED`, a repeated call for the same
+Execution, `RequestId` and exact instance MUST return that recorded result
+idempotently: it performs no second OS release, consumes no new authority, and
+cannot downgrade the phase. It is a read of an achieved outcome, not a replay of
+the authorization that produced it. If the instance is still `HELD`, an old proof
+is not a retry: the call MUST obtain a fresh `ReleaseAuthorityProof` valid under
+the current Lease/fencing identity and exact instance, or leave the instance
+`HELD` and follow physical cleanup plus M5 recovery. A repeated call never returns
+`RELEASED` merely because some earlier call attempted release, and never
+reinterprets a stale proof as a new one.
 
 When the policy requires credential delivery, the chain is ordered:
 
