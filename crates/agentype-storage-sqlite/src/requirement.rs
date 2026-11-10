@@ -51,6 +51,7 @@ fn contract_rejection(error: agentype_agent_contract::ContractError) -> Error {
         | C::InvalidRef { .. }
         | C::CapabilityDefinitionConflict { .. }
         | C::InvalidPolicyProjection { .. }
+        | C::InvalidSandboxPolicy { .. }
         | C::InvariantViolation(_) => Error::invariant(error.to_string()),
     }
 }

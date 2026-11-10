@@ -27,6 +27,7 @@ mod predicates;
 mod provisioning;
 mod records;
 mod requirement;
+mod sandbox;
 mod selector;
 
 pub use canonical::{
@@ -36,13 +37,13 @@ pub use canonical::{
     canonical_capability_definition_bytes, canonical_capability_definition_bytes_v1,
     canonical_capability_definition_bytes_v2, canonical_generation_policy_bytes,
     canonical_json_body_digest, canonical_provisioning_binding_bytes,
-    canonical_source_config_bytes, canonical_spawn_source_bytes,
+    canonical_sandbox_policy_bytes, canonical_source_config_bytes, canonical_spawn_source_bytes,
     canonical_task_agent_requirement_bytes, canonicalize_agent_type, canonicalize_capability_map,
     canonicalize_claims, canonicalize_credential_refs, canonicalize_generation_policy,
     canonicalize_source_config, canonicalize_spawn_source, canonicalize_task_agent_requirement,
     capability_definition_content_digest, content_digest, credential_refs_digest,
     generation_policy_content_digest, provisioning_binding_content_digest,
-    source_config_content_digest, spawn_source_content_digest,
+    sandbox_policy_content_digest, source_config_content_digest, spawn_source_content_digest,
     task_agent_requirement_content_digest, CANONICAL_FORMAT_VERSION,
 };
 pub use capability::{
@@ -56,8 +57,8 @@ pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,
     binding_snapshot_from_canonical_json, capability_definition_from_canonical_json,
     generation_policy_from_canonical_json, provisioning_binding_from_canonical_json,
-    source_config_revision_from_canonical_json, spawn_source_from_canonical_json,
-    task_agent_requirement_from_canonical_json,
+    sandbox_policy_from_canonical_json, source_config_revision_from_canonical_json,
+    spawn_source_from_canonical_json, task_agent_requirement_from_canonical_json,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;
@@ -82,5 +83,11 @@ pub use records::{
 };
 pub use requirement::{
     fold_generation_policy, AgentRequirementDraft, GenerationPolicy, TaskAgentRequirement,
+};
+pub use sandbox::{
+    CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy,
+    FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector,
+    PathSet, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit, SandboxPolicyParts,
+    ToolPolicy, WorkingDirectory, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

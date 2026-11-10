@@ -264,12 +264,12 @@ impl NetworkEndpoint {
     ) -> Result<Self, ContractError> {
         let host = host.into();
         if host.trim().is_empty() || host.trim() != host {
-            return Err(ContractError::InvalidPolicyProjection {
+            return Err(ContractError::InvalidSandboxPolicy {
                 reason: "network endpoint host must be a non-empty trimmed string".into(),
             });
         }
         if port == Some(0) {
-            return Err(ContractError::InvalidPolicyProjection {
+            return Err(ContractError::InvalidSandboxPolicy {
                 reason: "network endpoint port 0 is not a valid endpoint selector".into(),
             });
         }
@@ -290,6 +290,24 @@ impl NetworkEndpoint {
 
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+
+    /// Whether this rule covers `other` (rule subsumption).
+    ///
+    /// A transport selector of [`NetworkTransport::Any`] covers both concrete
+    /// transports, a host of `*` covers every host, and an omitted port covers
+    /// every port. This is the only endpoint algebra B5.1 has: there is no
+    /// regular-expression or arbitrary matching language.
+    pub fn covers(&self, other: &Self) -> bool {
+        let transport_covers =
+            self.transport == NetworkTransport::Any || self.transport == other.transport;
+        let host_covers = self.host == "*" || self.host == other.host;
+        let port_covers = match (self.port, other.port) {
+            (None, _) => true,
+            (Some(left), Some(right)) => left == right,
+            (Some(_), None) => false,
+        };
+        transport_covers && host_covers && port_covers
     }
 }
 

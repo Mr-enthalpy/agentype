@@ -31,6 +31,7 @@ use crate::records::{
     TaskRequirement,
 };
 use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
+use crate::sandbox::{NormalizedSandboxPolicy, SANDBOX_POLICY_SCHEMA_VERSION};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -612,6 +613,21 @@ fn policy_operation_value(operation: &PolicyOperation) -> Value {
     }
 }
 
+/// Canonical bytes of a normalized sandbox policy document.
+///
+/// The policy carries its own schema version inside the document, so a row's
+/// recorded `canonical_version` and the document cannot be confused. A change
+/// that alters these bytes for an equivalent policy MUST bump
+/// [`crate::sandbox::SANDBOX_POLICY_SCHEMA_VERSION`].
+pub fn canonical_sandbox_policy_bytes(policy: &NormalizedSandboxPolicy) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "SANDBOX_POLICY",
+        "sandbox_policy_schema_version": SANDBOX_POLICY_SCHEMA_VERSION,
+        "policy": policy.to_value(),
+    }))
+}
+
 /// Canonical bytes of a Task agent requirement (M6-B.3). The record MUST be
 /// canonicalized first (see [`canonicalize_task_agent_requirement`]).
 pub fn canonical_task_agent_requirement_bytes(req: &TaskAgentRequirement) -> Vec<u8> {
@@ -769,6 +785,10 @@ pub fn capability_definition_content_digest(
     content_digest(&canonical_capability_definition_bytes(
         reference, definition,
     ))
+}
+
+pub fn sandbox_policy_content_digest(policy: &NormalizedSandboxPolicy) -> String {
+    content_digest(&canonical_sandbox_policy_bytes(policy))
 }
 
 pub fn task_agent_requirement_content_digest(req: &TaskAgentRequirement) -> String {

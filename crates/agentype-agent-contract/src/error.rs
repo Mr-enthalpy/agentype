@@ -31,6 +31,9 @@ pub enum ContractError {
     /// A capability policy projection is not one of the explicitly permitted
     /// shapes (ADR-0013 §2). At the durable boundary this is catalog corruption.
     InvalidPolicyProjection { reason: String },
+    /// A sandbox policy is not well formed (or a durable sandbox policy document
+    /// cannot be decoded). At the durable boundary this is catalog corruption.
+    InvalidSandboxPolicy { reason: String },
     /// A Task's hard requirement conflicts with a value that must agree (e.g. a
     /// Generation policy that the Task would have to widen).
     RequirementConflict { reason: String },
@@ -73,6 +76,9 @@ impl fmt::Display for ContractError {
             ),
             Self::InvalidPolicyProjection { reason } => {
                 write!(f, "invalid capability policy projection: {reason}")
+            }
+            Self::InvalidSandboxPolicy { reason } => {
+                write!(f, "invalid sandbox policy: {reason}")
             }
             Self::RequirementConflict { reason } => {
                 write!(f, "task requirement conflict: {reason}")
