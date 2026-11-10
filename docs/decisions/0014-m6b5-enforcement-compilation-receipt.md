@@ -279,6 +279,22 @@ is insufficient: a later reader cannot re-run `validate_bootstrap` or the
 recovery path is exact, the Execution fails closed rather than treating an
 unverifiable manifest as applied.
 
+A persisted bootstrap manifest MUST contain no raw credential value and no usable
+bearer capability. Environment names, non-secret constants, logical resource
+references and launch requirements may appear; a credential value, an access token
+or any material that would let the worker bypass the broker may not. Credential
+delivery material is supplied only through the post-commit broker path, never
+through the bootstrap manifest, the snapshot bytes, the launch descriptor or the
+reconstruction recipe. The manifest is a typed structure: environment entries
+carry a name plus a non-secret literal or a secret-free value reference, and the
+structure has no credential or capability slot. Because
+`SourceConfigBody::OpaqueJson` remains publisher-opaque, Core is not expected to
+classify arbitrary publisher strings as secrets; the boundary is structural.
+`validate_bootstrap` rejects a manifest that carries credential-bearing or
+capability-bearing fields, and secret-sentinel coverage applies to both the
+persisted-bytes and deterministic-reconstruction paths, including a manifest that
+would smuggle material through an environment value or reconstruction default.
+
 A committed Execution's security contract is never changed by a later Task. A
 long-lived LogicalAgent may serve different Task policies when continuity and
 physical enforceability allow it, but a tightening alone does not mint a new
@@ -389,17 +405,40 @@ call, physical observation, RUNNING and the first renewal. The budget is derived
 from the enforcement profile and adapter binding and is fixed before physical work
 begins.
 
-The Kernel MUST NOT create the controlled instance unless the remaining Lease
-authority covers `B_secured`. If it does not, the acquisition defers before any
-physical work: no instance, receipt, release intent or release operation is
-created. If the window becomes insufficient after materialization because of
-unexpected delay or contention, the Kernel MUST NOT dispatch release; the instance
-stays `HELD`/`UNKNOWN`, follows M5 recovery and physical cleanup, and the same
-chain is not retried in the hope of a different outcome. Repeated secured-start
-infeasibility with the same candidate domain, binding and profile versions is a
-durable operator-visible deferral with a launch-window blocker class under the
-discipline of section 4, not an unbounded retry stream, and it changes no Task
-semantic authority.
+The window check is aligned with the durable authority already committed, so its
+failure action never misrepresents the current stage:
+
+```text
+before acquisition commit
+    → planned Lease window cannot cover B_secured
+    → defer; no Attempt, Lease or ProvisioningBinding
+
+after acquisition commit, before Execution commit
+    → create no physical instance
+    → close or recover the committed reservation through the frozen
+      pre-Execution settlement path; this is not an acquisition defer
+
+after Execution commit, before physical start
+    → create no physical instance
+    → follow the M5 post-Execution failure/recovery path; never report a
+      no-Attempt acquisition defer
+```
+
+Only the first row is an acquisition defer. In the second row the committed
+Attempt/Lease/provisioning authority must be settled, not silently abandoned or
+reused as if no Attempt existed. In the third row the Execution is a committed
+security decision, so its failure consumes the M5 recovery path and is never
+described as an acquisition defer. In every row the Kernel MUST NOT create the
+controlled instance, publish a receipt, create a release intent or dispatch a
+release when the remaining window cannot cover `B_secured`. If the window becomes
+insufficient after materialization because of unexpected delay or contention, the
+Kernel MUST NOT dispatch release; the instance stays `HELD`/`UNKNOWN`, follows M5
+recovery and physical cleanup, and the same chain is not retried in the hope of a
+different outcome. When the repeated failure occurs before acquisition commit, it
+is a durable operator-visible deferral with a launch-window blocker class under
+the discipline of section 4, not an unbounded retry stream, and it changes no Task
+semantic authority; a failure after acquisition commit is recorded by its
+settlement or M5 recovery outcome instead.
 
 B.5 v1 MUST NOT introduce a pre-RUNNING Lease renewal path. M5 already freezes the
 relation between the first positive RUNNING transition and the first Lease renewal

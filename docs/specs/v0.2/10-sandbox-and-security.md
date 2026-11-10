@@ -158,6 +158,20 @@ In `SECURITY_V1`:
   `SourceConfig` revision into a canonical secret-free `CredentialRequest` and
   validated as a whole before any probe; a broker response never supplies or
   widens the scope. When no credential is requested there is no obligation.
+- A persisted bootstrap manifest is typed and MUST contain no raw credential value
+  and no usable bearer capability. Environment names, non-secret constants, logical
+  resource references and launch requirements may appear; delivery material is
+  supplied only through the post-commit broker path, never through the manifest,
+  the snapshot bytes, the launch descriptor or the reconstruction recipe.
+  `validate_bootstrap` rejects credential- or capability-bearing manifest fields,
+  and secret-sentinel tests cover both the persisted and reconstructed paths.
+- `BrokeredAccess` requires its own isolation proof, not the workspace jail: the
+  broker's raw secret store must be unreachable from the worker's launch
+  environment, inherited handles and accessible paths; the capability must be
+  unusable outside its declared scope/audience; and expiry, revocation and version
+  fencing must be enforced by the trusted broker. The policy-only profile's
+  non-claim of same-user read confidentiality does not weaken this; a failure
+  blocks B5.3 rather than being narrowed away.
 - Authored policies live in an immutable catalog with canonical digests.
   Intersection products are canonical inline bytes plus a digest and MUST NOT be
   published as catalog rows. A `SECURITY_V1` Task's `TaskSecurityBinding`

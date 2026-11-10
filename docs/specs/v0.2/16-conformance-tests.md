@@ -683,6 +683,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   compiled plan and `P_eff`; launcher-only privileges must be proven
   non-inheritable and dropped, and manifest content must be recoverable as
   canonical bytes or exact deterministic reconstruction rather than digest-only;
+  the manifest is typed with no raw credential value or usable bearer-capability
+  slot, so delivery material can only arrive through the post-commit broker path;
+  secret-sentinel cases cover both the persisted-bytes and reconstruction paths,
+  including an attempt to smuggle a value through an environment entry or
+  reconstruction default;
 - receipt publication: the platform proof covers durable contents, atomic
   no-replace publication, durable namespace update, and re-read verification of
   the published identity; a process killed after publication but before namespace
@@ -785,11 +790,15 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   intent or the observed OS release state;
 - secured launch window: the usable window is the earlier of the absolute deadline
   and remaining Lease validity; without a window covering the declared
-  `B_secured` budget no controlled instance is created and the acquisition defers,
-  while a window lost after materialization forbids release dispatch and yields
-  `HELD`/`UNKNOWN` recovery rather than a retry loop or adapter-side extension;
-  repeated identical infeasibility is a durable launch-window deferral and no
-  pre-RUNNING renewal path exists;
+  `B_secured` budget no controlled instance is created, and the failure action is
+  stage-aligned — before acquisition commit the acquisition defers without an
+  Attempt, after acquisition commit but before Execution commit the committed
+  reservation is closed through the frozen pre-Execution settlement path, and
+  after Execution commit the M5 post-Execution failure/recovery path applies rather
+  than a no-Attempt defer; a window lost after materialization forbids release
+  dispatch and yields `HELD`/`UNKNOWN` recovery rather than a retry loop or
+  adapter-side extension; repeated identical acquisition-stage infeasibility is a
+  durable launch-window deferral and no pre-RUNNING renewal path exists;
 - historical release settlement: after Lease expiry, trusted evidence for the
   exact intent's dispatch-time lineage settles `dispatched`/`unknown` to
   `released`/`aborted` under recovery authorization, without a new proof, OS call,
@@ -825,6 +834,14 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   receipt mocks alone do not satisfy this, and a harness limited to raw
   environment or its own credential store is a recorded B5.3 blocker rather than
   brokered-capable;
+- broker secret isolation: the `BrokeredAccess` claim additionally requires that
+  the broker's raw secret store is unreachable from the worker's launch
+  environment, inherited handles and accessible paths; the capability cannot be
+  minted, widened or replayed outside its declared scope/audience; and expiry,
+  revocation and version fencing are broker-enforced. Content-write workspace
+  confinement does not prove this because the policy-only profile does not claim
+  same-user read confidentiality, and a failure is a B5.3 blocker rather than a
+  narrowing of the brokered claim;
 - partial credential delivery: a plan requesting several references that
   establishes only a subset produces no `CredentialDeliveryReceipt`, never reaches
   `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus

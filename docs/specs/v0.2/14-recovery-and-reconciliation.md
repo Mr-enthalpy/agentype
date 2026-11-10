@@ -81,15 +81,21 @@ transition and the first renewal MUST commit in the same fenced transaction; no
 separate security-confirmation state exists.
 
 The secured-start window is bounded by both the absolute operation deadline and
-the remaining Lease validity, whichever ends first. The Kernel MUST NOT create a
-controlled instance unless that window covers the declared `B_secured` budget for
-the exact binding; otherwise the acquisition defers before physical work. If the
-window becomes insufficient after materialization, release MUST NOT be dispatched,
-the instance stays `HELD`/`UNKNOWN` for M5 recovery, and the same chain is not
-repeated. No pre-RUNNING Lease renewal path exists: the first renewal remains part
-of the RUNNING transaction, and the adapter cannot extend the window itself.
-Repeated identical infeasibility is a durable launch-window deferral, not an
-unbounded retry stream.
+the remaining Lease validity, whichever ends first. The failure action follows the
+durable stage: before acquisition commit, a window that cannot cover `B_secured`
+defers without creating an Attempt; after acquisition commit but before Execution
+commit, no physical instance is created and the committed reservation closes
+through the frozen pre-Execution settlement path; after Execution commit but
+before physical start, no instance is created and the M5 post-Execution
+failure/recovery path applies, never a no-Attempt defer. In every stage the Kernel
+MUST NOT create a controlled instance when the window cannot cover the declared
+`B_secured` budget for the exact binding. If the window becomes insufficient after
+materialization, release MUST NOT be dispatched, the instance stays
+`HELD`/`UNKNOWN` for M5 recovery, and the same chain is not repeated. No
+pre-RUNNING Lease renewal path exists: the first renewal remains part of the
+RUNNING transaction, and the adapter cannot extend the window itself.
+Repeated identical acquisition-stage infeasibility is a durable launch-window
+deferral, not an unbounded retry stream.
 
 On restart, `reconcile_start` MUST recover the phase and, when the phase requires
 them, the receipts for the same `RequestId` and the same physical instance. A
