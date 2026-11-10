@@ -262,17 +262,27 @@ selected. The credential eligibility evidence includes the delivery-mode
 requirement in its subject, so a raw-capable source cannot satisfy a
 brokered-only policy.
 
-B5.3 acceptance also requires one real reference integration, not only a broker
-API and mock tests. Before B5.3 is accepted, an existing external agent runtime
-spawned through a real `SpawnSource` integration MUST complete an end-to-end
-constrained `BrokeredAccess` use: the source-local broker supplies a capability
-that the harness can actually consume, and Scheduler Core never interprets the
-provider or the secret. A harness that can consume credentials only as a raw
-environment variable or from its own local store is a genuine integration gap; it
-MUST be recorded as a B5.3 blocker rather than declared brokered-capable, unless an
+B5.3 has two acceptance levels. **Component-ready** means the broker
+qualification and delivery API, the canonical request/plan path and the component
+conformance tests pass; it is not an end-to-end claim and does not by itself accept
+B5.3. **End-to-end accepted** additionally requires one real reference integration,
+not only a broker API and mock tests. On the B5.4 policy-only secured
+start/hold/receipt/release path, an existing external agent runtime spawned
+through a real `SpawnSource` integration MUST complete an end-to-end constrained
+`BrokeredAccess` use: the source-local broker supplies a capability that the
+harness can actually consume, and Scheduler Core never interprets the provider or
+the secret. A harness that can consume credentials only as a raw environment
+variable or from its own local store is a genuine integration gap; it MUST be
+recorded as a B5.3 blocker rather than declared brokered-capable, unless an
 explicitly narrower scope is agreed. The reference integration need not cover
 every harness, but it must prove one real end-to-end path. This condition does not
 change the policy-only slice or the brokered-only security rule.
+
+The end-to-end gate runs on the policy-only handoff, not on the credential-bound
+handoff, so B5.3 acceptance does not wait for B5.4 credential-bound integration;
+the credential-bound handoff follows B5.3 acceptance. Conversely, B5.3 cannot be
+accepted end-to-end before the policy-only handoff exists, so the work-item numbers
+do not imply that B5.3 finishes before B5.4.
 
 `BrokeredAccess` is only a real boundary if the worker cannot read the broker's raw
 secret store and cannot bypass the capability. The policy-only reference profile
@@ -526,16 +536,23 @@ B5.1 policy kernel
     ├── B5.4 physical feasibility spike (both Linux and Windows)
     └── B5.2 semantic enforcement qualification
                   ↓
-             B5.3 credential implementation
+             B5.4 policy-only physical handoff
                   ↓
-             B5.4 physical handoff integration
+             B5.3 real broker integration
+                  ↓
+             B5.4 credential-bound physical handoff
+                  ↓
+             B5.5 end-to-end conformance
 ```
 
 The spike is not gated on completing B5.2 and may begin with a minimal OS prototype
 alongside B5.1. B5.2 may proceed in parallel; the spike's result, not the policy
 compiler, decides whether the required physical mechanism is attainable. Neither
-B5.3 nor a policy-only freeze may complete before the spike gate passes on both
-platforms.
+B5.3 end-to-end acceptance nor a policy-only freeze may complete before the spike
+gate passes on both platforms. B5.3 component work may begin after B5.2, but its
+end-to-end acceptance runs on the B5.4 policy-only secured handoff rather than on
+the credential-bound handoff, so the B5.3 gate does not depend on finishing
+credential-bound B5.4.
 
 The spike proves:
 
@@ -545,13 +562,17 @@ receipt publication and namespace durability
 crash / control-channel-loss / OS-restart recovery
 restart-time classification of HELD / RELEASED / UNKNOWN
 physical instance identity and release denial on PID/handle reuse
-worst-case secured-start chain fits the remaining Lease window under B_secured
+conservative secured-start budget fits the remaining Lease window
 ```
 
-The spike MUST also show that the declared secured-start budget `B_secured` fits a
-realistic initial Lease grant on the reference profile, using the measured
-worst-case chain rather than an assumed one. If it does not fit, the slice records
-a concrete blocker and narrows or defers the profile; it MUST NOT add a
+The spike MUST also show that `B_secured` — a conservative admission budget, not a
+mathematical worst-case bound on fsync, OS scheduling or IPC — fits a realistic
+initial Lease grant on the reference profile, using measurements under the stated
+reference platform and load conditions rather than an assumed figure. The spike
+validates feasibility, timeout handling and recovery correctness; it does not
+prove that an OS operation can never exceed the measured value, and actual
+overrun still fails closed as `UNKNOWN`. If the budget does not fit, the slice
+records a concrete blocker and narrows or defers the profile; it MUST NOT add a
 pre-RUNNING Lease renewal path or rely on repeating the failing chain.
 
 Restart-time classification is the first implementation gate of the policy-only
@@ -568,9 +589,13 @@ and credential-delivery work MUST NOT be treated as the critical path ahead of
 that proof: a credential protocol built on an unproven hold/receipt mechanism
 would restate the same risk with more machinery. A spike that shows the contract
 is unattainable on a platform narrows the reference profile rather than relaxing
-the contract. After the spike, B5.3 implements the broker and credential
-delivery, and B5.4 integrates them into the physical handoff already proven by
-the spike; the numbering does not authorize starting B5.3 first.
+the contract. After the spike, B5.2 and B5.3 component work may proceed, and B5.4
+first integrates the policy-only physical handoff. B5.3 is component-ready at that
+point but is accepted end-to-end only when its real integration passes on that
+policy-only handoff; the credential-bound handoff follows B5.3 acceptance. The
+numbering does not authorize end-to-end B5.3 acceptance before the policy-only
+handoff exists, and it does not make B5.4 credential-bound handoff a prerequisite
+of B5.3 acceptance.
 
 Narrowing the profile never means deleting a condition that `SECURITY_V1` needs
 in order to be trustworthy. If the gap is in the fail-closed hold, receipt
@@ -626,7 +651,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Receipt replay | Execution A's receipt cannot confirm B; a missing receipt cannot enter RUNNING |
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
 | Secured SPI deadline | the three secured operations take one absolute deadline, the hold/receipt-publication/release stages share it with no per-stage reset, an expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery instead of `RELEASED`/RUNNING, and a later `reconcile_secured_start` gets a new bounded deadline without changing the `RequestId` or creating a second instance |
-| Secured launch window | the usable window is the earlier of the absolute deadline and remaining Lease validity; a controlled instance is created only when that window covers the declared `B_secured` budget for the exact binding; the failure action is aligned with the committed stage — before acquisition commit it defers without creating an Attempt, after acquisition commit but before Execution commit it creates no instance and closes the committed reservation through the frozen pre-Execution settlement path, and after Execution commit it follows the M5 post-Execution failure/recovery path rather than a no-Attempt defer; a window lost after materialization forbids release dispatch and leaves the instance to M5 recovery; repeated identical acquisition-stage infeasibility is a durable launch-window deferral, the adapter cannot extend the window, and no pre-RUNNING Lease renewal path is added beyond the frozen RUNNING-plus-first-renewal transaction |
+| Secured launch window | the usable window is the earlier of the absolute deadline and remaining Lease validity; a controlled instance is created only when that window covers the declared `B_secured` budget for the exact binding, where `B_secured` is a conservative admission budget derived from the enforcement profile, binding and reference-platform measurements rather than a mathematical OS upper bound, and overrun still fails closed; the failure action is aligned with the committed stage — before acquisition commit it defers without creating an Attempt, after acquisition commit but before Execution commit it creates no instance and closes the committed reservation through the frozen pre-Execution settlement path, and after Execution commit it follows the M5 post-Execution failure/recovery path rather than a no-Attempt defer; a window lost after materialization forbids release dispatch and leaves the instance to M5 recovery; repeated identical acquisition-stage infeasibility is a durable launch-window deferral, the adapter cannot extend the window, and no pre-RUNNING Lease renewal path is added beyond the frozen RUNNING-plus-first-renewal transaction |
 | Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
 | Release authority proof | the proof carries ExecutionId, RequestId, Attempt/Lease fencing identity, exact instance witness, bounded validity, issuer and a single-use `ReleaseOperationId`; only the trusted Kernel path issues it, callers cannot supply or extend it, and the Kernel rechecks current authority immediately before release; a durable Kernel-owned `ReleaseOperationIntent` records the exact instance, fencing identity, proof digest/validity and `prepared`/`dispatched`/`released`/`unknown`/`aborted` state, with creation, dispatch and result recording in fenced Core transactions; a proof known to be invalid never initiates release; a repeated call after durable `RELEASED` for the same operation returns the recorded state without a second OS release, an unknown outcome is never re-issued, and a new operation is authorized only when no prior intent exists or the prior intent is terminal — a `dispatched`/`unknown` intent keeps the phase `UNKNOWN` and a `HELD` observation alone cannot close it or authorize a second operation; the adapter verifies instance/validity/operation only, and a Lease revocation racing an already-started valid release is owned by M5 fencing/recovery and cannot create a new valid semantic result |
 | Release settlement | authorization and historical settlement are separate: `authorize_release` requires current Lease/fencing authority and is the only operation that may dispatch an OS release, while `settle_historical_release_observation` may advance an existing non-terminal intent to `released`/`aborted` after Lease expiry using a narrowly scoped recovery authorization bound to the exact intent, instance and dispatch-time lineage and trusted evidence; settlement cannot create an intent, issue a proof, dispatch a release, renew authority or confirm RUNNING, is idempotent and never downgrades `released`, and an unprovable outcome stays `unknown`, is not retired by timeout and blocks only that exact instance until independent evidence proves it cannot execute |
@@ -650,7 +675,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Reference profile | every spec-10 enforcement feature is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed feature obligation makes the candidate ineligible, while a `Top`/unrestricted value yields no obligation and remains admissible through the full protocol; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding, crash recovery and restart-time HELD/RELEASED/UNKNOWN classification, with an unprovable release kept `UNKNOWN`; read confidentiality is a non-claim and is never assumed, and credential-free means only no Agentype-managed delivery or committed credential plan — not that the worker can reach no host secret |
 | Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain; the single receipt must prove the whole requested set was delivered exactly, and partial delivery never reaches `RELEASED` |
 | Single delivery domain | one `CredentialAccessPlan` is fulfilled entirely by one trusted broker delivery domain, which may sub-route internally but owns qualification, the canonical request, delivery and recovery; a plan requiring independent broker authorities is unsupported in v1 rather than implicitly fanned out or split into multiple receipts |
-| B5.3 reference integration | acceptance requires one real external agent runtime through a real `SpawnSource` integration to complete an end-to-end constrained `BrokeredAccess` use, with the broker supplying a capability the harness actually consumes and Core not interpreting the provider; mock-only broker/receipt tests do not satisfy this, and a harness limited to raw environment or its own credential store is a recorded B5.3 blocker rather than brokered-capable |
+| B5.3 reference integration | B5.3 has a component-ready level (broker qualification/delivery API, canonical request/plan, component conformance) and an end-to-end accepted level; the latter requires one real external agent runtime through a real `SpawnSource` integration to complete an end-to-end constrained `BrokeredAccess` use on the B5.4 policy-only secured handoff, not the credential-bound handoff, with the broker supplying a capability the harness actually consumes and Core not interpreting the provider; mock-only broker/receipt tests do not satisfy acceptance, a harness limited to raw environment or its own credential store is a recorded B5.3 blocker rather than brokered-capable, and the work-item numbers do not imply that B5.3 ends before B5.4 |
 | Broker secret isolation | `BrokeredAccess` additionally requires proof that the broker's raw secret store is not reachable through the worker's launch environment, inherited handles or accessible paths, that the capability cannot be minted, widened or replayed outside its declared scope/audience, and that expiry, revocation and version fencing are broker-enforced; this is not implied by content-write workspace confinement because the policy-only profile does not claim same-user read confidentiality, and a failure is a recorded B5.3 blocker rather than a policy-only narrowing |
 | Credential replacement gate | when partial-delivery capability closure cannot be proven, a later Execution is not authorized by physical worker quiescence alone: M5 process recovery and external broker invalidation are different facts, so the replacement plan needs an independent broker epoch/scope-fencing proof for the prior delivery identity; without it the candidate is ineligible or deferred, and this remains a B5.3/B5.4 acceptance condition rather than a Core credential lifecycle manager |
 | WARM credential reuse | a fresh per-Execution write jail proves content-write confinement only, not complete cross-Task security-context isolation; credential-bound WARM reuse additionally needs execution-bound broker verification, proof the old capability cannot be inherited or continued, or a physically verified reset witness, and is refused otherwise |

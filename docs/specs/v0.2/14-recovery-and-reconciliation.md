@@ -89,7 +89,9 @@ through the frozen pre-Execution settlement path; after Execution commit but
 before physical start, no instance is created and the M5 post-Execution
 failure/recovery path applies, never a no-Attempt defer. In every stage the Kernel
 MUST NOT create a controlled instance when the window cannot cover the declared
-`B_secured` budget for the exact binding. If the window becomes insufficient after
+`B_secured` budget for the exact binding; `B_secured` is a conservative admission
+budget, not a guarantee of worst-case OS latency, and an actual overrun still
+fails closed. If the window becomes insufficient after
 materialization, release MUST NOT be dispatched, the instance stays
 `HELD`/`UNKNOWN` for M5 recovery, and the same chain is not repeated. No
 pre-RUNNING Lease renewal path exists: the first renewal remains part of the

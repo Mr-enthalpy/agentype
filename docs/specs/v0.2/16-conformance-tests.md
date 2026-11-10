@@ -789,8 +789,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   the intent; a receipt or `HELD` observation cannot substitute for either the
   intent or the observed OS release state;
 - secured launch window: the usable window is the earlier of the absolute deadline
-  and remaining Lease validity; without a window covering the declared
-  `B_secured` budget no controlled instance is created, and the failure action is
+  and remaining Lease validity; `B_secured` is a conservative admission budget
+  derived from the enforcement profile, binding and reference-platform
+  measurements, not a mathematical OS upper bound, and an actual overrun still
+  fails closed; without a window covering it no controlled instance is created,
+  and the failure action is
   stage-aligned — before acquisition commit the acquisition defers without an
   Attempt, after acquisition commit but before Execution commit the committed
   reservation is closed through the frozen pre-Execution settlement path, and
@@ -827,13 +830,17 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   split into several receipts; one trusted delivery domain may sub-route
   internally but must own the single qualification proof and the whole canonical
   request, and a missing domain-level proof makes the candidate ineligible;
-- B5.3 reference integration: acceptance includes one real external agent runtime
-  spawned through a real `SpawnSource` integration completing an end-to-end
-  constrained `BrokeredAccess` use, with the broker supplying a capability the
-  harness actually consumes and Core never interpreting the provider; broker and
-  receipt mocks alone do not satisfy this, and a harness limited to raw
-  environment or its own credential store is a recorded B5.3 blocker rather than
-  brokered-capable;
+- B5.3 reference integration: component-ready covers the broker
+  qualification/delivery API, canonical request/plan path and component
+  conformance, but does not accept the slice end-to-end. End-to-end acceptance
+  requires one real external agent runtime spawned through a real `SpawnSource`
+  integration completing a constrained `BrokeredAccess` use on the B5.4
+  policy-only secured handoff, not on the credential-bound handoff, with the
+  broker supplying a capability the harness actually consumes and Core never
+  interpreting the provider; broker and receipt mocks alone do not satisfy this,
+  a harness limited to raw environment or its own credential store is a recorded
+  B5.3 blocker rather than brokered-capable, and B5.3 cannot be accepted before
+  the policy-only handoff exists;
 - broker secret isolation: the `BrokeredAccess` claim additionally requires that
   the broker's raw secret store is unreachable from the worker's launch
   environment, inherited handles and accessible paths; the capability cannot be

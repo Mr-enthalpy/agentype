@@ -398,12 +398,15 @@ The absolute deadline is not the only bound. The usable launch window is the
 intersection of that deadline and the remaining validity of the currently held
 Lease; the Kernel MUST use the earlier endpoint and MUST NOT treat the deadline as
 permission to outlive the Lease authority. A `SECURITY_V1` launch has a declared
-secured-start budget `B_secured` covering the worst case for the exact binding of:
-instance creation, restriction application, sandbox-receipt durability, optional
-credential delivery and its receipt, Kernel release authorization, the OS release
-call, physical observation, RUNNING and the first renewal. The budget is derived
-from the enforcement profile and adapter binding and is fixed before physical work
-begins.
+secured-start budget `B_secured`: a conservative admission budget for the exact
+binding covering instance creation, restriction application, sandbox-receipt
+durability, optional credential delivery and its receipt, Kernel release
+authorization, the OS release call, physical observation, RUNNING and the first
+renewal. It is a grounded budget commitment derived from the enforcement profile,
+adapter binding and reference-platform measurements — not a mathematical upper
+bound on fsync, OS scheduling or IPC latency. It is fixed before physical work
+begins, and exceeding it still fails closed as `DeadlineExceeded`/`UNKNOWN`; the
+estimate is never treated as a guarantee that the OS cannot take longer.
 
 The window check is aligned with the durable authority already committed, so its
 failure action never misrepresents the current stage:
