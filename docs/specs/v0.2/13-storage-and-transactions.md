@@ -39,6 +39,11 @@ shape. Existing worker escalations retain their format; preparation causes use a
 tagged child. Recovery repairs latest already-suspended faults missing their Root
 decision exactly once.
 
+M6-B.5 uses fresh schema v9 (final number fixed with the B5.1 table shape) and
+rejects any v8 database at open; it MUST NOT silently reinterpret a v8
+`sandbox_policy` reference or synthesize missing security rows. There is no
+v8 -> v9 in-place upgrade while `D-DB-MIGRATE` is unresolved.
+
 M6-B.3 (schema v7) adds the typed admission surface on top of the frozen v6
 catalog:
 
@@ -69,7 +74,10 @@ catalog:
   fixed at generation creation and applied as the spec 10 intersection on each
   typed admission (a Task exceeding it fails closed). A policy row may only be
   inserted under a `POLICY` generation, and admission reads policy presence only
-  through the authoritative `get_generation_policy`.
+  through the authoritative `get_generation_policy`. A `NONE` generation has no
+  policy row and its security mode is the derived `COARSE_V1`: it cannot admit a
+  `SECURITY_V1` Task, and the absent row is never read as an unconstrained or
+  implicitly `SECURITY_V1` Generation.
 - `tasks.agent_requirement_mode` (`LEGACY`/`TYPED`) and
   `generations.policy_mode` (`NONE`/`POLICY`) are positive parent-side presence
   markers fixed at creation/admission and immutable thereafter. A missing child
@@ -168,9 +176,15 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   positive marker. The commitment MUST be coherent: the snapshot's adapter
   key/kind, target/profile, provisioning-binding provenance (same Incarnation and
   same source/config), and validated config digest MUST all agree with the
-  Execution and its ProvisioningBinding, or the transaction fails. The
-  effective attempt-isolation requirement (`AgentType.requires OR Task.required`)
-  MUST be enforced by the frozen Execution, re-proved at commitment. The M5
+  Execution and its ProvisioningBinding, or the transaction fails. The frozen
+  M6-B.4 effective attempt-isolation requirement is the two-term union
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation`; the snapshot records it
+  and the frozen Execution MUST request it, re-proved at commitment. B.5 adds a
+  third disjunct, `SourceRequirement.requires_attempt_isolation`, which is
+  `false` for every v1 source because no versioned source contract defines it;
+  the stored value and the frozen commitment are therefore unchanged until such a
+  contract exists. The M5
   reconciliation-candidate read MUST also validate this marker/child coherence,
   so restart recovery never reconciles a `SNAPSHOT` Execution without its
   provenance. Recovery MUST continue to `resolve_exact(kind, key)`; a missing
@@ -193,6 +207,124 @@ M6-B.4 (schema v8) adds the first authority-bearing typed acquisition:
   authoritative binding-coherence read before excluding typed population from
   V0.1 capacity; a marker/child mismatch is corruption that aborts the whole
   reconcile transaction, never a silent exclusion.
+
+M6-B.5 (schema v9, when B5.1 freezes the table shape) adds the effective-security
+surface designed in
+[ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md) and
+[ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md):
+
+- An immutable authored sandbox-policy catalog stores exact revisions, canonical
+  content, and Core-computed digests. Intersection products are canonical inline
+  bytes plus a digest; they are never inserted as catalog rows.
+- `task_security_bindings` is immutable and write-once, created inside the
+  typed-admission transaction only when the mode requires it. Its existence is a
+  conditional biconditional keyed by the parent mode:
+
+  ```text
+  security_contract_mode = SECURITY_V1  ⇔  exactly one TaskSecurityBinding
+  security_contract_mode = COARSE_V1    ⇔  no TaskSecurityBinding
+  ```
+
+  The row has primary key `task_id`, a foreign key to the same
+  `task_agent_requirements` row, and no independent mode value. It stores inline
+  admitted policy bytes, policy digest, authored input refs/digests,
+  `normalization_version` / `meet_algorithm_version`, and the explicit set of
+  `Pending` `R_min` obligations deferred to candidate matching. A `SECURITY_V1`
+  requirement without its row, a binding whose requirement is `COARSE_V1`, a
+  non-matching `task_id`, or more than one row is corruption. A `COARSE_V1` Task
+  therefore has no security row at all, preserving the frozen coarse path.
+- `execution_security_snapshots` is immutable, one per Execution, created in the
+  same transaction as the Execution and `BindingSnapshot`: inline effective
+  policy bytes and digest, derivation identity, enforcement profile/digest,
+  security plan/digest, bootstrap manifest digest plus canonical manifest bytes
+  or a deterministic reconstruction recipe (either form typed and free of raw
+  credential values and usable bearer capabilities, because delivery material
+  arrives only through the post-commit broker path), validated bootstrap evidence
+  digest,
+  secret-free credential plan
+  including the canonical credential-request digest, proof identity, broker
+  epoch, issuer version, validity bound and
+  subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task
+  derivation digest.
+- `acquisition_budget_deferrals` is the durable owner of the repeated whole-set
+  compile-budget block, not the runtime-local `TypedDispatchState.cooldowns`. It
+  records the blocked Task, a digest of the candidate domain and the relevant
+  binding/profile versions, the budget class and observed cost class, the
+  consecutive over-budget classification and diagnostic reason, and the release
+  condition. It also owns the launch-window blocker class, recording an acquisition
+  that cannot obtain a remaining Lease window covering the declared secured-start
+  budget. It creates no Attempt, emits no Task NACK, selects no candidate and
+  changes no Task semantic authority; it only makes the existing whole-round defer
+  persist across restart and become operator-visible. Its consecutive count and
+  resolution fields may change; the recorded identity is otherwise stable. It is
+  cleared or updated only by an explicit configuration/authorization change or by
+  a new candidate domain. B5.2 chooses the exact encoding, but a runtime-local
+  cooldown MUST NOT be treated as satisfying this durable contract.
+- `release_operation_intents` is the Kernel-owned durable record for release
+  authorization consumption and dispatch lineage, keyed by
+  `(execution_id, request_id, release_operation_id)`. Its identity and
+  instance/fencing fields are immutable and write-once; its state advances only
+  through the defined transitions. It stores the exact physical
+  instance witness, Attempt/Lease fencing identity, proof digest and validity
+  bound, and a state among `prepared`, `dispatched`, `released`, `unknown` and
+  `aborted`. Creating the row, the `prepared → dispatched` transition and the
+  `dispatched → released`/`unknown` result record occur in fenced Core transactions
+  that validate current Lease/fencing authority and the exact instance; the adapter
+  returns evidence only and never writes it. `released` and `aborted` are
+  terminal. A new operation id is permitted only when no prior intent exists or
+  the prior intent is terminal; a `dispatched`/`unknown` intent blocks a second
+  release operation and keeps the phase `UNKNOWN` until recovery proves the actual
+  outcome. Observing `HELD` alone does not prove an earlier dispatched operation
+  can no longer complete and MUST NOT mark it `aborted`. A release with no intent
+  row, a mutated intent identity, or a state transition outside this contract is
+  corruption. The row is neither a receipt nor physical evidence; it does not
+  replace `applied_security_receipts` or the observed OS state. Only
+  `authorize_release` requires current Lease/fencing authority. Once the Lease has
+  expired, `settle_historical_release_observation` may advance a non-terminal
+  intent to `released`/`aborted` under an independent recovery authorization bound
+  to the exact intent, instance and dispatch-time lineage; it cannot create an
+  intent, issue a proof, dispatch a release, renew authority or confirm RUNNING. An
+  intent that cannot be settled remains `unknown`, is never retired by timeout, is
+  surfaced as recovery debt, and blocks only that exact instance until independent
+  evidence proves it cannot execute.
+- `applied_security_receipts` is an immutable, write-once, append-only receipt
+  chain, keyed by Execution and receipt kind (`SandboxAppliedReceipt`,
+  `CredentialDeliveryReceipt`). The SQLite rows are the authority-bearing records;
+  the daemon-owned receipt artifacts outside the worker-writable jail
+  root/workspace are separate recoverable physical evidence. The two MUST NOT be
+  conflated. A credential-delivery row binds the sandbox receipt digest and never
+  replaces it. The sandbox row binds the applied bootstrap manifest digest and is
+  written only after the trusted start path verified it equals the snapshot's
+  `bootstrap_manifest_digest`. The `(Execution, receipt kind)` key is also the
+  cardinality bound:
+  at most one `SandboxAppliedReceipt` and at most one `CredentialDeliveryReceipt`
+  per Execution. A second delivery request for the same Execution is rejected
+  before delivery, and a second row of the same kind is corruption, never an
+  upsert or append. A receipt covers the whole plan rather than one reference:
+  the requested set must be delivered exactly, and a partially delivered set
+  yields no receipt and cannot reach `RELEASED`. After a pre-RUNNING crash the
+  artifacts may reconstruct and verify
+  the chain only under the full relation (same ExecutionId/RequestId, binding and
+  plan digest, instance witness, matching sandbox receipt digest, proven release
+  phase); a missing artifact cannot be synthesized from the rows, and an artifact
+  alone cannot produce RUNNING. The rows are consumed by the RUNNING +
+  first-renewal transaction, never by a separate security state machine. Recovery
+  MUST distinguish `HELD`, `RELEASED` and `UNKNOWN`, including a restart where
+  release was reached but RUNNING was not committed; an unprovable release state
+  remains `UNKNOWN` and is never inferred as `RELEASED`, and receipt presence
+  alone MUST NOT confirm RUNNING.
+- `task_agent_requirements.security_contract_mode` is the **sole** owner of the
+  `SecurityContractMode` (`COARSE_V1` / `SECURITY_V1`) marker. It is immutable and
+  write-once, one row per Task, and is never inferred from `sandbox_policy`
+  presence. `task_security_bindings` is a one-to-one child that exists exactly
+  when the mode is `SECURITY_V1` and is absent for `COARSE_V1`; it carries no
+  second marker. `generation_task_bindings` carries none either and is never an
+  alternative authority source. Any derived copy kept for readability is
+  constrained equal and never decides. A missing required child, an unexpected
+  child on a `COARSE_V1` row, a mode mismatch, or two candidate authority rows
+  are corruption and MUST NOT degrade to `COARSE_V1`; the mode cannot be changed
+  after admission. The same write-once, same-identity `INSERT OR REPLACE`, and
+  authoritative-read coherence guards apply.
 
 The M6-B.2 Agent Contract catalog (schema v6) MUST persist immutable revision
 content **separately** from the mutable disposition overlay, so a disposition
@@ -297,6 +429,8 @@ cannot construct a record that merely looks validated.
 - one assigned LogicalAgent per Task
 - one STARTING/WARM/COLD Incarnation per LogicalAgent
 - at most one STARTING/RUNNING/UNKNOWN Execution per Incarnation
+- at most one non-terminal (`prepared`/`dispatched`/`unknown`) release intent per
+  Execution and exact physical instance
 
 ## Transaction boundaries (MUST be atomic)
 
@@ -305,8 +439,12 @@ cannot construct a record that merely looks validated.
 | Batch submit | Batch + Task graph + dependencies + initial BLOCKED/QUEUED |
 | Claim | fencing epoch increment + Attempt + Lease + LogicalAgent ASSIGNED |
 | Execution create | Execution associated with Attempt and Incarnation |
+| Execution security commitment | For `SECURITY_V1`, the Execution + `BindingSnapshot` transaction also writes the immutable `ExecutionSecuritySnapshot`, carrying the inline effective policy, the actual bound AgentType identity, the enforcement profile and the security plan digest. The snapshot MUST NOT be created or repaired later. |
 | Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
-| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. |
+| Secured launch window | The usable window is the earlier of the absolute secured-start deadline and the remaining Lease validity. The failure action is aligned with the durable stage: before acquisition commit a short planned window defers without creating an Attempt, Lease or ProvisioningBinding; after acquisition commit but before Execution commit no physical instance is created and the committed reservation is closed or recovered through the frozen pre-Execution settlement path; after Execution commit but before physical start no instance is created and the M5 post-Execution failure/recovery path applies, never a no-Attempt defer. In every stage the Kernel MUST NOT create a controlled instance unless that window covers the declared `B_secured` budget for the exact binding (a conservative admission budget, not an OS upper bound; overrun still fails closed), and a window that becomes insufficient after materialization forbids release dispatch and leaves the instance `HELD`/`UNKNOWN` for M5 recovery. Repeated identical acquisition-stage infeasibility is recorded as a durable launch-window deferral, not an unbounded retry stream, and no pre-RUNNING Lease renewal path is added. |
+| Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, `RELEASED` requires a validated `SandboxAppliedReceipt` and, when credential-bound, a `CredentialDeliveryReceipt` binding it, as inputs to the same transaction; `HELD` and `UNKNOWN` cannot produce RUNNING; a `TERMINAL` instance cannot produce RUNNING; a missing or invalid required receipt cannot produce RUNNING. |
+| Secured release | Creating a `ReleaseOperationIntent`, the `prepared → dispatched` transition that authorizes the adapter call, and recording `dispatched → released`/`unknown` while the dispatch-time authority is still current are each fenced Core transactions validating current Lease/fencing authority and the exact physical instance. The adapter returns evidence only and must not record the outcome; uncertainty MUST NOT be recorded as `released` or `aborted`. A second operation is not authorized while any prior intent is `dispatched`/`unknown`, and `HELD` observation alone cannot close that intent. |
+| Release settlement | `settle_historical_release_observation` advances an existing non-terminal intent to terminal `released`/`aborted` in a fenced recovery-authorized transaction that validates exact intent identity, instance, dispatch-time fencing lineage and trusted evidence issuer/kind, without current Lease validity, a proof, an OS call or a new intent; `released`/`aborted` never downgrade; an unprovable outcome stays `unknown` and is never retired by timeout. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |
 | Suspend | Task SUSPENDED, Lease REVOKED, Escalation, Batch SUSPENDED, and the decision/control outbox event in the **same** transaction |
@@ -319,7 +457,7 @@ cannot construct a record that merely looks validated.
 | Transform cutover | single transaction: successor create + lineage + topology cutover + source RETIRED + source live Incarnations fenced LOST + writer safety held. Durable state jumps TARGET_READY → COMPLETED. No persisted split-brain CUTTING_OVER. **Explicit freeze (option A)**, not a literal copy of the design saga's CUTTING_OVER row. |
 | MemoryCapsule version | MUST NOT be hidden LLM; promotion protocol DEFERRED so this tx MUST NOT auto-apply worker deltas |
 | Catalog publish | immutable revision content + canonical content digest + initial disposition in one transaction. Republishing the same exact `(ref, content digest)` is idempotent; a different digest for an already-published exact revision fails closed as an invariant violation |
-| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs |
+| Typed admission | M5 Task + GenerationTaskBinding + immutable TaskAgentRequirement in one transaction, with the exact AgentType pin resolved through the validated catalog read and the Generation policy folded in. A failure leaves none of the three; no SpawnSource is selected and no external I/O occurs. `task_agent_requirements.security_contract_mode` is the sole explicit mode marker in that transaction and is never inferred from policy presence. For `SECURITY_V1`, the same transaction writes the immutable `TaskSecurityBinding` as the single child required by that mode (including `Pending` obligations), runs the Task-local coarse/fine validation before normalization and before any cross-object meet, evaluates `RequiredAccess` and `CoarseExecutionModes`, and rejects `Unsatisfied` results; `RequiredCapabilities`, `PlacementConstraints` and candidate-dependent guarantees remain `Pending` until candidate matching. A `COARSE_V1` admission writes no `TaskSecurityBinding`. |
 | Generation policy | generation row + immutable `generation_policies` row in one transaction |
 | Agent type binding | write-once `logical_agent_type_bindings` row for an already-materialized LogicalAgent; no physical provisioning |
 

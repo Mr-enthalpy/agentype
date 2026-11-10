@@ -60,11 +60,39 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   look like security but have no enforcement path. A security/authority
   restriction MUST NOT exist without a proof path, and a derived type MUST NOT
   become narrower without an equal-or-narrower mechanically enforceable policy.
-  In M6-B.1 the sandbox policy is pinned by **exact reference** (equality);
-  ordering two policy references and intersecting AgentType with Task policy is
-  deferred (`D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION`), so the coarse
-  workspace/network/isolation fields and restriction capabilities are the
-  B.1-composable restrictions.
+  In M6-B.1 the sandbox policy is pinned by **exact reference** (equality).
+  M6-B.5 defines ordering and intersection for `SECURITY_V1` only
+  ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md)):
+  four security objects, no `P_config`, typed positive `R_min`
+  (`RequiredAccess` / `RequiredCapabilities` / `RequiredGuarantees` /
+  `CoarseExecutionModes` / `PlacementConstraints`), explicit durable admission
+  mode, per-object coarse relations (AgentType equality, Generation projection,
+  Task consistency),
+  Task-local coarse/fine validation before normalization, admission-level
+  satisfiability through one staged `satisfies_requirement` relation,
+  candidate-level capability/guarantee/placement satisfaction, and re-evaluation
+  of `CoarseExecutionModes` against the complete `P_eff` at candidate and
+  commitment stages. `RequiredAccess` is set-inclusion only for catalog-mapped
+  security operation requirements; other capabilities keep their existing
+  `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matcher. A `SECURITY_V1` Task is
+  never downgraded to `COARSE_V1`, and the mode is never inferred from policy
+  presence. Cross-mode exclusion is symmetric in B.5 v1: a `SECURITY_V1`
+  AgentType is excluded from `COARSE_V1` Tasks, a `SECURITY_V1` Generation cannot
+  admit a `COARSE_V1` Task, and a SpawnSource revision carrying an authored
+  `P_source` fine ceiling is usable only through the full `SECURITY_V1`
+  provisioning and launch path. The reason is the same for all three: the coarse
+  path does not evaluate the authored fine ceiling, so its coarse projection
+  cannot replace the authored fine contract, and executing anyway would exceed
+  the object's own author limit. A "supports both modes" label is not a proof; a
+  future dual-mode object needs independent mode-specific contracts and a new
+  ADR. Existing `COARSE_V1` Generations and Source revisions keep their frozen
+  contract, and the new semantics use new immutable records or revisions rather
+  than in-place reinterpretation. Authored
+  policies are catalogued; intersection products are inline
+  and content-addressed. `COARSE_V1` replay keeps the
+  exact-reference rule;
+  `D-SANDBOX-ORDER` / `D-SANDBOX-INTERSECTION` remain the registry pointers
+  until B5.5 verifies backend coverage.
 - `can_provision` checks that the config belongs to the exact source revision,
   source/config activity, lifecycle coverage and the continuity minimum against
   the **effective** envelope (a config may narrow, never widen, the source's
@@ -79,7 +107,11 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   and config digest it was resolved for). A capability's matcher kind and
   security class are defined once by a canonical `CapabilityCatalog`; a
   `DECLARED`/`ENFORCED` claim label is never a proof, and restrictions MUST NOT
-  be inferred from a stronger capability.
+  be inferred from a stronger capability. A `SECURITY_V1` source revision that
+  authors no fine `P_source` ceiling contributes `Top` to the meet and therefore
+  adds no restriction; it still MUST pass every check above, including imported
+  enforcement coverage, the feature gate and credential qualification, so `Top`
+  is never an eligibility bypass.
 - `can_provision_task` is the contract/sandbox eligibility predicate and a
   **mandatory conjunct of any authority-bearing typed acquisition/provisioning
   decision** (M6-B.4/M6-B.5; see
@@ -89,15 +121,26 @@ deferred under D-SANDBOX-ORDER / D-SANDBOX-INTERSECTION) and implemented in
   `can_execute(agent, task) && can_provision(agent, source, config, evidence)` is
   **necessary but not sufficient**: the imported environment MUST also be able to
   enforce the Task's effective (stricter) workspace/network, attempt isolation,
-  and pinned sandbox policy, not merely the AgentType ceiling. Effective attempt
-  isolation is `AgentType.requires_attempt_isolation OR
-  Task.required_attempt_isolation` (a Task may tighten it; the AgentType flag
-  stays a per-task requirement), and when effective it MUST be physically
-  enforceable. Full eligibility additionally
+  and pinned sandbox policy, not merely the AgentType ceiling. In the frozen
+  M6-B.4 contract, effective attempt isolation is the two-term union
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation`. B.5 extends that
+  requirement with a third disjunct,
+  `SourceRequirement.requires_attempt_isolation`; the Generation term enters the
+  Task term through `fold_generation_policy`, so a Task or Generation may tighten
+  it. The frozen schema v8 carries no source isolation field, so the third term
+  evaluates to `false` for every v1 source and changes no stored value until a
+  versioned source contract defines it. An adapter's ability to *support*
+  isolation is not a request. When effective it MUST be physically enforceable
+  by the exact binding, and the committed execution MUST request it. Full
+  eligibility additionally
   requires an active adapter policy, satisfied `required_safety`, a coherent
   adapter kind/binding, and a currently resolvable exact binding (M6-B.4); the
   availability of required credential refs is a B.5 conjunct, and B.4 records
-  only a secret-free credential-reference digest. No second implicit eligibility
+  only a secret-free credential-reference digest. B.5 fixes that conjunct in
+  [ADR-0015](../../decisions/0015-m6b5-credentials-feature-gates-scope-freeze.md)
+  (per-acquisition observation epoch, independent feature gates, v1
+  `BrokeredAccess` only). No second implicit eligibility
   relation may be introduced for these. For `Restriction` capabilities the
   effective value is the deterministic join of the AgentType and Task values
   (`Bool` OR, `Set` union, `Ordered`/`Quantity` max, `Exact` equality). `Bool`
@@ -287,7 +330,9 @@ Typedness is a positive durable fact: the Task carries an
 `agent_requirement_mode` (`LEGACY`/`TYPED`) fixed at admission, and any Task that
 is not `LEGACY` MUST be invisible to the legacy untyped consumer/claim path. A
 lost requirement row is therefore corruption, never a silent downgrade to a
-legacy Task. Symmetrically, a LogicalAgent that carries a
+legacy Task. `SecurityContractMode` (B.5) is a separate durable axis: a `TYPED`
+Task can be `COARSE_V1` or `SECURITY_V1`, and neither field implies the other.
+Symmetrically, a LogicalAgent that carries a
 `logical_agent_type_bindings` row MUST be excluded from the legacy
 consumer/claim pool, so a legacy Task can never acquire a type-bound agent
 without passing `can_execute`; when only bound READY agents remain, the legacy

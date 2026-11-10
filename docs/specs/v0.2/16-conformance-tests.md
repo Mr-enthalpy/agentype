@@ -473,6 +473,15 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   config failure, Task/Batch cancel, expiry, restart, NACK or ACK;
 - a fresh STARTING reservation never fabricates WARM/terminal physical evidence
   on pre-Execution cancellation and can be reused;
+- WARM security-context reuse: an unchanged `ProvisioningBinding` does not by
+  itself authorize reusing a WARM host for a Task with a different write scope,
+  secret scope, or execution guarantee; reuse requires a fresh per-Execution
+  isolation proof or a reset/quiescence witness covering the earlier Task's
+  possible writes, and otherwise fails closed before any physical start; a fresh
+  per-Execution write jail proves write confinement only, so credential-bound
+  reuse additionally needs execution-bound broker verification, proof the old
+  capability cannot be inherited or continued, or a verified physical reset
+  witness;
 - after pure prepare failure or cancellation, a STARTING reservation with a
   validated ProvisioningBinding and no Execution history can transactionally
   roll to another config/source once its claim closes; tests MUST cover
@@ -515,6 +524,365 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   construction; exact A and ordinary legacy requests succeed;
 - an earlier credential-bearing config and a wrong-kind source whose attestation
   would fail the whole search are skipped without invoking that attestation.
+
+### M6-B.5 effective security and credential gates
+
+`SECURITY_V1` MUST add:
+
+- policy algebra properties: `meet` is the greatest lower bound, the order is
+  transitive, `normalize` is idempotent, and canonical digests are stable under
+  permutation and duplicate removal;
+- equality regression: every contract accepted by the B.1–B.4 exact-reference
+  relation remains accepted by the pure policy order, while no new physical
+  eligibility is thereby granted;
+- coarse projection/consistency: every `SECURITY_V1` coarse/fine conflict,
+  including `ReadOnly` plus a write root and Task minimums unmet by the
+  Generation meet, is rejected at the correct stage; a Task-local coarse/fine
+  conflict is rejected even when another ceiling would hide it, and
+  `sandbox_policy = None` follows the `SECURITY_V1` rule;
+- `R_min` typing: `RequiredAccess ⊆ ProjectAccess` only for catalog-mapped
+  security operation requirements, and only a `Set` value projects through the
+  versioned member map (`Bool(true)` projects to nothing, an unmapped member
+  fails closed, `Set(∅)` is a legal empty floor); `RequiredCapabilities` are
+  `Pending` at admission and validated at the candidate stage against the actual
+  AgentType through their existing
+  `Bool`/`Set`/`Ordered`/`Quantity`/`Exact` matchers,
+  never through `ProjectAccess`; `CoarseExecutionModes`
+  use workspace/network predicates; `RequiredGuarantees` and
+  `PlacementConstraints` go through the single staged `satisfies_requirement`
+  relation, and `Pending` is never treated as satisfied;
+- stage separation: `PlacementConstraints` are not evaluated at admission; a
+  candidate that fails them is ineligible, and admission never assumes a
+  candidate Agent exists; at Candidate every previously `Pending` component
+  resolves to `Satisfied`/`Unsatisfied`, and a remaining `Pending` is a whole-round
+  defer or control-plane fault, never `Satisfied` and never an execution-authority
+  commit;
+- provisioning relation scope: `can_provision` is tested only for AgentType plus
+  SpawnSource/SourceConfig type/source-level eligibility and applicable security
+  constraints; it is not accepted as proof of the full four-way `P_eff`, which
+  `can_provision_task` and acquisition qualification must establish and Execution
+  commitment must re-prove against the actual bound identities;
+- composite mode re-check: constructing `P_eff` can leave no writable path even
+  though the Task and each ceiling individually allowed `Write`; candidate
+  matching and commitment MUST reject that candidate, and MUST NOT reuse the
+  admission-time `CoarseExecutionModes` verdict;
+- `Write` region: a composite policy whose only remaining write is a temporary
+  directory or any location outside the committed logical workspace region does
+  not satisfy `WorkspaceMode::Write`, even though some writable path exists;
+- guarantee composition: attempt isolation is the disjunction
+  `AgentTypeContract.security.requires_attempt_isolation OR
+  TaskAgentRequirement.hard.required_attempt_isolation OR
+  SourceRequirement.requires_attempt_isolation`;
+  no policy meet can clear it, an `EnforcementSupport` capability that merely
+  supports isolation does not create it, and a required isolation without an
+  isolating `ExecutionTarget`, exact-adapter enforceability, and a committed
+  isolation request makes the candidate ineligible;
+- isolation source staging: `AgentRequirementDraft::into_requirement` carries only
+  the Task-authored `required_attempt_isolation`, and `fold_generation_policy`
+  performs the Generation disjunction into the durable
+  `TaskAgentRequirement.hard`; a test asserts the stored requirement is the exact
+  fixed point of the re-fold, so B5 cannot "fix" the ADR by changing the frozen
+  `into_requirement` behavior;
+- admission mode: explicit `COARSE_V1 | SECURITY_V1` is durable and never
+  inferred from `sandbox_policy != None`; a `SECURITY_V1` Task cannot downgrade,
+  a `COARSE_V1` AgentType cannot execute it, and `SECURITY_V1 + None` is tested as
+  legal;
+- mode-marker ownership: `task_agent_requirements.security_contract_mode` is the
+  only mode authority; `task_security_bindings` exists exactly when the mode is
+  `SECURITY_V1` and is absent for `COARSE_V1` (no independent mode in either
+  case); `generation_task_bindings` carries none. A `SECURITY_V1` requirement
+  without its binding, a binding on a `COARSE_V1` requirement, a `task_id`
+  mismatch, more than one binding, and two candidate authority rows are all
+  rejected as corruption — and a legal `COARSE_V1` Task must be admitted with no
+  security row, so the biconditional is tested in both directions;
+- Generation mode coverage: a `NONE` Generation has no `generation_policies` row,
+  admits only `COARSE_V1` Tasks, rejects a `SECURITY_V1` Task at admission, and is
+  never read as unconstrained or implicitly `SECURITY_V1`; a `POLICY` Generation
+  derives its mode from the immutable row, and admission never backfills a row for
+  a `NONE` Generation;
+- cross-mode symmetry: a `SECURITY_V1` Generation MUST reject a `COARSE_V1` Task
+  at admission even when the Generation also lists `COARSE_V1` support, and every
+  `SECURITY_V1` SpawnSource revision MUST NOT be selected by the coarse path —
+  including one with `P_source = Top`, because it still declares the
+  `SECURITY_V1` protocol mode; both are negative cases, and a "supports both
+  modes" label grants no execution;
+- `P_source` top: a `SECURITY_V1` SpawnSource revision with no authored fine
+  ceiling has `P_source = Top`, adds no restriction, and still fails the
+  candidate when imported enforcement coverage, the feature gate, or credential
+  qualification fails; `Top` is never a bypass and never makes that revision
+  coarse-selectable;
+- policy algebra result type: `meet(P, Q) -> Result<NormalizedPolicy,
+  PolicyConflict>`; the GLB property is tested only on `Ok`, and a conflicted meet
+  is a deterministic unsatisfiability that is never surfaced as
+  `RESOURCE_UNAVAILABLE` and never persisted as a `Bottom` policy;
+- empty-vs-conflict: an empty allowed-set intersection is `Ok` with a deny-all
+  dimension (a Task obligation may then be `Unsatisfied`), while `PolicyConflict`
+  is reserved for required launch/structural clashes such as two different
+  required working directories or conflicting required environment values; tests
+  must not accept one as the other;
+- `RequiredAccess` projection: only a catalog-mapped `Set` with `polarity = Ability`
+  and `security_class` in `Authority`/`Sandbox` projects, through the versioned
+  member map; `Bool(true)` projects to nothing, a `Restriction` or an ineligible
+  class projects to nothing even as a `Set`, an unmapped member fails closed, and
+  `Set(∅)` yields a legal empty floor; a `Restriction` ceiling is never converted
+  into a positive floor;
+- canonical golden vectors keyed by `(canonical_version, algebra_version)`;
+- compile budget: exhausting the budget mid-round, or an unknown credential
+  candidate not proven continuity-non-decisive, cannot produce partial
+  selection; a failed winner does not fall back; repeated identical whole-set
+  over-budget rounds produce a durable operator-actionable diagnostic and an
+  explicitly blocked-for-operator defer, never an unbounded indistinguishable
+  retry stream, an automatically enlarged budget, a silently reduced candidate
+  set, or a choice among the compiled subset; the block is owned by a durable
+  record of the Task, candidate-domain/version digest, budget/cost class,
+  diagnostic reason and release condition, survives restart, creates no Attempt
+  and no NACK, and is not satisfied by the runtime-local `TypedDispatchState`
+  cooldown;
+- compile cache identity: the key includes normalization and meet algorithm
+  versions explicitly; a different algorithm version cannot reuse a cached plan
+  even when the effective-policy bytes digest matches;
+- enforcement-feature coverage: `RequiredEnforcementFeatures(normalized policy,
+  effective guarantees)` emits an obligation only for an enforceable restriction
+  or positive guarantee; a `Top`/unrestricted network or resource value emits no
+  obligation and MUST NOT by itself make the candidate ineligible, but it still
+  completes normalization, `meet`, compilation, receipt binding and the execution
+  protocol; a disabled network capability, a concrete resource ceiling or a
+  required guarantee emits an obligation, and a candidate is ineligible when one
+  is unsupported even with the protocol gate open; a source that supports A and B
+  is not assumed to support `A ∩ B`, and the check is over the whole composite
+  policy;
+- reference profile: `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` claims and non-claims
+  are tested on both Linux and Windows; a non-claimed enforcement-feature
+  obligation makes a candidate ineligible rather than partially enforced, while a
+  `Top`/unrestricted value yields no obligation and remains admissible through the
+  full protocol; B5.4 publishes the OS
+  enforcement-mechanism design note and proves receipt integrity,
+  non-replaceability, identity binding, crash recovery and worker
+  write/delete/replace denial; receipt read confidentiality is tested as a
+  non-claim, and no behavior may depend on the receipt path, digest or content
+  being unknown to the worker;
+- enforcement subject: claims cover `controlled_primary_process` and an
+  `os_restricted_descendant` proven to remain in the same restricted
+  token/job/cgroup/namespace/confinement domain; a normal child stays confined, a
+  helper that inherits the restriction stays confined, and a breakaway,
+  unrestricted re-exec or new-session attempt is denied or classified outside the
+  profile; an `externally_delegated_execution` or `unproven_external_process` is
+  never counted as covered, a Task requiring enforcement over it is ineligible
+  without an explicitly authored and proven subject, and a primary receipt cannot
+  prove that process's writes;
+- credential-free claim: "no credential authorization" and "credential-free" are
+  tested to mean no Agentype-managed grant, delivery or committed
+  `CredentialAccessPlan`; the test does not assert that the worker cannot
+  physically obtain a credential, or reach a host secret available through
+  harness-native configuration or file permissions, because read confidentiality
+  and arbitrary read-root isolation are explicit non-claims;
+- physical root binding: `ResolveRoot(committed descriptor, RequestId)` MUST equal
+  `receipt.actual_root` by materialized filesystem identity, not path string;
+  root substitution, symlink/reparse-point aliasing, and TOCTOU between
+  verification and rule application are negative cases, and a digest match with a
+  wrong root cannot confirm RUNNING;
+- bootstrap manifest binding: the trusted start path verifies
+  `AppliedBootstrapManifest.digest == snapshot.bootstrap_manifest_digest` before
+  publishing the sandbox receipt, and the receipt binds the applied manifest
+  digest; a substituted or unmeasurable manifest fails closed and never reaches
+  `HELD`, and a matching policy/profile/plan triple alone is not accepted as proof
+  of the committed bootstrap;
+- bootstrap authorization: `validate_bootstrap` rejects a manifest whose digest
+  matches but whose content adds a worker-visible environment name, inherited
+  handle, start exemption, path, credential or any other dimension beyond the
+  compiled plan and `P_eff`; launcher-only privileges must be proven
+  non-inheritable and dropped, and manifest content must be recoverable as
+  canonical bytes or exact deterministic reconstruction rather than digest-only;
+  the manifest is typed with no raw credential value or usable bearer-capability
+  slot, so delivery material can only arrive through the post-commit broker path;
+  secret-sentinel cases cover both the persisted-bytes and reconstruction paths,
+  including an attempt to smuggle a value through an environment entry or
+  reconstruction default;
+- receipt publication: the platform proof covers durable contents, atomic
+  no-replace publication, durable namespace update, and re-read verification of
+  the published identity; a process killed after publication but before namespace
+  durability MUST NOT be reported as `HELD` or `RELEASED`, and reconciliation
+  treats the receipt as not proven;
+- restart-time phase classification: after a crash or OS restart the runtime MUST
+  distinguish `HELD`, `RELEASED` and `UNKNOWN`, including the window where release
+  was reached but the RUNNING transaction was not committed; unprovable release
+  state remains `UNKNOWN` and is never inferred as `RELEASED`, and this proof is
+  the first implementation gate of the policy-only profile, not a B5.5 finding;
+- enforcement matrix completeness: every spec-10 dimension is classified
+  proven/limited/unsupported for the exact binding, and an unclassified
+  dimension fails the suite;
+- credential probe: broker unreachable is not absent, stale or wrong-scope
+  proofs are rejected, and epochs are not mixed; an unknown candidate in the
+  winner's continuity tier defers, and only a proven continuity-non-decisive
+  candidate may be ignored;
+- credential request provenance: the request comes from the exact `SourceConfig`
+  revision through the trusted resolver as a canonical secret-free
+  `CredentialRequest`, is validated as a whole against `P_eff` before the first
+  probe, and its digest reaches qualification and the `CredentialAccessPlan`;
+  resolution runs during candidate qualification after source attestation, never
+  at M6-A semantic admission; a scope learned from a broker response, or a request
+  changed during the same observation epoch, is rejected as probe-then-authorize;
+  the resolver is pure, read-only, secret-free, deterministic and deadline-bounded,
+  and creates no physical resource, broker call or delivery side effect;
+- credential reference completeness: over canonicalized references,
+  `Refs(request) == Refs(SourceConfig)`; a resolver that omits a ref, adds one,
+  returns an empty set for a non-empty config, keeps a duplicate, or mixes
+  revisions fails closed, and an empty request never turns a credential-bearing
+  config into a credential-free Execution that bypasses the brokered gate;
+- credential evidence durability and scope: proof identity/epoch/issuer
+  version/validity/subject digests reach the Execution snapshot, no raw broker
+  response is persisted, and a requested scope outside `P_eff` or the Source
+  ceiling is rejected;
+- credential authorization default: a credential-bearing `SourceConfig` whose
+  requested ref, use, scope, audience, or delivery mode is not explicitly granted
+  by the bound AgentType `SECURITY_V1` ceiling is ineligible even when the broker
+  reports `Available`, delivery is brokered, and the adapter supports it; an
+  AgentType ceiling that omits the secret-scope dimension grants nothing and is
+  never `Top`, while a Generation or source ceiling can only narrow a grant;
+- credential authorization namespace: two distinct credential authorities that
+  both use the string `prod-key` resolve to different
+  `CredentialAuthorizationId` values; a source-local ref cannot acquire an
+  AgentType grant by string equality across authorities, and a re-provisioned
+  source keeps the same logical identity while a different logical credential
+  requires a new AgentType revision;
+- secret sentinel: no raw secret material in Agentype-produced durable JSON,
+  logs, control errors, snapshots, or launch descriptors; the test covers the Core
+  control path and does not assert that Core can detect a secret inside an opaque
+  publisher-supplied `SourceConfigBody::OpaqueJson` payload, which remains a
+  source-publisher responsibility;
+- recipient identity: wrong SID/birth, wrong pinned instance, and
+  cross-Execution delivery are rejected;
+- receipt replay: Execution A's receipt cannot confirm B; a missing required
+  receipt cannot enter RUNNING;
+- hold/release: worker code does not run before sandbox-receipt durability; the
+  hold stays closed when the daemon crashes or the control channel disconnects,
+  and a parent-death-released pipe is rejected; recovery distinguishes
+  awaiting-release from actually started; a receipt alone does not confirm
+  RUNNING;
+- secured SPI deadline: all three secured operations take one absolute deadline,
+  the hold/receipt-publication/release stages share it with no per-stage reset, an
+  expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery
+  rather than `RELEASED` or RUNNING, and a later `reconcile_secured_start` may
+  take a new bounded deadline but cannot change the `RequestId` or create a
+  second physical instance;
+- secured start phase: `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are
+  exact; `HELD` requires a verified sandbox receipt, a credential-bound
+  `RELEASED` requires both receipts, `UNKNOWN` permits a missing chain and cannot
+  enter RUNNING; a crash-injection test where the controlled
+  process is created but the receipt is not yet persisted MUST yield `UNKNOWN`,
+  never `HELD`, `RELEASED`, or RUNNING, and the instance is never released or
+  acknowledged; release requires a
+  Kernel authority proof for the same RequestId and instance witness; PID reuse
+  cannot authorize release; uncertain release cannot create a second worker;
+- release authority proof: the proof carries `ExecutionId`, `RequestId`, the
+  Attempt/Lease fencing identity, the exact physical instance witness, a bounded
+  validity, the issuing authority identity and a single-use `ReleaseOperationId`;
+  only the trusted Kernel path may issue it, a caller-filled or extended proof is
+  rejected, and the Kernel rechecks current authority immediately before release;
+  a durable Kernel-owned `ReleaseOperationIntent` records the exact instance,
+  fencing identity, proof digest/validity and state, with creation, dispatch and
+  result recording in fenced Core transactions; a proof known to be invalid
+  never initiates release; after durable `RELEASED`, a repeat of the same operation
+  returns the recorded state without a second OS release, a consumed operation with
+  unknown outcome is not re-issued, and a new operation is authorized only when no
+  prior intent exists or the prior intent is terminal `released`/`aborted` — a
+  `dispatched`/`unknown` intent keeps the phase `UNKNOWN`, and observing `HELD`
+  alone cannot close it or authorize a second operation; a Lease revocation racing
+  an already-started valid release is not claimed atomic and is handled by M5
+  fencing/recovery;
+- release intent durability: a restart after `dispatched` with an unknown outcome
+  and the instance observed `HELD` keeps the intent non-terminal and the phase
+  `UNKNOWN`, does not mark it `aborted` and does not authorize a second operation;
+  only positive evidence that the operation had no effect, was cancelled or can no
+  longer take effect makes it terminal `aborted`; a missing/mutated intent or an
+  out-of-contract transition is corruption; the adapter cannot create or mutate
+  the intent; a receipt or `HELD` observation cannot substitute for either the
+  intent or the observed OS release state;
+- secured launch window: the usable window is the earlier of the absolute deadline
+  and remaining Lease validity; `B_secured` is a conservative admission budget
+  derived from the enforcement profile, binding and reference-platform
+  measurements, not a mathematical OS upper bound, and an actual overrun still
+  fails closed; without a window covering it no controlled instance is created,
+  and the failure action is
+  stage-aligned — before acquisition commit the acquisition defers without an
+  Attempt, after acquisition commit but before Execution commit the committed
+  reservation is closed through the frozen pre-Execution settlement path, and
+  after Execution commit the M5 post-Execution failure/recovery path applies rather
+  than a no-Attempt defer; a window lost after materialization forbids release
+  dispatch and yields `HELD`/`UNKNOWN` recovery rather than a retry loop or
+  adapter-side extension; repeated identical acquisition-stage infeasibility is a
+  durable launch-window deferral and no pre-RUNNING renewal path exists;
+- historical release settlement: after Lease expiry, trusted evidence for the
+  exact intent's dispatch-time lineage settles `dispatched`/`unknown` to
+  `released`/`aborted` under recovery authorization, without a new proof, OS call,
+  intent creation or Lease renewal; `released` never downgrades; evidence for a
+  different instance or lineage is rejected; an unprovable outcome stays
+  `unknown`, is not retired by timeout and blocks only that exact instance, and
+  terminating or replacing that instance requires independent proof it cannot
+  execute;
+- cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
+  Task, because the coarse path cannot prove its authored fine restrictions;
+- receipt chain: receipts are append-only, write-once, and bounded to one per
+  kind per Execution; the `SandboxAppliedReceipt` establishes `HELD` and is never
+  rewritten; a `CredentialDeliveryReceipt` binds the sandbox receipt digest; a
+  policy-only Execution has no credential receipt, and a credential-bound
+  Execution has both before `RELEASED`; a second row of the same kind, or an
+  upsert over one, is corruption;
+- credential ordering: a credential-bearing `SECURITY_V1` Execution establishes
+  delivery while `HELD`, persists the sandbox and credential-delivery receipts,
+  then revalidates authority before `RELEASED`; a request for a different
+  credential scope under the same Execution is rejected before any broker call,
+  because the committed plan is immutable and one Execution carries at most one
+  credential receipt — the different scope needs a new Execution with its own
+  qualification, snapshot, and chain;
+- single credential delivery domain: a plan whose references span independent
+  broker authorities is unsupported in v1 rather than implicitly fanned out or
+  split into several receipts; one trusted delivery domain may sub-route
+  internally but must own the single qualification proof and the whole canonical
+  request, and a missing domain-level proof makes the candidate ineligible;
+- B5.3 reference integration: component-ready covers the broker
+  qualification/delivery API, canonical request/plan path and component
+  conformance, but does not accept the slice end-to-end. End-to-end acceptance
+  requires one real external agent runtime spawned through a real `SpawnSource`
+  integration completing a constrained `BrokeredAccess` use on the B5.4
+  policy-only secured handoff, not on the credential-bound handoff, with the
+  broker supplying a capability the harness actually consumes and Core never
+  interpreting the provider; broker and receipt mocks alone do not satisfy this,
+  a harness limited to raw environment or its own credential store is a recorded
+  B5.3 blocker rather than brokered-capable, and B5.3 cannot be accepted before
+  the policy-only handoff exists;
+- broker secret isolation: the `BrokeredAccess` claim additionally requires that
+  the broker's raw secret store is unreachable from the worker's launch
+  environment, inherited handles and accessible paths; the capability cannot be
+  minted, widened or replayed outside its declared scope/audience; and expiry,
+  revocation and version fencing are broker-enforced. Content-write workspace
+  confinement does not prove this because the policy-only profile does not claim
+  same-user read confidentiality, and a failure is a B5.3 blocker rather than a
+  narrowing of the brokered claim;
+- partial credential delivery: a plan requesting several references that
+  establishes only a subset produces no `CredentialDeliveryReceipt`, never reaches
+  `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus
+  closure of the partial capabilities; when closure cannot be proven the state is
+  `UNKNOWN` and M5 recovery applies, never a "mostly delivered" success;
+- credential replacement gate: when partial-delivery closure cannot be proven, a
+  later Execution is not authorized by quiescing or recovering the old physical
+  worker alone; the replacement plan requires an independent broker epoch or
+  scope-fencing proof for the prior delivery identity, and without it the
+  candidate is ineligible or deferred; physical quiescence and external broker
+  invalidation are tested as distinct facts;
+- receipt durability: file and directory metadata are durable before release, an
+  existing different receipt is never replaced, and the worker inherits no
+  receipt file/directory handle and no write/delete/replace access; read
+  confidentiality is not claimed;
+- RUNNING atomicity: observation, required receipt chain, RUNNING and first
+  renewal all commit
+  or all roll back;
+- schema gate: a v8 database is rejected at v9 open and no implicit upgrade
+  occurs;
+- feature gating: without a declared policy/credential capability, behavior
+  remains at B.4 fail-closed;
+- crash recovery: an uncertain physical start keeps the original RequestId and
+  does not create a second security fact.
 
 These supplement, rather than replace, M4 writer-safety/recovery, M6-A frontier,
 B.3 admission/matching and default-feature API-boundary tests (ADR-0011).

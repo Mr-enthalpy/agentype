@@ -48,6 +48,105 @@ Execution itself to be RUNNING.
 The positive RUNNING transition and first Lease renewal MUST commit in one
 fenced Core transaction before daemon admission ([13](13-storage-and-transactions.md)).
 
+**M6-B.5 (`SECURITY_V1`):** a `start` or `reconcile_start` observation carries an
+explicit `SecuredStartPhase` (`HELD`, `RELEASED`, `UNKNOWN`, `TERMINAL`) and an
+**optional** `SecuredReceiptChain`: a `SandboxAppliedReceipt` plus, for a
+credential-bound Execution, a `CredentialDeliveryReceipt` that binds the sandbox
+receipt digest. `HELD` requires a valid, verified sandbox receipt; a
+credential-bound `RELEASED` requires both receipts; `UNKNOWN` permits the chain to
+be missing; `TERMINAL` may occur before any receipt exists.
+
+The phase, not receipt presence, decides RUNNING:
+
+| Phase | RUNNING |
+|---|---|
+| `HELD` | MUST NOT confirm |
+| `RELEASED` | MAY confirm, only after positive physical observation |
+| `UNKNOWN` | MUST NOT confirm |
+| `TERMINAL` | MUST NOT confirm |
+
+Physical start MUST hold worker code at a controlled pre-exec boundary until the
+sandbox receipt and its directory metadata are durable. Receipt publication is
+`durable contents → atomic no-replace publication → durable namespace update →
+verify published identity`; syncing only the file does not prove the published
+entry, and POSIX `fsync`/`rename` is not a cross-platform proof. The receipt's
+`actual_root` MUST equal `ResolveRoot(committed launch descriptor, RequestId)`,
+proven by materialized filesystem object identity through the trusted
+path-resolution rule, never by path-string equality. The hold MUST stay closed
+on daemon crash or control-channel loss; a wait mechanism that releases the worker
+when the parent's handle or pipe closes is invalid. Credential delivery happens
+while `HELD`, and its receipt is durable before authority revalidation and
+`RELEASED`. The observation, the required receipt chain, the positive RUNNING
+transition and the first renewal MUST commit in the same fenced transaction; no
+separate security-confirmation state exists.
+
+The secured-start window is bounded by both the absolute operation deadline and
+the remaining Lease validity, whichever ends first. The failure action follows the
+durable stage: before acquisition commit, a window that cannot cover `B_secured`
+defers without creating an Attempt; after acquisition commit but before Execution
+commit, no physical instance is created and the committed reservation closes
+through the frozen pre-Execution settlement path; after Execution commit but
+before physical start, no instance is created and the M5 post-Execution
+failure/recovery path applies, never a no-Attempt defer. In every stage the Kernel
+MUST NOT create a controlled instance when the window cannot cover the declared
+`B_secured` budget for the exact binding; `B_secured` is a conservative admission
+budget, not a guarantee of worst-case OS latency, and an actual overrun still
+fails closed. If the window becomes insufficient after
+materialization, release MUST NOT be dispatched, the instance stays
+`HELD`/`UNKNOWN` for M5 recovery, and the same chain is not repeated. No
+pre-RUNNING Lease renewal path exists: the first renewal remains part of the
+RUNNING transaction, and the adapter cannot extend the window itself.
+Repeated identical acquisition-stage infeasibility is a durable launch-window
+deferral, not an unbounded retry stream.
+
+On restart, `reconcile_start` MUST recover the phase and, when the phase requires
+them, the receipts for the same `RequestId` and the same physical instance. A
+`HELD` instance MUST NOT be released until the Kernel revalidates current
+Scheduler/Task authority and issues a proof for that exact `RequestId` and
+instance witness, carrying a single-use `ReleaseOperationId` and the current
+Lease/fencing identity; the Kernel checks that authority again immediately before
+the release call. The Kernel creates and advances the `ReleaseOperationIntent`
+only in fenced Core transactions, and a new operation id is authorized only when
+no prior intent exists or the prior intent is terminal (`released` or `aborted`).
+If a prior intent is `dispatched` or `unknown`, the instance remains `UNKNOWN`
+until recovery proves
+whether the operation was released, had no effect, was cancelled, or can no longer
+take effect; observing `HELD` alone MUST NOT close the intent or authorize a second
+operation. Release MUST be idempotent for the same operation: after the result is
+durable and the phase is proven `RELEASED`, a repeated call returns that recorded
+result without a second OS release or new authority; a terminal `aborted` intent
+with the instance still `HELD` may obtain a fresh proof with a new operation id
+under the current Lease/fencing identity.
+
+The Lease that authorized an earlier dispatch may already be expired when the
+evidence arrives. Recording that already-observed outcome through
+`settle_historical_release_observation` uses a narrowly scoped recovery
+authorization, not the old Lease: it may only settle the exact recorded intent to
+a terminal state and MUST NOT renew the Lease, create an intent, dispatch a
+release or confirm RUNNING. If the outcome cannot be proven, the intent stays
+`unknown` and the exact instance is neither replaced nor reused until independent
+evidence proves it cannot execute.
+
+A proof known to be invalid never initiates release; a Lease revocation racing an
+already-started valid release is handled by M5 fencing/recovery and cannot create a
+new valid semantic result. A reused PID
+MUST NOT confer release authority; if authority is invalid the worker stays held
+and follows physical cleanup plus M5 recovery; if the release result is uncertain
+no second worker may be created. Receipt presence alone MUST NOT confirm RUNNING.
+If a required receipt or the instance relation cannot be recovered, the Execution
+MUST NOT be admitted as RUNNING, a receipt MUST NOT be synthesized, and the legacy
+RUNNING path MUST NOT be used. A controlled process created before the sandbox
+receipt was persisted is `UNKNOWN`: reconciliation must not release it, must not
+synthesize a receipt, and must leave it to M5 physical recovery; the
+crash-injection suite covers this window. The receipt artifacts are stored in a
+daemon-owned state directory outside the worker-writable jail root/workspace,
+separately from the SQLite rows; the rows remain authority-bearing and the
+artifacts are verified physical evidence. The chain is append-only: the credential
+receipt binds the sandbox receipt digest and never replaces it. Receipt read
+confidentiality is not required; integrity, non-replaceability, identity binding
+and recoverability are
+([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md)).
+
 **M5:** configuration MUST satisfy
 `dispatcher_poll_seconds <= heartbeat_seconds < lease_seconds`.
 

@@ -82,9 +82,48 @@ cooldown or a catalog-frontier change. This is distinct from a Task failure
 implementation that turns a pre-acquisition ambiguity into a Task NACK is
 wrong.
 
+## Imported enforcement and credentials (M6-B.5)
+
+M6-B.5 extends the security dimension of this contract without creating a new
+authority center ([ADR-0013](../../decisions/0013-m6b5-policy-authority-algebra-identity.md),
+[ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md),
+[ADR-0015](../../decisions/0015-m6b5-credentials-feature-gates-scope-freeze.md)):
+
+- An adapter's support is an exact-binding imported `EnforcementSupport` profile,
+  never a name-derived guess; the default is unsupported. Each spec-10 dimension
+  is classified as proven, explicitly limited, or unsupported, and "supports A
+  and B" does not imply "supports `A ∩ B`".
+- A SourceConfig may narrow physical behavior only through source integration
+  and imported evidence. It is not an authored security ceiling; an authored
+  source ceiling requires a new immutable source revision.
+- Selection order becomes: static filters → effective policy derivation →
+  profile coverage → bounded root-relative compile → read-only attestation →
+  credential probe (when needed) → complete eligible candidate set →
+  deterministic selection. Compilation is per candidate and root-relative; a
+  budget shortfall or any unknown candidate not proven continuity-non-decisive
+  defers the whole round, and a failed winner never falls back to a weaker
+  candidate.
+- Credential-bearing configs are eligible only when the exact binding declares
+  `security_execution_v1.credential_brokered`. `credential_transient_raw` is
+  defined but unsupported in v1 production. Broker unreachable is not
+  credential absent.
+- For `SECURITY_V1`, start and reconcile return a `SecuredStartObservation`
+  carrying a `SecuredStartPhase` (`HELD` / `RELEASED` / `UNKNOWN` / `TERMINAL`)
+  and an optional `SecuredReceiptChain` (`SandboxAppliedReceipt`, plus a
+  `CredentialDeliveryReceipt` for a credential-bound Execution). `HELD` requires
+  the sandbox receipt; a credential-bound `RELEASED` requires both receipts;
+  `UNKNOWN` permits absence and cannot become RUNNING. A release without Kernel
+  authority revalidation for the exact `RequestId` and instance witness cannot
+  become RUNNING. The frozen base
+  `ExecutionAdapter` is unchanged for `COARSE_V1`; the secured behavior is a
+  versioned `SecuredExecutionAdapter` extension adding
+  `start_secured_execution`, `reconcile_secured_start`, and
+  `release_held_execution`. An adapter that cannot implement the extension cannot
+  provide `SECURITY_V1` for that binding.
+
 ## ExecutionAdapter (correctness required)
 
-Narrow interface, UNCHANGED from V0.1:
+Narrow base interface, UNCHANGED from V0.1 and used by `COARSE_V1`:
 
 - `start_execution`
 - `observe_execution`
