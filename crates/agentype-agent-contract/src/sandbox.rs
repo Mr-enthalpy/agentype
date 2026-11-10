@@ -1832,6 +1832,105 @@ impl SecurityContractMode {
     }
 }
 
+/// The imported enforcement protocol/profile identity a `SECURITY_V1` source
+/// revision can import (ADR-0013 §11).
+///
+/// B5.1 records the identity only: compile semantics belong to B5.2 and the
+/// proven coverage matrix to B5.4. The tuple is part of the immutable source
+/// revision contract, so it is validated here and never guessed from an
+/// adapter kind.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnforcementProfileRef {
+    protocol: String,
+    profile: String,
+    version: u32,
+}
+
+impl EnforcementProfileRef {
+    pub fn new(
+        protocol: impl Into<String>,
+        profile: impl Into<String>,
+        version: u32,
+    ) -> Result<Self, ContractError> {
+        let protocol = protocol.into();
+        let profile = profile.into();
+        validate_name_token(&protocol, "enforcement protocol")?;
+        validate_name_token(&profile, "enforcement profile")?;
+        if version == 0 {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: "enforcement profile version must be at least 1".into(),
+            });
+        }
+        Ok(Self {
+            protocol,
+            profile,
+            version,
+        })
+    }
+
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+/// The immutable security declaration of one exact SpawnSource revision.
+///
+/// A source revision is `SECURITY_V1` exactly when this record exists; absence
+/// keeps the frozen `COARSE_V1` contract. `source_policy` is the optional
+/// authored `P_source` ceiling, and `None` means `P_source = Top` — it adds no
+/// authored narrowing but still requires the complete full-path checks
+/// (ADR-0013 §11). It is never a "skip eligibility" marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnSourceSecurityDeclaration {
+    source_policy: Option<PolicyInput>,
+    enforcement_profile: EnforcementProfileRef,
+}
+
+impl SpawnSourceSecurityDeclaration {
+    pub fn new(
+        source_policy: Option<PolicyInput>,
+        enforcement_profile: EnforcementProfileRef,
+    ) -> Self {
+        Self {
+            source_policy,
+            enforcement_profile,
+        }
+    }
+
+    pub fn without_policy(enforcement_profile: EnforcementProfileRef) -> Self {
+        Self::new(None, enforcement_profile)
+    }
+
+    pub fn with_policy(
+        source_policy: PolicyInput,
+        enforcement_profile: EnforcementProfileRef,
+    ) -> Self {
+        Self::new(Some(source_policy), enforcement_profile)
+    }
+
+    pub fn source_policy(&self) -> Option<&PolicyInput> {
+        self.source_policy.as_ref()
+    }
+
+    pub fn enforcement_profile(&self) -> &EnforcementProfileRef {
+        &self.enforcement_profile
+    }
+
+    /// A source revision with a declaration is always `SECURITY_V1`; the mode
+    /// is a property of the record, not of `source_policy.is_some()`.
+    pub fn mode(&self) -> SecurityContractMode {
+        SecurityContractMode::SecurityV1
+    }
+}
+
 /// Prove that a Task's coarse fields and its (optional) fine policy agree
 /// before any cross-object meet or normalization (ADR-0013 §3).
 ///

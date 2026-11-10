@@ -89,12 +89,12 @@ pub use requirement::{
 pub use sandbox::{
     check_required_access, is_within, meet, project_capability_access, prove_no_wider,
     validate_task_local_coarse_fine, AccessDeficit, CredentialAuthorizationId,
-    CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy, FilePolicy, NameSet,
-    NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector, PathSet, PolicyAccess,
-    PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling, ResourceLimitName, ResourceScope,
-    ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode,
-    SecurityDerivation, ToolPolicy, WorkingDirectory, REQUIRED_ACCESS_SCHEMA_VERSION,
-    SANDBOX_POLICY_MEET_ALGORITHM_VERSION, SANDBOX_POLICY_NORMALIZATION_VERSION,
-    SANDBOX_POLICY_SCHEMA_VERSION,
+    CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef, EnvironmentPolicy, FilePolicy,
+    NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector, PathSet,
+    PolicyAccess, PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling, ResourceLimitName,
+    ResourceScope, ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode,
+    SecurityDerivation, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
+    REQUIRED_ACCESS_SCHEMA_VERSION, SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
+    SANDBOX_POLICY_NORMALIZATION_VERSION, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};
