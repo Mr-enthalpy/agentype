@@ -661,11 +661,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   write/delete/replace denial; receipt read confidentiality is tested as a
   non-claim, and no behavior may depend on the receipt path, digest or content
   being unknown to the worker;
-- credential-free claim: a policy-only Execution is asserted to have no
-  Agentype-managed credential delivery and no committed `CredentialAccessPlan`;
-  the test does not assert that the worker cannot reach a host secret available
-  through harness-native configuration or file permissions, because read
-  confidentiality and arbitrary read-root isolation are explicit non-claims;
+- enforcement subject: claims cover `controlled_primary_process` and an
+  `os_restricted_descendant` proven to remain in the same restricted
+  token/job/cgroup/namespace/confinement domain; a normal child stays confined, a
+  helper that inherits the restriction stays confined, and a breakaway,
+  unrestricted re-exec or new-session attempt is denied or classified outside the
+  profile; an `externally_delegated_execution` or `unproven_external_process` is
+  never counted as covered, a Task requiring enforcement over it is ineligible
+  without an explicitly authored and proven subject, and a primary receipt cannot
+  prove that process's writes;
+- credential-free claim: "no credential authorization" and "credential-free" are
+  tested to mean no Agentype-managed grant, delivery or committed
+  `CredentialAccessPlan`; the test does not assert that the worker cannot
+  physically obtain a credential, or reach a host secret available through
+  harness-native configuration or file permissions, because read confidentiality
+  and arbitrary read-root isolation are explicit non-claims;
 - physical root binding: `ResolveRoot(committed descriptor, RequestId)` MUST equal
   `receipt.actual_root` by materialized filesystem identity, not path string;
   root substitution, symlink/reparse-point aliasing, and TOCTOU between

@@ -1,6 +1,6 @@
 # ADR-0013 — M6-B.5 policy authority, sandbox algebra, and durable security identity
 
-Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
+Status: Accepted (M6-B.5 / B5.0 design baseline; not a milestone freeze)
 Date: 2026-11-08
 Canonical path: `docs/decisions/0013-m6b5-policy-authority-algebra-identity.md`
 
@@ -476,6 +476,14 @@ returns `Ok` and the credential obligation is `Unsatisfied`, which makes the
 candidate ineligible. It adds no `P_config` term and no `TaskSpec` field. When no
 credential is requested, the dimension imposes no obligation and policy-only
 execution is unaffected.
+
+"Authorizes no credential use" is scoped to Agentype-managed credential
+authorization and delivery. It does not mean the worker is physically unable to
+obtain a credential: host credentials reachable through harness-native
+configuration, inherited environment or ordinary file permissions are outside the
+managed grant, are not certified by this ADR, and neither satisfy nor are implied
+by a `CredentialAuthorizationId`. Absence of a grant and physical impossibility of
+credential access are different claims at every layer.
 
 `meet` is **partially defined** over the grammar, not total:
 

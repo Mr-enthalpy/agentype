@@ -1,6 +1,6 @@
 # ADR-0014 — M6-B.5 enforcement compilation, physical binding, and the applied-security receipt chain
 
-Status: Proposed (M6-B.5 / B5.0 normative design; pending maintainer audit; not a milestone freeze)
+Status: Accepted (M6-B.5 / B5.0 design baseline; not a milestone freeze)
 Date: 2026-11-08
 Canonical path: `docs/decisions/0014-m6b5-enforcement-compilation-receipt.md`
 
@@ -957,9 +957,45 @@ Claimed supported:
 - no Agentype-managed credential delivery and no committed
   `CredentialAccessPlan` ("credential-free" in this narrow sense).
 
-"Credential-free execution" in this profile means exactly that: no
-Agentype-managed delivery and no committed credential access plan. It is not a
-claim that the worker cannot reach any secret. The profile explicitly does not
+Every claim in this profile is relative to an explicit enforcement subject, not to
+an implicit process tree:
+
+```text
+EnforcementSubject
+    controlled_primary_process
+        the exact process the secured start creates, holds and releases; the
+        receipt and every claimed control are bound to it
+    os_restricted_descendant
+        a descendant that the OS mechanism proves remains inside the same
+        confinement domain as the primary process and cannot leave it
+    externally_delegated_execution
+        work handed to a service, daemon or harness component that runs outside
+        that proven domain
+    unproven_external_process
+        any process whose identity, parentage or confinement domain is not proven
+```
+
+`controlled_primary_process` and `os_restricted_descendant` are inside the claimed
+subject. A descendant is `os_restricted` only when the OS proves it stayed in the
+same restricted token, job, cgroup, namespace or confinement domain and received
+no breakaway, unrestricted token, new session or other route out; parent-child
+descent alone is not proof. Because Agentype intentionally permits harness-native
+subagents, a harness that may start a process outside that domain does not thereby
+extend the claim: the primary receipt proves the primary instance and its proven
+descendants, not every effect the harness can cause.
+
+`externally_delegated_execution` and `unproven_external_process` are outside the
+profile. A Task whose effective policy or guarantees require enforcement over them
+is ineligible under this profile; supporting one requires an explicit, separately
+authored and proven enforcement subject, or a new profile, not an assumption that
+a harness subagent inherits the jail. File effects produced there are not covered
+by the content-write confinement claim, and formal authority MUST NOT appear
+broader than the physical subject that can prove it.
+
+"Credential-free execution" and "no credential authorization" in this profile mean
+exactly: no Agentype-managed credential grant, delivery or committed credential
+access plan. They are not claims that the worker cannot physically obtain any
+credential. The profile explicitly does not
 guarantee same-user read confidentiality or arbitrary read-root isolation, so a
 worker may still read host credentials exposed through its harness-native
 configuration or ordinary file permissions. That exposure is outside
@@ -983,6 +1019,9 @@ Explicit non-claims:
 - attempt isolation (the current jail adapter does not provide it);
 - process-tree termination or quiescence;
 - general malicious-code isolation;
+- confinement or effects of an `externally_delegated_execution` or an
+  `unproven_external_process`, including a harness-native subagent that leaves the
+  proven domain;
 - arbitrary metadata immutability, including known Linux Landlock limitations.
 
 The profile is platform-common: a capability is claimed only when both Linux and
@@ -1023,10 +1062,13 @@ feature against this profile as proven, limited, or unsupported.
 ## Non-claims
 
 - No B.5 implementation exists at this baseline.
-- No claim that every adapter can compile every policy, or that a supported
-  feature works for every descendant process.
+- No claim that every adapter can compile every policy, or that a supported feature
+  extends beyond the receipt-bound `controlled_primary_process` and a proven
+  `os_restricted_descendant` to externally delegated or unproven external
+  processes.
 - The receipt proves applied policy on the proven direct process instance; it
-  does not turn process death into quiescence or cover an unproven process tree.
+  does not turn process death into quiescence, cover an unproven process tree, or
+  extend to `externally_delegated_execution`.
 - No new Scheduler authority, no worker-originated Result transport, and no
   in-place migration.
 
