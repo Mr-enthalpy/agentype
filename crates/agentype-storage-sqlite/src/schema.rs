@@ -15,10 +15,15 @@
 /// `generation_policies` ceiling. Version 8 adds M6-B.4 provisioning bindings
 /// (`provisioning_bindings`, `binding_snapshots`) with the parent presence
 /// markers (`incarnations.provisioning_mode`,
-/// `executions.binding_snapshot_mode`). Older files are rejected at open (fail
-/// closed); D-DB-MIGRATE is still unresolved, so there is deliberately no
-/// in-place upgrade.
-pub const SCHEMA_VERSION: i64 = 8;
+/// `executions.binding_snapshot_mode`). Version 9 adds the M6-B.5 effective
+/// security surface: the authored `sandbox_policy_revisions` catalog, the
+/// `agent_type_security_declarations` / `spawn_source_security_declarations`
+/// mode declarations, `capability_definitions.canonical_version`, and the
+/// `security_contract_mode` owner on `task_agent_requirements` and
+/// `generation_policies`. Older files are rejected at open (fail closed);
+/// D-DB-MIGRATE is still unresolved, so there is deliberately no in-place
+/// upgrade.
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -425,6 +430,7 @@ CREATE TABLE IF NOT EXISTS capability_definitions (
     matcher_kind TEXT NOT NULL CHECK (matcher_kind IN ('BOOL','SET','ORDERED','QUANTITY','EXACT')),
     security_class TEXT NOT NULL CHECK (security_class IN ('FUNCTIONAL','AUTHORITY','SANDBOX','CONTINUITY')),
     polarity TEXT NOT NULL CHECK (polarity IN ('ABILITY','RESTRICTION')),
+    canonical_version INTEGER NOT NULL CHECK (canonical_version IN (1,2)),
     content_json TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     created_at REAL NOT NULL,
@@ -741,6 +747,8 @@ CREATE TABLE IF NOT EXISTS generation_policies (
     generation_id TEXT PRIMARY KEY REFERENCES generations(generation_id) ON DELETE CASCADE,
     policy_json TEXT NOT NULL,
     policy_digest TEXT NOT NULL,
+    security_contract_mode TEXT NOT NULL DEFAULT 'COARSE_V1'
+        CHECK (security_contract_mode IN ('COARSE_V1','SECURITY_V1')),
     created_at REAL NOT NULL
 );
 
@@ -750,6 +758,8 @@ CREATE TABLE IF NOT EXISTS task_agent_requirements (
     required_type_revision INTEGER NOT NULL CHECK (required_type_revision >= 1),
     requirement_json TEXT NOT NULL,
     requirement_digest TEXT NOT NULL,
+    security_contract_mode TEXT NOT NULL DEFAULT 'COARSE_V1'
+        CHECK (security_contract_mode IN ('COARSE_V1','SECURITY_V1')),
     created_at REAL NOT NULL,
     FOREIGN KEY (required_type_id, required_type_revision)
         REFERENCES agent_types(type_id, revision)
@@ -1082,5 +1092,112 @@ WHEN NEW.state IN ('STARTING','WARM','COLD')
               AND state IN ('STARTING','WARM','COLD'))
 BEGIN
     SELECT RAISE(ABORT, 'a LogicalAgent already has an active incarnation');
+END;
+
+-- =========================================================================
+-- M6-B.5 effective-security surface (schema v9)
+--
+-- Only authored policies are catalog rows. An intersection product is inline
+-- canonical bytes on the binding/snapshot that produced it, never a row here.
+-- Mode declarations are additive immutable facts: absent = frozen COARSE_V1,
+-- explicit = SECURITY_V1. There is exactly one spelling per mode.
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS sandbox_policy_revisions (
+    policy_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    canonical_version INTEGER NOT NULL CHECK (canonical_version >= 1),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL CHECK (length(trim(content_digest)) > 0),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (policy_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS agent_type_security_declarations (
+    type_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    security_contract_mode TEXT NOT NULL CHECK (security_contract_mode = 'SECURITY_V1'),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (type_id, revision),
+    FOREIGN KEY (type_id, revision) REFERENCES agent_types(type_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS spawn_source_security_declarations (
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    security_contract_mode TEXT NOT NULL CHECK (security_contract_mode = 'SECURITY_V1'),
+    source_policy_id TEXT,
+    source_policy_revision INTEGER CHECK (source_policy_revision IS NULL OR source_policy_revision >= 1),
+    source_policy_digest TEXT,
+    enforcement_protocol TEXT NOT NULL CHECK (length(trim(enforcement_protocol)) > 0),
+    enforcement_profile TEXT NOT NULL CHECK (length(trim(enforcement_profile)) > 0),
+    enforcement_profile_version INTEGER NOT NULL CHECK (enforcement_profile_version >= 1),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (source_id, revision),
+    CHECK ((source_policy_id IS NULL) = (source_policy_revision IS NULL)),
+    CHECK ((source_policy_id IS NULL) = (source_policy_digest IS NULL)),
+    FOREIGN KEY (source_id, revision) REFERENCES spawn_sources(source_id, revision),
+    FOREIGN KEY (source_policy_id, source_policy_revision)
+        REFERENCES sandbox_policy_revisions(policy_id, revision)
+);
+
+CREATE TRIGGER IF NOT EXISTS sandbox_policy_revisions_immutable_update
+BEFORE UPDATE ON sandbox_policy_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'an authored sandbox policy revision is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sandbox_policy_revisions_immutable_delete
+BEFORE DELETE ON sandbox_policy_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'an authored sandbox policy revision is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sandbox_policy_revisions_no_reinsert
+BEFORE INSERT ON sandbox_policy_revisions
+WHEN EXISTS(SELECT 1 FROM sandbox_policy_revisions
+            WHERE policy_id=NEW.policy_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'an authored sandbox policy revision is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_security_declarations_immutable_update
+BEFORE UPDATE ON agent_type_security_declarations
+BEGIN
+    SELECT RAISE(ABORT, 'an AgentType security declaration is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_security_declarations_immutable_delete
+BEFORE DELETE ON agent_type_security_declarations
+BEGIN
+    SELECT RAISE(ABORT, 'an AgentType security declaration is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_type_security_declarations_no_reinsert
+BEFORE INSERT ON agent_type_security_declarations
+WHEN EXISTS(SELECT 1 FROM agent_type_security_declarations
+            WHERE type_id=NEW.type_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'an AgentType security declaration is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_security_declarations_immutable_update
+BEFORE UPDATE ON spawn_source_security_declarations
+BEGIN
+    SELECT RAISE(ABORT, 'a SpawnSource security declaration is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_security_declarations_immutable_delete
+BEFORE DELETE ON spawn_source_security_declarations
+BEGIN
+    SELECT RAISE(ABORT, 'a SpawnSource security declaration is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_security_declarations_no_reinsert
+BEFORE INSERT ON spawn_source_security_declarations
+WHEN EXISTS(SELECT 1 FROM spawn_source_security_declarations
+            WHERE source_id=NEW.source_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'a SpawnSource security declaration is write-once');
 END;
 "#;

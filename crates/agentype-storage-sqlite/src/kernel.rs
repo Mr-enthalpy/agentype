@@ -5,8 +5,9 @@ use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_agent_contract::{
     resolve_selector, AdapterBindingPolicy, AdapterPolicyRef, AgentType, AgentTypeRef,
-    AgentTypeSelector, CapabilityCatalog, CapabilityDefinition, CapabilityRef, SourceConfig,
-    SourceConfigRef, SpawnSource, SpawnSourceRef,
+    AgentTypeSelector, CapabilityCatalog, CapabilityDefinition, CapabilityRef,
+    NormalizedSandboxPolicy, SandboxPolicyRef, SecurityContractMode, SourceConfig, SourceConfigRef,
+    SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
 };
 use agentype_core::*;
 // Only the runtime-mechanical methods (claim, execution commitment, renewal,
@@ -817,6 +818,68 @@ impl Kernel {
         reference: &SpawnSourceRef,
     ) -> Result<Option<SpawnSource>, Error> {
         self.tx(|tx, _| crate::catalog::get_spawn_source(tx, reference))
+    }
+
+    // ---- M6-B.5 effective-security catalog (schema v9) ----
+
+    pub fn publish_sandbox_policy(
+        &self,
+        reference: &SandboxPolicyRef,
+        policy: &NormalizedSandboxPolicy,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_sandbox_policy(tx, now, reference, policy))
+    }
+
+    pub fn get_sandbox_policy(
+        &self,
+        reference: &SandboxPolicyRef,
+    ) -> Result<Option<NormalizedSandboxPolicy>, Error> {
+        self.tx(|tx, _| crate::catalog::get_sandbox_policy(tx, reference))
+    }
+
+    pub fn publish_agent_type_security_declaration(
+        &self,
+        reference: &AgentTypeRef,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_agent_type_security_declaration(tx, now, reference)
+        })
+    }
+
+    pub fn agent_type_security_mode(
+        &self,
+        reference: &AgentTypeRef,
+    ) -> Result<SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::catalog::agent_type_security_mode(tx, reference))
+    }
+
+    pub fn publish_spawn_source_security_declaration(
+        &self,
+        reference: &SpawnSourceRef,
+        declaration: &SpawnSourceSecurityDeclaration,
+    ) -> Result<(), Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_spawn_source_security_declaration(
+                tx,
+                now,
+                reference,
+                declaration,
+            )
+        })
+    }
+
+    pub fn spawn_source_security_declaration(
+        &self,
+        reference: &SpawnSourceRef,
+    ) -> Result<Option<SpawnSourceSecurityDeclaration>, Error> {
+        self.tx(|tx, _| crate::catalog::spawn_source_security_declaration(tx, reference))
+    }
+
+    pub fn spawn_source_security_mode(
+        &self,
+        reference: &SpawnSourceRef,
+    ) -> Result<SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::catalog::spawn_source_security_mode(tx, reference))
     }
 
     pub fn get_source_config(

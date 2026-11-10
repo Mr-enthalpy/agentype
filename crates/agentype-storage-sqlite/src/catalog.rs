@@ -15,14 +15,18 @@ use agentype_agent_contract::{
     agent_type_content_digest, agent_type_from_canonical_json,
     canonical_adapter_binding_policy_bytes, canonical_agent_type_bytes,
     canonical_capability_definition_bytes, canonical_json_body_digest,
-    canonical_source_config_bytes, canonical_spawn_source_bytes, canonicalize_agent_type,
-    canonicalize_source_config, canonicalize_spawn_source, capability_definition_content_digest,
-    capability_definition_from_canonical_json, content_digest, is_valid_refinement,
-    source_config_content_digest, source_config_revision_from_canonical_json,
-    spawn_source_content_digest, spawn_source_from_canonical_json, AdapterBindingPolicy,
-    AdapterPolicyRef, AgentType, AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog,
-    CapabilityDefinition, CapabilityRef, ConfigDigest, ConfigStatus, ContractError, SourceConfig,
-    SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
+    canonical_sandbox_policy_bytes, canonical_source_config_bytes, canonical_spawn_source_bytes,
+    canonicalize_agent_type, canonicalize_source_config, canonicalize_spawn_source,
+    capability_definition_content_digest, capability_definition_from_canonical_json,
+    content_digest, is_valid_refinement, sandbox_policy_content_digest,
+    sandbox_policy_from_canonical_json, source_config_content_digest,
+    source_config_revision_from_canonical_json, spawn_source_content_digest,
+    spawn_source_from_canonical_json, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
+    AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog, CapabilityDefinition,
+    CapabilityRef, ConfigDigest, ConfigStatus, ContractError, EnforcementProfileRef,
+    NormalizedSandboxPolicy, PolicyInput, SandboxPolicyRef, SecurityContractMode, SourceConfig,
+    SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
+    SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{Error, UnixTime};
 use rusqlite::{params, Transaction};
@@ -226,7 +230,7 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
     let mut statement = tx
         .prepare(
             "SELECT capability_id, revision, matcher_kind, security_class, polarity,
-                    content_json, content_digest
+                    canonical_version, content_json, content_digest
              FROM capability_definitions ORDER BY capability_id, revision",
         )
         .map_err(map_sqlite)?;
@@ -238,15 +242,24 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })
         .map_err(map_sqlite)?;
     let mut catalog = CapabilityCatalog::new();
     for row in rows {
-        let (capability_id, revision, matcher, class, polarity, content_json, content_digest) =
-            row.map_err(map_sqlite)?;
+        let (
+            capability_id,
+            revision,
+            matcher,
+            class,
+            polarity,
+            canonical_version,
+            content_json,
+            content_digest,
+        ) = row.map_err(map_sqlite)?;
         verify_content_digest(&content_json, &content_digest, "capability definition")?;
         let (canonical_ref, definition) =
             capability_definition_from_canonical_json(&content_json).map_err(contract_fault)?;
@@ -259,17 +272,25 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
                 && polarity == polarity_sql(&definition),
             "capability definition",
         )?;
+        // The row's version column is the authority for how the content is
+        // read; a document whose encoding disagrees with it must fail closed
+        // rather than be reinterpreted under the other version.
+        cross_check(
+            canonical_version as u32 == definition.canonical_version(),
+            "capability definition canonical_version",
+        )?;
         verify_reencoded(
             &canonical_capability_definition_bytes(&canonical_ref, &definition),
             &content_json,
             "capability definition",
         )?;
         catalog
-            .define(
+            .define_with_projection(
                 reference,
                 definition.matcher_kind,
                 definition.security_class,
                 definition.polarity,
+                definition.policy_projection.clone(),
             )
             .map_err(contract_fault)?;
     }
@@ -304,14 +325,15 @@ pub fn publish_capability_definition(
     tx.execute(
         "INSERT INTO capability_definitions(
              capability_id, revision, matcher_kind, security_class, polarity,
-             content_json, content_digest, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+             canonical_version, content_json, content_digest, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
             reference.capability_id().as_str(),
             reference.revision(),
             matcher_sql(definition),
             class_sql(definition),
             polarity_sql(definition),
+            definition.canonical_version(),
             content_json,
             digest,
             now,
@@ -1091,7 +1113,7 @@ pub fn get_capability_definition(
     let row = query_opt(
         tx,
         "SELECT capability_id, revision, matcher_kind, security_class, polarity,
-                content_json, content_digest
+                canonical_version, content_json, content_digest
          FROM capability_definitions WHERE capability_id=?1 AND revision=?2",
         params![reference.capability_id().as_str(), reference.revision()],
         |row| {
@@ -1101,14 +1123,24 @@ pub fn get_capability_definition(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         },
     )?;
     match row {
         None => Ok(None),
-        Some((capability_id, revision, matcher, class, polarity, json, digest)) => {
+        Some((
+            capability_id,
+            revision,
+            matcher,
+            class,
+            polarity,
+            canonical_version,
+            json,
+            digest,
+        )) => {
             verify_content_digest(&json, &digest, "capability definition")?;
             let (canonical_ref, definition) =
                 capability_definition_from_canonical_json(&json).map_err(contract_fault)?;
@@ -1120,6 +1152,10 @@ pub fn get_capability_definition(
                     && class == class_sql(&definition)
                     && polarity == polarity_sql(&definition),
                 "capability definition",
+            )?;
+            cross_check(
+                canonical_version as u32 == definition.canonical_version(),
+                "capability definition canonical_version",
             )?;
             verify_reencoded(
                 &canonical_capability_definition_bytes(&canonical_ref, &definition),
@@ -1380,6 +1416,387 @@ pub fn load_agent_type_lookup(tx: &Transaction<'_>) -> Result<DurableAgentTypeLo
         }
     }
     Ok(DurableAgentTypeLookup { published })
+}
+
+// =============================================================================
+// M6-B.5 authored sandbox policies and security declarations (schema v9)
+// =============================================================================
+
+/// Publish one immutable authored sandbox policy revision.
+///
+/// The canonical bytes and digest are computed here from the pure value form;
+/// a caller cannot declare either. Republishing the same exact revision is
+/// content-idempotent and re-validates the stored record.
+pub fn publish_sandbox_policy(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    reference: &SandboxPolicyRef,
+    policy: &NormalizedSandboxPolicy,
+) -> Result<String, Error> {
+    let digest = sandbox_policy_content_digest(policy);
+    let content_json =
+        canonical_json_string(canonical_sandbox_policy_bytes(policy), "sandbox policy")?;
+    let existing = existing_digest(
+        tx,
+        "SELECT content_digest FROM sandbox_policy_revisions
+         WHERE policy_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+    )?;
+    if let Some(stored) = existing {
+        guard_immutable(Some(stored), &digest, "sandbox policy")?;
+        get_sandbox_policy(tx, reference)?
+            .ok_or_else(|| Error::invariant("published sandbox policy is missing"))?;
+        return Ok(digest);
+    }
+    tx.execute(
+        "INSERT INTO sandbox_policy_revisions(
+             policy_id, revision, canonical_version, content_json, content_digest, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            reference.id().as_str(),
+            reference.revision(),
+            SANDBOX_POLICY_SCHEMA_VERSION,
+            content_json,
+            digest,
+            now,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    Ok(digest)
+}
+
+/// The validated authoritative read of one authored policy revision.
+pub fn get_sandbox_policy(
+    tx: &Transaction<'_>,
+    reference: &SandboxPolicyRef,
+) -> Result<Option<NormalizedSandboxPolicy>, Error> {
+    let row = query_opt(
+        tx,
+        "SELECT canonical_version, content_json, content_digest
+         FROM sandbox_policy_revisions WHERE policy_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    match row {
+        None => Ok(None),
+        Some((canonical_version, json, digest)) => {
+            verify_content_digest(&json, &digest, "sandbox policy")?;
+            let policy = sandbox_policy_from_canonical_json(&json).map_err(contract_fault)?;
+            // Policy rows store the canonical schema version only; the meet
+            // algorithm version belongs to derivation/binding rows. A row this
+            // build does not implement fails closed instead of being decoded
+            // under current semantics.
+            cross_check(
+                canonical_version as u32 == SANDBOX_POLICY_SCHEMA_VERSION,
+                "sandbox policy canonical_version",
+            )?;
+            verify_reencoded(
+                &canonical_sandbox_policy_bytes(&policy),
+                &json,
+                "sandbox policy",
+            )?;
+            Ok(Some(policy))
+        }
+    }
+}
+
+/// Make an AgentType revision explicitly `SECURITY_V1`.
+///
+/// Absence of the declaration is the frozen `COARSE_V1` contract, so there is
+/// no row for a coarse revision. The parent revision MUST be a complete
+/// validated catalog record before a security fact can attach to it.
+pub fn publish_agent_type_security_declaration(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    reference: &AgentTypeRef,
+) -> Result<(), Error> {
+    get_agent_type(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "agent type {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+    let existing = query_opt(
+        tx,
+        "SELECT security_contract_mode FROM agent_type_security_declarations
+         WHERE type_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| row.get::<_, String>(0),
+    )?;
+    if let Some(mode) = existing {
+        // Only one spelling is durable; a repeated declaration is an idempotent
+        // no-op, and any other stored mode is corruption.
+        return cross_check(
+            mode == SecurityContractMode::SecurityV1.as_str(),
+            "agent type security declaration",
+        );
+    }
+    tx.execute(
+        "INSERT INTO agent_type_security_declarations(
+             type_id, revision, security_contract_mode, created_at)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            reference.id().as_str(),
+            reference.revision(),
+            SecurityContractMode::SecurityV1.as_str(),
+            now
+        ],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
+/// The declared mode of an exact AgentType revision; absence is `COARSE_V1`.
+pub fn agent_type_security_mode(
+    tx: &Transaction<'_>,
+    reference: &AgentTypeRef,
+) -> Result<SecurityContractMode, Error> {
+    get_agent_type(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "agent type {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+    let stored = query_opt(
+        tx,
+        "SELECT security_contract_mode FROM agent_type_security_declarations
+         WHERE type_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| row.get::<_, String>(0),
+    )?;
+    match stored {
+        None => Ok(SecurityContractMode::CoarseV1),
+        Some(mode) => SecurityContractMode::parse(&mode)
+            .filter(|mode| *mode == SecurityContractMode::SecurityV1)
+            .ok_or_else(|| {
+                Error::invariant(format!(
+                    "agent type security declaration records unsupported mode {mode:?}"
+                ))
+            }),
+    }
+}
+
+/// Publish the immutable security declaration of one exact SpawnSource revision.
+///
+/// A declaration makes the revision `SECURITY_V1` whether or not it carries an
+/// authored `P_source` ceiling. The authored policy reference (if any) MUST
+/// resolve through the validated policy read and its digest MUST match the
+/// stored canonical content.
+pub fn publish_spawn_source_security_declaration(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    reference: &SpawnSourceRef,
+    declaration: &SpawnSourceSecurityDeclaration,
+) -> Result<(), Error> {
+    get_spawn_source(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "spawn source {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+
+    let (policy_id, policy_revision, policy_digest) = match declaration.source_policy() {
+        None => (None, None, None),
+        Some(input) => {
+            let authored = input.reference().ok_or_else(|| {
+                Error::invariant(
+                    "a SpawnSource P_source declaration must reference an authored policy revision",
+                )
+            })?;
+            let policy = get_sandbox_policy(tx, authored)?.ok_or_else(|| {
+                Error::not_found(format!(
+                    "sandbox policy {}@{} does not exist",
+                    authored.id().as_str(),
+                    authored.revision()
+                ))
+            })?;
+            let recomputed = sandbox_policy_content_digest(&policy);
+            if input.policy_digest() != recomputed {
+                return Err(Error::invariant(format!(
+                    "spawn source P_source digest {} does not match authored policy {recomputed}",
+                    input.policy_digest()
+                )));
+            }
+            (
+                Some(authored.id().as_str().to_string()),
+                Some(authored.revision() as i64),
+                Some(recomputed),
+            )
+        }
+    };
+
+    let existing = query_opt(
+        tx,
+        "SELECT source_policy_id, source_policy_revision, source_policy_digest,
+                enforcement_protocol, enforcement_profile, enforcement_profile_version
+         FROM spawn_source_security_declarations WHERE source_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    if let Some((
+        stored_id,
+        stored_revision,
+        stored_digest,
+        stored_protocol,
+        stored_profile,
+        stored_version,
+    )) = existing
+    {
+        let profile = declaration.enforcement_profile();
+        let identical = stored_id == policy_id
+            && stored_revision == policy_revision
+            && stored_digest == policy_digest
+            && stored_protocol == profile.protocol()
+            && stored_profile == profile.profile()
+            && stored_version as u32 == profile.version();
+        if !identical {
+            return Err(Error::invariant(
+                "spawn source security declaration for this exact revision already exists \
+                 with different content; a change requires a new source revision",
+            ));
+        }
+        return Ok(());
+    }
+
+    let profile = declaration.enforcement_profile();
+    tx.execute(
+        "INSERT INTO spawn_source_security_declarations(
+             source_id, revision, security_contract_mode,
+             source_policy_id, source_policy_revision, source_policy_digest,
+             enforcement_protocol, enforcement_profile, enforcement_profile_version,
+             created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            reference.id().as_str(),
+            reference.revision(),
+            SecurityContractMode::SecurityV1.as_str(),
+            policy_id,
+            policy_revision,
+            policy_digest,
+            profile.protocol(),
+            profile.profile(),
+            profile.version(),
+            now,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
+/// The validated security declaration of one exact SpawnSource revision.
+pub fn spawn_source_security_declaration(
+    tx: &Transaction<'_>,
+    reference: &SpawnSourceRef,
+) -> Result<Option<SpawnSourceSecurityDeclaration>, Error> {
+    let row = query_opt(
+        tx,
+        "SELECT security_contract_mode, source_policy_id, source_policy_revision,
+                source_policy_digest, enforcement_protocol, enforcement_profile,
+                enforcement_profile_version
+         FROM spawn_source_security_declarations WHERE source_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    let Some((mode, policy_id, policy_revision, policy_digest, protocol, profile, profile_version)) =
+        row
+    else {
+        return Ok(None);
+    };
+    cross_check(
+        mode == SecurityContractMode::SecurityV1.as_str(),
+        "spawn source security declaration",
+    )?;
+    let enforcement_profile = EnforcementProfileRef::new(protocol, profile, profile_version as u32)
+        .map_err(contract_fault)?;
+    let source_policy = match (policy_id, policy_revision, policy_digest) {
+        (Some(id), Some(revision), Some(declared_digest)) => {
+            let reference = SandboxPolicyRef::new(id, revision as u64).map_err(contract_fault)?;
+            let policy = get_sandbox_policy(tx, &reference)?.ok_or_else(|| {
+                Error::invariant(format!(
+                    "spawn source declaration references missing sandbox policy {}@{}",
+                    reference.id().as_str(),
+                    reference.revision()
+                ))
+            })?;
+            let recomputed = sandbox_policy_content_digest(&policy);
+            if recomputed != declared_digest {
+                return Err(Error::invariant(format!(
+                    "spawn source declaration digest {declared_digest} does not match \
+                     authored policy {recomputed}"
+                )));
+            }
+            Some(PolicyInput::authored(reference, &policy))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(Error::invariant(
+                "spawn source declaration policy reference is partially absent",
+            ))
+        }
+    };
+    Ok(Some(SpawnSourceSecurityDeclaration::new(
+        source_policy,
+        enforcement_profile,
+    )))
+}
+
+/// The declared mode of an exact SpawnSource revision; absence is `COARSE_V1`.
+pub fn spawn_source_security_mode(
+    tx: &Transaction<'_>,
+    reference: &SpawnSourceRef,
+) -> Result<SecurityContractMode, Error> {
+    get_spawn_source(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "spawn source {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+    let declared = query_opt(
+        tx,
+        "SELECT security_contract_mode FROM spawn_source_security_declarations
+         WHERE source_id=?1 AND revision=?2",
+        params![reference.id().as_str(), reference.revision()],
+        |row| row.get::<_, String>(0),
+    )?;
+    match declared {
+        None => Ok(SecurityContractMode::CoarseV1),
+        Some(mode) => SecurityContractMode::parse(&mode)
+            .filter(|mode| *mode == SecurityContractMode::SecurityV1)
+            .ok_or_else(|| {
+                Error::invariant(format!(
+                    "spawn source security declaration records unsupported mode {mode:?}"
+                ))
+            }),
+    }
 }
 
 #[cfg(test)]

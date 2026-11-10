@@ -1863,11 +1863,13 @@ fn confirmed_preparation_fault_after_elapsed_lease_still_blocks_orphan_retry() {
         .is_err());
 }
 
+/// Schema v9 is fresh-only, so there is no v8 file to reopen. Reopening an
+/// existing v9 file still re-applies the additive DDL idempotently, which is
+/// what keeps a dropped preparation-fault guard from becoming a bypass.
 #[test]
-fn prior_v8_database_reopen_installs_additive_preparation_fault_guards() {
-    let env = Env::new("prior-v8-fault-schema", 1);
+fn v9_database_reopen_reinstalls_additive_preparation_fault_guards() {
+    let env = Env::new("v9-fault-schema", 1);
     let raw = env.raw();
-    // Emulate the schema at the audited v8 head, which has no fault table.
     raw.execute_batch(
         "DROP TRIGGER executions_reject_preparation_fault; DROP TABLE preparation_faults;",
     )
@@ -1885,7 +1887,7 @@ fn prior_v8_database_reopen_installs_additive_preparation_fault_guards() {
         raw.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let guards: i64 = raw
         .query_row(
