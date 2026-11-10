@@ -80,6 +80,17 @@ while `HELD`, and its receipt is durable before authority revalidation and
 transition and the first renewal MUST commit in the same fenced transaction; no
 separate security-confirmation state exists.
 
+The secured-start window is bounded by both the absolute operation deadline and
+the remaining Lease validity, whichever ends first. The Kernel MUST NOT create a
+controlled instance unless that window covers the declared `B_secured` budget for
+the exact binding; otherwise the acquisition defers before physical work. If the
+window becomes insufficient after materialization, release MUST NOT be dispatched,
+the instance stays `HELD`/`UNKNOWN` for M5 recovery, and the same chain is not
+repeated. No pre-RUNNING Lease renewal path exists: the first renewal remains part
+of the RUNNING transaction, and the adapter cannot extend the window itself.
+Repeated identical infeasibility is a durable launch-window deferral, not an
+unbounded retry stream.
+
 On restart, `reconcile_start` MUST recover the phase and, when the phase requires
 them, the receipts for the same `RequestId` and the same physical instance. A
 `HELD` instance MUST NOT be released until the Kernel revalidates current
@@ -98,6 +109,16 @@ durable and the phase is proven `RELEASED`, a repeated call returns that recorde
 result without a second OS release or new authority; a terminal `aborted` intent
 with the instance still `HELD` may obtain a fresh proof with a new operation id
 under the current Lease/fencing identity.
+
+The Lease that authorized an earlier dispatch may already be expired when the
+evidence arrives. Recording that already-observed outcome through
+`settle_historical_release_observation` uses a narrowly scoped recovery
+authorization, not the old Lease: it may only settle the exact recorded intent to
+a terminal state and MUST NOT renew the Lease, create an intent, dispatch a
+release or confirm RUNNING. If the outcome cannot be proven, the intent stays
+`unknown` and the exact instance is neither replaced nor reused until independent
+evidence proves it cannot execute.
+
 A proof known to be invalid never initiates release; a Lease revocation racing an
 already-started valid release is handled by M5 fencing/recovery and cannot create a
 new valid semantic result. A reused PID

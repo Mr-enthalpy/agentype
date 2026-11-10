@@ -378,6 +378,37 @@ the versioned extension MUST NOT become a way around it:
   operation; evidence obtained after the endpoint is `DeadlineExceeded` and never
   a successful observation.
 
+The absolute deadline is not the only bound. The usable launch window is the
+intersection of that deadline and the remaining validity of the currently held
+Lease; the Kernel MUST use the earlier endpoint and MUST NOT treat the deadline as
+permission to outlive the Lease authority. A `SECURITY_V1` launch has a declared
+secured-start budget `B_secured` covering the worst case for the exact binding of:
+instance creation, restriction application, sandbox-receipt durability, optional
+credential delivery and its receipt, Kernel release authorization, the OS release
+call, physical observation, RUNNING and the first renewal. The budget is derived
+from the enforcement profile and adapter binding and is fixed before physical work
+begins.
+
+The Kernel MUST NOT create the controlled instance unless the remaining Lease
+authority covers `B_secured`. If it does not, the acquisition defers before any
+physical work: no instance, receipt, release intent or release operation is
+created. If the window becomes insufficient after materialization because of
+unexpected delay or contention, the Kernel MUST NOT dispatch release; the instance
+stays `HELD`/`UNKNOWN`, follows M5 recovery and physical cleanup, and the same
+chain is not retried in the hope of a different outcome. Repeated secured-start
+infeasibility with the same candidate domain, binding and profile versions is a
+durable operator-visible deferral with a launch-window blocker class under the
+discipline of section 4, not an unbounded retry stream, and it changes no Task
+semantic authority.
+
+B.5 v1 MUST NOT introduce a pre-RUNNING Lease renewal path. M5 already freezes the
+relation between the first positive RUNNING transition and the first Lease renewal
+in one transaction, and an adapter MUST NOT extend the launch window itself. If
+B5.4 evidence shows that a bounded initial Lease budget cannot cover the reference
+profile, the resolution is a separate, strictly scoped pre-RUN authorization
+contract, specified and version-frozen before use — not adapter-side renewal, not
+an implicitly longer Attempt, and not an unbounded repetition of the failing chain.
+
 `SandboxAppliedReceipt` binds at least:
 
 ```text
@@ -530,13 +561,15 @@ unknown ──operation completed with no effect, was cancelled,
 ```
 
 `released` and `aborted` are terminal. The identity, instance and fencing fields
-are immutable. Creating the intent, the `prepared → dispatched` transition that
-authorizes the adapter call, and the recording of `dispatched → released` or
-`unknown` MUST each commit in a fenced Core transaction that validates the current
-Lease/fencing authority and exact instance. The adapter performs the mechanical
-call and returns evidence, but MUST NOT create or mutate the intent. The intent is
-the durable record of authorization consumption and dispatch lineage; it is not a
-receipt and not a substitute for observed OS state.
+are immutable. Creating the intent and the `prepared → dispatched` transition
+that authorizes the adapter call MUST each commit in a fenced Core transaction
+that validates the current Lease/fencing authority and exact instance. Recording
+the immediate result may use that same current-authority transaction; once the
+authority has expired, the result is recorded only through the separate
+settlement operation below. The adapter performs the mechanical call and returns
+evidence, but MUST NOT create or mutate the intent. The intent is the durable
+record of authorization consumption and dispatch lineage; it is not a receipt and
+not a substitute for observed OS state.
 
 A new `ReleaseOperationId` for the same exact instance is permitted only when no
 prior intent exists or the prior intent is terminal (`released` or `aborted`). If
@@ -547,6 +580,40 @@ that an earlier dispatched operation can no longer complete, so it MUST NOT be u
 to mark that intent `aborted` or to justify a new operation. `aborted` requires
 positive evidence that the operation had no effect, was cancelled, or can no
 longer take effect — not merely the absence of an observed release.
+
+Settling a historical observation is a separate operation from authorizing a
+release:
+
+```text
+authorize_release(intent, current authority)            → prepared / dispatched
+settle_historical_release_observation(intent, lineage,
+    trusted physical evidence)                          → released / aborted
+```
+
+`authorize_release` requires current Lease/fencing authority at commit and is the
+only operation that may dispatch an OS release. After the Lease has expired or
+been superseded, the Kernel must still be able to record an outcome that already
+happened. `settle_historical_release_observation` therefore has its own narrowly
+scoped recovery authorization: it is bound to the exact existing intent, may only
+advance a non-terminal intent to a terminal state, and MUST NOT create an intent,
+issue or extend a proof, revalidate a stale Lease as if it were current, dispatch
+an OS call, or grant worker execution authority. Its transaction validates the
+intent identity, the exact instance witness, the dispatch-time fencing lineage
+recorded in the intent and the issuer/kind of the physical evidence — not that the
+original Lease is still valid. It is idempotent and monotonic: `released` never
+downgrades, and evidence conflicting with the recorded lineage is corruption.
+Confirming RUNNING remains a separate decision requiring current authority.
+
+An intent that cannot be settled stays `unknown`; it MUST NOT be rewritten to
+`aborted` by timeout or by the absence of evidence. The Execution remains
+`UNKNOWN`, the exact physical instance cannot be reused or replaced and no further
+release operation may be authorized for it until independent evidence shows it
+cannot execute, and the intent is surfaced as operator-visible recovery debt
+rather than silently accumulating. M5 may terminate the Execution only with that
+same evidence; a later physical replacement uses a new Execution with its own
+qualification, plan and chain, and records the unresolved intent identity as a
+precondition. An unresolved intent blocks only that exact instance, never
+unrelated Tasks or other instances.
 
 The Kernel MUST verify the current Lease/fencing authority immediately before the
 release call, not merely at proof issuance. The adapter verifies the exact

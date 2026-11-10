@@ -248,7 +248,9 @@ surface designed in
   records the blocked Task, a digest of the candidate domain and the relevant
   binding/profile versions, the budget class and observed cost class, the
   consecutive over-budget classification and diagnostic reason, and the release
-  condition. It creates no Attempt, emits no Task NACK, selects no candidate and
+  condition. It also owns the launch-window blocker class, recording an acquisition
+  that cannot obtain a remaining Lease window covering the declared secured-start
+  budget. It creates no Attempt, emits no Task NACK, selects no candidate and
   changes no Task semantic authority; it only makes the existing whole-round defer
   persist across restart and become operator-visible. Its consecutive count and
   resolution fields may change; the recorded identity is otherwise stable. It is
@@ -273,7 +275,15 @@ surface designed in
   can no longer complete and MUST NOT mark it `aborted`. A release with no intent
   row, a mutated intent identity, or a state transition outside this contract is
   corruption. The row is neither a receipt nor physical evidence; it does not
-  replace `applied_security_receipts` or the observed OS state.
+  replace `applied_security_receipts` or the observed OS state. Only
+  `authorize_release` requires current Lease/fencing authority. Once the Lease has
+  expired, `settle_historical_release_observation` may advance a non-terminal
+  intent to `released`/`aborted` under an independent recovery authorization bound
+  to the exact intent, instance and dispatch-time lineage; it cannot create an
+  intent, issue a proof, dispatch a release, renew authority or confirm RUNNING. An
+  intent that cannot be settled remains `unknown`, is never retired by timeout, is
+  surfaced as recovery debt, and blocks only that exact instance until independent
+  evidence proves it cannot execute.
 - `applied_security_receipts` is an immutable, write-once, append-only receipt
   chain, keyed by Execution and receipt kind (`SandboxAppliedReceipt`,
   `CredentialDeliveryReceipt`). The SQLite rows are the authority-bearing records;
@@ -428,8 +438,10 @@ cannot construct a record that merely looks validated.
 | Execution create | Execution associated with Attempt and Incarnation |
 | Execution security commitment | For `SECURITY_V1`, the Execution + `BindingSnapshot` transaction also writes the immutable `ExecutionSecuritySnapshot`, carrying the inline effective policy, the actual bound AgentType identity, the enforcement profile and the security plan digest. The snapshot MUST NOT be created or repaired later. |
 | Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
+| Secured launch window | The usable window is the earlier of the absolute secured-start deadline and the remaining Lease validity. The Kernel MUST NOT create a controlled instance unless that window covers the declared `B_secured` budget for the exact binding; if it does not, the acquisition defers before physical work. A window that becomes insufficient after materialization forbids release dispatch and leaves the instance `HELD`/`UNKNOWN` for M5 recovery. Repeated identical infeasibility is recorded as a durable launch-window deferral, not an unbounded retry stream, and no pre-RUNNING Lease renewal path is added. |
 | Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, `RELEASED` requires a validated `SandboxAppliedReceipt` and, when credential-bound, a `CredentialDeliveryReceipt` binding it, as inputs to the same transaction; `HELD` and `UNKNOWN` cannot produce RUNNING; a `TERMINAL` instance cannot produce RUNNING; a missing or invalid required receipt cannot produce RUNNING. |
-| Secured release | Creating a `ReleaseOperationIntent`, the `prepared → dispatched` transition that authorizes the adapter call, and recording `dispatched → released`/`unknown` are each fenced Core transactions validating current Lease/fencing authority and the exact physical instance. The adapter returns evidence only and must not record the outcome; uncertainty MUST NOT be recorded as `released` or `aborted`. A second operation is not authorized while any prior intent is `dispatched`/`unknown`, and `HELD` observation alone cannot close that intent. |
+| Secured release | Creating a `ReleaseOperationIntent`, the `prepared → dispatched` transition that authorizes the adapter call, and recording `dispatched → released`/`unknown` while the dispatch-time authority is still current are each fenced Core transactions validating current Lease/fencing authority and the exact physical instance. The adapter returns evidence only and must not record the outcome; uncertainty MUST NOT be recorded as `released` or `aborted`. A second operation is not authorized while any prior intent is `dispatched`/`unknown`, and `HELD` observation alone cannot close that intent. |
+| Release settlement | `settle_historical_release_observation` advances an existing non-terminal intent to terminal `released`/`aborted` in a fenced recovery-authorized transaction that validates exact intent identity, instance, dispatch-time fencing lineage and trusted evidence issuer/kind, without current Lease validity, a proof, an OS call or a new intent; `released`/`aborted` never downgrade; an unprovable outcome stays `unknown` and is never retired by timeout. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |
 | Suspend | Task SUSPENDED, Lease REVOKED, Escalation, Batch SUSPENDED, and the decision/control outbox event in the **same** transaction |

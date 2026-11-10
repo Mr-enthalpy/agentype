@@ -783,6 +783,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   out-of-contract transition is corruption; the adapter cannot create or mutate
   the intent; a receipt or `HELD` observation cannot substitute for either the
   intent or the observed OS release state;
+- secured launch window: the usable window is the earlier of the absolute deadline
+  and remaining Lease validity; without a window covering the declared
+  `B_secured` budget no controlled instance is created and the acquisition defers,
+  while a window lost after materialization forbids release dispatch and yields
+  `HELD`/`UNKNOWN` recovery rather than a retry loop or adapter-side extension;
+  repeated identical infeasibility is a durable launch-window deferral and no
+  pre-RUNNING renewal path exists;
+- historical release settlement: after Lease expiry, trusted evidence for the
+  exact intent's dispatch-time lineage settles `dispatched`/`unknown` to
+  `released`/`aborted` under recovery authorization, without a new proof, OS call,
+  intent creation or Lease renewal; `released` never downgrades; evidence for a
+  different instance or lineage is rejected; an unprovable outcome stays
+  `unknown`, is not retired by timeout and blocks only that exact instance, and
+  terminating or replacing that instance requires independent proof it cannot
+  execute;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
 - receipt chain: receipts are append-only, write-once, and bounded to one per
