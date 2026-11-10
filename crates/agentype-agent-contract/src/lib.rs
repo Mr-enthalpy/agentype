@@ -33,7 +33,8 @@ pub use canonical::{
     adapter_binding_policy_content_digest, agent_type_content_digest,
     binding_snapshot_content_digest, canonical_adapter_binding_policy_bytes,
     canonical_agent_type_bytes, canonical_binding_snapshot_bytes,
-    canonical_capability_definition_bytes, canonical_generation_policy_bytes,
+    canonical_capability_definition_bytes, canonical_capability_definition_bytes_v1,
+    canonical_capability_definition_bytes_v2, canonical_generation_policy_bytes,
     canonical_json_body_digest, canonical_provisioning_binding_bytes,
     canonical_source_config_bytes, canonical_spawn_source_bytes,
     canonical_task_agent_requirement_bytes, canonicalize_agent_type, canonicalize_capability_map,
@@ -46,8 +47,10 @@ pub use canonical::{
 };
 pub use capability::{
     value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
-    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
-    Quantity, SecurityClass,
+    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, FileOperationClass,
+    MatcherKind, NetworkEndpoint, NetworkTransport, PolicyAccessDimension, PolicyOperation,
+    PolicyProjection, Quantity, SecurityClass, CAPABILITY_DEFINITION_CANONICAL_VERSION_V1,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
 };
 pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,

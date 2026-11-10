@@ -57,6 +57,7 @@ fn definition(
         matcher_kind: matcher,
         security_class: class,
         polarity,
+        policy_projection: None,
     }
 }
 

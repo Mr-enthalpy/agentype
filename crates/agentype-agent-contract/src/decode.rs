@@ -17,7 +17,9 @@
 use crate::canonical::CANONICAL_FORMAT_VERSION;
 use crate::capability::{
     Assurance, CapabilityClaim, CapabilityDefinition, CapabilityPolarity, CapabilityRef,
-    CapabilityValue, MatcherKind, Quantity, SecurityClass,
+    CapabilityValue, FileOperationClass, MatcherKind, NetworkEndpoint, NetworkTransport,
+    PolicyAccessDimension, PolicyOperation, PolicyProjection, Quantity, SecurityClass,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V1, CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
 };
 use crate::error::ContractError;
 use crate::provisioning::{BindingSnapshot, MaterializationDigest, ProvisioningBinding};
@@ -484,19 +486,115 @@ pub fn capability_definition_from_canonical_json(
 ) -> Result<(CapabilityRef, CapabilityDefinition), ContractError> {
     let value = parse_document(json, "CAPABILITY_DEFINITION")?;
     let object = object(&value, "capability definition")?;
+    let version = match object.get("capability_canonical_version") {
+        None => CAPABILITY_DEFINITION_CANONICAL_VERSION_V1,
+        Some(value) => {
+            let raw = u64_of(value, "capability_canonical_version")?;
+            u32::try_from(raw).map_err(|_| err("capability_canonical_version is out of range"))?
+        }
+    };
     let reference = CapabilityRef::new(
         string_of(field(object, "capability_id")?, "capability_id")?,
         u64_of(field(object, "revision")?, "revision")?,
     )?;
-    let definition = CapabilityDefinition {
-        matcher_kind: matcher_kind(&string_of(field(object, "matcher_kind")?, "matcher_kind")?)?,
-        security_class: security_class(&string_of(
-            field(object, "security_class")?,
-            "security_class",
-        )?)?,
-        polarity: capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?,
+    let matcher_kind = matcher_kind(&string_of(field(object, "matcher_kind")?, "matcher_kind")?)?;
+    let security_class = security_class(&string_of(
+        field(object, "security_class")?,
+        "security_class",
+    )?)?;
+    let polarity = capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?;
+    let policy_projection = match version {
+        CAPABILITY_DEFINITION_CANONICAL_VERSION_V1 => {
+            // Unknown extra fields are ignored by the canonical decoders, so
+            // without this check a v1 document could smuggle a projection that
+            // the frozen encoder never emits. One identity MUST NOT carry two
+            // authorities.
+            if object.contains_key("policy_projection") {
+                return Err(ContractError::InvalidPolicyProjection {
+                    reason: "capability canonical v1 defines no policy projection".into(),
+                });
+            }
+            None
+        }
+        CAPABILITY_DEFINITION_CANONICAL_VERSION_V2 => {
+            Some(policy_projection_from(field(object, "policy_projection")?)?)
+        }
+        other => {
+            return Err(err(format!(
+                "unsupported capability canonical version {other}"
+            )))
+        }
     };
+    let definition = CapabilityDefinition {
+        matcher_kind,
+        security_class,
+        polarity,
+        policy_projection,
+    };
+    definition.validate_projection()?;
     Ok((reference, definition))
+}
+
+fn policy_projection_from(value: &Value) -> Result<PolicyProjection, ContractError> {
+    let document = object(value, "policy_projection")?;
+    let dimension_name = string_of(field(document, "dimension")?, "policy projection dimension")?;
+    let dimension = PolicyAccessDimension::parse(&dimension_name).ok_or_else(|| {
+        ContractError::InvalidPolicyProjection {
+            reason: format!("unknown policy access dimension {dimension_name}"),
+        }
+    })?;
+    let members = object(
+        field(document, "member_map")?,
+        "policy projection member_map",
+    )?;
+    let mut member_map = BTreeMap::new();
+    for (member, operation) in members {
+        member_map.insert(member.clone(), policy_operation_from(operation)?);
+    }
+    PolicyProjection::new(dimension, member_map)
+}
+
+fn policy_operation_from(value: &Value) -> Result<PolicyOperation, ContractError> {
+    let invalid = |reason: String| ContractError::InvalidPolicyProjection { reason };
+    let document = object(value, "policy operation")?;
+    let kind = string_of(field(document, "kind")?, "policy operation kind")?;
+    match kind.as_str() {
+        "FILE_OPERATION" => {
+            let class = string_of(field(document, "class")?, "policy file operation class")?;
+            let class = FileOperationClass::parse(&class)
+                .ok_or_else(|| invalid(format!("unknown file operation class {class}")))?;
+            Ok(PolicyOperation::FileOperation(class))
+        }
+        "TOOL_COMMAND" => Ok(PolicyOperation::ToolCommand(string_of(
+            field(document, "command")?,
+            "policy tool command",
+        )?)),
+        "NETWORK_ENDPOINT" => {
+            let transport_name =
+                string_of(field(document, "transport")?, "policy network transport")?;
+            let transport = NetworkTransport::parse(&transport_name)
+                .ok_or_else(|| invalid(format!("unknown network transport {transport_name}")))?;
+            let host = string_of(field(document, "host")?, "policy network host")?;
+            let port = match field(document, "port")? {
+                Value::Null => None,
+                other => {
+                    let raw = u64_of(other, "policy network port")?;
+                    Some(
+                        u16::try_from(raw)
+                            .map_err(|_| invalid("policy network port is out of range".into()))?,
+                    )
+                }
+            };
+            Ok(PolicyOperation::NetworkEndpoint(NetworkEndpoint::new(
+                transport, host, port,
+            )?))
+        }
+        "ENVIRONMENT_NAME" => Ok(PolicyOperation::EnvironmentName(string_of(
+            field(document, "name")?,
+            "policy environment name",
+        )?)),
+        other => Err(invalid(format!("unknown policy operation kind {other}"))),
+    }
 }
 
 fn string_set_from(value: &Value, what: &str) -> Result<BTreeSet<String>, ContractError> {

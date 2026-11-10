@@ -318,6 +318,7 @@ fn golden_digest_vectors_are_stable() {
         matcher_kind: MatcherKind::Set,
         security_class: SecurityClass::Sandbox,
         polarity: CapabilityPolarity::Restriction,
+        policy_projection: None,
     };
     let mut agent = AgentType {
         type_ref: AgentTypeRef::new("general-reviewer", 1).unwrap(),
@@ -613,4 +614,102 @@ fn b4_binding_snapshot_canonical_round_trips() {
     assert_eq!(decoded, snapshot);
     assert_eq!(canonical_binding_snapshot_bytes(&decoded), bytes);
     assert!(binding_snapshot_content_digest(&snapshot).starts_with("sha256:"));
+}
+
+#[test]
+fn capability_policy_projection_uses_local_canonical_v2() {
+    let cases = [
+        (
+            PolicyAccessDimension::FileOperationClass,
+            "read",
+            PolicyOperation::FileOperation(FileOperationClass::Read),
+        ),
+        (
+            PolicyAccessDimension::ToolCommandSet,
+            "git",
+            PolicyOperation::ToolCommand("git".into()),
+        ),
+        (
+            PolicyAccessDimension::NetworkEndpoint,
+            "registry",
+            PolicyOperation::NetworkEndpoint(
+                NetworkEndpoint::new(NetworkTransport::Tcp, "registry.example.com", Some(443))
+                    .unwrap(),
+            ),
+        ),
+        (
+            PolicyAccessDimension::EnvironmentName,
+            "proxy",
+            PolicyOperation::EnvironmentName("HTTP_PROXY".into()),
+        ),
+    ];
+    for (dimension, member, operation) in cases {
+        let reference = cref("sandbox.dimension", 2);
+        let members = [(member.to_string(), operation)].into_iter().collect();
+        let definition = CapabilityDefinition {
+            matcher_kind: MatcherKind::Set,
+            security_class: SecurityClass::Sandbox,
+            polarity: CapabilityPolarity::Ability,
+            policy_projection: Some(PolicyProjection::new(dimension, members).unwrap()),
+        };
+        assert_eq!(definition.canonical_version(), 2);
+        let bytes = canonical_capability_definition_bytes(&reference, &definition);
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        assert!(json.contains("\"capability_canonical_version\":2"));
+        let (decoded_reference, decoded) =
+            capability_definition_from_canonical_json(&json).unwrap();
+        assert_eq!(decoded_reference, reference);
+        assert_eq!(decoded, definition);
+        assert_eq!(
+            canonical_capability_definition_bytes(&decoded_reference, &decoded),
+            bytes
+        );
+    }
+
+    // A definition without a projection keeps the frozen v1 document, and a v1
+    // document MUST NOT smuggle a projection past the decoder.
+    let reference = cref("sandbox.commands", 1);
+    let unprojected = CapabilityDefinition {
+        matcher_kind: MatcherKind::Set,
+        security_class: SecurityClass::Sandbox,
+        polarity: CapabilityPolarity::Ability,
+        policy_projection: None,
+    };
+    let v1 = canonical_capability_definition_bytes(&reference, &unprojected);
+    assert_eq!(
+        v1,
+        canonical_capability_definition_bytes_v1(&reference, &unprojected)
+    );
+    assert!(!String::from_utf8(v1)
+        .unwrap()
+        .contains("capability_canonical_version"));
+
+    let projected = CapabilityDefinition {
+        policy_projection: Some(
+            PolicyProjection::new(
+                PolicyAccessDimension::ToolCommandSet,
+                [(
+                    "git".to_string(),
+                    PolicyOperation::ToolCommand("git".into()),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+        ),
+        ..unprojected.clone()
+    };
+    let mut smuggled: serde_json::Value = serde_json::from_str(
+        &String::from_utf8(canonical_capability_definition_bytes_v2(
+            &reference, &projected,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    smuggled["capability_canonical_version"] = serde_json::json!(1);
+    assert!(capability_definition_from_canonical_json(&smuggled.to_string()).is_err());
+    assert_ne!(
+        capability_definition_content_digest(&reference, &projected),
+        capability_definition_content_digest(&reference, &unprojected)
+    );
 }

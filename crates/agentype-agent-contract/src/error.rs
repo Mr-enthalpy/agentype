@@ -28,6 +28,9 @@ pub enum ContractError {
     InvalidRef { reason: String },
     /// A capability revision was redefined with different semantics.
     CapabilityDefinitionConflict { capability: String, revision: u64 },
+    /// A capability policy projection is not one of the explicitly permitted
+    /// shapes (ADR-0013 §2). At the durable boundary this is catalog corruption.
+    InvalidPolicyProjection { reason: String },
     /// A Task's hard requirement conflicts with a value that must agree (e.g. a
     /// Generation policy that the Task would have to widen).
     RequirementConflict { reason: String },
@@ -68,6 +71,9 @@ impl fmt::Display for ContractError {
                 f,
                 "capability {capability}@{revision} redefined with different semantics"
             ),
+            Self::InvalidPolicyProjection { reason } => {
+                write!(f, "invalid capability policy projection: {reason}")
+            }
             Self::RequirementConflict { reason } => {
                 write!(f, "task requirement conflict: {reason}")
             }

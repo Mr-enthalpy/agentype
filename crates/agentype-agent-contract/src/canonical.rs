@@ -19,7 +19,8 @@
 
 use crate::capability::{
     Assurance, CapabilityCatalog, CapabilityClaim, CapabilityDefinition, CapabilityPolarity,
-    CapabilityRef, CapabilityValue, MatcherKind, SecurityClass,
+    CapabilityRef, CapabilityValue, MatcherKind, PolicyOperation, PolicyProjection, SecurityClass,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
 };
 use crate::error::ContractError;
 use crate::predicates::{validate_source_config, validate_spawn_source};
@@ -518,7 +519,26 @@ pub fn canonical_adapter_binding_policy_bytes(policy: &AdapterBindingPolicy) -> 
     }))
 }
 
+/// Canonical bytes of a capability definition under its local canonical version.
+///
+/// Capability definitions carry their own canonical version so the frozen v1
+/// document is never reinterpreted: a definition without a policy projection
+/// keeps the exact v1 bytes and digest, while a projecting definition uses v2.
+/// The durable boundary MUST additionally compare the row's recorded
+/// `canonical_version` with [`CapabilityDefinition::canonical_version`].
 pub fn canonical_capability_definition_bytes(
+    reference: &CapabilityRef,
+    definition: &CapabilityDefinition,
+) -> Vec<u8> {
+    if definition.canonical_version() == CAPABILITY_DEFINITION_CANONICAL_VERSION_V2 {
+        canonical_capability_definition_bytes_v2(reference, definition)
+    } else {
+        canonical_capability_definition_bytes_v1(reference, definition)
+    }
+}
+
+/// Frozen capability canonical v1 bytes: no projection field is ever emitted.
+pub fn canonical_capability_definition_bytes_v1(
     reference: &CapabilityRef,
     definition: &CapabilityDefinition,
 ) -> Vec<u8> {
@@ -531,6 +551,65 @@ pub fn canonical_capability_definition_bytes(
         "security_class": class_str(definition.security_class),
         "polarity": polarity_str(definition.polarity),
     }))
+}
+
+/// Capability canonical v2 bytes: the projection-bearing encoding.
+///
+/// The document always states `capability_canonical_version` and always carries
+/// a non-null projection; a v2 document without one is rejected by the decoder
+/// so exactly one encoding exists per logical definition.
+pub fn canonical_capability_definition_bytes_v2(
+    reference: &CapabilityRef,
+    definition: &CapabilityDefinition,
+) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "CAPABILITY_DEFINITION",
+        "capability_canonical_version": CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
+        "capability_id": reference.capability_id().as_str(),
+        "revision": reference.revision(),
+        "matcher_kind": matcher_str(definition.matcher_kind),
+        "security_class": class_str(definition.security_class),
+        "polarity": polarity_str(definition.polarity),
+        "policy_projection": definition
+            .policy_projection
+            .as_ref()
+            .map(policy_projection_value),
+    }))
+}
+
+fn policy_projection_value(projection: &PolicyProjection) -> Value {
+    json!({
+        "dimension": projection.dimension().as_str(),
+        "member_map": projection
+            .member_map()
+            .iter()
+            .map(|(member, operation)| (member.clone(), policy_operation_value(operation)))
+            .collect::<BTreeMap<String, Value>>(),
+    })
+}
+
+fn policy_operation_value(operation: &PolicyOperation) -> Value {
+    match operation {
+        PolicyOperation::FileOperation(class) => json!({
+            "kind": "FILE_OPERATION",
+            "class": class.as_str(),
+        }),
+        PolicyOperation::ToolCommand(command) => json!({
+            "kind": "TOOL_COMMAND",
+            "command": command,
+        }),
+        PolicyOperation::NetworkEndpoint(endpoint) => json!({
+            "kind": "NETWORK_ENDPOINT",
+            "transport": endpoint.transport().as_str(),
+            "host": endpoint.host(),
+            "port": endpoint.port(),
+        }),
+        PolicyOperation::EnvironmentName(name) => json!({
+            "kind": "ENVIRONMENT_NAME",
+            "name": name,
+        }),
+    }
 }
 
 /// Canonical bytes of a Task agent requirement (M6-B.3). The record MUST be

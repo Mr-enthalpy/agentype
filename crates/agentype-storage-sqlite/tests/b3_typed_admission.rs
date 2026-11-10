@@ -358,6 +358,7 @@ fn capability_definitions_are_reusable_for_requirement_shape_checks() {
                 matcher_kind: MatcherKind::Set,
                 security_class: SecurityClass::Functional,
                 polarity: CapabilityPolarity::Ability,
+                policy_projection: None,
             },
         )
         .unwrap();
@@ -1530,6 +1531,7 @@ fn malformed_requirement_capability_is_a_command_rejection() {
                 matcher_kind: MatcherKind::Bool,
                 security_class: SecurityClass::Sandbox,
                 polarity: CapabilityPolarity::Restriction,
+                policy_projection: None,
             },
         )
         .unwrap();
