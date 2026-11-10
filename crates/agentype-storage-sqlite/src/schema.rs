@@ -20,7 +20,8 @@
 /// `agent_type_security_declarations` / `spawn_source_security_declarations`
 /// mode declarations, `capability_definitions.canonical_version`, and the
 /// `security_contract_mode` owner on `task_agent_requirements` and
-/// `generation_policies`. Older files are rejected at open (fail closed);
+/// `generation_policies`, plus the write-once `task_security_bindings` child for
+/// a `SECURITY_V1` Task. Older files are rejected at open (fail closed);
 /// D-DB-MIGRATE is still unresolved, so there is deliberately no in-place
 /// upgrade.
 pub const SCHEMA_VERSION: i64 = 9;
@@ -1199,5 +1200,58 @@ WHEN EXISTS(SELECT 1 FROM spawn_source_security_declarations
             WHERE source_id=NEW.source_id AND revision=NEW.revision)
 BEGIN
     SELECT RAISE(ABORT, 'a SpawnSource security declaration is write-once');
+END;
+
+-- ============================================================================
+-- M6-B.5 TaskSecurityBinding (schema v9)
+--
+-- One row per SECURITY_V1 Task, created inside the typed-admission transaction.
+-- Its existence is a conditional biconditional keyed by the parent
+-- task_agent_requirements.security_contract_mode; the binding carries no
+-- independent mode. A COARSE_V1 Task therefore has no row at all.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS task_security_bindings (
+    task_id TEXT PRIMARY KEY
+        REFERENCES task_agent_requirements(task_id) ON DELETE RESTRICT,
+    policy_json TEXT NOT NULL,
+    policy_digest TEXT NOT NULL CHECK (length(trim(policy_digest)) > 0),
+    derivation_json TEXT NOT NULL,
+    derivation_digest TEXT NOT NULL CHECK (length(trim(derivation_digest)) > 0),
+    normalization_version INTEGER NOT NULL CHECK (normalization_version >= 1),
+    meet_algorithm_version INTEGER NOT NULL CHECK (meet_algorithm_version >= 1),
+    required_access_digest TEXT NOT NULL CHECK (length(trim(required_access_digest)) > 0),
+    pending_obligations_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS task_security_bindings_immutable_update
+BEFORE UPDATE ON task_security_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a task security binding is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_security_bindings_immutable_delete
+BEFORE DELETE ON task_security_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'a task security binding is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_security_bindings_no_reinsert
+BEFORE INSERT ON task_security_bindings
+WHEN EXISTS(SELECT 1 FROM task_security_bindings WHERE task_id=NEW.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a task security binding is write-once');
+END;
+
+-- A binding may only exist under a SECURITY_V1 requirement. The reverse
+-- direction (a SECURITY_V1 requirement without its binding) is enforced by the
+-- authoritative read, because both rows are written by the same transaction.
+CREATE TRIGGER IF NOT EXISTS task_security_bindings_require_security_parent
+BEFORE INSERT ON task_security_bindings
+WHEN (SELECT security_contract_mode FROM task_agent_requirements
+      WHERE task_id=NEW.task_id) IS NOT 'SECURITY_V1'
+BEGIN
+    SELECT RAISE(ABORT, 'a task security binding requires a SECURITY_V1 requirement');
 END;
 "#;

@@ -34,8 +34,9 @@ use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
 use crate::sandbox::{
     CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy,
     FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector,
-    PathSet, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit, SandboxPolicyParts,
-    ToolPolicy, WorkingDirectory, SANDBOX_POLICY_SCHEMA_VERSION,
+    PathSet, PolicyInput, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
+    SandboxPolicyParts, SecurityDerivation, ToolPolicy, WorkingDirectory,
+    SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{
     ExecutionId, IncarnationId, InformationFunction, LogicalAgentId, WorkspaceMode,
@@ -916,6 +917,58 @@ pub fn sandbox_policy_from_canonical_json(
             .as_bool()
             .ok_or_else(|| err("attempt_isolation must be boolean"))?,
     })
+}
+
+fn policy_input_from(value: &Value) -> Result<PolicyInput, ContractError> {
+    let input = object(value, "policy input")?;
+    let reference = match field(input, "reference")? {
+        Value::Null => None,
+        other => {
+            let reference = object(other, "policy input reference")?;
+            Some(SandboxPolicyRef::new(
+                string_of(field(reference, "sandbox_policy_id")?, "sandbox_policy_id")?,
+                u64_of(field(reference, "revision")?, "policy input revision")?,
+            )?)
+        }
+    };
+    Ok(PolicyInput::from_parts(
+        reference,
+        string_of(field(input, "policy_digest")?, "policy input digest")?,
+    ))
+}
+
+/// Decode a security derivation document. The caller MUST also verify the
+/// stored digest, canonical byte equality, and that the versions are supported.
+pub fn security_derivation_from_canonical_json(
+    json: &str,
+) -> Result<SecurityDerivation, ContractError> {
+    let value = parse_document(json, "SECURITY_DERIVATION")?;
+    let document = object(&value, "security derivation")?;
+    let derivation = object(field(document, "derivation")?, "security derivation body")?;
+    let mut inputs = Vec::new();
+    for input in array(field(derivation, "inputs")?, "security derivation inputs")? {
+        inputs.push(policy_input_from(input)?);
+    }
+    let normalization_version = u32::try_from(u64_of(
+        field(derivation, "normalization_version")?,
+        "normalization_version",
+    )?)
+    .map_err(|_| err("normalization_version is out of range"))?;
+    let meet_algorithm_version = u32::try_from(u64_of(
+        field(derivation, "meet_algorithm_version")?,
+        "meet_algorithm_version",
+    )?)
+    .map_err(|_| err("meet_algorithm_version is out of range"))?;
+    Ok(SecurityDerivation::from_parts(
+        inputs,
+        normalization_version,
+        meet_algorithm_version,
+        string_of(field(derivation, "output_digest")?, "output_digest")?,
+        string_of(
+            field(derivation, "required_access_digest")?,
+            "required_access_digest",
+        )?,
+    ))
 }
 
 fn physical_safety_from(value: &Value) -> Result<PhysicalSafety, ContractError> {

@@ -2094,6 +2094,24 @@ impl SecurityDerivation {
         &self.required_access_digest
     }
 
+    /// Reject a derivation recorded under normalization or meet versions this
+    /// build does not implement.
+    ///
+    /// The two versions are checked separately (ADR-0013 §4): a row is never
+    /// reinterpreted by a newer normalizer or a newer meet.
+    pub fn ensure_supported(&self) -> Result<(), ContractError> {
+        if self.normalization_version == SANDBOX_POLICY_NORMALIZATION_VERSION
+            && self.meet_algorithm_version == SANDBOX_POLICY_MEET_ALGORITHM_VERSION
+        {
+            Ok(())
+        } else {
+            Err(ContractError::UnsupportedPolicyDerivationVersion {
+                normalization_version: self.normalization_version,
+                meet_algorithm_version: self.meet_algorithm_version,
+            })
+        }
+    }
+
     pub(crate) fn to_value(&self) -> Value {
         json!({
             "inputs": self
@@ -2112,5 +2130,87 @@ impl SecurityDerivation {
             "output_digest": self.output_digest,
             "required_access_digest": self.required_access_digest,
         })
+    }
+}
+
+// =============================================================================
+// Task security binding
+// =============================================================================
+
+/// A positive `R_min` component admission deliberately deferred to candidate
+/// matching (ADR-0013 §5).
+///
+/// Recording a component as pending is not a satisfaction claim. Only
+/// `Unsatisfied` rejects admission, and a pending component MUST be discharged
+/// before Execution commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PendingObligation {
+    RequiredCapabilities,
+    AttemptIsolation,
+    PlacementConstraints,
+}
+
+impl PendingObligation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RequiredCapabilities => "REQUIRED_CAPABILITIES",
+            Self::AttemptIsolation => "ATTEMPT_ISOLATION",
+            Self::PlacementConstraints => "PLACEMENT_CONSTRAINTS",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "REQUIRED_CAPABILITIES" => Some(Self::RequiredCapabilities),
+            "ATTEMPT_ISOLATION" => Some(Self::AttemptIsolation),
+            "PLACEMENT_CONSTRAINTS" => Some(Self::PlacementConstraints),
+            _ => None,
+        }
+    }
+}
+
+/// The immutable `TaskSecurityBinding` of one `SECURITY_V1` Task (ADR-0013 §4,
+/// §11).
+///
+/// It binds the admitted `P_generation ∩ P_task` bytes to their derivation
+/// identity and to the deferred `R_min` components. It is never a second
+/// authored policy and carries no independent mode: the parent
+/// `task_agent_requirements.security_contract_mode` remains the sole owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSecurityBinding {
+    policy: NormalizedSandboxPolicy,
+    derivation: SecurityDerivation,
+    pending_obligations: BTreeSet<PendingObligation>,
+}
+
+impl TaskSecurityBinding {
+    pub fn new(
+        policy: NormalizedSandboxPolicy,
+        derivation: SecurityDerivation,
+        pending_obligations: impl IntoIterator<Item = PendingObligation>,
+    ) -> Result<Self, ContractError> {
+        if derivation.output_digest() != crate::canonical::sandbox_policy_content_digest(&policy) {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: "task security binding derivation does not describe its admitted policy"
+                    .into(),
+            });
+        }
+        Ok(Self {
+            policy,
+            derivation,
+            pending_obligations: pending_obligations.into_iter().collect(),
+        })
+    }
+
+    pub fn policy(&self) -> &NormalizedSandboxPolicy {
+        &self.policy
+    }
+
+    pub fn derivation(&self) -> &SecurityDerivation {
+        &self.derivation
+    }
+
+    pub fn pending_obligations(&self) -> &BTreeSet<PendingObligation> {
+        &self.pending_obligations
     }
 }

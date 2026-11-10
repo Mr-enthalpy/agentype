@@ -41,6 +41,13 @@ pub enum ContractError {
         canonical_version: u32,
         algebra_version: u32,
     },
+    /// A durable security derivation records a normalization or meet version
+    /// this build does not implement. It MUST NOT be reinterpreted under the
+    /// current algorithms.
+    UnsupportedPolicyDerivationVersion {
+        normalization_version: u32,
+        meet_algorithm_version: u32,
+    },
     /// A Task's hard requirement conflicts with a value that must agree (e.g. a
     /// Generation policy that the Task would have to widen).
     RequirementConflict { reason: String },
@@ -93,6 +100,13 @@ impl fmt::Display for ContractError {
             } => write!(
                 f,
                 "unsupported sandbox policy version ({canonical_version}, {algebra_version})"
+            ),
+            Self::UnsupportedPolicyDerivationVersion {
+                normalization_version,
+                meet_algorithm_version,
+            } => write!(
+                f,
+                "unsupported security derivation version (normalization {normalization_version}, meet {meet_algorithm_version})"
             ),
             Self::RequirementConflict { reason } => {
                 write!(f, "task requirement conflict: {reason}")

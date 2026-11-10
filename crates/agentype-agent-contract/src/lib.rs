@@ -59,8 +59,9 @@ pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,
     binding_snapshot_from_canonical_json, capability_definition_from_canonical_json,
     generation_policy_from_canonical_json, provisioning_binding_from_canonical_json,
-    sandbox_policy_from_canonical_json, source_config_revision_from_canonical_json,
-    spawn_source_from_canonical_json, task_agent_requirement_from_canonical_json,
+    sandbox_policy_from_canonical_json, security_derivation_from_canonical_json,
+    source_config_revision_from_canonical_json, spawn_source_from_canonical_json,
+    task_agent_requirement_from_canonical_json,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;
@@ -91,10 +92,11 @@ pub use sandbox::{
     validate_task_local_coarse_fine, AccessDeficit, CredentialAuthorizationId,
     CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef, EnvironmentPolicy, FilePolicy,
     NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector, PathSet,
-    PolicyAccess, PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling, ResourceLimitName,
-    ResourceScope, ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode,
-    SecurityDerivation, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
-    REQUIRED_ACCESS_SCHEMA_VERSION, SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
-    SANDBOX_POLICY_NORMALIZATION_VERSION, SANDBOX_POLICY_SCHEMA_VERSION,
+    PendingObligation, PolicyAccess, PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling,
+    ResourceLimitName, ResourceScope, ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion,
+    SecurityContractMode, SecurityDerivation, SpawnSourceSecurityDeclaration, TaskSecurityBinding,
+    ToolPolicy, WorkingDirectory, REQUIRED_ACCESS_SCHEMA_VERSION,
+    SANDBOX_POLICY_MEET_ALGORITHM_VERSION, SANDBOX_POLICY_NORMALIZATION_VERSION,
+    SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

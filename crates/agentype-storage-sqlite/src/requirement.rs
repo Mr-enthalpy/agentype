@@ -13,13 +13,19 @@
 use crate::catalog::{get_agent_type, load_capability_catalog, AgentTypeStatus};
 use crate::store::{map_sqlite, query_opt};
 use agentype_agent_contract::{
-    can_execute, canonical_generation_policy_bytes, canonical_task_agent_requirement_bytes,
-    canonicalize_generation_policy, canonicalize_task_agent_requirement, content_digest,
-    fold_generation_policy, generation_policy_content_digest,
-    generation_policy_from_canonical_json, match_existing_agents, resolve_selector,
-    task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
-    AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, ContinuityMode, ExistingAgentCandidate,
-    GenerationPolicy, TaskAgentRequirement, TaskPlacement,
+    can_execute, canonical_generation_policy_bytes, canonical_sandbox_policy_bytes,
+    canonical_security_derivation_bytes, canonical_task_agent_requirement_bytes,
+    canonicalize_generation_policy, canonicalize_task_agent_requirement, check_required_access,
+    content_digest, fold_generation_policy, generation_policy_content_digest,
+    generation_policy_from_canonical_json, match_existing_agents, meet, project_capability_access,
+    required_access_content_digest, resolve_selector, sandbox_policy_content_digest,
+    sandbox_policy_from_canonical_json, security_derivation_content_digest,
+    security_derivation_from_canonical_json, task_agent_requirement_content_digest,
+    task_agent_requirement_from_canonical_json, validate_task_local_coarse_fine,
+    AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode,
+    ExistingAgentCandidate, GenerationPolicy, PendingObligation, PolicyAccess, PolicyInput,
+    RequiredAccess, SecurityContractMode, SecurityDerivation, TaskAgentRequirement, TaskPlacement,
+    TaskSecurityBinding,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -53,6 +59,7 @@ fn contract_rejection(error: agentype_agent_contract::ContractError) -> Error {
         | C::InvalidPolicyProjection { .. }
         | C::InvalidSandboxPolicy { .. }
         | C::UnsupportedPolicyVersion { .. }
+        | C::UnsupportedPolicyDerivationVersion { .. }
         | C::InvariantViolation(_) => Error::invariant(error.to_string()),
     }
 }
@@ -71,6 +78,7 @@ pub fn insert_task_agent_requirement(
     now: UnixTime,
     task_id: &TaskId,
     requirement: &TaskAgentRequirement,
+    security_mode: SecurityContractMode,
 ) -> Result<String, Error> {
     let catalog = load_capability_catalog(tx)?;
     let mut canonical = requirement.clone();
@@ -99,19 +107,48 @@ pub fn insert_task_agent_requirement(
     tx.execute(
         "INSERT INTO task_agent_requirements(
              task_id, required_type_id, required_type_revision,
-             requirement_json, requirement_digest, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6)",
+             requirement_json, requirement_digest, security_contract_mode, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             task_id.as_str(),
             reference.id().as_str(),
             reference.revision() as i64,
             content_json,
             digest,
+            security_mode.as_str(),
             now
         ],
     )
     .map_err(map_sqlite)?;
     Ok(digest)
+}
+
+/// The durable `SecurityContractMode` owned by `task_agent_requirements`.
+///
+/// `COARSE_V1` is the frozen absence default for a typed requirement. The mode
+/// is never inferred from `sandbox_policy.is_some()`.
+pub fn task_security_mode(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<SecurityContractMode, Error> {
+    let stored = query_opt(
+        tx,
+        "SELECT security_contract_mode FROM task_agent_requirements WHERE task_id=?1",
+        params![task_id.as_str()],
+        |row| row.get::<_, String>(0),
+    )?
+    .ok_or_else(|| {
+        Error::invariant(format!(
+            "task {} is missing its agent requirement mode",
+            task_id.as_str()
+        ))
+    })?;
+    SecurityContractMode::parse(&stored).ok_or_else(|| {
+        Error::invariant(format!(
+            "task {} records unsupported security_contract_mode {stored:?}",
+            task_id.as_str()
+        ))
+    })
 }
 
 /// The single authoritative read of a Task's agent requirement.
@@ -199,7 +236,45 @@ pub fn get_task_agent_requirement(
         ));
     }
     verify_requirement_mirrors(tx, task_id, &requirement)?;
+    let mode = task_security_mode(tx, task_id)?;
+    verify_task_security_binding_presence(tx, task_id, mode)?;
     Ok(Some(requirement))
+}
+
+fn task_security_binding_exists(tx: &Transaction<'_>, task_id: &TaskId) -> Result<bool, Error> {
+    Ok(query_opt(
+        tx,
+        "SELECT 1 FROM task_security_bindings WHERE task_id=?1",
+        params![task_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )?
+    .is_some())
+}
+
+/// The conditional biconditional between the requirement's mode and the
+/// binding's existence (ADR-0013 §11).
+///
+/// A `SECURITY_V1` requirement without its binding, or a binding under a
+/// `COARSE_V1` requirement, is corruption and MUST NOT degrade to `COARSE_V1`.
+fn verify_task_security_binding_presence(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+    mode: SecurityContractMode,
+) -> Result<(), Error> {
+    let present = task_security_binding_exists(tx, task_id)?;
+    match (mode, present) {
+        (SecurityContractMode::SecurityV1, true) | (SecurityContractMode::CoarseV1, false) => {
+            Ok(())
+        }
+        (SecurityContractMode::SecurityV1, false) => Err(Error::invariant(format!(
+            "SECURITY_V1 task {} is missing its security binding",
+            task_id.as_str()
+        ))),
+        (SecurityContractMode::CoarseV1, true) => Err(Error::invariant(format!(
+            "COARSE_V1 task {} unexpectedly has a security binding",
+            task_id.as_str()
+        ))),
+    }
 }
 
 /// Cross-check the duplicated TaskSpec-owned dimensions against their
@@ -491,10 +566,38 @@ pub fn insert_generation_policy(
     now: UnixTime,
     generation_id: &agentype_core::GenerationId,
     policy: &GenerationPolicy,
+    security_mode: SecurityContractMode,
 ) -> Result<String, Error> {
     let catalog = load_capability_catalog(tx)?;
     let mut canonical = policy.clone();
     canonicalize_generation_policy(&mut canonical, &catalog).map_err(contract_rejection)?;
+
+    if security_mode == SecurityContractMode::SecurityV1 {
+        // A SECURITY_V1 Generation MUST carry an authored policy: an absent
+        // policy would leave `project_gen` undefined (ADR-0013 §3). The
+        // Generation's coarse ceiling must also agree with the authored policy
+        // it projects.
+        let reference = canonical.sandbox_policy.as_ref().ok_or_else(|| {
+            Error::invalid_authority("a SECURITY_V1 generation policy must author a sandbox policy")
+        })?;
+        let authored = crate::catalog::get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+            Error::not_found(format!(
+                "sandbox policy {}@{} does not exist",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        })?;
+        validate_task_local_coarse_fine(
+            canonical.max_workspace,
+            canonical.max_network,
+            Some(&authored),
+        )
+        .map_err(|error| {
+            Error::invalid_authority(format!(
+                "SECURITY_V1 generation ceiling contradicts its authored policy: {error}"
+            ))
+        })?;
+    }
 
     let exists: bool = query_opt(
         tx,
@@ -515,9 +618,16 @@ pub fn insert_generation_policy(
         "generation policy",
     )?;
     tx.execute(
-        "INSERT INTO generation_policies(generation_id, policy_json, policy_digest, created_at)
-         VALUES(?1,?2,?3,?4)",
-        params![generation_id.as_str(), content_json, digest, now],
+        "INSERT INTO generation_policies(
+             generation_id, policy_json, policy_digest, security_contract_mode, created_at)
+         VALUES(?1,?2,?3,?4,?5)",
+        params![
+            generation_id.as_str(),
+            content_json,
+            digest,
+            security_mode.as_str(),
+            now
+        ],
     )
     .map_err(map_sqlite)?;
     Ok(digest)
@@ -580,6 +690,49 @@ pub fn get_generation_policy(
         ));
     }
     Ok(Some(policy))
+}
+
+/// The `SecurityContractMode` of an exact Generation.
+///
+/// A `NONE` Generation is the derived `COARSE_V1`; its mode is never stored as a
+/// second marker and B5 MUST NOT backfill a policy row for it. A `POLICY`
+/// Generation's mode is owned by its immutable policy row.
+pub fn generation_security_mode(
+    tx: &Transaction<'_>,
+    generation_id: &agentype_core::GenerationId,
+) -> Result<SecurityContractMode, Error> {
+    // The validated policy read is the single presence authority: a `POLICY`
+    // marker with a missing or corrupt row must fail closed rather than be
+    // treated as an unconstrained Generation.
+    get_generation_policy(tx, generation_id)?;
+    let mode = generation_policy_mode(tx, generation_id)?;
+    match mode.as_str() {
+        "NONE" => Ok(SecurityContractMode::CoarseV1),
+        "POLICY" => {
+            let stored = query_opt(
+                tx,
+                "SELECT security_contract_mode FROM generation_policies WHERE generation_id=?1",
+                params![generation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )?
+            .ok_or_else(|| {
+                Error::invariant(format!(
+                    "policy-bearing generation {} is missing its policy row",
+                    generation_id.as_str()
+                ))
+            })?;
+            SecurityContractMode::parse(&stored).ok_or_else(|| {
+                Error::invariant(format!(
+                    "generation {} records unsupported security_contract_mode {stored:?}",
+                    generation_id.as_str()
+                ))
+            })
+        }
+        other => Err(Error::invariant(format!(
+            "unknown policy_mode {other} for generation {}",
+            generation_id.as_str()
+        ))),
+    }
 }
 
 // =============================================================================
@@ -854,5 +1007,355 @@ pub fn match_existing_agents_for_task(
 
     let catalog = load_capability_catalog(tx)?;
     match_existing_agents(&required, &requirement, &placement, &candidates, &catalog)
+        .map_err(contract_fault)
+}
+
+// =============================================================================
+// TaskSecurityBinding (M6-B.5, schema v9)
+// =============================================================================
+
+/// Recompute the positive access floor a Task requirement imposes.
+///
+/// The floor is derived only from the durable requirement through the validated
+/// capability catalog, so the binding read can recompute it instead of trusting
+/// the stored digest. B5.1 has no path-level obligation (ADR-0013 §2).
+fn required_access_for(
+    requirement: &TaskAgentRequirement,
+    catalog: &CapabilityCatalog,
+) -> Result<RequiredAccess, Error> {
+    let mut operations = BTreeSet::new();
+    for (reference, value) in &requirement.hard.required_capabilities {
+        let definition = catalog.get(reference).ok_or_else(|| {
+            Error::invariant(format!(
+                "required capability {} is missing from the capability catalog",
+                reference.capability_id().as_str()
+            ))
+        })?;
+        operations.extend(project_capability_access(definition, value).map_err(contract_fault)?);
+    }
+    RequiredAccess::from_operations(operations).map_err(contract_fault)
+}
+
+/// The `R_min` components admission deliberately defers to candidate matching
+/// (ADR-0013 §5).
+///
+/// The set is a pure function of the durable requirement so a read can recompute
+/// it and reject a self-consistent but wrong stored obligation set.
+fn pending_obligations_for(requirement: &TaskAgentRequirement) -> Vec<PendingObligation> {
+    let mut pending = Vec::new();
+    if !requirement.hard.required_capabilities.is_empty() {
+        pending.push(PendingObligation::RequiredCapabilities);
+    }
+    if requirement.hard.required_attempt_isolation {
+        pending.push(PendingObligation::AttemptIsolation);
+    }
+    let placement = !requirement.hard.required_affinity.is_empty()
+        || requirement.hard.required_continuity != ContinuityMode::None
+        || requirement.hard.required_anchor.is_some();
+    if placement {
+        pending.push(PendingObligation::PlacementConstraints);
+    }
+    pending
+}
+
+fn pending_obligations_json(pending: &BTreeSet<PendingObligation>) -> String {
+    let encoded: Vec<&str> = pending.iter().map(|item| item.as_str()).collect();
+    serde_json::to_string(&encoded).expect("a string array always serializes")
+}
+
+fn pending_obligations_from_json(json: &str) -> Result<BTreeSet<PendingObligation>, Error> {
+    let stored: Vec<String> = serde_json::from_str(json)
+        .map_err(|error| Error::invariant(format!("task security binding obligations: {error}")))?;
+    let mut pending = BTreeSet::new();
+    for item in stored {
+        let obligation = PendingObligation::parse(&item).ok_or_else(|| {
+            Error::invariant(format!(
+                "task security binding records unknown obligation {item:?}"
+            ))
+        })?;
+        pending.insert(obligation);
+    }
+    // The stored encoding MUST be the canonical one: a duplicate, reordered or
+    // non-canonical spelling is corruption even if it decodes to the same set.
+    if pending_obligations_json(&pending) != json {
+        return Err(Error::invariant(
+            "task security binding obligations are not the canonical encoding",
+        ));
+    }
+    Ok(pending)
+}
+
+/// Derive the exact `TaskSecurityBinding` for a `SECURITY_V1` Task.
+///
+/// The effective policy is `meet(P_generation, P_task)` over the authored
+/// catalog revisions (ADR-0013 §3, §4). In B5.1 the frozen
+/// `fold_generation_policy` already requires a Task policy to equal the
+/// Generation's exact revision, so the meet is only applied when both authored
+/// inputs exist and are distinct. Admission then proves
+/// `RequiredAccess ⊆ ProjectAccess(P_eff)`; every deferred component is recorded
+/// as pending rather than assumed satisfied.
+pub fn prepare_task_security_binding(
+    tx: &Transaction<'_>,
+    generation_id: &GenerationId,
+    requirement: &TaskAgentRequirement,
+) -> Result<TaskSecurityBinding, Error> {
+    let generation_policy = get_generation_policy(tx, generation_id)?.ok_or_else(|| {
+        Error::invalid_authority(
+            "a SECURITY_V1 task requires its generation to carry a security policy",
+        )
+    })?;
+    let generation_reference = generation_policy.sandbox_policy.as_ref().ok_or_else(|| {
+        Error::invalid_authority("a SECURITY_V1 generation policy must author a sandbox policy")
+    })?;
+    let generation_policy = crate::catalog::get_sandbox_policy(tx, generation_reference)?
+        .ok_or_else(|| {
+            Error::invariant(format!(
+                "generation pins a missing sandbox policy {}@{}",
+                generation_reference.id().as_str(),
+                generation_reference.revision()
+            ))
+        })?;
+
+    let mut inputs = vec![PolicyInput::authored(
+        generation_reference.clone(),
+        &generation_policy,
+    )];
+    let effective = match requirement.hard.sandbox_policy.as_ref() {
+        None => generation_policy.clone(),
+        Some(reference) => {
+            let task_policy =
+                crate::catalog::get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+                    Error::invariant(format!(
+                        "task pins a missing sandbox policy {}@{}",
+                        reference.id().as_str(),
+                        reference.revision()
+                    ))
+                })?;
+            if reference != generation_reference {
+                inputs.push(PolicyInput::authored(reference.clone(), &task_policy));
+            }
+            meet(&generation_policy, &task_policy).map_err(|error| {
+                Error::invalid_authority(format!(
+                    "task sandbox policy conflicts with its generation policy: {error}"
+                ))
+            })?
+        }
+    };
+
+    let catalog = load_capability_catalog(tx)?;
+    let required_access = required_access_for(requirement, &catalog)?;
+    check_required_access(&required_access, &PolicyAccess::from_policy(&effective)).map_err(
+        |deficit| {
+            Error::invalid_authority(format!(
+                "SECURITY_V1 task required access is not satisfied by its admitted policy: {deficit}"
+            ))
+        },
+    )?;
+
+    let derivation =
+        SecurityDerivation::new(inputs, &effective, &required_access).map_err(contract_fault)?;
+    TaskSecurityBinding::new(effective, derivation, pending_obligations_for(requirement))
+        .map_err(contract_fault)
+}
+
+/// Persist the write-once security binding of a `SECURITY_V1` Task inside the
+/// same admission transaction that writes the Task and its requirement.
+pub fn insert_task_security_binding(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    task_id: &TaskId,
+    requirement: &TaskAgentRequirement,
+    binding: &TaskSecurityBinding,
+) -> Result<(), Error> {
+    let policy = binding.policy();
+    let derivation = binding.derivation();
+    derivation.ensure_supported().map_err(contract_fault)?;
+
+    let policy_json = canonical_utf8(
+        canonical_sandbox_policy_bytes(policy),
+        "task security binding policy",
+    )?;
+    let policy_digest = sandbox_policy_content_digest(policy);
+    if derivation.output_digest() != policy_digest {
+        return Err(Error::invariant(
+            "task security derivation does not describe its admitted policy",
+        ));
+    }
+    let derivation_json = canonical_utf8(
+        canonical_security_derivation_bytes(derivation),
+        "task security derivation",
+    )?;
+    let derivation_digest = security_derivation_content_digest(derivation);
+    let pending_json = pending_obligations_json(binding.pending_obligations());
+
+    // Recompute the floor from the durable requirement rather than trusting a
+    // caller-supplied digest, so the mirrored digest and the derivation identity
+    // can never disagree about what admission checked.
+    let catalog = load_capability_catalog(tx)?;
+    let required_access = required_access_for(requirement, &catalog)?;
+    let required_access_digest = required_access_content_digest(&required_access);
+    if required_access_digest != derivation.required_access_digest() {
+        return Err(Error::invariant(
+            "task security derivation required-access digest does not match the requirement",
+        ));
+    }
+
+    tx.execute(
+        "INSERT INTO task_security_bindings(
+             task_id, policy_json, policy_digest, derivation_json, derivation_digest,
+             normalization_version, meet_algorithm_version, required_access_digest,
+             pending_obligations_json, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            task_id.as_str(),
+            policy_json,
+            policy_digest,
+            derivation_json,
+            derivation_digest,
+            derivation.normalization_version() as i64,
+            derivation.meet_algorithm_version() as i64,
+            required_access_digest,
+            pending_json,
+            now
+        ],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
+/// The single authoritative read of a Task's security binding.
+///
+/// A `COARSE_V1` or legacy Task has none (its absence is already proven by
+/// `get_task_agent_requirement`). A `SECURITY_V1` binding is re-derived from the
+/// requirement, the Generation policy and the validated catalog, and the stored
+/// rows MUST be byte-identical to that derivation.
+pub fn get_task_security_binding(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<Option<TaskSecurityBinding>, Error> {
+    let Some(requirement) = get_task_agent_requirement(tx, task_id)? else {
+        return Ok(None);
+    };
+    if task_security_mode(tx, task_id)? == SecurityContractMode::CoarseV1 {
+        return Ok(None);
+    }
+
+    let generation_id: String = query_opt(
+        tx,
+        "SELECT generation_id FROM generation_task_bindings WHERE task_id=?1",
+        params![task_id.as_str()],
+        |row| row.get::<_, String>(0),
+    )?
+    .ok_or_else(|| Error::invariant("SECURITY_V1 task is missing its GenerationTaskBinding"))?;
+
+    let row = query_opt(
+        tx,
+        "SELECT policy_json, policy_digest, derivation_json, derivation_digest,
+                normalization_version, meet_algorithm_version, required_access_digest,
+                pending_obligations_json
+         FROM task_security_bindings WHERE task_id=?1",
+        params![task_id.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        },
+    )?
+    .ok_or_else(|| {
+        Error::invariant(format!(
+            "SECURITY_V1 task {} is missing its security binding",
+            task_id.as_str()
+        ))
+    })?;
+    let (
+        policy_json,
+        policy_digest,
+        derivation_json,
+        derivation_digest,
+        normalization_version,
+        meet_algorithm_version,
+        required_access_digest,
+        pending_json,
+    ) = row;
+
+    if content_digest(policy_json.as_bytes()) != policy_digest {
+        return Err(Error::invariant(
+            "task security binding policy digest does not match its stored bytes",
+        ));
+    }
+    if content_digest(derivation_json.as_bytes()) != derivation_digest {
+        return Err(Error::invariant(
+            "task security derivation digest does not match its stored bytes",
+        ));
+    }
+
+    let policy = sandbox_policy_from_canonical_json(&policy_json).map_err(contract_fault)?;
+    if canonical_utf8(
+        canonical_sandbox_policy_bytes(&policy),
+        "task security binding policy",
+    )? != policy_json
+    {
+        return Err(Error::invariant(
+            "task security binding policy is not the canonical encoding",
+        ));
+    }
+    let derivation =
+        security_derivation_from_canonical_json(&derivation_json).map_err(contract_fault)?;
+    derivation.ensure_supported().map_err(contract_fault)?;
+    if derivation.normalization_version() as i64 != normalization_version
+        || derivation.meet_algorithm_version() as i64 != meet_algorithm_version
+    {
+        return Err(Error::invariant(
+            "task security derivation version mirrors do not match its canonical document",
+        ));
+    }
+    if canonical_utf8(
+        canonical_security_derivation_bytes(&derivation),
+        "task security derivation",
+    )? != derivation_json
+    {
+        return Err(Error::invariant(
+            "task security derivation is not the canonical encoding",
+        ));
+    }
+    if derivation.required_access_digest() != required_access_digest {
+        return Err(Error::invariant(
+            "task security derivation required-access digest mirror does not match",
+        ));
+    }
+
+    let pending = pending_obligations_from_json(&pending_json)?;
+
+    // Re-derive the whole commitment from durable authority. A binding that is
+    // internally consistent but describes a policy/floor the requirement does
+    // not imply is corruption, not a valid past commitment.
+    let expected =
+        prepare_task_security_binding(tx, &GenerationId::from_string(generation_id), &requirement)?;
+    let expected_policy_json = canonical_utf8(
+        canonical_sandbox_policy_bytes(expected.policy()),
+        "task security binding policy",
+    )?;
+    let expected_derivation_json = canonical_utf8(
+        canonical_security_derivation_bytes(expected.derivation()),
+        "task security derivation",
+    )?;
+    if policy_json != expected_policy_json
+        || derivation_json != expected_derivation_json
+        || pending_json != pending_obligations_json(expected.pending_obligations())
+    {
+        return Err(Error::invariant(
+            "task security binding does not match its derived requirement",
+        ));
+    }
+
+    TaskSecurityBinding::new(policy, derivation, pending)
+        .map(Some)
         .map_err(contract_fault)
 }

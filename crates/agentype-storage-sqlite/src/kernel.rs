@@ -712,6 +712,31 @@ impl Kernel {
         })
     }
 
+    /// Typed admission under an explicit `SecurityContractMode` (M6-B.5).
+    ///
+    /// The mode is never inferred from the authored policy; `SECURITY_V1`
+    /// records a `TaskSecurityBinding`, `COARSE_V1` records none.
+    pub fn admit_typed_proposal_with_security_mode(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<agentype_core::TaskSpec>,
+        agent_requirement: agentype_agent_contract::AgentRequirementDraft,
+        security_mode: agentype_agent_contract::SecurityContractMode,
+    ) -> Result<agentype_core::TaskId, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::admit_typed_proposal_with_security_mode(
+                tx,
+                now,
+                proposal_id,
+                expected_generation_revision,
+                override_task_spec,
+                agent_requirement,
+                security_mode,
+            )
+        })
+    }
+
     /// Create a Generation with an immutable policy ceiling (M6-B.3 D-GEN-POLICY).
     pub fn create_generation_with_policy(
         &self,
@@ -720,6 +745,24 @@ impl Kernel {
     ) -> Result<agentype_core::GenerationRecord, Error> {
         self.tx(|tx, now| {
             crate::frontier::create_generation_with_policy(tx, now, seed_payload, policy)
+        })
+    }
+
+    /// Create a Generation under an explicit `SecurityContractMode` (M6-B.5).
+    pub fn create_generation_with_security_mode(
+        &self,
+        seed_payload: serde_json::Value,
+        policy: Option<agentype_agent_contract::GenerationPolicy>,
+        security_mode: agentype_agent_contract::SecurityContractMode,
+    ) -> Result<agentype_core::GenerationRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::create_generation_with_security_mode(
+                tx,
+                now,
+                seed_payload,
+                policy,
+                security_mode,
+            )
         })
     }
 
@@ -985,6 +1028,23 @@ impl Kernel {
         self.tx(|tx, _| crate::requirement::get_task_agent_requirement(tx, task_id))
     }
 
+    /// The authoritative `TaskSecurityBinding` of a `SECURITY_V1` Task, or `None`
+    /// for a `COARSE_V1`/legacy Task (M6-B.5).
+    pub fn get_task_security_binding(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Option<agentype_agent_contract::TaskSecurityBinding>, Error> {
+        self.tx(|tx, _| crate::requirement::get_task_security_binding(tx, task_id))
+    }
+
+    /// The `SecurityContractMode` owned by a typed Task's requirement.
+    pub fn get_task_security_mode(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<agentype_agent_contract::SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::requirement::task_security_mode(tx, task_id))
+    }
+
     pub fn get_logical_agent_type_binding(
         &self,
         agent_id: &agentype_core::LogicalAgentId,
@@ -997,6 +1057,14 @@ impl Kernel {
         generation_id: &agentype_core::GenerationId,
     ) -> Result<Option<agentype_agent_contract::GenerationPolicy>, Error> {
         self.tx(|tx, _| crate::requirement::get_generation_policy(tx, generation_id))
+    }
+
+    /// The `SecurityContractMode` owned by an exact Generation.
+    pub fn get_generation_security_mode(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+    ) -> Result<agentype_agent_contract::SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::requirement::generation_security_mode(tx, generation_id))
     }
 
     /// Rank existing, bound LogicalAgents for a Task's requirement (pure read).
