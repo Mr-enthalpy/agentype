@@ -135,15 +135,19 @@ In `SECURITY_V1`:
   cannot admit a `SECURITY_V1` Task. Cross-mode exclusion
   is symmetric in B.5 v1: a `COARSE_V1` AgentType cannot execute a `SECURITY_V1`
   Task, a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a
-  `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and a SpawnSource
-  revision carrying an authored `P_source` ceiling is reachable only through the
-  full `SECURITY_V1` path. In each case the coarse path cannot prove the authored
-  fine restrictions, so its coarse projection is not a substitute for the full
-  contract. Existing `COARSE_V1` objects keep their frozen contract. A
+  `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and every
+  `SECURITY_V1` SpawnSource revision is reachable only through the full
+  `SECURITY_V1` path, whether or not it carries an authored `P_source` ceiling. In
+  each case the coarse path cannot prove the authored fine restrictions or the
+  declared protocol mode, so its coarse projection is not a substitute for the
+  full contract. Existing `COARSE_V1` objects keep their frozen contract. A
   `SECURITY_V1` source revision with no authored fine ceiling has
   `P_source = Top`: it adds no restriction, but it still MUST pass complete
-  imported-enforcement coverage, the feature gate and credential qualification;
-  `Top` is never an eligibility bypass.
+  imported-enforcement coverage, the feature gate and credential qualification,
+  and it MUST NOT become coarse-selectable because it adds nothing; `Top` is never
+  an eligibility or path bypass. A revision can be reachable from both paths only
+  through an independent, explicitly authored and versioned mode-specific
+  contract; a "supports both modes" label is not one.
 - Credential authorization is positive and deny-by-default. The bound AgentType
   `SECURITY_V1` ceiling MUST explicitly grant the exact credential reference with
   its use, scope, audience, and delivery mode; an omitted secret-scope dimension
@@ -167,7 +171,15 @@ In `SECURITY_V1`:
   (for example conflicting required environment values or incompatible required
   working directories), not for "no permission in a dimension".
 - Every candidate needs imported `EnforcementSupport` for the whole composite
-  policy, not merely for its parts. Compilation is root-relative and bounded;
+  policy, not merely for its parts.
+  `RequiredEnforcementFeatures(NormalizedPolicy, EffectiveExecutionGuarantees) ->
+  FeatureObligations` emits an obligation only for an enforceable restriction or
+  positive guarantee; a `Top`/unrestricted value emits none for that dimension,
+  while a concrete ceiling, disabled capability or required guarantee emits one.
+  `FeatureObligations ⊆ EnforcementSupport(exact_binding)` is checked over the
+  composite plan. An absent obligation is not partial enforcement, and `Top` MUST
+  NOT bypass normalization, `meet`, compilation, receipt binding or the execution
+  protocol. Compilation is root-relative and bounded;
   whole-round defer is required when any relevant candidate is unqualified, and
   a failed winner MUST NOT fall back to a weaker candidate. Unsupported
   combinations exclude the candidate; protocol/corruption faults are control
@@ -198,8 +210,10 @@ In `SECURITY_V1`:
   ([ADR-0014](../../decisions/0014-m6b5-enforcement-compilation-receipt.md) §14).
   It is a minimum target to be empirically proven by B5.4/B5.5, not a claim about
   the current B.4 jail. Its supported set and explicit non-claims are normative: a
-  dimension outside the profile is ineligible, not partially enforced, and a
-  capability is claimed only when both supported platforms prove it. B5.4 must
+  required enforcement feature outside the profile is ineligible, not partially
+  enforced, while a `Top`/unrestricted value creates no such obligation and stays
+  admissible through the full protocol; a capability is claimed only when both
+  supported platforms prove it. B5.4 must
   publish an OS enforcement-mechanism design note that proves receipt integrity,
   non-replaceability, identity binding, crash recovery and worker
   write/delete/replace denial. Receipt read confidentiality is explicitly not a

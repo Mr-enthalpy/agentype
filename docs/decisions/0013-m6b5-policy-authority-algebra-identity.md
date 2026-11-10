@@ -377,7 +377,7 @@ satisfies_requirement(R_min, P, stage, candidate?)
 | Stage | Evaluated | Deliberately deferred |
 |---|---|---|
 | Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
-| Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy enforceability, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
+| Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy `FeatureObligations` coverage, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
 | Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot, including every positive Task requirement and `CoarseExecutionModes` against the committed `P_eff` | — |
 
 Only `Unsatisfied` rejects. For a `SECURITY_V1` Task, `Pending` components are
@@ -677,7 +677,9 @@ created or published — never a mutable "supports" label chosen at admission:
   pass the complete imported-enforcement coverage check and the feature gate.
   `Top` MUST NOT be read as "skip eligibility", "skip profile coverage", or
   "skip credential qualification"; it only means this object adds no authored
-  narrowing.
+  narrowing. Nor does `Top` change the admissible execution path: the source
+  revision declares `SECURITY_V1`, so it remains a full-path source and MUST NOT
+  be selected by the coarse path merely because it adds no restriction.
 
 Consequently:
 
@@ -695,11 +697,16 @@ Consequently:
 - the same conservative rule is symmetric for the other two objects: a
   `SECURITY_V1` Generation MUST NOT admit a `COARSE_V1` Task, because coarse
   admission and dispatch do not evaluate its authored fine ceiling and would
-  exceed the Generation's own author limit; and a SpawnSource revision carrying an
-  authored `P_source` MUST NOT be selected through the coarse path — it may only be
-  used by the complete `SECURITY_V1` provisioning and launch path, which proves
-  its restriction. A "supports both modes" label is not a proof and never
-  substitutes for mode-specific contracts;
+  exceed the Generation's own author limit; and every `SECURITY_V1` SpawnSource
+  revision MUST NOT be selected through the coarse path, whether or not it
+  carries an authored `P_source` ceiling. A revision with `P_source = Top` adds no
+  restriction but still declares the `SECURITY_V1` protocol mode, so it may only
+  be used by the complete provisioning and launch path. `Top` does not make a
+  single-mode source revision coarse-compatible. A source revision may be
+  reachable from both paths only through an independent, explicitly authored and
+  versioned mode-specific contract that proves coarse execution stays within its
+  declared ceiling; a "supports both modes" label is not such a contract and
+  never substitutes for one;
 - existing `COARSE_V1` Generations and Source revisions keep their frozen
   contract; the new security semantics use new immutable records or revisions, not
   an in-place reinterpretation;

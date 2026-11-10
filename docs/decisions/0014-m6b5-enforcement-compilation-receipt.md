@@ -722,10 +722,41 @@ substituted, symlinked, or reparse-point-aliased root MUST NOT confirm RUNNING.
 [ADR-0015](0015-m6b5-credentials-feature-gates-scope-freeze.md)) means the
 policy/receipt/recovery protocol is implemented, not that every dimension is
 enforceable. The `EnforcementSupport` matrix still decides per dimension. Even
-with the gate open, a policy using an unsupported dimension makes the candidate
-ineligible. The profile digest is part of the evidence subject and is
-revalidated inside the acquisition transaction, so gate and profile version
+with the gate open, a policy whose required enforcement features are unsupported
+makes the candidate ineligible. The profile digest is part of the evidence subject
+and is revalidated inside the acquisition transaction, so gate and profile version
 cannot drift apart.
+
+"Uses a dimension" is a semantic property of the normalized policy, not the mere
+presence of a field. Compilation derives obligations through one normative
+relation:
+
+```text
+RequiredEnforcementFeatures(
+    NormalizedPolicy,
+    EffectiveExecutionGuarantees
+) -> FeatureObligations
+```
+
+An obligation exists only where the effective policy or guarantees impose an
+enforceable restriction or a positive guarantee. A normalized `Top` or
+unrestricted value contributes no per-dimension obligation: unrestricted egress
+needs no egress filter, and no resource ceiling needs no resource limiter. A
+concrete value does create one: disabled egress, a 1 GiB ceiling, or a required
+attempt-isolation guarantee each produce the corresponding obligation.
+
+A candidate is eligible only when:
+
+```text
+FeatureObligations ⊆ EnforcementSupport(exact_binding)
+```
+
+The check is over the whole composite policy, not object by object. An absent
+obligation is not partial enforcement; it is nothing to enforce. `Top` removes
+only that per-dimension obligation and MUST NOT bypass normalization, `meet`,
+compilation, profile and receipt binding, credential qualification or the
+execution protocol. A policy containing `Top` still produces a real compiled
+plan, receipt and hold/release sequence.
 
 ### 14. `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
 
@@ -806,10 +837,12 @@ isolation is required, it MUST be recorded as a high-risk implementation
 dependency with its own OS mechanism and proof; it MUST NOT be assumed to follow
 from a small extension of the current jail.
 
-A `SECURITY_V1` Task whose policy needs a non-claimed dimension is ineligible
-under this profile; it MUST NOT be partially enforced. The B5.5 enforcement
-matrix MUST classify every spec-10 dimension against this profile as proven,
-limited, or unsupported.
+A `SECURITY_V1` Task whose effective policy or guarantees produce a non-claimed
+`FeatureObligation` is ineligible under this profile; it MUST NOT be partially
+enforced. A `Top`/unrestricted value produces no such obligation and remains
+admissible, but it still passes the complete compile, receipt and execution
+protocol. The B5.5 enforcement matrix MUST classify every spec-10 enforcement
+feature against this profile as proven, limited, or unsupported.
 
 ## Non-claims
 

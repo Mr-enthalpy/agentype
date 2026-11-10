@@ -601,14 +601,16 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   derives its mode from the immutable row, and admission never backfills a row for
   a `NONE` Generation;
 - cross-mode symmetry: a `SECURITY_V1` Generation MUST reject a `COARSE_V1` Task
-  at admission even when the Generation also lists `COARSE_V1` support, and a
-  SpawnSource revision carrying an authored `P_source` ceiling MUST NOT be
-  selected by the coarse path — both are negative cases, and a "supports both
+  at admission even when the Generation also lists `COARSE_V1` support, and every
+  `SECURITY_V1` SpawnSource revision MUST NOT be selected by the coarse path —
+  including one with `P_source = Top`, because it still declares the
+  `SECURITY_V1` protocol mode; both are negative cases, and a "supports both
   modes" label grants no execution;
 - `P_source` top: a `SECURITY_V1` SpawnSource revision with no authored fine
   ceiling has `P_source = Top`, adds no restriction, and still fails the
   candidate when imported enforcement coverage, the feature gate, or credential
-  qualification fails; `Top` is never a bypass;
+  qualification fails; `Top` is never a bypass and never makes that revision
+  coarse-selectable;
 - policy algebra result type: `meet(P, Q) -> Result<NormalizedPolicy,
   PolicyConflict>`; the GLB property is tested only on `Ok`, and a conflicted meet
   is a deterministic unsatisfiability that is never surfaced as
@@ -631,12 +633,21 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - compile cache identity: the key includes normalization and meet algorithm
   versions explicitly; a different algorithm version cannot reuse a cached plan
   even when the effective-policy bytes digest matches;
-- imported coverage: a policy using an unsupported dimension is ineligible even
-  when the protocol gate is open, and a source that supports A and B is not
-  assumed to support `A ∩ B`;
+- enforcement-feature coverage: `RequiredEnforcementFeatures(normalized policy,
+  effective guarantees)` emits an obligation only for an enforceable restriction
+  or positive guarantee; a `Top`/unrestricted network or resource value emits no
+  obligation and MUST NOT by itself make the candidate ineligible, but it still
+  completes normalization, `meet`, compilation, receipt binding and the execution
+  protocol; a disabled network capability, a concrete resource ceiling or a
+  required guarantee emits an obligation, and a candidate is ineligible when one
+  is unsupported even with the protocol gate open; a source that supports A and B
+  is not assumed to support `A ∩ B`, and the check is over the whole composite
+  policy;
 - reference profile: `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` claims and non-claims
-  are tested on both Linux and Windows; a non-claimed dimension makes a candidate
-  ineligible rather than partially enforced; B5.4 publishes the OS
+  are tested on both Linux and Windows; a non-claimed enforcement-feature
+  obligation makes a candidate ineligible rather than partially enforced, while a
+  `Top`/unrestricted value yields no obligation and remains admissible through the
+  full protocol; B5.4 publishes the OS
   enforcement-mechanism design note and proves receipt integrity,
   non-replaceability, identity binding, crash recovery and worker
   write/delete/replace denial; receipt read confidentiality is tested as a
@@ -771,6 +782,13 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   split into several receipts; one trusted delivery domain may sub-route
   internally but must own the single qualification proof and the whole canonical
   request, and a missing domain-level proof makes the candidate ineligible;
+- B5.3 reference integration: acceptance includes one real external agent runtime
+  spawned through a real `SpawnSource` integration completing an end-to-end
+  constrained `BrokeredAccess` use, with the broker supplying a capability the
+  harness actually consumes and Core never interpreting the provider; broker and
+  receipt mocks alone do not satisfy this, and a harness limited to raw
+  environment or its own credential store is a recorded B5.3 blocker rather than
+  brokered-capable;
 - partial credential delivery: a plan requesting several references that
   establishes only a subset produces no `CredentialDeliveryReceipt`, never reaches
   `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus
