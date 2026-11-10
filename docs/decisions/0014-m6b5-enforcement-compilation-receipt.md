@@ -747,7 +747,16 @@ Claimed supported:
   worker write/delete/replace denial;
 - an append-only `SandboxAppliedReceipt` bound to the exact Execution and
   physical instance, with crash recovery and the hold/release phase machine;
-- credential-free execution.
+- no Agentype-managed credential delivery and no committed
+  `CredentialAccessPlan` ("credential-free" in this narrow sense).
+
+"Credential-free execution" in this profile means exactly that: no
+Agentype-managed delivery and no committed credential access plan. It is not a
+claim that the worker cannot reach any secret. The profile explicitly does not
+guarantee same-user read confidentiality or arbitrary read-root isolation, so a
+worker may still read host credentials exposed through its harness-native
+configuration or ordinary file permissions. That exposure is outside
+Agentype-managed delivery and is not certified by this profile.
 
 The credential-bound scope additionally requires a `CredentialDeliveryReceipt`
 that binds the sandbox receipt digest. That second receipt is not part of this

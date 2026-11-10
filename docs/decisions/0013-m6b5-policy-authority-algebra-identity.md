@@ -387,6 +387,13 @@ obligation set. Admission MUST NOT assume that a candidate Agent exists: a Task
 may name a workstream that no future Agent matches, and that is a candidate
 ineligibility, not an admission contradiction.
 
+At the Candidate stage every previously `Pending` component MUST resolve to
+`Satisfied` or `Unsatisfied`; at Execution commitment no `Pending` may remain at
+all. A remaining `Pending` at Candidate is a whole-round defer when its subject is
+still legitimately unavailable, or a control-plane fault when the subject should
+exist; it is never treated as `Satisfied` and never authorizes execution
+commitment.
+
 `RequiredCapabilities` is deferred at admission because admission has only the
 Generation and Task policy objects, while the existing M6-B.2 matcher compares a
 requirement against the actual AgentType's capability claims. Moving it earlier
@@ -545,12 +552,33 @@ catalogs. Only the previously deferred sandbox dimension is added:
 - `can_execute` also checks Task minimum access and AgentType/Task policy
   compatibility.
 - `can_provision` keeps type-level capability, lifecycle, continuity and coarse
-  safety checks and adds whole-policy enforceability.
+  safety checks and adds type/source-level enforceability for the AgentType and
+  SpawnSource/SourceConfig contract. It receives no Task or Generation, so it does
+  not decide the full Task-specific `P_eff`.
 - `more_specific_for` uses proven policy narrowing, never nominal inheritance
   depth or continuity strength.
 - `is_valid_refinement` requires a provable non-widening relation; an unresolved
   "new policy ID" cannot bypass it.
 - `can_provision_task` remains the mandatory authority-bearing conjunct.
+
+The responsibility split is therefore explicit:
+
+```text
+can_provision
+    AgentType + SpawnSource/SourceConfig type- and source-level eligibility
+    and their applicable security constraints
+
+can_provision_task / acquisition qualification
+    full Task-specific P_eff, including Task and Generation terms
+
+Execution commitment
+    re-prove the complete contract against the actual bound identities
+```
+
+`can_provision` MUST NOT be described as proving the whole four-way
+`P_A ∩ P_G ∩ P_T ∩ P_S`; that claim belongs to the Task-specific stage and is
+re-proved at commitment. This is an interface clarification, not a change to the
+frozen four relations.
 
 The new order is monotone over the old one:
 

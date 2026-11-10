@@ -553,7 +553,15 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   relation, and `Pending` is never treated as satisfied;
 - stage separation: `PlacementConstraints` are not evaluated at admission; a
   candidate that fails them is ineligible, and admission never assumes a
-  candidate Agent exists;
+  candidate Agent exists; at Candidate every previously `Pending` component
+  resolves to `Satisfied`/`Unsatisfied`, and a remaining `Pending` is a whole-round
+  defer or control-plane fault, never `Satisfied` and never an execution-authority
+  commit;
+- provisioning relation scope: `can_provision` is tested only for AgentType plus
+  SpawnSource/SourceConfig type/source-level eligibility and applicable security
+  constraints; it is not accepted as proof of the full four-way `P_eff`, which
+  `can_provision_task` and acquisition qualification must establish and Execution
+  commitment must re-prove against the actual bound identities;
 - composite mode re-check: constructing `P_eff` can leave no writable path even
   though the Task and each ceiling individually allowed `Write`; candidate
   matching and commitment MUST reject that candidate, and MUST NOT reuse the
@@ -634,6 +642,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   write/delete/replace denial; receipt read confidentiality is tested as a
   non-claim, and no behavior may depend on the receipt path, digest or content
   being unknown to the worker;
+- credential-free claim: a policy-only Execution is asserted to have no
+  Agentype-managed credential delivery and no committed `CredentialAccessPlan`;
+  the test does not assert that the worker cannot reach a host secret available
+  through harness-native configuration or file permissions, because read
+  confidentiality and arbitrary read-root isolation are explicit non-claims;
 - physical root binding: `ResolveRoot(committed descriptor, RequestId)` MUST equal
   `receipt.actual_root` by materialized filesystem identity, not path string;
   root substitution, symlink/reparse-point aliasing, and TOCTOU between
@@ -753,6 +766,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   because the committed plan is immutable and one Execution carries at most one
   credential receipt — the different scope needs a new Execution with its own
   qualification, snapshot, and chain;
+- single credential delivery domain: a plan whose references span independent
+  broker authorities is unsupported in v1 rather than implicitly fanned out or
+  split into several receipts; one trusted delivery domain may sub-route
+  internally but must own the single qualification proof and the whole canonical
+  request, and a missing domain-level proof makes the candidate ineligible;
 - partial credential delivery: a plan requesting several references that
   establishes only a subset produces no `CredentialDeliveryReceipt`, never reaches
   `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus
