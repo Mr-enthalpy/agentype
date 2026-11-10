@@ -44,6 +44,61 @@ pub const SANDBOX_POLICY_SCHEMA_VERSION: u32 = 1;
 /// record exactly which positive obligations admission checked.
 pub const REQUIRED_ACCESS_SCHEMA_VERSION: u32 = 1;
 
+/// The exact versions a durable policy row was written under.
+///
+/// A row's `(canonical_version, algebra_version)` pair is part of its identity.
+/// Rows are decoded and re-derived only under the versions recorded with them,
+/// and a pair this build does not implement fails closed instead of being
+/// reinterpreted by the current algorithms (ADR-0013 §11). Golden vectors are
+/// keyed by this pair for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SandboxPolicyVersion {
+    canonical_version: u32,
+    algebra_version: u32,
+}
+
+impl SandboxPolicyVersion {
+    /// The versions this build reads and writes.
+    pub const CURRENT: Self = Self::new(
+        SANDBOX_POLICY_SCHEMA_VERSION,
+        SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
+    );
+
+    pub const fn new(canonical_version: u32, algebra_version: u32) -> Self {
+        Self {
+            canonical_version,
+            algebra_version,
+        }
+    }
+
+    pub const fn canonical_version(self) -> u32 {
+        self.canonical_version
+    }
+
+    pub const fn algebra_version(self) -> u32 {
+        self.algebra_version
+    }
+
+    pub fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+
+    /// Reject a row recorded under a version this build does not implement.
+    ///
+    /// There is deliberately no fallback: evaluating an old row with a newer
+    /// meet would be an implicit reinterpretation of committed authority.
+    pub fn ensure_supported(self) -> Result<Self, ContractError> {
+        if self.is_current() {
+            Ok(self)
+        } else {
+            Err(ContractError::UnsupportedPolicyVersion {
+                canonical_version: self.canonical_version,
+                algebra_version: self.algebra_version,
+            })
+        }
+    }
+}
+
 /// The root of an anchored logical path selector.
 ///
 /// B5.1 intentionally knows only the committed logical workspace. Physical

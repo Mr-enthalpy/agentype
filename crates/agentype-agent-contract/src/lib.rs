@@ -92,8 +92,9 @@ pub use sandbox::{
     CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy, FilePolicy, NameSet,
     NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector, PathSet, PolicyAccess,
     PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling, ResourceLimitName, ResourceScope,
-    ResourceUnit, SandboxPolicyParts, SecurityContractMode, SecurityDerivation, ToolPolicy,
-    WorkingDirectory, REQUIRED_ACCESS_SCHEMA_VERSION, SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
-    SANDBOX_POLICY_NORMALIZATION_VERSION, SANDBOX_POLICY_SCHEMA_VERSION,
+    ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode,
+    SecurityDerivation, ToolPolicy, WorkingDirectory, REQUIRED_ACCESS_SCHEMA_VERSION,
+    SANDBOX_POLICY_MEET_ALGORITHM_VERSION, SANDBOX_POLICY_NORMALIZATION_VERSION,
+    SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

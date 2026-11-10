@@ -34,6 +34,13 @@ pub enum ContractError {
     /// A sandbox policy is not well formed (or a durable sandbox policy document
     /// cannot be decoded). At the durable boundary this is catalog corruption.
     InvalidSandboxPolicy { reason: String },
+    /// A durable sandbox policy row records a `(canonical_version,
+    /// algebra_version)` pair this build does not implement. It MUST NOT be
+    /// reinterpreted under the current algorithms.
+    UnsupportedPolicyVersion {
+        canonical_version: u32,
+        algebra_version: u32,
+    },
     /// A Task's hard requirement conflicts with a value that must agree (e.g. a
     /// Generation policy that the Task would have to widen).
     RequirementConflict { reason: String },
@@ -80,6 +87,13 @@ impl fmt::Display for ContractError {
             Self::InvalidSandboxPolicy { reason } => {
                 write!(f, "invalid sandbox policy: {reason}")
             }
+            Self::UnsupportedPolicyVersion {
+                canonical_version,
+                algebra_version,
+            } => write!(
+                f,
+                "unsupported sandbox policy version ({canonical_version}, {algebra_version})"
+            ),
             Self::RequirementConflict { reason } => {
                 write!(f, "task requirement conflict: {reason}")
             }
