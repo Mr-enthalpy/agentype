@@ -13,6 +13,8 @@
 use crate::store::{map_sqlite, query_opt};
 #[cfg(any(test, feature = "runtime-internal"))]
 use crate::txutil::{birth_agent, required_agent, required_partition, required_task};
+#[cfg(any(test, feature = "runtime-internal"))]
+use agentype_agent_contract::SecurityContractMode;
 use agentype_agent_contract::{
     binding_snapshot_from_canonical_json, canonical_binding_snapshot_bytes,
     canonical_provisioning_binding_bytes, content_digest, credential_refs_digest,
@@ -695,6 +697,31 @@ fn acquisition_rejection(error: agentype_agent_contract::ContractError) -> Error
     Error::invalid_authority(error.to_string())
 }
 
+/// M6-B.5 B5.1 gate: the coarse typed acquisition path has no security
+/// execution support, so a `SECURITY_V1` Task MUST NOT gain Attempt/Lease
+/// authority through it.
+///
+/// The mode is read from its sole durable owner (`task_agent_requirements`) and
+/// never inferred from policy presence. This is a fail-closed rejection, not an
+/// operator switch: it stays until the B.5 execution path can commit the
+/// required `ExecutionSecuritySnapshot`. A legacy Task has no requirement mode
+/// and is unaffected.
+#[cfg(any(test, feature = "runtime-internal"))]
+fn reject_security_v1_coarse_acquisition(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<(), Error> {
+    if crate::requirement::task_agent_requirement_mode(tx, task_id)? != "TYPED" {
+        return Ok(());
+    }
+    if crate::requirement::task_security_mode(tx, task_id)? == SecurityContractMode::SecurityV1 {
+        return Err(Error::invalid_authority(
+            "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "runtime-internal"))]
 /// Re-check the frozen M5 placement gates (exact partition, concrete tag
 /// superset, `Required` continuity workstream) over the durable agent and task.
@@ -1010,6 +1037,12 @@ fn finish_acquisition(
             "typed acquisition requires a TYPED task",
         ));
     }
+    // M6-B.5 B5.1 gate: the coarse typed acquisition path has no security
+    // execution support, so a SECURITY_V1 Task MUST NOT gain Attempt/Lease
+    // authority through it. Checked after the shared readiness predicate and
+    // before any requirement, agent, catalog, attestation, credential, or
+    // private-I/O work.
+    reject_security_v1_coarse_acquisition(tx, task_id)?;
     let requirement = crate::requirement::get_task_agent_requirement(tx, task_id)?
         .ok_or_else(|| Error::invariant("a TYPED task is missing its agent requirement"))?;
 
@@ -1260,6 +1293,9 @@ pub fn acquire_typed_task_new_agent(
     let task = required_task(tx, task_id.as_str())?;
     let requirement = crate::requirement::get_task_agent_requirement(tx, task_id)?
         .ok_or_else(|| Error::invariant("a TYPED task is missing its agent requirement"))?;
+    // Refuse before birthing a fresh LogicalAgent for work the coarse path can
+    // never dispatch.
+    reject_security_v1_coarse_acquisition(tx, task_id)?;
     let tags: Vec<String> = serde_json::from_str(&task.affinity_tags_json)
         .map_err(|e| Error::invariant(format!("task affinity tags: {e}")))?;
     let agent_id = birth_agent(

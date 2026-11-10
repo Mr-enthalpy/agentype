@@ -4315,17 +4315,33 @@ impl Kernel {
     /// One SELECT observes Task/Batch/partition/backoff together; success grants
     /// no authority. The acquisition transaction must re-prove the same Core
     /// readiness predicate after any attestation or concurrent control change.
+    ///
+    /// M6-B.5 B5.1 gate: a `SECURITY_V1` Task is rejected here, after readiness
+    /// and before semantic matching, source-private attestation, credential
+    /// resolution, or any other private I/O. The coarse typed path cannot
+    /// discharge a `SECURITY_V1` contract, so it must not begin work for one.
+    /// The check reads the mode from its sole durable owner and never from
+    /// policy presence, and it is re-proved transactionally at acquisition.
     #[cfg(any(test, feature = "runtime-internal"))]
     pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
         let now = self.clock.now();
         self.store.query(|conn| {
-            let (state, batch, active, next): (String, Option<String>, Option<bool>, Option<f64>) =
-                conn.query_row(
-                    "SELECT t.state,b.state,p.active,t.next_eligible_at FROM tasks t
+            let (
+                state,
+                batch,
+                active,
+                next,
+                security_mode,
+            ): (String, Option<String>, Option<bool>, Option<f64>, Option<String>) = conn
+                .query_row(
+                    "SELECT t.state,b.state,p.active,t.next_eligible_at,r.security_contract_mode
+                     FROM tasks t
                      LEFT JOIN batches b ON b.id=t.batch_id
-                     LEFT JOIN pool_partitions p ON p.name=t.partition_name WHERE t.id=?1",
+                     LEFT JOIN pool_partitions p ON p.name=t.partition_name
+                     LEFT JOIN task_agent_requirements r ON r.task_id=t.id
+                     WHERE t.id=?1",
                     params![id.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()
                 .map_err(map_sqlite)?
@@ -4342,6 +4358,20 @@ impl Kernel {
                 return Err(Error::invalid_transition(
                     "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
                 ));
+            }
+            if let Some(stored) = security_mode {
+                let mode = agentype_agent_contract::SecurityContractMode::parse(&stored)
+                    .ok_or_else(|| {
+                        Error::invariant(format!(
+                            "task {} records unsupported security_contract_mode {stored:?}",
+                            id.as_str()
+                        ))
+                    })?;
+                if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
+                    return Err(Error::invalid_authority(
+                        "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
+                    ));
+                }
             }
             Ok(())
         })
