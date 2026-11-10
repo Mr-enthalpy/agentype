@@ -292,6 +292,17 @@ impl NetworkEndpoint {
         self.port
     }
 
+    /// The same host/port with a different transport selector. Crate-private:
+    /// normalization uses it to collapse `{TCP, UDP}` into the equivalent
+    /// `ANY` selector when a finite set contains both.
+    pub(crate) fn with_transport(&self, transport: NetworkTransport) -> Self {
+        Self {
+            transport,
+            host: self.host.clone(),
+            port: self.port,
+        }
+    }
+
     /// Whether this rule covers `other` (rule subsumption).
     ///
     /// A transport selector of [`NetworkTransport::Any`] covers both concrete
@@ -315,7 +326,7 @@ impl NetworkEndpoint {
 ///
 /// The variant MUST agree with [`PolicyProjection::dimension`]; a mismatch makes
 /// the catalog entry invalid and admission MUST reject rather than drop it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PolicyOperation {
     FileOperation(FileOperationClass),
     ToolCommand(String),

@@ -31,7 +31,10 @@ use crate::records::{
     TaskRequirement,
 };
 use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
-use crate::sandbox::{NormalizedSandboxPolicy, SANDBOX_POLICY_SCHEMA_VERSION};
+use crate::sandbox::{
+    NormalizedSandboxPolicy, RequiredAccess, SecurityDerivation, REQUIRED_ACCESS_SCHEMA_VERSION,
+    SANDBOX_POLICY_SCHEMA_VERSION,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -628,6 +631,25 @@ pub fn canonical_sandbox_policy_bytes(policy: &NormalizedSandboxPolicy) -> Vec<u
     }))
 }
 
+/// Canonical bytes of a Task's positive `RequiredAccess` floor.
+pub fn canonical_required_access_bytes(required: &RequiredAccess) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "REQUIRED_ACCESS",
+        "required_access_schema_version": REQUIRED_ACCESS_SCHEMA_VERSION,
+        "required_access": required.to_value(),
+    }))
+}
+
+/// Canonical bytes of a `SecurityDerivation` identity.
+pub fn canonical_security_derivation_bytes(derivation: &SecurityDerivation) -> Vec<u8> {
+    to_bytes(json!({
+        "canonical": CANONICAL_FORMAT_VERSION,
+        "kind": "SECURITY_DERIVATION",
+        "derivation": derivation.to_value(),
+    }))
+}
+
 /// Canonical bytes of a Task agent requirement (M6-B.3). The record MUST be
 /// canonicalized first (see [`canonicalize_task_agent_requirement`]).
 pub fn canonical_task_agent_requirement_bytes(req: &TaskAgentRequirement) -> Vec<u8> {
@@ -789,6 +811,14 @@ pub fn capability_definition_content_digest(
 
 pub fn sandbox_policy_content_digest(policy: &NormalizedSandboxPolicy) -> String {
     content_digest(&canonical_sandbox_policy_bytes(policy))
+}
+
+pub fn required_access_content_digest(required: &RequiredAccess) -> String {
+    content_digest(&canonical_required_access_bytes(required))
+}
+
+pub fn security_derivation_content_digest(derivation: &SecurityDerivation) -> String {
+    content_digest(&canonical_security_derivation_bytes(derivation))
 }
 
 pub fn task_agent_requirement_content_digest(req: &TaskAgentRequirement) -> String {

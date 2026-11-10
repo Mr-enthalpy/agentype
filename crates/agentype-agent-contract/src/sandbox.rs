@@ -21,16 +21,28 @@
 //!
 //! [`Any`]: NameSet::Any
 
-use crate::capability::NetworkEndpoint;
+use crate::capability::{
+    CapabilityDefinition, CapabilityValue, FileOperationClass, NetworkEndpoint, NetworkTransport,
+    PolicyOperation,
+};
 use crate::error::ContractError;
+use crate::records::{NetworkPolicy, SandboxPolicyRef};
+use agentype_core::WorkspaceMode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 /// Canonical document schema for an authored sandbox policy.
 ///
 /// A change that alters the canonical bytes of a logically equivalent policy
 /// MUST bump this version so old rows are never reinterpreted.
 pub const SANDBOX_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Canonical document schema for a `RequiredAccess` floor.
+///
+/// Required access is content-addressed separately so the Task binding can
+/// record exactly which positive obligations admission checked.
+pub const REQUIRED_ACCESS_SCHEMA_VERSION: u32 = 1;
 
 /// The root of an anchored logical path selector.
 ///
@@ -260,14 +272,33 @@ impl NetworkEndpointSet {
         Self::Allowed(BTreeSet::new())
     }
 
-    /// A finite allowed set, normalized by removing endpoints covered by a
-    /// broader rule.
+    /// A finite allowed set, normalized by merging an explicit `{TCP, UDP}` pair
+    /// at the same host/port into the equivalent `ANY` selector and then removing
+    /// endpoints covered by a broader rule.
     pub fn allowed<I>(endpoints: I) -> Self
     where
         I: IntoIterator<Item = NetworkEndpoint>,
     {
-        let endpoints: BTreeSet<NetworkEndpoint> = endpoints.into_iter().collect();
-        let all: Vec<NetworkEndpoint> = endpoints.into_iter().collect();
+        let mut all: BTreeSet<NetworkEndpoint> = endpoints.into_iter().collect();
+        // `ANY` is exactly the two-element transport domain in v1, so an
+        // explicit TCP+UDP pair is the same rule and MUST NOT produce a second
+        // canonical spelling.
+        let keys: BTreeSet<(String, Option<u16>)> = all
+            .iter()
+            .map(|endpoint| (endpoint.host().to_string(), endpoint.port()))
+            .collect();
+        for (host, port) in keys {
+            let tcp = NetworkEndpoint::new(NetworkTransport::Tcp, host.clone(), port);
+            let udp = NetworkEndpoint::new(NetworkTransport::Udp, host.clone(), port);
+            if let (Ok(tcp), Ok(udp)) = (tcp, udp) {
+                if all.contains(&tcp) && all.contains(&udp) {
+                    all.remove(&tcp);
+                    all.remove(&udp);
+                    all.insert(tcp.with_transport(NetworkTransport::Any));
+                }
+            }
+        }
+        let all: Vec<NetworkEndpoint> = all.into_iter().collect();
         let kept = all
             .iter()
             .enumerate()
@@ -608,6 +639,12 @@ impl CredentialGrant {
     pub fn delivery_modes(&self) -> &BTreeSet<CredentialDeliveryMode> {
         &self.delivery_modes
     }
+
+    /// Whether this grant can authorize any use at all. Every facet is a
+    /// narrowing set, so an empty facet authorizes nothing rather than all.
+    pub fn is_usable(&self) -> bool {
+        !self.uses.is_empty() && !self.audience.is_empty() && !self.delivery_modes.is_empty()
+    }
 }
 
 /// The scope a resource ceiling applies to. Scopes are not interchangeable: a
@@ -891,12 +928,8 @@ fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, Cont
                 reason: "credential grant identity does not match its map key".into(),
             });
         }
-        let grant = CredentialGrant::new(
-            id.clone(),
-            grant.uses,
-            grant.audience,
-            grant.delivery_modes,
-        )?;
+        let grant =
+            CredentialGrant::new(id.clone(), grant.uses, grant.audience, grant.delivery_modes)?;
         credentials.insert(id, grant);
     }
     Ok(SandboxPolicyParts {
@@ -1029,4 +1062,901 @@ fn credential_grant_value(id: &CredentialAuthorizationId, grant: &CredentialGran
         },
         "uses": grant.uses.iter().collect::<Vec<_>>(),
     })
+}
+
+// =============================================================================
+// Policy algebra
+// =============================================================================
+
+/// Version of the normalization rules that produce [`NormalizedSandboxPolicy`].
+///
+/// Recorded separately from [`SANDBOX_POLICY_MEET_ALGORITHM_VERSION`]: a change
+/// to canonicalization and a change to intersection are different events, and
+/// old rows must stay readable under the versions they were written with.
+pub const SANDBOX_POLICY_NORMALIZATION_VERSION: u32 = 1;
+
+/// Version of the `meet`/ordering rules in this module.
+///
+/// A change that could produce different output bytes for the same inputs MUST
+/// bump this and add golden vectors keyed by `(canonical_version, algebra_version)`.
+pub const SANDBOX_POLICY_MEET_ALGORITHM_VERSION: u32 = 1;
+
+/// A deterministic unsatisfiability result of two contracts (ADR-0013 §6).
+///
+/// This is reserved for required launch/structural constraints that cannot both
+/// hold. An empty allowed set in a permission dimension is **not** a conflict:
+/// it is a legal deny-all policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyConflict {
+    reason: String,
+}
+
+impl PolicyConflict {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for PolicyConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sandbox policy conflict: {}", self.reason)
+    }
+}
+
+impl std::error::Error for PolicyConflict {}
+
+fn conflict(reason: impl Into<String>) -> PolicyConflict {
+    PolicyConflict::new(reason)
+}
+
+fn intersect_path_sets(left: &PathSet, right: &PathSet) -> PathSet {
+    match (left, right) {
+        (PathSet::Any, other) | (other, PathSet::Any) => other.clone(),
+        (PathSet::Allowed(left), PathSet::Allowed(right)) => PathSet::allowed(
+            left.iter()
+                .flat_map(|a| right.iter().filter_map(|b| intersect_selectors(a, b)))
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn intersect_selectors(left: &PathSelector, right: &PathSelector) -> Option<PathSelector> {
+    if left.covers(right) {
+        Some(right.clone())
+    } else if right.covers(left) {
+        Some(left.clone())
+    } else {
+        None
+    }
+}
+
+fn intersect_name_sets(left: &NameSet, right: &NameSet) -> NameSet {
+    match (left, right) {
+        (NameSet::Any, other) | (other, NameSet::Any) => other.clone(),
+        (NameSet::Allowed(left), NameSet::Allowed(right)) => {
+            NameSet::Allowed(left.intersection(right).cloned().collect())
+        }
+    }
+}
+
+/// Intersection of two endpoint boxes. `None` means the boxes are disjoint.
+fn intersect_endpoints(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Option<NetworkEndpoint> {
+    let transport = match (left.transport(), right.transport()) {
+        (NetworkTransport::Any, other) => other,
+        (other, NetworkTransport::Any) => other,
+        (a, b) if a == b => a,
+        _ => return None,
+    };
+    let host = if left.host() == "*" {
+        right.host().to_string()
+    } else if right.host() == "*" || left.host() == right.host() {
+        left.host().to_string()
+    } else {
+        return None;
+    };
+    let port = match (left.port(), right.port()) {
+        (None, other) => other,
+        (other, None) => other,
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => return None,
+    };
+    NetworkEndpoint::new(transport, host, port).ok()
+}
+
+fn intersect_network_sets(
+    left: &NetworkEndpointSet,
+    right: &NetworkEndpointSet,
+) -> NetworkEndpointSet {
+    match (left, right) {
+        (NetworkEndpointSet::Any, other) | (other, NetworkEndpointSet::Any) => other.clone(),
+        (NetworkEndpointSet::Allowed(left), NetworkEndpointSet::Allowed(right)) => {
+            NetworkEndpointSet::allowed(
+                left.iter()
+                    .flat_map(|a| right.iter().filter_map(|b| intersect_endpoints(a, b)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+}
+
+fn meet_file_policies(left: &FilePolicy, right: &FilePolicy) -> FilePolicy {
+    FilePolicy::new(
+        intersect_path_sets(left.read(), right.read()),
+        intersect_path_sets(left.write(), right.write()),
+        intersect_path_sets(left.execute(), right.execute()),
+        intersect_path_sets(left.delete(), right.delete()),
+        intersect_path_sets(left.visible(), right.visible()),
+    )
+}
+
+fn meet_environments(
+    left: &EnvironmentPolicy,
+    right: &EnvironmentPolicy,
+) -> Result<EnvironmentPolicy, PolicyConflict> {
+    let allowed = intersect_name_sets(left.allowed_names(), right.allowed_names());
+    let mut required = left.required_values().clone();
+    for (name, value) in right.required_values() {
+        match required.get(name) {
+            Some(existing) if existing != value => {
+                return Err(conflict(format!(
+                    "conflicting required environment values for {name:?}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                required.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    EnvironmentPolicy::new(allowed, required)
+        .map_err(|error| PolicyConflict::new(error.to_string()))
+}
+
+fn meet_credentials(
+    left: &BTreeMap<CredentialAuthorizationId, CredentialGrant>,
+    right: &BTreeMap<CredentialAuthorizationId, CredentialGrant>,
+) -> Result<BTreeMap<CredentialAuthorizationId, CredentialGrant>, PolicyConflict> {
+    let mut granted = BTreeMap::new();
+    // The credential dimension has no `Any`: an omitted grant authorizes
+    // nothing, so the meet keeps exactly the ids both ceilings grant.
+    for (id, left_grant) in left {
+        let Some(right_grant) = right.get(id) else {
+            continue;
+        };
+        let grant = CredentialGrant::new(
+            id.clone(),
+            left_grant.uses().intersection(right_grant.uses()).cloned(),
+            left_grant
+                .audience()
+                .intersection(right_grant.audience())
+                .cloned(),
+            left_grant
+                .delivery_modes()
+                .intersection(right_grant.delivery_modes())
+                .copied(),
+        )
+        .map_err(|error| PolicyConflict::new(error.to_string()))?;
+        granted.insert(id.clone(), grant);
+    }
+    Ok(granted)
+}
+
+fn meet_resources(
+    left: &BTreeMap<ResourceLimitName, ResourceCeiling>,
+    right: &BTreeMap<ResourceLimitName, ResourceCeiling>,
+) -> Result<BTreeMap<ResourceLimitName, ResourceCeiling>, PolicyConflict> {
+    let mut ceilings = left.clone();
+    for (name, right_ceiling) in right {
+        match ceilings.get(name) {
+            None => {
+                ceilings.insert(name.clone(), *right_ceiling);
+            }
+            Some(left_ceiling) => {
+                if left_ceiling.scope() != right_ceiling.scope()
+                    || left_ceiling.unit() != right_ceiling.unit()
+                {
+                    return Err(conflict(format!(
+                        "resource ceiling {name:?} is declared with incompatible scope or unit"
+                    )));
+                }
+                ceilings.insert(
+                    name.clone(),
+                    ResourceCeiling::new(
+                        left_ceiling.scope(),
+                        left_ceiling.unit(),
+                        left_ceiling.limit().min(right_ceiling.limit()),
+                    ),
+                );
+            }
+        }
+    }
+    Ok(ceilings)
+}
+
+fn meet_working_directories(
+    left: &WorkingDirectory,
+    right: &WorkingDirectory,
+) -> Result<WorkingDirectory, PolicyConflict> {
+    match (left, right) {
+        (WorkingDirectory::Any, other) | (other, WorkingDirectory::Any) => Ok(other.clone()),
+        (WorkingDirectory::Required(left), WorkingDirectory::Required(right)) if left == right => {
+            Ok(WorkingDirectory::Required(left.clone()))
+        }
+        _ => Err(conflict(
+            "two different required working directories cannot both hold",
+        )),
+    }
+}
+
+/// Greatest lower bound of two normalized policies (ADR-0013 §6).
+///
+/// `Ok` is the greatest representable policy below both inputs; an empty
+/// allowed set in a permission dimension is a legal result. `Err` is reserved
+/// for structural/launch constraints that cannot both hold.
+pub fn meet(
+    left: &NormalizedSandboxPolicy,
+    right: &NormalizedSandboxPolicy,
+) -> Result<NormalizedSandboxPolicy, PolicyConflict> {
+    let parts = SandboxPolicyParts {
+        files: meet_file_policies(left.files(), right.files()),
+        tools: ToolPolicy::new(
+            intersect_name_sets(left.tools().tools(), right.tools().tools()),
+            intersect_name_sets(left.tools().commands(), right.tools().commands()),
+        ),
+        network: intersect_network_sets(left.network(), right.network()),
+        environment: meet_environments(left.environment(), right.environment())?,
+        credentials: meet_credentials(left.credentials(), right.credentials())?,
+        resources: meet_resources(left.resources(), right.resources())?,
+        working_directory: meet_working_directories(
+            left.working_directory(),
+            right.working_directory(),
+        )?,
+        // An execution guarantee is a disjunction and no meet can clear it.
+        attempt_isolation: left.attempt_isolation() || right.attempt_isolation(),
+    };
+    NormalizedSandboxPolicy::from_parts(parts)
+        .map_err(|error| PolicyConflict::new(error.to_string()))
+}
+
+fn path_set_within(inner: &PathSet, outer: &PathSet) -> bool {
+    match inner {
+        PathSet::Any => outer.is_any(),
+        PathSet::Allowed(inner) => match outer {
+            PathSet::Any => true,
+            PathSet::Allowed(outer) => inner
+                .iter()
+                .all(|selector| outer.iter().any(|allowed| allowed.covers(selector))),
+        },
+    }
+}
+
+fn name_set_within(inner: &NameSet, outer: &NameSet) -> bool {
+    match inner {
+        NameSet::Any => outer.is_any(),
+        NameSet::Allowed(inner) => match outer {
+            NameSet::Any => true,
+            NameSet::Allowed(outer) => inner.is_subset(outer),
+        },
+    }
+}
+
+fn network_set_within(inner: &NetworkEndpointSet, outer: &NetworkEndpointSet) -> bool {
+    match inner {
+        NetworkEndpointSet::Any => outer.is_any(),
+        NetworkEndpointSet::Allowed(inner) => match outer {
+            NetworkEndpointSet::Any => true,
+            NetworkEndpointSet::Allowed(outer) => inner
+                .iter()
+                .all(|endpoint| outer.iter().any(|allowed| allowed.covers(endpoint))),
+        },
+    }
+}
+
+fn credentials_within(
+    inner: &BTreeMap<CredentialAuthorizationId, CredentialGrant>,
+    outer: &BTreeMap<CredentialAuthorizationId, CredentialGrant>,
+) -> bool {
+    inner.iter().all(|(id, grant)| {
+        // An unusable grant authorizes nothing, so it cannot widen authority.
+        if !grant.is_usable() {
+            return true;
+        }
+        outer.get(id).is_some_and(|allowed| {
+            grant.uses().is_subset(allowed.uses())
+                && grant.audience().is_subset(allowed.audience())
+                && grant.delivery_modes().is_subset(allowed.delivery_modes())
+        })
+    })
+}
+
+fn resources_within(
+    inner: &BTreeMap<ResourceLimitName, ResourceCeiling>,
+    outer: &BTreeMap<ResourceLimitName, ResourceCeiling>,
+) -> bool {
+    // `Any` (an omitted ceiling) adds no restriction, so every ceiling the
+    // outer policy declares must be declared at least as strictly by the inner.
+    outer.iter().all(|(name, allowed)| {
+        inner.get(name).is_some_and(|ceiling| {
+            ceiling.scope() == allowed.scope()
+                && ceiling.unit() == allowed.unit()
+                && ceiling.limit() <= allowed.limit()
+        })
+    })
+}
+
+fn working_directory_within(inner: &WorkingDirectory, outer: &WorkingDirectory) -> bool {
+    match (inner, outer) {
+        (_, WorkingDirectory::Any) => true,
+        (WorkingDirectory::Required(inner), WorkingDirectory::Required(outer)) => inner == outer,
+        (WorkingDirectory::Any, WorkingDirectory::Required(_)) => false,
+    }
+}
+
+/// Whether `inner` is provably no wider than `outer` (`inner ⪯ outer`).
+///
+/// Attempt isolation is deliberately ignored: it is an execution guarantee, not
+/// part of the authorization ordering, and a meet may only add it.
+pub fn is_within(inner: &NormalizedSandboxPolicy, outer: &NormalizedSandboxPolicy) -> bool {
+    path_set_within(inner.files().read(), outer.files().read())
+        && path_set_within(inner.files().write(), outer.files().write())
+        && path_set_within(inner.files().execute(), outer.files().execute())
+        && path_set_within(inner.files().delete(), outer.files().delete())
+        && path_set_within(inner.files().visible(), outer.files().visible())
+        && name_set_within(inner.tools().tools(), outer.tools().tools())
+        && name_set_within(inner.tools().commands(), outer.tools().commands())
+        && network_set_within(inner.network(), outer.network())
+        && name_set_within(
+            inner.environment().allowed_names(),
+            outer.environment().allowed_names(),
+        )
+        && outer
+            .environment()
+            .required_values()
+            .iter()
+            .all(|(name, value)| inner.environment().required_values().get(name) == Some(value))
+        && credentials_within(inner.credentials(), outer.credentials())
+        && resources_within(inner.resources(), outer.resources())
+        && working_directory_within(inner.working_directory(), outer.working_directory())
+}
+
+/// Prove that a derived policy stays within a base policy, or fail closed.
+pub fn prove_no_wider(
+    derived: &NormalizedSandboxPolicy,
+    base: &NormalizedSandboxPolicy,
+) -> Result<(), PolicyConflict> {
+    if is_within(derived, base) {
+        Ok(())
+    } else {
+        Err(conflict(
+            "derived policy is not provably within the base policy",
+        ))
+    }
+}
+
+// =============================================================================
+// Required access and capability projection
+// =============================================================================
+
+/// The positive access floor of a Task in `SECURITY_V1`.
+///
+/// B5.1 deliberately has no path-level obligation (ADR-0013 §2): file access is
+/// an operation-class floor, and path requirements would need a separate ADR.
+/// Credential ids are usable authorization identities, never provider secrets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiredAccess {
+    file_operations: BTreeSet<FileOperationClass>,
+    tools_commands: BTreeSet<String>,
+    network_endpoints: BTreeSet<NetworkEndpoint>,
+    environment_names: BTreeSet<String>,
+    credentials: BTreeSet<CredentialAuthorizationId>,
+}
+
+impl RequiredAccess {
+    pub fn empty() -> Self {
+        Self {
+            file_operations: BTreeSet::new(),
+            tools_commands: BTreeSet::new(),
+            network_endpoints: BTreeSet::new(),
+            environment_names: BTreeSet::new(),
+            credentials: BTreeSet::new(),
+        }
+    }
+
+    pub fn new(
+        file_operations: impl IntoIterator<Item = FileOperationClass>,
+        tools_commands: impl IntoIterator<Item = String>,
+        network_endpoints: impl IntoIterator<Item = NetworkEndpoint>,
+        environment_names: impl IntoIterator<Item = String>,
+        credentials: impl IntoIterator<Item = CredentialAuthorizationId>,
+    ) -> Result<Self, ContractError> {
+        let mut tools = BTreeSet::new();
+        for name in tools_commands {
+            validate_name_token(&name, "required tool or command")?;
+            tools.insert(name);
+        }
+        let mut environment = BTreeSet::new();
+        for name in environment_names {
+            validate_name_token(&name, "required environment name")?;
+            environment.insert(name);
+        }
+        Ok(Self {
+            file_operations: file_operations.into_iter().collect(),
+            tools_commands: tools,
+            network_endpoints: network_endpoints.into_iter().collect(),
+            environment_names: environment,
+            credentials: credentials.into_iter().collect(),
+        })
+    }
+
+    /// Build a floor from capability-projected policy operations.
+    pub fn from_operations<I>(operations: I) -> Result<Self, ContractError>
+    where
+        I: IntoIterator<Item = PolicyOperation>,
+    {
+        let mut access = Self::empty();
+        for operation in operations {
+            match operation {
+                PolicyOperation::FileOperation(class) => {
+                    access.file_operations.insert(class);
+                }
+                PolicyOperation::ToolCommand(name) => {
+                    validate_name_token(&name, "required tool or command")?;
+                    access.tools_commands.insert(name);
+                }
+                PolicyOperation::NetworkEndpoint(endpoint) => {
+                    access.network_endpoints.insert(endpoint);
+                }
+                PolicyOperation::EnvironmentName(name) => {
+                    validate_name_token(&name, "required environment name")?;
+                    access.environment_names.insert(name);
+                }
+            }
+        }
+        Ok(access)
+    }
+
+    pub fn with_credentials<I>(mut self, credentials: I) -> Self
+    where
+        I: IntoIterator<Item = CredentialAuthorizationId>,
+    {
+        self.credentials.extend(credentials);
+        self
+    }
+
+    pub fn file_operations(&self) -> &BTreeSet<FileOperationClass> {
+        &self.file_operations
+    }
+
+    pub fn tools_commands(&self) -> &BTreeSet<String> {
+        &self.tools_commands
+    }
+
+    pub fn network_endpoints(&self) -> &BTreeSet<NetworkEndpoint> {
+        &self.network_endpoints
+    }
+
+    pub fn environment_names(&self) -> &BTreeSet<String> {
+        &self.environment_names
+    }
+
+    pub fn credentials(&self) -> &BTreeSet<CredentialAuthorizationId> {
+        &self.credentials
+    }
+
+    pub(crate) fn to_value(&self) -> Value {
+        json!({
+            "credentials": self
+                .credentials
+                .iter()
+                .map(|id| json!({
+                    "namespace": id.namespace,
+                    "reference": id.reference,
+                }))
+                .collect::<Vec<_>>(),
+            "environment_names": self.environment_names.iter().collect::<Vec<_>>(),
+            "file_operations": self
+                .file_operations
+                .iter()
+                .map(|class| class.as_str())
+                .collect::<Vec<_>>(),
+            "network_endpoints": self
+                .network_endpoints
+                .iter()
+                .map(endpoint_value)
+                .collect::<Vec<_>>(),
+            "tools_commands": self.tools_commands.iter().collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The access a normalized policy actually permits.
+///
+/// It is a projection for obligation checking, not a second policy authority:
+/// path regions, credential facets and resource ceilings stay in the policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyAccess {
+    file_operations: BTreeSet<FileOperationClass>,
+    tools: ToolPolicy,
+    network: NetworkEndpointSet,
+    environment: NameSet,
+    credentials: BTreeSet<CredentialAuthorizationId>,
+}
+
+impl PolicyAccess {
+    pub fn from_policy(policy: &NormalizedSandboxPolicy) -> Self {
+        let files = policy.files();
+        let mut file_operations = BTreeSet::new();
+        for (class, set) in [
+            (FileOperationClass::Read, files.read()),
+            (FileOperationClass::Write, files.write()),
+            (FileOperationClass::Execute, files.execute()),
+            (FileOperationClass::Delete, files.delete()),
+        ] {
+            if !set.is_empty() {
+                file_operations.insert(class);
+            }
+        }
+        Self {
+            file_operations,
+            tools: policy.tools().clone(),
+            network: policy.network().clone(),
+            environment: policy.environment().allowed_names().clone(),
+            // A grant with an empty facet authorizes nothing and MUST NOT
+            // satisfy a credential obligation.
+            credentials: policy
+                .credentials()
+                .iter()
+                .filter(|(_, grant)| grant.is_usable())
+                .map(|(id, _)| id.clone())
+                .collect(),
+        }
+    }
+
+    pub fn file_operations(&self) -> &BTreeSet<FileOperationClass> {
+        &self.file_operations
+    }
+
+    pub fn allows_file_operation(&self, class: FileOperationClass) -> bool {
+        self.file_operations.contains(&class)
+    }
+
+    pub fn allows_tool_or_command(&self, name: &str) -> bool {
+        self.tools.allows(name)
+    }
+
+    pub fn allows_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
+        self.network.contains(endpoint)
+    }
+
+    pub fn allows_environment_name(&self, name: &str) -> bool {
+        self.environment.contains(name)
+    }
+
+    pub fn allows_credential(&self, id: &CredentialAuthorizationId) -> bool {
+        self.credentials.contains(id)
+    }
+}
+
+/// The parts of a required-access floor that the effective policy does not
+/// grant. This is an unsatisfied Task obligation, not a `PolicyConflict`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessDeficit {
+    reasons: Vec<String>,
+}
+
+impl AccessDeficit {
+    pub fn reasons(&self) -> &[String] {
+        &self.reasons
+    }
+}
+
+impl fmt::Display for AccessDeficit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "required access is not satisfied: {}",
+            self.reasons.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for AccessDeficit {}
+
+/// Check `RequiredAccess ⊆ ProjectAccess(effective)` (ADR-0013 §5).
+pub fn check_required_access(
+    required: &RequiredAccess,
+    access: &PolicyAccess,
+) -> Result<(), AccessDeficit> {
+    let mut reasons = Vec::new();
+    for class in required.file_operations() {
+        if !access.allows_file_operation(*class) {
+            reasons.push(format!("file operation {}", class.as_str()));
+        }
+    }
+    for name in required.tools_commands() {
+        if !access.allows_tool_or_command(name) {
+            reasons.push(format!("tool or command {name:?}"));
+        }
+    }
+    for endpoint in required.network_endpoints() {
+        if !access.allows_endpoint(endpoint) {
+            reasons.push(format!(
+                "network endpoint {}:{} over {}",
+                endpoint.host(),
+                endpoint
+                    .port()
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "*".into()),
+                endpoint.transport().as_str()
+            ));
+        }
+    }
+    for name in required.environment_names() {
+        if !access.allows_environment_name(name) {
+            reasons.push(format!("environment name {name:?}"));
+        }
+    }
+    for id in required.credentials() {
+        if !access.allows_credential(id) {
+            reasons.push(format!("credential {}/{}", id.namespace(), id.reference()));
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(AccessDeficit { reasons })
+    }
+}
+
+/// Project a capability value into its catalog-declared policy operations.
+///
+/// A `Set` capability with no projection contributes nothing. A projecting
+/// capability MUST map every member of the value: an unmapped member fails the
+/// whole projection closed and is never silently dropped (ADR-0013 §2).
+pub fn project_capability_access(
+    definition: &CapabilityDefinition,
+    value: &CapabilityValue,
+) -> Result<BTreeSet<PolicyOperation>, ContractError> {
+    definition.validate_projection()?;
+    let Some(projection) = &definition.policy_projection else {
+        // A capability with no explicit mapping contributes nothing; it is
+        // never guessed into a policy dimension.
+        return Ok(BTreeSet::new());
+    };
+    let CapabilityValue::Set(members) = value else {
+        return Err(ContractError::InvalidPolicyProjection {
+            reason: "capability value shape does not match a Set definition".into(),
+        });
+    };
+    let mut operations = BTreeSet::new();
+    for member in members {
+        let operation = projection.operation_for(member).ok_or_else(|| {
+            ContractError::InvalidPolicyProjection {
+                reason: format!("capability member {member:?} has no policy projection"),
+            }
+        })?;
+        operations.insert(operation.clone());
+    }
+    Ok(operations)
+}
+
+// =============================================================================
+// Mode and Task-local coarse/fine consistency
+// =============================================================================
+
+/// The explicit durable security mode selected at typed admission.
+///
+/// The mode is never inferred from `sandbox_policy.is_some()`: `SECURITY_V1`
+/// with no authored Task policy is a legal combination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SecurityContractMode {
+    CoarseV1,
+    SecurityV1,
+}
+
+impl SecurityContractMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CoarseV1 => "COARSE_V1",
+            Self::SecurityV1 => "SECURITY_V1",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "COARSE_V1" => Some(Self::CoarseV1),
+            "SECURITY_V1" => Some(Self::SecurityV1),
+            _ => None,
+        }
+    }
+}
+
+/// Prove that a Task's coarse fields and its (optional) fine policy agree
+/// before any cross-object meet or normalization (ADR-0013 §3).
+///
+/// `None` means "this Task authored no additional fine restriction" and is
+/// distinguishable from an explicit top policy. A contradiction is rejected
+/// here even when a stricter ceiling would later hide it.
+pub fn validate_task_local_coarse_fine(
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+    policy: Option<&NormalizedSandboxPolicy>,
+) -> Result<(), PolicyConflict> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    match workspace {
+        WorkspaceMode::ReadOnly => {
+            if !policy.files().write().is_empty() {
+                return Err(conflict(
+                    "task workspace is read-only but its policy allows writing",
+                ));
+            }
+        }
+        WorkspaceMode::Write => {
+            if policy.files().write().is_empty() {
+                return Err(conflict(
+                    "task requires writing but its policy allows no write region",
+                ));
+            }
+        }
+    }
+    if network == NetworkPolicy::Disabled && !policy.network().is_empty() {
+        return Err(conflict(
+            "task network is disabled but its policy allows network endpoints",
+        ));
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Derivation identity
+// =============================================================================
+
+/// One authored or derived policy input to an intersection.
+///
+/// The digest identifies canonical content; the optional authored reference is
+/// provenance. Two different sources can therefore share content without
+/// losing their respective derivation inputs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PolicyInput {
+    reference: Option<SandboxPolicyRef>,
+    policy_digest: String,
+}
+
+impl PolicyInput {
+    pub fn of(reference: Option<SandboxPolicyRef>, policy: &NormalizedSandboxPolicy) -> Self {
+        Self {
+            reference,
+            policy_digest: crate::canonical::sandbox_policy_content_digest(policy),
+        }
+    }
+
+    pub fn authored(reference: SandboxPolicyRef, policy: &NormalizedSandboxPolicy) -> Self {
+        Self::of(Some(reference), policy)
+    }
+
+    pub fn derived(policy: &NormalizedSandboxPolicy) -> Self {
+        Self::of(None, policy)
+    }
+
+    pub fn from_parts(
+        reference: Option<SandboxPolicyRef>,
+        policy_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            reference,
+            policy_digest: policy_digest.into(),
+        }
+    }
+
+    pub fn reference(&self) -> Option<&SandboxPolicyRef> {
+        self.reference.as_ref()
+    }
+
+    pub fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+}
+
+/// The immutable identity of one policy derivation (ADR-0013 §4).
+///
+/// Normalization and intersection versions are recorded separately, and the
+/// output and required-access digests bind the exact content this derivation
+/// produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityDerivation {
+    inputs: Vec<PolicyInput>,
+    normalization_version: u32,
+    meet_algorithm_version: u32,
+    output_digest: String,
+    required_access_digest: String,
+}
+
+impl SecurityDerivation {
+    pub fn new(
+        inputs: impl IntoIterator<Item = PolicyInput>,
+        output: &NormalizedSandboxPolicy,
+        required_access: &RequiredAccess,
+    ) -> Result<Self, ContractError> {
+        let mut inputs: Vec<PolicyInput> = inputs.into_iter().collect();
+        inputs.sort();
+        inputs.dedup();
+        if inputs.is_empty() {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: "a security derivation needs at least one input policy".into(),
+            });
+        }
+        Ok(Self {
+            inputs,
+            normalization_version: SANDBOX_POLICY_NORMALIZATION_VERSION,
+            meet_algorithm_version: SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
+            output_digest: crate::canonical::sandbox_policy_content_digest(output),
+            required_access_digest: crate::canonical::required_access_content_digest(
+                required_access,
+            ),
+        })
+    }
+
+    pub fn from_parts(
+        inputs: impl IntoIterator<Item = PolicyInput>,
+        normalization_version: u32,
+        meet_algorithm_version: u32,
+        output_digest: impl Into<String>,
+        required_access_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            inputs: inputs.into_iter().collect(),
+            normalization_version,
+            meet_algorithm_version,
+            output_digest: output_digest.into(),
+            required_access_digest: required_access_digest.into(),
+        }
+    }
+
+    pub fn inputs(&self) -> &[PolicyInput] {
+        &self.inputs
+    }
+
+    pub fn normalization_version(&self) -> u32 {
+        self.normalization_version
+    }
+
+    pub fn meet_algorithm_version(&self) -> u32 {
+        self.meet_algorithm_version
+    }
+
+    pub fn output_digest(&self) -> &str {
+        &self.output_digest
+    }
+
+    pub fn required_access_digest(&self) -> &str {
+        &self.required_access_digest
+    }
+
+    pub(crate) fn to_value(&self) -> Value {
+        json!({
+            "inputs": self
+                .inputs
+                .iter()
+                .map(|input| json!({
+                    "policy_digest": input.policy_digest,
+                    "reference": input.reference.as_ref().map(|reference| json!({
+                        "revision": reference.revision(),
+                        "sandbox_policy_id": reference.id().as_str(),
+                    })),
+                }))
+                .collect::<Vec<_>>(),
+            "meet_algorithm_version": self.meet_algorithm_version,
+            "normalization_version": self.normalization_version,
+            "output_digest": self.output_digest,
+            "required_access_digest": self.required_access_digest,
+        })
+    }
 }
