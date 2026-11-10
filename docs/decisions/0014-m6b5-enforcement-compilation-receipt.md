@@ -480,34 +480,47 @@ ReleaseAuthorityProof
     exact physical instance witness
     bounded validity
     issuing authority identity
+    ReleaseOperationId
 ```
 
 Only the trusted Kernel path may issue it; a caller cannot supply or extend it.
-Its validity is bounded and checked at the release call, and a proof that was
-valid earlier does not survive a Lease expiry or fencing-identity change. A stale,
-replayed, or mismatched proof leaves the instance `HELD`, never released. The
-adapter verifies only that the trusted release authorization names this exact
-instance and `RequestId` and is currently valid; it does not interpret Scheduler
-semantics. The release result is then part of the evidence consumed by the RUNNING
-transaction; it is not a second security authority.
+`ReleaseOperationId` identifies exactly one release authorization and is never
+reused. The Kernel records it with the exact fencing identity and the release
+intent before invoking the adapter, and the durable intent distinguishes
+`not consumed`, `release in progress`, and `released`. First valid use consumes the
+operation; a consumed operation is never presented as a new authorization.
 
-Kernel validation and the OS release cannot be made atomic across SQLite and the
-OS. A bounded race remains between the authority check and the physical release;
-it is owned by M5 fencing and recovery. B.5 does not claim an atomic release, and
-the design must fail closed rather than widen authority when that window is
-observed.
+The Kernel MUST verify the current Lease/fencing authority immediately before the
+release call, not merely at proof issuance. The adapter verifies the exact
+instance, the proof's current validity, and the operation identity, and performs
+the mechanical release; it does not interpret Scheduler semantics. The release
+result is then part of the evidence consumed by the RUNNING transaction; it is not
+a second security authority.
 
-Replay rejection and retry idempotency are different cases. Once the release result
-is durable and the phase is proven `RELEASED`, a repeated call for the same
-Execution, `RequestId` and exact instance MUST return that recorded result
-idempotently: it performs no second OS release, consumes no new authority, and
-cannot downgrade the phase. It is a read of an achieved outcome, not a replay of
-the authorization that produced it. If the instance is still `HELD`, an old proof
-is not a retry: the call MUST obtain a fresh `ReleaseAuthorityProof` valid under
-the current Lease/fencing identity and exact instance, or leave the instance
+Replay rejection and retry idempotency are different cases, keyed by the operation
+identity. Once the release result is durable and the phase is proven `RELEASED`, a
+repeated call for the same Execution, `RequestId`, exact instance and
+`ReleaseOperationId` MUST return that recorded result idempotently: it performs no
+second OS release, consumes no new authority, and cannot downgrade the phase. It is
+a read of an achieved outcome, not a replay of the authorization that produced it.
+If the operation was consumed but the release result is unknown, the instance stays
+`UNKNOWN`/`HELD` and follows M5 recovery; the same operation is not re-issued. If
+the instance is still `HELD` and the operation was consumed or failed, or its
+validity/fencing identity is no longer current, the call MUST obtain a fresh proof
+with a new `ReleaseOperationId` under the current authority, or leave the instance
 `HELD` and follow physical cleanup plus M5 recovery. A repeated call never returns
-`RELEASED` merely because some earlier call attempted release, and never
-reinterprets a stale proof as a new one.
+`RELEASED` merely because some earlier call attempted release, and an old proof is
+never reinterpreted as a new authorization.
+
+Two claims must stay separate. A proof known to be invalid — expired, replayed,
+mismatched instance, or bound to a superseded Lease/fencing identity — MUST NOT
+initiate a release. But once a currently valid proof passes the Kernel check, a
+Lease revocation can still race the OS call; that window cannot be eliminated
+across SQLite and the OS. M5 fencing and recovery guarantee that such a release
+cannot yield a new valid semantic result (RUNNING and worker output remain fenced),
+rather than claiming the physical call never happens. B.5 does not claim an atomic
+release, and the design fails closed rather than widening authority when the race
+is observed.
 
 When the policy requires credential delivery, the chain is ordered:
 

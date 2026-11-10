@@ -729,13 +729,15 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   cannot authorize release; uncertain release cannot create a second worker;
 - release authority proof: the proof carries `ExecutionId`, `RequestId`, the
   Attempt/Lease fencing identity, the exact physical instance witness, a bounded
-  validity and the issuing authority identity; only the trusted Kernel path may
-  issue it, a caller-filled or extended proof is rejected, and a stale or replayed
-  proof cannot release a still-`HELD` instance after a Lease expiry or fencing
-  change; after durable `RELEASED`, a repeated call returns the recorded state
-  without a second OS release, while a `HELD` instance requires a fresh valid
-  proof; the Kernel-check/OS-release race is not claimed atomic and fails closed
-  into M5 recovery;
+  validity, the issuing authority identity and a single-use `ReleaseOperationId`;
+  only the trusted Kernel path may issue it, a caller-filled or extended proof is
+  rejected, and the Kernel rechecks current authority immediately before release;
+  a proof known to be invalid never initiates release; after durable `RELEASED`,
+  a repeat of the same operation returns the recorded state without a second OS
+  release, a consumed operation with unknown outcome is not re-issued, and a
+  still-`HELD` instance requires a fresh proof with a new operation id under current
+  authority; a Lease revocation racing an already-started valid release is not
+  claimed atomic and is handled by M5 fencing/recovery;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
 - receipt chain: receipts are append-only, write-once, and bounded to one per
@@ -756,6 +758,12 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   `RELEASED`, stays at most `HELD`/`UNKNOWN`, and triggers reconciliation plus
   closure of the partial capabilities; when closure cannot be proven the state is
   `UNKNOWN` and M5 recovery applies, never a "mostly delivered" success;
+- credential replacement gate: when partial-delivery closure cannot be proven, a
+  later Execution is not authorized by quiescing or recovering the old physical
+  worker alone; the replacement plan requires an independent broker epoch or
+  scope-fencing proof for the prior delivery identity, and without it the
+  candidate is ineligible or deferred; physical quiescence and external broker
+  invalidation are tested as distinct facts;
 - receipt durability: file and directory metadata are durable before release, an
   existing different receipt is never replaced, and the worker inherits no
   receipt file/directory handle and no write/delete/replace access; read

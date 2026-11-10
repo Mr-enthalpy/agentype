@@ -84,11 +84,16 @@ On restart, `reconcile_start` MUST recover the phase and, when the phase require
 them, the receipts for the same `RequestId` and the same physical instance. A
 `HELD` instance MUST NOT be released until the Kernel revalidates current
 Scheduler/Task authority and issues a proof for that exact `RequestId` and
-instance witness. Release MUST be idempotent for the same instance: after the
+instance witness, carrying a single-use `ReleaseOperationId` and the current
+Lease/fencing identity; the Kernel checks that authority again immediately before
+the release call. Release MUST be idempotent for the same operation: after the
 result is durable and the phase is proven `RELEASED`, a repeated call returns that
 recorded result without a second OS release or new authority; while the instance is
-still `HELD`, an old proof is not a retry and a fresh valid proof under the current
-Lease/fencing identity is required. A reused PID
+still `HELD`, a consumed/failed operation or an old proof is not a retry and a fresh
+proof with a new operation id under the current Lease/fencing identity is required.
+A proof known to be invalid never initiates release; a Lease revocation racing an
+already-started valid release is handled by M5 fencing/recovery and cannot create a
+new valid semantic result. A reused PID
 MUST NOT confer release authority; if authority is invalid the worker stays held
 and follows physical cleanup plus M5 recovery; if the release result is uncertain
 no second worker may be created. Receipt presence alone MUST NOT confirm RUNNING.

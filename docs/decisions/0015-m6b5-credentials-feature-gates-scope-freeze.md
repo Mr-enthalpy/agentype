@@ -399,6 +399,18 @@ capabilities with `revoke_or_close`, and if closure cannot be proven records
 `UNKNOWN` and follows M5 recovery instead of assuming the delivered subset is
 harmless. The next attempt is a new Execution with a new plan and chain.
 
+That replacement gate is independent of physical worker recovery. When broker
+capability closure cannot be proven, a later Execution MUST NOT be authorized
+merely because the previous physical worker was quiesced or its process recovered:
+M5 physical quiescence and invalidation of an external broker capability are
+different facts. Before the replacement plan can be authorized, the broker must
+supply an independent epoch/scope-fencing proof for the prior delivery identity —
+for example a new broker epoch that supersedes the old capability, or explicit
+closure/denial evidence — and the new plan must bind that evidence. Without it the
+replacement candidate is ineligible or deferred. This is a B5.3/B5.4 acceptance
+condition, not a new Core credential lifecycle manager; Core still keeps no secret
+and does not track provider capabilities on its own.
+
 ### 11. Scoped freeze ladder
 
 The freeze status ladder is:
@@ -544,7 +556,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Hold/release | worker code does not run before receipt durability; recovery distinguishes awaiting-release from actually started; a receipt alone does not confirm RUNNING |
 | Secured SPI deadline | the three secured operations take one absolute deadline, the hold/receipt-publication/release stages share it with no per-stage reset, an expired deadline with unknown physical state yields `UNKNOWN` and M5 recovery instead of `RELEASED`/RUNNING, and a later `reconcile_secured_start` gets a new bounded deadline without changing the `RequestId` or creating a second instance |
 | Secured start phase | `HELD`/`RELEASED`/`UNKNOWN`/`TERMINAL` transitions are explicit; `HELD` requires a verified sandbox receipt, a credential-bound `RELEASED` also requires a credential-delivery receipt; `UNKNOWN` permits absence and never enters RUNNING; release requires a Kernel authority proof for the exact RequestId and instance; PID reuse cannot authorize release; uncertain release cannot create a second worker; the hold stays closed on daemon crash or control-channel loss |
-| Release authority proof | the proof carries ExecutionId, RequestId, Attempt/Lease fencing identity, exact instance witness, bounded validity and issuer; only the trusted Kernel path issues it, callers cannot supply or extend it, and a stale or replayed proof cannot release a `HELD` instance after Lease expiry or fencing change; a repeated call after durable `RELEASED` returns that recorded state idempotently without a second OS release, while a still-`HELD` instance needs a fresh valid proof; the adapter verifies instance correspondence only, and the residual Kernel/OS race is owned by M5 recovery rather than claimed atomic |
+| Release authority proof | the proof carries ExecutionId, RequestId, Attempt/Lease fencing identity, exact instance witness, bounded validity, issuer and a single-use `ReleaseOperationId`; only the trusted Kernel path issues it, callers cannot supply or extend it, and the Kernel rechecks current authority immediately before release; a proof known to be invalid never initiates release; a repeated call after durable `RELEASED` for the same operation returns the recorded state without a second OS release, an unknown outcome is never re-issued, and a still-`HELD` instance needs a fresh proof with a new operation id under current authority; the adapter verifies instance/validity/operation only, and a Lease revocation racing an already-started valid release is owned by M5 fencing/recovery and cannot create a new valid semantic result |
 | Receipt chain | receipts are append-only, write-once, and bounded to one per kind per Execution; the sandbox receipt establishes `HELD` and is never rewritten; a credential-delivery receipt binds the sandbox receipt digest; a second row of the same kind is corruption, not an append; a policy-only Execution has no credential receipt, and a credential-bound Execution has both before `RELEASED` |
 | Physical root binding | `ResolveRoot(committed descriptor, RequestId) = receipt.actual_root` is checked against materialized filesystem identity, not path string equality; a digest match with a substituted, symlinked or reparse-point-aliased root cannot confirm RUNNING; root substitution, aliasing and TOCTOU are negative tests |
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |
@@ -563,6 +575,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Freeze scope | the M6-B aggregate freeze requires M6-B.4 frozen, policy-only `FREEZE READY`, credential-bound `FREEZE READY`, and every open `BLOCKS_M6B_FREEZE` item closed; `BLOCKS_M6B_B5_FREEZE` items block only their named slice, and a slice freeze is never reported as the aggregate |
 | Reference profile | every spec-10 dimension is classified against `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`; a non-claimed dimension makes the candidate ineligible; a capability is claimed only when both platforms prove it; B5.4 must prove receipt integrity, non-replaceability, identity binding, crash recovery and restart-time HELD/RELEASED/UNKNOWN classification, with an unprovable release kept `UNKNOWN`; read confidentiality is a non-claim and is never assumed |
 | Credential ordering | delivery is established while `HELD`; the credential-delivery receipt is durable before `RELEASED` and binds the sandbox receipt; one immutable `CredentialAccessPlan` yields at most one `CredentialDeliveryReceipt`, so a different scope is rejected under the same Execution and requires a new Execution with its own qualification, snapshot and chain; the single receipt must prove the whole requested set was delivered exactly, and partial delivery never reaches `RELEASED` |
+| Credential replacement gate | when partial-delivery capability closure cannot be proven, a later Execution is not authorized by physical worker quiescence alone: M5 process recovery and external broker invalidation are different facts, so the replacement plan needs an independent broker epoch/scope-fencing proof for the prior delivery identity; without it the candidate is ineligible or deferred, and this remains a B5.3/B5.4 acceptance condition rather than a Core credential lifecycle manager |
 | WARM credential reuse | a fresh per-Execution write jail proves content-write confinement only, not complete cross-Task security-context isolation; credential-bound WARM reuse additionally needs execution-bound broker verification, proof the old capability cannot be inherited or continued, or a physically verified reset witness, and is refused otherwise |
 | RUNNING atomicity | observation, receipt chain, RUNNING, and first renewal all commit or all roll back |
 | Schema gate | v8 cannot open as v9; no implicit upgrade |
