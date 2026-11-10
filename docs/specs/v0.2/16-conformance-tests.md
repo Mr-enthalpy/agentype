@@ -633,7 +633,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   over-budget rounds produce a durable operator-actionable diagnostic and an
   explicitly blocked-for-operator defer, never an unbounded indistinguishable
   retry stream, an automatically enlarged budget, a silently reduced candidate
-  set, or a choice among the compiled subset;
+  set, or a choice among the compiled subset; the block is owned by a durable
+  record of the Task, candidate-domain/version digest, budget/cost class,
+  diagnostic reason and release condition, survives restart, creates no Attempt
+  and no NACK, and is not satisfied by the runtime-local `TypedDispatchState`
+  cooldown;
 - compile cache identity: the key includes normalization and meet algorithm
   versions explicitly; a different algorithm version cannot reuse a cached plan
   even when the effective-policy bytes digest matches;
@@ -760,12 +764,25 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
   validity, the issuing authority identity and a single-use `ReleaseOperationId`;
   only the trusted Kernel path may issue it, a caller-filled or extended proof is
   rejected, and the Kernel rechecks current authority immediately before release;
-  a proof known to be invalid never initiates release; after durable `RELEASED`,
-  a repeat of the same operation returns the recorded state without a second OS
-  release, a consumed operation with unknown outcome is not re-issued, and a
-  still-`HELD` instance requires a fresh proof with a new operation id under current
-  authority; a Lease revocation racing an already-started valid release is not
-  claimed atomic and is handled by M5 fencing/recovery;
+  a durable Kernel-owned `ReleaseOperationIntent` records the exact instance,
+  fencing identity, proof digest/validity and state, with creation, dispatch and
+  result recording in fenced Core transactions; a proof known to be invalid
+  never initiates release; after durable `RELEASED`, a repeat of the same operation
+  returns the recorded state without a second OS release, a consumed operation with
+  unknown outcome is not re-issued, and a new operation is authorized only when no
+  prior intent exists or the prior intent is terminal `released`/`aborted` — a
+  `dispatched`/`unknown` intent keeps the phase `UNKNOWN`, and observing `HELD`
+  alone cannot close it or authorize a second operation; a Lease revocation racing
+  an already-started valid release is not claimed atomic and is handled by M5
+  fencing/recovery;
+- release intent durability: a restart after `dispatched` with an unknown outcome
+  and the instance observed `HELD` keeps the intent non-terminal and the phase
+  `UNKNOWN`, does not mark it `aborted` and does not authorize a second operation;
+  only positive evidence that the operation had no effect, was cancelled or can no
+  longer take effect makes it terminal `aborted`; a missing/mutated intent or an
+  out-of-contract transition is corruption; the adapter cannot create or mutate
+  the intent; a receipt or `HELD` observation cannot substitute for either the
+  intent or the observed OS release state;
 - cross-mode exclusion: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1`
   Task, because the coarse path cannot prove its authored fine restrictions;
 - receipt chain: receipts are append-only, write-once, and bounded to one per

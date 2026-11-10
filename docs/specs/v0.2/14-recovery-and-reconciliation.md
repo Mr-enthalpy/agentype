@@ -86,11 +86,18 @@ them, the receipts for the same `RequestId` and the same physical instance. A
 Scheduler/Task authority and issues a proof for that exact `RequestId` and
 instance witness, carrying a single-use `ReleaseOperationId` and the current
 Lease/fencing identity; the Kernel checks that authority again immediately before
-the release call. Release MUST be idempotent for the same operation: after the
-result is durable and the phase is proven `RELEASED`, a repeated call returns that
-recorded result without a second OS release or new authority; while the instance is
-still `HELD`, a consumed/failed operation or an old proof is not a retry and a fresh
-proof with a new operation id under the current Lease/fencing identity is required.
+the release call. The Kernel creates and advances the `ReleaseOperationIntent`
+only in fenced Core transactions, and a new operation id is authorized only when
+no prior intent exists or the prior intent is terminal (`released` or `aborted`).
+If a prior intent is `dispatched` or `unknown`, the instance remains `UNKNOWN`
+until recovery proves
+whether the operation was released, had no effect, was cancelled, or can no longer
+take effect; observing `HELD` alone MUST NOT close the intent or authorize a second
+operation. Release MUST be idempotent for the same operation: after the result is
+durable and the phase is proven `RELEASED`, a repeated call returns that recorded
+result without a second OS release or new authority; a terminal `aborted` intent
+with the instance still `HELD` may obtain a fresh proof with a new operation id
+under the current Lease/fencing identity.
 A proof known to be invalid never initiates release; a Lease revocation racing an
 already-started valid release is handled by M5 fencing/recovery and cannot create a
 new valid semantic result. A reused PID

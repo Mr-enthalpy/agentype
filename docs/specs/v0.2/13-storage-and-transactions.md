@@ -243,6 +243,37 @@ surface designed in
   epoch, issuer version, validity bound and
   subject/scope digests, actual bound `AgentTypeRef` (or digest), and Task
   derivation digest.
+- `acquisition_budget_deferrals` is the durable owner of the repeated whole-set
+  compile-budget block, not the runtime-local `TypedDispatchState.cooldowns`. It
+  records the blocked Task, a digest of the candidate domain and the relevant
+  binding/profile versions, the budget class and observed cost class, the
+  consecutive over-budget classification and diagnostic reason, and the release
+  condition. It creates no Attempt, emits no Task NACK, selects no candidate and
+  changes no Task semantic authority; it only makes the existing whole-round defer
+  persist across restart and become operator-visible. Its consecutive count and
+  resolution fields may change; the recorded identity is otherwise stable. It is
+  cleared or updated only by an explicit configuration/authorization change or by
+  a new candidate domain. B5.2 chooses the exact encoding, but a runtime-local
+  cooldown MUST NOT be treated as satisfying this durable contract.
+- `release_operation_intents` is the Kernel-owned durable record for release
+  authorization consumption and dispatch lineage, keyed by
+  `(execution_id, request_id, release_operation_id)`. Its identity and
+  instance/fencing fields are immutable and write-once; its state advances only
+  through the defined transitions. It stores the exact physical
+  instance witness, Attempt/Lease fencing identity, proof digest and validity
+  bound, and a state among `prepared`, `dispatched`, `released`, `unknown` and
+  `aborted`. Creating the row, the `prepared → dispatched` transition and the
+  `dispatched → released`/`unknown` result record occur in fenced Core transactions
+  that validate current Lease/fencing authority and the exact instance; the adapter
+  returns evidence only and never writes it. `released` and `aborted` are
+  terminal. A new operation id is permitted only when no prior intent exists or
+  the prior intent is terminal; a `dispatched`/`unknown` intent blocks a second
+  release operation and keeps the phase `UNKNOWN` until recovery proves the actual
+  outcome. Observing `HELD` alone does not prove an earlier dispatched operation
+  can no longer complete and MUST NOT mark it `aborted`. A release with no intent
+  row, a mutated intent identity, or a state transition outside this contract is
+  corruption. The row is neither a receipt nor physical evidence; it does not
+  replace `applied_security_receipts` or the observed OS state.
 - `applied_security_receipts` is an immutable, write-once, append-only receipt
   chain, keyed by Execution and receipt kind (`SandboxAppliedReceipt`,
   `CredentialDeliveryReceipt`). The SQLite rows are the authority-bearing records;
@@ -385,6 +416,8 @@ cannot construct a record that merely looks validated.
 - one assigned LogicalAgent per Task
 - one STARTING/WARM/COLD Incarnation per LogicalAgent
 - at most one STARTING/RUNNING/UNKNOWN Execution per Incarnation
+- at most one non-terminal (`prepared`/`dispatched`/`unknown`) release intent per
+  Execution and exact physical instance
 
 ## Transaction boundaries (MUST be atomic)
 
@@ -396,6 +429,7 @@ cannot construct a record that merely looks validated.
 | Execution security commitment | For `SECURITY_V1`, the Execution + `BindingSnapshot` transaction also writes the immutable `ExecutionSecuritySnapshot`, carrying the inline effective policy, the actual bound AgentType identity, the enforcement profile and the security plan digest. The snapshot MUST NOT be created or repaired later. |
 | Typed acquisition reservation | Attempt/Lease/assignment + immutable ProvisioningBinding; `Attempt.incarnation_id` remains NULL until Execution creation. The Execution + BindingSnapshot transaction MUST prove the exact reserved provisioning provenance or roll back. Pre-Execution closure MUST NOT infer physical terminality for an earlier WARM host; a never-materialized STARTING reservation may be reused. M5 settlement/writer safety after Execution creation remains unchanged (ADR-0011). |
 | Confirm RUNNING | Positive RUNNING transition **and first Lease renewal** in one fenced Core transaction **before** daemon supervision admission. MUST NOT commit Execution RUNNING then renew later. For `SECURITY_V1`, `RELEASED` requires a validated `SandboxAppliedReceipt` and, when credential-bound, a `CredentialDeliveryReceipt` binding it, as inputs to the same transaction; `HELD` and `UNKNOWN` cannot produce RUNNING; a `TERMINAL` instance cannot produce RUNNING; a missing or invalid required receipt cannot produce RUNNING. |
+| Secured release | Creating a `ReleaseOperationIntent`, the `prepared → dispatched` transition that authorizes the adapter call, and recording `dispatched → released`/`unknown` are each fenced Core transactions validating current Lease/fencing authority and the exact physical instance. The adapter returns evidence only and must not record the outcome; uncertainty MUST NOT be recorded as `released` or `aborted`. A second operation is not authorized while any prior intent is `dispatched`/`unknown`, and `HELD` observation alone cannot close that intent. |
 | Success ACK | Attempt SUCCEEDED, Lease RELEASED, Task COMPLETED, exactly one Result AVAILABLE, dependency release, Batch recompute. If this transaction is the **first** `Batch → COMPLETED`, it MUST also insert **exactly one** `BATCH_RESULTS_READY` outbox row. MUST NOT complete Batch in tx1 and enqueue wakeup in tx2. |
 | Retryable NACK | Failure, Attempt FAILED, Lease RELEASED, Task RETRY_WAIT, agent release |
 | Suspend | Task SUSPENDED, Lease REVOKED, Escalation, Batch SUSPENDED, and the decision/control outbox event in the **same** transaction |

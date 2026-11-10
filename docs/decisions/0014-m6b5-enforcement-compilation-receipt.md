@@ -145,6 +145,14 @@ class, and the acquisition remains deferred in an explicitly blocked-for-operato
 condition; identical subsequent rounds MUST NOT be emitted as an unbounded stream
 of indistinguishable retries.
 
+The diagnostic is backed by a durable record owned by the acquisition control
+plane, not by the runtime-local `TypedDispatchState.cooldowns`. It binds the
+blocked Task, a digest of the candidate domain and relevant binding/profile
+versions, the budget and observed cost class, the diagnostic reason and the
+release condition. It creates no Attempt, emits no Task NACK and changes no Task
+semantic authority. B5.2 chooses the exact encoding, but a restart-transient
+cooldown MUST NOT be used to satisfy this rule.
+
 Resolution requires an explicit operator action or configuration change, such as
 raising the budget/resource class or narrowing the candidate domain through a new
 authored decision. This rule MUST NOT automatically enlarge the budget, silently
@@ -505,10 +513,40 @@ ReleaseAuthorityProof
 
 Only the trusted Kernel path may issue it; a caller cannot supply or extend it.
 `ReleaseOperationId` identifies exactly one release authorization and is never
-reused. The Kernel records it with the exact fencing identity and the release
-intent before invoking the adapter, and the durable intent distinguishes
-`not consumed`, `release in progress`, and `released`. First valid use consumes the
-operation; a consumed operation is never presented as a new authorization.
+reused. The Kernel owns a durable `ReleaseOperationIntent` whose identity
+`(ExecutionId, RequestId, ReleaseOperationId)` is write-once; it records the
+exact physical instance witness, the Attempt/Lease fencing identity, the proof
+digest and validity bound, and a single state that advances only through:
+
+```text
+prepared ──dispatch──→ dispatched ──positive evidence──→ released
+    │                       │
+    │                       └──outcome not durable──→ unknown
+    └──authority invalidated before dispatch──→ aborted
+
+unknown ──positive physical evidence──→ released
+unknown ──operation completed with no effect, was cancelled,
+           or can no longer take effect──→ aborted
+```
+
+`released` and `aborted` are terminal. The identity, instance and fencing fields
+are immutable. Creating the intent, the `prepared → dispatched` transition that
+authorizes the adapter call, and the recording of `dispatched → released` or
+`unknown` MUST each commit in a fenced Core transaction that validates the current
+Lease/fencing authority and exact instance. The adapter performs the mechanical
+call and returns evidence, but MUST NOT create or mutate the intent. The intent is
+the durable record of authorization consumption and dispatch lineage; it is not a
+receipt and not a substitute for observed OS state.
+
+A new `ReleaseOperationId` for the same exact instance is permitted only when no
+prior intent exists or the prior intent is terminal (`released` or `aborted`). If
+any prior intent is `dispatched` or `unknown`, no second release operation may be
+issued: the instance remains `UNKNOWN` and recovery must establish which terminal
+outcome actually occurred. Observing the instance as `HELD` alone does not prove
+that an earlier dispatched operation can no longer complete, so it MUST NOT be used
+to mark that intent `aborted` or to justify a new operation. `aborted` requires
+positive evidence that the operation had no effect, was cancelled, or can no
+longer take effect — not merely the absence of an observed release.
 
 The Kernel MUST verify the current Lease/fencing authority immediately before the
 release call, not merely at proof issuance. The adapter verifies the exact
@@ -524,13 +562,22 @@ repeated call for the same Execution, `RequestId`, exact instance and
 second OS release, consumes no new authority, and cannot downgrade the phase. It is
 a read of an achieved outcome, not a replay of the authorization that produced it.
 If the operation was consumed but the release result is unknown, the instance stays
-`UNKNOWN`/`HELD` and follows M5 recovery; the same operation is not re-issued. If
-the instance is still `HELD` and the operation was consumed or failed, or its
-validity/fencing identity is no longer current, the call MUST obtain a fresh proof
-with a new `ReleaseOperationId` under the current authority, or leave the instance
-`HELD` and follow physical cleanup plus M5 recovery. A repeated call never returns
+`UNKNOWN`/`HELD`, the prior intent stays `dispatched`/`unknown`, and M5 recovery
+must establish its terminal outcome; the same operation is not re-issued and no
+new operation is authorized. If the prior intent is terminal `aborted`, the
+instance is still `HELD`, and its validity/fencing identity is no longer current,
+the call MUST obtain a fresh proof with a new `ReleaseOperationId` under the
+current authority, or leave the instance `HELD` and follow physical cleanup plus
+M5 recovery. A repeated call never returns
 `RELEASED` merely because some earlier call attempted release, and an old proof is
 never reinterpreted as a new authorization.
+
+The durable receipt, the release intent and the observed OS state answer different
+questions and MUST NOT substitute for one another. A receipt proves applied policy
+or credential scope; the intent proves which authorization was consumed and
+whether dispatch may have happened; the OS observation proves physical release.
+Secured-start and recovery decisions consume all required evidence, and none of
+the three may be inferred from another.
 
 Two claims must stay separate. A proof known to be invalid — expired, replayed,
 mismatched instance, or bound to a superseded Lease/fencing identity — MUST NOT
