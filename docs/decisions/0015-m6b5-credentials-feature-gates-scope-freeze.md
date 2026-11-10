@@ -274,19 +274,22 @@ explicitly narrower scope is agreed. The reference integration need not cover
 every harness, but it must prove one real end-to-end path. This condition does not
 change the policy-only slice or the brokered-only security rule.
 
-If a future version enables transient raw delivery, delivery mode must become an
-AgentType `SECURITY_V1` ceiling, not a `TaskSpec` field, and a v1 Task cannot
-independently forbid raw delivery. That change needs its own decision.
+Delivery mode is already an authorization dimension of the v1 AgentType
+`SECURITY_V1` ceiling (section 5): the grant must name the exact mode, and B5.1
+MUST encode it in that grant now rather than defer it to a future schema. B.5 v1
+production admits only `BrokeredAccess`; `TransientRawDelivery` is present in the
+versioned mode set but marked unsupported and is never selected. A v1 Task cannot
+independently forbid raw delivery, because the delivery-mode dimension is
+**outside the v1 Task policy grammar**.
 
-This is consistent with the `meet` dimension row that says credential "refs, use,
-delivery mode and audience all narrow" (ADR-0013 §6): that dimension exists in
-the general algebra but is **outside the v1 Task policy grammar**. A v1 Task
-cannot express a delivery-mode narrowing merely because `sandbox_policy` is
-authored, so there is no second, implicit authority competing with the AgentType
-ceiling. Enabling raw delivery therefore requires a new versioned Task grammar
-that includes the dimension *and* its `meet`/conflict rule; a v1 Task must not be
-reinterpreted as carrying one. Until then, the delivery-mode requirement is
-derived from the AgentType ceiling and the credential eligibility subject only.
+Enabling `TransientRawDelivery` later therefore does not create a new
+authorization dimension. It expands the versioned set of allowed delivery modes
+and, if a Task must be able to narrow below its AgentType ceiling, adds the
+delivery-mode dimension *and* its `meet`/conflict rule to a new Task policy
+grammar. A v1 Task MUST NOT be reinterpreted as carrying that narrowing. Until
+then, the requirement is derived from the AgentType ceiling and the credential
+eligibility subject only, with no second implicit authority competing with the
+ceiling.
 
 ### 7. Secret protection means exactly what it says
 
@@ -581,7 +584,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Imported coverage | `RequiredEnforcementFeatures(normalized policy, effective guarantees)` emits an obligation only for an enforceable restriction or positive guarantee; a `Top`/unrestricted value emits none and is not itself a reason for ineligibility, while a concrete ceiling, disabled capability or required guarantee emits one; a candidate is ineligible when `FeatureObligations ⊄ EnforcementSupport(exact_binding)` even with the protocol gate open; the check is over the complete composite policy, and supporting A and B does not imply supporting `A ∩ B` |
 | Enforcement matrix completeness | every spec-10 dimension is classified proven/limited/unsupported for the exact binding, and an unclassified dimension fails the suite |
 | Canonical golden vectors | each schema/algorithm version pins byte-level input/output and digest |
-| Compile budget | exhausting the budget mid-round, or an unknown candidate not proven continuity-non-decisive, cannot produce partial selection |
+| Compile budget | exhausting the budget mid-round, or an unknown candidate not proven continuity-non-decisive, cannot produce partial selection; repeated identical over-budget rounds surface a durable operator-actionable diagnostic and an explicitly blocked-for-operator defer instead of unbounded indistinguishable retries, without auto-enlarging the budget, silently shrinking the candidate set or choosing among the compiled subset |
 | Credential probe | broker down is not absent; different epochs and wrong scope are not mixed; an unknown candidate in the winner's continuity tier defers, and only a proven non-decisive candidate may be ignored |
 | Secret sentinel | no raw secret sentinel in Agentype-produced durable JSON, logs, control errors, snapshots, or descriptors; `SourceConfigBody::OpaqueJson` remains publisher-opaque, so the sentinel does not claim Core can identify secrets inside arbitrary publisher payload — that is a source-publisher contract violation |
 | Compile cache | the cache key includes `effective_policy_digest`, `normalization_version`, `meet_algorithm_version`, adapter identity, enforcement profile and compiler protocol; the policy digest does not implicitly commit to either algorithm version, and a version change cannot reuse an older compile result |
@@ -596,7 +599,7 @@ B5.5 MUST treat these as mandatory regression categories:
 | Receipt publication | durable contents, atomic no-replace publication, durable namespace update, and re-read verification of the published identity; POSIX `fsync`/`rename` alone is not a cross-platform proof |
 | Cross-mode exclusion | symmetric in B.5 v1: a `SECURITY_V1` AgentType cannot execute a `COARSE_V1` Task, a `SECURITY_V1` Generation cannot admit a `COARSE_V1` Task, and every `SECURITY_V1` SpawnSource revision is reachable only through the full `SECURITY_V1` path, including one with `P_source = Top`; in each case the coarse projection cannot replace the authored fine contract or the declared protocol mode, a "supports both modes" label grants no execution, and only an independently authored versioned mode-specific contract can make a revision reachable from both paths |
 | Admission mode | the mode is owned solely by `task_agent_requirements.security_contract_mode`; `task_security_bindings` exists exactly when the mode is `SECURITY_V1` and is absent for `COARSE_V1` (conditional biconditional), with no independent mode, and `generation_task_bindings` carries none; a Generation's mode follows `policy_mode`: `POLICY` reads the immutable `generation_policies` row, `NONE` is the derived `COARSE_V1` with no row and cannot admit a `SECURITY_V1` Task; the mode is explicit and durable, never inferred from policy presence; a `SECURITY_V1` Task cannot downgrade at matching, provisioning or recovery |
-| Delivery mode vs Task grammar | the credential delivery-mode dimension is outside the v1 Task policy grammar, so a v1 authored `sandbox_policy` cannot narrow it; the requirement is derived from the AgentType ceiling and credential eligibility subject; enabling `TransientRawDelivery` needs a new versioned Task grammar with its own `meet`/conflict rule |
+| Delivery mode vs Task grammar | delivery mode is already an explicit dimension of the v1 AgentType `SECURITY_V1` grant, so B5.1 must encode it now; v1 production admits only `BrokeredAccess` while `TransientRawDelivery` remains defined but unsupported. The dimension is outside the v1 Task policy grammar, so a v1 authored `sandbox_policy` cannot narrow it; enabling raw later expands the versioned allowed-mode set and, if Task narrowing is wanted, adds the dimension plus its `meet`/conflict rule in a new Task grammar, never by reinterpreting a v1 Task |
 | Stage separation | `RequiredCapabilities` are not evaluated at admission because they need the actual AgentType; `PlacementConstraints` are never evaluated at admission; `Pending` obligations are recorded and discharged at the candidate stage; at Candidate every `Pending` resolves to `Satisfied`/`Unsatisfied`, and a remaining `Pending` is a whole-round defer or control-plane fault, never `Satisfied` and never an execution-authority commit |
 | Provisioning relation scope | `can_provision` proves AgentType plus SpawnSource/SourceConfig type- and source-level eligibility and their applicable security constraints, but not the full four-way `P_eff`, because it takes no Task or Generation; `can_provision_task` and acquisition qualification prove full Task-specific `P_eff`, and Execution commitment re-proves the complete contract against actual bound identities |
 | Composite mode re-check | candidate matching and commitment re-evaluate `CoarseExecutionModes` and every positive Task requirement against the complete `P_eff`; an admission-time verdict is not reused, because a later meet can remove every writable path; `Write` requires an allowed write inside the committed logical workspace region, not a writable temporary location |

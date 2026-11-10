@@ -132,6 +132,26 @@ final selection MUST NOT proceed over the remaining candidates. Budget
 exhaustion or temporary inability to qualify the whole set is a whole-round
 defer, never a partial selection over the first few successes.
 
+Budget exhaustion is retryable only while the underlying candidate set or
+available budget may change. A fixed budget that is permanently below the cost of
+the complete set would otherwise defer and back off forever without a diagnosable
+result. After a bounded, configured number of consecutive rounds that defer solely
+because the complete candidate set exceeds the fixed compile budget — with the
+same candidate domain and the same binding/profile versions, and no new
+qualification fact — the control plane MUST surface a durable,
+operator-actionable diagnostic through the existing defer/escalation mechanism.
+The diagnostic records the full candidate count, the budget and the observed cost
+class, and the acquisition remains deferred in an explicitly blocked-for-operator
+condition; identical subsequent rounds MUST NOT be emitted as an unbounded stream
+of indistinguishable retries.
+
+Resolution requires an explicit operator action or configuration change, such as
+raising the budget/resource class or narrowing the candidate domain through a new
+authored decision. This rule MUST NOT automatically enlarge the budget, silently
+shrink the candidate set, select among the compiled subset, or introduce a new
+semantic selection policy. A budget defer is an operator-visible liveness
+classification, never a security rejection of any candidate.
+
 Classification is strict:
 
 - a deterministically unsupported combination excludes that candidate;

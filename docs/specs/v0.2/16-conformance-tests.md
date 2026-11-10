@@ -629,7 +629,11 @@ The M6-B.4 inherited-contract acceptance matrix MUST additionally cover:
 - canonical golden vectors keyed by `(canonical_version, algebra_version)`;
 - compile budget: exhausting the budget mid-round, or an unknown credential
   candidate not proven continuity-non-decisive, cannot produce partial
-  selection; a failed winner does not fall back;
+  selection; a failed winner does not fall back; repeated identical whole-set
+  over-budget rounds produce a durable operator-actionable diagnostic and an
+  explicitly blocked-for-operator defer, never an unbounded indistinguishable
+  retry stream, an automatically enlarged budget, a silently reduced candidate
+  set, or a choice among the compiled subset;
 - compile cache identity: the key includes normalization and meet algorithm
   versions explicitly; a different algorithm version cannot reuse a cached plan
   even when the effective-policy bytes digest matches;

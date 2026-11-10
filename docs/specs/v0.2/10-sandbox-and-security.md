@@ -181,9 +181,12 @@ In `SECURITY_V1`:
   NOT bypass normalization, `meet`, compilation, receipt binding or the execution
   protocol. Compilation is root-relative and bounded;
   whole-round defer is required when any relevant candidate is unqualified, and
-  a failed winner MUST NOT fall back to a weaker candidate. Unsupported
-  combinations exclude the candidate; protocol/corruption faults are control
-  plane failures.
+  a failed winner MUST NOT fall back to a weaker candidate. Repeated identical
+  over-budget rounds MUST surface an operator-actionable diagnostic through the
+  existing escalation mechanism and remain deferred, rather than retrying
+  indistinguishably forever; the budget and candidate set MUST NOT be adjusted
+  automatically. Unsupported combinations exclude the candidate;
+  protocol/corruption faults are control plane failures.
 - The effective policy, an execution security snapshot containing the actual
   bound AgentType, and an append-only receipt chain MUST reach physical start.
   `SandboxAppliedReceipt` binds policy, profile, plan, root and proven instance
