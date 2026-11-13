@@ -70,8 +70,9 @@ pub use ids::{
 };
 pub use matching::{match_existing_agents, ExistingAgentCandidate, TaskPlacement};
 pub use predicates::{
-    can_execute, can_provision, can_provision_task, is_valid_refinement, more_specific_for,
-    validate_source_config, validate_spawn_source,
+    can_execute, can_execute_security_v1, can_provision, can_provision_task, is_valid_refinement,
+    is_valid_refinement_with_policies, more_specific_for, validate_source_config,
+    validate_spawn_source,
 };
 pub use provisioning::{
     BindingSnapshot, MaterializationDigest, ProvisioningBinding, RESOLVER_VERSION,

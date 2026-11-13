@@ -985,7 +985,13 @@ fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, Cont
         }
         let grant =
             CredentialGrant::new(id.clone(), grant.uses, grant.audience, grant.delivery_modes)?;
-        credentials.insert(id, grant);
+        // Every facet narrows, so an empty facet authorizes nothing. Dropping the
+        // unusable grant makes the canonical form the unique identity of the
+        // authorization semantics: an explicit no-authority grant and an absent
+        // grant are the same policy.
+        if grant.is_usable() {
+            credentials.insert(id, grant);
+        }
     }
     Ok(SandboxPolicyParts {
         files: FilePolicy::new(

@@ -20,6 +20,7 @@ use crate::records::{
     network_rank, workspace_rank, AffinityConstraint, AgentType, AgentTypeContract, ConfigStatus,
     ContinuityMode, SandboxPolicyRef, SourceConfig, SourceStatus, SpawnSource, TaskRequirement,
 };
+use crate::sandbox::{is_within, NormalizedSandboxPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Deterministic declaration lookup. Conflicting values at the same exact
@@ -223,6 +224,36 @@ pub fn can_execute(
     req: &TaskRequirement,
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
+    can_execute_inner(agent, req, catalog, None)
+}
+
+/// M6-B.5 `SECURITY_V1` admission predicate.
+///
+/// Semantically identical to [`can_execute`] except that the optional Task
+/// fine-policy layer is compared by the real policy order instead of by
+/// reference equality. The caller supplies the exact effective Task policy
+/// (`meet(P_generation, P_task)`) and the pinned AgentType's authored policy, so
+/// a Task policy in a different catalog revision but provably no wider than the
+/// AgentType's policy is a legal narrowing.
+///
+/// `COARSE_V1` MUST keep using [`can_execute`] and its frozen exact-reference
+/// relation.
+pub fn can_execute_security_v1(
+    agent: &AgentType,
+    req: &TaskRequirement,
+    effective_policy: &NormalizedSandboxPolicy,
+    agent_policy: &NormalizedSandboxPolicy,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    can_execute_inner(agent, req, catalog, Some((effective_policy, agent_policy)))
+}
+
+fn can_execute_inner(
+    agent: &AgentType,
+    req: &TaskRequirement,
+    catalog: &CapabilityCatalog,
+    security_policies: Option<(&NormalizedSandboxPolicy, &NormalizedSandboxPolicy)>,
+) -> Result<(), ContractError> {
     agent.contract.validate(catalog)?;
 
     if !agent
@@ -307,10 +338,24 @@ pub fn can_execute(
             capability: "continuity".into(),
         });
     }
-    if !sandbox_policy_within(&req.sandbox_policy, &agent.contract.sandbox_policy) {
-        return Err(ContractError::CapabilityMismatch {
-            capability: "sandbox_policy".into(),
-        });
+    match security_policies {
+        None => {
+            if !sandbox_policy_within(&req.sandbox_policy, &agent.contract.sandbox_policy) {
+                return Err(ContractError::CapabilityMismatch {
+                    capability: "sandbox_policy".into(),
+                });
+            }
+        }
+        Some((effective, agent_policy)) => {
+            // The effective Task policy is a real meet of authored revisions,
+            // so a distinct reference is not a conflict. It MUST stay within the
+            // pinned AgentType's authored ceiling.
+            if !is_within(effective, agent_policy) {
+                return Err(ContractError::SecurityUnenforceable {
+                    reason: "task effective sandbox policy is wider than the pinned agent type's authored policy".into(),
+                });
+            }
+        }
     }
     if let Some(required_anchor) = &req.required_anchor {
         if let Some(constraint) = &agent.contract.anchor_constraint {
@@ -856,6 +901,61 @@ pub fn is_valid_refinement(
     derived: &AgentType,
     catalog: &CapabilityCatalog,
 ) -> Result<(), ContractError> {
+    is_valid_refinement_inner(base, derived, catalog, |base, derived| {
+        if sandbox_policy_no_wider(
+            &derived.contract.sandbox_policy,
+            &base.contract.sandbox_policy,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidRefinement {
+                reason: "derived sandbox policy is wider than base sandbox policy".into(),
+            })
+        }
+    })
+}
+
+/// `SECURITY_V1` refinement: like [`is_valid_refinement`], but the authored
+/// sandbox policy is ordered by the real policy algebra instead of by reference
+/// equality.
+///
+/// The caller supplies the loaded authored policies of the base and derived
+/// revisions. A base with no authored policy imposes no policy ceiling; a base
+/// with one requires the derived revision to author a policy that is provably no
+/// wider. `COARSE_V1` MUST keep using [`is_valid_refinement`].
+pub fn is_valid_refinement_with_policies(
+    base: &AgentType,
+    derived: &AgentType,
+    base_policy: Option<&NormalizedSandboxPolicy>,
+    derived_policy: Option<&NormalizedSandboxPolicy>,
+    catalog: &CapabilityCatalog,
+) -> Result<(), ContractError> {
+    is_valid_refinement_inner(base, derived, catalog, |_, _| {
+        let Some(base_policy) = base_policy else {
+            return Ok(());
+        };
+        let derived_policy = derived_policy.ok_or_else(|| ContractError::InvalidRefinement {
+            reason: "derived SECURITY_V1 revision is missing its authored sandbox policy".into(),
+        })?;
+        if is_within(derived_policy, base_policy) {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidRefinement {
+                reason: "derived sandbox policy is wider than base sandbox policy".into(),
+            })
+        }
+    })
+}
+
+fn is_valid_refinement_inner<F>(
+    base: &AgentType,
+    derived: &AgentType,
+    catalog: &CapabilityCatalog,
+    sandbox_check: F,
+) -> Result<(), ContractError>
+where
+    F: FnOnce(&AgentType, &AgentType) -> Result<(), ContractError>,
+{
     base.contract.validate(catalog)?;
     derived.contract.validate(catalog)?;
 
@@ -881,9 +981,7 @@ pub fn is_valid_refinement(
     if derived_c.continuity < base_c.continuity {
         return invalid("derived continuity weakens base continuity");
     }
-    if !sandbox_policy_no_wider(&derived_c.sandbox_policy, &base_c.sandbox_policy) {
-        return invalid("derived sandbox policy is wider than base sandbox policy");
-    }
+    sandbox_check(base, derived)?;
     if let Some(constraint) = &base_c.anchor_constraint {
         if derived_c.anchor_constraint.as_ref() != Some(constraint) {
             return invalid("derived anchor does not satisfy base anchor constraint");
