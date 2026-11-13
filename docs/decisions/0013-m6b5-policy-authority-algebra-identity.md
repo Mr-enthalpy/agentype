@@ -388,11 +388,12 @@ Publication-time validation is not a substitute for a validated read. The schema
 guards make the relevant columns immutable, but the project's corruption
 discipline requires that a bypassing direct-SQL writer still fails closed:
 
-- `spawn_source_security_declaration` re-reads the declared `P_source` and
-  rejects it when `attempt_isolation = true`, matching
-  `validated_source_declaration`. The source contract has no independent field
-  that could attribute an isolation guarantee, so a repointed declaration MUST
-  NOT acquire one.
+- `spawn_source_security_declaration` validates its parent SpawnSource first
+  (canonical content and disposition overlay), then re-reads the declared
+  `P_source` and rejects it when `attempt_isolation = true`, matching
+  `validated_source_declaration`. A missing or corrupt parent MUST NOT be
+  reported as a legal `COARSE_V1` source with no declaration, and a repointed
+  declaration MUST NOT acquire an isolation guarantee.
 - `get_task_security_binding` compares `generation_security_mode(...)` with the
   Task's durable `security_contract_mode` before re-deriving the binding.
   Admission required the two modes to be equal; a read that sees a locally valid
@@ -467,6 +468,33 @@ RequiredAccess is therefore checked as
 AgentType's authored policy. B5.1 does not weaken the `SECURITY_V1` strict
 ordering to obtain this result; it supplies the comparison with the complete,
 explainable Task constraint.
+
+#### The binding policy is not the complete execution authority
+
+`TaskSecurityBinding.policy` is exactly `meet(P_generation, P_task_fine)`; it does
+not include the Task's coarse `workspace`/`network` upper bounds. For example a
+`ReadOnly` Task under a `Write` Generation keeps the Generation's write paths in
+`binding.policy()`, while the Task's actual authority permits neither writing nor
+deletion. B5.1 handles this correctly by applying `TaskAuthority` in every
+admission check, but the raw binding value MUST NOT become the physical compiler
+input.
+
+B5.2 MUST introduce a typed composite authority (for example
+`EffectiveTaskAuthority` or `QualifiedSecurityContract`) whose only constructor
+combines:
+
+```text
+TaskSecurityBinding.policy
++ durable Task coarse modes (required_workspace, required_network)
++ the actual bound AgentType authored ceiling
++ the SpawnSource authored ceiling
+```
+
+and whose type is what `compile_execution_security` accepts. Passing
+`binding.policy()` directly is forbidden. The composite MUST also record the
+exact source, binding and AgentType identities so Execution commitment can
+re-prove them. This is a B5.2 API requirement, not B5.1 runtime behavior; B5.1
+adds no `EffectiveTaskAuthority` type.
 
 `RequiredCapabilities` is deferred at admission because admission has only the
 Generation and Task policy objects, while the existing M6-B.2 matcher compares a
@@ -768,6 +796,9 @@ at most 256 `uses` and 256 `audience` members. `NameSet::allowed`,
 `EnvironmentPolicy::new`, `CredentialGrant::new`, `RequiredAccess::new` and
 `NormalizedSandboxPolicy::from_parts` reject an oversized collection, and the
 decoder rejects it before constructing a partial policy.
+`RequiredAccess::try_with_credentials` re-checks the merged credential set, so a
+value cannot cross the bound through a post-construction update; there is no
+infallible credential setter.
 
 Those per-dimension bounds alone still allow a maximal policy to be physically
 large, so one canonical sandbox policy document is additionally limited to
@@ -936,11 +967,29 @@ relation, which still compares policy references by equality for both
 `COARSE_V1` and `SECURITY_V1` requirements. Consequently a `SECURITY_V1`
 AgentType whose authored policy is a strict superset of the Task's effective
 policy is admissible under `can_execute_security_v1` but is not returned as an
-existing-agent candidate in B5.1. This is a pure semantic wiring gap, not an
-execution-authority leak: the coarse acquisition path cannot execute a
-`SECURITY_V1` Task. Mode-aware existing-agent matching and a policy-aware
-`more_specific_for` belong to B5.2. Until that lands, B5.1 MUST NOT claim that all
-four relations are policy-order aware.
+existing-agent candidate in B5.1.
+
+This is an explicit **scope amendment** to the initial B5.1 slice: B5.1 delivers
+the two relations where the policy order is already required for admission and
+refinement, and defers the other two to B5.2. It is not an execution-authority
+leak, because the coarse acquisition path cannot execute a `SECURITY_V1` Task
+and admission already rejects that path. It is nevertheless a hard B5.2
+acceptance item, not an optional optimization:
+
+```text
+B5.2 MUST deliver, with differential tests:
+  1. mode-aware match_existing_agents_for_task over the policy order;
+  2. policy-aware more_specific_for (including based_on and preselection);
+  3. the same order in can_provision/acquisition when a SECURITY_V1
+     existing agent is compared to a SECURITY_V1 Task;
+  4. no SECURITY_V1 candidate is silently dropped merely because its
+     policy reference differs but its policy is provably narrower.
+```
+
+B5.2 MUST NOT be declared complete while a `SECURITY_V1` Task that is admissible
+under `can_execute_security_v1` still loses an eligible existing-agent candidate
+because preselection uses reference equality. Until those items land, B5.1 MUST
+NOT claim that all four relations are policy-order aware.
 
 ### 10. `ActualAuthority` is defined by provable equality, not by a claim
 
