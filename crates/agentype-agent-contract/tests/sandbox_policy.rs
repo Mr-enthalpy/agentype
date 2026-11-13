@@ -491,7 +491,7 @@ fn task_local_coarse_fine_rejects_contradictions() {
             PathSet::any(),
             PathSet::deny_all(),
             PathSet::any(),
-            PathSet::any(),
+            PathSet::deny_all(),
             PathSet::any(),
         ),
         ..Default::default()
@@ -510,12 +510,38 @@ fn task_local_coarse_fine_rejects_contradictions() {
     )
     .is_err());
 
-    let networked = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+    // `Delete` is a content-modifying operation: a delete-only policy does not
+    // project to `ReadOnly`, so a `ReadOnly` Task cannot author it.
+    let delete_only = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
         files: FilePolicy::new(
             PathSet::any(),
             PathSet::deny_all(),
             PathSet::any(),
             PathSet::any(),
+            PathSet::any(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(validate_task_local_coarse_fine(
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+        Some(&delete_only)
+    )
+    .is_err());
+    assert!(validate_task_local_coarse_fine(
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+        Some(&delete_only)
+    )
+    .is_ok());
+
+    let networked = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::any(),
+            PathSet::deny_all(),
             PathSet::any(),
         ),
         network: NetworkEndpointSet::allowed([endpoint(
@@ -1052,6 +1078,35 @@ fn task_coarse_authority_narrows_only_the_coarse_dimensions() {
     assert!(
         check_required_access(&endpoint_required, &PolicyAccess::from_policy(&no_network)).is_err()
     );
+
+    // `Delete` is content modification, so it projects to `Write` and is removed
+    // by a `ReadOnly` Task ceiling just like write.
+    let files = full.files();
+    let mut deleting_parts = full.parts().clone();
+    deleting_parts.files = FilePolicy::new(
+        files.read().clone(),
+        PathSet::deny_all(),
+        files.execute().clone(),
+        PathSet::allowed([workspace(&["src", "lib"])]),
+        files.visible().clone(),
+    );
+    let deleting = NormalizedSandboxPolicy::from_parts(deleting_parts).unwrap();
+    assert_eq!(project_workspace(&deleting), WorkspaceMode::Write);
+    let read_only_deleting = task_coarse_authority(
+        &deleting,
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    )
+    .unwrap();
+    assert!(read_only_deleting.files().delete().is_empty());
+    let delete_required =
+        RequiredAccess::new([FileOperationClass::Delete], [], [], [], []).unwrap();
+    assert!(check_required_access(
+        &delete_required,
+        &PolicyAccess::from_policy(&read_only_deleting)
+    )
+    .is_err());
+    assert!(check_required_access(&delete_required, &PolicyAccess::from_policy(&deleting)).is_ok());
 }
 
 /// The builder enforces bounded path depth and component length before any
@@ -1126,4 +1181,133 @@ fn path_selector_collections_are_bounded() {
         ..Default::default()
     });
     assert!(over_policy_limit.is_err());
+}
+
+/// A legal pair of 256-rule policies can propose 65,536 intersection candidates.
+/// The result is unrepresentable (more than 256 distinct rules), so admission
+/// must fail closed after bounded work rather than enter a global quadratic scan.
+#[test]
+fn a_bounded_network_meet_rejects_an_unrepresentable_product() {
+    let left = network_only((0..MAX_NETWORK_ENDPOINTS).map(|index| {
+        NetworkEndpoint::new(
+            NetworkTransport::Any,
+            format!("host{index}.example.com"),
+            None,
+        )
+        .unwrap()
+    }));
+    let right = network_only((0..MAX_NETWORK_ENDPOINTS).map(|index| {
+        NetworkEndpoint::new(
+            NetworkTransport::Any,
+            "*",
+            Some(u16::try_from(index + 1).unwrap()),
+        )
+        .unwrap()
+    }));
+
+    assert!(meet(&left, &right).is_err());
+}
+
+/// The same 256 × 256 product can normalize back to the 256-rule bound. This
+/// must remain admissible: the bound applies to the represented result, not to
+/// the intermediate candidate count.
+#[test]
+fn a_large_network_product_that_simplifies_is_admissible() {
+    let left = network_only((0..MAX_NETWORK_ENDPOINTS).map(|index| {
+        NetworkEndpoint::new(
+            NetworkTransport::Tcp,
+            format!("host{index}.example.com"),
+            None,
+        )
+        .unwrap()
+    }));
+    let mut rules = (0..MAX_NETWORK_ENDPOINTS - 1)
+        .map(|index| {
+            NetworkEndpoint::new(
+                NetworkTransport::Any,
+                "*",
+                Some(u16::try_from(index + 1).unwrap()),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    rules.push(NetworkEndpoint::new(NetworkTransport::Tcp, "*", None).unwrap());
+    let right = network_only(rules);
+
+    let met = meet(&left, &right).unwrap();
+    let endpoints = met.network().endpoints().unwrap();
+    assert_eq!(endpoints.len(), MAX_NETWORK_ENDPOINTS);
+    assert!(endpoints.iter().all(|endpoint| endpoint.port().is_none()));
+}
+
+/// Exhaustive equivalence check for the grouped endpoint normalizer against the
+/// straightforward pairwise definition over a small domain. This keeps the
+/// `O(n log n)` implementation from drifting from the rule-subsumption semantics.
+#[test]
+fn grouped_network_normalization_matches_pairwise_subsumption() {
+    fn naive_allowed(endpoints: impl IntoIterator<Item = NetworkEndpoint>) -> NetworkEndpointSet {
+        let mut all: BTreeSet<NetworkEndpoint> = endpoints.into_iter().collect();
+        let keys: BTreeSet<(String, Option<u16>)> = all
+            .iter()
+            .map(|endpoint| (endpoint.host().to_string(), endpoint.port()))
+            .collect();
+        for (host, port) in keys {
+            let tcp = NetworkEndpoint::new(NetworkTransport::Tcp, host.clone(), port).unwrap();
+            let udp = NetworkEndpoint::new(NetworkTransport::Udp, host.clone(), port).unwrap();
+            if all.contains(&tcp) && all.contains(&udp) {
+                all.remove(&tcp);
+                all.remove(&udp);
+                all.insert(NetworkEndpoint::new(NetworkTransport::Any, host, port).unwrap());
+            }
+        }
+        if all.iter().any(|endpoint| {
+            endpoint.transport() == NetworkTransport::Any
+                && endpoint.host() == "*"
+                && endpoint.port().is_none()
+        }) {
+            return NetworkEndpointSet::Any;
+        }
+        let all = all.into_iter().collect::<Vec<_>>();
+        let kept = all
+            .iter()
+            .enumerate()
+            .filter(|(index, endpoint)| {
+                !all.iter()
+                    .enumerate()
+                    .any(|(other_index, other)| other_index != *index && other.covers(endpoint))
+            })
+            .map(|(_, endpoint)| endpoint.clone())
+            .collect::<BTreeSet<_>>();
+        NetworkEndpointSet::Allowed(kept)
+    }
+
+    let domain = [
+        NetworkTransport::Tcp,
+        NetworkTransport::Udp,
+        NetworkTransport::Any,
+    ]
+    .into_iter()
+    .flat_map(|transport| {
+        ["*", "a.example.com"].into_iter().flat_map(move |host| {
+            [None, Some(1)]
+                .into_iter()
+                .map(move |port| NetworkEndpoint::new(transport, host, port).unwrap())
+        })
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(domain.len(), 12);
+
+    for subset in 0u16..(1 << domain.len()) {
+        let selected = domain
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| subset & (1 << index) != 0)
+            .map(|(_, endpoint)| endpoint.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            NetworkEndpointSet::allowed(selected.clone()),
+            naive_allowed(selected),
+            "subset {subset:#x}"
+        );
+    }
 }

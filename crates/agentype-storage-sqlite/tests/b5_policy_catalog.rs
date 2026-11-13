@@ -494,6 +494,90 @@ fn agent_type_security_mode_is_published_atomically_and_write_once() {
         .is_err());
 }
 
+/// P2: publication closure is a storage invariant, not only an API convention.
+/// An already-published `COARSE_V1` AgentType or SpawnSource must reject a first
+/// declaration inserted directly, so raw SQL cannot upgrade a revision in place.
+#[test]
+fn published_revisions_reject_late_security_declarations() {
+    let db = Db::new("late-declaration");
+    let kernel = db.kernel();
+    publish_adapter_policy(&kernel);
+
+    let coarse = agent_type();
+    kernel.publish_agent_type(&coarse).unwrap();
+    let source = source_at(2);
+    kernel.publish_spawn_source(&source).unwrap();
+
+    let conn = db.raw();
+    let declarations: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_type_security_declarations)
+                  + (SELECT COUNT(*) FROM spawn_source_security_declarations)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        declarations, 0,
+        "a COARSE_V1 publication has no declaration row"
+    );
+
+    // Publication closure rejects a first declaration after the disposition
+    // marker exists, even though the declaration table itself has no row to
+    // conflict with.
+    let error = conn
+        .execute(
+            "INSERT INTO agent_type_security_declarations(
+                 type_id, revision, security_contract_mode, created_at)
+             VALUES(?1,?2,'SECURITY_V1',1000.0)",
+            rusqlite::params![coarse.type_ref.id().as_str(), coarse.type_ref.revision()],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("before publication"), "{error}");
+
+    // A SpawnSource declaration may omit its ceiling, so `source_policy = NULL`
+    // is not an escape hatch either.
+    let error = conn
+        .execute(
+            "INSERT INTO spawn_source_security_declarations(
+                 source_id, revision, security_contract_mode, source_policy_id,
+                 source_policy_revision, source_policy_digest, enforcement_protocol,
+                 enforcement_profile, enforcement_profile_version, created_at)
+             VALUES(?1,?2,'SECURITY_V1',NULL,NULL,NULL,
+                    'agentype-enforcement','policy-only',1,1000.0)",
+            rusqlite::params![
+                source.source_ref.id().as_str(),
+                source.source_ref.revision()
+            ],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("before publication"), "{error}");
+    drop(conn);
+
+    // The rejected writes changed neither the durable mode nor the declaration
+    // set: both revisions still read as exactly COARSE_V1.
+    assert_eq!(
+        kernel.agent_type_security_mode(&coarse.type_ref).unwrap(),
+        SecurityContractMode::CoarseV1
+    );
+    assert_eq!(
+        kernel
+            .spawn_source_security_mode(&source.source_ref)
+            .unwrap(),
+        SecurityContractMode::CoarseV1
+    );
+    let conn = db.raw();
+    let declarations: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_type_security_declarations)
+                  + (SELECT COUNT(*) FROM spawn_source_security_declarations)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(declarations, 0);
+}
+
 #[test]
 fn security_agent_type_requires_a_policy_exactly_projected_and_claim_consistent() {
     let kernel = memory_kernel();

@@ -267,6 +267,31 @@ fn policy_with_files_and_network(
     .unwrap()
 }
 
+/// A policy whose only workspace modification is deletion. It projects to
+/// `Write`, because deleting content or a directory entry is modification.
+fn policy_with_delete_and_network(
+    delete: PathSet,
+    network: NetworkEndpointSet,
+) -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            delete,
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network,
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
 /// Publish a `SECURITY_V1` AgentType with the given authored policy and coarse
 /// fields. Empty capabilities keep this focused on sandbox authority.
 fn publish_secure_type(
@@ -456,6 +481,38 @@ fn publish_write_capability(kernel: &Kernel) {
     kernel
         .publish_capability_definition(
             &write_capability(),
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Set,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: Some(projection),
+            },
+        )
+        .unwrap();
+}
+
+fn delete_capability() -> CapabilityRef {
+    CapabilityRef::new("filesystem.delete", 1).unwrap()
+}
+
+fn delete_value() -> CapabilityValue {
+    CapabilityValue::Set(["src".to_string()].into_iter().collect())
+}
+
+fn publish_delete_capability(kernel: &Kernel) {
+    let projection = PolicyProjection::new(
+        PolicyAccessDimension::FileOperationClass,
+        [(
+            "src".to_string(),
+            PolicyOperation::FileOperation(FileOperationClass::Delete),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    kernel
+        .publish_capability_definition(
+            &delete_capability(),
             &CapabilityDefinition {
                 matcher_kind: MatcherKind::Set,
                 security_class: SecurityClass::Sandbox,
@@ -1794,6 +1851,78 @@ fn a_read_only_task_cannot_require_a_write_capability() {
         )
         .unwrap();
     // `task_spec()` is `ReadOnly`, so the coarse ceiling removes every write.
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, capabilities),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("required access is not satisfied"),
+        "{error}"
+    );
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+}
+
+/// P1-2, delete side: `ReadOnly` is an upper bound on content and
+/// directory-entry modification, so a Task that declares it cannot be satisfied
+/// by a delete capability even when the Generation's fine policy allows delete.
+#[test]
+fn a_read_only_task_cannot_require_a_delete_capability() {
+    let db = Db::new("read-only-task-delete-floor");
+    let kernel = db.kernel();
+    publish_delete_capability(&kernel);
+
+    let authored = policy_with_delete_and_network(
+        PathSet::allowed([workspace_path(&["src"])]),
+        restricted_network(),
+    );
+    // Deleting modifies the workspace, so the policy projects to `Write` and can
+    // legally back a `Write` AgentType and Generation.
+    assert_eq!(project_workspace(&authored), WorkspaceMode::Write);
+    let generation_reference = policy_ref("delete-generation", 1);
+    let agent_reference = policy_ref("delete-agent", 1);
+    kernel
+        .publish_sandbox_policy(&generation_reference, &authored)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&agent_reference, &authored)
+        .unwrap();
+
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(delete_capability(), delete_value());
+    let pin = publish_secure_type_with_capabilities(
+        &kernel,
+        "secure-deleter",
+        agent_reference,
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+        capabilities.clone(),
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    // `task_spec()` is `ReadOnly`, so the coarse ceiling removes delete as well
+    // as write before the required-access check.
     let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
     let error = kernel
         .admit_typed_proposal_with_security_mode(
