@@ -1412,10 +1412,102 @@ fn network_set_within(inner: &NetworkEndpointSet, outer: &NetworkEndpointSet) ->
         NetworkEndpointSet::Any => outer.is_any(),
         NetworkEndpointSet::Allowed(inner) => match outer {
             NetworkEndpointSet::Any => true,
-            NetworkEndpointSet::Allowed(outer) => inner
-                .iter()
-                .all(|endpoint| outer.iter().any(|allowed| allowed.covers(endpoint))),
+            NetworkEndpointSet::Allowed(outer) => network_allowed_union_within(inner, outer),
         },
+    }
+}
+
+/// Host projection of the finite endpoint grammar. `*` is the only wildcard, so
+/// an exact host and the single "every other host" atom partition the host
+/// space without enumerating any concrete host twice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NetworkHostAtom {
+    Exact(String),
+    Other,
+}
+
+/// Port projection of the finite endpoint grammar. `None` is the "any port"
+/// wildcard; `Other` partitions every port not named by an exact rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkPortAtom {
+    Exact(u16),
+    Other,
+}
+
+/// Whether the union of `inner` rules is contained in the union of `outer`
+/// rules.
+///
+/// A single inner rule may be covered by several outer rules together, e.g.
+/// `ANY:*:443` is covered by `TCP:*:443 ∪ UDP:*:*`. The endpoint grammar is a
+/// product of finite transport, host and port partitions, so we mark the atoms
+/// covered by the outer union and require every inner atom to be marked. This is
+/// exact set containment, not "some single outer rule covers the whole rule".
+fn network_allowed_union_within(
+    inner: &BTreeSet<NetworkEndpoint>,
+    outer: &BTreeSet<NetworkEndpoint>,
+) -> bool {
+    let mut named_hosts = BTreeSet::new();
+    let mut named_ports = BTreeSet::new();
+    for endpoint in inner.iter().chain(outer.iter()) {
+        if endpoint.host() != "*" {
+            named_hosts.insert(endpoint.host().to_string());
+        }
+        if let Some(port) = endpoint.port() {
+            named_ports.insert(port);
+        }
+    }
+    let mut host_atoms: Vec<NetworkHostAtom> = named_hosts
+        .into_iter()
+        .map(NetworkHostAtom::Exact)
+        .collect();
+    host_atoms.push(NetworkHostAtom::Other);
+    let mut port_atoms: Vec<NetworkPortAtom> = named_ports
+        .into_iter()
+        .map(NetworkPortAtom::Exact)
+        .collect();
+    port_atoms.push(NetworkPortAtom::Other);
+    let transport_atoms = [NetworkTransport::Tcp, NetworkTransport::Udp];
+
+    inner.iter().all(|rule| {
+        transport_atoms.iter().all(|transport| {
+            if !network_transport_covers(rule.transport(), *transport) {
+                return true;
+            }
+            host_atoms.iter().all(|host| {
+                if !network_host_covers(rule.host(), host) {
+                    return true;
+                }
+                port_atoms.iter().all(|port| {
+                    if !network_port_covers(rule.port(), *port) {
+                        return true;
+                    }
+                    outer.iter().any(|allowed| {
+                        network_transport_covers(allowed.transport(), *transport)
+                            && network_host_covers(allowed.host(), host)
+                            && network_port_covers(allowed.port(), *port)
+                    })
+                })
+            })
+        })
+    })
+}
+
+fn network_transport_covers(rule: NetworkTransport, atom: NetworkTransport) -> bool {
+    rule == NetworkTransport::Any || rule == atom
+}
+
+fn network_host_covers(rule: &str, atom: &NetworkHostAtom) -> bool {
+    match atom {
+        NetworkHostAtom::Exact(host) => rule == "*" || rule == host,
+        NetworkHostAtom::Other => rule == "*",
+    }
+}
+
+fn network_port_covers(rule: Option<u16>, atom: NetworkPortAtom) -> bool {
+    match (rule, atom) {
+        (None, _) => true,
+        (Some(rule), NetworkPortAtom::Exact(port)) => rule == port,
+        (Some(_), NetworkPortAtom::Other) => false,
     }
 }
 
@@ -2063,6 +2155,46 @@ pub fn validate_task_local_coarse_fine(
     Ok(())
 }
 
+/// Prove that a Task's coarse execution modes remain satisfiable **after** the
+/// Task/Generation policy meet (ADR-0013 §5).
+///
+/// `fold_generation_policy_security_v1` compares coarse levels before the meet,
+/// but an intersection can erase a positive requirement even when both layers
+/// are individually valid: `write {src} ∩ write {tests} = ∅` is a legal
+/// deny-all write set, not a `PolicyConflict`. A Task whose durable
+/// `required_workspace` is `Write` therefore MUST be rejected at admission if
+/// the admitted policy has no writable region. The same applies to the positive
+/// network modes: `Restricted` needs at least one endpoint and `Enabled` needs
+/// every endpoint.
+///
+/// `ReadOnly` and `Disabled` are upper bounds already carried by the durable
+/// coarse requirement and add no positive check here.
+pub fn validate_effective_task_execution_modes(
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+    policy: &NormalizedSandboxPolicy,
+) -> Result<(), PolicyConflict> {
+    if workspace == WorkspaceMode::Write && policy.files().write().is_empty() {
+        return Err(conflict(
+            "task requires writing but the admitted policy allows no write region",
+        ));
+    }
+    match network {
+        NetworkPolicy::Restricted if project_network(policy) == NetworkPolicy::Disabled => {
+            return Err(conflict(
+                "task network is restricted but the admitted policy allows no network endpoint",
+            ));
+        }
+        NetworkPolicy::Enabled if project_network(policy) != NetworkPolicy::Enabled => {
+            return Err(conflict(
+                "task network is enabled but the admitted policy does not allow every endpoint",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Meet an optional authored layer onto a base policy.
 ///
 /// `None` means the object authored no additional fine layer; it adds no
@@ -2321,6 +2453,16 @@ impl PendingObligation {
 /// identity and to the deferred `R_min` components. It is never a second
 /// authored policy and carries no independent mode: the parent
 /// `task_agent_requirements.security_contract_mode` remains the sole owner.
+///
+/// **The bound policy is a fine-policy derivation, not the Task's complete
+/// authority.** When the Task authors no fine layer, the effective policy can
+/// still contain authority granted only by the Generation ceiling — for example
+/// a `ReadOnly` Task under a `Write` Generation retains the Generation's write
+/// paths in this policy. The Task's coarse `required_workspace` /
+/// `required_network` fields remain an independent durable requirement, and any
+/// later execution-plan compilation MUST compose and verify both. A consumer
+/// MUST NOT compile a plan from this policy alone and treat it as the complete
+/// effective Task permission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskSecurityBinding {
     policy: NormalizedSandboxPolicy,

@@ -23,11 +23,12 @@ use agentype_agent_contract::{
     sandbox_policy_content_digest, sandbox_policy_from_canonical_json,
     security_derivation_content_digest, security_derivation_from_canonical_json,
     task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
-    validate_generation_coarse_fine, validate_task_local_coarse_fine, AgentRequirementDraft,
-    AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode, ExistingAgentCandidate,
-    GenerationPolicy, NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput,
-    RequiredAccess, SandboxPolicyRef, SecurityContractMode, SecurityDerivation,
-    TaskAgentRequirement, TaskPlacement, TaskSecurityBinding,
+    validate_effective_task_execution_modes, validate_generation_coarse_fine,
+    validate_task_local_coarse_fine, AgentRequirementDraft, AgentTypeRef, AgentTypeSelector,
+    CapabilityCatalog, ContinuityMode, ExistingAgentCandidate, GenerationPolicy,
+    NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput, RequiredAccess,
+    SandboxPolicyRef, SecurityContractMode, SecurityDerivation, TaskAgentRequirement,
+    TaskPlacement, TaskSecurityBinding,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -1354,6 +1355,20 @@ pub fn prepare_task_security_binding(
         }
     }
     let effective = resolved.effective;
+
+    // A legal meet can still erase a positive coarse requirement that both
+    // authored layers satisfied separately. Re-prove the Task's execution modes
+    // on the admitted policy before the binding becomes durable.
+    validate_effective_task_execution_modes(
+        requirement.hard.required_workspace,
+        requirement.hard.required_network,
+        &effective,
+    )
+    .map_err(|error| {
+        Error::invalid_authority(format!(
+            "SECURITY_V1 task coarse requirement is not satisfied by its admitted policy: {error}"
+        ))
+    })?;
 
     let catalog = load_capability_catalog(tx)?;
     let required_access = required_access_for(requirement, &catalog)?;
