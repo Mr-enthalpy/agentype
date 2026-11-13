@@ -353,6 +353,72 @@ fn capability_definition_version_column_corruption_fails_closed() {
 }
 
 #[test]
+fn capability_publication_rejects_an_invalid_projection_before_persisting() {
+    let kernel = memory_kernel();
+    let reference = CapabilityRef::new("filesystem.write", 1).unwrap();
+    let projection = PolicyProjection::new(
+        PolicyAccessDimension::FileOperationClass,
+        [(
+            "src".to_string(),
+            PolicyOperation::FileOperation(FileOperationClass::Write),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+
+    // A hand-built definition can bypass `PolicyProjection`'s constructor. The
+    // publisher must re-run the whole-definition invariant before its digest and
+    // insert: otherwise an authoritative read would fail closed forever on an
+    // immutable row.
+    let invalid = [
+        CapabilityDefinition {
+            matcher_kind: MatcherKind::Bool,
+            security_class: SecurityClass::Sandbox,
+            polarity: CapabilityPolarity::Ability,
+            policy_projection: Some(projection.clone()),
+        },
+        CapabilityDefinition {
+            matcher_kind: MatcherKind::Set,
+            security_class: SecurityClass::Sandbox,
+            polarity: CapabilityPolarity::Restriction,
+            policy_projection: Some(projection.clone()),
+        },
+        CapabilityDefinition {
+            matcher_kind: MatcherKind::Set,
+            security_class: SecurityClass::Functional,
+            polarity: CapabilityPolarity::Ability,
+            policy_projection: Some(projection.clone()),
+        },
+    ];
+    for definition in &invalid {
+        let error = kernel
+            .publish_capability_definition(&reference, definition)
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("projection"),
+            "{error}"
+        );
+    }
+
+    // Reusing the same immutable identity proves no rejected definition became
+    // durable, and the following catalog read must still succeed.
+    kernel
+        .publish_capability_definition(
+            &reference,
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Set,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: Some(projection),
+            },
+        )
+        .unwrap();
+    let catalog = kernel.load_capability_catalog().unwrap();
+    assert_eq!(catalog.get(&reference).unwrap().canonical_version(), 2);
+}
+
+#[test]
 fn sandbox_policy_version_must_fit_u32() {
     let db = Db::new("policy-version-width");
     let kernel = db.kernel();

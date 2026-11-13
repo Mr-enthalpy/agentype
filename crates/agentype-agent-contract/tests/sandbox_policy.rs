@@ -655,3 +655,136 @@ fn declared_collections_stay_canonical() {
     let set = NameSet::allowed(tools.iter().cloned()).unwrap();
     assert_eq!(set.names().unwrap().len(), 1);
 }
+
+fn network_only<I>(endpoints: I) -> NormalizedSandboxPolicy
+where
+    I: IntoIterator<Item = NetworkEndpoint>,
+{
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        network: NetworkEndpointSet::allowed(endpoints),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+fn top_network_policy() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        network: NetworkEndpointSet::Any,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// The union of several outer rules may cover one inner rule even when no single
+/// outer rule does. Containment is over allowed *sets*, not rule-by-rule
+/// subsumption.
+#[test]
+fn network_containment_compares_the_union_of_outer_rules() {
+    let any_transport = network_only([endpoint(NetworkTransport::Any, "*", Some(443))]);
+    let split = network_only([
+        endpoint(NetworkTransport::Tcp, "*", Some(443)),
+        endpoint(NetworkTransport::Udp, "*", None),
+    ]);
+
+    assert!(is_within(&any_transport, &split));
+    assert!(!is_within(&split, &any_transport));
+
+    // `meet` already normalizes the two transport slices back to the `ANY` rule,
+    // so the failure of the old single-rule check also broke the GLB law.
+    let met = meet(&any_transport, &split).unwrap();
+    assert_eq!(
+        met.network()
+            .endpoints()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![endpoint(NetworkTransport::Any, "*", Some(443))]
+    );
+    assert!(is_within(&met, &any_transport));
+    assert!(is_within(&met, &split));
+
+    // A union of exact hosts never covers the `*` host atom.
+    let wildcard_host = network_only([endpoint(NetworkTransport::Tcp, "*", Some(443))]);
+    let exact_hosts = network_only([
+        endpoint(NetworkTransport::Tcp, "a.example.com", Some(443)),
+        endpoint(NetworkTransport::Tcp, "b.example.com", Some(443)),
+    ]);
+    assert!(!is_within(&wildcard_host, &exact_hosts));
+
+    // Neither does a union of exact ports cover the "any port" atom.
+    let any_port = network_only([endpoint(NetworkTransport::Tcp, "a.example.com", None)]);
+    let exact_ports = network_only([
+        endpoint(NetworkTransport::Tcp, "a.example.com", Some(443)),
+        endpoint(NetworkTransport::Tcp, "a.example.com", Some(8443)),
+    ]);
+    assert!(!is_within(&any_port, &exact_ports));
+}
+
+/// `is_within` is a preorder and `meet` is its greatest lower bound over the
+/// finite transport/host/port grammar, including wildcard and mixed rules.
+#[test]
+fn network_order_is_a_preorder_with_a_greatest_lower_bound() {
+    let mut policies = vec![
+        network_only([]),
+        top_network_policy(),
+        // Universal endpoint spelled as an explicit rule (semantically top).
+        network_only([endpoint(NetworkTransport::Any, "*", None)]),
+        // A rule that only the union of several rules can cover.
+        network_only([
+            endpoint(NetworkTransport::Tcp, "*", Some(443)),
+            endpoint(NetworkTransport::Udp, "*", None),
+        ]),
+        // `{TCP, UDP}` normalizes to `ANY` at one host/port.
+        network_only([
+            endpoint(NetworkTransport::Tcp, "api.example.com", Some(443)),
+            endpoint(NetworkTransport::Udp, "api.example.com", Some(443)),
+        ]),
+    ];
+    for rule in [
+        endpoint(NetworkTransport::Any, "*", Some(443)),
+        endpoint(NetworkTransport::Tcp, "*", Some(443)),
+        endpoint(NetworkTransport::Udp, "*", None),
+        endpoint(NetworkTransport::Any, "api.example.com", Some(443)),
+        endpoint(NetworkTransport::Tcp, "api.example.com", None),
+        endpoint(NetworkTransport::Udp, "api.example.com", Some(80)),
+        endpoint(NetworkTransport::Any, "db.example.com", Some(5432)),
+    ] {
+        policies.push(network_only([rule]));
+    }
+
+    for policy in &policies {
+        assert!(is_within(policy, policy), "reflexivity failed: {policy:?}");
+    }
+
+    for left in &policies {
+        for right in &policies {
+            let met = meet(left, right).unwrap();
+            assert!(is_within(&met, left), "meet is not a lower bound: {met:?}");
+            assert!(is_within(&met, right), "meet is not a lower bound: {met:?}");
+        }
+    }
+
+    for a in &policies {
+        for b in &policies {
+            for c in &policies {
+                if is_within(a, b) && is_within(b, c) {
+                    assert!(is_within(a, c), "transitivity failed: {a:?} {b:?} {c:?}");
+                }
+            }
+        }
+    }
+
+    for lower in &policies {
+        for left in &policies {
+            for right in &policies {
+                if is_within(lower, left) && is_within(lower, right) {
+                    assert!(
+                        is_within(lower, &meet(left, right).unwrap()),
+                        "meet is not the greatest lower bound: {lower:?} {left:?} {right:?}"
+                    );
+                }
+            }
+        }
+    }
+}

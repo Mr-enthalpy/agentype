@@ -7,8 +7,8 @@
 //! policy. They do not compile or execute a security plan.
 
 use agentype_agent_contract::{
-    sandbox_policy_content_digest, AffinityConstraint, AgentRequirementDraft, AgentType,
-    AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityDefinition,
+    project_workspace, sandbox_policy_content_digest, AffinityConstraint, AgentRequirementDraft,
+    AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityDefinition,
     CapabilityPolarity, CapabilityRef, CapabilityValue, ContinuityMode, CredentialAuthorizationId,
     CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy, FileOperationClass, FilePolicy,
     GenerationPolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet,
@@ -207,6 +207,76 @@ fn policy_with_credential() -> NormalizedSandboxPolicy {
 
 fn type_ref(id: &str, revision: u64) -> AgentTypeRef {
     AgentTypeRef::new(id, revision).unwrap()
+}
+
+fn workspace_path(components: &[&str]) -> PathSelector {
+    PathSelector::workspace(components.iter().copied()).unwrap()
+}
+
+fn endpoint(host: &str) -> NetworkEndpoint {
+    NetworkEndpoint::new(NetworkTransport::Tcp, host, Some(443)).unwrap()
+}
+
+/// A policy with an explicit read-anything / write-narrow / restricted-network
+/// shape, so the only dimension under test is the supplied one.
+fn policy_with_files_and_network(
+    write: PathSet,
+    network: NetworkEndpointSet,
+) -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            write,
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network,
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+/// Publish a `SECURITY_V1` AgentType with the given authored policy and coarse
+/// fields. Empty capabilities keep this focused on sandbox authority.
+fn publish_secure_type(
+    kernel: &Kernel,
+    id: &str,
+    reference: SandboxPolicyRef,
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+) -> AgentTypeRef {
+    let mut agent = agent_type(id, BTreeMap::new());
+    agent.contract.security.workspace = workspace;
+    agent.contract.security.network = network;
+    agent.contract.sandbox_policy = Some(reference);
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent.type_ref
+}
+
+/// A rejected admission must not leave a half-written Task or binding behind:
+/// the whole command is one transaction.
+fn assert_no_durable_task_rows(db: &Db) {
+    let conn = db.raw();
+    for table in [
+        "tasks",
+        "generation_task_bindings",
+        "task_security_bindings",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} must be empty after a rejected admission");
+    }
 }
 
 fn read_capability() -> CapabilityRef {
@@ -904,6 +974,240 @@ fn a_task_read_only_contradiction_with_its_authored_policy_is_rejected() {
             .contains("coarse fields contradict its authored sandbox policy"),
         "{error}"
     );
+}
+
+#[test]
+fn an_empty_post_meet_write_region_rejects_a_write_task() {
+    let db = Db::new("write-meet-empty");
+    let kernel = db.kernel();
+    let generation_reference = policy_ref("generation-policy", 1);
+    let task_reference = policy_ref("task-policy", 1);
+    let agent_reference = policy_ref("agent-policy", 1);
+    let restricted = restricted_network();
+
+    // Both authored layers individually allow writing, and both project to
+    // `Write`. Their meet is a legal deny-all write set, so only a check on the
+    // admitted policy can see that the Task's `Write` requirement is now
+    // unsatisfiable.
+    kernel
+        .publish_sandbox_policy(
+            &generation_reference,
+            &policy_with_files_and_network(
+                PathSet::allowed([workspace_path(&["src"])]),
+                restricted.clone(),
+            ),
+        )
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(
+            &task_reference,
+            &policy_with_files_and_network(
+                PathSet::allowed([workspace_path(&["tests"])]),
+                restricted.clone(),
+            ),
+        )
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(
+            &agent_reference,
+            &policy_with_files_and_network(
+                PathSet::allowed([workspace_path(&["src"]), workspace_path(&["tests"])]),
+                restricted,
+            ),
+        )
+        .unwrap();
+
+    let pin = publish_secure_type(
+        &kernel,
+        "secure-writer",
+        agent_reference,
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec().write());
+
+    let mut layered = draft(pin, BTreeMap::new());
+    layered.sandbox_policy = Some(task_reference);
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coarse requirement is not satisfied"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no write region"), "{error}");
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+}
+
+#[test]
+fn an_empty_post_meet_network_rejects_a_restricted_task() {
+    let db = Db::new("network-meet-empty");
+    let kernel = db.kernel();
+    let generation_reference = policy_ref("generation-policy", 1);
+    let task_reference = policy_ref("task-policy", 1);
+    let agent_reference = policy_ref("agent-policy", 1);
+    let no_write = PathSet::deny_all();
+
+    kernel
+        .publish_sandbox_policy(
+            &generation_reference,
+            &policy_with_files_and_network(
+                no_write.clone(),
+                NetworkEndpointSet::allowed([endpoint("example.com")]),
+            ),
+        )
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(
+            &task_reference,
+            &policy_with_files_and_network(
+                no_write.clone(),
+                NetworkEndpointSet::allowed([endpoint("other.com")]),
+            ),
+        )
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(
+            &agent_reference,
+            &policy_with_files_and_network(
+                no_write,
+                NetworkEndpointSet::allowed([endpoint("example.com"), endpoint("other.com")]),
+            ),
+        )
+        .unwrap();
+
+    let pin = publish_secure_type(
+        &kernel,
+        "secure-reader",
+        agent_reference,
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    // `draft` requires `Restricted` network, and both authored layers satisfy
+    // it separately; the meet's empty allowlist projects to `Disabled`.
+    let mut layered = draft(pin, BTreeMap::new());
+    layered.sandbox_policy = Some(task_reference);
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coarse requirement is not satisfied"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no network endpoint"), "{error}");
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+}
+
+#[test]
+fn a_binding_keeps_generation_write_under_a_read_only_task() {
+    let kernel = memory_kernel();
+    let generation_reference = policy_ref("generation-policy", 1);
+    let agent_reference = policy_ref("agent-policy", 1);
+    let generation_policy_value = policy_with_files_and_network(
+        PathSet::allowed([workspace_path(&["src"])]),
+        restricted_network(),
+    );
+    kernel
+        .publish_sandbox_policy(&generation_reference, &generation_policy_value)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&agent_reference, &generation_policy_value)
+        .unwrap();
+
+    let pin = publish_secure_type(
+        &kernel,
+        "secure-writer",
+        agent_reference,
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    // The Task is read-only and authors no fine layer, so its binding is the
+    // Generation policy and still carries the Generation's write paths.
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, BTreeMap::new()),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+
+    let requirement = kernel
+        .get_task_agent_requirement(&task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(requirement.hard.required_workspace, WorkspaceMode::ReadOnly);
+    assert_eq!(requirement.hard.sandbox_policy, None);
+
+    let binding = kernel.get_task_security_binding(&task_id).unwrap().unwrap();
+    assert_eq!(binding.policy(), &generation_policy_value);
+    assert_eq!(project_workspace(binding.policy()), WorkspaceMode::Write);
+    assert!(binding
+        .policy()
+        .files()
+        .write()
+        .contains(&workspace_path(&["src"])));
 }
 
 #[test]
