@@ -167,6 +167,69 @@ pub fn provisioning_admin_surface() {}
 /// ```
 pub fn catalog_admin_surface() {}
 
+/// The M6-B.5 B5.2 pure composite-authority and policy-order surface, as a
+/// `no_run` doctest.
+///
+/// These are pure, non-authoritative contract values: constructing one performs
+/// no I/O and grants no execution authority. The composite is the only place a
+/// `SECURITY_V1` Task's four authority terms are folded; a consumer must never
+/// compile a plan from the durable binding policy alone.
+///
+/// ```no_run
+/// use agentype_agent_contract::{
+///     CapabilityCatalog, EffectiveTaskAuthority, QualifiedExistingAgentCandidate,
+///     SecurityRevision, SpawnSource, SpawnSourceSecurityDeclaration, TaskAgentRequirement,
+///     TaskPlacement, TaskSecurityBinding, TaskSecurityCeiling,
+/// };
+/// use agentype_core::{GenerationId, LogicalAgentId, TaskId};
+///
+/// #[allow(clippy::too_many_arguments)]
+/// fn compose(
+///     task: &TaskId,
+///     generation: &GenerationId,
+///     agent: &LogicalAgentId,
+///     binding: &TaskSecurityBinding,
+///     requirement: &TaskAgentRequirement,
+///     revision: &SecurityRevision<'_>,
+///     source: &SpawnSource,
+///     declaration: &SpawnSourceSecurityDeclaration,
+///     ceiling: &TaskSecurityCeiling,
+///     candidates: &[QualifiedExistingAgentCandidate<'_>],
+///     placement: &TaskPlacement,
+///     catalog: &CapabilityCatalog,
+/// ) {
+///     let _ = SecurityRevision::new(
+///         revision.agent_type(),
+///         revision.mode(),
+///         revision.authored_policy(),
+///     );
+///     let _ = TaskSecurityCeiling::from_binding(task.clone(), binding, requirement);
+///     let _ = EffectiveTaskAuthority::new(
+///         task.clone(),
+///         generation.clone(),
+///         agent.clone(),
+///         binding,
+///         requirement,
+///         revision,
+///         source,
+///         declaration,
+///         None,
+///     );
+///     let _ = agentype_agent_contract::match_existing_agents_security_v1(
+///         revision, ceiling, requirement, placement, candidates, catalog,
+///     );
+///     let _ = agentype_agent_contract::more_specific_for_with_policies(
+///         revision,
+///         revision,
+///         &requirement.hard,
+///         ceiling,
+///         catalog,
+///     );
+///     let _ = candidates.first().map(|candidate| candidate.candidate());
+/// }
+/// ```
+pub fn b5_composite_authority_surface() {}
+
 /// Boundary probes: one `compile_fail` doctest per unreachable item.
 ///
 /// The numbering is the boundary list this milestone was audited against.
