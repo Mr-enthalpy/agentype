@@ -10,6 +10,7 @@
 //! specificity; capability semantics come from the catalog, not from either
 //! AgentType.
 
+use crate::authority::{SecurityRevision, TaskSecurityCeiling};
 use crate::capability::{
     join_requirement_values, value_satisfies, value_within, Assurance, CapabilityCatalog,
     CapabilityClaim, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
@@ -860,6 +861,26 @@ fn authority_no_wider(
     b: &AgentTypeContract,
     catalog: &CapabilityCatalog,
 ) -> bool {
+    authority_no_wider_inner(
+        a,
+        b,
+        catalog,
+        sandbox_policy_no_wider(&a.sandbox_policy, &b.sandbox_policy),
+    )
+}
+
+/// The frozen authority order with a caller-supplied sandbox verdict.
+///
+/// Only the sandbox dimension is replaceable: `COARSE_V1` keeps reference
+/// equality, while `SECURITY_V1` supplies `is_within` over the loaded authored
+/// policies. Every other dimension is listed exactly once so the two paths
+/// cannot drift.
+fn authority_no_wider_inner(
+    a: &AgentTypeContract,
+    b: &AgentTypeContract,
+    catalog: &CapabilityCatalog,
+    sandbox_no_wider: bool,
+) -> bool {
     a.allowed_information_functions
         .iter()
         .all(|f| b.allowed_information_functions.contains(f))
@@ -869,7 +890,7 @@ fn authority_no_wider(
         && workspace_rank(a.security.workspace) <= workspace_rank(b.security.workspace)
         && network_rank(a.security.network) <= network_rank(b.security.network)
         && (!b.security.requires_attempt_isolation || a.security.requires_attempt_isolation)
-        && sandbox_policy_no_wider(&a.sandbox_policy, &b.sandbox_policy)
+        && sandbox_no_wider
         && anchor_no_wider(&a.anchor_constraint, &b.anchor_constraint)
         && capability_provision_no_wider(a, b, catalog)
 }
@@ -891,6 +912,52 @@ pub fn more_specific_for(
     }
     authority_no_wider(&a.contract, &b.contract, catalog)
         && !authority_no_wider(&b.contract, &a.contract, catalog)
+}
+
+/// `SECURITY_V1` preselection order: [`more_specific_for`] with the authored
+/// sandbox policies ordered by the real policy algebra.
+///
+/// Both revisions must be `SECURITY_V1` and carry their loaded authored policy,
+/// and both must be executable against the exact Task effective policy
+/// ([`can_execute_security_v1`]). A candidate that is not executable is never
+/// ranked, exactly as in the frozen relation. A reference mismatch alone is not
+/// incomparability: `A` is more specific than `B` when `P_A ⊆ P_B` and at least
+/// one dimension (including sandbox) is strictly narrower.
+///
+/// `COARSE_V1` MUST keep using [`more_specific_for`].
+pub fn more_specific_for_with_policies(
+    a: &SecurityRevision<'_>,
+    b: &SecurityRevision<'_>,
+    req: &TaskRequirement,
+    ceiling: &TaskSecurityCeiling,
+    catalog: &CapabilityCatalog,
+) -> bool {
+    if a.agent_type().type_ref == b.agent_type().type_ref {
+        return false;
+    }
+    if !a.is_security_v1() || !b.is_security_v1() {
+        return false;
+    }
+    let (Some(a_policy), Some(b_policy)) = (a.authored_policy(), b.authored_policy()) else {
+        return false;
+    };
+    if can_execute_security_v1(a.agent_type(), req, ceiling.policy(), a_policy, catalog).is_err()
+        || can_execute_security_v1(b.agent_type(), req, ceiling.policy(), b_policy, catalog)
+            .is_err()
+    {
+        return false;
+    }
+    authority_no_wider_inner(
+        &a.agent_type().contract,
+        &b.agent_type().contract,
+        catalog,
+        is_within(a_policy, b_policy),
+    ) && !authority_no_wider_inner(
+        &b.agent_type().contract,
+        &a.agent_type().contract,
+        catalog,
+        is_within(b_policy, a_policy),
+    )
 }
 
 /// Spec 06 refinement monotonicity: the derived type MUST NOT enlarge authority

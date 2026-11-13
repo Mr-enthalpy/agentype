@@ -16,6 +16,7 @@
 //! - Hard constraints are filtered before ranking; cost MUST NOT override
 //!   correctness or security.
 
+mod authority;
 mod canonical;
 mod capability;
 mod decode;
@@ -30,6 +31,7 @@ mod requirement;
 mod sandbox;
 mod selector;
 
+pub use authority::{EffectiveTaskAuthority, SecurityRevision, TaskSecurityCeiling};
 pub use canonical::{
     adapter_binding_policy_content_digest, agent_type_content_digest,
     binding_snapshot_content_digest, canonical_adapter_binding_policy_bytes,
@@ -70,11 +72,14 @@ pub use evidence::ResolvedProvisioningEvidence;
 pub use ids::{
     AdapterPolicyId, AgentTypeId, CapabilityId, SandboxPolicyId, SourceConfigId, SpawnSourceId,
 };
-pub use matching::{match_existing_agents, ExistingAgentCandidate, TaskPlacement};
+pub use matching::{
+    match_existing_agents, match_existing_agents_security_v1, ExistingAgentCandidate,
+    QualifiedExistingAgentCandidate, TaskPlacement,
+};
 pub use predicates::{
     can_execute, can_execute_security_v1, can_provision, can_provision_task, is_valid_refinement,
-    is_valid_refinement_with_policies, more_specific_for, validate_source_config,
-    validate_spawn_source,
+    is_valid_refinement_with_policies, more_specific_for, more_specific_for_with_policies,
+    validate_source_config, validate_spawn_source,
 };
 pub use provisioning::{
     BindingSnapshot, MaterializationDigest, ProvisioningBinding, RESOLVER_VERSION,
