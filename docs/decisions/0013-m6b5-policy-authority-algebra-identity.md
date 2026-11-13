@@ -313,10 +313,12 @@ policy that allows `write Workspace/src` is invalid on its own; a Generation
 when this check fails.
 
 `sandbox_policy = None` in `SECURITY_V1` means "no additional Task-level fine
-restriction", so the Task policy layer is the explicit top
-and `P_task` reduces to the two coarse terms — `TaskSpec.workspace_mode` and
-`requirement_draft.required_network` (see §3). It never widens another ceiling,
-and the coarse fields remain authoritative in their own sources. AgentType and
+restriction". It is an **absent optional layer**, not an explicit top policy: it
+adds no restriction and MUST NOT be represented as `Top` for the meet. The
+credential dimension is a positive grant set rather than a `Top`-shaped lattice
+element, so an explicit top would silently erase the Generation's credential
+grants. With no Task layer, `P_eff` is `P_generation`, and the coarse fields
+remain authoritative in their own sources. AgentType and
 Generation `SECURITY_V1` contracts MUST carry an authored policy; an absent
 policy there would make `project_agent`/`project_gen` undefined. `COARSE_V1`
 keeps its frozen `None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
@@ -653,6 +655,12 @@ competing authority sources:
 Mode declarations are per-object immutable facts, fixed when the object is
 created or published — never a mutable "supports" label chosen at admission:
 
+- an AgentType revision's mode and a SpawnSource revision's security declaration
+  are written in the same transaction that inserts the immutable revision. There
+  is no post-publication declaration API: a revision cannot be published as
+  `COARSE_V1` and later reinterpreted in place, and an idempotent republish MUST
+  carry exactly the same mode/declaration. Changing either requires a new
+  revision;
 - each Generation's `SecurityContractMode` follows its immutable
   `generations.policy_mode`, which the frozen schema restricts to `NONE` or
   `POLICY`:
