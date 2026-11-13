@@ -12,11 +12,12 @@ use agentype_agent_contract::{
     AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint, AgentType, AgentTypeContract,
     AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue,
     ConfigStatus, ContinuityMode, EnforcementProfileRef, EnvironmentPolicy, FileOperationClass,
-    FilePolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet, NetworkPolicy,
-    NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet, PhysicalSafety,
-    PolicyAccessDimension, PolicyInput, PolicyOperation, PolicyProjection, SandboxPolicyParts,
-    SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode, SourceStatus,
-    SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
+    FilePolicy, LifecycleMode, MatcherKind, NameSet, NetworkEndpoint, NetworkEndpointSet,
+    NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet,
+    PhysicalSafety, PolicyAccessDimension, PolicyInput, PolicyOperation, PolicyProjection,
+    SandboxPolicyParts, SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode,
+    SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy,
+    WorkingDirectory, MAX_ENVIRONMENT_REQUIRED_VALUES,
 };
 use agentype_core::{Clock, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::Kernel;
@@ -242,6 +243,30 @@ fn sandbox_policy_round_trips_and_is_immutable() {
         .unwrap_err();
     assert!(error.to_string().contains("immutable"), "{error}");
     assert_eq!(kernel.get_sandbox_policy(&reference).unwrap(), Some(policy));
+}
+
+#[test]
+fn sandbox_policy_publication_rejects_an_oversized_document() {
+    let kernel = memory_kernel();
+    let mut required = BTreeMap::new();
+    for index in 0..MAX_ENVIRONMENT_REQUIRED_VALUES {
+        required.insert(format!("VAR{index}"), "x".repeat(4096));
+    }
+    let policy = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        environment: EnvironmentPolicy::new(NameSet::any(), required).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    let reference = policy_ref("oversized-policy", 1);
+
+    // The per-dimension bounds are individually respected, but the canonical
+    // document exceeds the whole-policy budget: publication rejects it before
+    // writing an immutable row that every read would have to reject.
+    let error = kernel
+        .publish_sandbox_policy(&reference, &policy)
+        .unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
+    assert!(kernel.get_sandbox_policy(&reference).unwrap().is_none());
 }
 
 #[test]

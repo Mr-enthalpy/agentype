@@ -1311,3 +1311,138 @@ fn grouped_network_normalization_matches_pairwise_subsumption() {
         );
     }
 }
+
+/// P2-1: the RequiredAccess network floor is one set, so it is decided by one
+/// union-containment pass. The per-endpoint scan is only the rejecting path's
+/// diagnostic walk, not 256 independent partition enumerations.
+#[test]
+fn required_access_checks_the_whole_network_floor_once() {
+    let allowed = std::iter::once(endpoint(NetworkTransport::Tcp, "*", None))
+        .chain((1..=255u16).map(|port| endpoint(NetworkTransport::Udp, "*", Some(port))));
+    let access = PolicyAccess::from_policy(&network_only(allowed));
+
+    // No single allowed rule covers `ANY:*:p`, but the union does.
+    let covered =
+        required_network((1..=255u16).map(|port| endpoint(NetworkTransport::Any, "*", Some(port))));
+    assert!(check_required_access(&covered, &access).is_ok());
+
+    // A 256-rule floor with exactly one uncovered member reports only that
+    // member after the aggregate check fails.
+    let missing =
+        required_network((1..=256u16).map(|port| endpoint(NetworkTransport::Any, "*", Some(port))));
+    let error = check_required_access(&missing, &access).unwrap_err();
+    assert_eq!(error.reasons().len(), 1, "{error}");
+    assert!(error.to_string().contains("*:256"), "{error}");
+}
+
+/// P2-2: the name, map, facet and whole-document dimensions are bounded, so a
+/// policy cannot be enlarged without limit by legal individual members.
+#[test]
+fn policy_sets_maps_and_documents_are_bounded() {
+    let over_names = (0..=MAX_NAME_SET_MEMBERS)
+        .map(|index| format!("tool{index}"))
+        .collect::<Vec<_>>();
+    assert!(NameSet::allowed(over_names.clone()).is_err());
+
+    let required = over_names
+        .iter()
+        .map(|name| (name.clone(), "value".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(EnvironmentPolicy::new(NameSet::any(), required).is_err());
+
+    let over_facet = (0..=MAX_CREDENTIAL_FACET_MEMBERS)
+        .map(|index| format!("use{index}"))
+        .collect::<Vec<_>>();
+    let id = CredentialAuthorizationId::new("build", "service").unwrap();
+    assert!(CredentialGrant::new(
+        id,
+        over_facet,
+        ["registry.example.com".to_string()],
+        [CredentialDeliveryMode::BrokeredAccess],
+    )
+    .is_err());
+
+    let mut credentials = BTreeMap::new();
+    for index in 0..=MAX_POLICY_MAP_ENTRIES {
+        let id = CredentialAuthorizationId::new("build", format!("service{index}")).unwrap();
+        credentials.insert(
+            id.clone(),
+            CredentialGrant::new(
+                id,
+                ["read".to_string()],
+                ["registry.example.com".to_string()],
+                [CredentialDeliveryMode::BrokeredAccess],
+            )
+            .unwrap(),
+        );
+    }
+    assert!(NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        credentials,
+        ..Default::default()
+    })
+    .is_err());
+
+    let mut resources = BTreeMap::new();
+    for index in 0..=MAX_POLICY_MAP_ENTRIES {
+        resources.insert(
+            ResourceLimitName::new(format!("limit{index}")).unwrap(),
+            ResourceCeiling::new(ResourceScope::Process, ResourceUnit::Count, 1),
+        );
+    }
+    assert!(NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        resources,
+        ..Default::default()
+    })
+    .is_err());
+
+    let over_required = (0..=MAX_NAME_SET_MEMBERS)
+        .map(|index| format!("name{index}"))
+        .collect::<Vec<_>>();
+    assert!(RequiredAccess::new(
+        Vec::<FileOperationClass>::new(),
+        over_required,
+        Vec::<NetworkEndpoint>::new(),
+        Vec::<String>::new(),
+        Vec::<CredentialAuthorizationId>::new(),
+    )
+    .is_err());
+
+    // The decoder enforces the whole-document budget before parsing it.
+    let oversized = format!("{}{}", " ".repeat(MAX_SANDBOX_POLICY_BYTES), "{}");
+    let error = sandbox_policy_from_canonical_json(&oversized).unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
+}
+
+/// P2-3: v1 has one `ToolCommandSet` namespace. A name allowed as a tool
+/// satisfies a required tool-or-command operation and vice versa; the physical
+/// compiler cannot later split the same string into two meanings.
+#[test]
+fn tool_and_command_allowlists_share_one_operation_namespace() {
+    let tool_only = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::allowed(["git".to_string()]).unwrap(),
+            NameSet::deny_all(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let command_only = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::deny_all(),
+            NameSet::allowed(["git".to_string()]).unwrap(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let required = RequiredAccess::new(
+        Vec::<FileOperationClass>::new(),
+        ["git".to_string()],
+        Vec::<NetworkEndpoint>::new(),
+        Vec::<String>::new(),
+        Vec::<CredentialAuthorizationId>::new(),
+    )
+    .unwrap();
+
+    assert!(check_required_access(&required, &PolicyAccess::from_policy(&tool_only)).is_ok());
+    assert!(check_required_access(&required, &PolicyAccess::from_policy(&command_only)).is_ok());
+}
