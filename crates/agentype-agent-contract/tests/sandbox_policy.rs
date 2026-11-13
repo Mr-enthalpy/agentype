@@ -995,3 +995,135 @@ fn network_endpoint_collections_are_bounded() {
     )
     .is_err());
 }
+
+/// The Task's coarse ceiling must constrain the authority used by admission
+/// checks, but MUST NOT rewrite the fine-derived binding identity: only the
+/// constrained dimensions are replaced.
+#[test]
+fn task_coarse_authority_narrows_only_the_coarse_dimensions() {
+    let full = constrained_policy(false);
+
+    // `Write` + `Restricted` is the identity on the authority view.
+    assert_eq!(
+        task_coarse_authority(&full, WorkspaceMode::Write, NetworkPolicy::Restricted).unwrap(),
+        full
+    );
+
+    let read_only =
+        task_coarse_authority(&full, WorkspaceMode::ReadOnly, NetworkPolicy::Restricted).unwrap();
+    assert!(read_only.files().write().is_empty());
+    assert_eq!(read_only.files().read(), full.files().read());
+    assert_eq!(read_only.files().execute(), full.files().execute());
+    assert_eq!(read_only.files().visible(), full.files().visible());
+    assert_eq!(read_only.network(), full.network());
+    assert_eq!(read_only.credentials(), full.credentials());
+    assert_eq!(read_only.resources(), full.resources());
+    assert_eq!(read_only.environment(), full.environment());
+    assert!(is_within(&read_only, &full));
+    assert_eq!(project_workspace(&read_only), WorkspaceMode::ReadOnly);
+
+    let no_network =
+        task_coarse_authority(&full, WorkspaceMode::Write, NetworkPolicy::Disabled).unwrap();
+    assert_eq!(no_network.files().write(), full.files().write());
+    assert!(no_network.network().endpoints().unwrap().is_empty());
+    assert_eq!(project_network(&no_network), NetworkPolicy::Disabled);
+
+    let both =
+        task_coarse_authority(&full, WorkspaceMode::ReadOnly, NetworkPolicy::Disabled).unwrap();
+    assert!(both.files().write().is_empty());
+    assert!(both.network().endpoints().unwrap().is_empty());
+    assert_eq!(
+        both,
+        task_coarse_authority(&both, WorkspaceMode::ReadOnly, NetworkPolicy::Disabled).unwrap()
+    );
+
+    // The narrowed view is what admission may use for positive floors, so a
+    // required write or endpoint is unsatisfiable under the matching coarse
+    // ceiling even though the fine layer still shows it.
+    let write_required = RequiredAccess::new([FileOperationClass::Write], [], [], [], []).unwrap();
+    assert!(
+        check_required_access(&write_required, &PolicyAccess::from_policy(&read_only)).is_err()
+    );
+    let endpoint = endpoint(NetworkTransport::Tcp, "registry.example.com", Some(443));
+    let endpoint_required = required_network([endpoint]);
+    assert!(
+        check_required_access(&endpoint_required, &PolicyAccess::from_policy(&read_only)).is_ok()
+    );
+    assert!(
+        check_required_access(&endpoint_required, &PolicyAccess::from_policy(&no_network)).is_err()
+    );
+}
+
+/// The builder enforces bounded path depth and component length before any
+/// selector can enter a policy.
+#[test]
+fn path_selectors_are_bounded_in_depth_and_component_length() {
+    let at_limit = (0..MAX_PATH_COMPONENTS).map(|_| "d").collect::<Vec<_>>();
+    assert!(PathSelector::workspace(at_limit).is_ok());
+
+    let too_deep = (0..=MAX_PATH_COMPONENTS).map(|_| "d").collect::<Vec<_>>();
+    assert!(PathSelector::workspace(too_deep).is_err());
+
+    let long = "a".repeat(MAX_PATH_COMPONENT_LEN);
+    assert!(PathSelector::workspace([long.as_str()]).is_ok());
+
+    let too_long = "a".repeat(MAX_PATH_COMPONENT_LEN + 1);
+    assert!(PathSelector::workspace([too_long.as_str()]).is_err());
+}
+
+/// Path sets and whole policies are bounded before/around the pairwise cover
+/// scan, so an authored policy cannot force unbounded normalization work.
+#[test]
+fn path_selector_collections_are_bounded() {
+    let disjoint = |count: usize| {
+        (0..count)
+            .map(|index| {
+                PathSelector::workspace([format!("p{index}")]).expect("a short component is legal")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let at_limit = disjoint(MAX_PATH_SELECTORS);
+    assert!(PathSet::try_allowed(at_limit.iter().cloned()).is_ok());
+    assert!(PathSet::try_allowed(disjoint(MAX_PATH_SELECTORS + 1)).is_err());
+
+    // The per-set bound is also enforced by `from_parts` for an infallibly built
+    // set, so a caller cannot smuggle one past the policy boundary.
+    let oversized = PathSet::allowed(disjoint(MAX_PATH_SELECTORS + 1));
+    assert!(NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            oversized,
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        ..Default::default()
+    })
+    .is_err());
+
+    // Two full sets reach the aggregate bound exactly; a third exceeds it.
+    let full_set = || PathSet::allowed(disjoint(MAX_PATH_SELECTORS));
+    let at_policy_limit = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            full_set(),
+            full_set(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        ..Default::default()
+    });
+    assert!(at_policy_limit.is_ok());
+    let over_policy_limit = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            full_set(),
+            full_set(),
+            full_set(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        ..Default::default()
+    });
+    assert!(over_policy_limit.is_err());
+}

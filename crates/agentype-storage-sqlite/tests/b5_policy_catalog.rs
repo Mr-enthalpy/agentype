@@ -882,3 +882,30 @@ fn declarations_survive_a_restart() {
         Some(read_only_restricted_policy())
     );
 }
+
+/// A `SpawnSource` revision carries no isolation guarantee field, so its
+/// `P_source` policy MUST NOT introduce an unattributed isolation requirement.
+#[test]
+fn spawn_source_policy_cannot_require_attempt_isolation() {
+    let kernel = memory_kernel();
+    publish_adapter_policy(&kernel);
+    let reference = policy_ref("isolating-source-policy", 1);
+    let mut parts = read_only_restricted_policy().parts().clone();
+    parts.attempt_isolation = true;
+    let policy = NormalizedSandboxPolicy::from_parts(parts).unwrap();
+    kernel.publish_sandbox_policy(&reference, &policy).unwrap();
+
+    let source = source_at(2);
+    let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        PolicyInput::authored(reference, &policy),
+        profile(),
+    );
+    let error = kernel
+        .publish_spawn_source_with_security(&source, Some(&declaration))
+        .unwrap_err();
+    assert!(error.to_string().contains("attempt isolation"), "{error}");
+    assert!(kernel
+        .get_spawn_source(&source.source_ref)
+        .unwrap()
+        .is_none());
+}

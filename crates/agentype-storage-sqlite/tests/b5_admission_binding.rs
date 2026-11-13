@@ -434,6 +434,58 @@ fn publish_secure_network_type(kernel: &Kernel, reference: SandboxPolicyRef) -> 
     agent.type_ref
 }
 
+fn write_capability() -> CapabilityRef {
+    CapabilityRef::new("filesystem.write", 1).unwrap()
+}
+
+fn write_value() -> CapabilityValue {
+    CapabilityValue::Set(["src".to_string()].into_iter().collect())
+}
+
+fn publish_write_capability(kernel: &Kernel) {
+    let projection = PolicyProjection::new(
+        PolicyAccessDimension::FileOperationClass,
+        [(
+            "src".to_string(),
+            PolicyOperation::FileOperation(FileOperationClass::Write),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    kernel
+        .publish_capability_definition(
+            &write_capability(),
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Set,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: Some(projection),
+            },
+        )
+        .unwrap();
+}
+
+/// Publish a `SECURITY_V1` AgentType with explicit capability claims and
+/// sandbox fields.
+fn publish_secure_type_with_capabilities(
+    kernel: &Kernel,
+    id: &str,
+    reference: SandboxPolicyRef,
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+    capabilities: BTreeMap<CapabilityRef, CapabilityValue>,
+) -> AgentTypeRef {
+    let mut agent = agent_type(id, capabilities);
+    agent.contract.security.workspace = workspace;
+    agent.contract.security.network = network;
+    agent.contract.sandbox_policy = Some(reference);
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent.type_ref
+}
+
 fn generation_policy(
     reference: Option<SandboxPolicyRef>,
     max_workspace: WorkspaceMode,
@@ -1695,4 +1747,298 @@ fn a_coarse_requirement_cannot_own_a_binding() {
             .contains("unexpectedly has a security binding"),
         "{error}"
     );
+}
+
+/// P1-1: a `ReadOnly` Task whose required capability projects to a write cannot
+/// be satisfied by its fine policy, even when the Generation's write paths and
+/// the AgentType's policy both allow writing. Admission must judge the positive
+/// floor against the coarse-constrained authority, not the fine layer alone.
+#[test]
+fn a_read_only_task_cannot_require_a_write_capability() {
+    let db = Db::new("read-only-task-write-floor");
+    let kernel = db.kernel();
+    publish_write_capability(&kernel);
+
+    let authored = policy_with_files_and_network(
+        PathSet::allowed([workspace_path(&["src"])]),
+        restricted_network(),
+    );
+    let generation_reference = policy_ref("write-generation", 1);
+    let agent_reference = policy_ref("write-agent", 1);
+    kernel
+        .publish_sandbox_policy(&generation_reference, &authored)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&agent_reference, &authored)
+        .unwrap();
+
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(write_capability(), write_value());
+    let pin = publish_secure_type_with_capabilities(
+        &kernel,
+        "secure-writer",
+        agent_reference,
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+        capabilities.clone(),
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    // `task_spec()` is `ReadOnly`, so the coarse ceiling removes every write.
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, capabilities),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("required access is not satisfied"),
+        "{error}"
+    );
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+}
+
+/// P1-1, network side: a `Disabled` Task whose required capability projects to
+/// an endpoint is unsatisfiable even when the Generation's fine policy allows
+/// the endpoint.
+#[test]
+fn a_disabled_network_task_cannot_require_an_endpoint() {
+    let db = Db::new("disabled-network-task-endpoint-floor");
+    let kernel = db.kernel();
+    publish_network_capability(&kernel);
+
+    let policy = split_network_policy();
+    let generation_reference = policy_ref("split-network-generation", 1);
+    let agent_reference = policy_ref("split-network-agent", 1);
+    kernel
+        .publish_sandbox_policy(&generation_reference, &policy)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&agent_reference, &policy)
+        .unwrap();
+
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(network_capability(), network_value());
+    let pin = publish_secure_type_with_capabilities(
+        &kernel,
+        "secure-network",
+        agent_reference,
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+        capabilities.clone(),
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let mut requirement = draft(pin, capabilities);
+    requirement.required_network = NetworkPolicy::Disabled;
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            requirement,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("required access is not satisfied"),
+        "{error}"
+    );
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+}
+
+/// P1-2: a legal `ReadOnly` Task under a `Write` Generation must be admitted
+/// against a `ReadOnly` AgentType. The Generation's write paths are removed by
+/// the Task ceiling before the pinned-type compatibility check, so the fine
+/// layer looking wider than the type is not a rejection.
+#[test]
+fn a_read_only_task_admits_against_a_read_only_agent_type() {
+    let kernel = memory_kernel();
+    let generation_reference = policy_ref("write-generation", 1);
+    let agent_reference = policy_ref("read-only-agent", 1);
+    let generation_policy_value = policy_with_files_and_network(
+        PathSet::allowed([workspace_path(&["src"])]),
+        restricted_network(),
+    );
+    kernel
+        .publish_sandbox_policy(&generation_reference, &generation_policy_value)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&agent_reference, &read_only_workspace_policy())
+        .unwrap();
+
+    let pin = publish_secure_type(
+        &kernel,
+        "secure-read-only",
+        agent_reference,
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, BTreeMap::new()),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+
+    let binding = kernel.get_task_security_binding(&task_id).unwrap().unwrap();
+    assert_eq!(binding.policy(), &generation_policy_value);
+    assert_eq!(project_workspace(binding.policy()), WorkspaceMode::Write);
+}
+
+/// P2: the Generation's authored isolation bit and its coarse guarantee are a
+/// single authority. Either direction of disagreement is rejected at publication.
+#[test]
+fn generation_isolation_policy_and_guarantee_must_agree() {
+    let kernel = memory_kernel();
+    let isolated_reference = policy_ref("isolated-generation-policy", 1);
+    let mut parts = read_only_workspace_policy().parts().clone();
+    parts.attempt_isolation = true;
+    let isolated = NormalizedSandboxPolicy::from_parts(parts).unwrap();
+    kernel
+        .publish_sandbox_policy(&isolated_reference, &isolated)
+        .unwrap();
+
+    // Policy authors isolation, guarantee does not declare it.
+    let error = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(isolated_reference.clone()),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("attempt isolation"), "{error}");
+
+    // Guarantee declares isolation, policy does not author it.
+    let plain_reference = policy_ref("plain-generation-policy", 1);
+    kernel
+        .publish_sandbox_policy(&plain_reference, &read_only_workspace_policy())
+        .unwrap();
+    let mut declaring = generation_policy(
+        Some(plain_reference),
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    );
+    declaring.requires_attempt_isolation = true;
+    let error = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(declaring),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("attempt isolation"), "{error}");
+}
+
+/// P2: a Task's authored policy may repeat the Task's own isolation requirement
+/// but MUST NOT introduce one that no requirement asks an execution to honor.
+#[test]
+fn a_task_policy_cannot_introduce_an_unrequested_isolation_guarantee() {
+    let db = Db::new("task-policy-unrequested-isolation");
+    let kernel = db.kernel();
+    let generation_reference = policy_ref("plain-generation", 1);
+    let task_reference = policy_ref("isolated-task", 1);
+    kernel
+        .publish_sandbox_policy(&generation_reference, &read_only_workspace_policy())
+        .unwrap();
+    let mut parts = read_only_workspace_policy().parts().clone();
+    parts.attempt_isolation = true;
+    let isolated_task = NormalizedSandboxPolicy::from_parts(parts).unwrap();
+    kernel
+        .publish_sandbox_policy(&task_reference, &isolated_task)
+        .unwrap();
+
+    let pin = publish_secure_type(
+        &kernel,
+        "secure-read-only",
+        generation_reference.clone(),
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let mut requirement = draft(pin, BTreeMap::new());
+    requirement.sandbox_policy = Some(task_reference);
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            requirement,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("attempt isolation"), "{error}");
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
 }
