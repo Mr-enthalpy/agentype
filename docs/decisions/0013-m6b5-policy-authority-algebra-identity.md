@@ -611,6 +611,13 @@ the decoder rejects a longer authored array; a larger collection is rejected
 before it reaches the finite-partition containment algorithm. These are input
 grammar rules, not B5.2 physical-compiler policy.
 
+This collapse is part of defining the initial policy canonical, not a
+reinterpretation of durable data: B5.1 is the first build to write policy rows,
+and the pinned `(canonical_version, algebra_version) = (1, 1)` golden vectors are
+unchanged because none contains the explicit universal rule. A post-B5.1 change
+to these bytes MUST bump `SANDBOX_POLICY_SCHEMA_VERSION` and add new vectors
+rather than let an existing digest mean something new.
+
 #### Visibility is observability, not an access precondition
 
 `FilePolicy.visible` is the set of path regions the execution may observe while
