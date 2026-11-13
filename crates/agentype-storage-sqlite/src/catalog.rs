@@ -1954,10 +1954,22 @@ fn insert_spawn_source_declaration(
 }
 
 /// The validated security declaration of one exact SpawnSource revision.
+///
+/// The parent SpawnSource is read through the validated catalog reader first. A
+/// declaration therefore never outlives or disguises a missing/corrupt parent:
+/// a caller cannot mistake `None` for "a legal `COARSE_V1` source with no
+/// declaration" when the source row itself is unreadable.
 pub fn spawn_source_security_declaration(
     tx: &Transaction<'_>,
     reference: &SpawnSourceRef,
 ) -> Result<Option<SpawnSourceSecurityDeclaration>, Error> {
+    get_spawn_source(tx, reference)?.ok_or_else(|| {
+        Error::not_found(format!(
+            "spawn source {}@{} does not exist",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
     let row = query_opt(
         tx,
         "SELECT security_contract_mode, source_policy_id, source_policy_revision,
@@ -2038,19 +2050,12 @@ pub fn spawn_source_security_declaration(
 
 /// The declared mode of an exact SpawnSource revision; absence is `COARSE_V1`.
 ///
-/// The declaration is read through the validated reader, so a corrupt
-/// declaration fails closed instead of being reported as coarse.
+/// The declaration reader validates the parent source first, so a missing or
+/// corrupt source fails closed instead of being reported as coarse.
 pub fn spawn_source_security_mode(
     tx: &Transaction<'_>,
     reference: &SpawnSourceRef,
 ) -> Result<SecurityContractMode, Error> {
-    get_spawn_source(tx, reference)?.ok_or_else(|| {
-        Error::not_found(format!(
-            "spawn source {}@{} does not exist",
-            reference.id().as_str(),
-            reference.revision()
-        ))
-    })?;
     match spawn_source_security_declaration(tx, reference)? {
         None => Ok(SecurityContractMode::CoarseV1),
         Some(declaration) => Ok(declaration.mode()),

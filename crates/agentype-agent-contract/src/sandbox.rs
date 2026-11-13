@@ -2155,12 +2155,20 @@ impl RequiredAccess {
         Ok(access)
     }
 
-    pub fn with_credentials<I>(mut self, credentials: I) -> Self
+    /// Add credential authorization identities, re-checking the merged budget.
+    ///
+    /// `RequiredAccess` has one input budget no matter how it is built: the
+    /// credential set is capped by [`MAX_POLICY_MAP_ENTRIES`] like the other
+    /// maps. A fallible updater keeps every constructible value re-readable;
+    /// an infallible setter would let a caller cross the bound after a valid
+    /// construction.
+    pub fn try_with_credentials<I>(mut self, credentials: I) -> Result<Self, ContractError>
     where
         I: IntoIterator<Item = CredentialAuthorizationId>,
     {
         self.credentials.extend(credentials);
-        self
+        validate_required_access_counts(&self)?;
+        Ok(self)
     }
 
     pub fn file_operations(&self) -> &BTreeSet<FileOperationClass> {
