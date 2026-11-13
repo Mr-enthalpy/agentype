@@ -280,6 +280,30 @@ fn verify_task_security_binding_presence(
     }
 }
 
+/// Re-prove the admission-time Task/Generation `security_contract_mode` equality.
+///
+/// Admission requires the two modes to agree in both directions and the mode
+/// columns are immutable under the schema guards, so a mismatch can only be
+/// injected corruption. The check is symmetric on purpose: guarding only the
+/// `SECURITY_V1` Task direction leaves a `COARSE_V1` Task that was repointed at a
+/// `SECURITY_V1` Generation reading as a valid coarse Task, which the frozen
+/// coarse acquisition gate would then treat as dispatchable.
+fn verify_generation_mode_agreement(
+    tx: &Transaction<'_>,
+    generation_id: &agentype_core::GenerationId,
+    task_mode: SecurityContractMode,
+) -> Result<(), Error> {
+    let generation_mode = generation_security_mode(tx, generation_id)?;
+    if generation_mode != task_mode {
+        return Err(Error::invariant(format!(
+            "task security mode {} does not match its generation security mode {}",
+            task_mode.as_str(),
+            generation_mode.as_str()
+        )));
+    }
+    Ok(())
+}
+
 /// Cross-check the duplicated TaskSpec-owned dimensions against their
 /// authoritative sources. The Task, the GenerationTaskBinding, and the folded
 /// Generation policy remain the single authority; a self-consistent corruption of
@@ -352,6 +376,12 @@ fn verify_requirement_mirrors(
         })?;
     }
     let generation_id = GenerationId::from_string(generation_id);
+    // Re-prove both directions of the admission-time mode agreement here, so
+    // every validated requirement read owns the check. `get_task_security_binding`
+    // alone only covers the `SECURITY_V1` direction: a `COARSE_V1` Task whose
+    // Generation is repointed to `SECURITY_V1` would otherwise still refold as a
+    // legal coarse Task.
+    verify_generation_mode_agreement(tx, &generation_id, security_mode)?;
     match get_generation_policy(tx, &generation_id)? {
         Some(policy) => {
             let effective = policy.min_continuity.max(base);
@@ -1515,18 +1545,10 @@ pub fn get_task_security_binding(
     .ok_or_else(|| Error::invariant("SECURITY_V1 task is missing its GenerationTaskBinding"))?;
     let generation_id = GenerationId::from_string(generation_id);
 
-    // Re-prove the admission-time security-mode agreement on read. The mode
-    // columns are immutable under the schema guards, so a mismatch can only be
-    // injected corruption; accepting it would let B5.2 treat a locally valid
-    // binding as an execution qualification across contradictory records.
-    let generation_mode = generation_security_mode(tx, &generation_id)?;
-    if generation_mode != task_mode {
-        return Err(Error::invariant(format!(
-            "task security mode {} does not match its generation security mode {}",
-            task_mode.as_str(),
-            generation_mode.as_str()
-        )));
-    }
+    // The admission-time security-mode agreement is already re-proved by
+    // `get_task_agent_requirement`; re-state it through the same helper so this
+    // read does not depend on an implicit precondition of its caller.
+    verify_generation_mode_agreement(tx, &generation_id, task_mode)?;
 
     let row = query_opt(
         tx,
