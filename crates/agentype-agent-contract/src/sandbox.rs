@@ -382,6 +382,69 @@ pub enum NetworkEndpointSet {
     Allowed(BTreeSet<NetworkEndpoint>),
 }
 
+/// The transport lattice as a two-bit mask: `TCP` and `UDP` are the atoms and
+/// `Any` is their union. Collapsing `{TCP, UDP}` to `ANY` is therefore a plain
+/// OR, not a separate normalization pass.
+const TRANSPORT_TCP: u8 = 0b01;
+const TRANSPORT_UDP: u8 = 0b10;
+const TRANSPORT_ANY: u8 = TRANSPORT_TCP | TRANSPORT_UDP;
+
+fn transport_mask(transport: NetworkTransport) -> u8 {
+    match transport {
+        NetworkTransport::Tcp => TRANSPORT_TCP,
+        NetworkTransport::Udp => TRANSPORT_UDP,
+        NetworkTransport::Any => TRANSPORT_ANY,
+    }
+}
+
+fn transport_from_mask(mask: u8) -> Option<NetworkTransport> {
+    match mask {
+        TRANSPORT_TCP => Some(NetworkTransport::Tcp),
+        TRANSPORT_UDP => Some(NetworkTransport::Udp),
+        TRANSPORT_ANY => Some(NetworkTransport::Any),
+        _ => None,
+    }
+}
+
+/// Collapse one host's rules to the minimal set not covered by another rule of
+/// the same host.
+///
+/// Ports form a flat domain with `None` (any port) above each exact port. An
+/// any-port rule only removes an exact-port rule when its transport mask covers
+/// that rule's whole mask, because rule removal is single-rule subsumption, not
+/// set subtraction.
+fn reduce_host_ports(ports: &mut BTreeMap<Option<u16>, u8>) {
+    let Some(any_port) = ports.get(&None).copied() else {
+        return;
+    };
+    if any_port == TRANSPORT_ANY {
+        ports.clear();
+        ports.insert(None, TRANSPORT_ANY);
+        return;
+    }
+    ports.retain(|port, mask| {
+        port.is_none() || *mask == TRANSPORT_ANY || (*mask & any_port) != *mask
+    });
+}
+
+fn push_endpoint_rules(
+    host: &str,
+    ports: &BTreeMap<Option<u16>, u8>,
+    out: &mut BTreeSet<NetworkEndpoint>,
+) {
+    for (port, mask) in ports {
+        let Some(transport) = transport_from_mask(*mask) else {
+            continue;
+        };
+        // The host and port already passed `NetworkEndpoint::new` when the
+        // policy was decoded or authored, so this cannot fail. Skipping instead
+        // of unwrapping keeps the infallible constructor total.
+        if let Ok(endpoint) = NetworkEndpoint::new(transport, host.to_string(), *port) {
+            out.insert(endpoint);
+        }
+    }
+}
+
 impl NetworkEndpointSet {
     pub fn any() -> Self {
         Self::Any
@@ -400,29 +463,59 @@ impl NetworkEndpointSet {
     /// universe (TCP/UDP × any host × any port), so they MUST not survive as two
     /// canonical spellings. Keeping both would make `project_network` and the
     /// policy order disagree about a semantically top policy.
+    ///
+    /// Normalization groups by host and port, so removal is `O(n log n)` rather
+    /// than a global `O(n²)` pairwise scan. A rule can only be covered by a rule
+    /// with the same host or the `*` host; this keeps a bounded `256 × 256` meet
+    /// product cheap enough that the final 256-rule policy bound, not the
+    /// intermediate normalization work, decides admissibility.
     pub fn allowed<I>(endpoints: I) -> Self
     where
         I: IntoIterator<Item = NetworkEndpoint>,
     {
-        let mut all: BTreeSet<NetworkEndpoint> = endpoints.into_iter().collect();
-        // `ANY` is exactly the two-element transport domain in v1, so an
-        // explicit TCP+UDP pair is the same rule and MUST NOT produce a second
-        // canonical spelling.
-        let keys: BTreeSet<(String, Option<u16>)> = all
-            .iter()
-            .map(|endpoint| (endpoint.host().to_string(), endpoint.port()))
-            .collect();
-        for (host, port) in keys {
-            let tcp = NetworkEndpoint::new(NetworkTransport::Tcp, host.clone(), port);
-            let udp = NetworkEndpoint::new(NetworkTransport::Udp, host.clone(), port);
-            if let (Ok(tcp), Ok(udp)) = (tcp, udp) {
-                if all.contains(&tcp) && all.contains(&udp) {
-                    all.remove(&tcp);
-                    all.remove(&udp);
-                    all.insert(tcp.with_transport(NetworkTransport::Any));
-                }
-            }
+        let mut by_host: BTreeMap<String, BTreeMap<Option<u16>, u8>> = BTreeMap::new();
+        for endpoint in endpoints {
+            let mask = by_host
+                .entry(endpoint.host().to_string())
+                .or_default()
+                .entry(endpoint.port())
+                .or_insert(0);
+            *mask |= transport_mask(endpoint.transport());
         }
+        for ports in by_host.values_mut() {
+            reduce_host_ports(ports);
+        }
+
+        // `*` is the only cross-host wildcard: an exact-host rule can only be
+        // covered by another rule of the same host or by a `*` rule.
+        let wildcard = by_host.remove("*");
+        let wildcard_any_port = wildcard
+            .as_ref()
+            .and_then(|ports| ports.get(&None).copied());
+        for ports in by_host.values_mut() {
+            if wildcard_any_port == Some(TRANSPORT_ANY) {
+                ports.clear();
+                continue;
+            }
+            ports.retain(|port, mask| {
+                if wildcard_any_port.is_some_and(|w| w == *mask) {
+                    return false;
+                }
+                match wildcard.as_ref().and_then(|rules| rules.get(port)) {
+                    Some(w) => *w != TRANSPORT_ANY && *w != *mask,
+                    None => true,
+                }
+            });
+        }
+
+        let mut all = BTreeSet::new();
+        if let Some(wildcard) = wildcard.as_ref() {
+            push_endpoint_rules("*", wildcard, &mut all);
+        }
+        for (host, ports) in &by_host {
+            push_endpoint_rules(host, ports, &mut all);
+        }
+
         // `ANY:*:*` is the whole v1 network operation domain, exactly like
         // `Any`. No broader finite rule exists because `*` and "any port" are
         // the only host/port wildcards.
@@ -433,18 +526,7 @@ impl NetworkEndpointSet {
         }) {
             return Self::Any;
         }
-        let all: Vec<NetworkEndpoint> = all.into_iter().collect();
-        let kept = all
-            .iter()
-            .enumerate()
-            .filter(|(index, endpoint)| {
-                !all.iter()
-                    .enumerate()
-                    .any(|(other_index, other)| other_index != *index && other.covers(endpoint))
-            })
-            .map(|(_, endpoint)| endpoint.clone())
-            .collect();
-        Self::Allowed(kept)
+        Self::Allowed(all)
     }
 
     /// Whether some single allowed rule covers `endpoint`.
@@ -1379,6 +1461,11 @@ fn intersect_network_sets(
     match (left, right) {
         (NetworkEndpointSet::Any, other) | (other, NetworkEndpointSet::Any) => other.clone(),
         (NetworkEndpointSet::Allowed(left), NetworkEndpointSet::Allowed(right)) => {
+            // Each input is validated to at most `MAX_NETWORK_ENDPOINTS` rules, so
+            // this product is deterministically bounded by 256 × 256 candidates.
+            // `allowed` normalizes that product in `O(n log n)`, and
+            // `from_parts` rejects a result that still exceeds the 256-rule
+            // policy bound. No input can force a global quadratic normalization.
             NetworkEndpointSet::allowed(
                 left.iter()
                     .flat_map(|a| right.iter().filter_map(|b| intersect_endpoints(a, b)))
@@ -2209,12 +2296,13 @@ impl SpawnSourceSecurityDeclaration {
 
 /// The coarse workspace projection of an authored policy (ADR-0013 §3).
 ///
-/// `Write` is projected exactly when at least one write region survives; a
-/// deny-all write set is `ReadOnly`. This is the projection the coarse
-/// `SecurityContract` of an AgentType must equal and that a Generation ceiling
-/// must match, never a separate authorization grant.
+/// `Write` is projected when either a write region or a delete region survives;
+/// `ReadOnly` means the policy authorizes no content or directory-entry
+/// modification. This is the projection the coarse `SecurityContract` of an
+/// AgentType must equal and that a Generation ceiling must match, never a
+/// separate authorization grant.
 pub fn project_workspace(policy: &NormalizedSandboxPolicy) -> WorkspaceMode {
-    if policy.files().write().is_empty() {
+    if policy.files().write().is_empty() && policy.files().delete().is_empty() {
         WorkspaceMode::ReadOnly
     } else {
         WorkspaceMode::Write
@@ -2383,14 +2471,15 @@ pub fn validate_effective_task_execution_modes(
 ///
 /// `P_task` is the coarse workspace/network term intersected with the optional
 /// fine policy, so the authority admission may rely on is
-/// `meet(P_generation, P_task)`. A `ReadOnly` Task removes every write region and
-/// a `Disabled` Task removes every endpoint, even when the fine layer still shows
-/// them; the fine-derived meet remains the durable `TaskSecurityBinding` identity.
+/// `meet(P_generation, P_task)`. A `ReadOnly` Task removes every write and delete
+/// region and a `Disabled` Task removes every endpoint, even when the fine layer
+/// still shows them; the fine-derived meet remains the durable
+/// `TaskSecurityBinding` identity.
 ///
 /// Checking the fine layer alone is wrong in both directions. It accepts a
-/// `ReadOnly` Task whose required capability projects to `Write`, and it rejects
-/// a legal `ReadOnly` Task because unrelated Generation write paths make the fine
-/// layer look wider than a read-only AgentType.
+/// `ReadOnly` Task whose required capability projects to `Write` or `Delete`,
+/// and it rejects a legal `ReadOnly` Task because unrelated Generation write
+/// paths make the fine layer look wider than a read-only AgentType.
 ///
 /// This is a pure narrowing: it only replaces the constrained dimensions, so the
 /// credential, tool, environment and resource grants of the meet are preserved.
@@ -2406,7 +2495,7 @@ pub fn task_coarse_authority(
             files.read().clone(),
             PathSet::deny_all(),
             files.execute().clone(),
-            files.delete().clone(),
+            PathSet::deny_all(),
             files.visible().clone(),
         );
     }

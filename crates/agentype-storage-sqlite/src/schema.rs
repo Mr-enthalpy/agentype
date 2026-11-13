@@ -1202,6 +1202,27 @@ BEGIN
     SELECT RAISE(ABORT, 'a SpawnSource security declaration is write-once');
 END;
 
+-- Publication closure: a declaration is part of the revision's identity and is
+-- written before its disposition/published marker in the same transaction. Once
+-- the disposition exists, the revision is published and no declaration may be
+-- appended, so a raw writer cannot upgrade an existing COARSE_V1 revision in
+-- place. Dispositions themselves cannot be deleted or reinserted.
+CREATE TRIGGER IF NOT EXISTS agent_type_security_declarations_publication_closure
+BEFORE INSERT ON agent_type_security_declarations
+WHEN EXISTS(SELECT 1 FROM agent_type_dispositions
+            WHERE type_id=NEW.type_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'an AgentType security declaration must be written before publication');
+END;
+
+CREATE TRIGGER IF NOT EXISTS spawn_source_security_declarations_publication_closure
+BEFORE INSERT ON spawn_source_security_declarations
+WHEN EXISTS(SELECT 1 FROM spawn_source_dispositions
+            WHERE source_id=NEW.source_id AND revision=NEW.revision)
+BEGIN
+    SELECT RAISE(ABORT, 'a SpawnSource security declaration must be written before publication');
+END;
+
 -- ============================================================================
 -- M6-B.5 TaskSecurityBinding (schema v9)
 --

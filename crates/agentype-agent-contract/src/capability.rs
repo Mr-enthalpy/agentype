@@ -367,17 +367,6 @@ impl NetworkEndpoint {
         self.port
     }
 
-    /// The same host/port with a different transport selector. Crate-private:
-    /// normalization uses it to collapse `{TCP, UDP}` into the equivalent
-    /// `ANY` selector when a finite set contains both.
-    pub(crate) fn with_transport(&self, transport: NetworkTransport) -> Self {
-        Self {
-            transport,
-            host: self.host.clone(),
-            port: self.port,
-        }
-    }
-
     /// Whether this rule covers `other` (rule subsumption).
     ///
     /// A transport selector of [`NetworkTransport::Any`] covers both concrete

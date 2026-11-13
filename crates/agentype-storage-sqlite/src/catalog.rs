@@ -632,19 +632,11 @@ pub fn publish_agent_type_with_security(
         ],
     )
     .map_err(map_sqlite)?;
-    tx.execute(
-        "INSERT INTO agent_type_dispositions(
-             type_id, revision, status, deprecated_at, updated_at)
-         VALUES(?1,?2,'PUBLISHED',NULL,?3)",
-        params![
-            canonical.type_ref.id().as_str(),
-            canonical.type_ref.revision(),
-            now
-        ],
-    )
-    .map_err(map_sqlite)?;
-    // The declaration is written in the same transaction as the revision; there
-    // is no separate post-publication declaration API. Absence is `COARSE_V1`.
+    // The declaration is written before the disposition/published marker and in
+    // the same transaction as the revision; there is no separate
+    // post-publication declaration API. Absence is `COARSE_V1`. The schema
+    // publication-closure trigger rejects a late declaration once the
+    // disposition exists.
     if security_mode == SecurityContractMode::SecurityV1 {
         tx.execute(
             "INSERT INTO agent_type_security_declarations(
@@ -659,6 +651,17 @@ pub fn publish_agent_type_with_security(
         )
         .map_err(map_sqlite)?;
     }
+    tx.execute(
+        "INSERT INTO agent_type_dispositions(
+             type_id, revision, status, deprecated_at, updated_at)
+         VALUES(?1,?2,'PUBLISHED',NULL,?3)",
+        params![
+            canonical.type_ref.id().as_str(),
+            canonical.type_ref.revision(),
+            now
+        ],
+    )
+    .map_err(map_sqlite)?;
     Ok(digest)
 }
 
@@ -755,6 +758,12 @@ pub fn publish_spawn_source_with_security(
         ],
     )
     .map_err(map_sqlite)?;
+    // The declaration is written before the disposition/published marker so the
+    // schema publication-closure trigger can prove it belongs to the initial
+    // publication, not to a later upgrade of an existing COARSE_V1 revision.
+    if let Some(declaration) = declaration {
+        insert_spawn_source_declaration(tx, now, &canonical.source_ref, declaration)?;
+    }
     // A fresh revision persists the caller's initial disposition; an existing
     // revision's overlay is never (re)created or repaired here.
     tx.execute(
@@ -769,9 +778,6 @@ pub fn publish_spawn_source_with_security(
         ],
     )
     .map_err(map_sqlite)?;
-    if let Some(declaration) = declaration {
-        insert_spawn_source_declaration(tx, now, &canonical.source_ref, declaration)?;
-    }
     Ok(digest)
 }
 
