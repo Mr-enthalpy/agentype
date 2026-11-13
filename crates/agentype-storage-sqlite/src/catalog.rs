@@ -326,6 +326,13 @@ pub fn publish_capability_definition(
     reference: &CapabilityRef,
     definition: &CapabilityDefinition,
 ) -> Result<String, Error> {
+    // The publisher is a command boundary: a hand-built definition can bypass the
+    // `PolicyProjection` constructor, so re-run the whole-definition invariant
+    // before any digest or insert. Otherwise an invalid row would be durable and
+    // every later catalog read would fail closed on it.
+    definition
+        .validate_projection()
+        .map_err(|error| Error::invalid_authority(error.to_string()))?;
     let digest = capability_definition_content_digest(reference, definition);
     let content_json = canonical_json_string(
         canonical_capability_definition_bytes(reference, definition),
