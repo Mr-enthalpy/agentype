@@ -135,6 +135,31 @@ fn restricted_network() -> NetworkEndpointSet {
     .unwrap()])
 }
 
+/// A `ReadOnly` / `Restricted` policy whose two rules jointly cover
+/// `ANY:*:443` but where no single rule covers it.
+fn split_network_policy() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: NetworkEndpointSet::allowed([
+            NetworkEndpoint::new(NetworkTransport::Tcp, "*", Some(443)).unwrap(),
+            NetworkEndpoint::new(NetworkTransport::Udp, "*", None).unwrap(),
+        ]),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
 /// A policy that still projects to `ReadOnly` / `Restricted` but denies every
 /// file read, so a required read capability is unsatisfied.
 fn read_only_restricted_but_file_denying_policy() -> NormalizedSandboxPolicy {
@@ -311,6 +336,43 @@ fn publish_read_capability(kernel: &Kernel) {
         .unwrap();
 }
 
+fn network_capability() -> CapabilityRef {
+    CapabilityRef::new("network.egress", 1).unwrap()
+}
+
+fn network_value() -> CapabilityValue {
+    CapabilityValue::Set(["https".to_string()].into_iter().collect())
+}
+
+/// Publish a capability whose `https` member projects to the required endpoint
+/// `ANY:*:443`. No single effective policy rule needs to cover that endpoint;
+/// admission must compare against the union of the effective rules.
+fn publish_network_capability(kernel: &Kernel) {
+    let projection = PolicyProjection::new(
+        PolicyAccessDimension::NetworkEndpoint,
+        [(
+            "https".to_string(),
+            PolicyOperation::NetworkEndpoint(
+                NetworkEndpoint::new(NetworkTransport::Any, "*", Some(443)).unwrap(),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    kernel
+        .publish_capability_definition(
+            &network_capability(),
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Set,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: Some(projection),
+            },
+        )
+        .unwrap();
+}
+
 fn agent_type(id: &str, capabilities: BTreeMap<CapabilityRef, CapabilityValue>) -> AgentType {
     AgentType {
         type_ref: type_ref(id, 1),
@@ -353,6 +415,18 @@ fn publish_secure_reading_type(kernel: &Kernel, reference: SandboxPolicyRef) -> 
     let mut capabilities = BTreeMap::new();
     capabilities.insert(read_capability(), read_value());
     let mut agent = agent_type("secure-reader", capabilities);
+    agent.contract.sandbox_policy = Some(reference);
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent.type_ref
+}
+
+fn publish_secure_network_type(kernel: &Kernel, reference: SandboxPolicyRef) -> AgentTypeRef {
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(network_capability(), network_value());
+    let mut agent = agent_type("secure-network", capabilities);
+    agent.contract.security.network = NetworkPolicy::Restricted;
     agent.contract.sandbox_policy = Some(reference);
     kernel
         .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
@@ -673,6 +747,48 @@ fn unsatisfied_required_access_rejects_security_admission() {
         kernel.get_proposal(&proposal.proposal_id).unwrap().state,
         ProposalStateKind::Pending
     );
+}
+
+/// A capability-projected `ANY:*:443` requirement is satisfied by the union of
+/// `TCP:*:443` and `UDP:*:*`. This is the admission-stage counterpart of the
+/// policy-order union test; single-rule coverage would reject a valid Task.
+#[test]
+fn required_any_transport_endpoint_is_satisfied_by_a_split_network_union() {
+    let kernel = memory_kernel();
+    publish_network_capability(&kernel);
+    let reference = policy_ref("split-network-policy", 1);
+    let policy = split_network_policy();
+    kernel.publish_sandbox_policy(&reference, &policy).unwrap();
+    let pin = publish_secure_network_type(&kernel, reference.clone());
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(network_capability(), network_value());
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, capabilities),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let binding = kernel
+        .get_task_security_binding(&task_id)
+        .unwrap()
+        .expect("a SECURITY_V1 task has a binding");
+    assert_eq!(binding.policy(), &policy);
 }
 
 #[test]
