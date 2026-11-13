@@ -257,6 +257,23 @@ pub const MAX_NETWORK_HOST_LEN: usize = 253;
 /// deduplication, which is exactly the input size of that algorithm.
 pub const MAX_NETWORK_ENDPOINTS: usize = 256;
 
+/// Maximum number of entries in one capability `PolicyProjection::member_map`.
+/// A projection is authored catalog content, so its size must be bounded before
+/// it is normalized, hashed or stored; otherwise every later catalog read would
+/// carry an attacker-controlled map.
+pub const MAX_POLICY_PROJECTION_MEMBERS: usize = 256;
+
+/// Maximum byte length of one projection member name or operation token. This
+/// mirrors the bounded identifier grammar of the sandbox policy `NameSet`.
+pub const MAX_POLICY_PROJECTION_TOKEN_LEN: usize = 256;
+
+/// Maximum canonical JSON size of one capability definition document.
+///
+/// The projection member bounds make the map finite, but the capability id and
+/// operation strings are still author-controlled. Publication and decode reject
+/// a document above this budget before hashing, storing or parsing it.
+pub const MAX_CAPABILITY_DEFINITION_BYTES: usize = 1_048_576;
+
 /// Validate the v1 exact-host or single-wildcard grammar.
 ///
 /// `*` is the only wildcard token. Every other host is a bounded ASCII token:
@@ -415,6 +432,14 @@ fn validate_operation_token(value: &str, what: &str) -> Result<(), ContractError
             reason: format!("{what} must be a non-empty trimmed string"),
         });
     }
+    if value.len() > MAX_POLICY_PROJECTION_TOKEN_LEN || value.contains('\0') || value.contains('=')
+    {
+        return Err(ContractError::InvalidPolicyProjection {
+            reason: format!(
+                "{what} must be at most {MAX_POLICY_PROJECTION_TOKEN_LEN} bytes and contain no NUL or '='"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -435,6 +460,14 @@ impl PolicyProjection {
         dimension: PolicyAccessDimension,
         member_map: BTreeMap<String, PolicyOperation>,
     ) -> Result<Self, ContractError> {
+        if member_map.len() > MAX_POLICY_PROJECTION_MEMBERS {
+            return Err(ContractError::InvalidPolicyProjection {
+                reason: format!(
+                    "policy projection has {} members; at most {MAX_POLICY_PROJECTION_MEMBERS} are allowed",
+                    member_map.len()
+                ),
+            });
+        }
         for (member, operation) in &member_map {
             validate_operation_token(member, "policy member name")?;
             if operation.dimension() != dimension {

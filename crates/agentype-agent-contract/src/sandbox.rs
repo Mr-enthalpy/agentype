@@ -1105,7 +1105,13 @@ impl NormalizedSandboxPolicy {
     pub fn from_parts(parts: SandboxPolicyParts) -> Result<Self, ContractError> {
         let parts = normalize_parts(parts)?;
         validate_parts(&parts)?;
-        Ok(Self { parts })
+        let policy = Self { parts };
+        // The canonical document budget is a property of the value, not only of
+        // catalog publication: a derived `meet` must not produce a policy that
+        // the durable reader would reject. Checking after normalization means an
+        // oversized effective policy fails as a `PolicyConflict` at admission.
+        validate_canonical_size(&policy)?;
+        Ok(policy)
     }
 
     pub fn parts(&self) -> &SandboxPolicyParts {
@@ -1370,6 +1376,19 @@ fn validate_path_sets(files: &FilePolicy) -> Result<(), ContractError> {
         return Err(ContractError::InvalidSandboxPolicy {
             reason: format!(
                 "policy has {total} path selectors; at most {MAX_PATH_SELECTORS_PER_POLICY} are allowed"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_canonical_size(policy: &NormalizedSandboxPolicy) -> Result<(), ContractError> {
+    let bytes = crate::canonical::canonical_sandbox_policy_bytes(policy);
+    if bytes.len() > MAX_SANDBOX_POLICY_BYTES {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "canonical sandbox policy document is {} bytes; at most {MAX_SANDBOX_POLICY_BYTES} are allowed",
+                bytes.len()
             ),
         });
     }

@@ -20,7 +20,7 @@ use crate::capability::{
     CapabilityValue, FileOperationClass, MatcherKind, NetworkEndpoint, NetworkTransport,
     PolicyAccessDimension, PolicyOperation, PolicyProjection, Quantity, SecurityClass,
     CAPABILITY_DEFINITION_CANONICAL_VERSION_V1, CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
-    MAX_NETWORK_ENDPOINTS,
+    MAX_CAPABILITY_DEFINITION_BYTES, MAX_NETWORK_ENDPOINTS,
 };
 use crate::error::ContractError;
 use crate::provisioning::{BindingSnapshot, MaterializationDigest, ProvisioningBinding};
@@ -492,6 +492,15 @@ pub fn adapter_binding_policy_from_canonical_json(
 pub fn capability_definition_from_canonical_json(
     json: &str,
 ) -> Result<(CapabilityRef, CapabilityDefinition), ContractError> {
+    // The capability id and projection tokens are author-controlled. Reject an
+    // oversized document before parsing or constructing any projection value;
+    // the publisher enforces the same budget before storing it.
+    if json.len() > MAX_CAPABILITY_DEFINITION_BYTES {
+        return Err(err(format!(
+            "capability definition document is {} bytes; at most {MAX_CAPABILITY_DEFINITION_BYTES} are allowed",
+            json.len()
+        )));
+    }
     let value = parse_document(json, "CAPABILITY_DEFINITION")?;
     let object = object(&value, "capability definition")?;
     let version = match object.get("capability_canonical_version") {

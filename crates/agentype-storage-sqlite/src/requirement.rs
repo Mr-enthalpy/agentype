@@ -1501,7 +1501,8 @@ pub fn get_task_security_binding(
     let Some(requirement) = get_task_agent_requirement(tx, task_id)? else {
         return Ok(None);
     };
-    if task_security_mode(tx, task_id)? == SecurityContractMode::CoarseV1 {
+    let task_mode = task_security_mode(tx, task_id)?;
+    if task_mode == SecurityContractMode::CoarseV1 {
         return Ok(None);
     }
 
@@ -1512,6 +1513,20 @@ pub fn get_task_security_binding(
         |row| row.get::<_, String>(0),
     )?
     .ok_or_else(|| Error::invariant("SECURITY_V1 task is missing its GenerationTaskBinding"))?;
+    let generation_id = GenerationId::from_string(generation_id);
+
+    // Re-prove the admission-time security-mode agreement on read. The mode
+    // columns are immutable under the schema guards, so a mismatch can only be
+    // injected corruption; accepting it would let B5.2 treat a locally valid
+    // binding as an execution qualification across contradictory records.
+    let generation_mode = generation_security_mode(tx, &generation_id)?;
+    if generation_mode != task_mode {
+        return Err(Error::invariant(format!(
+            "task security mode {} does not match its generation security mode {}",
+            task_mode.as_str(),
+            generation_mode.as_str()
+        )));
+    }
 
     let row = query_opt(
         tx,
@@ -1601,8 +1616,7 @@ pub fn get_task_security_binding(
     // Re-derive the whole commitment from durable authority. A binding that is
     // internally consistent but describes a policy/floor the requirement does
     // not imply is corruption, not a valid past commitment.
-    let expected =
-        prepare_task_security_binding(tx, &GenerationId::from_string(generation_id), &requirement)?;
+    let expected = prepare_task_security_binding(tx, &generation_id, &requirement)?;
     let expected_policy_json = canonical_utf8(
         canonical_sandbox_policy_bytes(expected.policy()),
         "task security binding policy",

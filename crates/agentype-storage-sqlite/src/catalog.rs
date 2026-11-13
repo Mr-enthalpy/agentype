@@ -27,7 +27,7 @@ use agentype_agent_contract::{
     CapabilityRef, ConfigDigest, ConfigStatus, ContractError, EnforcementProfileRef,
     NormalizedSandboxPolicy, PolicyInput, SandboxPolicyRef, SecurityContractMode, SourceConfig,
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
-    MAX_SANDBOX_POLICY_BYTES, SANDBOX_POLICY_SCHEMA_VERSION,
+    MAX_CAPABILITY_DEFINITION_BYTES, MAX_SANDBOX_POLICY_BYTES, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{Error, UnixTime};
 use rusqlite::{params, Transaction};
@@ -333,11 +333,21 @@ pub fn publish_capability_definition(
     definition
         .validate_projection()
         .map_err(|error| Error::invalid_authority(error.to_string()))?;
-    let digest = capability_definition_content_digest(reference, definition);
     let content_json = canonical_json_string(
         canonical_capability_definition_bytes(reference, definition),
         "capability definition",
     )?;
+    // Reject an oversized capability document before hashing or storing it.
+    // The projection constructor bounds the map, but the capability id and the
+    // operation strings remain author-controlled; the decoder enforces the same
+    // whole-document budget on read.
+    if content_json.len() > MAX_CAPABILITY_DEFINITION_BYTES {
+        return Err(Error::invalid_authority(format!(
+            "capability definition document is {} bytes; at most {MAX_CAPABILITY_DEFINITION_BYTES} are allowed",
+            content_json.len()
+        )));
+    }
+    let digest = capability_definition_content_digest(reference, definition);
     let existing = existing_digest(
         tx,
         "SELECT content_digest FROM capability_definitions
@@ -2001,6 +2011,15 @@ pub fn spawn_source_security_declaration(
                     "spawn source declaration digest {declared_digest} does not match \
                      authored policy {recomputed}"
                 )));
+            }
+            // Re-prove the publication-time isolation invariant on read. A
+            // direct-SQL writer that bypasses the schema guards must not be able
+            // to point the declaration at a legal policy that introduces an
+            // unattributed isolation guarantee.
+            if policy.attempt_isolation() {
+                return Err(Error::invariant(
+                    "spawn source P_source policy cannot require attempt isolation; the requirement's guarantee is the only authority",
+                ));
             }
             Some(PolicyInput::authored(reference, &policy))
         }
