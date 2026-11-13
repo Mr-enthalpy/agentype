@@ -16,16 +16,17 @@ use agentype_agent_contract::{
     can_execute, canonical_generation_policy_bytes, canonical_sandbox_policy_bytes,
     canonical_security_derivation_bytes, canonical_task_agent_requirement_bytes,
     canonicalize_generation_policy, canonicalize_task_agent_requirement, check_required_access,
-    content_digest, fold_generation_policy, generation_policy_content_digest,
-    generation_policy_from_canonical_json, match_existing_agents, meet, project_capability_access,
-    required_access_content_digest, resolve_selector, sandbox_policy_content_digest,
-    sandbox_policy_from_canonical_json, security_derivation_content_digest,
-    security_derivation_from_canonical_json, task_agent_requirement_content_digest,
-    task_agent_requirement_from_canonical_json, validate_task_local_coarse_fine,
-    AgentRequirementDraft, AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode,
-    ExistingAgentCandidate, GenerationPolicy, PendingObligation, PolicyAccess, PolicyInput,
-    RequiredAccess, SecurityContractMode, SecurityDerivation, TaskAgentRequirement, TaskPlacement,
-    TaskSecurityBinding,
+    content_digest, fold_generation_policy, fold_generation_policy_security_v1,
+    generation_policy_content_digest, generation_policy_from_canonical_json, match_existing_agents,
+    meet_optional_layer, project_capability_access, required_access_content_digest,
+    resolve_selector, sandbox_policy_content_digest, sandbox_policy_from_canonical_json,
+    security_derivation_content_digest, security_derivation_from_canonical_json,
+    task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
+    validate_generation_coarse_fine, validate_task_local_coarse_fine, AgentRequirementDraft,
+    AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode, ExistingAgentCandidate,
+    GenerationPolicy, NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput,
+    RequiredAccess, SandboxPolicyRef, SecurityContractMode, SecurityDerivation,
+    TaskAgentRequirement, TaskPlacement, TaskSecurityBinding,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -235,8 +236,8 @@ pub fn get_task_agent_requirement(
             "task agent requirement is not the canonical encoding; refusing to read",
         ));
     }
-    verify_requirement_mirrors(tx, task_id, &requirement)?;
     let mode = task_security_mode(tx, task_id)?;
+    verify_requirement_mirrors(tx, task_id, &requirement, mode)?;
     verify_task_security_binding_presence(tx, task_id, mode)?;
     Ok(Some(requirement))
 }
@@ -285,6 +286,7 @@ fn verify_requirement_mirrors(
     tx: &Transaction<'_>,
     task_id: &TaskId,
     requirement: &TaskAgentRequirement,
+    security_mode: SecurityContractMode,
 ) -> Result<(), Error> {
     let task = query_opt(
         tx,
@@ -331,6 +333,22 @@ fn verify_requirement_mirrors(
         ContinuityPreference::Required => ContinuityMode::Logical,
         ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
     };
+    // Re-prove the §3 Task-local consistency on read. A durable requirement that
+    // contradicts its own authored Task policy is corruption, never a valid past
+    // commitment, even when a stricter ceiling would hide it in `P_eff`.
+    if security_mode == SecurityContractMode::SecurityV1 {
+        let authored = load_authored_policy(tx, requirement.hard.sandbox_policy.as_ref())?;
+        validate_task_local_coarse_fine(
+            requirement.hard.required_workspace,
+            requirement.hard.required_network,
+            authored.as_ref(),
+        )
+        .map_err(|error| {
+            Error::invariant(format!(
+                "task agent requirement contradicts its authored Task policy: {error}"
+            ))
+        })?;
+    }
     let generation_id = GenerationId::from_string(generation_id);
     match get_generation_policy(tx, &generation_id)? {
         Some(policy) => {
@@ -345,7 +363,15 @@ fn verify_requirement_mirrors(
             // dimension (workspace, network, isolation, sandbox, budget, anchor,
             // information function, affinity, continuity) rather than a
             // hand-picked subset, and keeps future policy fields covered.
-            let refolded = fold_generation_policy(&policy, &requirement.hard).map_err(|error| {
+            let refolded = match security_mode {
+                SecurityContractMode::CoarseV1 => {
+                    fold_generation_policy(&policy, &requirement.hard)
+                }
+                SecurityContractMode::SecurityV1 => {
+                    fold_generation_policy_security_v1(&policy, &requirement.hard)
+                }
+            }
+            .map_err(|error| {
                 Error::invariant(format!(
                     "task agent requirement violates its Generation policy: {error}"
                 ))
@@ -357,6 +383,11 @@ fn verify_requirement_mirrors(
             }
         }
         None => {
+            if security_mode == SecurityContractMode::SecurityV1 {
+                return Err(Error::invariant(
+                    "SECURITY_V1 task requirement has a generation without a security policy",
+                ));
+            }
             if base != requirement.hard.required_continuity {
                 return Err(Error::invariant(
                     "task agent requirement required_continuity does not match the Task continuity",
@@ -393,6 +424,7 @@ pub fn task_agent_requirement_mode(
 pub fn build_task_agent_requirement(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
+    security_mode: SecurityContractMode,
     draft: AgentRequirementDraft,
     information_function: InformationFunction,
     task_spec: &TaskSpec,
@@ -401,6 +433,7 @@ pub fn build_task_agent_requirement(
     let requirement = derive_task_agent_requirement(
         tx,
         generation_id,
+        security_mode,
         draft,
         information_function,
         task_spec,
@@ -418,6 +451,7 @@ pub fn build_task_agent_requirement(
 pub fn build_task_agent_requirement_replay(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
+    security_mode: SecurityContractMode,
     draft: AgentRequirementDraft,
     information_function: InformationFunction,
     task_spec: &TaskSpec,
@@ -427,6 +461,7 @@ pub fn build_task_agent_requirement_replay(
     derive_task_agent_requirement(
         tx,
         generation_id,
+        security_mode,
         draft,
         information_function,
         task_spec,
@@ -482,6 +517,7 @@ fn resolve_draft_selector(
 fn derive_task_agent_requirement(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
+    security_mode: SecurityContractMode,
     draft: AgentRequirementDraft,
     information_function: InformationFunction,
     task_spec: &TaskSpec,
@@ -496,6 +532,24 @@ fn derive_task_agent_requirement(
         ContinuityPreference::Required => ContinuityMode::Logical,
         ContinuityPreference::Preferred | ContinuityPreference::None => ContinuityMode::None,
     };
+
+    // ADR-0013 §3: the Task-local coarse/fine check runs on the un-normalized
+    // authored inputs, before any cross-object meet and before normalization. It
+    // is part of the `SECURITY_V1` contract; `COARSE_V1` keeps its frozen replay
+    // exactly, where the optional policy is not admitted as a second grant.
+    if security_mode == SecurityContractMode::SecurityV1 {
+        let authored_policy = load_authored_policy(tx, draft.sandbox_policy.as_ref())?;
+        validate_task_local_coarse_fine(
+            task_spec.workspace_mode,
+            draft.required_network,
+            authored_policy.as_ref(),
+        )
+        .map_err(|error| {
+            Error::invalid_authority(format!(
+                "task coarse fields contradict its authored sandbox policy: {error}"
+            ))
+        })?;
+    }
 
     let mut requirement = draft.into_requirement(
         required_type,
@@ -512,15 +566,48 @@ fn derive_task_agent_requirement(
     // The authoritative policy read is the single presence authority: a `NONE`
     // generation with an unexpected row, or a `POLICY` generation with a missing
     // row, fails closed rather than being treated as unconstrained.
-    if let Some(policy) = get_generation_policy(tx, generation_id)? {
-        requirement.hard =
-            fold_generation_policy(&policy, &requirement.hard).map_err(contract_rejection)?;
+    let generation_policy = get_generation_policy(tx, generation_id)?;
+    if security_mode == SecurityContractMode::SecurityV1 && generation_policy.is_none() {
+        return Err(Error::invalid_authority(
+            "a SECURITY_V1 task requires a policy-bearing generation",
+        ));
+    }
+    if let Some(policy) = generation_policy {
+        // `SECURITY_V1` keeps the Task's authored policy reference as an
+        // independent input; the effective policy is a real meet at binding
+        // time. `COARSE_V1` keeps the frozen exact-reference fold.
+        let folded = match security_mode {
+            SecurityContractMode::CoarseV1 => fold_generation_policy(&policy, &requirement.hard),
+            SecurityContractMode::SecurityV1 => {
+                fold_generation_policy_security_v1(&policy, &requirement.hard)
+            }
+        };
+        requirement.hard = folded.map_err(contract_rejection)?;
     }
     requirement
         .normalize(&catalog)
         .map_err(contract_rejection)?;
 
     Ok(requirement)
+}
+
+/// Load the canonical authored policy a Task or Generation names, if any.
+fn load_authored_policy(
+    tx: &Transaction<'_>,
+    reference: Option<&SandboxPolicyRef>,
+) -> Result<Option<NormalizedSandboxPolicy>, Error> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    crate::catalog::get_sandbox_policy(tx, reference)?
+        .map(Some)
+        .ok_or_else(|| {
+            Error::not_found(format!(
+                "sandbox policy {}@{} does not exist",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        })
 }
 
 /// The pinned contract MUST be able to execute its own effective requirement;
@@ -587,10 +674,11 @@ pub fn insert_generation_policy(
                 reference.revision()
             ))
         })?;
-        validate_task_local_coarse_fine(
+        validate_generation_coarse_fine(
             canonical.max_workspace,
             canonical.max_network,
-            Some(&authored),
+            canonical.requires_attempt_isolation,
+            &authored,
         )
         .map_err(|error| {
             Error::invalid_authority(format!(
@@ -645,11 +733,18 @@ pub fn get_generation_policy(
     let mode = generation_policy_mode(tx, generation_id)?;
     let row = query_opt(
         tx,
-        "SELECT policy_json, policy_digest FROM generation_policies WHERE generation_id=?1",
+        "SELECT policy_json, policy_digest, security_contract_mode
+         FROM generation_policies WHERE generation_id=?1",
         params![generation_id.as_str()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
-    let (json, digest) = match (mode.as_str(), row) {
+    let (json, digest, stored_security_mode) = match (mode.as_str(), row) {
         ("NONE", None) => return Ok(None),
         ("POLICY", None) => {
             return Err(Error::invariant(format!(
@@ -688,6 +783,38 @@ pub fn get_generation_policy(
         return Err(Error::invariant(
             "generation policy is not the canonical encoding; refusing to read",
         ));
+    }
+    // Re-prove the §3 Generation projection on read: a `SECURITY_V1` ceiling
+    // whose authored policy does not project back to it is corruption, not a
+    // valid past commitment.
+    let security_mode = SecurityContractMode::parse(&stored_security_mode).ok_or_else(|| {
+        Error::invariant(format!(
+            "generation {} records unsupported security_contract_mode {stored_security_mode:?}",
+            generation_id.as_str()
+        ))
+    })?;
+    if security_mode == SecurityContractMode::SecurityV1 {
+        let reference = policy.sandbox_policy.as_ref().ok_or_else(|| {
+            Error::invariant("a SECURITY_V1 generation policy is missing its sandbox policy")
+        })?;
+        let authored = crate::catalog::get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+            Error::invariant(format!(
+                "SECURITY_V1 generation pins a missing sandbox policy {}@{}",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        })?;
+        validate_generation_coarse_fine(
+            policy.max_workspace,
+            policy.max_network,
+            policy.requires_attempt_isolation,
+            &authored,
+        )
+        .map_err(|error| {
+            Error::invariant(format!(
+                "SECURITY_V1 generation ceiling contradicts its authored policy: {error}"
+            ))
+        })?;
     }
     Ok(Some(policy))
 }
@@ -1088,12 +1215,15 @@ fn pending_obligations_from_json(json: &str) -> Result<BTreeSet<PendingObligatio
 /// Derive the exact `TaskSecurityBinding` for a `SECURITY_V1` Task.
 ///
 /// The effective policy is `meet(P_generation, P_task)` over the authored
-/// catalog revisions (ADR-0013 §3, §4). In B5.1 the frozen
-/// `fold_generation_policy` already requires a Task policy to equal the
-/// Generation's exact revision, so the meet is only applied when both authored
-/// inputs exist and are distinct. Admission then proves
-/// `RequiredAccess ⊆ ProjectAccess(P_eff)`; every deferred component is recorded
-/// as pending rather than assumed satisfied.
+/// catalog revisions (ADR-0013 §3, §4). Both authored inputs are recorded
+/// independently, so a Task policy that differs from the Generation policy is a
+/// legal narrowing rather than the frozen exact-reference conflict. A Task that
+/// authored no policy contributes no additional fine layer (it is **not** an
+/// explicit top, which would erase credential grants), and the binding remains
+/// `P_generation`.
+///
+/// Admission then proves `RequiredAccess ⊆ ProjectAccess(P_eff)`; every
+/// deferred component is recorded as pending rather than assumed satisfied.
 pub fn prepare_task_security_binding(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
@@ -1107,7 +1237,7 @@ pub fn prepare_task_security_binding(
     let generation_reference = generation_policy.sandbox_policy.as_ref().ok_or_else(|| {
         Error::invalid_authority("a SECURITY_V1 generation policy must author a sandbox policy")
     })?;
-    let generation_policy = crate::catalog::get_sandbox_policy(tx, generation_reference)?
+    let generation_authored = crate::catalog::get_sandbox_policy(tx, generation_reference)?
         .ok_or_else(|| {
             Error::invariant(format!(
                 "generation pins a missing sandbox policy {}@{}",
@@ -1116,31 +1246,40 @@ pub fn prepare_task_security_binding(
             ))
         })?;
 
+    // ADR-0013 §3: re-prove the Task-local consistency on the authored inputs,
+    // not on a normalized meet where `None` and an explicit policy could become
+    // indistinguishable. A conflict is rejected even when a stricter Generation
+    // ceiling would hide it in `P_eff`.
+    let task_policy = load_authored_policy(tx, requirement.hard.sandbox_policy.as_ref())?;
+    validate_task_local_coarse_fine(
+        requirement.hard.required_workspace,
+        requirement.hard.required_network,
+        task_policy.as_ref(),
+    )
+    .map_err(|error| {
+        Error::invalid_authority(format!(
+            "task coarse fields contradict its authored sandbox policy: {error}"
+        ))
+    })?;
+
     let mut inputs = vec![PolicyInput::authored(
         generation_reference.clone(),
-        &generation_policy,
+        &generation_authored,
     )];
-    let effective = match requirement.hard.sandbox_policy.as_ref() {
-        None => generation_policy.clone(),
-        Some(reference) => {
-            let task_policy =
-                crate::catalog::get_sandbox_policy(tx, reference)?.ok_or_else(|| {
-                    Error::invariant(format!(
-                        "task pins a missing sandbox policy {}@{}",
-                        reference.id().as_str(),
-                        reference.revision()
-                    ))
-                })?;
-            if reference != generation_reference {
-                inputs.push(PolicyInput::authored(reference.clone(), &task_policy));
-            }
-            meet(&generation_policy, &task_policy).map_err(|error| {
-                Error::invalid_authority(format!(
-                    "task sandbox policy conflicts with its generation policy: {error}"
-                ))
-            })?
+    if let Some(reference) = requirement.hard.sandbox_policy.as_ref() {
+        if reference != generation_reference {
+            let authored = task_policy
+                .as_ref()
+                .expect("an authored reference always has a loaded policy");
+            inputs.push(PolicyInput::authored(reference.clone(), authored));
         }
-    };
+    }
+    let effective =
+        meet_optional_layer(&generation_authored, task_policy.as_ref()).map_err(|error| {
+            Error::invalid_authority(format!(
+                "task sandbox policy conflicts with its generation policy: {error}"
+            ))
+        })?;
 
     let catalog = load_capability_catalog(tx)?;
     let required_access = required_access_for(requirement, &catalog)?;

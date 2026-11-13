@@ -22,11 +22,11 @@
 //! [`Any`]: NameSet::Any
 
 use crate::capability::{
-    CapabilityDefinition, CapabilityValue, FileOperationClass, NetworkEndpoint, NetworkTransport,
-    PolicyOperation,
+    CapabilityCatalog, CapabilityDefinition, CapabilityRef, CapabilityValue, FileOperationClass,
+    NetworkEndpoint, NetworkTransport, PolicyOperation,
 };
 use crate::error::ContractError;
-use crate::records::{NetworkPolicy, SandboxPolicyRef};
+use crate::records::{NetworkPolicy, SandboxPolicyRef, SecurityContract};
 use agentype_core::WorkspaceMode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1931,12 +1931,96 @@ impl SpawnSourceSecurityDeclaration {
     }
 }
 
-/// Prove that a Task's coarse fields and its (optional) fine policy agree
-/// before any cross-object meet or normalization (ADR-0013 §3).
+/// The coarse workspace projection of an authored policy (ADR-0013 §3).
+///
+/// `Write` is projected exactly when at least one write region survives; a
+/// deny-all write set is `ReadOnly`. This is the projection the coarse
+/// `SecurityContract` of an AgentType must equal and that a Generation ceiling
+/// must match, never a separate authorization grant.
+pub fn project_workspace(policy: &NormalizedSandboxPolicy) -> WorkspaceMode {
+    if policy.files().write().is_empty() {
+        WorkspaceMode::ReadOnly
+    } else {
+        WorkspaceMode::Write
+    }
+}
+
+/// The coarse network projection of an authored policy (ADR-0013 §3).
+///
+/// An empty finite allowlist is `Disabled`, an unrestricted set is `Enabled`,
+/// and every other finite allowlist is `Restricted`.
+pub fn project_network(policy: &NormalizedSandboxPolicy) -> NetworkPolicy {
+    match policy.network() {
+        NetworkEndpointSet::Any => NetworkPolicy::Enabled,
+        NetworkEndpointSet::Allowed(endpoints) if endpoints.is_empty() => NetworkPolicy::Disabled,
+        NetworkEndpointSet::Allowed(_) => NetworkPolicy::Restricted,
+    }
+}
+
+/// The coarse AgentType security contract an authored policy projects to.
+///
+/// Equality with the AgentType's `SecurityContract` is the §3 relation; attempt
+/// isolation is carried as an execution guarantee, not as an allowed set.
+pub fn project_security_contract(policy: &NormalizedSandboxPolicy) -> SecurityContract {
+    SecurityContract {
+        workspace: project_workspace(policy),
+        network: project_network(policy),
+        requires_attempt_isolation: policy.attempt_isolation(),
+    }
+}
+
+/// Prove that a `SECURITY_V1` AgentType's coarse `SecurityContract` is exactly
+/// the projection of its authored policy (ADR-0013 §3).
+pub fn validate_agent_type_coarse_fine(
+    contract: &SecurityContract,
+    policy: &NormalizedSandboxPolicy,
+) -> Result<(), PolicyConflict> {
+    if project_security_contract(policy) != *contract {
+        return Err(conflict(
+            "agent type security contract does not equal its authored policy projection",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that a `SECURITY_V1` Generation ceiling is exactly the projection of
+/// its authored policy and that the policy entails its isolation guarantee
+/// (ADR-0013 §3).
+///
+/// A Generation is a maximum-authority ceiling, so both coarse modes must equal
+/// the policy projection rather than merely bound it. Isolation is a monotone
+/// guarantee: a Generation that requires isolation must author it in the policy.
+pub fn validate_generation_coarse_fine(
+    max_workspace: WorkspaceMode,
+    max_network: NetworkPolicy,
+    requires_attempt_isolation: bool,
+    policy: &NormalizedSandboxPolicy,
+) -> Result<(), PolicyConflict> {
+    if project_workspace(policy) != max_workspace {
+        return Err(conflict(
+            "generation workspace ceiling does not equal its authored policy projection",
+        ));
+    }
+    if project_network(policy) != max_network {
+        return Err(conflict(
+            "generation network ceiling does not equal its authored policy projection",
+        ));
+    }
+    if requires_attempt_isolation && !policy.attempt_isolation() {
+        return Err(conflict(
+            "generation requires attempt isolation but its authored policy does not entail it",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that a Task's coarse fields and its optional fine policy agree before
+/// any cross-object meet or normalization (ADR-0013 §3).
 ///
 /// `None` means "this Task authored no additional fine restriction" and is
 /// distinguishable from an explicit top policy. A contradiction is rejected
-/// here even when a stricter ceiling would later hide it.
+/// here even when a stricter ceiling would later hide it, so a coarse field can
+/// never be silently contradicted by the Task's own authored policy.
 pub fn validate_task_local_coarse_fine(
     workspace: WorkspaceMode,
     network: NetworkPolicy,
@@ -1945,26 +2029,81 @@ pub fn validate_task_local_coarse_fine(
     let Some(policy) = policy else {
         return Ok(());
     };
-    match workspace {
-        WorkspaceMode::ReadOnly => {
-            if !policy.files().write().is_empty() {
-                return Err(conflict(
-                    "task workspace is read-only but its policy allows writing",
-                ));
-            }
-        }
-        WorkspaceMode::Write => {
-            if policy.files().write().is_empty() {
-                return Err(conflict(
-                    "task requires writing but its policy allows no write region",
-                ));
-            }
-        }
+    if project_workspace(policy) != workspace {
+        return Err(conflict(match workspace {
+            WorkspaceMode::ReadOnly => "task workspace is read-only but its policy allows writing",
+            WorkspaceMode::Write => "task requires writing but its policy allows no write region",
+        }));
     }
-    if network == NetworkPolicy::Disabled && !policy.network().is_empty() {
-        return Err(conflict(
-            "task network is disabled but its policy allows network endpoints",
-        ));
+    let projected = project_network(policy);
+    match network {
+        NetworkPolicy::Disabled if projected != NetworkPolicy::Disabled => {
+            return Err(conflict(
+                "task network is disabled but its policy allows network endpoints",
+            ));
+        }
+        NetworkPolicy::Restricted if projected == NetworkPolicy::Disabled => {
+            return Err(conflict(
+                "task network is restricted but its policy allows no network endpoint",
+            ));
+        }
+        NetworkPolicy::Enabled if projected != NetworkPolicy::Enabled => {
+            return Err(conflict(
+                "task network is enabled but its policy does not allow every endpoint",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Meet an optional authored layer onto a base policy.
+///
+/// `None` means the object authored no additional fine layer; it adds no
+/// restriction and MUST NOT be represented as an explicit top policy, because
+/// an explicit top would erase the base's credential grants through the
+/// not-`Top` credential dimension. `Some(layer)` delegates to [`meet`].
+pub fn meet_optional_layer(
+    base: &NormalizedSandboxPolicy,
+    layer: Option<&NormalizedSandboxPolicy>,
+) -> Result<NormalizedSandboxPolicy, PolicyConflict> {
+    match layer {
+        None => Ok(base.clone()),
+        Some(layer) => meet(base, layer),
+    }
+}
+
+/// Prove that every capability claim an AgentType requires is allowed by the
+/// same AgentType's authored policy (ADR-0013 §3, §6).
+///
+/// A formally mapped capability and its policy dimension express the same
+/// restriction and therefore have exactly one authoritative value. A claim
+/// whose projected operations the authored policy does not allow is an invalid
+/// `SECURITY_V1` AgentType, not a candidate-local mismatch.
+pub fn validate_capability_claims_against_policy(
+    claims: &BTreeMap<CapabilityRef, CapabilityValue>,
+    catalog: &CapabilityCatalog,
+    policy: &NormalizedSandboxPolicy,
+) -> Result<(), ContractError> {
+    let access = PolicyAccess::from_policy(policy);
+    for (reference, value) in claims {
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: reference.capability_id().as_str().to_string(),
+                })?;
+        let operations = project_capability_access(definition, value)?;
+        let required = RequiredAccess::from_operations(operations)?;
+        check_required_access(&required, &access).map_err(|deficit| {
+            ContractError::InvalidPolicyProjection {
+                reason: format!(
+                    "agent type capability {}@{} is not allowed by its authored policy: {deficit}",
+                    reference.capability_id().as_str(),
+                    reference.revision()
+                ),
+            }
+        })?;
     }
     Ok(())
 }

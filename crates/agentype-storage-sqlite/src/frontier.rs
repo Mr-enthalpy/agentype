@@ -1209,6 +1209,7 @@ fn admit_proposal_core(
                 let expected = crate::requirement::build_task_agent_requirement_replay(
                     tx,
                     &generation_id,
+                    security_mode,
                     draft,
                     info_fn,
                     &admitted_spec,
@@ -1422,6 +1423,7 @@ fn admit_proposal_core(
         let requirement = crate::requirement::build_task_agent_requirement(
             tx,
             &generation_id,
+            security_mode,
             draft,
             info_fn,
             &task_spec,

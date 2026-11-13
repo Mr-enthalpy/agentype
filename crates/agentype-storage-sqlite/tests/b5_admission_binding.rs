@@ -9,11 +9,13 @@
 use agentype_agent_contract::{
     sandbox_policy_content_digest, AffinityConstraint, AgentRequirementDraft, AgentType,
     AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityDefinition,
-    CapabilityPolarity, CapabilityRef, CapabilityValue, ContinuityMode, EnvironmentPolicy,
-    FileOperationClass, FilePolicy, GenerationPolicy, LifecycleMode, MatcherKind,
-    NetworkEndpointSet, NetworkPolicy, NormalizedSandboxPolicy, PathSet, PendingObligation,
-    PolicyAccessDimension, PolicyOperation, PolicyProjection, SandboxPolicyParts, SandboxPolicyRef,
-    SecurityClass, SecurityContract, SecurityContractMode, ToolPolicy, WorkingDirectory,
+    CapabilityPolarity, CapabilityRef, CapabilityValue, ContinuityMode, CredentialAuthorizationId,
+    CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy, FileOperationClass, FilePolicy,
+    GenerationPolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet,
+    NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet,
+    PendingObligation, PolicyAccessDimension, PolicyOperation, PolicyProjection,
+    SandboxPolicyParts, SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode,
+    ToolPolicy, WorkingDirectory,
 };
 use agentype_core::{
     Clock, GenerationId, InformationFunction, ManualClock, ProposalRecord, ProposalStateKind,
@@ -100,8 +102,10 @@ fn policy_ref(id: &str, revision: u64) -> SandboxPolicyRef {
 }
 
 /// A policy that is consistent with a `ReadOnly` Generation ceiling: it must
-/// not allow writing. It still grants reads, tools and the network so a positive
-/// `RequiredAccess` floor can be satisfied.
+/// not allow writing, and its finite network allowlist must project to
+/// `Restricted` so the coarse and fine fields agree (ADR-0013 §3). It still
+/// grants reads, tools and one endpoint so a positive `RequiredAccess` floor can
+/// be satisfied.
 fn read_only_workspace_policy() -> NormalizedSandboxPolicy {
     NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
         files: FilePolicy::new(
@@ -112,9 +116,88 @@ fn read_only_workspace_policy() -> NormalizedSandboxPolicy {
             PathSet::deny_all(),
         ),
         tools: ToolPolicy::top(),
-        network: NetworkEndpointSet::Any,
+        network: restricted_network(),
         environment: EnvironmentPolicy::top(),
         credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+fn restricted_network() -> NetworkEndpointSet {
+    NetworkEndpointSet::allowed([NetworkEndpoint::new(
+        NetworkTransport::Tcp,
+        "example.com",
+        Some(443),
+    )
+    .unwrap()])
+}
+
+/// A policy that still projects to `ReadOnly` / `Restricted` but denies every
+/// file read, so a required read capability is unsatisfied.
+fn read_only_restricted_but_file_denying_policy() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::deny_all(),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+fn policy_with_working_directory(directory: &str) -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Required(
+            PathSelector::workspace([directory]).unwrap(),
+        ),
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+fn credential_grant() -> (CredentialAuthorizationId, CredentialGrant) {
+    let id = CredentialAuthorizationId::new("vault", "github-token").unwrap();
+    let grant = CredentialGrant::new(
+        id.clone(),
+        ["repo.read".to_string()],
+        ["github.com".to_string()],
+        [CredentialDeliveryMode::BrokeredAccess],
+    )
+    .unwrap();
+    (id, grant)
+}
+
+fn policy_with_credential() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::from([credential_grant()]),
         resources: BTreeMap::new(),
         working_directory: WorkingDirectory::Any,
         attempt_isolation: false,
@@ -232,8 +315,17 @@ fn compile_proposal(
     generation_id: &GenerationId,
     spec: TaskSpec,
 ) -> ProposalRecord {
+    compile_named_proposal(kernel, generation_id, spec, "security_work")
+}
+
+fn compile_named_proposal(
+    kernel: &Kernel,
+    generation_id: &GenerationId,
+    spec: TaskSpec,
+    key: &str,
+) -> ProposalRecord {
     let intent = RawWorkIntent {
-        raw_intent_key: "security_work".into(),
+        raw_intent_key: key.into(),
         objective: "security work".into(),
         information_function: InformationFunction::Expand,
         semantic_input_set: SemanticInputSet::new(),
@@ -460,9 +552,12 @@ fn security_mode_is_explicit_and_must_agree_with_the_generation() {
 fn unsatisfied_required_access_rejects_security_admission() {
     let kernel = memory_kernel();
     publish_read_capability(&kernel);
-    let reference = policy_ref("deny-policy", 1);
+    let reference = policy_ref("deny-read-policy", 1);
+    // The policy still projects to the Generation's `ReadOnly` / `Restricted`
+    // ceiling but denies every file read, so the required read floor is not
+    // satisfied.
     kernel
-        .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::deny_all())
+        .publish_sandbox_policy(&reference, &read_only_restricted_but_file_denying_policy())
         .unwrap();
     let pin = publish_reading_type(&kernel);
     let generation = kernel
@@ -498,15 +593,17 @@ fn unsatisfied_required_access_rejects_security_admission() {
 }
 
 #[test]
-fn a_task_policy_that_conflicts_with_its_generation_is_rejected() {
+fn a_task_policy_that_structurally_conflicts_with_its_generation_is_rejected() {
     let kernel = memory_kernel();
     let reference = policy_ref("generation-policy", 1);
     let other = policy_ref("task-policy", 1);
+    // Two different required working directories cannot both hold: this is a
+    // structural conflict, not a legal narrowing.
     kernel
-        .publish_sandbox_policy(&reference, &read_only_workspace_policy())
+        .publish_sandbox_policy(&reference, &policy_with_working_directory("generation"))
         .unwrap();
     kernel
-        .publish_sandbox_policy(&other, &NormalizedSandboxPolicy::deny_all())
+        .publish_sandbox_policy(&other, &policy_with_working_directory("task"))
         .unwrap();
     let pin = publish_plain_type(&kernel);
     let generation = kernel
@@ -536,9 +633,208 @@ fn a_task_policy_that_conflicts_with_its_generation_is_rejected() {
     assert!(
         error
             .to_string()
-            .contains("not the generation's exact sandbox policy"),
+            .contains("task sandbox policy conflicts with its generation policy"),
         "{error}"
     );
+}
+
+#[test]
+fn a_narrower_task_policy_is_a_legal_layering_not_a_conflict() {
+    let kernel = memory_kernel();
+    let reference = policy_ref("generation-policy", 1);
+    let other = policy_ref("task-policy", 1);
+    let generation_policy_value = read_only_workspace_policy();
+    kernel
+        .publish_sandbox_policy(&reference, &generation_policy_value)
+        .unwrap();
+    // A distinct authored revision that is strictly narrower: it restricts the
+    // readable prefix while keeping the ReadOnly/Restricted projection.
+    let narrower = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::allowed([PathSelector::workspace(["src"]).unwrap()]),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap();
+    kernel.publish_sandbox_policy(&other, &narrower).unwrap();
+    let pin = publish_plain_type(&kernel);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    let mut layered = draft(pin, BTreeMap::new());
+    layered.sandbox_policy = Some(other);
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let binding = kernel
+        .get_task_security_binding(&task_id)
+        .unwrap()
+        .expect("a SECURITY_V1 task has a binding");
+    // The effective policy is the real meet of both authored revisions.
+    assert_eq!(binding.policy(), &narrower);
+}
+
+#[test]
+fn a_task_read_only_contradiction_with_its_authored_policy_is_rejected() {
+    let kernel = memory_kernel();
+    let reference = policy_ref("generation-policy", 1);
+    let task_policy = policy_ref("task-policy", 1);
+    kernel
+        .publish_sandbox_policy(&reference, &read_only_workspace_policy())
+        .unwrap();
+    // The Task authors a policy that allows writing while its coarse workspace
+    // field is `ReadOnly`: the contradiction must be rejected even though the
+    // Generation ceiling also forbids writing.
+    let writing = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap();
+    kernel
+        .publish_sandbox_policy(&task_policy, &writing)
+        .unwrap();
+    let pin = publish_plain_type(&kernel);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    let mut contradictory = draft(pin, BTreeMap::new());
+    contradictory.sandbox_policy = Some(task_policy);
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            contradictory,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coarse fields contradict its authored sandbox policy"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_absent_task_policy_is_not_an_explicit_top_layer() {
+    let kernel = memory_kernel();
+    publish_read_capability(&kernel);
+    let reference = policy_ref("generation-policy", 1);
+    let generation_policy_value = policy_with_credential();
+    let (credential_id, _grant) = credential_grant();
+    kernel
+        .publish_sandbox_policy(&reference, &generation_policy_value)
+        .unwrap();
+    let pin = publish_reading_type(&kernel);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+
+    // The Generation policy carries a credential authorization. A Task that
+    // authors no policy must keep it: `None` adds no restriction and is not an
+    // explicit top that would erase the credential dimension.
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(read_capability(), read_value());
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin.clone(), capabilities.clone()),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let binding = kernel.get_task_security_binding(&task_id).unwrap().unwrap();
+    assert_eq!(binding.policy(), &generation_policy_value);
+    assert!(binding.policy().credentials().contains_key(&credential_id));
+
+    // An explicit Task layer with the same projection but no credential grant is
+    // a real narrowing: the meet intersects the credential dimension and the
+    // effective policy keeps no grant. This is observably different from `None`.
+    let explicit = policy_ref("task-policy", 1);
+    kernel
+        .publish_sandbox_policy(&explicit, &read_only_workspace_policy())
+        .unwrap();
+    let proposal = compile_named_proposal(
+        &kernel,
+        &generation.generation_id,
+        task_spec(),
+        "explicit_layer_work",
+    );
+    let mut layered = draft(pin, capabilities);
+    layered.sandbox_policy = Some(explicit);
+    let layered_task = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let layered_binding = kernel
+        .get_task_security_binding(&layered_task)
+        .unwrap()
+        .unwrap();
+    assert!(layered_binding.policy().credentials().is_empty());
 }
 
 #[test]

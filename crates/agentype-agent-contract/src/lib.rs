@@ -85,18 +85,21 @@ pub use records::{
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, TaskRequirement,
 };
 pub use requirement::{
-    fold_generation_policy, AgentRequirementDraft, GenerationPolicy, TaskAgentRequirement,
+    fold_generation_policy, fold_generation_policy_security_v1, AgentRequirementDraft,
+    GenerationPolicy, TaskAgentRequirement,
 };
 pub use sandbox::{
-    check_required_access, is_within, meet, project_capability_access, prove_no_wider,
-    validate_task_local_coarse_fine, AccessDeficit, CredentialAuthorizationId,
-    CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef, EnvironmentPolicy, FilePolicy,
-    NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector, PathSet,
-    PendingObligation, PolicyAccess, PolicyConflict, PolicyInput, RequiredAccess, ResourceCeiling,
-    ResourceLimitName, ResourceScope, ResourceUnit, SandboxPolicyParts, SandboxPolicyVersion,
-    SecurityContractMode, SecurityDerivation, SpawnSourceSecurityDeclaration, TaskSecurityBinding,
-    ToolPolicy, WorkingDirectory, REQUIRED_ACCESS_SCHEMA_VERSION,
-    SANDBOX_POLICY_MEET_ALGORITHM_VERSION, SANDBOX_POLICY_NORMALIZATION_VERSION,
-    SANDBOX_POLICY_SCHEMA_VERSION,
+    check_required_access, is_within, meet, meet_optional_layer, project_capability_access,
+    project_network, project_security_contract, project_workspace, prove_no_wider,
+    validate_agent_type_coarse_fine, validate_capability_claims_against_policy,
+    validate_generation_coarse_fine, validate_task_local_coarse_fine, AccessDeficit,
+    CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef,
+    EnvironmentPolicy, FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot,
+    PathSelector, PathSet, PendingObligation, PolicyAccess, PolicyConflict, PolicyInput,
+    RequiredAccess, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
+    SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode, SecurityDerivation,
+    SpawnSourceSecurityDeclaration, TaskSecurityBinding, ToolPolicy, WorkingDirectory,
+    REQUIRED_ACCESS_SCHEMA_VERSION, SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
+    SANDBOX_POLICY_NORMALIZATION_VERSION, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};
