@@ -159,9 +159,9 @@ PlacementConstraints(T)    // M5 placement predicate
 - `CoarseExecutionModes` carries the workspace and network modes. They are
   compared by the existing dimension-specific predicates (workspace rank and
   network polarity/enforcement mode), never by set inclusion. `ReadOnly` is an
-  upper bound on write authority, `Disabled` is a network restriction, and
-  `Restricted` is an execution mode; none of them is a positive access
-  requirement.
+  upper bound on content and directory-entry modification authority (write and
+  delete), `Disabled` is a network restriction, and `Restricted` is an execution
+  mode; none of them is a positive access requirement.
 - `RequiredGuarantees` carries guarantees that are not allowed-operation sets:
   `required_attempt_isolation` (the disjunction defined in §3, not a per-object
   intersection), continuity, and any other execution guarantee.
@@ -209,6 +209,11 @@ The relation is defined per object, because they have different authorship:
 | AgentType | `project_agent(P) == SecurityContract` (equality) |
 | Generation | `project_gen(P) == (max_workspace, max_network)`, and `P` entails `requires_attempt_isolation` |
 | Task | **consistency**, not projection equality |
+
+`project_workspace(P)` is `Write` when `P` authorizes writing **or deleting** any
+logical workspace region, and `ReadOnly` otherwise. Deletion modifies workspace
+content and directory entries, so a policy that can delete cannot project to
+`ReadOnly`.
 
 `requires_attempt_isolation` is an execution guarantee, not part of the
 file/network allowed set, so the normalized policy carries it explicitly.
@@ -280,7 +285,7 @@ P_task = TaskSpec.workspace_mode            // coarse workspace, M6-A
 
 ```text
 required_workspace = Write    ⇒ P_task allows write
-required_workspace = ReadOnly ⇒ P_task contains no write
+required_workspace = ReadOnly ⇒ P_task contains no write and no delete
 required_network follows the existing rank/polarity
 required_attempt_isolation    ⇒ the candidate carries the isolation guarantee
 ```
@@ -291,8 +296,8 @@ the fine policy is the draft's optional `sandbox_policy`. The spec MUST NOT
 attribute `required_network` to `TaskSpec`. `required_attempt_isolation` is also
 carried by the draft (and folded with the Generation policy, see §3).
 
-Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine
-write root MUST be rejected.
+Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine write
+or delete root MUST be rejected.
 
 The Task-local check runs before any cross-object meet and before normalization:
 
@@ -415,21 +420,23 @@ fine-derived meet and its canonical bytes are unchanged, but every admission
 check uses the pure coarse-constrained view
 
 ```text
-TaskAuthority(P) = P with write := ∅                 if required_workspace = ReadOnly
-                   P with network := ∅               if required_network = Disabled
+TaskAuthority(P) = P with write := ∅ and delete := ∅   if required_workspace = ReadOnly
+                   P with network := ∅                 if required_network = Disabled
 ```
 
-which preserves reads, tools, environment, credentials and resource ceilings.
-`ReadOnly` and `Disabled` are upper bounds carried by the Task itself, so they
-apply to every layer the Task admits, including the Generation layer. This
-closes both directions of the combined-obligation error: a `ReadOnly` Task whose
-required capability projects to a write, or a `Disabled` Task whose required
-capability projects to an endpoint, is unsatisfiable even when the fine layer
-shows the operation; and a legal `ReadOnly` Task under a `Write` Generation is
-not rejected merely because the fine meet retains Generation write paths that
-the Task ceiling removes before the pinned AgentType comparison. A later
-Candidate or Execution stage re-applies the same view to the complete `P_eff`
-because a later meet can only narrow it.
+which preserves reads, execute, tools, environment, credentials and resource
+ceilings. `ReadOnly` and `Disabled` are upper bounds carried by the Task itself,
+so they apply to every layer the Task admits, including the Generation layer.
+`Delete` is included because deletion modifies workspace content and directory
+entries; a Task that declares `ReadOnly` cannot be satisfied by a policy that
+still authorizes deletion. This closes both directions of the
+combined-obligation error: a `ReadOnly` Task whose required capability projects
+to a write or delete, or a `Disabled` Task whose required capability projects to
+an endpoint, is unsatisfiable even when the fine layer shows the operation; and
+a legal `ReadOnly` Task under a `Write` Generation is not rejected merely because
+the fine meet retains Generation write paths that the Task ceiling removes before
+the pinned AgentType comparison. A later Candidate or Execution stage re-applies
+the same view to the complete `P_eff` because a later meet can only narrow it.
 
 RequiredAccess is therefore checked as
 `RequiredAccess ⊆ ProjectAccess(TaskAuthority(meet(P_generation, P_task)))`, and
@@ -661,6 +668,15 @@ set and each `RequiredAccess` endpoint set is limited to 256 distinct rules, and
 the decoder rejects a longer authored array; a larger collection is rejected
 before it reaches the finite-partition containment algorithm. These are input
 grammar rules, not B5.2 physical-compiler policy.
+
+The meet of two bounded endpoint sets is also bounded. Each side has at most 256
+rules, so the rule-wise product has at most 65,536 candidates; normalization
+groups candidates by host and port and removes covered rules in `O(n log n)`
+rather than with a global pairwise scan. A normalized result that still exceeds
+256 rules is rejected as a `PolicyConflict` by policy construction. Thus a
+legitimate 256 × 256 input can fail closed on the representable-output bound but
+cannot force unbounded CPU work, and an intermediate product that simplifies to
+a representable policy remains admissible.
 
 This collapse is part of defining the initial policy canonical, not a
 reinterpretation of durable data: B5.1 is the first build to write policy rows,
@@ -948,6 +964,15 @@ digest, and initial disposition. Republishing the same exact `(ref, content
 digest)` is idempotent; a different digest for an already-published exact
 revision fails closed. A Source security record is published in the same
 transaction as its exact source revision; a change requires a new revision.
+
+The declaration MUST be written before the disposition/published marker in that
+transaction. The database enforces publication closure: once an
+`agent_type_dispositions` or `spawn_source_dispositions` row exists, the schema
+triggers reject a first `INSERT` into the corresponding security-declaration
+table. Disposition rows cannot be deleted or reinserted, so a published
+`COARSE_V1` revision cannot later gain a `SECURITY_V1` declaration through raw
+SQL. This is the storage-level counterpart of the API rule that the security
+mode is fixed at revision publication.
 
 Old canonical encodings and digests are never reinterpreted because a new field
 or algorithm version was added.
