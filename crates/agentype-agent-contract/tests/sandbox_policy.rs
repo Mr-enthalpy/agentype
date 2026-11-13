@@ -1446,3 +1446,158 @@ fn tool_and_command_allowlists_share_one_operation_namespace() {
     assert!(check_required_access(&required, &PolicyAccess::from_policy(&tool_only)).is_ok());
     assert!(check_required_access(&required, &PolicyAccess::from_policy(&command_only)).is_ok());
 }
+
+/// P1 regression: `PolicyAccess`, `meet` and `is_within` agree on the one v1
+/// `ToolCommandSet`. Because normalization stores the effective union in
+/// `tools` and deny-all in `commands`, the two authored spellings are mutually
+/// comparable, have one canonical identity, and their GLB still allows the
+/// shared operation.
+#[test]
+fn tool_and_command_allowlists_have_one_glb() {
+    let tool_spelling = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::allowed(["git".to_string()]).unwrap(),
+            NameSet::deny_all(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let command_spelling = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::deny_all(),
+            NameSet::allowed(["git".to_string()]).unwrap(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // The two spellings are the same canonical policy: equal ordering in both
+    // directions and identical bytes/digest.
+    assert!(is_within(&tool_spelling, &command_spelling));
+    assert!(is_within(&command_spelling, &tool_spelling));
+    assert_eq!(tool_spelling, command_spelling);
+    assert_eq!(
+        canonical_sandbox_policy_bytes(&tool_spelling),
+        canonical_sandbox_policy_bytes(&command_spelling)
+    );
+    assert_eq!(
+        sandbox_policy_content_digest(&tool_spelling),
+        sandbox_policy_content_digest(&command_spelling)
+    );
+
+    let met = meet(&tool_spelling, &command_spelling).unwrap();
+    assert!(met.tools().allows("git"));
+    assert!(is_within(&met, &tool_spelling));
+    assert!(is_within(&met, &command_spelling));
+    // The meet keeps the operation instead of intersecting two empty fields.
+    assert!(PolicyAccess::from_policy(&met).allows_tool_or_command("git"));
+
+    // The GLB is over the effective union, not over the two storage fields:
+    // `{git, cargo}` against `{git} ∪ {cargo}` intersects to `{git, cargo}`.
+    let both_in_tools = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::allowed(["git".to_string(), "cargo".to_string()]).unwrap(),
+            NameSet::deny_all(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let split_fields = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        tools: ToolPolicy::new(
+            NameSet::allowed(["git".to_string()]).unwrap(),
+            NameSet::allowed(["cargo".to_string()]).unwrap(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(both_in_tools, split_fields);
+    let met = meet(&both_in_tools, &split_fields).unwrap();
+    assert!(met.tools().allows("git"));
+    assert!(met.tools().allows("cargo"));
+    assert_eq!(met, both_in_tools);
+}
+
+/// P2 regression: the v1 network canonical form is deterministic for one rule
+/// syntax, but it is not union-minimal. Two rule sets may permit exactly the
+/// same operations while producing different bytes and digests. Permission
+/// equivalence therefore MUST be decided by `is_within`/`meet`, never by digest
+/// equality.
+#[test]
+fn network_canonical_form_is_deterministic_but_not_union_minimal() {
+    let split_udp = network_only([
+        endpoint(NetworkTransport::Tcp, "*", None),
+        endpoint(NetworkTransport::Udp, "*", Some(443)),
+    ]);
+    let any_transport = network_only([
+        endpoint(NetworkTransport::Tcp, "*", None),
+        endpoint(NetworkTransport::Any, "*", Some(443)),
+    ]);
+
+    // `TCP:*:*` already covers the TCP half of `ANY:*:443`, so the two sets
+    // permit exactly the same network operations.
+    assert!(is_within(&split_udp, &any_transport));
+    assert!(is_within(&any_transport, &split_udp));
+
+    // They are not collapsed to one canonical spelling, so their identities
+    // differ even though their authority does not.
+    assert_ne!(split_udp, any_transport);
+    assert_ne!(
+        canonical_sandbox_policy_bytes(&split_udp),
+        canonical_sandbox_policy_bytes(&any_transport)
+    );
+    assert_ne!(
+        sandbox_policy_content_digest(&split_udp),
+        sandbox_policy_content_digest(&any_transport)
+    );
+
+    // The same rule syntax always produces the same canonical identity.
+    let rebuilt = network_only([
+        endpoint(NetworkTransport::Tcp, "*", None),
+        endpoint(NetworkTransport::Udp, "*", Some(443)),
+    ]);
+    assert_eq!(
+        sandbox_policy_content_digest(&split_udp),
+        sandbox_policy_content_digest(&rebuilt)
+    );
+
+    // A meet of the two equivalent spellings stays below both.
+    let met = meet(&split_udp, &any_transport).unwrap();
+    assert!(is_within(&met, &split_udp));
+    assert!(is_within(&met, &any_transport));
+}
+
+/// P2 performance regression: a legal 256×256 containment query with many
+/// wildcard-host rules and distinct ports must finish under a bounded budget.
+/// The exact rule of thumb is pinned in ADR-0013: the finite partition has at
+/// most `2 · 513 · 513` atoms, and each rule projects once to the host/port
+/// atoms it covers instead of rescanning the whole partition per rule.
+#[test]
+fn adversarial_network_containment_stays_bounded() {
+    use std::time::{Duration, Instant};
+
+    // The outer set allows one distinct port on every host, so no two rules
+    // cover each other and the host partition is genuinely enumerated.
+    let allowed =
+        network_only((1..=256u16).map(|port| endpoint(NetworkTransport::Any, "*", Some(port))));
+    // The inner set adds 256 distinct exact hosts, enlarging the host partition
+    // while every rule remains covered by the corresponding wildcard-host rule.
+    let inner = network_only((1..=256u16).map(|port| {
+        endpoint(
+            NetworkTransport::Any,
+            &format!("host{port}.example.com"),
+            Some(port),
+        )
+    }));
+
+    let started = Instant::now();
+    assert!(is_within(&inner, &allowed));
+    let elapsed = started.elapsed();
+    eprintln!("adversarial 256x256 network containment: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "network containment exceeded its 10s budget: {elapsed:?}"
+    );
+
+    // The reverse direction is not contained, and it must reject promptly too.
+    assert!(!is_within(&allowed, &inner));
+}

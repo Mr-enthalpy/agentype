@@ -781,7 +781,7 @@ fn sandbox_policy_canonical_round_trips_and_normalizes() {
     assert_eq!(decoded.normalize().unwrap(), policy);
     assert_eq!(
         sandbox_policy_content_digest(&policy),
-        "sha256:84c0f64dd047e9d7551638269d4c9310ecd0cfaf4c14d11c7f025ab02ffb45f7"
+        "sha256:4f03cced850a957bdbe8f40331fe81d03ca0952688d825f1f8e8a684168558ed"
     );
 }
 

@@ -141,9 +141,12 @@ fn normalization_golden_vector() {
     let decoded = sandbox_policy_from_canonical_json(DENY_ALL_CANONICAL_JSON).unwrap();
     assert_eq!(decoded, NormalizedSandboxPolicy::deny_all());
 
+    // `base_policy` authors different `tools` and `commands` sets; the digest
+    // is over their canonical `ToolCommandSet` union (union stored in `tools`,
+    // `commands` deny-all), so both spellings share one identity.
     assert_eq!(
         sandbox_policy_content_digest(&base_policy()),
-        "sha256:e0781d0a58fc48014f6f80bbeec3b239a9789b32d7628dea519597f7a1fa33df"
+        "sha256:f88cb323eebe8dd41c6d5087c1760edc43ef485c5ed2fd0ae371bb4e9036e463"
     );
     assert_eq!(
         sandbox_policy_content_digest(&narrow_policy()),
@@ -270,7 +273,7 @@ fn derivation_golden_vector() {
     .unwrap();
     assert_eq!(
         security_derivation_content_digest(&derivation),
-        "sha256:7ad27401835b1e364f2d8d3cafd61467ce4b84d43a98196ec53ec6ae4556937d"
+        "sha256:67923e294c0e5632fe7901d8812f7b01213af45c47e447cfbc36aa3a3e1de73b"
     );
     assert_eq!(
         derivation.output_digest(),
