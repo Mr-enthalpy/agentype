@@ -923,6 +923,43 @@ pub fn get_agent_type(
     tx: &Transaction<'_>,
     reference: &AgentTypeRef,
 ) -> Result<Option<(AgentType, AgentTypeStatus)>, Error> {
+    Ok(load_agent_type(tx, reference)?.map(|(agent, status, _mode, _policy)| (agent, status)))
+}
+
+/// The validated AgentType revision **with** its security identity, read once.
+///
+/// The mode and the authored policy come from the same validation pass as the
+/// contract itself, so a caller can never pair one revision's contract with
+/// another revision's mode or policy bytes. This is the only read that
+/// M6-B.5 candidate preselection may use; absent declarations are `COARSE_V1`
+/// with no authored policy.
+pub fn get_agent_type_security_view(
+    tx: &Transaction<'_>,
+    reference: &AgentTypeRef,
+) -> Result<
+    Option<(
+        AgentType,
+        AgentTypeStatus,
+        SecurityContractMode,
+        Option<NormalizedSandboxPolicy>,
+    )>,
+    Error,
+> {
+    load_agent_type(tx, reference)
+}
+
+fn load_agent_type(
+    tx: &Transaction<'_>,
+    reference: &AgentTypeRef,
+) -> Result<
+    Option<(
+        AgentType,
+        AgentTypeStatus,
+        SecurityContractMode,
+        Option<NormalizedSandboxPolicy>,
+    )>,
+    Error,
+> {
     let row = query_opt(
         tx,
         "SELECT at.content_json, at.content_digest, at.based_on_type_id, at.based_on_revision,
@@ -973,8 +1010,13 @@ pub fn get_agent_type(
             let catalog = load_capability_catalog(tx)?;
             canonicalize_agent_type(&mut agent, &catalog).map_err(contract_fault)?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
-            validate_agent_type_security_read(tx, &agent, &catalog)?;
-            Ok(Some((agent, AgentTypeStatus::parse_sql(&status)?)))
+            let (mode, policy) = validate_agent_type_security_read(tx, &agent, &catalog)?;
+            Ok(Some((
+                agent,
+                AgentTypeStatus::parse_sql(&status)?,
+                mode,
+                policy,
+            )))
         }
     }
 }
@@ -1777,14 +1819,15 @@ pub fn agent_type_security_mode(
     tx: &Transaction<'_>,
     reference: &AgentTypeRef,
 ) -> Result<SecurityContractMode, Error> {
-    get_agent_type(tx, reference)?.ok_or_else(|| {
-        Error::not_found(format!(
-            "agent type {}@{} does not exist",
-            reference.id().as_str(),
-            reference.revision()
-        ))
-    })?;
-    raw_agent_type_security_mode(tx, reference)
+    get_agent_type_security_view(tx, reference)?
+        .map(|(_, _, mode, _)| mode)
+        .ok_or_else(|| {
+            Error::not_found(format!(
+                "agent type {}@{} does not exist",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        })
 }
 
 /// Re-prove the §3 AgentType projection and §6 capability consistency on the
@@ -1797,9 +1840,10 @@ fn validate_agent_type_security_read(
     tx: &Transaction<'_>,
     agent: &AgentType,
     catalog: &CapabilityCatalog,
-) -> Result<(), Error> {
-    if raw_agent_type_security_mode(tx, &agent.type_ref)? != SecurityContractMode::SecurityV1 {
-        return Ok(());
+) -> Result<(SecurityContractMode, Option<NormalizedSandboxPolicy>), Error> {
+    let mode = raw_agent_type_security_mode(tx, &agent.type_ref)?;
+    if mode != SecurityContractMode::SecurityV1 {
+        return Ok((mode, None));
     }
     let reference = agent.contract.sandbox_policy.as_ref().ok_or_else(|| {
         Error::invariant("a SECURITY_V1 agent type is missing its authored sandbox policy")
@@ -1826,7 +1870,7 @@ fn validate_agent_type_security_read(
             "SECURITY_V1 agent type capability claims contradict its authored policy: {error}"
         ))
     })?;
-    Ok(())
+    Ok((mode, Some(authored)))
 }
 
 /// Validate a SpawnSource security declaration against the authored policy

@@ -10,7 +10,9 @@
 //! selects a `SpawnSource`; the pure matching engine only orders already-bound
 //! LogicalAgents.
 
-use crate::catalog::{get_agent_type, load_capability_catalog, AgentTypeStatus};
+use crate::catalog::{
+    get_agent_type, get_agent_type_security_view, load_capability_catalog, AgentTypeStatus,
+};
 use crate::store::{map_sqlite, query_opt};
 use agentype_agent_contract::{
     can_execute, can_execute_security_v1, canonical_generation_policy_bytes,
@@ -18,17 +20,19 @@ use agentype_agent_contract::{
     canonical_task_agent_requirement_bytes, canonicalize_generation_policy,
     canonicalize_task_agent_requirement, check_required_access, content_digest,
     fold_generation_policy, fold_generation_policy_security_v1, generation_policy_content_digest,
-    generation_policy_from_canonical_json, match_existing_agents, meet_optional_layer,
-    project_capability_access, required_access_content_digest, resolve_selector,
-    sandbox_policy_content_digest, sandbox_policy_from_canonical_json,
-    security_derivation_content_digest, security_derivation_from_canonical_json,
-    task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
-    task_coarse_authority, validate_effective_task_execution_modes,
-    validate_generation_coarse_fine, validate_task_local_coarse_fine, AgentRequirementDraft,
-    AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode, ExistingAgentCandidate,
-    GenerationPolicy, NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput,
-    RequiredAccess, SandboxPolicyRef, SecurityContractMode, SecurityDerivation,
-    TaskAgentRequirement, TaskPlacement, TaskSecurityBinding,
+    generation_policy_from_canonical_json, match_existing_agents,
+    match_existing_agents_security_v1, meet_optional_layer, project_capability_access,
+    required_access_content_digest, resolve_selector, sandbox_policy_content_digest,
+    sandbox_policy_from_canonical_json, security_derivation_content_digest,
+    security_derivation_from_canonical_json, task_agent_requirement_content_digest,
+    task_agent_requirement_from_canonical_json, task_coarse_authority,
+    validate_effective_task_execution_modes, validate_generation_coarse_fine,
+    validate_task_local_coarse_fine, AgentRequirementDraft, AgentTypeRef, AgentTypeSelector,
+    CapabilityCatalog, ContinuityMode, ExistingAgentCandidate, GenerationPolicy,
+    NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput,
+    QualifiedExistingAgentCandidate, RequiredAccess, SandboxPolicyRef, SecurityContractMode,
+    SecurityDerivation, SecurityRevision, TaskAgentRequirement, TaskPlacement, TaskSecurityBinding,
+    TaskSecurityCeiling,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -1180,10 +1184,13 @@ pub fn match_existing_agents_for_task(
     let Some(requirement) = get_task_agent_requirement(tx, task_id)? else {
         return Ok(Vec::new());
     };
-    let required_ref = requirement.required_type.clone();
-    let (required, _status) = get_agent_type(tx, &required_ref)?.ok_or_else(|| {
-        Error::invariant("a task agent requirement references a missing agent type")
-    })?;
+    // The Task's mode comes from its sole durable owner. It is never inferred
+    // from a policy reference.
+    let security_mode = task_security_mode(tx, task_id)?;
+    let (required, _status, required_mode, required_policy) =
+        get_agent_type_security_view(tx, &requirement.required_type)?.ok_or_else(|| {
+            Error::invariant("a task agent requirement references a missing agent type")
+        })?;
 
     let task_row = query_opt(
         tx,
@@ -1247,29 +1254,79 @@ pub fn match_existing_agents_for_task(
         out
     };
 
-    let mut candidates = Vec::with_capacity(rows.len());
+    // Each agent's mode and authored policy come from the same validated read as
+    // its contract, so they can never be paired across revisions.
+    let mut loaded = Vec::with_capacity(rows.len());
     for (agent_id, partition, tags_json, workstream, available_since, created_at) in rows {
         let agent = LogicalAgentId::from_string(agent_id);
         let Some(bound_ref) = get_logical_agent_type_binding(tx, &agent)? else {
             continue;
         };
-        let (agent_type, _status) = get_agent_type(tx, &bound_ref)?.ok_or_else(|| {
-            Error::invariant("a LogicalAgent type binding references a missing agent type")
-        })?;
-        candidates.push(ExistingAgentCandidate {
-            logical_agent_id: agent,
-            agent_type,
-            partition: PartitionId::new(partition),
-            tags: parse_tags(&tags_json)?,
-            workstream_id: workstream.map(WorkstreamId::from_string),
-            available_since,
-            created_at,
-        });
+        let (agent_type, _status, candidate_mode, candidate_policy) =
+            get_agent_type_security_view(tx, &bound_ref)?.ok_or_else(|| {
+                Error::invariant("a LogicalAgent type binding references a missing agent type")
+            })?;
+        loaded.push((
+            ExistingAgentCandidate {
+                logical_agent_id: agent,
+                agent_type,
+                partition: PartitionId::new(partition),
+                tags: parse_tags(&tags_json)?,
+                workstream_id: workstream.map(WorkstreamId::from_string),
+                available_since,
+                created_at,
+            },
+            candidate_mode,
+            candidate_policy,
+        ));
     }
 
     let catalog = load_capability_catalog(tx)?;
-    match_existing_agents(&required, &requirement, &placement, &candidates, &catalog)
-        .map_err(contract_fault)
+    match security_mode {
+        // The frozen relation, unchanged: reference equality on the authored
+        // policy and `can_execute`.
+        SecurityContractMode::CoarseV1 => {
+            let candidates: Vec<ExistingAgentCandidate> = loaded
+                .into_iter()
+                .map(|(candidate, _mode, _policy)| candidate)
+                .collect();
+            match_existing_agents(&required, &requirement, &placement, &candidates, &catalog)
+                .map_err(contract_fault)
+        }
+        // B5.2: the proven policy order, with cross-mode exclusion of COARSE
+        // candidates and the Task ceiling as the comparison target.
+        SecurityContractMode::SecurityV1 => {
+            let binding = get_task_security_binding(tx, task_id)?.ok_or_else(|| {
+                Error::invariant("a SECURITY_V1 task is missing its TaskSecurityBinding")
+            })?;
+            let ceiling =
+                TaskSecurityCeiling::from_binding(task_id.clone(), &binding, &requirement)
+                    .map_err(contract_fault)?;
+            let required_revision =
+                SecurityRevision::new(&required, required_mode, required_policy.as_ref())
+                    .map_err(contract_fault)?;
+            let qualified = loaded
+                .iter()
+                .map(|(candidate, candidate_mode, candidate_policy)| {
+                    QualifiedExistingAgentCandidate::new(
+                        candidate,
+                        *candidate_mode,
+                        candidate_policy.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(contract_fault)?;
+            match_existing_agents_security_v1(
+                &required_revision,
+                &ceiling,
+                &requirement,
+                &placement,
+                &qualified,
+                &catalog,
+            )
+            .map_err(contract_fault)
+        }
+    }
 }
 
 // =============================================================================
