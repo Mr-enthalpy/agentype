@@ -234,6 +234,9 @@ pub struct EffectiveTaskAuthority {
     requirement_digest: String,
     agent_policy_digest: String,
     source_policy_digest: Option<String>,
+    normalization_version: u32,
+    meet_algorithm_version: u32,
+    requires_attempt_isolation: bool,
 }
 
 impl EffectiveTaskAuthority {
@@ -329,6 +332,14 @@ impl EffectiveTaskAuthority {
             requirement_digest: task_agent_requirement_content_digest(requirement),
             agent_policy_digest,
             source_policy_digest,
+            normalization_version: binding.derivation().normalization_version(),
+            meet_algorithm_version: binding.derivation().meet_algorithm_version(),
+            requires_attempt_isolation: requirement.hard.required_attempt_isolation
+                || agent
+                    .agent_type()
+                    .contract
+                    .security
+                    .requires_attempt_isolation,
         })
     }
 
@@ -388,6 +399,24 @@ impl EffectiveTaskAuthority {
 
     pub fn source_policy_digest(&self) -> Option<&str> {
         self.source_policy_digest.as_deref()
+    }
+
+    /// The normalization version the durable derivation was produced under.
+    /// Together with [`Self::meet_algorithm_version`] it is an explicit compile
+    /// cache-key component (ADR-0014 §4).
+    pub fn normalization_version(&self) -> u32 {
+        self.normalization_version
+    }
+
+    pub fn meet_algorithm_version(&self) -> u32 {
+        self.meet_algorithm_version
+    }
+
+    /// Whether the Task or the bound AgentType requires attempt isolation. This
+    /// is a guarantee, not a policy dimension, so it is folded into the
+    /// enforcement obligations separately from the policy bytes.
+    pub fn requires_attempt_isolation(&self) -> bool {
+        self.requires_attempt_isolation
     }
 
     /// Re-check the Task's positive coarse modes against the complete policy.

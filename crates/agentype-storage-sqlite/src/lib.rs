@@ -31,6 +31,7 @@ mod preparation;
 pub mod provisioning;
 pub mod requirement;
 mod schema;
+pub mod security_acquisition;
 mod store;
 pub mod txutil;
 

@@ -20,6 +20,7 @@ mod authority;
 mod canonical;
 mod capability;
 mod decode;
+mod enforcement;
 mod error;
 mod evidence;
 mod ids;
@@ -66,6 +67,16 @@ pub use decode::{
     sandbox_policy_from_canonical_json, security_derivation_from_canonical_json,
     source_config_revision_from_canonical_json, spawn_source_from_canonical_json,
     task_agent_requirement_from_canonical_json,
+};
+pub use enforcement::{
+    binding_profile_digest, compile_execution_security, qualify_security_candidate,
+    AcquisitionBudget, AcquisitionCost, BudgetExhaustion, BudgetLimit, CandidateDomain,
+    CompileCacheKey, CompiledExecutionSecurity, EffectiveExecutionGuarantees, EnforcementFeature,
+    EnforcementSubject, EnforcementSupport, ImportedEnforcementProfile, PolicyEnforcementPlan,
+    RequiredEnforcementFeatures, SecurityAcquisitionBlock, SecurityAcquisitionBlockStatus,
+    SecurityAcquisitionRelease, SecurityEvidenceSubject, ENFORCEMENT_COMPILER_PROTOCOL,
+    ENFORCEMENT_PLAN_SCHEMA_VERSION, ENFORCEMENT_PROFILE_SCHEMA_VERSION,
+    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;

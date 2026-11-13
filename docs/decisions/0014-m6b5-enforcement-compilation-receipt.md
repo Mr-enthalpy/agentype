@@ -160,6 +160,44 @@ shrink the candidate set, select among the compiled subset, or introduce a new
 semantic selection policy. A budget defer is an operator-visible liveness
 classification, never a security rejection of any candidate.
 
+#### Durable encoding (schema v10)
+
+The diagnostic is the `security_acquisition_blocks` table. It is the only new
+durable object B5.2 adds, and it carries no Attempt, Lease, Execution or Task
+authority:
+
+```text
+task_id                    PRIMARY KEY, FK task_agent_requirements(task_id)
+generation_id              the Task's durable GenerationTaskBinding generation
+candidate_domain_digest    order-independent digest of the distinct candidate ids
+candidate_count            distinct candidate identities seen in the round
+binding_profile_digest     digest of (adapter binding policy, imported profile,
+                           compiler protocol)
+cost_candidates, cost_compiles
+budget_max_candidates, budget_max_compiles
+budget_limit               CANDIDATE_COUNT | COMPILE_COUNT
+status                     BLOCKED | RELEASED
+created_at, released_at, release_reason
+                           release_reason: OPERATOR_ACTION | CONFIGURATION_CHANGED
+```
+
+The row is owned by the acquisition control plane, not by runtime-local
+`TypedDispatchState.cooldowns`, so it survives restart. Its identity is the
+condition, not the round: the same `(candidate_domain_digest,
+binding_profile_digest)` pair MUST remain one row. Re-observing it is a no-op —
+including after release, so a released condition cannot resurrect itself. A
+different condition replaces the diagnostic fields and starts `BLOCKED` again;
+that is a new diagnostic, not a retry of the released one. `RELEASED` requires
+both release fields, `BLOCKED` forbids them, and the release identity and time are
+final once written. Rows are released, never deleted, and the parent rule admits
+only a `SECURITY_V1` Task, because the coarse typed path has no compiled
+candidate round to defer.
+
+The schema is fresh-only: version 10 rejects a v9 file at open under the existing
+D-DB-MIGRATE rule, and there is no in-place migration and no backfill of a
+historical block. A budget defer therefore leaves no durable trace until the
+control plane records one; it never mints a partial selection.
+
 Classification is strict:
 
 - a deterministically unsupported combination excludes that candidate;
