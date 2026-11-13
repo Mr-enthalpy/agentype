@@ -230,6 +230,63 @@ pub fn catalog_admin_surface() {}
 /// ```
 pub fn b5_composite_authority_surface() {}
 
+/// The M6-B.5 B5.2 pure enforcement-compilation surface, as a `no_run` doctest.
+///
+/// Compilation is pure and root-relative: it creates no directory, starts no
+/// process, and grants no Attempt/Lease authority. An imported enforcement
+/// profile is an external fact, so the supported surface can accept one but
+/// cannot mint one.
+///
+/// ```no_run
+/// use agentype_agent_contract::{
+///     binding_profile_digest, compile_execution_security, qualify_security_candidate,
+///     AcquisitionBudget, AcquisitionCost, AdapterBindingPolicy, CandidateDomain,
+///     CapabilityCatalog, EffectiveTaskAuthority, ImportedEnforcementProfile,
+///     PolicyEnforcementPlan, SecurityAcquisitionBlock, SecurityAcquisitionRelease,
+///     SecurityRevision, TaskAgentRequirement,
+/// };
+/// use agentype_core::GenerationId;
+///
+/// #[allow(clippy::too_many_arguments)]
+/// fn compile(
+///     authority: &EffectiveTaskAuthority,
+///     requirement: &TaskAgentRequirement,
+///     revision: &SecurityRevision<'_>,
+///     binding: &AdapterBindingPolicy,
+///     profile: &ImportedEnforcementProfile,
+///     catalog: &CapabilityCatalog,
+/// ) {
+///     let compiled =
+///         compile_execution_security(authority, binding, profile).expect("candidate-local");
+///     let plan: &PolicyEnforcementPlan = compiled.plan();
+///     let _ = plan.plan_digest();
+///     let _ = plan.obligations();
+///     let _ = compiled.cache_key().enforcement_profile_digest();
+///     let _ = compiled.evidence_subject().is_complete();
+///     let _ = binding_profile_digest(binding, profile);
+///     let _ = qualify_security_candidate(
+///         authority, requirement, revision, binding, profile, catalog,
+///     );
+///
+///     let budget = AcquisitionBudget::new(8, 8).expect("non-zero budget");
+///     if let Err(exhaustion) = budget.require_whole_round(AcquisitionCost::new(9, 9)) {
+///         let block = SecurityAcquisitionBlock::from_budget_defer(
+///             authority.task_id().clone(),
+///             GenerationId::from_string("generation"),
+///             CandidateDomain::from_ids([]),
+///             "sha256:binding",
+///             exhaustion,
+///             0.0,
+///         )
+///         .expect("a whole-round defer is a durable diagnostic");
+///         let _ = block.reason();
+///         let _ = block.release_condition();
+///         let _ = SecurityAcquisitionRelease::OperatorAction;
+///     }
+/// }
+/// ```
+pub fn b5_compiled_security_surface() {}
+
 /// Boundary probes: one `compile_fail` doctest per unreachable item.
 ///
 /// The numbering is the boundary list this milestone was audited against.
@@ -489,6 +546,19 @@ pub fn b5_composite_authority_surface() {}
 /// use agentype_runtime::provisioning_resolver::SourceIntegrationRegistry;
 /// fn _no_uniform_source_route() {
 ///     let _ = SourceIntegrationRegistry::uniform;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // 31. An imported enforcement profile is an external fact: the supported
+/// //     surface has no constructor for it (`import` / `from_parts` are gated
+/// //     behind `provisioning-producer`, which the default surface does not
+/// //     enable). A consumer may consume an imported profile; it cannot mint
+/// //     one and thereby assert enforcement a physical domain does not provide.
+/// use agentype_agent_contract::ImportedEnforcementProfile;
+/// fn _no_profile_import() {
+///     let _ = ImportedEnforcementProfile::import;
+///     let _ = ImportedEnforcementProfile::from_parts;
 /// }
 /// ```
 pub fn probes() {}

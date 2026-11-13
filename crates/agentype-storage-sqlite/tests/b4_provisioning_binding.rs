@@ -1863,11 +1863,11 @@ fn confirmed_preparation_fault_after_elapsed_lease_still_blocks_orphan_retry() {
         .is_err());
 }
 
-/// Schema v9 is fresh-only, so there is no v8 file to reopen. Reopening an
-/// existing v9 file still re-applies the additive DDL idempotently, which is
-/// what keeps a dropped preparation-fault guard from becoming a bypass.
+/// The Rust-era schema is fresh-only, so there is no older file to reopen.
+/// Reopening an existing file still re-applies the additive DDL idempotently,
+/// which is what keeps a dropped preparation-fault guard from becoming a bypass.
 #[test]
-fn v9_database_reopen_reinstalls_additive_preparation_fault_guards() {
+fn current_schema_reopen_reinstalls_additive_preparation_fault_guards() {
     let env = Env::new("v9-fault-schema", 1);
     let raw = env.raw();
     raw.execute_batch(
@@ -1887,7 +1887,7 @@ fn v9_database_reopen_reinstalls_additive_preparation_fault_guards() {
         raw.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let guards: i64 = raw
         .query_row(
