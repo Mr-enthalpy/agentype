@@ -364,6 +364,19 @@ separately, not one vague "derivation version". Golden vectors are keyed by
 `(canonical_version, algebra_version)`. Existing rows are read under the version
 recorded with them and MUST NOT be reinterpreted by a newer algorithm.
 
+`SecurityDerivation` proves the canonical **output content** and the unique
+**set** of authored/derived input references and digests used to produce it. Its
+input list is unordered: each `(reference, digest)` pair is sorted and
+deduplicated, and it carries no per-input author role. Consequently a Generation
+and a Task that author the same exact policy contribute one input entry, not two
+role-tagged entries. The Task author identity is carried by
+`TaskAgentRequirement.sandbox_policy` and re-read jointly with the Generation
+policy and the derivation: a binding is accepted only when the independently
+recomputed derivation, the durable requirement, and the catalog agree. A reader
+MUST NOT treat the derivation digest alone as proof of which author contributed
+which layer. Role-tagged inputs would change the canonical bytes and therefore
+require a new derivation canonical version; B5.1 does not adopt them.
+
 ### 5. Admission proves satisfiability; candidates prove satisfaction
 
 There is exactly one `satisfies_requirement` relation. It is total over `R_min`
@@ -487,6 +500,18 @@ managed grant, are not certified by this ADR, and neither satisfy nor are implie
 by a `CredentialAuthorizationId`. Absence of a grant and physical impossibility of
 credential access are different claims at every layer.
 
+The canonical form is the identity of the policy's authorization semantics. A
+`CredentialGrant` with an empty `uses`, `audience` or `delivery_modes` facet
+authorizes nothing, so normalization **drops** it instead of serializing an inert
+grant; the corresponding `CredentialAuthorizationId` is then simply absent from
+the canonical map. An explicitly authored no-authority grant and an absent grant
+therefore share one canonical byte sequence and one content digest. Dropping such
+a grant loses no authority and no later reader may reintroduce authority from a
+digest. `is_within` is a preorder on normalized policies, and canonical digest
+equality is a sufficient but not the only way to observe no-wider in both
+directions; it MUST NOT be used as a substitute for the algebra when comparing
+policies that were not produced by the same normalization path.
+
 `meet` is **partially defined** over the grammar, not total:
 
 ```text
@@ -599,6 +624,20 @@ equality ⊆ new_order
 Every contract accepted under B.1–B.4 exact equality MUST remain accepted. A
 previously rejected "different but narrower" policy becomes legal only through
 an explicit catalog declaration. A differential test MUST pin this.
+
+B5.1 applies the mode-aware policy order only where a `SECURITY_V1` revision is
+matched: admission of a Task against a pinned `SECURITY_V1` AgentType, and
+`based_on` refinement between two `SECURITY_V1` revisions. The frozen
+`can_execute`, `more_specific_for` and `is_valid_refinement` relations keep their
+exact-reference policy behavior for `COARSE_V1`; a `SECURITY_V1` Task that pins a
+`COARSE_V1` AgentType stays eligible at admission and its execution-mode
+eligibility is a candidate-stage decision. A `SECURITY_V1` revision may therefore
+be refined by another `SECURITY_V1` revision with a different, provably narrower
+authored policy, while `SECURITY_V1 -> COARSE_V1` refinement is rejected because
+it drops the physical enforcement contract even when the coarse fields and policy
+reference are unchanged. B5.1 thus implements this conservative subset of the
+§5 ordering; it does not claim the complete secured-execution qualification that
+B5.2/B5.4 own.
 
 ### 10. `ActualAuthority` is defined by provable equality, not by a claim
 
