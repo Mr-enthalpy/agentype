@@ -382,6 +382,29 @@ MUST NOT treat the derivation digest alone as proof of which author contributed
 which layer. Role-tagged inputs would change the canonical bytes and therefore
 require a new derivation canonical version; B5.1 does not adopt them.
 
+#### Read-side revalidation of release invariants
+
+Publication-time validation is not a substitute for a validated read. The schema
+guards make the relevant columns immutable, but the project's corruption
+discipline requires that a bypassing direct-SQL writer still fails closed:
+
+- `spawn_source_security_declaration` re-reads the declared `P_source` and
+  rejects it when `attempt_isolation = true`, matching
+  `validated_source_declaration`. The source contract has no independent field
+  that could attribute an isolation guarantee, so a repointed declaration MUST
+  NOT acquire one.
+- `get_task_security_binding` compares `generation_security_mode(...)` with the
+  Task's durable `security_contract_mode` before re-deriving the binding.
+  Admission required the two modes to be equal; a read that sees a locally valid
+  but cross-record contradictory pair treats it as corruption, never as
+  execution qualification.
+- The sandbox-policy and capability-document budgets are re-checked by their
+  decoders, and a stored binding policy is re-encoded and compared byte-for-byte
+  with its canonical form.
+
+These checks are error paths, not alternate semantics: they return an invariant
+or contract error and never repair, downgrade, or reinterpret the stored value.
+
 ### 5. Admission proves satisfiability; candidates prove satisfaction
 
 There is exactly one `satisfies_requirement` relation. It is total over `R_min`
@@ -748,12 +771,29 @@ decoder rejects it before constructing a partial policy.
 
 Those per-dimension bounds alone still allow a maximal policy to be physically
 large, so one canonical sandbox policy document is additionally limited to
-1,048,576 bytes. `sandbox_policy_from_canonical_json` checks the document length
-before parsing, and the catalog publisher checks the canonical encoding before
-hashing or storing it. An oversized document is rejected at the input boundary;
-it is never stored and then rejected on every read. As with the path bounds,
-these are v1 input-grammar limits: they do not change the canonical bytes of an
-accepted policy, and relaxing them requires an explicit version decision.
+1,048,576 bytes. The limit is enforced by the value constructor
+`NormalizedSandboxPolicy::from_parts`, after normalization: an authored policy, a
+decoded policy and the result of `meet` all pass the same check before the value
+exists. `sandbox_policy_from_canonical_json` checks the document length before
+parsing, and the catalog publisher checks the canonical encoding before hashing
+or storing it; those are boundary repetitions of the value invariant, not the
+only enforcement point. Consequently a `meet(P_generation, P_task)` whose result
+is not representable fails as a `PolicyConflict` inside admission, before any
+durable Task, Batch, binding or requirement row is committed. A durable
+commitment can never be written that the validated reader would refuse to read.
+As with the path bounds, these are v1 input-grammar limits: they do not change
+the canonical bytes of an accepted policy, and relaxing them requires an
+explicit version decision.
+
+A capability definition with a v2 `PolicyProjection` is bounded as authored
+catalog input as well. One projection map has at most 256 members, one member
+name or operation token is at most 256 bytes and contains no NUL or `=`, and one
+canonical capability definition document is at most 1,048,576 bytes.
+`PolicyProjection::new` enforces the map and token bounds,
+`capability_definition_from_canonical_json` checks the whole-document budget
+before parsing, and the publisher checks the canonical encoding before hashing
+or storing it. An oversized definition is therefore rejected at publication and
+cannot make a later `load_capability_catalog` traverse unbounded input.
 
 #### v1 `ToolCommandSet` is one abstract operation namespace
 
