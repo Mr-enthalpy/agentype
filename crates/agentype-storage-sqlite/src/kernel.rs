@@ -830,11 +830,38 @@ impl Kernel {
     }
 
     pub fn publish_agent_type(&self, agent: &AgentType) -> Result<String, Error> {
-        self.tx(|tx, now| crate::catalog::publish_agent_type(tx, now, agent))
+        self.publish_agent_type_with_security(agent, SecurityContractMode::CoarseV1)
+    }
+
+    /// Publish an AgentType revision and its immutable security mode atomically.
+    ///
+    /// There is no post-publication declaration API: a revision's mode is part
+    /// of its identity, and changing it requires a new revision.
+    pub fn publish_agent_type_with_security(
+        &self,
+        agent: &AgentType,
+        security_mode: SecurityContractMode,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_agent_type_with_security(tx, now, agent, security_mode)
+        })
     }
 
     pub fn publish_spawn_source(&self, source: &SpawnSource) -> Result<String, Error> {
-        self.tx(|tx, now| crate::catalog::publish_spawn_source(tx, now, source))
+        self.publish_spawn_source_with_security(source, None)
+    }
+
+    /// Publish a SpawnSource revision and its immutable security declaration
+    /// atomically. A declaration makes the revision `SECURITY_V1`; absence is
+    /// the frozen `COARSE_V1` contract.
+    pub fn publish_spawn_source_with_security(
+        &self,
+        source: &SpawnSource,
+        declaration: Option<&SpawnSourceSecurityDeclaration>,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_spawn_source_with_security(tx, now, source, declaration)
+        })
     }
 
     pub fn publish_source_config(
@@ -880,35 +907,11 @@ impl Kernel {
         self.tx(|tx, _| crate::catalog::get_sandbox_policy(tx, reference))
     }
 
-    pub fn publish_agent_type_security_declaration(
-        &self,
-        reference: &AgentTypeRef,
-    ) -> Result<(), Error> {
-        self.tx(|tx, now| {
-            crate::catalog::publish_agent_type_security_declaration(tx, now, reference)
-        })
-    }
-
     pub fn agent_type_security_mode(
         &self,
         reference: &AgentTypeRef,
     ) -> Result<SecurityContractMode, Error> {
         self.tx(|tx, _| crate::catalog::agent_type_security_mode(tx, reference))
-    }
-
-    pub fn publish_spawn_source_security_declaration(
-        &self,
-        reference: &SpawnSourceRef,
-        declaration: &SpawnSourceSecurityDeclaration,
-    ) -> Result<(), Error> {
-        self.tx(|tx, now| {
-            crate::catalog::publish_spawn_source_security_declaration(
-                tx,
-                now,
-                reference,
-                declaration,
-            )
-        })
     }
 
     pub fn spawn_source_security_declaration(

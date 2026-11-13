@@ -21,7 +21,8 @@ use agentype_agent_contract::{
     content_digest, is_valid_refinement, sandbox_policy_content_digest,
     sandbox_policy_from_canonical_json, source_config_content_digest,
     source_config_revision_from_canonical_json, spawn_source_content_digest,
-    spawn_source_from_canonical_json, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
+    spawn_source_from_canonical_json, validate_agent_type_coarse_fine,
+    validate_capability_claims_against_policy, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
     AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog, CapabilityDefinition,
     CapabilityRef, ConfigDigest, ConfigStatus, ContractError, EnforcementProfileRef,
     NormalizedSandboxPolicy, PolicyInput, SandboxPolicyRef, SecurityContractMode, SourceConfig,
@@ -153,6 +154,27 @@ fn contract_fault(error: ContractError) -> Error {
     Error::invariant(error.to_string())
 }
 
+/// Convert a durable unsigned revision/version into the signed integer domain
+/// only when it round-trips, so a truncating `as` cast can never make two
+/// different versions compare equal.
+fn checked_i64(value: u64, what: &str) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|_| {
+        Error::invariant(format!(
+            "{what} {value} does not fit in the durable integer domain"
+        ))
+    })
+}
+
+/// Convert a stored signed version into `u32` only when it is exactly
+/// representable; a negative or oversized value is corruption, not a version.
+fn checked_u32(value: i64, what: &str) -> Result<u32, Error> {
+    u32::try_from(value).map_err(|_| {
+        Error::invariant(format!(
+            "{what} {value} is outside the supported unsigned 32-bit version domain"
+        ))
+    })
+}
+
 fn canonical_json_string(bytes: Vec<u8>, what: &str) -> Result<String, Error> {
     String::from_utf8(bytes)
         .map_err(|_| Error::invariant(format!("{what} canonical bytes are not UTF-8")))
@@ -276,7 +298,8 @@ pub fn load_capability_catalog(tx: &Transaction<'_>) -> Result<CapabilityCatalog
         // read; a document whose encoding disagrees with it must fail closed
         // rather than be reinterpreted under the other version.
         cross_check(
-            canonical_version as u32 == definition.canonical_version(),
+            checked_u32(canonical_version, "capability definition canonical_version")?
+                == definition.canonical_version(),
             "capability definition canonical_version",
         )?;
         verify_reencoded(
@@ -446,6 +469,25 @@ pub fn publish_agent_type(
     now: UnixTime,
     agent: &AgentType,
 ) -> Result<String, Error> {
+    publish_agent_type_with_security(tx, now, agent, SecurityContractMode::CoarseV1)
+}
+
+/// Publish an AgentType revision together with its immutable security mode.
+///
+/// The mode is part of the revision: a `SECURITY_V1` revision's declaration row
+/// is written in the same transaction as the immutable content, so there is no
+/// window or API to attach a security fact after publication. Absence of a row
+/// is the frozen `COARSE_V1` contract.
+///
+/// A `SECURITY_V1` revision MUST author a sandbox policy whose projection is
+/// exactly its coarse `SecurityContract`, and every mapped capability claim it
+/// requires MUST be allowed by that same policy (ADR-0013 §3, §6).
+pub fn publish_agent_type_with_security(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    agent: &AgentType,
+    security_mode: SecurityContractMode,
+) -> Result<String, Error> {
     let mut canonical = agent.clone();
     let catalog = load_capability_catalog(tx)?;
     canonicalize_agent_type(&mut canonical, &catalog).map_err(contract_fault)?;
@@ -467,6 +509,38 @@ pub fn publish_agent_type(
         is_valid_refinement(&base, &canonical, &catalog).map_err(contract_fault)?;
     }
 
+    // P1-3: a `SECURITY_V1` AgentType is only valid when its authored policy is
+    // the single authority its coarse contract and mapped claims project from.
+    if security_mode == SecurityContractMode::SecurityV1 {
+        let reference = canonical.contract.sandbox_policy.as_ref().ok_or_else(|| {
+            Error::invalid_authority("a SECURITY_V1 agent type must author a sandbox policy")
+        })?;
+        let authored = get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+            Error::not_found(format!(
+                "sandbox policy {}@{} does not exist",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        })?;
+        validate_agent_type_coarse_fine(&canonical.contract.security, &authored).map_err(
+            |error| {
+                Error::invalid_authority(format!(
+                    "SECURITY_V1 agent type contradicts its authored policy: {error}"
+                ))
+            },
+        )?;
+        validate_capability_claims_against_policy(
+            &canonical.contract.required_capabilities,
+            &catalog,
+            &authored,
+        )
+        .map_err(|error| {
+            Error::invalid_authority(format!(
+                "SECURITY_V1 agent type capability claims contradict its authored policy: {error}"
+            ))
+        })?;
+    }
+
     let digest = agent_type_content_digest(&canonical);
     let content_json = canonical_json_string(canonical_agent_type_bytes(&canonical), "agent type")?;
     let existing = existing_digest(
@@ -481,6 +555,19 @@ pub fn publish_agent_type(
         // Never repair an existing revision: validate the complete stored record
         // (including its disposition overlay) and the offered content identity.
         guard_immutable(Some(stored), &digest, "agent type")?;
+        // The security mode is part of the immutable revision identity. An
+        // idempotent republish must request the same mode; changing it would
+        // reinterpret an existing revision and requires a new revision instead.
+        let stored_mode = raw_agent_type_security_mode(tx, &canonical.type_ref)?;
+        if stored_mode != security_mode {
+            return Err(Error::invariant(format!(
+                "agent type {}@{} is {} but was republished as {}; a mode change requires a new revision",
+                canonical.type_ref.id().as_str(),
+                canonical.type_ref.revision(),
+                stored_mode.as_str(),
+                security_mode.as_str()
+            )));
+        }
         get_agent_type(tx, &canonical.type_ref)?
             .ok_or_else(|| Error::invariant("published agent type is missing"))?;
         return Ok(digest);
@@ -512,6 +599,22 @@ pub fn publish_agent_type(
         ],
     )
     .map_err(map_sqlite)?;
+    // The declaration is written in the same transaction as the revision; there
+    // is no separate post-publication declaration API. Absence is `COARSE_V1`.
+    if security_mode == SecurityContractMode::SecurityV1 {
+        tx.execute(
+            "INSERT INTO agent_type_security_declarations(
+                 type_id, revision, security_contract_mode, created_at)
+             VALUES(?1,?2,?3,?4)",
+            params![
+                canonical.type_ref.id().as_str(),
+                canonical.type_ref.revision(),
+                SecurityContractMode::SecurityV1.as_str(),
+                now
+            ],
+        )
+        .map_err(map_sqlite)?;
+    }
     Ok(digest)
 }
 
@@ -523,6 +626,23 @@ pub fn publish_spawn_source(
     tx: &Transaction<'_>,
     now: UnixTime,
     source: &SpawnSource,
+) -> Result<String, Error> {
+    publish_spawn_source_with_security(tx, now, source, None)
+}
+
+/// Publish a SpawnSource revision together with its immutable security
+/// declaration, if any (ADR-0013 §11).
+///
+/// A declaration makes the revision `SECURITY_V1` whether or not it carries an
+/// authored `P_source` ceiling. It is written in the same transaction as the
+/// immutable source content, so a source revision can never be selected as
+/// `COARSE_V1` and later "upgraded" in place; changing the declaration requires
+/// a new revision.
+pub fn publish_spawn_source_with_security(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    source: &SpawnSource,
+    declaration: Option<&SpawnSourceSecurityDeclaration>,
 ) -> Result<String, Error> {
     let mut canonical = source.clone();
     let catalog = load_capability_catalog(tx)?;
@@ -541,6 +661,12 @@ pub fn publish_spawn_source(
         ))
     })?;
 
+    // Validate the optional declaration before any write, including its
+    // authored `P_source` reference and content digest.
+    if let Some(declaration) = declaration {
+        validated_source_declaration(tx, declaration)?;
+    }
+
     let digest = spawn_source_content_digest(&canonical);
     let content_json =
         canonical_json_string(canonical_spawn_source_bytes(&canonical), "spawn source")?;
@@ -554,6 +680,17 @@ pub fn publish_spawn_source(
     )?;
     if let Some(stored) = existing {
         guard_immutable(Some(stored), &digest, "spawn source")?;
+        // The security declaration is part of the immutable revision identity.
+        // An idempotent republish must carry exactly the same declaration; any
+        // change requires a new source revision.
+        let stored_declaration = spawn_source_security_declaration(tx, &canonical.source_ref)?;
+        if stored_declaration.as_ref() != declaration {
+            return Err(Error::invariant(format!(
+                "spawn source {}@{} security declaration differs from its existing immutable revision; a change requires a new revision",
+                canonical.source_ref.id().as_str(),
+                canonical.source_ref.revision()
+            )));
+        }
         get_spawn_source(tx, &canonical.source_ref)?
             .ok_or_else(|| Error::invariant("published spawn source is missing"))?;
         return Ok(digest);
@@ -588,6 +725,9 @@ pub fn publish_spawn_source(
         ],
     )
     .map_err(map_sqlite)?;
+    if let Some(declaration) = declaration {
+        insert_spawn_source_declaration(tx, now, &canonical.source_ref, declaration)?;
+    }
     Ok(digest)
 }
 
@@ -753,10 +893,13 @@ pub fn get_agent_type(
             verify_content_digest(&json, &digest, "agent type")?;
             let mut agent = agent_type_from_canonical_json(&json).map_err(contract_fault)?;
             cross_check(agent.type_ref == *reference, "agent type")?;
-            let canonical_base = agent
-                .based_on
-                .as_ref()
-                .map(|base| (base.id().as_str().to_string(), base.revision() as i64));
+            let canonical_base = match agent.based_on.as_ref() {
+                Some(base) => Some((
+                    base.id().as_str().to_string(),
+                    checked_i64(base.revision(), "agent type revision")?,
+                )),
+                None => None,
+            };
             let row_base = match (base_id, base_revision) {
                 (Some(id), Some(revision)) => Some((id, revision)),
                 (None, None) => None,
@@ -770,6 +913,7 @@ pub fn get_agent_type(
             let catalog = load_capability_catalog(tx)?;
             canonicalize_agent_type(&mut agent, &catalog).map_err(contract_fault)?;
             verify_reencoded(&canonical_agent_type_bytes(&agent), &json, "agent type")?;
+            validate_agent_type_security_read(tx, &agent, &catalog)?;
             Ok(Some((agent, AgentTypeStatus::parse_sql(&status)?)))
         }
     }
@@ -817,7 +961,8 @@ pub(crate) fn load_spawn_source(
             cross_check(source.source_ref == *reference, "spawn source")?;
             cross_check(
                 source.adapter_policy.id().as_str() == policy_id
-                    && source.adapter_policy.revision() as i64 == policy_revision,
+                    && checked_i64(source.adapter_policy.revision(), "adapter policy revision")?
+                        == policy_revision,
                 "spawn source",
             )?;
             // Decode, re-canonicalize against the catalog, then require the
@@ -1154,7 +1299,8 @@ pub fn get_capability_definition(
                 "capability definition",
             )?;
             cross_check(
-                canonical_version as u32 == definition.canonical_version(),
+                checked_u32(canonical_version, "capability definition canonical_version")?
+                    == definition.canonical_version(),
                 "capability definition canonical_version",
             )?;
             verify_reencoded(
@@ -1493,7 +1639,8 @@ pub fn get_sandbox_policy(
             // build does not implement fails closed instead of being decoded
             // under current semantics.
             cross_check(
-                canonical_version as u32 == SANDBOX_POLICY_SCHEMA_VERSION,
+                checked_u32(canonical_version, "sandbox policy canonical_version")?
+                    == SANDBOX_POLICY_SCHEMA_VERSION,
                 "sandbox policy canonical_version",
             )?;
             verify_reencoded(
@@ -1506,65 +1653,16 @@ pub fn get_sandbox_policy(
     }
 }
 
-/// Make an AgentType revision explicitly `SECURITY_V1`.
+/// The raw declared mode of an exact AgentType revision; absence is `COARSE_V1`.
 ///
-/// Absence of the declaration is the frozen `COARSE_V1` contract, so there is
-/// no row for a coarse revision. The parent revision MUST be a complete
-/// validated catalog record before a security fact can attach to it.
-pub fn publish_agent_type_security_declaration(
-    tx: &Transaction<'_>,
-    now: UnixTime,
-    reference: &AgentTypeRef,
-) -> Result<(), Error> {
-    get_agent_type(tx, reference)?.ok_or_else(|| {
-        Error::not_found(format!(
-            "agent type {}@{} does not exist",
-            reference.id().as_str(),
-            reference.revision()
-        ))
-    })?;
-    let existing = query_opt(
-        tx,
-        "SELECT security_contract_mode FROM agent_type_security_declarations
-         WHERE type_id=?1 AND revision=?2",
-        params![reference.id().as_str(), reference.revision()],
-        |row| row.get::<_, String>(0),
-    )?;
-    if let Some(mode) = existing {
-        // Only one spelling is durable; a repeated declaration is an idempotent
-        // no-op, and any other stored mode is corruption.
-        return cross_check(
-            mode == SecurityContractMode::SecurityV1.as_str(),
-            "agent type security declaration",
-        );
-    }
-    tx.execute(
-        "INSERT INTO agent_type_security_declarations(
-             type_id, revision, security_contract_mode, created_at)
-         VALUES(?1,?2,?3,?4)",
-        params![
-            reference.id().as_str(),
-            reference.revision(),
-            SecurityContractMode::SecurityV1.as_str(),
-            now
-        ],
-    )
-    .map_err(map_sqlite)?;
-    Ok(())
-}
-
-/// The declared mode of an exact AgentType revision; absence is `COARSE_V1`.
-pub fn agent_type_security_mode(
+/// This is deliberately **not** a publication API: the declaration is written
+/// only together with the immutable revision by
+/// [`publish_agent_type_with_security`]. Keeping the raw read separate avoids a
+/// recursion through the validated [`get_agent_type`] read.
+fn raw_agent_type_security_mode(
     tx: &Transaction<'_>,
     reference: &AgentTypeRef,
 ) -> Result<SecurityContractMode, Error> {
-    get_agent_type(tx, reference)?.ok_or_else(|| {
-        Error::not_found(format!(
-            "agent type {}@{} does not exist",
-            reference.id().as_str(),
-            reference.revision()
-        ))
-    })?;
     let stored = query_opt(
         tx,
         "SELECT security_contract_mode FROM agent_type_security_declarations
@@ -1584,28 +1682,71 @@ pub fn agent_type_security_mode(
     }
 }
 
-/// Publish the immutable security declaration of one exact SpawnSource revision.
-///
-/// A declaration makes the revision `SECURITY_V1` whether or not it carries an
-/// authored `P_source` ceiling. The authored policy reference (if any) MUST
-/// resolve through the validated policy read and its digest MUST match the
-/// stored canonical content.
-pub fn publish_spawn_source_security_declaration(
+/// The declared mode of an exact AgentType revision; absence is `COARSE_V1`.
+pub fn agent_type_security_mode(
     tx: &Transaction<'_>,
-    now: UnixTime,
-    reference: &SpawnSourceRef,
-    declaration: &SpawnSourceSecurityDeclaration,
-) -> Result<(), Error> {
-    get_spawn_source(tx, reference)?.ok_or_else(|| {
+    reference: &AgentTypeRef,
+) -> Result<SecurityContractMode, Error> {
+    get_agent_type(tx, reference)?.ok_or_else(|| {
         Error::not_found(format!(
-            "spawn source {}@{} does not exist",
+            "agent type {}@{} does not exist",
             reference.id().as_str(),
             reference.revision()
         ))
     })?;
+    raw_agent_type_security_mode(tx, reference)
+}
 
-    let (policy_id, policy_revision, policy_digest) = match declaration.source_policy() {
-        None => (None, None, None),
+/// Re-prove the §3 AgentType projection and §6 capability consistency on the
+/// validated catalog read.
+///
+/// A `SECURITY_V1` revision whose authored policy no longer projects to its
+/// coarse contract, or which requires a mapped capability its own policy denies,
+/// is catalog corruption and MUST NOT become an agent's identity.
+fn validate_agent_type_security_read(
+    tx: &Transaction<'_>,
+    agent: &AgentType,
+    catalog: &CapabilityCatalog,
+) -> Result<(), Error> {
+    if raw_agent_type_security_mode(tx, &agent.type_ref)? != SecurityContractMode::SecurityV1 {
+        return Ok(());
+    }
+    let reference = agent.contract.sandbox_policy.as_ref().ok_or_else(|| {
+        Error::invariant("a SECURITY_V1 agent type is missing its authored sandbox policy")
+    })?;
+    let authored = get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+        Error::invariant(format!(
+            "SECURITY_V1 agent type pins a missing sandbox policy {}@{}",
+            reference.id().as_str(),
+            reference.revision()
+        ))
+    })?;
+    validate_agent_type_coarse_fine(&agent.contract.security, &authored).map_err(|error| {
+        Error::invariant(format!(
+            "SECURITY_V1 agent type contradicts its authored policy: {error}"
+        ))
+    })?;
+    validate_capability_claims_against_policy(
+        &agent.contract.required_capabilities,
+        catalog,
+        &authored,
+    )
+    .map_err(|error| {
+        Error::invariant(format!(
+            "SECURITY_V1 agent type capability claims contradict its authored policy: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validate a SpawnSource security declaration against the authored policy
+/// catalog and return its durable reference tuple.
+fn validated_source_declaration(
+    tx: &Transaction<'_>,
+    declaration: &SpawnSourceSecurityDeclaration,
+) -> Result<(Option<String>, Option<i64>, Option<String>), Error> {
+    match declaration.source_policy() {
+        None => Ok((None, None, None)),
         Some(input) => {
             let authored = input.reference().ok_or_else(|| {
                 Error::invariant(
@@ -1626,13 +1767,26 @@ pub fn publish_spawn_source_security_declaration(
                     input.policy_digest()
                 )));
             }
-            (
+            Ok((
                 Some(authored.id().as_str().to_string()),
-                Some(authored.revision() as i64),
+                Some(checked_i64(authored.revision(), "sandbox policy revision")?),
                 Some(recomputed),
-            )
+            ))
         }
-    };
+    }
+}
+
+/// Insert the immutable security declaration row of one exact source revision.
+fn insert_spawn_source_declaration(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    reference: &SpawnSourceRef,
+    declaration: &SpawnSourceSecurityDeclaration,
+) -> Result<(), Error> {
+    let (policy_id, policy_revision, policy_digest) =
+        validated_source_declaration(tx, declaration)?;
+    let profile = declaration.enforcement_profile();
+    let profile_version = checked_i64(u64::from(profile.version()), "enforcement profile version")?;
 
     let existing = query_opt(
         tx,
@@ -1660,13 +1814,12 @@ pub fn publish_spawn_source_security_declaration(
         stored_version,
     )) = existing
     {
-        let profile = declaration.enforcement_profile();
         let identical = stored_id == policy_id
             && stored_revision == policy_revision
             && stored_digest == policy_digest
             && stored_protocol == profile.protocol()
             && stored_profile == profile.profile()
-            && stored_version as u32 == profile.version();
+            && stored_version == profile_version;
         if !identical {
             return Err(Error::invariant(
                 "spawn source security declaration for this exact revision already exists \
@@ -1676,7 +1829,6 @@ pub fn publish_spawn_source_security_declaration(
         return Ok(());
     }
 
-    let profile = declaration.enforcement_profile();
     tx.execute(
         "INSERT INTO spawn_source_security_declarations(
              source_id, revision, security_contract_mode,
@@ -1693,7 +1845,7 @@ pub fn publish_spawn_source_security_declaration(
             policy_digest,
             profile.protocol(),
             profile.profile(),
-            profile.version(),
+            profile_version,
             now,
         ],
     )
@@ -1734,11 +1886,18 @@ pub fn spawn_source_security_declaration(
         mode == SecurityContractMode::SecurityV1.as_str(),
         "spawn source security declaration",
     )?;
-    let enforcement_profile = EnforcementProfileRef::new(protocol, profile, profile_version as u32)
-        .map_err(contract_fault)?;
+    let enforcement_profile = EnforcementProfileRef::new(
+        protocol,
+        profile,
+        checked_u32(profile_version, "enforcement profile version")?,
+    )
+    .map_err(contract_fault)?;
     let source_policy = match (policy_id, policy_revision, policy_digest) {
         (Some(id), Some(revision), Some(declared_digest)) => {
-            let reference = SandboxPolicyRef::new(id, revision as u64).map_err(contract_fault)?;
+            let revision = u64::try_from(revision).map_err(|_| {
+                Error::invariant("spawn source declaration sandbox policy revision is negative")
+            })?;
+            let reference = SandboxPolicyRef::new(id, revision).map_err(contract_fault)?;
             let policy = get_sandbox_policy(tx, &reference)?.ok_or_else(|| {
                 Error::invariant(format!(
                     "spawn source declaration references missing sandbox policy {}@{}",
@@ -1769,6 +1928,9 @@ pub fn spawn_source_security_declaration(
 }
 
 /// The declared mode of an exact SpawnSource revision; absence is `COARSE_V1`.
+///
+/// The declaration is read through the validated reader, so a corrupt
+/// declaration fails closed instead of being reported as coarse.
 pub fn spawn_source_security_mode(
     tx: &Transaction<'_>,
     reference: &SpawnSourceRef,
@@ -1780,22 +1942,9 @@ pub fn spawn_source_security_mode(
             reference.revision()
         ))
     })?;
-    let declared = query_opt(
-        tx,
-        "SELECT security_contract_mode FROM spawn_source_security_declarations
-         WHERE source_id=?1 AND revision=?2",
-        params![reference.id().as_str(), reference.revision()],
-        |row| row.get::<_, String>(0),
-    )?;
-    match declared {
+    match spawn_source_security_declaration(tx, reference)? {
         None => Ok(SecurityContractMode::CoarseV1),
-        Some(mode) => SecurityContractMode::parse(&mode)
-            .filter(|mode| *mode == SecurityContractMode::SecurityV1)
-            .ok_or_else(|| {
-                Error::invariant(format!(
-                    "spawn source security declaration records unsupported mode {mode:?}"
-                ))
-            }),
+        Some(declaration) => Ok(declaration.mode()),
     }
 }
 

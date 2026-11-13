@@ -1,19 +1,22 @@
 //! M6-B.5 schema v9 effective-security catalog conformance:
-//! authored sandbox policies, capability canonical versions, and the additive
-//! AgentType / SpawnSource `SECURITY_V1` declarations.
+//! authored sandbox policies, capability canonical versions, and the atomic
+//! AgentType / SpawnSource `SECURITY_V1` publication.
 //!
 //! These tests exercise the durable boundary only. B5.1 does not compile or
 //! execute a security plan; they prove that a policy can be submitted and
-//! re-read as exactly the same canonical contract, and that a corrupted or
-//! rewritten row fails closed.
+//! re-read as exactly the same canonical contract, that a revision's security
+//! mode is part of its immutable identity, and that a corrupted or rewritten row
+//! fails closed.
 
 use agentype_agent_contract::{
     AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint, AgentType, AgentTypeContract,
-    AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef, ConfigStatus,
-    ContinuityMode, EnforcementProfileRef, FileOperationClass, LifecycleMode, MatcherKind,
-    NetworkPolicy, NormalizedSandboxPolicy, PhysicalSafety, PolicyAccessDimension, PolicyInput,
-    PolicyOperation, PolicyProjection, SandboxPolicyRef, SecurityClass, SecurityContract,
-    SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
+    AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue,
+    ConfigStatus, ContinuityMode, EnforcementProfileRef, EnvironmentPolicy, FileOperationClass,
+    FilePolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet, NetworkPolicy,
+    NetworkTransport, NormalizedSandboxPolicy, PathSet, PhysicalSafety, PolicyAccessDimension,
+    PolicyInput, PolicyOperation, PolicyProjection, SandboxPolicyParts, SandboxPolicyRef,
+    SecurityClass, SecurityContract, SecurityContractMode, SourceStatus, SpawnSource,
+    SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
 };
 use agentype_core::{Clock, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::Kernel;
@@ -141,12 +144,58 @@ fn spawn_source() -> SpawnSource {
     }
 }
 
-fn publish_parents(kernel: &Kernel) {
+fn source_at(revision: u64) -> SpawnSource {
+    let mut source = spawn_source();
+    source.source_ref = SpawnSourceRef::new("codex-local", revision).unwrap();
+    source
+}
+
+/// A policy that projects to exactly `ReadOnly` workspace and `Restricted`
+/// network: the coarse contract of [`agent_type`].
+fn read_only_restricted_policy() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::any(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: NetworkEndpointSet::allowed([NetworkEndpoint::new(
+            NetworkTransport::Tcp,
+            "example.com",
+            Some(443),
+        )
+        .unwrap()]),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+fn publish_adapter_policy(kernel: &Kernel) {
     kernel
         .publish_adapter_binding_policy(&adapter_policy())
         .unwrap();
-    kernel.publish_agent_type(&agent_type()).unwrap();
-    kernel.publish_spawn_source(&spawn_source()).unwrap();
+}
+
+/// Publish one `SECURITY_V1` AgentType revision and return its canonical value.
+fn publish_secure_agent_type(kernel: &Kernel) -> AgentType {
+    let reference = policy_ref("agent-policy", 1);
+    kernel
+        .publish_sandbox_policy(&reference, &read_only_restricted_policy())
+        .unwrap();
+    let mut agent = agent_type();
+    agent.type_ref = type_ref("secure-coder", 1);
+    agent.contract.sandbox_policy = Some(reference);
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent
 }
 
 /// Drop every trigger so a test can simulate a bypassing direct-SQL writer.
@@ -304,29 +353,56 @@ fn capability_definition_version_column_corruption_fails_closed() {
 }
 
 #[test]
-fn agent_type_security_declaration_is_additive_and_write_once() {
+fn sandbox_policy_version_must_fit_u32() {
+    let db = Db::new("policy-version-width");
+    let kernel = db.kernel();
+    let reference = policy_ref("workstation-policy", 1);
+    kernel
+        .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::top())
+        .unwrap();
+
+    // `2^32 + 1` truncates to `1` under an `as u32` cast, which would make a
+    // corrupted row compare equal to the real v1 document.
+    update_without_guards(
+        &db.path,
+        "UPDATE sandbox_policy_revisions SET canonical_version = 4294967297",
+    );
+
+    let error = kernel.get_sandbox_policy(&reference).unwrap_err();
+    assert!(error.to_string().contains("32-bit"), "{error}");
+}
+
+#[test]
+fn agent_type_security_mode_is_published_atomically_and_write_once() {
     let db = Db::new("agent-declaration");
     let kernel = db.kernel();
-    publish_parents(&kernel);
-    let reference = type_ref("coder", 1);
+    publish_adapter_policy(&kernel);
 
     // Absence is the frozen COARSE_V1 contract.
+    let coarse = agent_type();
+    kernel.publish_agent_type(&coarse).unwrap();
     assert_eq!(
-        kernel.agent_type_security_mode(&reference).unwrap(),
-        agentype_agent_contract::SecurityContractMode::CoarseV1
+        kernel.agent_type_security_mode(&coarse.type_ref).unwrap(),
+        SecurityContractMode::CoarseV1
     );
 
-    kernel
-        .publish_agent_type_security_declaration(&reference)
-        .unwrap();
+    // A SECURITY_V1 revision is published together with its mode; there is no
+    // post-publication declaration API.
+    let secured = publish_secure_agent_type(&kernel);
     assert_eq!(
-        kernel.agent_type_security_mode(&reference).unwrap(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
+        kernel.agent_type_security_mode(&secured.type_ref).unwrap(),
+        SecurityContractMode::SecurityV1
     );
-    // Repeating the one legal declaration is an idempotent no-op.
+    // Repeating the same mode is an idempotent republish.
     kernel
-        .publish_agent_type_security_declaration(&reference)
+        .publish_agent_type_with_security(&secured, SecurityContractMode::SecurityV1)
         .unwrap();
+    // Reinterpreting the same revision as COARSE_V1 requires a new revision.
+    let error = kernel.publish_agent_type(&secured).unwrap_err();
+    assert!(
+        error.to_string().contains("requires a new revision"),
+        "{error}"
+    );
 
     let conn = db.raw();
     // The declaration is immutable at the storage boundary.
@@ -353,91 +429,163 @@ fn agent_type_security_declaration_is_additive_and_write_once() {
 }
 
 #[test]
-fn spawn_source_security_declaration_round_trips_with_authored_ceiling() {
+fn security_agent_type_requires_a_policy_exactly_projected_and_claim_consistent() {
     let kernel = memory_kernel();
-    publish_parents(&kernel);
-    let reference = SpawnSourceRef::new("codex-local", 2).unwrap();
+    publish_adapter_policy(&kernel);
+
+    // No authored policy: the coarse/fine relation cannot be proved.
+    let mut bare = agent_type();
+    bare.type_ref = type_ref("no-policy", 1);
+    let error = kernel
+        .publish_agent_type_with_security(&bare, SecurityContractMode::SecurityV1)
+        .unwrap_err();
+    assert!(error.to_string().contains("must author"), "{error}");
+
+    // A policy whose workspace/network projection contradicts the coarse
+    // contract is rejected rather than silently treated as a second grant.
+    let reference = policy_ref("agent-policy", 1);
+    kernel
+        .publish_sandbox_policy(&reference, &read_only_restricted_policy())
+        .unwrap();
+    let mut mismatched = agent_type();
+    mismatched.type_ref = type_ref("mismatched", 1);
+    mismatched.contract.sandbox_policy = Some(reference.clone());
+    mismatched.contract.security.workspace = WorkspaceMode::Write;
+    let error = kernel
+        .publish_agent_type_with_security(&mismatched, SecurityContractMode::SecurityV1)
+        .unwrap_err();
+    assert!(error.to_string().contains("contradicts"), "{error}");
+
+    // A formally mapped capability claim the same policy denies is an invalid
+    // SECURITY_V1 AgentType, not a later candidate-local mismatch.
+    let write_capability = CapabilityRef::new("filesystem.write", 1).unwrap();
+    let projection = PolicyProjection::new(
+        PolicyAccessDimension::FileOperationClass,
+        [(
+            "src".to_string(),
+            PolicyOperation::FileOperation(FileOperationClass::Write),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    kernel
+        .publish_capability_definition(
+            &write_capability,
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Set,
+                security_class: SecurityClass::Sandbox,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: Some(projection),
+            },
+        )
+        .unwrap();
+    let mut claiming = agent_type();
+    claiming.type_ref = type_ref("claiming", 1);
+    claiming.contract.sandbox_policy = Some(reference);
+    claiming.contract.required_capabilities.insert(
+        write_capability,
+        CapabilityValue::Set(["src".to_string()].into_iter().collect()),
+    );
+    let error = kernel
+        .publish_agent_type_with_security(&claiming, SecurityContractMode::SecurityV1)
+        .unwrap_err();
+    assert!(error.to_string().contains("capability claims"), "{error}");
+}
+
+#[test]
+fn spawn_source_security_declaration_is_published_atomically_with_its_authored_ceiling() {
+    let kernel = memory_kernel();
+    publish_adapter_policy(&kernel);
     let policy_reference = policy_ref("source-policy", 1);
     let policy = NormalizedSandboxPolicy::deny_all();
     kernel
         .publish_sandbox_policy(&policy_reference, &policy)
         .unwrap();
 
-    assert_eq!(
-        kernel.spawn_source_security_mode(&reference).unwrap(),
-        agentype_agent_contract::SecurityContractMode::CoarseV1
-    );
+    // A coarse revision has no declaration; it cannot be reinterpreted in place.
+    let source = source_at(2);
+    kernel.publish_spawn_source(&source).unwrap();
     assert_eq!(
         kernel
-            .spawn_source_security_declaration(&reference)
+            .spawn_source_security_mode(&source.source_ref)
             .unwrap(),
-        None
+        SecurityContractMode::CoarseV1
     );
-
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
-        PolicyInput::authored(policy_reference.clone(), &policy),
+        PolicyInput::authored(policy_reference, &policy),
         profile(),
     );
+    let error = kernel
+        .publish_spawn_source_with_security(&source, Some(&declaration))
+        .unwrap_err();
+    assert!(error.to_string().contains("immutable"), "{error}");
+
+    // A fresh revision publishes content and declaration atomically.
+    let secure = source_at(3);
     kernel
-        .publish_spawn_source_security_declaration(&reference, &declaration)
+        .publish_spawn_source_with_security(&secure, Some(&declaration))
         .unwrap();
     assert_eq!(
-        kernel.spawn_source_security_mode(&reference).unwrap(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
+        kernel
+            .spawn_source_security_mode(&secure.source_ref)
+            .unwrap(),
+        SecurityContractMode::SecurityV1
     );
     let read = kernel
-        .spawn_source_security_declaration(&reference)
+        .spawn_source_security_declaration(&secure.source_ref)
         .unwrap()
         .unwrap();
     assert_eq!(read, declaration);
-    assert_eq!(
-        read.mode(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
-    );
 
     // Republishing identical content is idempotent; different content needs a
     // new source revision.
     kernel
-        .publish_spawn_source_security_declaration(&reference, &declaration)
+        .publish_spawn_source_with_security(&secure, Some(&declaration))
         .unwrap();
     let changed = SpawnSourceSecurityDeclaration::new(
         None,
         EnforcementProfileRef::new("agentype-enforcement", "policy-only", 2).unwrap(),
     );
     let error = kernel
-        .publish_spawn_source_security_declaration(&reference, &changed)
+        .publish_spawn_source_with_security(&secure, Some(&changed))
         .unwrap_err();
-    assert!(error.to_string().contains("already exists"), "{error}");
+    assert!(
+        error.to_string().contains("requires a new revision"),
+        "{error}"
+    );
 }
 
 #[test]
 fn spawn_source_declaration_without_ceiling_keeps_top_and_security_mode() {
     let kernel = memory_kernel();
-    publish_parents(&kernel);
-    let reference = SpawnSourceRef::new("codex-local", 2).unwrap();
+    publish_adapter_policy(&kernel);
+    let source = source_at(2);
     let declaration = SpawnSourceSecurityDeclaration::without_policy(profile());
     kernel
-        .publish_spawn_source_security_declaration(&reference, &declaration)
+        .publish_spawn_source_with_security(&source, Some(&declaration))
         .unwrap();
 
     let read = kernel
-        .spawn_source_security_declaration(&reference)
+        .spawn_source_security_declaration(&source.source_ref)
         .unwrap()
         .unwrap();
     // No authored ceiling is `P_source = Top`, not "skip full-path checks":
     // the revision is still SECURITY_V1.
     assert!(read.source_policy().is_none());
     assert_eq!(
-        kernel.spawn_source_security_mode(&reference).unwrap(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
+        kernel
+            .spawn_source_security_mode(&source.source_ref)
+            .unwrap(),
+        SecurityContractMode::SecurityV1
     );
 }
 
 #[test]
 fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
     let kernel = memory_kernel();
-    publish_parents(&kernel);
-    let reference = SpawnSourceRef::new("codex-local", 2).unwrap();
+    publish_adapter_policy(&kernel);
+    let source = source_at(2);
 
     // A derived input has no authored identity and cannot be a P_source.
     let derived = SpawnSourceSecurityDeclaration::with_policy(
@@ -445,13 +593,12 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
         profile(),
     );
     let error = kernel
-        .publish_spawn_source_security_declaration(&reference, &derived)
+        .publish_spawn_source_with_security(&source, Some(&derived))
         .unwrap_err();
     assert!(error.to_string().contains("authored"), "{error}");
 
     // A digest that does not match the resolved canonical content fails closed.
     let policy = NormalizedSandboxPolicy::top();
-    // Publish the referenced revision, then declare a different digest for it.
     kernel
         .publish_sandbox_policy(&policy_ref("missing-policy", 1), &policy)
         .unwrap();
@@ -460,9 +607,12 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     );
     let error = kernel
-        .publish_spawn_source_security_declaration(
-            &reference,
-            &SpawnSourceSecurityDeclaration::new(Some(wrong_digest), profile()),
+        .publish_spawn_source_with_security(
+            &source,
+            Some(&SpawnSourceSecurityDeclaration::new(
+                Some(wrong_digest),
+                profile(),
+            )),
         )
         .unwrap_err();
     assert!(error.to_string().contains("digest"), "{error}");
@@ -476,29 +626,32 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
         profile(),
     );
     let error = kernel
-        .publish_spawn_source_security_declaration(&reference, &missing)
+        .publish_spawn_source_with_security(&source, Some(&missing))
         .unwrap_err();
     assert!(error.to_string().contains("does not exist"), "{error}");
+
+    // None of the rejected publications left a source or declaration behind.
+    assert_eq!(kernel.get_spawn_source(&source.source_ref).unwrap(), None);
 }
 
 #[test]
 fn spawn_source_declaration_digest_corruption_fails_closed() {
     let db = Db::new("source-declaration");
     let kernel = db.kernel();
-    publish_parents(&kernel);
-    let reference = SpawnSourceRef::new("codex-local", 2).unwrap();
+    publish_adapter_policy(&kernel);
+    let reference = source_at(2).source_ref;
     let policy_reference = policy_ref("source-policy", 1);
     let policy = NormalizedSandboxPolicy::top();
     kernel
         .publish_sandbox_policy(&policy_reference, &policy)
         .unwrap();
     kernel
-        .publish_spawn_source_security_declaration(
-            &reference,
-            &SpawnSourceSecurityDeclaration::with_policy(
+        .publish_spawn_source_with_security(
+            &source_at(2),
+            Some(&SpawnSourceSecurityDeclaration::with_policy(
                 PolicyInput::authored(policy_reference, &policy),
                 profile(),
-            ),
+            )),
         )
         .unwrap();
 
@@ -515,24 +668,52 @@ fn spawn_source_declaration_digest_corruption_fails_closed() {
 }
 
 #[test]
+fn spawn_source_declaration_enforcement_version_must_fit_u32() {
+    let db = Db::new("source-version-width");
+    let kernel = db.kernel();
+    publish_adapter_policy(&kernel);
+    let reference = source_at(2).source_ref;
+    kernel
+        .publish_spawn_source_with_security(
+            &source_at(2),
+            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+        )
+        .unwrap();
+
+    update_without_guards(
+        &db.path,
+        "UPDATE spawn_source_security_declarations
+         SET enforcement_profile_version = 4294967297",
+    );
+
+    let error = kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap_err();
+    assert!(error.to_string().contains("32-bit"), "{error}");
+}
+
+#[test]
 fn declarations_survive_a_restart() {
     let db = Db::new("restart");
     {
         let kernel = db.kernel();
-        publish_parents(&kernel);
+        publish_adapter_policy(&kernel);
         kernel
             .publish_sandbox_policy(
-                &policy_ref("source-policy", 1),
-                &NormalizedSandboxPolicy::top(),
+                &policy_ref("agent-policy", 1),
+                &read_only_restricted_policy(),
             )
             .unwrap();
+        let mut agent = agent_type();
+        agent.type_ref = type_ref("secure-coder", 1);
+        agent.contract.sandbox_policy = Some(policy_ref("agent-policy", 1));
         kernel
-            .publish_agent_type_security_declaration(&type_ref("coder", 1))
+            .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
             .unwrap();
         kernel
-            .publish_spawn_source_security_declaration(
-                &SpawnSourceRef::new("codex-local", 2).unwrap(),
-                &SpawnSourceSecurityDeclaration::without_policy(profile()),
+            .publish_spawn_source_with_security(
+                &source_at(2),
+                Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
             )
             .unwrap();
     }
@@ -540,20 +721,20 @@ fn declarations_survive_a_restart() {
     let kernel = db.kernel();
     assert_eq!(
         kernel
-            .agent_type_security_mode(&type_ref("coder", 1))
+            .agent_type_security_mode(&type_ref("secure-coder", 1))
             .unwrap(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
+        SecurityContractMode::SecurityV1
     );
     assert_eq!(
         kernel
             .spawn_source_security_mode(&SpawnSourceRef::new("codex-local", 2).unwrap())
             .unwrap(),
-        agentype_agent_contract::SecurityContractMode::SecurityV1
+        SecurityContractMode::SecurityV1
     );
     assert_eq!(
         kernel
-            .get_sandbox_policy(&policy_ref("source-policy", 1))
+            .get_sandbox_policy(&policy_ref("agent-policy", 1))
             .unwrap(),
-        Some(NormalizedSandboxPolicy::top())
+        Some(read_only_restricted_policy())
     );
 }
