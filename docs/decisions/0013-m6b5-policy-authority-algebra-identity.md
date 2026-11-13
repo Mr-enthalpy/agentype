@@ -419,7 +419,11 @@ Only the `RequiredAccess` component is a set inclusion. `RequiredCapabilities`
 use their catalog matchers, and `RequiredGuarantees`, `CoarseExecutionModes`, and
 `PlacementConstraints` use their own predicates. There MUST be exactly one
 relation, not two implementations that disagree about which `R_min` dimensions
-are set-like or about which stage owns placement.
+are set-like or about which stage owns placement. In particular, network
+`RequiredAccess` uses the same union containment as `is_within`: a required
+endpoint rule is satisfied when the union of the effective rules covers it, not
+only when one effective rule covers the whole rule. `ANY:*:443` is therefore
+satisfied by `TCP:*:443 ∪ UDP:*:*` at every stage.
 
 Admission checks only `Generation ∩ Task`. Provisioning adds the actual
 AgentType and the SpawnSource ceiling, and its failure is a different class
@@ -474,7 +478,7 @@ not sufficient:
 | Dimension | Composition rule |
 |---|---|
 | allowed file operations and path ranges | set intersection per operation class |
-| hidden/prohibited ranges | keep common restrictions; normalize to equivalent allowed/prohibited regions |
+| hidden/prohibited ranges | keep common restrictions; normalize to equivalent allowed/prohibited regions; visibility is an independent observability dimension, not an operation precondition (see §7) |
 | tools, commands | allowed-set intersection |
 | network endpoints/protocols/ports | meet in that dimension |
 | environment variables | allowed-name intersection; conflicting required values reject |
@@ -578,6 +582,60 @@ changes require evidence from the exact enforcement profile. Runtime
 dependencies, temporary directories, and launch-required files enter an
 explicit bootstrap manifest. A compile failure MUST NOT add an unrestricted
 "needed to run" exception.
+
+#### v1 network universe, canonical universal rule, and bounded host tokens
+
+The B5.1 network operation domain is exactly
+
+```text
+{TCP, UDP} × Host × Port,   Port = {1 ..= 65535}
+```
+
+`NetworkTransport::Any` is the union of `TCP` and `UDP`, and
+`NetworkEndpointSet::Any` is the whole domain. The finite rule `ANY:*:*` denotes
+exactly the same domain, so normalization MUST collapse it to `Any`. A canonical
+policy MUST NOT retain both spellings, and `project_network` together with
+`is_within` MUST agree that the explicit universal rule and `Any` are the same
+top policy. A protocol outside `TCP`/`UDP` requires a new policy canonical or
+algebra version; it MUST NOT be silently folded into the v1 `Any` value.
+
+An exact host token is 1 to 253 ASCII bytes drawn from `[A-Za-z0-9._-]` and MUST
+contain at least one alphanumeric byte. A token containing `:` MUST parse as an
+IPv6 literal, so `example.com:443` and other `host:port` fragments are invalid;
+the port is always a separate selector. `*` is the only wildcard and MUST be the
+entire host token; `*.example.com`, `example.*`, and any other embedded `*` are
+invalid. NUL, control bytes, whitespace, path or URL syntax, and non-ASCII text
+are invalid. Port 0 is not an endpoint selector. Each normalized policy network
+set and each `RequiredAccess` endpoint set is limited to 256 distinct rules, and
+the decoder rejects a longer authored array; a larger collection is rejected
+before it reaches the finite-partition containment algorithm. These are input
+grammar rules, not B5.2 physical-compiler policy.
+
+#### Visibility is observability, not an access precondition
+
+`FilePolicy.visible` is the set of path regions the execution may observe while
+enumerating a directory. It is an independent authorization dimension and MUST
+NOT be interpreted as a precondition for reading, writing, executing or deleting
+an explicitly named path. A hidden path is one that no `visible` selector covers;
+there is no separate negation.
+
+Consequently:
+
+- `project_workspace` and `PolicyAccess` derive operation authority only from the
+  non-empty `read`, `write`, `execute` and `delete` sets. A deny-all `visible`
+  set does not erase a writable region, and `Write` remains satisfied while a
+  write operation is authorized;
+- `meet` intersects `visible` with the other dimensions independently, and
+  `is_within` compares it as its own dimension;
+- physical enforcement of directory observability belongs to the B5.2
+  enforcement compiler. It MUST NOT be used to infer an operation grant or deny
+  one: a policy that hides a path while allowing a known-path write means exactly
+  that, not "write is denied".
+
+Treating visibility as an access precondition would change the authorization
+meaning of an existing dimension and therefore requires a new ADR and a new
+canonical/algebra version; it MUST NOT be introduced as an implementation
+convenience.
 
 ### 8. Capability algebra stays separate
 
