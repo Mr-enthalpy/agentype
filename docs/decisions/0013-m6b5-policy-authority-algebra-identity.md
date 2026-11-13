@@ -485,9 +485,8 @@ deletion. B5.1 handles this correctly by applying `TaskAuthority` in every
 admission check, but the raw binding value MUST NOT become the physical compiler
 input.
 
-B5.2 MUST introduce a typed composite authority (for example
-`EffectiveTaskAuthority` or `QualifiedSecurityContract`) whose only constructor
-combines:
+B5.2 introduces the typed composite authority, `EffectiveTaskAuthority`, whose
+only constructor combines:
 
 ```text
 TaskSecurityBinding.policy
@@ -497,10 +496,41 @@ TaskSecurityBinding.policy
 ```
 
 and whose type is what `compile_execution_security` accepts. Passing
-`binding.policy()` directly is forbidden. The composite MUST also record the
-exact source, binding and AgentType identities so Execution commitment can
-re-prove them. This is a B5.2 API requirement, not B5.1 runtime behavior; B5.1
-adds no `EffectiveTaskAuthority` type.
+`binding.policy()` directly is forbidden. The composite also records the exact
+source, binding and AgentType identities so Execution commitment can re-prove
+them. This is a B5.2 API requirement, not B5.1 runtime behavior; B5.1 adds no
+`EffectiveTaskAuthority` type.
+
+The landed shape is:
+
+```text
+EffectiveTaskAuthority::new(
+    task_id, generation_id, logical_agent_id,
+    &TaskSecurityBinding, &TaskAgentRequirement,
+    &SecurityRevision<AgentType>,          // validated SECURITY_V1 agent view
+    &SpawnSource, &SpawnSourceSecurityDeclaration,
+    Option<&NormalizedSandboxPolicy>,       // the source's authored policy
+) -> Result<EffectiveTaskAuthority, ContractError>
+
+P_eff = TaskAuthority(meet(P_binding, P_agent, P_source))
+```
+
+The type is private-fielded and has no canonical encoding of its own: the
+durable binding, requirement and catalog revisions remain the authority, and the
+composite records their content digests (`binding_policy_digest`,
+`binding_derivation_digest`, `required_access_digest`, `requirement_digest`,
+`agent_policy_digest`, `source_policy_digest`, `effective_policy_digest`) so a
+later commitment can re-prove the exact fold. It performs no I/O and grants no
+execution authority. A meet conflict between otherwise valid durable inputs is
+candidate-local unsatisfiability (`SecurityUnenforceable`), never catalog
+corruption.
+
+Candidate-independent preselection needs a Task-side value before any agent is
+chosen, so B5.2 also lands `TaskSecurityCeiling`, the pure
+`TaskAuthority(meet(P_generation, P_task_fine))` with the same identity binding.
+It is the policy every candidate's authored ceiling is compared against; it is
+not the complete execution authority, and candidate selection still re-evaluates
+the coarse modes on the four-term `P_eff`.
 
 `RequiredCapabilities` is deferred at admission because admission has only the
 Generation and Task policy objects, while the existing M6-B.2 matcher compares a
