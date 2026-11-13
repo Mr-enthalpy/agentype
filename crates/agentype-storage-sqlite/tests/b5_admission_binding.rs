@@ -7,15 +7,16 @@
 //! policy. They do not compile or execute a security plan.
 
 use agentype_agent_contract::{
-    project_workspace, sandbox_policy_content_digest, AffinityConstraint, AgentRequirementDraft,
-    AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CapabilityDefinition,
-    CapabilityPolarity, CapabilityRef, CapabilityValue, ContinuityMode, CredentialAuthorizationId,
-    CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy, FileOperationClass, FilePolicy,
-    GenerationPolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet,
-    NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet,
-    PendingObligation, PolicyAccessDimension, PolicyOperation, PolicyProjection,
-    SandboxPolicyParts, SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode,
-    ToolPolicy, WorkingDirectory,
+    canonical_sandbox_policy_bytes, project_workspace, sandbox_policy_content_digest,
+    AffinityConstraint, AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef,
+    AgentTypeSelector, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef,
+    CapabilityValue, ContinuityMode, CredentialAuthorizationId, CredentialDeliveryMode,
+    CredentialGrant, EnvironmentPolicy, FileOperationClass, FilePolicy, GenerationPolicy,
+    LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet, NetworkPolicy,
+    NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet, PendingObligation,
+    PolicyAccessDimension, PolicyOperation, PolicyProjection, SandboxPolicyParts, SandboxPolicyRef,
+    SecurityClass, SecurityContract, SecurityContractMode, ToolPolicy, WorkingDirectory,
+    MAX_PATH_COMPONENTS, MAX_SANDBOX_POLICY_BYTES,
 };
 use agentype_core::{
     Clock, GenerationId, InformationFunction, ManualClock, ProposalRecord, ProposalStateKind,
@@ -2170,4 +2171,166 @@ fn a_task_policy_cannot_introduce_an_unrequested_isolation_guarantee() {
         ProposalStateKind::Pending
     );
     assert_no_durable_task_rows(&db);
+}
+
+/// A legal workspace selector long enough that a bounded number of them can
+/// exceed the canonical policy budget even though each authored policy stays
+/// under it.
+fn long_workspace_selector(prefix: &str, index: usize) -> PathSelector {
+    let mut components = Vec::with_capacity(MAX_PATH_COMPONENTS);
+    components.push(format!("{prefix}{index:03}"));
+    components.extend((0..MAX_PATH_COMPONENTS - 1).map(|_| "d".repeat(200)));
+    PathSelector::workspace(components).unwrap()
+}
+
+fn wide_policy(read: PathSet, write: PathSet) -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(read, write, PathSet::any(), PathSet::any(), PathSet::any()),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+/// P1: the canonical byte budget belongs to the effective policy value, not
+/// only to catalog publication. Two individually publishable authored policies
+/// whose meet is not representable MUST be rejected inside the admission
+/// transaction, leaving the proposal pending and no durable Task, Batch, or
+/// binding behind.
+#[test]
+fn an_oversized_derived_policy_is_rejected_in_the_admission_transaction() {
+    let db = Db::new("oversized-derived-policy");
+    let kernel = db.kernel();
+
+    let generation_reference = policy_ref("wide-generation", 1);
+    let task_reference = policy_ref("wide-task", 1);
+    let generation_value = wide_policy(
+        PathSet::allowed((0..128).map(|index| long_workspace_selector("g", index))),
+        PathSet::any(),
+    );
+    let task_value = wide_policy(
+        PathSet::any(),
+        PathSet::allowed((0..128).map(|index| long_workspace_selector("t", index))),
+    );
+    // Each authored policy is within the same budget the decoder enforces, so
+    // both publications succeed; only their intersection is unrepresentable.
+    assert!(canonical_sandbox_policy_bytes(&generation_value).len() <= MAX_SANDBOX_POLICY_BYTES);
+    assert!(canonical_sandbox_policy_bytes(&task_value).len() <= MAX_SANDBOX_POLICY_BYTES);
+    assert!(
+        canonical_sandbox_policy_bytes(&generation_value).len()
+            + canonical_sandbox_policy_bytes(&task_value).len()
+            > MAX_SANDBOX_POLICY_BYTES
+    );
+    kernel
+        .publish_sandbox_policy(&generation_reference, &generation_value)
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&task_reference, &task_value)
+        .unwrap();
+
+    // The pinned type bounds both authored policies: read/write are `Any` and
+    // the network is the same restricted set, so only the derived document
+    // budget can reject this admission.
+    let agent_reference = policy_ref("wide-agent", 1);
+    let agent_value = wide_policy(PathSet::any(), PathSet::any());
+    kernel
+        .publish_sandbox_policy(&agent_reference, &agent_value)
+        .unwrap();
+    let pin = publish_secure_type(
+        &kernel,
+        "wide-writer",
+        agent_reference,
+        WorkspaceMode::Write,
+        NetworkPolicy::Restricted,
+    );
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::Write,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let spec = TaskSpec::new("wide", json!({}))
+        .partition("general")
+        .write();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, spec);
+    let mut requirement = draft(pin, BTreeMap::new());
+    requirement.sandbox_policy = Some(task_reference);
+
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            requirement,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
+    assert_eq!(
+        kernel.get_proposal(&proposal.proposal_id).unwrap().state,
+        ProposalStateKind::Pending
+    );
+    assert_no_durable_task_rows(&db);
+    let batches: i64 = db
+        .raw()
+        .query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(batches, 0);
+}
+
+/// P2: the admission-time Generation/Task `security_contract_mode` equality is
+/// re-proven by the validated binding read. The mode columns are immutable
+/// under the schema guards, so only bypassing corruption can desynchronize
+/// them; the read must fail closed rather than qualify an execution.
+#[test]
+fn generation_task_security_mode_corruption_fails_closed_on_read() {
+    let db = Db::new("security-mode-corruption");
+    let kernel = db.kernel();
+    publish_read_capability(&kernel);
+    let reference = policy_ref("generation-policy", 1);
+    kernel
+        .publish_sandbox_policy(&reference, &read_only_workspace_policy())
+        .unwrap();
+    let pin = publish_reading_type(&kernel);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(read_capability(), read_value());
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            draft(pin, capabilities),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+
+    execute_without_guards(
+        &db.path,
+        "UPDATE generation_policies SET security_contract_mode='COARSE_V1'",
+    );
+
+    let error = kernel.get_task_security_binding(&task_id).unwrap_err();
+    assert!(error.to_string().contains("does not match"), "{error}");
 }

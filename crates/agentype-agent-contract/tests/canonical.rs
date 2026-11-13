@@ -852,3 +852,49 @@ fn sandbox_policy_decoder_rejects_malformed_documents() {
     });
     assert!(sandbox_policy_from_canonical_json(&unallowed_environment.to_string()).is_err());
 }
+
+#[test]
+fn policy_projection_rejects_excess_members() {
+    let members: BTreeMap<String, PolicyOperation> = (0..=MAX_POLICY_PROJECTION_MEMBERS)
+        .map(|index| {
+            (
+                format!("member{index}"),
+                PolicyOperation::EnvironmentName(format!("ENV_{index}")),
+            )
+        })
+        .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("members"), "{error}");
+}
+
+#[test]
+fn policy_projection_rejects_oversized_tokens() {
+    let oversized = "m".repeat(MAX_POLICY_PROJECTION_TOKEN_LEN + 1);
+    let members = [(
+        oversized.clone(),
+        PolicyOperation::EnvironmentName("PATH".into()),
+    )]
+    .into_iter()
+    .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("at most"), "{error}");
+
+    // The operation token is bounded independently of the member name.
+    let members = [(
+        "path".to_string(),
+        PolicyOperation::EnvironmentName(oversized),
+    )]
+    .into_iter()
+    .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("at most"), "{error}");
+}
+
+#[test]
+fn capability_decoder_rejects_an_oversized_document() {
+    // The decoder MUST reject the budget before parsing or constructing any
+    // projection value, matching the publication-side whole-document limit.
+    let document = "x".repeat(MAX_CAPABILITY_DEFINITION_BYTES + 1);
+    let error = capability_definition_from_canonical_json(&document).unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
+}

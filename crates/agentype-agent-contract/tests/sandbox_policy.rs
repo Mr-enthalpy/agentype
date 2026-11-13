@@ -1411,6 +1411,20 @@ fn policy_sets_maps_and_documents_are_bounded() {
     let oversized = format!("{}{}", " ".repeat(MAX_SANDBOX_POLICY_BYTES), "{}");
     let error = sandbox_policy_from_canonical_json(&oversized).unwrap_err();
     assert!(error.to_string().contains("bytes"), "{error}");
+
+    // The same budget belongs to the value constructor, so a derived policy
+    // cannot be written and then be unreadable. Every per-dimension bound is
+    // respected here; only the whole-document size rejects it.
+    let mut required_values = BTreeMap::new();
+    for index in 0..MAX_ENVIRONMENT_REQUIRED_VALUES {
+        required_values.insert(format!("VAR{index}"), "x".repeat(4096));
+    }
+    let error = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        environment: EnvironmentPolicy::new(NameSet::any(), required_values).unwrap(),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
 }
 
 /// P2-3: v1 has one `ToolCommandSet` namespace. A name allowed as a tool

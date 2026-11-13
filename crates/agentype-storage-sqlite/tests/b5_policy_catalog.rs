@@ -9,15 +9,16 @@
 //! fails closed.
 
 use agentype_agent_contract::{
-    AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint, AgentType, AgentTypeContract,
-    AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue,
-    ConfigStatus, ContinuityMode, EnforcementProfileRef, EnvironmentPolicy, FileOperationClass,
-    FilePolicy, LifecycleMode, MatcherKind, NameSet, NetworkEndpoint, NetworkEndpointSet,
-    NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet,
-    PhysicalSafety, PolicyAccessDimension, PolicyInput, PolicyOperation, PolicyProjection,
-    SandboxPolicyParts, SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode,
-    SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy,
-    WorkingDirectory, MAX_ENVIRONMENT_REQUIRED_VALUES,
+    sandbox_policy_content_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
+    AgentType, AgentTypeContract, AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity,
+    CapabilityRef, CapabilityValue, ConfigStatus, ContinuityMode, EnforcementProfileRef,
+    EnvironmentPolicy, FileOperationClass, FilePolicy, LifecycleMode, MatcherKind, NameSet,
+    NetworkEndpoint, NetworkEndpointSet, NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy,
+    PathSelector, PathSet, PhysicalSafety, PolicyAccessDimension, PolicyInput, PolicyOperation,
+    PolicyProjection, SandboxPolicyParts, SandboxPolicyRef, SecurityClass, SecurityContract,
+    SecurityContractMode, SourceStatus, SpawnSource, SpawnSourceRef,
+    SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory, MAX_CAPABILITY_DEFINITION_BYTES,
+    MAX_ENVIRONMENT_REQUIRED_VALUES,
 };
 use agentype_core::{Clock, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::Kernel;
@@ -246,27 +247,52 @@ fn sandbox_policy_round_trips_and_is_immutable() {
 }
 
 #[test]
-fn sandbox_policy_publication_rejects_an_oversized_document() {
+fn sandbox_policy_construction_rejects_an_oversized_document() {
     let kernel = memory_kernel();
     let mut required = BTreeMap::new();
     for index in 0..MAX_ENVIRONMENT_REQUIRED_VALUES {
         required.insert(format!("VAR{index}"), "x".repeat(4096));
     }
-    let policy = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+    // Every per-dimension bound is respected, but the canonical document
+    // exceeds the whole-policy budget. The budget belongs to the value
+    // constructor, so an authored policy, a derived `meet`, and a decoded
+    // policy share one representation limit: nothing can be constructed that
+    // the durable decoder would later refuse to read.
+    let error = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
         environment: EnvironmentPolicy::new(NameSet::any(), required).unwrap(),
         ..Default::default()
     })
-    .unwrap();
-    let reference = policy_ref("oversized-policy", 1);
+    .unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
+    assert!(kernel
+        .get_sandbox_policy(&policy_ref("oversized-policy", 1))
+        .unwrap()
+        .is_none());
+}
 
-    // The per-dimension bounds are individually respected, but the canonical
-    // document exceeds the whole-policy budget: publication rejects it before
-    // writing an immutable row that every read would have to reject.
+#[test]
+fn capability_publication_rejects_an_oversized_document_before_persisting() {
+    let kernel = memory_kernel();
+    // The projection constructor bounds the member map, but the capability id
+    // itself is an author-controlled token. The publisher MUST reject a
+    // document above the canonical budget before hashing or storing it.
+    let reference = CapabilityRef::new("c".repeat(MAX_CAPABILITY_DEFINITION_BYTES + 1), 1).unwrap();
+    let definition = CapabilityDefinition {
+        matcher_kind: MatcherKind::Bool,
+        security_class: SecurityClass::Functional,
+        polarity: CapabilityPolarity::Ability,
+        policy_projection: None,
+    };
+
     let error = kernel
-        .publish_sandbox_policy(&reference, &policy)
+        .publish_capability_definition(&reference, &definition)
         .unwrap_err();
     assert!(error.to_string().contains("bytes"), "{error}");
-    assert!(kernel.get_sandbox_policy(&reference).unwrap().is_none());
+    assert!(kernel
+        .load_capability_catalog()
+        .unwrap()
+        .get(&reference)
+        .is_none());
 }
 
 #[test]
@@ -918,6 +944,56 @@ fn spawn_source_declaration_digest_corruption_fails_closed() {
         .spawn_source_security_declaration(&reference)
         .unwrap_err();
     assert!(error.to_string().contains("does not match"), "{error}");
+}
+
+#[test]
+fn spawn_source_declaration_isolation_corruption_fails_closed() {
+    let db = Db::new("source-declaration-isolation");
+    let kernel = db.kernel();
+    publish_adapter_policy(&kernel);
+    let reference = source_at(2).source_ref;
+    let policy_reference = policy_ref("source-policy", 1);
+    let policy = NormalizedSandboxPolicy::top();
+    kernel
+        .publish_sandbox_policy(&policy_reference, &policy)
+        .unwrap();
+    kernel
+        .publish_spawn_source_with_security(
+            &source_at(2),
+            Some(&SpawnSourceSecurityDeclaration::with_policy(
+                PolicyInput::authored(policy_reference, &policy),
+                profile(),
+            )),
+        )
+        .unwrap();
+
+    // A second legal authored policy that DOES require attempt isolation. The
+    // publication path refuses to use it as `P_source`, but a direct-SQL writer
+    // can still repoint the declaration at it while keeping the digest
+    // self-consistent. The validated read must re-prove the isolation invariant
+    // rather than trusting publication-time validation.
+    let isolated_reference = policy_ref("isolated-source-policy", 1);
+    let mut parts = NormalizedSandboxPolicy::top().parts().clone();
+    parts.attempt_isolation = true;
+    let isolated = NormalizedSandboxPolicy::from_parts(parts).unwrap();
+    kernel
+        .publish_sandbox_policy(&isolated_reference, &isolated)
+        .unwrap();
+    let digest = sandbox_policy_content_digest(&isolated);
+
+    update_without_guards(
+        &db.path,
+        &format!(
+            "UPDATE spawn_source_security_declarations
+             SET source_policy_id='{}', source_policy_revision=1, source_policy_digest='{digest}'",
+            isolated_reference.id().as_str()
+        ),
+    );
+
+    let error = kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap_err();
+    assert!(error.to_string().contains("attempt isolation"), "{error}");
 }
 
 #[test]
