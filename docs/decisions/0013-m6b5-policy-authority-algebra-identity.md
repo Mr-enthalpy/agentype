@@ -394,11 +394,17 @@ discipline requires that a bypassing direct-SQL writer still fails closed:
   `validated_source_declaration`. A missing or corrupt parent MUST NOT be
   reported as a legal `COARSE_V1` source with no declaration, and a repointed
   declaration MUST NOT acquire an isolation guarantee.
-- `get_task_security_binding` compares `generation_security_mode(...)` with the
-  Task's durable `security_contract_mode` before re-deriving the binding.
-  Admission required the two modes to be equal; a read that sees a locally valid
-  but cross-record contradictory pair treats it as corruption, never as
-  execution qualification.
+- The Task/Generation `security_contract_mode` agreement is re-proved
+  **symmetrically** by the validated requirement read
+  (`verify_requirement_mirrors` → `verify_generation_mode_agreement`), not only
+  by `get_task_security_binding`. Admission requires the two modes to be equal in
+  both directions, and the mode columns are immutable under the schema guards, so
+  a mismatch can only be injected corruption. The symmetric check matters because
+  a `SECURITY_V1`-only guard leaves the mirror image open: a `COARSE_V1` Task
+  whose Generation is repointed to `SECURITY_V1` would still refold as a legal
+  coarse requirement, and the frozen coarse acquisition gate would then treat it
+  as dispatchable. A read that sees a locally valid but cross-record
+  contradictory pair treats it as corruption, never as execution qualification.
 - The sandbox-policy and capability-document budgets are re-checked by their
   decoders, and a stored binding policy is re-encoded and compared byte-for-byte
   with its canonical form.
@@ -785,6 +791,16 @@ per-set and aggregate counts. The bounds are part of the v1 grammar: raising the
 changes the accepted input language, not the canonical bytes of an already
 accepted policy, and still requires an explicit version decision rather than a
 silent relaxation.
+
+`PathSet::allowed` remains an infallible constructor for trusted,
+already-bounded callers. It runs pairwise cover removal before any later
+`from_parts` budget check, so a caller that hands it unbounded authored input
+performs quadratic work before the value is rejected. Every current boundary
+(the decoder, `NormalizedSandboxPolicy::from_parts`, the catalog publisher) uses
+`try_allowed` or an equivalent count check first, so this is an API-misuse risk
+rather than a reachable path. Narrowing the constructor to crate-private use, or
+making it fallible everywhere, is a non-breaking-to-behavior API cleanup that
+does not gate B5.1.
 
 #### v1 name, map and document bounds
 
