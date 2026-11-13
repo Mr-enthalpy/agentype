@@ -18,10 +18,10 @@ use agentype_agent_contract::{
     canonical_sandbox_policy_bytes, canonical_source_config_bytes, canonical_spawn_source_bytes,
     canonicalize_agent_type, canonicalize_source_config, canonicalize_spawn_source,
     capability_definition_content_digest, capability_definition_from_canonical_json,
-    content_digest, is_valid_refinement, sandbox_policy_content_digest,
-    sandbox_policy_from_canonical_json, source_config_content_digest,
-    source_config_revision_from_canonical_json, spawn_source_content_digest,
-    spawn_source_from_canonical_json, validate_agent_type_coarse_fine,
+    content_digest, is_valid_refinement, is_valid_refinement_with_policies,
+    sandbox_policy_content_digest, sandbox_policy_from_canonical_json,
+    source_config_content_digest, source_config_revision_from_canonical_json,
+    spawn_source_content_digest, spawn_source_from_canonical_json, validate_agent_type_coarse_fine,
     validate_capability_claims_against_policy, AdapterBindingPolicy, AdapterPolicyRef, AgentType,
     AgentTypeId, AgentTypeLookup, AgentTypeRef, CapabilityCatalog, CapabilityDefinition,
     CapabilityRef, ConfigDigest, ConfigStatus, ContractError, EnforcementProfileRef,
@@ -506,7 +506,44 @@ pub fn publish_agent_type_with_security(
                 base_ref.revision()
             ))
         })?;
-        is_valid_refinement(&base, &canonical, &catalog).map_err(contract_fault)?;
+        // The security contract mode is part of the authority a revision carries.
+        // A refinement MUST NOT silently drop a physical enforcement contract, so
+        // `SECURITY_V1 -> COARSE_V1` is rejected even when every coarse field is
+        // unchanged. Within `SECURITY_V1` the authored policies are ordered by the
+        // real policy algebra; a `COARSE_V1` base keeps the frozen reference
+        // relation.
+        let base_mode = raw_agent_type_security_mode(tx, base_ref)?;
+        match (base_mode, security_mode) {
+            (SecurityContractMode::SecurityV1, SecurityContractMode::CoarseV1) => {
+                return Err(Error::invalid_authority(format!(
+                    "agent type {}@{} is a COARSE_V1 refinement of SECURITY_V1 base {}@{}: a refinement must not drop the physical enforcement contract",
+                    canonical.type_ref.id().as_str(),
+                    canonical.type_ref.revision(),
+                    base_ref.id().as_str(),
+                    base_ref.revision()
+                )));
+            }
+            (SecurityContractMode::SecurityV1, SecurityContractMode::SecurityV1) => {
+                let base_policy = load_optional_policy(tx, base.contract.sandbox_policy.as_ref())?;
+                let derived_policy =
+                    load_optional_policy(tx, canonical.contract.sandbox_policy.as_ref())?;
+                is_valid_refinement_with_policies(
+                    &base,
+                    &canonical,
+                    base_policy.as_ref(),
+                    derived_policy.as_ref(),
+                    &catalog,
+                )
+                .map_err(contract_fault)?;
+            }
+            (SecurityContractMode::CoarseV1, _) => {
+                // A coarse base carries no fine policy ceiling, so the frozen
+                // exact-reference monotonicity remains the whole contract. A
+                // derived `SECURITY_V1` revision may narrow by pinning a policy
+                // reference but cannot relax the base's coarse reference.
+                is_valid_refinement(&base, &canonical, &catalog).map_err(contract_fault)?;
+            }
+        }
     }
 
     // P1-3: a `SECURITY_V1` AgentType is only valid when its authored policy is
@@ -1609,6 +1646,27 @@ pub fn publish_sandbox_policy(
     )
     .map_err(map_sqlite)?;
     Ok(digest)
+}
+
+/// Load the authored policy of an optional AgentType contract reference.
+///
+/// Absence is not corruption (a coarse contract may pin no fine policy), but a
+/// present reference that names a missing revision is: the immutable AgentType
+/// content is then unreadable authority.
+fn load_optional_policy(
+    tx: &Transaction<'_>,
+    reference: Option<&SandboxPolicyRef>,
+) -> Result<Option<NormalizedSandboxPolicy>, Error> {
+    match reference {
+        None => Ok(None),
+        Some(reference) => get_sandbox_policy(tx, reference)?.map(Some).ok_or_else(|| {
+            Error::not_found(format!(
+                "sandbox policy {}@{} does not exist",
+                reference.id().as_str(),
+                reference.revision()
+            ))
+        }),
+    }
 }
 
 /// The validated authoritative read of one authored policy revision.
