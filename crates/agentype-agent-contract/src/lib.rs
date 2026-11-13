@@ -110,7 +110,7 @@ pub use requirement::{
 pub use sandbox::{
     check_required_access, is_within, meet, meet_optional_layer, project_capability_access,
     project_network, project_security_contract, project_workspace, prove_no_wider,
-    task_coarse_authority, validate_agent_type_coarse_fine,
+    required_access_from_claims, task_coarse_authority, validate_agent_type_coarse_fine,
     validate_capability_claims_against_policy, validate_effective_task_execution_modes,
     validate_generation_coarse_fine, validate_task_local_coarse_fine, AccessDeficit,
     CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef,

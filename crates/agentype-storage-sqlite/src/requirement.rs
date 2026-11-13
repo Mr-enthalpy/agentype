@@ -21,8 +21,8 @@ use agentype_agent_contract::{
     canonicalize_task_agent_requirement, check_required_access, content_digest,
     fold_generation_policy, fold_generation_policy_security_v1, generation_policy_content_digest,
     generation_policy_from_canonical_json, match_existing_agents,
-    match_existing_agents_security_v1, meet_optional_layer, project_capability_access,
-    required_access_content_digest, resolve_selector, sandbox_policy_content_digest,
+    match_existing_agents_security_v1, meet_optional_layer, required_access_content_digest,
+    required_access_from_claims, resolve_selector, sandbox_policy_content_digest,
     sandbox_policy_from_canonical_json, security_derivation_content_digest,
     security_derivation_from_canonical_json, task_agent_requirement_content_digest,
     task_agent_requirement_from_canonical_json, task_coarse_authority,
@@ -1338,21 +1338,16 @@ pub fn match_existing_agents_for_task(
 /// The floor is derived only from the durable requirement through the validated
 /// capability catalog, so the binding read can recompute it instead of trusting
 /// the stored digest. B5.1 has no path-level obligation (ADR-0013 §2).
+///
+/// The projection itself lives in `required_access_from_claims`, which is also
+/// what candidate qualification calls: admission and the candidate-stage
+/// re-proof MUST agree on one projection authority (ADR-0013 §5).
 fn required_access_for(
     requirement: &TaskAgentRequirement,
     catalog: &CapabilityCatalog,
 ) -> Result<RequiredAccess, Error> {
-    let mut operations = BTreeSet::new();
-    for (reference, value) in &requirement.hard.required_capabilities {
-        let definition = catalog.get(reference).ok_or_else(|| {
-            Error::invariant(format!(
-                "required capability {} is missing from the capability catalog",
-                reference.capability_id().as_str()
-            ))
-        })?;
-        operations.extend(project_capability_access(definition, value).map_err(contract_fault)?);
-    }
-    RequiredAccess::from_operations(operations).map_err(contract_fault)
+    required_access_from_claims(&requirement.hard.required_capabilities, catalog)
+        .map_err(contract_fault)
 }
 
 /// The `R_min` components admission deliberately defers to candidate matching

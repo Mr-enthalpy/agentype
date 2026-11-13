@@ -549,16 +549,29 @@ pub fn b5_compiled_security_surface() {}
 /// }
 /// ```
 ///
-/// ```compile_fail
-/// // 31. An imported enforcement profile is an external fact: the supported
-/// //     surface has no constructor for it (`import` / `from_parts` are gated
-/// //     behind `provisioning-producer`, which the default surface does not
-/// //     enable). A consumer may consume an imported profile; it cannot mint
-/// //     one and thereby assert enforcement a physical domain does not provide.
-/// use agentype_agent_contract::ImportedEnforcementProfile;
-/// fn _no_profile_import() {
-///     let _ = ImportedEnforcementProfile::import;
-///     let _ = ImportedEnforcementProfile::from_parts;
+/// ```no_run
+/// // 31. An imported enforcement profile is visible to a host that embeds the
+/// //     runtime: `agentype-runtime` enables `provisioning-producer`, and Cargo
+/// //     feature unification gives this boundary fixture the same constructor.
+/// //     This is a supported-surface convenience, NOT an unforgeable fence --
+/// //     the real boundary is that no production API accepts a caller-supplied
+/// //     profile and the authority transaction re-proves imported facts.
+/// //     `tests/public-api-contract-only` is the fixture that proves the
+/// //     constructor is absent from a contract-only default build.
+/// use agentype_agent_contract::{
+///     EnforcementFeature, EnforcementProfileRef, EnforcementSubject, EnforcementSupport,
+///     ImportedEnforcementProfile,
+/// };
+///
+/// fn _profile_is_visible_to_a_runtime_host() {
+///     let profile = ImportedEnforcementProfile::import(
+///         EnforcementProfileRef::new("runtime-boundary", "runtime-boundary", 1).unwrap(),
+///         1,
+///         EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
+///         [EnforcementSubject::ControlledPrimaryProcess],
+///     )
+///     .expect("the runtime host sees the producer constructor");
+///     assert!(profile.covers_subject(EnforcementSubject::ControlledPrimaryProcess));
 /// }
 /// ```
 pub fn probes() {}

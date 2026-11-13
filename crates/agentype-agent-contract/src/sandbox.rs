@@ -2408,6 +2408,31 @@ pub fn project_capability_access(
     Ok(operations)
 }
 
+/// Build the positive `RequiredAccess` floor a Task requirement declares.
+///
+/// This is the single projection authority for the Task floor: durable admission
+/// and candidate qualification both call it, so the admission proof and the
+/// candidate-stage re-proof cannot drift (ADR-0013 §2, §5). The catalog must be
+/// the exact revision set the requirement was admitted against; a required
+/// capability missing from it is a capability mismatch, never a silently empty
+/// floor.
+pub fn required_access_from_claims(
+    claims: &BTreeMap<CapabilityRef, CapabilityValue>,
+    catalog: &CapabilityCatalog,
+) -> Result<RequiredAccess, ContractError> {
+    let mut operations = BTreeSet::new();
+    for (reference, value) in claims {
+        let definition =
+            catalog
+                .get(reference)
+                .ok_or_else(|| ContractError::CapabilityMismatch {
+                    capability: reference.capability_id().as_str().to_string(),
+                })?;
+        operations.extend(project_capability_access(definition, value)?);
+    }
+    RequiredAccess::from_operations(operations)
+}
+
 // =============================================================================
 // Mode and Task-local coarse/fine consistency
 // =============================================================================

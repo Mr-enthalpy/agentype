@@ -74,6 +74,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentype-public-api-contract-only"
+version = "0.2.0"
+dependencies = [
+ "agentype-agent-contract",
+]
+
+[[package]]
 name = "agentype-root-bridge"
 version = "0.2.0"
 dependencies = [
