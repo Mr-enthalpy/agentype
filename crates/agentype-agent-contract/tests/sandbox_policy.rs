@@ -1427,6 +1427,46 @@ fn policy_sets_maps_and_documents_are_bounded() {
     assert!(error.to_string().contains("bytes"), "{error}");
 }
 
+#[test]
+fn required_access_credential_builder_rechecks_the_merged_bound() {
+    let credentials = |count: usize| {
+        (0..count)
+            .map(|index| {
+                CredentialAuthorizationId::new("build", format!("service{index}")).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let access = RequiredAccess::empty()
+        .try_with_credentials(credentials(MAX_POLICY_MAP_ENTRIES))
+        .unwrap();
+    assert_eq!(access.credentials().len(), MAX_POLICY_MAP_ENTRIES);
+    // A value at the bound still has one canonical document; the builder does
+    // not create anything the decoder or a validated read would refuse.
+    let bytes = canonical_required_access_bytes(&access);
+    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        document["required_access"]["credentials"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_POLICY_MAP_ENTRIES
+    );
+
+    // Duplicate identities add no new entry, so re-adding the same set is legal.
+    assert!(access
+        .clone()
+        .try_with_credentials(credentials(MAX_POLICY_MAP_ENTRIES))
+        .is_ok());
+
+    // A merged credential set above the bound fails closed instead of producing
+    // a value that only construction accepted.
+    let error = access
+        .try_with_credentials(credentials(MAX_POLICY_MAP_ENTRIES + 1))
+        .unwrap_err();
+    assert!(error.to_string().contains("credential"), "{error}");
+}
+
 /// P2-3: v1 has one `ToolCommandSet` namespace. A name allowed as a tool
 /// satisfies a required tool-or-command operation and vice versa; the physical
 /// compiler cannot later split the same string into two meanings.

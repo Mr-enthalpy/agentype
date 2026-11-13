@@ -997,6 +997,74 @@ fn spawn_source_declaration_isolation_corruption_fails_closed() {
 }
 
 #[test]
+fn spawn_source_declaration_requires_an_existing_parent_source() {
+    let kernel = memory_kernel();
+    let reference = source_at(2).source_ref;
+    let error = kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap_err();
+    assert!(error.to_string().contains("does not exist"), "{error}");
+}
+
+#[test]
+fn spawn_source_declaration_requires_the_parent_disposition_overlay() {
+    let db = Db::new("source-declaration-parent-disposition");
+    let kernel = db.kernel();
+    publish_adapter_policy(&kernel);
+    let source = source_at(2);
+    let reference = source.source_ref.clone();
+    kernel
+        .publish_spawn_source_with_security(
+            &source,
+            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+        )
+        .unwrap();
+
+    update_without_guards(
+        &db.path,
+        "DELETE FROM spawn_source_dispositions
+         WHERE source_id='codex-local' AND revision=2",
+    );
+
+    let error = kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap_err();
+    assert!(error.to_string().contains("disposition overlay"), "{error}");
+}
+
+#[test]
+fn spawn_source_declaration_rejects_an_untrusted_parent_source() {
+    let db = Db::new("source-declaration-parent-digest");
+    let kernel = db.kernel();
+    publish_adapter_policy(&kernel);
+    let source = source_at(2);
+    let reference = source.source_ref.clone();
+    kernel
+        .publish_spawn_source_with_security(
+            &source,
+            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+        )
+        .unwrap();
+
+    // The declaration itself is valid; only the parent row is corrupted. The
+    // public getter must not return a declaration from an unvalidated parent.
+    assert!(kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap()
+        .is_some());
+
+    update_without_guards(
+        &db.path,
+        "UPDATE spawn_sources SET content_json = content_json || ' '",
+    );
+
+    let error = kernel
+        .spawn_source_security_declaration(&reference)
+        .unwrap_err();
+    assert!(error.to_string().contains("digest"), "{error}");
+}
+
+#[test]
 fn spawn_source_declaration_enforcement_version_must_fit_u32() {
     let db = Db::new("source-version-width");
     let kernel = db.kernel();
