@@ -17,7 +17,10 @@
 use crate::canonical::CANONICAL_FORMAT_VERSION;
 use crate::capability::{
     Assurance, CapabilityClaim, CapabilityDefinition, CapabilityPolarity, CapabilityRef,
-    CapabilityValue, MatcherKind, Quantity, SecurityClass,
+    CapabilityValue, FileOperationClass, MatcherKind, NetworkEndpoint, NetworkTransport,
+    PolicyAccessDimension, PolicyOperation, PolicyProjection, Quantity, SecurityClass,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V1, CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
+    MAX_CAPABILITY_DEFINITION_BYTES, MAX_NETWORK_ENDPOINTS,
 };
 use crate::error::ContractError;
 use crate::provisioning::{BindingSnapshot, MaterializationDigest, ProvisioningBinding};
@@ -29,6 +32,13 @@ use crate::records::{
     TaskRequirement,
 };
 use crate::requirement::{GenerationPolicy, TaskAgentRequirement};
+use crate::sandbox::{
+    CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy,
+    FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector,
+    PathSet, PolicyInput, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
+    SandboxPolicyParts, SecurityDerivation, ToolPolicy, WorkingDirectory, MAX_PATH_SELECTORS,
+    MAX_SANDBOX_POLICY_BYTES, SANDBOX_POLICY_SCHEMA_VERSION,
+};
 use agentype_core::{
     ExecutionId, IncarnationId, InformationFunction, LogicalAgentId, WorkspaceMode,
 };
@@ -482,21 +492,126 @@ pub fn adapter_binding_policy_from_canonical_json(
 pub fn capability_definition_from_canonical_json(
     json: &str,
 ) -> Result<(CapabilityRef, CapabilityDefinition), ContractError> {
+    // The capability id and projection tokens are author-controlled. Reject an
+    // oversized document before parsing or constructing any projection value;
+    // the publisher enforces the same budget before storing it.
+    if json.len() > MAX_CAPABILITY_DEFINITION_BYTES {
+        return Err(err(format!(
+            "capability definition document is {} bytes; at most {MAX_CAPABILITY_DEFINITION_BYTES} are allowed",
+            json.len()
+        )));
+    }
     let value = parse_document(json, "CAPABILITY_DEFINITION")?;
     let object = object(&value, "capability definition")?;
+    let version = match object.get("capability_canonical_version") {
+        None => CAPABILITY_DEFINITION_CANONICAL_VERSION_V1,
+        Some(value) => {
+            let raw = u64_of(value, "capability_canonical_version")?;
+            u32::try_from(raw).map_err(|_| err("capability_canonical_version is out of range"))?
+        }
+    };
     let reference = CapabilityRef::new(
         string_of(field(object, "capability_id")?, "capability_id")?,
         u64_of(field(object, "revision")?, "revision")?,
     )?;
-    let definition = CapabilityDefinition {
-        matcher_kind: matcher_kind(&string_of(field(object, "matcher_kind")?, "matcher_kind")?)?,
-        security_class: security_class(&string_of(
-            field(object, "security_class")?,
-            "security_class",
-        )?)?,
-        polarity: capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?,
+    let matcher_kind = matcher_kind(&string_of(field(object, "matcher_kind")?, "matcher_kind")?)?;
+    let security_class = security_class(&string_of(
+        field(object, "security_class")?,
+        "security_class",
+    )?)?;
+    let polarity = capability_polarity(&string_of(field(object, "polarity")?, "polarity")?)?;
+    let policy_projection = match version {
+        CAPABILITY_DEFINITION_CANONICAL_VERSION_V1 => {
+            // Unknown extra fields are ignored by the canonical decoders, so
+            // without this check a v1 document could smuggle a projection that
+            // the frozen encoder never emits. One identity MUST NOT carry two
+            // authorities.
+            if object.contains_key("policy_projection") {
+                return Err(ContractError::InvalidPolicyProjection {
+                    reason: "capability canonical v1 defines no policy projection".into(),
+                });
+            }
+            None
+        }
+        CAPABILITY_DEFINITION_CANONICAL_VERSION_V2 => {
+            Some(policy_projection_from(field(object, "policy_projection")?)?)
+        }
+        other => {
+            return Err(err(format!(
+                "unsupported capability canonical version {other}"
+            )))
+        }
     };
+    let definition = CapabilityDefinition {
+        matcher_kind,
+        security_class,
+        polarity,
+        policy_projection,
+    };
+    definition.validate_projection()?;
     Ok((reference, definition))
+}
+
+fn policy_projection_from(value: &Value) -> Result<PolicyProjection, ContractError> {
+    let document = object(value, "policy_projection")?;
+    let dimension_name = string_of(field(document, "dimension")?, "policy projection dimension")?;
+    let dimension = PolicyAccessDimension::parse(&dimension_name).ok_or_else(|| {
+        ContractError::InvalidPolicyProjection {
+            reason: format!("unknown policy access dimension {dimension_name}"),
+        }
+    })?;
+    let members = object(
+        field(document, "member_map")?,
+        "policy projection member_map",
+    )?;
+    let mut member_map = BTreeMap::new();
+    for (member, operation) in members {
+        member_map.insert(member.clone(), policy_operation_from(operation)?);
+    }
+    PolicyProjection::new(dimension, member_map)
+}
+
+fn policy_operation_from(value: &Value) -> Result<PolicyOperation, ContractError> {
+    let invalid = |reason: String| ContractError::InvalidPolicyProjection { reason };
+    let document = object(value, "policy operation")?;
+    let kind = string_of(field(document, "kind")?, "policy operation kind")?;
+    match kind.as_str() {
+        "FILE_OPERATION" => {
+            let class = string_of(field(document, "class")?, "policy file operation class")?;
+            let class = FileOperationClass::parse(&class)
+                .ok_or_else(|| invalid(format!("unknown file operation class {class}")))?;
+            Ok(PolicyOperation::FileOperation(class))
+        }
+        "TOOL_COMMAND" => Ok(PolicyOperation::ToolCommand(string_of(
+            field(document, "command")?,
+            "policy tool command",
+        )?)),
+        "NETWORK_ENDPOINT" => {
+            let transport_name =
+                string_of(field(document, "transport")?, "policy network transport")?;
+            let transport = NetworkTransport::parse(&transport_name)
+                .ok_or_else(|| invalid(format!("unknown network transport {transport_name}")))?;
+            let host = string_of(field(document, "host")?, "policy network host")?;
+            let port = match field(document, "port")? {
+                Value::Null => None,
+                other => {
+                    let raw = u64_of(other, "policy network port")?;
+                    Some(
+                        u16::try_from(raw)
+                            .map_err(|_| invalid("policy network port is out of range".into()))?,
+                    )
+                }
+            };
+            Ok(PolicyOperation::NetworkEndpoint(NetworkEndpoint::new(
+                transport, host, port,
+            )?))
+        }
+        "ENVIRONMENT_NAME" => Ok(PolicyOperation::EnvironmentName(string_of(
+            field(document, "name")?,
+            "policy environment name",
+        )?)),
+        other => Err(invalid(format!("unknown policy operation kind {other}"))),
+    }
 }
 
 fn string_set_from(value: &Value, what: &str) -> Result<BTreeSet<String>, ContractError> {
@@ -600,6 +715,289 @@ pub fn generation_policy_from_canonical_json(
         allowed_affinity,
         anchor_constraint: opt_string(field(policy, "anchor_constraint")?)?,
     })
+}
+
+fn path_selector_from(value: &Value) -> Result<PathSelector, ContractError> {
+    let document = object(value, "sandbox path selector")?;
+    let root_name = string_of(field(document, "root")?, "sandbox path root")?;
+    let root = PathRoot::parse(&root_name)
+        .ok_or_else(|| err(format!("unknown sandbox path root {root_name}")))?;
+    let components = array(field(document, "components")?, "sandbox path components")?
+        .iter()
+        .map(|item| string_of(item, "sandbox path component"))
+        .collect::<Result<Vec<_>, _>>()?;
+    match root {
+        PathRoot::Workspace => PathSelector::workspace(components),
+    }
+}
+
+fn path_set_from(value: &Value) -> Result<PathSet, ContractError> {
+    let document = object(value, "sandbox path set")?;
+    let kind = string_of(field(document, "kind")?, "sandbox path set kind")?;
+    match kind.as_str() {
+        "ANY" => Ok(PathSet::any()),
+        "ALLOWED" => {
+            let mut selectors = Vec::new();
+            for item in array(field(document, "selectors")?, "sandbox path selectors")? {
+                if selectors.len() == MAX_PATH_SELECTORS {
+                    return Err(err(format!(
+                        "sandbox path set exceeds the {MAX_PATH_SELECTORS}-selector bound"
+                    )));
+                }
+                selectors.push(path_selector_from(item)?);
+            }
+            Ok(PathSet::allowed(selectors))
+        }
+        other => Err(err(format!("unknown sandbox path set kind {other}"))),
+    }
+}
+
+fn name_set_from(value: &Value) -> Result<NameSet, ContractError> {
+    let document = object(value, "sandbox name set")?;
+    let kind = string_of(field(document, "kind")?, "sandbox name set kind")?;
+    match kind.as_str() {
+        "ANY" => Ok(NameSet::any()),
+        "ALLOWED" => {
+            let names = array(field(document, "names")?, "sandbox names")?
+                .iter()
+                .map(|item| string_of(item, "sandbox name"))
+                .collect::<Result<Vec<_>, _>>()?;
+            NameSet::allowed(names)
+        }
+        other => Err(err(format!("unknown sandbox name set kind {other}"))),
+    }
+}
+
+fn network_endpoint_from(value: &Value) -> Result<NetworkEndpoint, ContractError> {
+    let document = object(value, "sandbox network endpoint")?;
+    let transport_name = string_of(field(document, "transport")?, "sandbox network transport")?;
+    let transport = NetworkTransport::parse(&transport_name)
+        .ok_or_else(|| err(format!("unknown network transport {transport_name}")))?;
+    let host = string_of(field(document, "host")?, "sandbox network host")?;
+    let port = match field(document, "port")? {
+        Value::Null => None,
+        other => {
+            let raw = u64_of(other, "sandbox network port")?;
+            Some(u16::try_from(raw).map_err(|_| err("sandbox network port is out of range"))?)
+        }
+    };
+    NetworkEndpoint::new(transport, host, port)
+}
+
+fn network_endpoint_set_from(value: &Value) -> Result<NetworkEndpointSet, ContractError> {
+    let document = object(value, "sandbox network set")?;
+    let kind = string_of(field(document, "kind")?, "sandbox network set kind")?;
+    match kind.as_str() {
+        "ANY" => Ok(NetworkEndpointSet::any()),
+        "ALLOWED" => {
+            let mut endpoints = Vec::new();
+            for item in array(field(document, "endpoints")?, "sandbox network endpoints")? {
+                if endpoints.len() == MAX_NETWORK_ENDPOINTS {
+                    return Err(err(format!(
+                        "sandbox network endpoint set exceeds the {MAX_NETWORK_ENDPOINTS}-rule bound"
+                    )));
+                }
+                endpoints.push(network_endpoint_from(item)?);
+            }
+            Ok(NetworkEndpointSet::allowed(endpoints))
+        }
+        other => Err(err(format!("unknown sandbox network set kind {other}"))),
+    }
+}
+
+fn environment_policy_from(value: &Value) -> Result<EnvironmentPolicy, ContractError> {
+    let document = object(value, "sandbox environment")?;
+    let allowed_names = name_set_from(field(document, "allowed_names")?)?;
+    let required = object(
+        field(document, "required_values")?,
+        "sandbox required environment values",
+    )?;
+    let mut required_values = BTreeMap::new();
+    for (name, raw) in required {
+        required_values.insert(name.clone(), string_of(raw, "sandbox environment value")?);
+    }
+    EnvironmentPolicy::new(allowed_names, required_values)
+}
+
+fn credential_authorization_id_from(
+    value: &Value,
+) -> Result<CredentialAuthorizationId, ContractError> {
+    let document = object(value, "credential authorization id")?;
+    CredentialAuthorizationId::new(
+        string_of(field(document, "namespace")?, "credential namespace")?,
+        string_of(field(document, "reference")?, "credential reference")?,
+    )
+}
+
+fn credentials_from(
+    value: &Value,
+) -> Result<BTreeMap<CredentialAuthorizationId, CredentialGrant>, ContractError> {
+    let mut credentials = BTreeMap::new();
+    for item in array(value, "sandbox credentials")? {
+        let document = object(item, "credential grant")?;
+        let id = credential_authorization_id_from(field(document, "id")?)?;
+        let uses = string_set_from(field(document, "uses")?, "credential uses")?;
+        let audience = string_set_from(field(document, "audience")?, "credential audience")?;
+        let mut delivery_modes = BTreeSet::new();
+        for mode in array(
+            field(document, "delivery_modes")?,
+            "credential delivery modes",
+        )? {
+            let name = string_of(mode, "credential delivery mode")?;
+            let mode = CredentialDeliveryMode::parse(&name)
+                .ok_or_else(|| err(format!("unknown credential delivery mode {name}")))?;
+            delivery_modes.insert(mode);
+        }
+        let grant = CredentialGrant::new(id.clone(), uses, audience, delivery_modes)?;
+        if credentials.insert(id, grant).is_some() {
+            return Err(err(
+                "duplicate credential grant in canonical sandbox policy",
+            ));
+        }
+    }
+    Ok(credentials)
+}
+
+fn resources_from(
+    value: &Value,
+) -> Result<BTreeMap<ResourceLimitName, ResourceCeiling>, ContractError> {
+    let mut resources = BTreeMap::new();
+    for item in array(value, "sandbox resources")? {
+        let document = object(item, "resource ceiling")?;
+        let name =
+            ResourceLimitName::new(string_of(field(document, "name")?, "resource limit name")?)?;
+        let scope_name = string_of(field(document, "scope")?, "resource scope")?;
+        let scope = ResourceScope::parse(&scope_name)
+            .ok_or_else(|| err(format!("unknown resource scope {scope_name}")))?;
+        let unit_name = string_of(field(document, "unit")?, "resource unit")?;
+        let unit = ResourceUnit::parse(&unit_name)
+            .ok_or_else(|| err(format!("unknown resource unit {unit_name}")))?;
+        let limit = u64_of(field(document, "limit")?, "resource limit")?;
+        if resources
+            .insert(name, ResourceCeiling::new(scope, unit, limit))
+            .is_some()
+        {
+            return Err(err(
+                "duplicate resource ceiling in canonical sandbox policy",
+            ));
+        }
+    }
+    Ok(resources)
+}
+
+fn working_directory_from(value: &Value) -> Result<WorkingDirectory, ContractError> {
+    let document = object(value, "sandbox working directory")?;
+    let kind = string_of(field(document, "kind")?, "sandbox working directory kind")?;
+    match kind.as_str() {
+        "ANY" => Ok(WorkingDirectory::Any),
+        "REQUIRED" => Ok(WorkingDirectory::Required(path_selector_from(field(
+            document, "path",
+        )?)?)),
+        other => Err(err(format!("unknown working directory kind {other}"))),
+    }
+}
+
+/// Decode a normalized sandbox policy document. The caller MUST also verify the
+/// stored content digest and canonical byte equality at the durable boundary.
+pub fn sandbox_policy_from_canonical_json(
+    json: &str,
+) -> Result<NormalizedSandboxPolicy, ContractError> {
+    // Reject an oversized document before parsing or constructing any policy
+    // value. The per-dimension bounds keep normalization finite; this is the
+    // whole-document budget the durable boundary also enforces on publication.
+    if json.len() > MAX_SANDBOX_POLICY_BYTES {
+        return Err(err(format!(
+            "sandbox policy document is {} bytes; at most {MAX_SANDBOX_POLICY_BYTES} are allowed",
+            json.len()
+        )));
+    }
+    let value = parse_document(json, "SANDBOX_POLICY")?;
+    let document = object(&value, "sandbox policy")?;
+    let version = u64_of(
+        field(document, "sandbox_policy_schema_version")?,
+        "sandbox_policy_schema_version",
+    )?;
+    if version != u64::from(SANDBOX_POLICY_SCHEMA_VERSION) {
+        return Err(err(format!(
+            "unsupported sandbox policy schema version {version}"
+        )));
+    }
+    let body = object(field(document, "policy")?, "sandbox policy body")?;
+    let files = object(field(body, "files")?, "sandbox file policy")?;
+    let tools = object(field(body, "tools")?, "sandbox tool policy")?;
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            path_set_from(field(files, "read")?)?,
+            path_set_from(field(files, "write")?)?,
+            path_set_from(field(files, "execute")?)?,
+            path_set_from(field(files, "delete")?)?,
+            path_set_from(field(files, "visible")?)?,
+        ),
+        tools: ToolPolicy::new(
+            name_set_from(field(tools, "tools")?)?,
+            name_set_from(field(tools, "commands")?)?,
+        ),
+        network: network_endpoint_set_from(field(body, "network")?)?,
+        environment: environment_policy_from(field(body, "environment")?)?,
+        credentials: credentials_from(field(body, "credentials")?)?,
+        resources: resources_from(field(body, "resources")?)?,
+        working_directory: working_directory_from(field(body, "working_directory")?)?,
+        attempt_isolation: field(body, "attempt_isolation")?
+            .as_bool()
+            .ok_or_else(|| err("attempt_isolation must be boolean"))?,
+    })
+}
+
+fn policy_input_from(value: &Value) -> Result<PolicyInput, ContractError> {
+    let input = object(value, "policy input")?;
+    let reference = match field(input, "reference")? {
+        Value::Null => None,
+        other => {
+            let reference = object(other, "policy input reference")?;
+            Some(SandboxPolicyRef::new(
+                string_of(field(reference, "sandbox_policy_id")?, "sandbox_policy_id")?,
+                u64_of(field(reference, "revision")?, "policy input revision")?,
+            )?)
+        }
+    };
+    Ok(PolicyInput::from_parts(
+        reference,
+        string_of(field(input, "policy_digest")?, "policy input digest")?,
+    ))
+}
+
+/// Decode a security derivation document. The caller MUST also verify the
+/// stored digest, canonical byte equality, and that the versions are supported.
+pub fn security_derivation_from_canonical_json(
+    json: &str,
+) -> Result<SecurityDerivation, ContractError> {
+    let value = parse_document(json, "SECURITY_DERIVATION")?;
+    let document = object(&value, "security derivation")?;
+    let derivation = object(field(document, "derivation")?, "security derivation body")?;
+    let mut inputs = Vec::new();
+    for input in array(field(derivation, "inputs")?, "security derivation inputs")? {
+        inputs.push(policy_input_from(input)?);
+    }
+    let normalization_version = u32::try_from(u64_of(
+        field(derivation, "normalization_version")?,
+        "normalization_version",
+    )?)
+    .map_err(|_| err("normalization_version is out of range"))?;
+    let meet_algorithm_version = u32::try_from(u64_of(
+        field(derivation, "meet_algorithm_version")?,
+        "meet_algorithm_version",
+    )?)
+    .map_err(|_| err("meet_algorithm_version is out of range"))?;
+    Ok(SecurityDerivation::from_parts(
+        inputs,
+        normalization_version,
+        meet_algorithm_version,
+        string_of(field(derivation, "output_digest")?, "output_digest")?,
+        string_of(
+            field(derivation, "required_access_digest")?,
+            "required_access_digest",
+        )?,
+    ))
 }
 
 fn physical_safety_from(value: &Value) -> Result<PhysicalSafety, ContractError> {

@@ -159,9 +159,9 @@ PlacementConstraints(T)    // M5 placement predicate
 - `CoarseExecutionModes` carries the workspace and network modes. They are
   compared by the existing dimension-specific predicates (workspace rank and
   network polarity/enforcement mode), never by set inclusion. `ReadOnly` is an
-  upper bound on write authority, `Disabled` is a network restriction, and
-  `Restricted` is an execution mode; none of them is a positive access
-  requirement.
+  upper bound on content and directory-entry modification authority (write and
+  delete), `Disabled` is a network restriction, and `Restricted` is an execution
+  mode; none of them is a positive access requirement.
 - `RequiredGuarantees` carries guarantees that are not allowed-operation sets:
   `required_attempt_isolation` (the disjunction defined in §3, not a per-object
   intersection), continuity, and any other execution guarantee.
@@ -209,6 +209,11 @@ The relation is defined per object, because they have different authorship:
 | AgentType | `project_agent(P) == SecurityContract` (equality) |
 | Generation | `project_gen(P) == (max_workspace, max_network)`, and `P` entails `requires_attempt_isolation` |
 | Task | **consistency**, not projection equality |
+
+`project_workspace(P)` is `Write` when `P` authorizes writing **or deleting** any
+logical workspace region, and `ReadOnly` otherwise. Deletion modifies workspace
+content and directory entries, so a policy that can delete cannot project to
+`ReadOnly`.
 
 `requires_attempt_isolation` is an execution guarantee, not part of the
 file/network allowed set, so the normalized policy carries it explicitly.
@@ -280,7 +285,7 @@ P_task = TaskSpec.workspace_mode            // coarse workspace, M6-A
 
 ```text
 required_workspace = Write    ⇒ P_task allows write
-required_workspace = ReadOnly ⇒ P_task contains no write
+required_workspace = ReadOnly ⇒ P_task contains no write and no delete
 required_network follows the existing rank/polarity
 required_attempt_isolation    ⇒ the candidate carries the isolation guarantee
 ```
@@ -291,8 +296,8 @@ the fine policy is the draft's optional `sandbox_policy`. The spec MUST NOT
 attribute `required_network` to `TaskSpec`. `required_attempt_isolation` is also
 carried by the draft (and folded with the Generation policy, see §3).
 
-Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine
-write root MUST be rejected.
+Consequently a coarse/fine pair such as `workspace = ReadOnly` with a fine write
+or delete root MUST be rejected.
 
 The Task-local check runs before any cross-object meet and before normalization:
 
@@ -313,10 +318,12 @@ policy that allows `write Workspace/src` is invalid on its own; a Generation
 when this check fails.
 
 `sandbox_policy = None` in `SECURITY_V1` means "no additional Task-level fine
-restriction", so the Task policy layer is the explicit top
-and `P_task` reduces to the two coarse terms — `TaskSpec.workspace_mode` and
-`requirement_draft.required_network` (see §3). It never widens another ceiling,
-and the coarse fields remain authoritative in their own sources. AgentType and
+restriction". It is an **absent optional layer**, not an explicit top policy: it
+adds no restriction and MUST NOT be represented as `Top` for the meet. The
+credential dimension is a positive grant set rather than a `Top`-shaped lattice
+element, so an explicit top would silently erase the Generation's credential
+grants. With no Task layer, `P_eff` is `P_generation`, and the coarse fields
+remain authoritative in their own sources. AgentType and
 Generation `SECURITY_V1` contracts MUST carry an authored policy; an absent
 policy there would make `project_agent`/`project_gen` undefined. `COARSE_V1`
 keeps its frozen `None` semantics and replay. `SECURITY_V1` MUST NOT bypass the
@@ -362,6 +369,49 @@ separately, not one vague "derivation version". Golden vectors are keyed by
 `(canonical_version, algebra_version)`. Existing rows are read under the version
 recorded with them and MUST NOT be reinterpreted by a newer algorithm.
 
+`SecurityDerivation` proves the canonical **output content** and the unique
+**set** of authored/derived input references and digests used to produce it. Its
+input list is unordered: each `(reference, digest)` pair is sorted and
+deduplicated, and it carries no per-input author role. Consequently a Generation
+and a Task that author the same exact policy contribute one input entry, not two
+role-tagged entries. The Task author identity is carried by
+`TaskAgentRequirement.sandbox_policy` and re-read jointly with the Generation
+policy and the derivation: a binding is accepted only when the independently
+recomputed derivation, the durable requirement, and the catalog agree. A reader
+MUST NOT treat the derivation digest alone as proof of which author contributed
+which layer. Role-tagged inputs would change the canonical bytes and therefore
+require a new derivation canonical version; B5.1 does not adopt them.
+
+#### Read-side revalidation of release invariants
+
+Publication-time validation is not a substitute for a validated read. The schema
+guards make the relevant columns immutable, but the project's corruption
+discipline requires that a bypassing direct-SQL writer still fails closed:
+
+- `spawn_source_security_declaration` validates its parent SpawnSource first
+  (canonical content and disposition overlay), then re-reads the declared
+  `P_source` and rejects it when `attempt_isolation = true`, matching
+  `validated_source_declaration`. A missing or corrupt parent MUST NOT be
+  reported as a legal `COARSE_V1` source with no declaration, and a repointed
+  declaration MUST NOT acquire an isolation guarantee.
+- The Task/Generation `security_contract_mode` agreement is re-proved
+  **symmetrically** by the validated requirement read
+  (`verify_requirement_mirrors` → `verify_generation_mode_agreement`), not only
+  by `get_task_security_binding`. Admission requires the two modes to be equal in
+  both directions, and the mode columns are immutable under the schema guards, so
+  a mismatch can only be injected corruption. The symmetric check matters because
+  a `SECURITY_V1`-only guard leaves the mirror image open: a `COARSE_V1` Task
+  whose Generation is repointed to `SECURITY_V1` would still refold as a legal
+  coarse requirement, and the frozen coarse acquisition gate would then treat it
+  as dispatchable. A read that sees a locally valid but cross-record
+  contradictory pair treats it as corruption, never as execution qualification.
+- The sandbox-policy and capability-document budgets are re-checked by their
+  decoders, and a stored binding policy is re-encoded and compared byte-for-byte
+  with its canonical form.
+
+These checks are error paths, not alternate semantics: they return an invariant
+or contract error and never repair, downgrade, or reinterpret the stored value.
+
 ### 5. Admission proves satisfiability; candidates prove satisfaction
 
 There is exactly one `satisfies_requirement` relation. It is total over `R_min`
@@ -376,7 +426,7 @@ satisfies_requirement(R_min, P, stage, candidate?)
 
 | Stage | Evaluated | Deliberately deferred |
 |---|---|---|
-| Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
+| Typed admission | `RequiredAccess ⊆ ProjectAccess(TaskAuthority(meet(P_generation, P_task)))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency, and the pinned AgentType's authored policy compared against `TaskAuthority(meet(...))` | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
 | Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy `FeatureObligations` coverage, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
 | Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot, including every positive Task requirement and `CoarseExecutionModes` against the committed `P_eff` | — |
 
@@ -394,6 +444,64 @@ still legitimately unavailable, or a control-plane fault when the subject should
 exist; it is never treated as `Satisfied` and never authorizes execution
 commitment.
 
+The admission predicate MUST NOT use the fine-derived meet as if it were the
+complete Task authority. The durable `TaskSecurityBinding.policy` remains the
+fine-derived meet and its canonical bytes are unchanged, but every admission
+check uses the pure coarse-constrained view
+
+```text
+TaskAuthority(P) = P with write := ∅ and delete := ∅   if required_workspace = ReadOnly
+                   P with network := ∅                 if required_network = Disabled
+```
+
+which preserves reads, execute, tools, environment, credentials and resource
+ceilings. `ReadOnly` and `Disabled` are upper bounds carried by the Task itself,
+so they apply to every layer the Task admits, including the Generation layer.
+`Delete` is included because deletion modifies workspace content and directory
+entries; a Task that declares `ReadOnly` cannot be satisfied by a policy that
+still authorizes deletion. This closes both directions of the
+combined-obligation error: a `ReadOnly` Task whose required capability projects
+to a write or delete, or a `Disabled` Task whose required capability projects to
+an endpoint, is unsatisfiable even when the fine layer shows the operation; and
+a legal `ReadOnly` Task under a `Write` Generation is not rejected merely because
+the fine meet retains Generation write paths that the Task ceiling removes before
+the pinned AgentType comparison. A later Candidate or Execution stage re-applies
+the same view to the complete `P_eff` because a later meet can only narrow it.
+
+RequiredAccess is therefore checked as
+`RequiredAccess ⊆ ProjectAccess(TaskAuthority(meet(P_generation, P_task)))`, and
+`can_execute_security_v1` compares `TaskAuthority(meet(...))` with the pinned
+AgentType's authored policy. B5.1 does not weaken the `SECURITY_V1` strict
+ordering to obtain this result; it supplies the comparison with the complete,
+explainable Task constraint.
+
+#### The binding policy is not the complete execution authority
+
+`TaskSecurityBinding.policy` is exactly `meet(P_generation, P_task_fine)`; it does
+not include the Task's coarse `workspace`/`network` upper bounds. For example a
+`ReadOnly` Task under a `Write` Generation keeps the Generation's write paths in
+`binding.policy()`, while the Task's actual authority permits neither writing nor
+deletion. B5.1 handles this correctly by applying `TaskAuthority` in every
+admission check, but the raw binding value MUST NOT become the physical compiler
+input.
+
+B5.2 MUST introduce a typed composite authority (for example
+`EffectiveTaskAuthority` or `QualifiedSecurityContract`) whose only constructor
+combines:
+
+```text
+TaskSecurityBinding.policy
++ durable Task coarse modes (required_workspace, required_network)
++ the actual bound AgentType authored ceiling
++ the SpawnSource authored ceiling
+```
+
+and whose type is what `compile_execution_security` accepts. Passing
+`binding.policy()` directly is forbidden. The composite MUST also record the
+exact source, binding and AgentType identities so Execution commitment can
+re-prove them. This is a B5.2 API requirement, not B5.1 runtime behavior; B5.1
+adds no `EffectiveTaskAuthority` type.
+
 `RequiredCapabilities` is deferred at admission because admission has only the
 Generation and Task policy objects, while the existing M6-B.2 matcher compares a
 requirement against the actual AgentType's capability claims. Moving it earlier
@@ -404,7 +512,11 @@ Only the `RequiredAccess` component is a set inclusion. `RequiredCapabilities`
 use their catalog matchers, and `RequiredGuarantees`, `CoarseExecutionModes`, and
 `PlacementConstraints` use their own predicates. There MUST be exactly one
 relation, not two implementations that disagree about which `R_min` dimensions
-are set-like or about which stage owns placement.
+are set-like or about which stage owns placement. In particular, network
+`RequiredAccess` uses the same union containment as `is_within`: a required
+endpoint rule is satisfied when the union of the effective rules covers it, not
+only when one effective rule covers the whole rule. `ANY:*:443` is therefore
+satisfied by `TCP:*:443 ∪ UDP:*:*` at every stage.
 
 Admission checks only `Generation ∩ Task`. Provisioning adds the actual
 AgentType and the SpawnSource ceiling, and its failure is a different class
@@ -443,6 +555,14 @@ This matches the existing coarse rejection of
 fail at the same stage, not later during provisioning. An unsatisfiable Task
 must never become a durable semantic commitment.
 
+Admission itself MUST apply this re-evaluation to the admitted
+`meet(P_generation, P_task)` before the Task or its `TaskSecurityBinding` becomes
+durable. A Task whose `required_workspace` is `Write` MUST be rejected when the
+admitted policy has no writable region; `Restricted`/`Enabled` network modes MUST
+be rejected when the admitted policy allows no endpoint or is not unrestricted.
+A legal deny-all intersection is not a `PolicyConflict`; it is an unsatisfiable
+positive requirement at the admission stage.
+
 ### 6. Dimension rules for `meet`
 
 The algebra is defined dimension by dimension; "intersect the allowed sets" is
@@ -451,8 +571,8 @@ not sufficient:
 | Dimension | Composition rule |
 |---|---|
 | allowed file operations and path ranges | set intersection per operation class |
-| hidden/prohibited ranges | keep common restrictions; normalize to equivalent allowed/prohibited regions |
-| tools, commands | allowed-set intersection |
+| hidden/prohibited ranges | keep common restrictions; normalize to equivalent allowed/prohibited regions; visibility is an independent observability dimension, not an operation precondition (see §7) |
+| tools, commands | intersect the effective `ToolCommandSet` union (see §7) |
 | network endpoints/protocols/ports | meet in that dimension |
 | environment variables | allowed-name intersection; conflicting required values reject |
 | credential scope | refs, use, delivery mode and audience all narrow; an omitted grant in the AgentType ceiling is empty, not `Top`, and other ceilings can only narrow |
@@ -463,6 +583,28 @@ not sufficient:
 `P_eff` covers allowed operations and ceilings only. Guarantees live beside it:
 meeting two policies can never clear an isolation requirement, and an
 `EnforcementSupport` capability cannot create one (see §3).
+
+The authored policy isolation bit and the object's durable guarantee field are a
+single authority, not two independent representations. Consequently
+`validate_generation_coarse_fine` requires
+
+```text
+Generation.requires_attempt_isolation
+    ⇔ authored_policy.attempt_isolation
+```
+
+and the AgentType analogue requires the same equality. A Generation that authors
+isolation without declaring the guarantee, or declares it without authoring it,
+is rejected at publication; neither direction may leave `P_eff.attempt_isolation
+= true` while no requirement asks a committed execution to request isolation. A
+Task's optional fine policy MAY repeat the Task's own
+`required_attempt_isolation = true`, but MUST NOT introduce the guarantee when
+the Task does not declare it. `SpawnSource` has no isolation guarantee field, so
+its `P_source` MUST NOT set `attempt_isolation`; an unattributed source-level
+guarantee is rejected at publication rather than left for B5.2/B5.4 to
+interpret. Making fine-policy `true` *create* an isolation requirement would
+change the `I_required` composition and therefore requires a new ADR revision
+and algebra version.
 
 The credential dimension is the one dimension where absence is not `Top`. A
 `SECURITY_V1` AgentType ceiling that does not explicitly grant a secret scope
@@ -484,6 +626,18 @@ configuration, inherited environment or ordinary file permissions are outside th
 managed grant, are not certified by this ADR, and neither satisfy nor are implied
 by a `CredentialAuthorizationId`. Absence of a grant and physical impossibility of
 credential access are different claims at every layer.
+
+The canonical form is the identity of the policy's authorization semantics. A
+`CredentialGrant` with an empty `uses`, `audience` or `delivery_modes` facet
+authorizes nothing, so normalization **drops** it instead of serializing an inert
+grant; the corresponding `CredentialAuthorizationId` is then simply absent from
+the canonical map. An explicitly authored no-authority grant and an absent grant
+therefore share one canonical byte sequence and one content digest. Dropping such
+a grant loses no authority and no later reader may reintroduce authority from a
+digest. `is_within` is a preorder on normalized policies, and canonical digest
+equality is a sufficient but not the only way to observe no-wider in both
+directions; it MUST NOT be used as a substitute for the algebra when comparing
+policies that were not produced by the same normalization path.
 
 `meet` is **partially defined** over the grammar, not total:
 
@@ -544,6 +698,217 @@ dependencies, temporary directories, and launch-required files enter an
 explicit bootstrap manifest. A compile failure MUST NOT add an unrestricted
 "needed to run" exception.
 
+#### v1 network universe, canonical universal rule, and bounded host tokens
+
+The B5.1 network operation domain is exactly
+
+```text
+{TCP, UDP} × Host × Port,   Port = {1 ..= 65535}
+```
+
+`NetworkTransport::Any` is the union of `TCP` and `UDP`, and
+`NetworkEndpointSet::Any` is the whole domain. The finite rule `ANY:*:*` denotes
+exactly the same domain, so normalization MUST collapse it to `Any`. A canonical
+policy MUST NOT retain both spellings, and `project_network` together with
+`is_within` MUST agree that the explicit universal rule and `Any` are the same
+top policy. A protocol outside `TCP`/`UDP` requires a new policy canonical or
+algebra version; it MUST NOT be silently folded into the v1 `Any` value.
+
+An exact host token is 1 to 253 ASCII bytes drawn from `[A-Za-z0-9._-]` and MUST
+contain at least one alphanumeric byte. A token containing `:` MUST parse as an
+IPv6 literal, so `example.com:443` and other `host:port` fragments are invalid;
+the port is always a separate selector. `*` is the only wildcard and MUST be the
+entire host token; `*.example.com`, `example.*`, and any other embedded `*` are
+invalid. NUL, control bytes, whitespace, path or URL syntax, and non-ASCII text
+are invalid. Port 0 is not an endpoint selector. Each normalized policy network
+set and each `RequiredAccess` endpoint set is limited to 256 distinct rules, and
+the decoder rejects a longer authored array; a larger collection is rejected
+before it reaches the finite-partition containment algorithm. These are input
+grammar rules, not B5.2 physical-compiler policy.
+
+The meet of two bounded endpoint sets is also bounded. Each side has at most 256
+rules, so the rule-wise product has at most 65,536 candidates; normalization
+groups candidates by host and port and removes covered rules in `O(n log n)`
+rather than with a global pairwise scan. A normalized result that still exceeds
+256 rules is rejected as a `PolicyConflict` by policy construction. Thus a
+legitimate 256 × 256 input can fail closed on the representable-output bound but
+cannot force unbounded CPU work, and an intermediate product that simplifies to
+a representable policy remains admissible.
+
+This collapse is part of defining the initial policy canonical, not a
+reinterpretation of durable data: B5.1 is the first build to write policy rows,
+and the pinned `(canonical_version, algebra_version) = (1, 1)` golden vectors
+are defined by this initial canonical. No vector keeps a second spelling of the
+explicit universal rule. A post-B5.1 change to these bytes MUST bump
+`SANDBOX_POLICY_SCHEMA_VERSION` and add new vectors rather than let an existing
+digest mean something new.
+
+The containment predicate `network_allowed_union_within` uses the same finite
+partition. If the two sets together name `H` distinct exact hosts and `P`
+distinct exact ports, the partition has `2 · (H + 1) · (P + 1)` atoms. The
+per-set bound limits each side to 256 rules, so across one comparison `H ≤ 512`
+and `P ≤ 512`: at most `2 · 513 · 513 ≈ 526,338` atoms. The predicate marks the
+outer union once and then requires every atom an inner rule covers to be marked.
+Each rule first projects to the host and port atoms it covers, so an exact-port
+rule touches one port column per covered host instead of rescanning every port
+atom to reject it. The cost is bounded by the input grammar, and a 256 × 256
+adversarial regression pins it. This is pure in-transaction policy evaluation;
+B5.1 does not add a separate wall-clock admission budget.
+
+#### Network canonical identity is deterministic but not union-minimal
+
+The v1 canonical form is deterministic for a given rule syntax: the same
+endpoint array always normalizes to the same rule set, bytes and digest. It is
+not a complete union-minimal form. A rule covered only by the *union* of several
+other rules is retained, because removing it would require canonicalizing the
+whole wildcard product. For example
+
+```text
+A = TCP:*:* ∪ UDP:*:443
+B = TCP:*:* ∪ ANY:*:443
+```
+
+permit exactly the same operations, because `TCP:*:*` already contains the TCP
+part of `ANY:*:443`. `is_within` proves `A ⪯ B` and `B ⪯ A`, and `meet` handles
+them correctly, but `A` and `B` keep different canonical bytes and digests.
+
+This is a documented limitation of the initial canonical, not a permission
+difference. B5.2/B5.4 MUST compare policy authority with `is_within` (or with
+the normalized meet result), never by digest equality. A future canonical that
+collapses semantic unions MUST bump `SANDBOX_POLICY_SCHEMA_VERSION` and add new
+golden vectors; it MUST NOT silently change the identity of already-published
+policies.
+
+#### v1 path bounds
+
+Path selectors are bounded by the same resource argument. One selector has at
+most 32 components, one component is at most 255 bytes, one normalized path set
+has at most 256 selectors, and one policy has at most 512 selectors across its
+five path sets (`read`, `write`, `execute`, `delete`, `visible`). The decoder and
+`PathSet::try_allowed` reject an oversized authored collection before pairwise
+cover removal, and `NormalizedSandboxPolicy::from_parts` re-checks both the
+per-set and aggregate counts. The bounds are part of the v1 grammar: raising them
+changes the accepted input language, not the canonical bytes of an already
+accepted policy, and still requires an explicit version decision rather than a
+silent relaxation.
+
+`PathSet::allowed` remains an infallible constructor for trusted,
+already-bounded callers. It runs pairwise cover removal before any later
+`from_parts` budget check, so a caller that hands it unbounded authored input
+performs quadratic work before the value is rejected. Every current boundary
+(the decoder, `NormalizedSandboxPolicy::from_parts`, the catalog publisher) uses
+`try_allowed` or an equivalent count check first, so this is an API-misuse risk
+rather than a reachable path. Narrowing the constructor to crate-private use, or
+making it fallible everywhere, is a non-breaking-to-behavior API cleanup that
+does not gate B5.1.
+
+#### v1 name, map and document bounds
+
+The remaining set and map dimensions use the same resource argument. One
+allowed-name set (`tools`, `commands` or allowed environment names) has at most
+256 distinct members; a policy's `required_values` map, credential grant map and
+resource ceiling map each have at most 256 entries; and one credential grant has
+at most 256 `uses` and 256 `audience` members. `NameSet::allowed`,
+`EnvironmentPolicy::new`, `CredentialGrant::new`, `RequiredAccess::new` and
+`NormalizedSandboxPolicy::from_parts` reject an oversized collection, and the
+decoder rejects it before constructing a partial policy.
+`RequiredAccess::try_with_credentials` re-checks the merged credential set, so a
+value cannot cross the bound through a post-construction update; there is no
+infallible credential setter.
+
+Those per-dimension bounds alone still allow a maximal policy to be physically
+large, so one canonical sandbox policy document is additionally limited to
+1,048,576 bytes. The limit is enforced by the value constructor
+`NormalizedSandboxPolicy::from_parts`, after normalization: an authored policy, a
+decoded policy and the result of `meet` all pass the same check before the value
+exists. `sandbox_policy_from_canonical_json` checks the document length before
+parsing, and the catalog publisher checks the canonical encoding before hashing
+or storing it; those are boundary repetitions of the value invariant, not the
+only enforcement point. Consequently a `meet(P_generation, P_task)` whose result
+is not representable fails as a `PolicyConflict` inside admission, before any
+durable Task, Batch, binding or requirement row is committed. A durable
+commitment can never be written that the validated reader would refuse to read.
+As with the path bounds, these are v1 input-grammar limits: they do not change
+the canonical bytes of an accepted policy, and relaxing them requires an
+explicit version decision.
+
+A capability definition with a v2 `PolicyProjection` is bounded as authored
+catalog input as well. One projection map has at most 256 members, one member
+name or operation token is at most 256 bytes and contains no NUL or `=`, and one
+canonical capability definition document is at most 1,048,576 bytes.
+`PolicyProjection::new` enforces the map and token bounds,
+`capability_definition_from_canonical_json` checks the whole-document budget
+before parsing, and the publisher checks the canonical encoding before hashing
+or storing it. An oversized definition is therefore rejected at publication and
+cannot make a later `load_capability_catalog` traverse unbounded input.
+
+#### v1 `ToolCommandSet` is one abstract operation namespace
+
+The v1 projection dimension is `ToolCommandSet`, not separate `Tool` and
+`Command` operations. A policy stores two authoring allowlists, `tools` and
+`commands`, but they do not grant two independent capabilities. The effective
+`ToolCommandSet` is their union: a required operation named `"git"` is satisfied
+by `tools = {"git"}`, by `commands = {"git"}`, or by both. v1 does not
+distinguish a tool invocation from a command invocation that share a name, and
+it does not promise that a physical compiler can enforce that distinction.
+
+Because the union is the authority, normalization MUST give that union one
+canonical spelling: the union of the two finite sets is stored in `tools` and
+`commands` is explicit deny-all. If either field is `Any`, the whole namespace is
+authorized, so both fields remain `Any`. Consequently
+
+```text
+{tools: {git}, commands: {}}  ==  {tools: {}, commands: {git}}
+                              ==  {tools: {git}, commands: {git}}
+```
+
+as values, canonical bytes and content digests. `meet` and `is_within` operate on
+this same effective union, so `{tools: {git}, commands: {}}` and
+`{tools: {}, commands: {git}}` are mutually within and their meet still allows
+`"git"`. Intersecting the two storage fields separately would violate the
+greatest-lower-bound property and make `PolicyAccess` disagree with the ordering.
+
+Because the canonical union is one allowed-name set, the 256-member bound of
+§7 applies to the union itself: an authored pair whose combined distinct names
+exceed it is rejected at construction rather than split across two fields.
+
+This canonical spelling is part of the initial B5.1 policy canonical, not a
+reinterpretation of durable data: B5.1 is the first build to write policy rows.
+Any later change to how the union is spelled MUST bump
+`SANDBOX_POLICY_SCHEMA_VERSION` and add new golden vectors.
+
+If B5.2/B5.4 need different enforceability guarantees for tool and command
+invocation, that requires a new policy canonical/schema version and separate
+versioned projection operations. The same string MUST NOT be reinterpreted as a
+tool or a command only by the physical compiler, because that would silently
+change the meaning of an already-published capability projection.
+
+#### Visibility is observability, not an access precondition
+
+`FilePolicy.visible` is the set of path regions the execution may observe while
+enumerating a directory. It is an independent authorization dimension and MUST
+NOT be interpreted as a precondition for reading, writing, executing or deleting
+an explicitly named path. A hidden path is one that no `visible` selector covers;
+there is no separate negation.
+
+Consequently:
+
+- `project_workspace` and `PolicyAccess` derive operation authority only from the
+  non-empty `read`, `write`, `execute` and `delete` sets. A deny-all `visible`
+  set does not erase a writable region, and `Write` remains satisfied while a
+  write operation is authorized;
+- `meet` intersects `visible` with the other dimensions independently, and
+  `is_within` compares it as its own dimension;
+- physical enforcement of directory observability belongs to the B5.2
+  enforcement compiler. It MUST NOT be used to infer an operation grant or deny
+  one: a policy that hides a path while allowing a known-path write means exactly
+  that, not "write is denied".
+
+Treating visibility as an access precondition would change the authorization
+meaning of an existing dimension and therefore requires a new ADR and a new
+canonical/algebra version; it MUST NOT be introduced as an implementation
+convenience.
+
 ### 8. Capability algebra stays separate
 
 The existing `Ability`/`Restriction` polarity and matcher rules are preserved.
@@ -598,6 +963,50 @@ Every contract accepted under B.1–B.4 exact equality MUST remain accepted. A
 previously rejected "different but narrower" policy becomes legal only through
 an explicit catalog declaration. A differential test MUST pin this.
 
+B5.1 applies the mode-aware policy order only where a `SECURITY_V1` revision is
+matched: admission of a Task against a pinned `SECURITY_V1` AgentType, and
+`based_on` refinement between two `SECURITY_V1` revisions. The frozen
+`can_execute`, `more_specific_for` and `is_valid_refinement` relations keep their
+exact-reference policy behavior for `COARSE_V1`; a `SECURITY_V1` Task that pins a
+`COARSE_V1` AgentType stays eligible at admission and its execution-mode
+eligibility is a candidate-stage decision. A `SECURITY_V1` revision may therefore
+be refined by another `SECURITY_V1` revision with a different, provably narrower
+authored policy, while `SECURITY_V1 -> COARSE_V1` refinement is rejected because
+it drops the physical enforcement contract even when the coarse fields and policy
+reference are unchanged. B5.1 thus implements this conservative subset of the
+§5 ordering; it does not claim the complete secured-execution qualification that
+B5.2/B5.4 own.
+
+B5.1 does **not** wire the mode-aware order into existing-agent preselection.
+`match_existing_agents_for_task` keeps the frozen `match_existing_agents`
+relation, which still compares policy references by equality for both
+`COARSE_V1` and `SECURITY_V1` requirements. Consequently a `SECURITY_V1`
+AgentType whose authored policy is a strict superset of the Task's effective
+policy is admissible under `can_execute_security_v1` but is not returned as an
+existing-agent candidate in B5.1.
+
+This is an explicit **scope amendment** to the initial B5.1 slice: B5.1 delivers
+the two relations where the policy order is already required for admission and
+refinement, and defers the other two to B5.2. It is not an execution-authority
+leak, because the coarse acquisition path cannot execute a `SECURITY_V1` Task
+and admission already rejects that path. It is nevertheless a hard B5.2
+acceptance item, not an optional optimization:
+
+```text
+B5.2 MUST deliver, with differential tests:
+  1. mode-aware match_existing_agents_for_task over the policy order;
+  2. policy-aware more_specific_for (including based_on and preselection);
+  3. the same order in can_provision/acquisition when a SECURITY_V1
+     existing agent is compared to a SECURITY_V1 Task;
+  4. no SECURITY_V1 candidate is silently dropped merely because its
+     policy reference differs but its policy is provably narrower.
+```
+
+B5.2 MUST NOT be declared complete while a `SECURITY_V1` Task that is admissible
+under `can_execute_security_v1` still loses an eligible existing-agent candidate
+because preselection uses reference equality. Until those items land, B5.1 MUST
+NOT claim that all four relations are policy-order aware.
+
 ### 10. `ActualAuthority` is defined by provable equality, not by a claim
 
 `ActualAuthority(E)` is not directly observable. Acceptance uses falsifiable
@@ -650,9 +1059,23 @@ competing authority sources:
   kept for readability, if any, is derived and constrained equal; it never
   decides.
 
+`TaskSecurityBinding.policy` is the fine `P_eff` derivation, not the Task's
+complete authority. A `ReadOnly` Task under a `Write` Generation that authors no
+fine layer retains the Generation's write paths in the binding, while its durable
+`required_workspace` still says `ReadOnly`. B5.2/B5.4 execution compilation MUST
+therefore compose the binding policy with the durable Task coarse requirement
+(and the actual AgentType/SpawnSource terms); it MUST NOT treat the binding policy
+alone as the effective Task permission.
+
 Mode declarations are per-object immutable facts, fixed when the object is
 created or published — never a mutable "supports" label chosen at admission:
 
+- an AgentType revision's mode and a SpawnSource revision's security declaration
+  are written in the same transaction that inserts the immutable revision. There
+  is no post-publication declaration API: a revision cannot be published as
+  `COARSE_V1` and later reinterpreted in place, and an idempotent republish MUST
+  carry exactly the same mode/declaration. Changing either requires a new
+  revision;
 - each Generation's `SecurityContractMode` follows its immutable
   `generations.policy_mode`, which the frozen schema restricts to `NONE` or
   `POLICY`:
@@ -744,6 +1167,15 @@ digest, and initial disposition. Republishing the same exact `(ref, content
 digest)` is idempotent; a different digest for an already-published exact
 revision fails closed. A Source security record is published in the same
 transaction as its exact source revision; a change requires a new revision.
+
+The declaration MUST be written before the disposition/published marker in that
+transaction. The database enforces publication closure: once an
+`agent_type_dispositions` or `spawn_source_dispositions` row exists, the schema
+triggers reject a first `INSERT` into the corresponding security-declaration
+table. Disposition rows cannot be deleted or reinserted, so a published
+`COARSE_V1` revision cannot later gain a `SECURITY_V1` declaration through raw
+SQL. This is the storage-level counterpart of the API rule that the security
+mode is fixed at revision publication.
 
 Old canonical encodings and digests are never reinterpreted because a new field
 or algorithm version was added.

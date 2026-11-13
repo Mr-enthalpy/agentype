@@ -11,7 +11,9 @@
 
 use crate::store::{json_dump, json_load, map_sqlite, query_opt};
 use crate::txutil::required_partition;
-use agentype_agent_contract::{task_agent_requirement_content_digest, AgentRequirementDraft};
+use agentype_agent_contract::{
+    task_agent_requirement_content_digest, AgentRequirementDraft, SecurityContractMode,
+};
 use agentype_core::{
     generation_allows_admit, is_generation_settled, is_generation_view_settled, ArtifactRef,
     BatchId, ContinuityPreference, Error, FailureClass, GenerationId, GenerationRecord,
@@ -357,7 +359,13 @@ pub fn create_generation(
     now: UnixTime,
     seed_payload: Value,
 ) -> Result<GenerationRecord, Error> {
-    create_generation_with_policy(tx, now, seed_payload, None)
+    create_generation_with_security_mode(
+        tx,
+        now,
+        seed_payload,
+        None,
+        SecurityContractMode::CoarseV1,
+    )
 }
 
 /// Create a new semantic admission frontier with an optional immutable
@@ -369,6 +377,32 @@ pub fn create_generation_with_policy(
     seed_payload: Value,
     policy: Option<agentype_agent_contract::GenerationPolicy>,
 ) -> Result<GenerationRecord, Error> {
+    create_generation_with_security_mode(
+        tx,
+        now,
+        seed_payload,
+        policy,
+        SecurityContractMode::CoarseV1,
+    )
+}
+
+/// Create a Generation with an explicit `SecurityContractMode` (M6-B.5).
+///
+/// The mode is selected by the caller and never inferred from
+/// `sandbox_policy.is_some()`: `SECURITY_V1 + sandbox_policy = None` is rejected
+/// as an invalid authority claim, not silently downgraded to `COARSE_V1`.
+pub fn create_generation_with_security_mode(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    seed_payload: Value,
+    policy: Option<agentype_agent_contract::GenerationPolicy>,
+    security_mode: SecurityContractMode,
+) -> Result<GenerationRecord, Error> {
+    if security_mode == SecurityContractMode::SecurityV1 && policy.is_none() {
+        return Err(Error::invalid_authority(
+            "a SECURITY_V1 generation must author a security policy",
+        ));
+    }
     let generation_id = GenerationId::new();
     let seed_json = json_dump(&seed_payload);
     let policy_mode = if policy.is_some() { "POLICY" } else { "NONE" };
@@ -381,7 +415,13 @@ pub fn create_generation_with_policy(
     .map_err(map_sqlite)?;
 
     if let Some(policy) = &policy {
-        crate::requirement::insert_generation_policy(tx, now, &generation_id, policy)?;
+        crate::requirement::insert_generation_policy(
+            tx,
+            now,
+            &generation_id,
+            policy,
+            security_mode,
+        )?;
     }
 
     Ok(GenerationRecord {
@@ -997,6 +1037,7 @@ pub fn admit_proposal(
         expected_generation_revision,
         override_task_spec,
         None,
+        SecurityContractMode::CoarseV1,
     )
 }
 
@@ -1015,6 +1056,31 @@ pub fn admit_typed_proposal(
     override_task_spec: Option<TaskSpec>,
     agent_requirement: AgentRequirementDraft,
 ) -> Result<TaskId, Error> {
+    admit_typed_proposal_with_security_mode(
+        tx,
+        now,
+        proposal_id,
+        expected_generation_revision,
+        override_task_spec,
+        agent_requirement,
+        SecurityContractMode::CoarseV1,
+    )
+}
+
+/// Typed admission under an explicit `SecurityContractMode` (M6-B.5).
+///
+/// The mode is a command input, never inferred from the authored policy: a
+/// `SECURITY_V1` admission records a `TaskSecurityBinding`, a `COARSE_V1`
+/// admission records none.
+pub fn admit_typed_proposal_with_security_mode(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    proposal_id: &ProposalId,
+    expected_generation_revision: u64,
+    override_task_spec: Option<TaskSpec>,
+    agent_requirement: AgentRequirementDraft,
+    security_mode: SecurityContractMode,
+) -> Result<TaskId, Error> {
     admit_proposal_core(
         tx,
         now,
@@ -1022,6 +1088,7 @@ pub fn admit_typed_proposal(
         expected_generation_revision,
         override_task_spec,
         Some(agent_requirement),
+        security_mode,
     )
 }
 
@@ -1032,6 +1099,7 @@ fn admit_proposal_core(
     expected_generation_revision: u64,
     override_task_spec: Option<TaskSpec>,
     typed_draft: Option<AgentRequirementDraft>,
+    security_mode: SecurityContractMode,
 ) -> Result<TaskId, Error> {
     // 1. Fetch proposal row
     let proposal_row = query_opt(
@@ -1083,6 +1151,20 @@ fn admit_proposal_core(
                     )))
                 }
             }
+            if typed_draft.is_some() {
+                let committed_security =
+                    crate::requirement::task_security_mode(tx, &existing_task)?;
+                if committed_security != security_mode {
+                    return Err(Error::conflict(
+                        "admission replay security contract mode conflicts with the committed task",
+                    ));
+                }
+                if security_mode == SecurityContractMode::SecurityV1 {
+                    // The replay must not succeed against a missing or incoherent
+                    // binding; the authoritative read re-derives it.
+                    crate::requirement::get_task_security_binding(tx, &existing_task)?;
+                }
+            }
             if let Some(override_spec) = override_task_spec {
                 let admitted_spec_json: Option<String> = tx
                     .query_row(
@@ -1127,6 +1209,7 @@ fn admit_proposal_core(
                 let expected = crate::requirement::build_task_agent_requirement_replay(
                     tx,
                     &generation_id,
+                    security_mode,
                     draft,
                     info_fn,
                     &admitted_spec,
@@ -1193,6 +1276,20 @@ fn admit_proposal_core(
             return Err(Error::invalid_authority(
                 "a generation with a policy requires typed admission; legacy admit_proposal is forbidden",
             ));
+        }
+    } else {
+        // The requested mode and the Generation's committed mode must agree in
+        // both directions: a `COARSE_V1` Task may not enter a `SECURITY_V1`
+        // Generation, and a `SECURITY_V1` Task may not enter a `COARSE_V1` one.
+        // This runs before any durable write.
+        let generation_id = GenerationId::from_string(gid.clone());
+        let generation_mode = crate::requirement::generation_security_mode(tx, &generation_id)?;
+        if generation_mode != security_mode {
+            return Err(Error::invalid_authority(format!(
+                "typed admission in {} mode is not allowed in a {} generation",
+                security_mode.as_str(),
+                generation_mode.as_str()
+            )));
         }
     }
 
@@ -1326,11 +1423,32 @@ fn admit_proposal_core(
         let requirement = crate::requirement::build_task_agent_requirement(
             tx,
             &generation_id,
+            security_mode,
             draft,
             info_fn,
             &task_spec,
         )?;
-        crate::requirement::insert_task_agent_requirement(tx, now, &task_id, &requirement)?;
+        crate::requirement::insert_task_agent_requirement(
+            tx,
+            now,
+            &task_id,
+            &requirement,
+            security_mode,
+        )?;
+        if security_mode == SecurityContractMode::SecurityV1 {
+            let binding = crate::requirement::prepare_task_security_binding(
+                tx,
+                &generation_id,
+                &requirement,
+            )?;
+            crate::requirement::insert_task_security_binding(
+                tx,
+                now,
+                &task_id,
+                &requirement,
+                &binding,
+            )?;
+        }
     }
 
     // 9. Transition proposal to ADMITTED

@@ -215,6 +215,34 @@ pub fn fold_generation_policy(
     policy: &GenerationPolicy,
     task: &TaskRequirement,
 ) -> Result<TaskRequirement, ContractError> {
+    let sandbox = sandbox_fold(&policy.sandbox_policy, &task.sandbox_policy)?;
+    fold_generation_policy_with_sandbox(policy, task, sandbox)
+}
+
+/// Fold a Generation policy into a Task requirement under `SECURITY_V1`
+/// (ADR-0013 §3, §4).
+///
+/// The coarse dimensions keep the frozen ceiling semantics, but the sandbox
+/// layer is different: the Task's authored policy reference is preserved as an
+/// independent authored input, and the effective policy is later proven by a
+/// real `meet(P_generation, P_task)` at binding time. A distinct Task policy is
+/// therefore a legal narrowing, not the frozen exact-reference conflict. When
+/// the Task authored no policy, the durable requirement keeps `None`, which
+/// means "no additional Task-level fine restriction" and not "copy the
+/// Generation reference".
+pub fn fold_generation_policy_security_v1(
+    policy: &GenerationPolicy,
+    task: &TaskRequirement,
+) -> Result<TaskRequirement, ContractError> {
+    let sandbox = task.sandbox_policy.clone();
+    fold_generation_policy_with_sandbox(policy, task, sandbox)
+}
+
+fn fold_generation_policy_with_sandbox(
+    policy: &GenerationPolicy,
+    task: &TaskRequirement,
+    sandbox_policy: Option<SandboxPolicyRef>,
+) -> Result<TaskRequirement, ContractError> {
     if !policy
         .allowed_information_functions
         .contains(&task.information_function)
@@ -271,7 +299,7 @@ pub fn fold_generation_policy(
         required_attempt_isolation: policy.requires_attempt_isolation
             || task.required_attempt_isolation,
         required_continuity: policy.min_continuity.max(task.required_continuity),
-        sandbox_policy: sandbox_fold(&policy.sandbox_policy, &task.sandbox_policy)?,
+        sandbox_policy,
         required_anchor: effective_anchor,
         budget: if policy.budget_ceiling <= task.budget {
             policy.budget_ceiling

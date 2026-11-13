@@ -28,6 +28,26 @@ pub enum ContractError {
     InvalidRef { reason: String },
     /// A capability revision was redefined with different semantics.
     CapabilityDefinitionConflict { capability: String, revision: u64 },
+    /// A capability policy projection is not one of the explicitly permitted
+    /// shapes (ADR-0013 §2). At the durable boundary this is catalog corruption.
+    InvalidPolicyProjection { reason: String },
+    /// A sandbox policy is not well formed (or a durable sandbox policy document
+    /// cannot be decoded). At the durable boundary this is catalog corruption.
+    InvalidSandboxPolicy { reason: String },
+    /// A durable sandbox policy row records a `(canonical_version,
+    /// algebra_version)` pair this build does not implement. It MUST NOT be
+    /// reinterpreted under the current algorithms.
+    UnsupportedPolicyVersion {
+        canonical_version: u32,
+        algebra_version: u32,
+    },
+    /// A durable security derivation records a normalization or meet version
+    /// this build does not implement. It MUST NOT be reinterpreted under the
+    /// current algorithms.
+    UnsupportedPolicyDerivationVersion {
+        normalization_version: u32,
+        meet_algorithm_version: u32,
+    },
     /// A Task's hard requirement conflicts with a value that must agree (e.g. a
     /// Generation policy that the Task would have to widen).
     RequirementConflict { reason: String },
@@ -67,6 +87,26 @@ impl fmt::Display for ContractError {
             } => write!(
                 f,
                 "capability {capability}@{revision} redefined with different semantics"
+            ),
+            Self::InvalidPolicyProjection { reason } => {
+                write!(f, "invalid capability policy projection: {reason}")
+            }
+            Self::InvalidSandboxPolicy { reason } => {
+                write!(f, "invalid sandbox policy: {reason}")
+            }
+            Self::UnsupportedPolicyVersion {
+                canonical_version,
+                algebra_version,
+            } => write!(
+                f,
+                "unsupported sandbox policy version ({canonical_version}, {algebra_version})"
+            ),
+            Self::UnsupportedPolicyDerivationVersion {
+                normalization_version,
+                meet_algorithm_version,
+            } => write!(
+                f,
+                "unsupported security derivation version (normalization {normalization_version}, meet {meet_algorithm_version})"
             ),
             Self::RequirementConflict { reason } => {
                 write!(f, "task requirement conflict: {reason}")

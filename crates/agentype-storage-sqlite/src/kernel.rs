@@ -5,8 +5,9 @@ use crate::store::{json_dump, json_load, map_sqlite, query_opt, Store};
 use crate::txutil::*;
 use agentype_agent_contract::{
     resolve_selector, AdapterBindingPolicy, AdapterPolicyRef, AgentType, AgentTypeRef,
-    AgentTypeSelector, CapabilityCatalog, CapabilityDefinition, CapabilityRef, SourceConfig,
-    SourceConfigRef, SpawnSource, SpawnSourceRef,
+    AgentTypeSelector, CapabilityCatalog, CapabilityDefinition, CapabilityRef,
+    NormalizedSandboxPolicy, SandboxPolicyRef, SecurityContractMode, SourceConfig, SourceConfigRef,
+    SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
 };
 use agentype_core::*;
 // Only the runtime-mechanical methods (claim, execution commitment, renewal,
@@ -711,6 +712,31 @@ impl Kernel {
         })
     }
 
+    /// Typed admission under an explicit `SecurityContractMode` (M6-B.5).
+    ///
+    /// The mode is never inferred from the authored policy; `SECURITY_V1`
+    /// records a `TaskSecurityBinding`, `COARSE_V1` records none.
+    pub fn admit_typed_proposal_with_security_mode(
+        &self,
+        proposal_id: &agentype_core::ProposalId,
+        expected_generation_revision: u64,
+        override_task_spec: Option<agentype_core::TaskSpec>,
+        agent_requirement: agentype_agent_contract::AgentRequirementDraft,
+        security_mode: agentype_agent_contract::SecurityContractMode,
+    ) -> Result<agentype_core::TaskId, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::admit_typed_proposal_with_security_mode(
+                tx,
+                now,
+                proposal_id,
+                expected_generation_revision,
+                override_task_spec,
+                agent_requirement,
+                security_mode,
+            )
+        })
+    }
+
     /// Create a Generation with an immutable policy ceiling (M6-B.3 D-GEN-POLICY).
     pub fn create_generation_with_policy(
         &self,
@@ -719,6 +745,24 @@ impl Kernel {
     ) -> Result<agentype_core::GenerationRecord, Error> {
         self.tx(|tx, now| {
             crate::frontier::create_generation_with_policy(tx, now, seed_payload, policy)
+        })
+    }
+
+    /// Create a Generation under an explicit `SecurityContractMode` (M6-B.5).
+    pub fn create_generation_with_security_mode(
+        &self,
+        seed_payload: serde_json::Value,
+        policy: Option<agentype_agent_contract::GenerationPolicy>,
+        security_mode: agentype_agent_contract::SecurityContractMode,
+    ) -> Result<agentype_core::GenerationRecord, Error> {
+        self.tx(|tx, now| {
+            crate::frontier::create_generation_with_security_mode(
+                tx,
+                now,
+                seed_payload,
+                policy,
+                security_mode,
+            )
         })
     }
 
@@ -786,11 +830,38 @@ impl Kernel {
     }
 
     pub fn publish_agent_type(&self, agent: &AgentType) -> Result<String, Error> {
-        self.tx(|tx, now| crate::catalog::publish_agent_type(tx, now, agent))
+        self.publish_agent_type_with_security(agent, SecurityContractMode::CoarseV1)
+    }
+
+    /// Publish an AgentType revision and its immutable security mode atomically.
+    ///
+    /// There is no post-publication declaration API: a revision's mode is part
+    /// of its identity, and changing it requires a new revision.
+    pub fn publish_agent_type_with_security(
+        &self,
+        agent: &AgentType,
+        security_mode: SecurityContractMode,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_agent_type_with_security(tx, now, agent, security_mode)
+        })
     }
 
     pub fn publish_spawn_source(&self, source: &SpawnSource) -> Result<String, Error> {
-        self.tx(|tx, now| crate::catalog::publish_spawn_source(tx, now, source))
+        self.publish_spawn_source_with_security(source, None)
+    }
+
+    /// Publish a SpawnSource revision and its immutable security declaration
+    /// atomically. A declaration makes the revision `SECURITY_V1`; absence is
+    /// the frozen `COARSE_V1` contract.
+    pub fn publish_spawn_source_with_security(
+        &self,
+        source: &SpawnSource,
+        declaration: Option<&SpawnSourceSecurityDeclaration>,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| {
+            crate::catalog::publish_spawn_source_with_security(tx, now, source, declaration)
+        })
     }
 
     pub fn publish_source_config(
@@ -817,6 +888,44 @@ impl Kernel {
         reference: &SpawnSourceRef,
     ) -> Result<Option<SpawnSource>, Error> {
         self.tx(|tx, _| crate::catalog::get_spawn_source(tx, reference))
+    }
+
+    // ---- M6-B.5 effective-security catalog (schema v9) ----
+
+    pub fn publish_sandbox_policy(
+        &self,
+        reference: &SandboxPolicyRef,
+        policy: &NormalizedSandboxPolicy,
+    ) -> Result<String, Error> {
+        self.tx(|tx, now| crate::catalog::publish_sandbox_policy(tx, now, reference, policy))
+    }
+
+    pub fn get_sandbox_policy(
+        &self,
+        reference: &SandboxPolicyRef,
+    ) -> Result<Option<NormalizedSandboxPolicy>, Error> {
+        self.tx(|tx, _| crate::catalog::get_sandbox_policy(tx, reference))
+    }
+
+    pub fn agent_type_security_mode(
+        &self,
+        reference: &AgentTypeRef,
+    ) -> Result<SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::catalog::agent_type_security_mode(tx, reference))
+    }
+
+    pub fn spawn_source_security_declaration(
+        &self,
+        reference: &SpawnSourceRef,
+    ) -> Result<Option<SpawnSourceSecurityDeclaration>, Error> {
+        self.tx(|tx, _| crate::catalog::spawn_source_security_declaration(tx, reference))
+    }
+
+    pub fn spawn_source_security_mode(
+        &self,
+        reference: &SpawnSourceRef,
+    ) -> Result<SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::catalog::spawn_source_security_mode(tx, reference))
     }
 
     pub fn get_source_config(
@@ -922,6 +1031,23 @@ impl Kernel {
         self.tx(|tx, _| crate::requirement::get_task_agent_requirement(tx, task_id))
     }
 
+    /// The authoritative `TaskSecurityBinding` of a `SECURITY_V1` Task, or `None`
+    /// for a `COARSE_V1`/legacy Task (M6-B.5).
+    pub fn get_task_security_binding(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Option<agentype_agent_contract::TaskSecurityBinding>, Error> {
+        self.tx(|tx, _| crate::requirement::get_task_security_binding(tx, task_id))
+    }
+
+    /// The `SecurityContractMode` owned by a typed Task's requirement.
+    pub fn get_task_security_mode(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<agentype_agent_contract::SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::requirement::task_security_mode(tx, task_id))
+    }
+
     pub fn get_logical_agent_type_binding(
         &self,
         agent_id: &agentype_core::LogicalAgentId,
@@ -934,6 +1060,14 @@ impl Kernel {
         generation_id: &agentype_core::GenerationId,
     ) -> Result<Option<agentype_agent_contract::GenerationPolicy>, Error> {
         self.tx(|tx, _| crate::requirement::get_generation_policy(tx, generation_id))
+    }
+
+    /// The `SecurityContractMode` owned by an exact Generation.
+    pub fn get_generation_security_mode(
+        &self,
+        generation_id: &agentype_core::GenerationId,
+    ) -> Result<agentype_agent_contract::SecurityContractMode, Error> {
+        self.tx(|tx, _| crate::requirement::generation_security_mode(tx, generation_id))
     }
 
     /// Rank existing, bound LogicalAgents for a Task's requirement (pure read).
@@ -4184,17 +4318,56 @@ impl Kernel {
     /// One SELECT observes Task/Batch/partition/backoff together; success grants
     /// no authority. The acquisition transaction must re-prove the same Core
     /// readiness predicate after any attestation or concurrent control change.
+    ///
+    /// M6-B.5 B5.1 gate: a `SECURITY_V1` Task is rejected here, after readiness
+    /// and before semantic matching, source-private attestation, credential
+    /// resolution, or any other private I/O. The coarse typed path cannot
+    /// discharge a `SECURITY_V1` contract, so it must not begin work for one.
+    /// The check reads the mode from its sole durable owner and never from
+    /// policy presence, and it is re-proved transactionally at acquisition.
+    ///
+    /// The `agent_requirement_mode` mirror decides whether a requirement row is
+    /// expected at all: a `TYPED` Task whose requirement row is missing is
+    /// durable corruption (fail closed), while a `LEGACY` Task legitimately has
+    /// no mode and stays on the frozen coarse path.
     #[cfg(any(test, feature = "runtime-internal"))]
     pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
         let now = self.clock.now();
         self.store.query(|conn| {
-            let (state, batch, active, next): (String, Option<String>, Option<bool>, Option<f64>) =
-                conn.query_row(
-                    "SELECT t.state,b.state,p.active,t.next_eligible_at FROM tasks t
+            let (
+                state,
+                batch,
+                active,
+                next,
+                requirement_mode,
+                security_mode,
+            ): (
+                String,
+                Option<String>,
+                Option<bool>,
+                Option<f64>,
+                String,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT t.state,b.state,p.active,t.next_eligible_at,
+                            t.agent_requirement_mode,r.security_contract_mode
+                     FROM tasks t
                      LEFT JOIN batches b ON b.id=t.batch_id
-                     LEFT JOIN pool_partitions p ON p.name=t.partition_name WHERE t.id=?1",
+                     LEFT JOIN pool_partitions p ON p.name=t.partition_name
+                     LEFT JOIN task_agent_requirements r ON r.task_id=t.id
+                     WHERE t.id=?1",
                     params![id.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(map_sqlite)?
@@ -4211,6 +4384,44 @@ impl Kernel {
                 return Err(Error::invalid_transition(
                     "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
                 ));
+            }
+            match requirement_mode.as_str() {
+                "LEGACY" => {
+                    if security_mode.is_some() {
+                        return Err(Error::invariant(format!(
+                            "legacy task {} unexpectedly owns an agent requirement mode",
+                            id.as_str()
+                        )));
+                    }
+                }
+                "TYPED" => {
+                    let stored = security_mode.ok_or_else(|| {
+                        Error::invariant(format!(
+                            "typed task {} is missing its agent requirement mode row",
+                            id.as_str()
+                        ))
+                    })?;
+                    let mode =
+                        agentype_agent_contract::SecurityContractMode::parse(&stored).ok_or_else(
+                            || {
+                                Error::invariant(format!(
+                                    "task {} records unsupported security_contract_mode {stored:?}",
+                                    id.as_str()
+                                ))
+                            },
+                        )?;
+                    if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
+                        return Err(Error::invalid_authority(
+                            "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(Error::invariant(format!(
+                        "task {} records unknown agent_requirement_mode {other:?}",
+                        id.as_str()
+                    )))
+                }
             }
             Ok(())
         })

@@ -57,6 +57,7 @@ fn definition(
         matcher_kind: matcher,
         security_class: class,
         polarity,
+        policy_projection: None,
     }
 }
 
@@ -255,9 +256,9 @@ fn corrupt_json_only(path: &Path, table: &str, where_clause: &str, suffix: &str)
 }
 
 #[test]
-fn schema_version_is_eight() {
-    assert_eq!(SCHEMA_VERSION, 8);
-    assert_eq!(memory_kernel().schema_version().unwrap(), 8);
+fn schema_version_is_nine() {
+    assert_eq!(SCHEMA_VERSION, 9);
+    assert_eq!(memory_kernel().schema_version().unwrap(), 9);
 }
 
 #[test]

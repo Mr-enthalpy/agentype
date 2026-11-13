@@ -2033,6 +2033,42 @@ fn schema_v6_database_is_rejected_after_typed_tables() {
     );
 }
 
+/// Schema v8 (M6-B.4, without the M6-B.5 effective-security surface) is
+/// rejected at open: D-DB-MIGRATE is unresolved, so there is deliberately no
+/// v8->v9 upgrade. A v8 `sandbox_policy` reference is never reinterpreted as a
+/// v9 authored policy row.
+#[test]
+fn schema_v8_database_is_rejected_after_b5_security_surface() {
+    let db = FixtureDb::new("schema-v8-old");
+    {
+        let env = file_env(&db);
+        assert_eq!(env.k.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute("UPDATE schema_migrations SET version=8", [])
+        .unwrap();
+    // Drop the v9-only tables in foreign-key-safe order. The version gate
+    // rejects an old file before inspecting its physical shape.
+    conn.execute("DROP TABLE spawn_source_security_declarations", [])
+        .unwrap();
+    conn.execute("DROP TABLE agent_type_security_declarations", [])
+        .unwrap();
+    conn.execute("DROP TABLE sandbox_policy_revisions", [])
+        .unwrap();
+    drop(conn);
+
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1.0));
+    let err = match Kernel::open(&db.path, clock, 10.0, CONTINUITY_MAX_BYTES) {
+        Err(e) => e,
+        Ok(_) => panic!("schema v8 database must be rejected at open"),
+    };
+    assert!(
+        err.to_string()
+            .contains(&format!("does not match expected {SCHEMA_VERSION}")),
+        "the rejection must be the schema-version gate: {err:?}"
+    );
+}
+
 /// Schema v7 (M6-B.3 typed admission, no M6-B.4 provisioning bindings,
 /// binding snapshots or preparation-fault tables) is rejected at open:
 /// D-DB-MIGRATE is unresolved, so there is deliberately no v7->v8 upgrade.

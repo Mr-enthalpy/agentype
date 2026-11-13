@@ -27,32 +27,41 @@ mod predicates;
 mod provisioning;
 mod records;
 mod requirement;
+mod sandbox;
 mod selector;
 
 pub use canonical::{
     adapter_binding_policy_content_digest, agent_type_content_digest,
     binding_snapshot_content_digest, canonical_adapter_binding_policy_bytes,
     canonical_agent_type_bytes, canonical_binding_snapshot_bytes,
-    canonical_capability_definition_bytes, canonical_generation_policy_bytes,
+    canonical_capability_definition_bytes, canonical_capability_definition_bytes_v1,
+    canonical_capability_definition_bytes_v2, canonical_generation_policy_bytes,
     canonical_json_body_digest, canonical_provisioning_binding_bytes,
-    canonical_source_config_bytes, canonical_spawn_source_bytes,
-    canonical_task_agent_requirement_bytes, canonicalize_agent_type, canonicalize_capability_map,
-    canonicalize_claims, canonicalize_credential_refs, canonicalize_generation_policy,
-    canonicalize_source_config, canonicalize_spawn_source, canonicalize_task_agent_requirement,
-    capability_definition_content_digest, content_digest, credential_refs_digest,
-    generation_policy_content_digest, provisioning_binding_content_digest,
-    source_config_content_digest, spawn_source_content_digest,
+    canonical_required_access_bytes, canonical_sandbox_policy_bytes,
+    canonical_security_derivation_bytes, canonical_source_config_bytes,
+    canonical_spawn_source_bytes, canonical_task_agent_requirement_bytes, canonicalize_agent_type,
+    canonicalize_capability_map, canonicalize_claims, canonicalize_credential_refs,
+    canonicalize_generation_policy, canonicalize_source_config, canonicalize_spawn_source,
+    canonicalize_task_agent_requirement, capability_definition_content_digest, content_digest,
+    credential_refs_digest, generation_policy_content_digest, provisioning_binding_content_digest,
+    required_access_content_digest, sandbox_policy_content_digest,
+    security_derivation_content_digest, source_config_content_digest, spawn_source_content_digest,
     task_agent_requirement_content_digest, CANONICAL_FORMAT_VERSION,
 };
 pub use capability::{
     value_satisfies, value_within, Assurance, CapabilityCatalog, CapabilityClaim,
-    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, MatcherKind,
-    Quantity, SecurityClass,
+    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, FileOperationClass,
+    MatcherKind, NetworkEndpoint, NetworkTransport, PolicyAccessDimension, PolicyOperation,
+    PolicyProjection, Quantity, SecurityClass, CAPABILITY_DEFINITION_CANONICAL_VERSION_V1,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V2, MAX_CAPABILITY_DEFINITION_BYTES,
+    MAX_NETWORK_ENDPOINTS, MAX_NETWORK_HOST_LEN, MAX_POLICY_PROJECTION_MEMBERS,
+    MAX_POLICY_PROJECTION_TOKEN_LEN,
 };
 pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,
     binding_snapshot_from_canonical_json, capability_definition_from_canonical_json,
     generation_policy_from_canonical_json, provisioning_binding_from_canonical_json,
+    sandbox_policy_from_canonical_json, security_derivation_from_canonical_json,
     source_config_revision_from_canonical_json, spawn_source_from_canonical_json,
     task_agent_requirement_from_canonical_json,
 };
@@ -63,8 +72,9 @@ pub use ids::{
 };
 pub use matching::{match_existing_agents, ExistingAgentCandidate, TaskPlacement};
 pub use predicates::{
-    can_execute, can_provision, can_provision_task, is_valid_refinement, more_specific_for,
-    validate_source_config, validate_spawn_source,
+    can_execute, can_execute_security_v1, can_provision, can_provision_task, is_valid_refinement,
+    is_valid_refinement_with_policies, more_specific_for, validate_source_config,
+    validate_spawn_source,
 };
 pub use provisioning::{
     BindingSnapshot, MaterializationDigest, ProvisioningBinding, RESOLVER_VERSION,
@@ -78,6 +88,25 @@ pub use records::{
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, TaskRequirement,
 };
 pub use requirement::{
-    fold_generation_policy, AgentRequirementDraft, GenerationPolicy, TaskAgentRequirement,
+    fold_generation_policy, fold_generation_policy_security_v1, AgentRequirementDraft,
+    GenerationPolicy, TaskAgentRequirement,
+};
+pub use sandbox::{
+    check_required_access, is_within, meet, meet_optional_layer, project_capability_access,
+    project_network, project_security_contract, project_workspace, prove_no_wider,
+    task_coarse_authority, validate_agent_type_coarse_fine,
+    validate_capability_claims_against_policy, validate_effective_task_execution_modes,
+    validate_generation_coarse_fine, validate_task_local_coarse_fine, AccessDeficit,
+    CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnforcementProfileRef,
+    EnvironmentPolicy, FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot,
+    PathSelector, PathSet, PendingObligation, PolicyAccess, PolicyConflict, PolicyInput,
+    RequiredAccess, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
+    SandboxPolicyParts, SandboxPolicyVersion, SecurityContractMode, SecurityDerivation,
+    SpawnSourceSecurityDeclaration, TaskSecurityBinding, ToolPolicy, WorkingDirectory,
+    MAX_CREDENTIAL_FACET_MEMBERS, MAX_ENVIRONMENT_REQUIRED_VALUES, MAX_NAME_SET_MEMBERS,
+    MAX_PATH_COMPONENTS, MAX_PATH_COMPONENT_LEN, MAX_PATH_SELECTORS, MAX_PATH_SELECTORS_PER_POLICY,
+    MAX_POLICY_MAP_ENTRIES, MAX_SANDBOX_POLICY_BYTES, REQUIRED_ACCESS_SCHEMA_VERSION,
+    SANDBOX_POLICY_MEET_ALGORITHM_VERSION, SANDBOX_POLICY_NORMALIZATION_VERSION,
+    SANDBOX_POLICY_SCHEMA_VERSION,
 };
 pub use selector::{resolve_selector, AgentTypeSelector};

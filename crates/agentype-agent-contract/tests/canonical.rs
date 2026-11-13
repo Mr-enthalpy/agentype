@@ -318,6 +318,7 @@ fn golden_digest_vectors_are_stable() {
         matcher_kind: MatcherKind::Set,
         security_class: SecurityClass::Sandbox,
         polarity: CapabilityPolarity::Restriction,
+        policy_projection: None,
     };
     let mut agent = AgentType {
         type_ref: AgentTypeRef::new("general-reviewer", 1).unwrap(),
@@ -613,4 +614,287 @@ fn b4_binding_snapshot_canonical_round_trips() {
     assert_eq!(decoded, snapshot);
     assert_eq!(canonical_binding_snapshot_bytes(&decoded), bytes);
     assert!(binding_snapshot_content_digest(&snapshot).starts_with("sha256:"));
+}
+
+#[test]
+fn capability_policy_projection_uses_local_canonical_v2() {
+    let cases = [
+        (
+            PolicyAccessDimension::FileOperationClass,
+            "read",
+            PolicyOperation::FileOperation(FileOperationClass::Read),
+        ),
+        (
+            PolicyAccessDimension::ToolCommandSet,
+            "git",
+            PolicyOperation::ToolCommand("git".into()),
+        ),
+        (
+            PolicyAccessDimension::NetworkEndpoint,
+            "registry",
+            PolicyOperation::NetworkEndpoint(
+                NetworkEndpoint::new(NetworkTransport::Tcp, "registry.example.com", Some(443))
+                    .unwrap(),
+            ),
+        ),
+        (
+            PolicyAccessDimension::EnvironmentName,
+            "proxy",
+            PolicyOperation::EnvironmentName("HTTP_PROXY".into()),
+        ),
+    ];
+    for (dimension, member, operation) in cases {
+        let reference = cref("sandbox.dimension", 2);
+        let members = [(member.to_string(), operation)].into_iter().collect();
+        let definition = CapabilityDefinition {
+            matcher_kind: MatcherKind::Set,
+            security_class: SecurityClass::Sandbox,
+            polarity: CapabilityPolarity::Ability,
+            policy_projection: Some(PolicyProjection::new(dimension, members).unwrap()),
+        };
+        assert_eq!(definition.canonical_version(), 2);
+        let bytes = canonical_capability_definition_bytes(&reference, &definition);
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        assert!(json.contains("\"capability_canonical_version\":2"));
+        let (decoded_reference, decoded) =
+            capability_definition_from_canonical_json(&json).unwrap();
+        assert_eq!(decoded_reference, reference);
+        assert_eq!(decoded, definition);
+        assert_eq!(
+            canonical_capability_definition_bytes(&decoded_reference, &decoded),
+            bytes
+        );
+    }
+
+    // A definition without a projection keeps the frozen v1 document, and a v1
+    // document MUST NOT smuggle a projection past the decoder.
+    let reference = cref("sandbox.commands", 1);
+    let unprojected = CapabilityDefinition {
+        matcher_kind: MatcherKind::Set,
+        security_class: SecurityClass::Sandbox,
+        polarity: CapabilityPolarity::Ability,
+        policy_projection: None,
+    };
+    let v1 = canonical_capability_definition_bytes(&reference, &unprojected);
+    assert_eq!(
+        v1,
+        canonical_capability_definition_bytes_v1(&reference, &unprojected)
+    );
+    assert!(!String::from_utf8(v1)
+        .unwrap()
+        .contains("capability_canonical_version"));
+
+    let projected = CapabilityDefinition {
+        policy_projection: Some(
+            PolicyProjection::new(
+                PolicyAccessDimension::ToolCommandSet,
+                [(
+                    "git".to_string(),
+                    PolicyOperation::ToolCommand("git".into()),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+        ),
+        ..unprojected.clone()
+    };
+    let mut smuggled: serde_json::Value = serde_json::from_str(
+        &String::from_utf8(canonical_capability_definition_bytes_v2(
+            &reference, &projected,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    smuggled["capability_canonical_version"] = serde_json::json!(1);
+    assert!(capability_definition_from_canonical_json(&smuggled.to_string()).is_err());
+    assert_ne!(
+        capability_definition_content_digest(&reference, &projected),
+        capability_definition_content_digest(&reference, &unprojected)
+    );
+}
+
+#[test]
+fn sandbox_policy_canonical_round_trips_and_normalizes() {
+    let path = |components: &[&str]| PathSelector::workspace(components.iter().copied()).unwrap();
+    let credential_id = CredentialAuthorizationId::new("build", "service-token").unwrap();
+    let grant = CredentialGrant::new(
+        credential_id.clone(),
+        ["read".to_string()],
+        ["registry.example.com".to_string()],
+        [CredentialDeliveryMode::BrokeredAccess],
+    )
+    .unwrap();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(credential_id, grant);
+    let mut resources = BTreeMap::new();
+    resources.insert(
+        ResourceLimitName::new("max_open_files").unwrap(),
+        ResourceCeiling::new(ResourceScope::Process, ResourceUnit::Count, 1024),
+    );
+    let mut required_values = BTreeMap::new();
+    required_values.insert("HTTP_PROXY".to_string(), "http://proxy".to_string());
+
+    let policy = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            // `src` subsumes `src/lib`, and the workspace base subsumes both.
+            PathSet::allowed([path(&["src", "lib"]), path(&["src"]), path(&["tests"])]),
+            PathSet::any(),
+            PathSet::allowed([path(&["tools"])]),
+            PathSet::deny_all(),
+            PathSet::allowed([path(&["src"]), path(&[])]),
+        ),
+        tools: ToolPolicy::new(
+            NameSet::allowed(["git".to_string()]).unwrap(),
+            NameSet::any(),
+        ),
+        network: NetworkEndpointSet::allowed([
+            NetworkEndpoint::new(NetworkTransport::Any, "*", None).unwrap(),
+            NetworkEndpoint::new(NetworkTransport::Tcp, "registry.example.com", Some(443)).unwrap(),
+        ]),
+        environment: EnvironmentPolicy::new(
+            NameSet::allowed(["HTTP_PROXY".to_string()]).unwrap(),
+            required_values,
+        )
+        .unwrap(),
+        credentials,
+        resources,
+        working_directory: WorkingDirectory::Required(path(&["src"])),
+        attempt_isolation: true,
+    })
+    .unwrap();
+
+    // `Any` and an empty allowlist are opposite meanings, never the same state.
+    assert!(policy.files().write().is_any());
+    assert!(policy.files().delete().is_empty());
+    // A covering selector removes the selectors it subsumes.
+    assert_eq!(policy.files().read().selectors().unwrap().len(), 2);
+    assert_eq!(policy.files().visible().selectors().unwrap().len(), 1);
+    // An explicit universal rule is the same canonical value as `Any`.
+    assert!(policy.network().is_any());
+
+    let bytes = canonical_sandbox_policy_bytes(&policy);
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    let decoded = sandbox_policy_from_canonical_json(&json).unwrap();
+    assert_eq!(decoded, policy);
+    assert_eq!(canonical_sandbox_policy_bytes(&decoded), bytes);
+    assert_eq!(decoded.normalize().unwrap(), policy);
+    assert_eq!(
+        sandbox_policy_content_digest(&policy),
+        "sha256:4f03cced850a957bdbe8f40331fe81d03ca0952688d825f1f8e8a684168558ed"
+    );
+}
+
+#[test]
+fn sandbox_policy_decoder_rejects_malformed_documents() {
+    let policy = NormalizedSandboxPolicy::deny_all();
+    let json = String::from_utf8(canonical_sandbox_policy_bytes(&policy)).unwrap();
+    let base: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(sandbox_policy_from_canonical_json(&json).is_ok());
+
+    // Version and shape are part of the envelope.
+    let mut wrong_version = base.clone();
+    wrong_version["sandbox_policy_schema_version"] = serde_json::json!(2);
+    assert!(sandbox_policy_from_canonical_json(&wrong_version.to_string()).is_err());
+
+    let mut unknown_root = base.clone();
+    unknown_root["policy"]["files"]["read"] = serde_json::json!({
+        "kind": "ALLOWED",
+        "selectors": [{"root": "FILESYSTEM", "components": []}],
+    });
+    assert!(sandbox_policy_from_canonical_json(&unknown_root.to_string()).is_err());
+
+    let mut wildcard_component = base.clone();
+    wildcard_component["policy"]["files"]["write"] = serde_json::json!({
+        "kind": "ALLOWED",
+        "selectors": [{"root": "WORKSPACE", "components": ["src", "*.rs"]}],
+    });
+    assert!(sandbox_policy_from_canonical_json(&wildcard_component.to_string()).is_err());
+
+    let mut unknown_transport = base.clone();
+    unknown_transport["policy"]["network"] = serde_json::json!({
+        "kind": "ALLOWED",
+        "endpoints": [{"transport": "SCTP", "host": "example.com", "port": null}],
+    });
+    assert!(sandbox_policy_from_canonical_json(&unknown_transport.to_string()).is_err());
+
+    let mut unknown_kind = base.clone();
+    unknown_kind["policy"]["working_directory"] = serde_json::json!({"kind": "SOMEWHERE"});
+    assert!(sandbox_policy_from_canonical_json(&unknown_kind.to_string()).is_err());
+
+    // A credential grant may appear once per authorization id, and a resource
+    // ceiling once per limit name; a duplicate is corruption, not a set merge.
+    let grant = serde_json::json!({
+        "audience": ["registry.example.com"],
+        "delivery_modes": ["BROKERED_ACCESS"],
+        "id": {"namespace": "build", "reference": "service-token"},
+        "uses": ["read"],
+    });
+    let mut duplicate_credential = base.clone();
+    duplicate_credential["policy"]["credentials"] = serde_json::json!([grant.clone(), grant]);
+    assert!(sandbox_policy_from_canonical_json(&duplicate_credential.to_string()).is_err());
+
+    let ceiling = serde_json::json!({
+        "limit": 1024,
+        "name": "max_open_files",
+        "scope": "PROCESS",
+        "unit": "COUNT",
+    });
+    let mut duplicate_resource = base.clone();
+    duplicate_resource["policy"]["resources"] = serde_json::json!([ceiling.clone(), ceiling]);
+    assert!(sandbox_policy_from_canonical_json(&duplicate_resource.to_string()).is_err());
+
+    // A required environment name outside the allowed set is not a policy.
+    let mut unallowed_environment = base.clone();
+    unallowed_environment["policy"]["environment"] = serde_json::json!({
+        "allowed_names": {"kind": "ALLOWED", "names": []},
+        "required_values": {"HTTP_PROXY": "http://proxy"},
+    });
+    assert!(sandbox_policy_from_canonical_json(&unallowed_environment.to_string()).is_err());
+}
+
+#[test]
+fn policy_projection_rejects_excess_members() {
+    let members: BTreeMap<String, PolicyOperation> = (0..=MAX_POLICY_PROJECTION_MEMBERS)
+        .map(|index| {
+            (
+                format!("member{index}"),
+                PolicyOperation::EnvironmentName(format!("ENV_{index}")),
+            )
+        })
+        .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("members"), "{error}");
+}
+
+#[test]
+fn policy_projection_rejects_oversized_tokens() {
+    let oversized = "m".repeat(MAX_POLICY_PROJECTION_TOKEN_LEN + 1);
+    let members = [(
+        oversized.clone(),
+        PolicyOperation::EnvironmentName("PATH".into()),
+    )]
+    .into_iter()
+    .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("at most"), "{error}");
+
+    // The operation token is bounded independently of the member name.
+    let members = [(
+        "path".to_string(),
+        PolicyOperation::EnvironmentName(oversized),
+    )]
+    .into_iter()
+    .collect();
+    let error = PolicyProjection::new(PolicyAccessDimension::EnvironmentName, members).unwrap_err();
+    assert!(error.to_string().contains("at most"), "{error}");
+}
+
+#[test]
+fn capability_decoder_rejects_an_oversized_document() {
+    // The decoder MUST reject the budget before parsing or constructing any
+    // projection value, matching the publication-side whole-document limit.
+    let document = "x".repeat(MAX_CAPABILITY_DEFINITION_BYTES + 1);
+    let error = capability_definition_from_canonical_json(&document).unwrap_err();
+    assert!(error.to_string().contains("bytes"), "{error}");
 }
