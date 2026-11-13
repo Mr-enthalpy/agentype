@@ -1832,6 +1832,16 @@ fn validated_source_declaration(
                     input.policy_digest()
                 )));
             }
+            // A SpawnSource revision has no isolation guarantee field, so its
+            // policy MUST NOT introduce an unattributed guarantee. Isolation is
+            // carried only by the AgentType/Task/SourceRequirement fields that
+            // `I_required` composes; otherwise `P_eff.attempt_isolation = true`
+            // would have no requirement asking the execution to request it.
+            if policy.attempt_isolation() {
+                return Err(Error::invariant(
+                    "spawn source P_source policy cannot require attempt isolation; the requirement's guarantee is the only authority",
+                ));
+            }
             Ok((
                 Some(authored.id().as_str().to_string()),
                 Some(checked_i64(authored.revision(), "sandbox policy revision")?),

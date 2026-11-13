@@ -124,6 +124,26 @@ impl PathRoot {
     }
 }
 
+/// Maximum path depth of one selector. Deep enough for any workspace layout a
+/// tool can address, shallow enough that the number of selector prefixes stays
+/// bounded during meet and containment checks.
+pub const MAX_PATH_COMPONENTS: usize = 32;
+
+/// Maximum byte length of one path component. This is the common filesystem
+/// name limit; it also bounds the canonical selector size.
+pub const MAX_PATH_COMPONENT_LEN: usize = 255;
+
+/// Maximum number of selectors in one normalized path set. Path normalization
+/// removes covered selectors with a pairwise scan, so authored input is bounded
+/// by [`PathSet::try_allowed`] and the decoder before that scan; the policy
+/// boundary rechecks the normalized counts.
+pub const MAX_PATH_SELECTORS: usize = 256;
+
+/// Maximum number of selectors across the five path sets of one policy. The
+/// per-set bound alone would still let one policy carry five times the work;
+/// this aggregate bound keeps the whole authored policy finite.
+pub const MAX_PATH_SELECTORS_PER_POLICY: usize = 512;
+
 /// An anchored path prefix: the selector covers the path itself and every
 /// descendant. Components are exact names; wildcards are not part of v1.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -148,6 +168,14 @@ impl PathSelector {
                 Ok(component)
             })
             .collect::<Result<Vec<_>, ContractError>>()?;
+        if components.len() > MAX_PATH_COMPONENTS {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "path selector has {} components; at most {MAX_PATH_COMPONENTS} are allowed",
+                    components.len()
+                ),
+            });
+        }
         Ok(Self {
             root: PathRoot::Workspace,
             components,
@@ -174,6 +202,14 @@ fn validate_path_component(component: &str) -> Result<(), ContractError> {
     if component.is_empty() || component.trim() != component {
         return Err(ContractError::InvalidSandboxPolicy {
             reason: "path components must be non-empty and trimmed".into(),
+        });
+    }
+    if component.len() > MAX_PATH_COMPONENT_LEN {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "path component is {} bytes; at most {MAX_PATH_COMPONENT_LEN} are allowed",
+                component.len()
+            ),
         });
     }
     if component.contains('\0') || component.contains('/') || component.contains('\\') {
@@ -213,7 +249,35 @@ impl PathSet {
         Self::Allowed(BTreeSet::new())
     }
 
+    /// A finite allowed set bounded by [`MAX_PATH_SELECTORS`], normalized to a
+    /// minimal antichain of prefixes.
+    ///
+    /// Prefer this fallible constructor at every boundary that accepts authored
+    /// input: the count is checked *before* cover removal runs its pairwise scan.
+    /// [`PathSet::allowed`] remains the infallible convenience for trusted,
+    /// already-bounded callers.
+    pub fn try_allowed<I>(selectors: I) -> Result<Self, ContractError>
+    where
+        I: IntoIterator<Item = PathSelector>,
+    {
+        let selectors: Vec<PathSelector> = selectors.into_iter().collect();
+        if selectors.len() > MAX_PATH_SELECTORS {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "path set has {} selectors; at most {MAX_PATH_SELECTORS} are allowed",
+                    selectors.len()
+                ),
+            });
+        }
+        Ok(Self::allowed(selectors))
+    }
+
     /// A finite allowed set, normalized to a minimal antichain of prefixes.
+    ///
+    /// Cover removal is a pairwise scan. Authored input MUST go through
+    /// [`PathSet::try_allowed`] or the decode/policy boundaries, which enforce
+    /// [`MAX_PATH_SELECTORS`] before this scan; an oversized caller-built set is
+    /// also rejected by [`NormalizedSandboxPolicy::from_parts`].
     pub fn allowed<I>(selectors: I) -> Self
     where
         I: IntoIterator<Item = PathSelector>,
@@ -993,6 +1057,11 @@ impl NormalizedSandboxPolicy {
 }
 
 fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, ContractError> {
+    // Bound the authored per-set and aggregate selector counts before the
+    // downstream meet/containment normalization scans them again. The decode and
+    // `PathSet::try_allowed` boundaries reject an oversized raw set before its
+    // own pairwise cover removal.
+    validate_path_sets(&parts.files)?;
     let environment = EnvironmentPolicy::new(
         normalize_name_set(&parts.environment.allowed_names)?,
         parts.environment.required_values.clone(),
@@ -1068,7 +1137,42 @@ fn validate_network_endpoint_count(count: usize) -> Result<(), ContractError> {
     Ok(())
 }
 
+fn validate_path_sets(files: &FilePolicy) -> Result<(), ContractError> {
+    let sets = [
+        files.read(),
+        files.write(),
+        files.execute(),
+        files.delete(),
+        files.visible(),
+    ];
+    let mut total = 0usize;
+    for set in sets {
+        if let PathSet::Allowed(selectors) = set {
+            if selectors.len() > MAX_PATH_SELECTORS {
+                return Err(ContractError::InvalidSandboxPolicy {
+                    reason: format!(
+                        "path set has {} selectors; at most {MAX_PATH_SELECTORS} are allowed",
+                        selectors.len()
+                    ),
+                });
+            }
+            total += selectors.len();
+        }
+    }
+    if total > MAX_PATH_SELECTORS_PER_POLICY {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "policy has {total} path selectors; at most {MAX_PATH_SELECTORS_PER_POLICY} are allowed"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_parts(parts: &SandboxPolicyParts) -> Result<(), ContractError> {
+    // Post-normalization defense in depth; the raw-set bound above rejects a
+    // wider authored policy before the pairwise cover scan.
+    validate_path_sets(&parts.files)?;
     if let Some(endpoints) = parts.network.endpoints() {
         validate_network_endpoint_count(endpoints.len())?;
     }
@@ -2156,12 +2260,14 @@ pub fn validate_agent_type_coarse_fine(
 }
 
 /// Prove that a `SECURITY_V1` Generation ceiling is exactly the projection of
-/// its authored policy and that the policy entails its isolation guarantee
-/// (ADR-0013 §3).
+/// its authored policy (ADR-0013 §3).
 ///
 /// A Generation is a maximum-authority ceiling, so both coarse modes must equal
-/// the policy projection rather than merely bound it. Isolation is a monotone
-/// guarantee: a Generation that requires isolation must author it in the policy.
+/// the policy projection rather than merely bound it. The isolation bit has one
+/// authority, `requires_attempt_isolation`: a generation that requires isolation
+/// must author it, and a policy that authors isolation must declare the
+/// guarantee. Anything else would leave `P_eff.attempt_isolation = true` with no
+/// requirement that asks a committed execution to request isolation.
 pub fn validate_generation_coarse_fine(
     max_workspace: WorkspaceMode,
     max_network: NetworkPolicy,
@@ -2178,12 +2284,15 @@ pub fn validate_generation_coarse_fine(
             "generation network ceiling does not equal its authored policy projection",
         ));
     }
-    if requires_attempt_isolation && !policy.attempt_isolation() {
-        return Err(conflict(
+    match (requires_attempt_isolation, policy.attempt_isolation()) {
+        (true, false) => Err(conflict(
             "generation requires attempt isolation but its authored policy does not entail it",
-        ));
+        )),
+        (false, true) => Err(conflict(
+            "generation authored policy requires attempt isolation but the generation does not declare the guarantee",
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Prove that a Task's coarse fields and its optional fine policy agree before
@@ -2267,6 +2376,44 @@ pub fn validate_effective_task_execution_modes(
         _ => {}
     }
     Ok(())
+}
+
+/// The Task's coarse-constrained authority for admission checks (ADR-0013 §3,
+/// §5).
+///
+/// `P_task` is the coarse workspace/network term intersected with the optional
+/// fine policy, so the authority admission may rely on is
+/// `meet(P_generation, P_task)`. A `ReadOnly` Task removes every write region and
+/// a `Disabled` Task removes every endpoint, even when the fine layer still shows
+/// them; the fine-derived meet remains the durable `TaskSecurityBinding` identity.
+///
+/// Checking the fine layer alone is wrong in both directions. It accepts a
+/// `ReadOnly` Task whose required capability projects to `Write`, and it rejects
+/// a legal `ReadOnly` Task because unrelated Generation write paths make the fine
+/// layer look wider than a read-only AgentType.
+///
+/// This is a pure narrowing: it only replaces the constrained dimensions, so the
+/// credential, tool, environment and resource grants of the meet are preserved.
+pub fn task_coarse_authority(
+    policy: &NormalizedSandboxPolicy,
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+) -> Result<NormalizedSandboxPolicy, ContractError> {
+    let mut parts = policy.parts().clone();
+    if workspace == WorkspaceMode::ReadOnly {
+        let files = parts.files;
+        parts.files = FilePolicy::new(
+            files.read().clone(),
+            PathSet::deny_all(),
+            files.execute().clone(),
+            files.delete().clone(),
+            files.visible().clone(),
+        );
+    }
+    if network == NetworkPolicy::Disabled {
+        parts.network = NetworkEndpointSet::deny_all();
+    }
+    NormalizedSandboxPolicy::from_parts(parts)
 }
 
 /// Meet an optional authored layer onto a base policy.

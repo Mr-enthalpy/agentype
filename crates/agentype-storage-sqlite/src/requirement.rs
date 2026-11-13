@@ -23,12 +23,12 @@ use agentype_agent_contract::{
     sandbox_policy_content_digest, sandbox_policy_from_canonical_json,
     security_derivation_content_digest, security_derivation_from_canonical_json,
     task_agent_requirement_content_digest, task_agent_requirement_from_canonical_json,
-    validate_effective_task_execution_modes, validate_generation_coarse_fine,
-    validate_task_local_coarse_fine, AgentRequirementDraft, AgentTypeRef, AgentTypeSelector,
-    CapabilityCatalog, ContinuityMode, ExistingAgentCandidate, GenerationPolicy,
-    NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput, RequiredAccess,
-    SandboxPolicyRef, SecurityContractMode, SecurityDerivation, TaskAgentRequirement,
-    TaskPlacement, TaskSecurityBinding,
+    task_coarse_authority, validate_effective_task_execution_modes,
+    validate_generation_coarse_fine, validate_task_local_coarse_fine, AgentRequirementDraft,
+    AgentTypeRef, AgentTypeSelector, CapabilityCatalog, ContinuityMode, ExistingAgentCandidate,
+    GenerationPolicy, NormalizedSandboxPolicy, PendingObligation, PolicyAccess, PolicyInput,
+    RequiredAccess, SandboxPolicyRef, SecurityContractMode, SecurityDerivation,
+    TaskAgentRequirement, TaskPlacement, TaskSecurityBinding,
 };
 use agentype_core::{
     ContinuityPreference, Error, GenerationId, InformationFunction, LogicalAgentId, PartitionId,
@@ -664,10 +664,20 @@ fn validate_pinned_type_can_execute(
                         agent_reference.revision()
                     ))
                 })?;
+            // The pinned type must bound the complete Task authority, not the
+            // fine layer alone: a `ReadOnly` Task contributes no write even when
+            // the Generation does, so comparing the unconstrained meet would
+            // reject a legal Task.
+            let task_authority = task_coarse_authority(
+                &resolved.effective,
+                requirement.hard.required_workspace,
+                requirement.hard.required_network,
+            )
+            .map_err(contract_fault)?;
             can_execute_security_v1(
                 &agent_type,
                 &requirement.hard,
-                &resolved.effective,
+                &task_authority,
                 &agent_policy,
                 &catalog,
             )
@@ -1317,8 +1327,9 @@ fn pending_obligations_from_json(json: &str) -> Result<BTreeSet<PendingObligatio
 /// explicit top, which would erase credential grants), and the binding remains
 /// `P_generation`.
 ///
-/// Admission then proves `RequiredAccess ⊆ ProjectAccess(P_eff)`; every
-/// deferred component is recorded as pending rather than assumed satisfied.
+/// Admission then proves `RequiredAccess ⊆ ProjectAccess(meet(P_eff, coarse))`,
+/// where `coarse` is the durable Task workspace/network ceiling; every deferred
+/// component is recorded as pending rather than assumed satisfied.
 pub fn prepare_task_security_binding(
     tx: &Transaction<'_>,
     generation_id: &GenerationId,
@@ -1340,6 +1351,20 @@ pub fn prepare_task_security_binding(
             "task coarse fields contradict its authored sandbox policy: {error}"
         ))
     })?;
+
+    // Isolation has one authority, the Task guarantee. A fine layer may repeat a
+    // requirement the Task already carries, but it MUST NOT introduce a guarantee
+    // that no requirement asks a committed execution to honor.
+    if resolved
+        .task_authored
+        .as_ref()
+        .is_some_and(NormalizedSandboxPolicy::attempt_isolation)
+        && !requirement.hard.required_attempt_isolation
+    {
+        return Err(Error::invalid_authority(
+            "task authored policy requires attempt isolation but the task does not declare the guarantee",
+        ));
+    }
 
     let mut inputs = vec![PolicyInput::authored(
         resolved.generation_reference.clone(),
@@ -1372,13 +1397,25 @@ pub fn prepare_task_security_binding(
 
     let catalog = load_capability_catalog(tx)?;
     let required_access = required_access_for(requirement, &catalog)?;
-    check_required_access(&required_access, &PolicyAccess::from_policy(&effective)).map_err(
-        |deficit| {
-            Error::invalid_authority(format!(
-                "SECURITY_V1 task required access is not satisfied by its admitted policy: {deficit}"
-            ))
-        },
-    )?;
+    // `RequiredAccess` is a positive floor, so it MUST be judged against the
+    // coarse-constrained Task authority. The fine layer alone still shows write
+    // paths under a `ReadOnly` Task and endpoints under a `Disabled` Task, which
+    // would accept a contract whose own coarse ceiling contradicts its floor.
+    let task_authority = task_coarse_authority(
+        &effective,
+        requirement.hard.required_workspace,
+        requirement.hard.required_network,
+    )
+    .map_err(contract_fault)?;
+    check_required_access(
+        &required_access,
+        &PolicyAccess::from_policy(&task_authority),
+    )
+    .map_err(|deficit| {
+        Error::invalid_authority(format!(
+            "SECURITY_V1 task required access is not satisfied by its admitted policy: {deficit}"
+        ))
+    })?;
 
     let derivation =
         SecurityDerivation::new(inputs, &effective, &required_access).map_err(contract_fault)?;

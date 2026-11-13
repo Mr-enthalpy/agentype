@@ -36,7 +36,7 @@ use crate::sandbox::{
     CredentialAuthorizationId, CredentialDeliveryMode, CredentialGrant, EnvironmentPolicy,
     FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector,
     PathSet, PolicyInput, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
-    SandboxPolicyParts, SecurityDerivation, ToolPolicy, WorkingDirectory,
+    SandboxPolicyParts, SecurityDerivation, ToolPolicy, WorkingDirectory, MAX_PATH_SELECTORS,
     SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{
@@ -730,6 +730,11 @@ fn path_set_from(value: &Value) -> Result<PathSet, ContractError> {
         "ALLOWED" => {
             let mut selectors = Vec::new();
             for item in array(field(document, "selectors")?, "sandbox path selectors")? {
+                if selectors.len() == MAX_PATH_SELECTORS {
+                    return Err(err(format!(
+                        "sandbox path set exceeds the {MAX_PATH_SELECTORS}-selector bound"
+                    )));
+                }
                 selectors.push(path_selector_from(item)?);
             }
             Ok(PathSet::allowed(selectors))
