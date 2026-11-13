@@ -1,7 +1,8 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 2 (2026-11-14) — records the independent re-audit of revision 1
+Revision: 3 (2026-11-14) — records the P2-3 decision: the durable-block
+idempotence claim is narrowed, not implemented as a history table
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`)
 Date: 2026-11-14
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
@@ -33,12 +34,18 @@ requirement on the complete effective policy.
 | Revision | Head | Change |
 |---|---|---|
 | 1 | `d14137f` | First audit record over `c0497eb..d3ab482`; docs-only. |
-| 2 | this commit | Records the independent re-audit: two revision-1 claims corrected, five findings added, B5.1 handoff table added. Still docs-only; no code, ADR, spec or index change. |
+| 2 | `a8117fc` | Records the independent re-audit: two revision-1 claims corrected, five findings added, B5.1 handoff table added. Still docs-only; no code, ADR, spec or index change. |
+| 3 | this commit | Records the P2-3 decision: ADR-0014 §4 and this record state that durable-block idempotence is scoped to the currently stored condition, instead of adding a per-condition history table. Docs-only; no code, schema, ADR `Status:` line, spec or index change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
 close it, so the follow-up code pull requests can be reviewed against the same
 statements.
+
+Revision 3 resolves exactly one finding, and it resolves it by narrowing the
+claim rather than changing the encoding: P2-3. P1-1 and P1-2 have proposed fixes
+in PR #31, which was open and unmerged when this revision was written; this
+record does not count an unmerged fix as closure.
 
 ## Why this record exists
 
@@ -46,7 +53,8 @@ B5.2 was delivered as two merged pull requests without a milestone closure
 report. That is enough to read the diff, but not enough to audit it: a reviewer
 needs a single page that says which normative sentence each function implements,
 which test fails if that sentence is broken, and which fences were checked. This
-record is that page. It is deliberately additive: no code, ADR status, spec
+record is that page. Apart from the revision-3 wording correction to ADR-0014 §4
+recorded below, it is deliberately additive: no code, ADR `Status:` line, spec
 status, or index entry changes in the same change.
 
 This record does **not** claim:
@@ -103,7 +111,7 @@ current build: while acquisition rejects `SECURITY_V1`, all of them are latent.
 | P1-2 | P1 | The "default build cannot mint an imported profile" claim is false, and public-API probe 31 cannot prove it | Using the record as a B5.4 gate input |
 | P2-1 | P2 | The compiler never checks that the profile was imported for this binding or that it covers the executing subject | Trustworthy `SECURITY_V1` evidence |
 | P2-2 | P2 | A credential *authorization* is treated as a credential *delivery* obligation | Correctness of candidate rejection (over-rejection) |
-| P2-3 | P2 | Durable-block idempotence holds only for the single stored condition, not across history | The ADR-0014 §4 statement the report quotes |
+| P2-3 | P2 | Durable-block idempotence holds only for the single stored condition, not across history | The ADR-0014 §4 statement the report quotes (**closed in revision 3 by narrowing the ADR**) |
 | P2-4 | P2 | Candidate preselection is implemented, but acquisition qualification is not wired (the fourth B5.1 handoff item) | Declaring B5.2 complete |
 
 ### P1-1 — the positive access floor is not re-proved on `P_eff`
@@ -302,13 +310,24 @@ condition A  -> BLOCKED (B's row replaced; the RELEASED A is gone)
 ```
 
 Revision 1's wording — "re-recording is a no-op even after release" — is true
-only for the condition currently stored. Two resolutions are acceptable, but one
-must be chosen explicitly: keep per-condition immutable history plus a current
-pointer, or narrow the ADR-0014 §4 sentence and this record to "the currently
-stored condition is never reopened". Regression test: `A → release A → B → A`.
+only for the condition currently stored. Two resolutions were acceptable: keep
+per-condition immutable history plus a current pointer, or narrow the ADR-0014 §4
+sentence and this record to "the currently stored condition is never reopened".
 
-**Status.** Open; documentation-only narrowing would need an ADR edit and is not
-part of this record.
+**Resolved by narrowing (revision 3).** ADR-0014 §4 now states the rule in the
+narrow form: a Task holds one diagnostic whose identity is the currently stored
+condition, a stored released condition cannot resurrect itself, and the encoding
+promises no cross-history idempotence. The `A → release A → B → A` sequence above
+is therefore **specified behaviour, not a defect**: re-observing A after B
+replaced it starts a new `BLOCKED` diagnostic and is not a retry of the released
+A. No history table, schema bump or code change was added: the narrowed rule is
+now specified, and the diagnostic still has no production writer.
+
+**Status.** Closed by this revision, as a specification narrowing. The existing
+`b5_acquisition_block::a_released_condition_is_never_reopened` test already pins
+the stored-row rule, so no new regression is owed by this decision. If the
+diagnostic ever gains a production writer, the `A → release A → B → A` sequence
+should be pinned by a test so the narrowed semantics cannot drift back.
 
 ### P2-4 — preselection is done, acquisition qualification is not
 
@@ -385,7 +404,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | Claim | Code | Test | Commit |
 |---|---|---|---|
 | A Task holds **one current** diagnostic; an indistinguishable condition is a no-op, a different condition replaces the row and restarts `BLOCKED` **(rev 2: scope corrected)** | `security_acquisition.rs` `record_security_acquisition_block`; `schema.rs` `task_id PRIMARY KEY` | `b5_acquisition_block::one_condition_is_one_durable_diagnostic` | `5f644b4` |
-| Re-recording the **currently stored** condition is a no-op even after release; an earlier released condition that is no longer stored can be reopened **(rev 2)** | trigger `..._no_same_condition_reopen` compares only `OLD`/`NEW` | `b5_acquisition_block::a_released_condition_is_never_reopened` covers the stored case only | `5f644b4` (P2-3) |
+| Re-recording the **currently stored** condition is a no-op even after release; an earlier released condition that is no longer stored can be reopened **(rev 2; ADR-0014 §4 states this scope in rev 3)** | trigger `..._no_same_condition_reopen` compares only `OLD`/`NEW` | `b5_acquisition_block::a_released_condition_is_never_reopened` covers the stored case only | `5f644b4` (P2-3) |
 | `RELEASED` requires both release fields; `BLOCKED` forbids them | `schema.rs` table `CHECK`; `SecurityAcquisitionBlock::from_durable_parts` | `b5_enforcement::a_durable_block_row_cannot_have_inconsistent_release_fields`, `b5_acquisition_block::a_release_timestamp_must_be_a_real_instant` | `5f644b4` |
 | Release is final: release identity and time cannot change | trigger `..._release_is_final` | `b5_enforcement::a_block_is_released_only_by_operator_action_or_configuration_change` | `5f644b4` |
 | Rows are released, never deleted; a raw writer cannot delete or reopen the stored condition | triggers `..._immutable_delete`, `..._no_same_condition_reopen` | `b5_acquisition_block::the_durable_row_cannot_be_deleted_or_reopened_by_a_raw_writer` | `5f644b4` |
@@ -472,8 +491,8 @@ resolved.
    `(adapter_kind, binding_key)` should carry the expected adapter policy.
 2. **The durable block is not wired.** `record_security_acquisition_block` has
    no production caller, so today a budget defer leaves no durable trace unless
-   a test writes one. Its stated history property is also narrower than revision
-   1 claimed (P2-3).
+   a test writes one. Its stated history property is narrower than revision 1
+   claimed (P2-3); revision 3 narrows ADR-0014 §4 to match it.
 3. **`budget_limit` records one limit.** If a round exceeds both the candidate
    and compile budgets, `require_whole_round` reports `CANDIDATE_COUNT`. This is
    deterministic and documented here so it is not mistaken for a missing field;
@@ -506,7 +525,6 @@ cargo test -p agentype-public-api-boundary
 ```
 
 Measured at revision 1's head (a docs-only change on top of `d3ab482`):
-
 | Command | Result |
 |---|---|
 | `cargo fmt --all --check` | pass |
@@ -524,8 +542,14 @@ read-only checks that produced the findings:
 | Repository-wide content search for `check_required_access`, `covers_subject`, `is_inside_proven_domain`, `qualify_security_candidate` callers | as stated in P1-1, P2-1, P2-4 |
 | Repository-wide content search for the `credential` derivation and `PolicyAccess::from_policy` | as stated in P2-2 |
 
+Revision 3 is also docs-only and re-runs none of these commands. It changes one
+ADR sentence and this record; no code, schema or test changed.
+
 The revision-1 suite result remains a record of that run. It is not re-attested
-by revision 2, and the re-auditor did not independently re-run it either.
+by revision 2 or 3, and the re-auditor did not independently re-run it either.
+Once PR #31 lands, the workspace command above also excludes a second fixture,
+`agentype-public-api-contract-only`, for the same reason as
+`agentype-public-api-boundary`.
 
 The workspace suite includes the following new test modules, all green at
 revision 1:
@@ -554,11 +578,13 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility |
 | 3 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives |
 | 4 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
-| 5 | Decide durable-block history semantics (P2-3) | `A → release A → B → A` regression, or narrowed ADR sentence |
+| 5 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1` |
 
-Items 1–5 are code changes and belong in follow-up pull requests, not in this
-docs-only record. This record is what those pull requests are reviewed against.
+Items 1–4 are code changes and belong in follow-up pull requests, not in this
+docs-only record. Item 5 was a design decision and is settled in revision 3 by
+narrowing the ADR rather than by adding history. This record is what those pull
+requests are reviewed against.
 
 ## Evidence index
 

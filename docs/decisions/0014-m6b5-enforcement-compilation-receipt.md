@@ -182,16 +182,21 @@ created_at, released_at, release_reason
 ```
 
 The row is owned by the acquisition control plane, not by runtime-local
-`TypedDispatchState.cooldowns`, so it survives restart. Its identity is the
-condition, not the round: the same `(candidate_domain_digest,
-binding_profile_digest)` pair MUST remain one row. Re-observing it is a no-op —
-including after release, so a released condition cannot resurrect itself. A
-different condition replaces the diagnostic fields and starts `BLOCKED` again;
-that is a new diagnostic, not a retry of the released one. `RELEASED` requires
-both release fields, `BLOCKED` forbids them, and the release identity and time are
-final once written. Rows are released, never deleted, and the parent rule admits
-only a `SECURITY_V1` Task, because the coarse typed path has no compiled
-candidate round to defer.
+`TypedDispatchState.cooldowns`, so it survives restart. A Task holds exactly one
+diagnostic, and its identity is the **currently stored** condition, not the
+round: while a condition occupies the row, the same `(candidate_domain_digest,
+binding_profile_digest)` pair MUST remain one row. Re-observing the stored
+condition is a no-op — including after release, so a released condition cannot
+resurrect itself while it is the stored row. A different condition replaces the
+diagnostic fields and starts `BLOCKED` again; that is a new diagnostic, not a
+retry of the released one, and the replaced condition is not retained as history.
+This encoding therefore promises no cross-history idempotence: re-observing a
+condition that an intervening condition replaced starts a new `BLOCKED`
+diagnostic and MUST NOT be read as reopening the earlier released one. `RELEASED`
+requires both release fields, `BLOCKED` forbids them, and the release identity
+and time are final for the stored row once written. Rows are released, never
+deleted, and the parent rule admits only a `SECURITY_V1` Task, because the coarse
+typed path has no compiled candidate round to defer.
 
 The schema is fresh-only: version 10 rejects a v9 file at open under the existing
 D-DB-MIGRATE rule, and there is no in-place migration and no backfill of a
