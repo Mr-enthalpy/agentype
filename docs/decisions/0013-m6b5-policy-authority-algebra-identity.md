@@ -515,7 +515,7 @@ not sufficient:
 |---|---|
 | allowed file operations and path ranges | set intersection per operation class |
 | hidden/prohibited ranges | keep common restrictions; normalize to equivalent allowed/prohibited regions; visibility is an independent observability dimension, not an operation precondition (see §7) |
-| tools, commands | allowed-set intersection |
+| tools, commands | intersect the effective `ToolCommandSet` union (see §7) |
 | network endpoints/protocols/ports | meet in that dimension |
 | environment variables | allowed-name intersection; conflicting required values reject |
 | credential scope | refs, use, delivery mode and audience all narrow; an omitted grant in the AgentType ceiling is empty, not `Top`, and other ceilings can only narrow |
@@ -680,10 +680,47 @@ a representable policy remains admissible.
 
 This collapse is part of defining the initial policy canonical, not a
 reinterpretation of durable data: B5.1 is the first build to write policy rows,
-and the pinned `(canonical_version, algebra_version) = (1, 1)` golden vectors are
-unchanged because none contains the explicit universal rule. A post-B5.1 change
-to these bytes MUST bump `SANDBOX_POLICY_SCHEMA_VERSION` and add new vectors
-rather than let an existing digest mean something new.
+and the pinned `(canonical_version, algebra_version) = (1, 1)` golden vectors
+are defined by this initial canonical. No vector keeps a second spelling of the
+explicit universal rule. A post-B5.1 change to these bytes MUST bump
+`SANDBOX_POLICY_SCHEMA_VERSION` and add new vectors rather than let an existing
+digest mean something new.
+
+The containment predicate `network_allowed_union_within` uses the same finite
+partition. If the two sets together name `H` distinct exact hosts and `P`
+distinct exact ports, the partition has `2 · (H + 1) · (P + 1)` atoms. The
+per-set bound limits each side to 256 rules, so across one comparison `H ≤ 512`
+and `P ≤ 512`: at most `2 · 513 · 513 ≈ 526,338` atoms. The predicate marks the
+outer union once and then requires every atom an inner rule covers to be marked.
+Each rule first projects to the host and port atoms it covers, so an exact-port
+rule touches one port column per covered host instead of rescanning every port
+atom to reject it. The cost is bounded by the input grammar, and a 256 × 256
+adversarial regression pins it. This is pure in-transaction policy evaluation;
+B5.1 does not add a separate wall-clock admission budget.
+
+#### Network canonical identity is deterministic but not union-minimal
+
+The v1 canonical form is deterministic for a given rule syntax: the same
+endpoint array always normalizes to the same rule set, bytes and digest. It is
+not a complete union-minimal form. A rule covered only by the *union* of several
+other rules is retained, because removing it would require canonicalizing the
+whole wildcard product. For example
+
+```text
+A = TCP:*:* ∪ UDP:*:443
+B = TCP:*:* ∪ ANY:*:443
+```
+
+permit exactly the same operations, because `TCP:*:*` already contains the TCP
+part of `ANY:*:443`. `is_within` proves `A ⪯ B` and `B ⪯ A`, and `meet` handles
+them correctly, but `A` and `B` keep different canonical bytes and digests.
+
+This is a documented limitation of the initial canonical, not a permission
+difference. B5.2/B5.4 MUST compare policy authority with `is_within` (or with
+the normalized meet result), never by digest equality. A future canonical that
+collapses semantic unions MUST bump `SANDBOX_POLICY_SCHEMA_VERSION` and add new
+golden vectors; it MUST NOT silently change the identity of already-published
+policies.
 
 #### v1 path bounds
 
@@ -722,12 +759,36 @@ accepted policy, and relaxing them requires an explicit version decision.
 
 The v1 projection dimension is `ToolCommandSet`, not separate `Tool` and
 `Command` operations. A policy stores two authoring allowlists, `tools` and
-`commands`, but `PolicyAccess::allows_tool_or_command` and the capability
-projection use their union as one abstract operation namespace: a required
-operation named `"git"` is satisfied by `tools = {"git"}`, by
-`commands = {"git"}`, or by both. v1 does not distinguish a tool invocation from
-a command invocation that share a name, and it does not promise that a physical
-compiler can enforce that distinction.
+`commands`, but they do not grant two independent capabilities. The effective
+`ToolCommandSet` is their union: a required operation named `"git"` is satisfied
+by `tools = {"git"}`, by `commands = {"git"}`, or by both. v1 does not
+distinguish a tool invocation from a command invocation that share a name, and
+it does not promise that a physical compiler can enforce that distinction.
+
+Because the union is the authority, normalization MUST give that union one
+canonical spelling: the union of the two finite sets is stored in `tools` and
+`commands` is explicit deny-all. If either field is `Any`, the whole namespace is
+authorized, so both fields remain `Any`. Consequently
+
+```text
+{tools: {git}, commands: {}}  ==  {tools: {}, commands: {git}}
+                              ==  {tools: {git}, commands: {git}}
+```
+
+as values, canonical bytes and content digests. `meet` and `is_within` operate on
+this same effective union, so `{tools: {git}, commands: {}}` and
+`{tools: {}, commands: {git}}` are mutually within and their meet still allows
+`"git"`. Intersecting the two storage fields separately would violate the
+greatest-lower-bound property and make `PolicyAccess` disagree with the ordering.
+
+Because the canonical union is one allowed-name set, the 256-member bound of
+§7 applies to the union itself: an authored pair whose combined distinct names
+exceed it is rejected at construction rather than split across two fields.
+
+This canonical spelling is part of the initial B5.1 policy canonical, not a
+reinterpretation of durable data: B5.1 is the first build to write policy rows.
+Any later change to how the union is spelled MUST bump
+`SANDBOX_POLICY_SCHEMA_VERSION` and add new golden vectors.
 
 If B5.2/B5.4 need different enforceability guarantees for tool and command
 invocation, that requires a new policy canonical/schema version and separate
