@@ -277,6 +277,19 @@ fn publish_reading_type(kernel: &Kernel) -> AgentTypeRef {
     agent.type_ref
 }
 
+/// Publish a `SECURITY_V1` AgentType whose authored policy is the given exact
+/// revision, so admission can compare the Task's effective policy against it.
+fn publish_secure_reading_type(kernel: &Kernel, reference: SandboxPolicyRef) -> AgentTypeRef {
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert(read_capability(), read_value());
+    let mut agent = agent_type("secure-reader", capabilities);
+    agent.contract.sandbox_policy = Some(reference);
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent.type_ref
+}
+
 fn generation_policy(
     reference: Option<SandboxPolicyRef>,
     max_workspace: WorkspaceMode,
@@ -698,6 +711,135 @@ fn a_narrower_task_policy_is_a_legal_layering_not_a_conflict() {
         .expect("a SECURITY_V1 task has a binding");
     // The effective policy is the real meet of both authored revisions.
     assert_eq!(binding.policy(), &narrower);
+}
+
+/// Build a policy with the same `ReadOnly`/`Restricted` projection as
+/// [`read_only_workspace_policy`] but whose readable prefix is strictly narrower.
+fn workspace_src_read_only_policy() -> NormalizedSandboxPolicy {
+    NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::allowed([PathSelector::workspace(["src"]).unwrap()]),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        tools: ToolPolicy::top(),
+        network: restricted_network(),
+        environment: EnvironmentPolicy::top(),
+        credentials: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        working_directory: WorkingDirectory::Any,
+        attempt_isolation: false,
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_security_v1_agent_type_admits_a_narrower_task_policy_in_another_revision() {
+    let kernel = memory_kernel();
+    publish_read_capability(&kernel);
+    // AgentType, Generation and Task each pin a different authored revision. The
+    // Task revision is strictly narrower, so the old exact-reference predicate
+    // would reject a legal narrowing. The mode-aware predicate must accept it.
+    let agent_reference = policy_ref("agent-policy", 1);
+    let generation_reference = policy_ref("generation-policy", 1);
+    let task_reference = policy_ref("task-policy", 1);
+    kernel
+        .publish_sandbox_policy(&agent_reference, &read_only_workspace_policy())
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&generation_reference, &read_only_workspace_policy())
+        .unwrap();
+    let narrower = workspace_src_read_only_policy();
+    kernel
+        .publish_sandbox_policy(&task_reference, &narrower)
+        .unwrap();
+
+    let pin = publish_secure_reading_type(&kernel, agent_reference);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    let mut layered = draft(pin, BTreeMap::new());
+    layered.sandbox_policy = Some(task_reference);
+    let task_id = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let binding = kernel
+        .get_task_security_binding(&task_id)
+        .unwrap()
+        .expect("a SECURITY_V1 task has a binding");
+    assert_eq!(binding.policy(), &narrower);
+}
+
+#[test]
+fn a_task_policy_wider_than_the_security_v1_agent_type_is_rejected() {
+    let kernel = memory_kernel();
+    publish_read_capability(&kernel);
+    // The AgentType authors the narrower ceiling. The Generation and Task author
+    // a wider policy that still stays inside the Generation coarse fields, so
+    // only the policy order between the effective Task policy and the pinned
+    // AgentType policy can reject it.
+    let agent_reference = policy_ref("agent-policy", 1);
+    let generation_reference = policy_ref("generation-policy", 1);
+    let task_reference = policy_ref("task-policy", 1);
+    kernel
+        .publish_sandbox_policy(&agent_reference, &workspace_src_read_only_policy())
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&generation_reference, &read_only_workspace_policy())
+        .unwrap();
+    kernel
+        .publish_sandbox_policy(&task_reference, &read_only_workspace_policy())
+        .unwrap();
+
+    let pin = publish_secure_reading_type(&kernel, agent_reference);
+    let generation = kernel
+        .create_generation_with_security_mode(
+            json!({}),
+            Some(generation_policy(
+                Some(generation_reference),
+                WorkspaceMode::ReadOnly,
+                NetworkPolicy::Restricted,
+            )),
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap();
+    let proposal = compile_proposal(&kernel, &generation.generation_id, task_spec());
+
+    let mut layered = draft(pin, BTreeMap::new());
+    layered.sandbox_policy = Some(task_reference);
+    let error = kernel
+        .admit_typed_proposal_with_security_mode(
+            &proposal.proposal_id,
+            0,
+            None,
+            layered,
+            SecurityContractMode::SecurityV1,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wider than the pinned agent type"),
+        "{error}"
+    );
 }
 
 #[test]

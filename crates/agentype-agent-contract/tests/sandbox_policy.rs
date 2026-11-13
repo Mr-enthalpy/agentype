@@ -601,6 +601,54 @@ fn security_contract_mode_spellings_are_stable() {
 }
 
 #[test]
+fn unusable_credential_grants_normalize_to_absence() {
+    let id = CredentialAuthorizationId::new("build", "service").unwrap();
+    let unusable = [
+        CredentialGrant::new(
+            id.clone(),
+            Vec::<String>::new(),
+            ["worker".to_string()],
+            [CredentialDeliveryMode::BrokeredAccess],
+        )
+        .unwrap(),
+        CredentialGrant::new(
+            id.clone(),
+            ["read".to_string()],
+            Vec::<String>::new(),
+            [CredentialDeliveryMode::BrokeredAccess],
+        )
+        .unwrap(),
+        CredentialGrant::new(
+            id.clone(),
+            ["read".to_string()],
+            ["worker".to_string()],
+            Vec::<CredentialDeliveryMode>::new(),
+        )
+        .unwrap(),
+    ];
+    let bare = simple_policy();
+    for grant in unusable {
+        assert!(!grant.is_usable());
+        let mut parts = bare.parts().clone();
+        parts.credentials = BTreeMap::from([(id.clone(), grant)]);
+        let with_grant = NormalizedSandboxPolicy::from_parts(parts).unwrap();
+        // An unusable grant authorizes nothing, so it is not part of the policy's
+        // authorization semantics: it must not change the canonical identity.
+        assert!(with_grant.credentials().is_empty());
+        assert_eq!(
+            canonical_sandbox_policy_bytes(&with_grant),
+            canonical_sandbox_policy_bytes(&bare)
+        );
+        assert_eq!(
+            sandbox_policy_content_digest(&with_grant),
+            sandbox_policy_content_digest(&bare)
+        );
+        assert!(is_within(&with_grant, &bare));
+        assert!(is_within(&bare, &with_grant));
+    }
+}
+
+#[test]
 fn declared_collections_stay_canonical() {
     let mut tools = BTreeSet::new();
     tools.insert("git".to_string());

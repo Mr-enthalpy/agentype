@@ -13,10 +13,10 @@ use agentype_agent_contract::{
     AgentTypeRef, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue,
     ConfigStatus, ContinuityMode, EnforcementProfileRef, EnvironmentPolicy, FileOperationClass,
     FilePolicy, LifecycleMode, MatcherKind, NetworkEndpoint, NetworkEndpointSet, NetworkPolicy,
-    NetworkTransport, NormalizedSandboxPolicy, PathSet, PhysicalSafety, PolicyAccessDimension,
-    PolicyInput, PolicyOperation, PolicyProjection, SandboxPolicyParts, SandboxPolicyRef,
-    SecurityClass, SecurityContract, SecurityContractMode, SourceStatus, SpawnSource,
-    SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
+    NetworkTransport, NormalizedSandboxPolicy, PathSelector, PathSet, PhysicalSafety,
+    PolicyAccessDimension, PolicyInput, PolicyOperation, PolicyProjection, SandboxPolicyParts,
+    SandboxPolicyRef, SecurityClass, SecurityContract, SecurityContractMode, SourceStatus,
+    SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, ToolPolicy, WorkingDirectory,
 };
 use agentype_core::{Clock, InformationFunction, ManualClock, WorkspaceMode};
 use agentype_storage_sqlite::Kernel;
@@ -491,6 +491,84 @@ fn security_agent_type_requires_a_policy_exactly_projected_and_claim_consistent(
         .publish_agent_type_with_security(&claiming, SecurityContractMode::SecurityV1)
         .unwrap_err();
     assert!(error.to_string().contains("capability claims"), "{error}");
+}
+
+#[test]
+fn security_refinement_orders_authored_policies_and_forbids_mode_downgrade() {
+    let kernel = memory_kernel();
+    publish_adapter_policy(&kernel);
+    let base = publish_secure_agent_type(&kernel);
+
+    // A SECURITY_V1 derived revision with a distinct but provably narrower
+    // authored policy is a legal refinement: the ordering uses the policy
+    // algebra, not reference equality.
+    let narrower_reference = policy_ref("agent-policy-narrow", 1);
+    kernel
+        .publish_sandbox_policy(
+            &narrower_reference,
+            &NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+                files: FilePolicy::new(
+                    PathSet::allowed([PathSelector::workspace(["src"]).unwrap()]),
+                    PathSet::deny_all(),
+                    PathSet::deny_all(),
+                    PathSet::deny_all(),
+                    PathSet::deny_all(),
+                ),
+                tools: ToolPolicy::top(),
+                network: NetworkEndpointSet::allowed([NetworkEndpoint::new(
+                    NetworkTransport::Tcp,
+                    "example.com",
+                    Some(443),
+                )
+                .unwrap()]),
+                environment: EnvironmentPolicy::top(),
+                credentials: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                working_directory: WorkingDirectory::Any,
+                attempt_isolation: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let mut narrower = agent_type();
+    narrower.type_ref = type_ref("secure-coder", 2);
+    narrower.based_on = Some(base.type_ref.clone());
+    narrower.contract.sandbox_policy = Some(narrower_reference);
+    kernel
+        .publish_agent_type_with_security(&narrower, SecurityContractMode::SecurityV1)
+        .unwrap();
+
+    // Refining the narrower revision with the wider base policy is rejected: the
+    // derived policy must be provably no wider than its own base.
+    let mut widened = agent_type();
+    widened.type_ref = type_ref("secure-coder", 3);
+    widened.based_on = Some(narrower.type_ref.clone());
+    widened.contract.sandbox_policy = Some(policy_ref("agent-policy", 1));
+    let error = kernel
+        .publish_agent_type_with_security(&widened, SecurityContractMode::SecurityV1)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("derived sandbox policy is wider than base"),
+        "{error}"
+    );
+
+    // Dropping the physical enforcement contract is never a legal refinement,
+    // even when every coarse field and the policy reference are identical.
+    let mut downgraded = narrower.clone();
+    downgraded.type_ref = type_ref("secure-coder", 4);
+    downgraded.based_on = Some(base.type_ref.clone());
+    downgraded.contract.sandbox_policy = base.contract.sandbox_policy.clone();
+    let error = kernel
+        .publish_agent_type_with_security(&downgraded, SecurityContractMode::CoarseV1)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must not drop the physical enforcement contract"),
+        "{error}"
+    );
 }
 
 #[test]
