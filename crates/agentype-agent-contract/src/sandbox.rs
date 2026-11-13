@@ -144,6 +144,32 @@ pub const MAX_PATH_SELECTORS: usize = 256;
 /// this aggregate bound keeps the whole authored policy finite.
 pub const MAX_PATH_SELECTORS_PER_POLICY: usize = 512;
 
+/// Maximum number of distinct members in one allowed-name set (`tools`,
+/// `commands`, or allowed environment names). The network and path dimensions
+/// are bounded independently; this keeps the remaining set dimensions from
+/// accepting an unbounded authored collection.
+pub const MAX_NAME_SET_MEMBERS: usize = 256;
+
+/// Maximum number of entries in one policy's required-environment-values map.
+pub const MAX_ENVIRONMENT_REQUIRED_VALUES: usize = 256;
+
+/// Maximum number of entries in one policy's credential-grant or
+/// resource-ceiling map.
+pub const MAX_POLICY_MAP_ENTRIES: usize = 256;
+
+/// Maximum number of members in one credential grant facet (`uses` or
+/// `audience`). Delivery modes are a closed two-value domain.
+pub const MAX_CREDENTIAL_FACET_MEMBERS: usize = 256;
+
+/// Maximum canonical JSON size of one authored sandbox policy document.
+///
+/// The per-dimension bounds keep normalization finite, but their combination
+/// (for example maximum-length path components in every selector) can still
+/// describe a very large document. Publication and decode reject a document
+/// above this byte budget before doing durable work with it. The limit is part
+/// of the v1 input grammar, not of the canonical bytes of an accepted policy.
+pub const MAX_SANDBOX_POLICY_BYTES: usize = 1_048_576;
+
 /// An anchored path prefix: the selector covers the path itself and every
 /// descendant. Components are exact names; wildcards are not part of v1.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -347,6 +373,14 @@ impl NameSet {
             let name = name.into();
             validate_name_token(&name, "allowed name")?;
             allowed.insert(name);
+        }
+        if allowed.len() > MAX_NAME_SET_MEMBERS {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "allowed name set has {} members; at most {MAX_NAME_SET_MEMBERS} are allowed",
+                    allowed.len()
+                ),
+            });
         }
         Ok(Self::Allowed(allowed))
     }
@@ -685,6 +719,14 @@ impl EnvironmentPolicy {
             validate_name_token(name, "required environment name")?;
             validate_environment_value(value)?;
         }
+        if required_values.len() > MAX_ENVIRONMENT_REQUIRED_VALUES {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "required environment map has {} entries; at most {MAX_ENVIRONMENT_REQUIRED_VALUES} are allowed",
+                    required_values.len()
+                ),
+            });
+        }
         if let NameSet::Allowed(allowed) = &allowed_names {
             for name in required_values.keys() {
                 if !allowed.contains(name) {
@@ -837,6 +879,22 @@ impl CredentialGrant {
         for value in audience {
             validate_name_token(&value, "credential audience")?;
             validated_audience.insert(value);
+        }
+        if validated_uses.len() > MAX_CREDENTIAL_FACET_MEMBERS {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "credential use set has {} members; at most {MAX_CREDENTIAL_FACET_MEMBERS} are allowed",
+                    validated_uses.len()
+                ),
+            });
+        }
+        if validated_audience.len() > MAX_CREDENTIAL_FACET_MEMBERS {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "credential audience set has {} members; at most {MAX_CREDENTIAL_FACET_MEMBERS} are allowed",
+                    validated_audience.len()
+                ),
+            });
         }
         Ok(Self {
             id,
@@ -1148,6 +1206,8 @@ fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, Cont
         normalize_name_set(&parts.environment.allowed_names)?,
         parts.environment.required_values.clone(),
     )?;
+    validate_policy_map_entries(parts.credentials.len(), "credential grant")?;
+    validate_policy_map_entries(parts.resources.len(), "resource ceiling")?;
     let mut credentials = BTreeMap::new();
     for (id, grant) in parts.credentials {
         if grant.id != id {
@@ -1219,6 +1279,45 @@ fn validate_network_endpoint_count(count: usize) -> Result<(), ContractError> {
     Ok(())
 }
 
+fn validate_policy_map_entries(count: usize, what: &str) -> Result<(), ContractError> {
+    if count > MAX_POLICY_MAP_ENTRIES {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "policy has {count} {what} entries; at most {MAX_POLICY_MAP_ENTRIES} are allowed"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_required_access_counts(access: &RequiredAccess) -> Result<(), ContractError> {
+    if access.tools_commands.len() > MAX_NAME_SET_MEMBERS {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "required tool or command set has {} members; at most {MAX_NAME_SET_MEMBERS} are allowed",
+                access.tools_commands.len()
+            ),
+        });
+    }
+    if access.environment_names.len() > MAX_NAME_SET_MEMBERS {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "required environment name set has {} members; at most {MAX_NAME_SET_MEMBERS} are allowed",
+                access.environment_names.len()
+            ),
+        });
+    }
+    if access.credentials.len() > MAX_POLICY_MAP_ENTRIES {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "required credential set has {} members; at most {MAX_POLICY_MAP_ENTRIES} are allowed",
+                access.credentials.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_path_sets(files: &FilePolicy) -> Result<(), ContractError> {
     let sets = [
         files.read(),
@@ -1257,6 +1356,32 @@ fn validate_parts(parts: &SandboxPolicyParts) -> Result<(), ContractError> {
     validate_path_sets(&parts.files)?;
     if let Some(endpoints) = parts.network.endpoints() {
         validate_network_endpoint_count(endpoints.len())?;
+    }
+    for set in [
+        &parts.tools.tools,
+        &parts.tools.commands,
+        &parts.environment.allowed_names,
+    ] {
+        if let NameSet::Allowed(names) = set {
+            if names.len() > MAX_NAME_SET_MEMBERS {
+                return Err(ContractError::InvalidSandboxPolicy {
+                    reason: format!(
+                        "allowed name set has {} members; at most {MAX_NAME_SET_MEMBERS} are allowed",
+                        names.len()
+                    ),
+                });
+            }
+        }
+    }
+    validate_policy_map_entries(parts.credentials.len(), "credential grant")?;
+    validate_policy_map_entries(parts.resources.len(), "resource ceiling")?;
+    if parts.environment.required_values.len() > MAX_ENVIRONMENT_REQUIRED_VALUES {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "required environment map has {} entries; at most {MAX_ENVIRONMENT_REQUIRED_VALUES} are allowed",
+                parts.environment.required_values.len()
+            ),
+        });
     }
     if let NameSet::Allowed(allowed) = &parts.environment.allowed_names {
         for name in parts.environment.required_values.keys() {
@@ -1895,13 +2020,15 @@ impl RequiredAccess {
         }
         let network_endpoints: BTreeSet<NetworkEndpoint> = network_endpoints.into_iter().collect();
         validate_network_endpoint_count(network_endpoints.len())?;
-        Ok(Self {
+        let access = Self {
             file_operations: file_operations.into_iter().collect(),
             tools_commands: tools,
             network_endpoints,
             environment_names: environment,
             credentials: credentials.into_iter().collect(),
-        })
+        };
+        validate_required_access_counts(&access)?;
+        Ok(access)
     }
 
     /// Build a floor from capability-projected policy operations.
@@ -1929,6 +2056,7 @@ impl RequiredAccess {
             }
         }
         validate_network_endpoint_count(access.network_endpoints.len())?;
+        validate_required_access_counts(&access)?;
         Ok(access)
     }
 
@@ -2102,17 +2230,30 @@ pub fn check_required_access(
             reasons.push(format!("tool or command {name:?}"));
         }
     }
-    for endpoint in required.network_endpoints() {
-        if !access.allows_endpoint(endpoint) {
-            reasons.push(format!(
-                "network endpoint {}:{} over {}",
-                endpoint.host(),
-                endpoint
-                    .port()
-                    .map(|port| port.to_string())
-                    .unwrap_or_else(|| "*".into()),
-                endpoint.transport().as_str()
-            ));
+    // Required endpoints are a finite set: one union-containment check decides
+    // every member at once. The per-endpoint scan runs only on the rejecting
+    // path, to name the endpoints that are actually missing. Calling
+    // `allows_endpoint` for each member would rebuild the required singleton and
+    // re-enumerate the same partition up to 256 times for one admission.
+    let required_network = required.network_endpoints();
+    if !required_network.is_empty()
+        && !network_set_within(
+            &NetworkEndpointSet::Allowed(required_network.clone()),
+            &access.network,
+        )
+    {
+        for endpoint in required_network {
+            if !access.allows_endpoint(endpoint) {
+                reasons.push(format!(
+                    "network endpoint {}:{} over {}",
+                    endpoint.host(),
+                    endpoint
+                        .port()
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "*".into()),
+                    endpoint.transport().as_str()
+                ));
+            }
         }
     }
     for name in required.environment_names() {

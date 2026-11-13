@@ -27,7 +27,7 @@ use agentype_agent_contract::{
     CapabilityRef, ConfigDigest, ConfigStatus, ContractError, EnforcementProfileRef,
     NormalizedSandboxPolicy, PolicyInput, SandboxPolicyRef, SecurityContractMode, SourceConfig,
     SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration,
-    SANDBOX_POLICY_SCHEMA_VERSION,
+    MAX_SANDBOX_POLICY_BYTES, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{Error, UnixTime};
 use rusqlite::{params, Transaction};
@@ -1629,9 +1629,18 @@ pub fn publish_sandbox_policy(
     reference: &SandboxPolicyRef,
     policy: &NormalizedSandboxPolicy,
 ) -> Result<String, Error> {
-    let digest = sandbox_policy_content_digest(policy);
     let content_json =
         canonical_json_string(canonical_sandbox_policy_bytes(policy), "sandbox policy")?;
+    // The decoder enforces the same whole-document budget. Checking here keeps
+    // an oversized policy out of the immutable catalog and out of the digest
+    // path, rather than storing bytes every later read must reject.
+    if content_json.len() > MAX_SANDBOX_POLICY_BYTES {
+        return Err(Error::invalid_authority(format!(
+            "sandbox policy document is {} bytes; at most {MAX_SANDBOX_POLICY_BYTES} are allowed",
+            content_json.len()
+        )));
+    }
+    let digest = sandbox_policy_content_digest(policy);
     let existing = existing_digest(
         tx,
         "SELECT content_digest FROM sandbox_policy_revisions

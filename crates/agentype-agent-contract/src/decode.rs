@@ -37,7 +37,7 @@ use crate::sandbox::{
     FilePolicy, NameSet, NetworkEndpointSet, NormalizedSandboxPolicy, PathRoot, PathSelector,
     PathSet, PolicyInput, ResourceCeiling, ResourceLimitName, ResourceScope, ResourceUnit,
     SandboxPolicyParts, SecurityDerivation, ToolPolicy, WorkingDirectory, MAX_PATH_SELECTORS,
-    SANDBOX_POLICY_SCHEMA_VERSION,
+    MAX_SANDBOX_POLICY_BYTES, SANDBOX_POLICY_SCHEMA_VERSION,
 };
 use agentype_core::{
     ExecutionId, IncarnationId, InformationFunction, LogicalAgentId, WorkspaceMode,
@@ -893,6 +893,15 @@ fn working_directory_from(value: &Value) -> Result<WorkingDirectory, ContractErr
 pub fn sandbox_policy_from_canonical_json(
     json: &str,
 ) -> Result<NormalizedSandboxPolicy, ContractError> {
+    // Reject an oversized document before parsing or constructing any policy
+    // value. The per-dimension bounds keep normalization finite; this is the
+    // whole-document budget the durable boundary also enforces on publication.
+    if json.len() > MAX_SANDBOX_POLICY_BYTES {
+        return Err(err(format!(
+            "sandbox policy document is {} bytes; at most {MAX_SANDBOX_POLICY_BYTES} are allowed",
+            json.len()
+        )));
+    }
     let value = parse_document(json, "SANDBOX_POLICY")?;
     let document = object(&value, "sandbox policy")?;
     let version = u64_of(
