@@ -10,22 +10,28 @@
 //!
 //! `ImportedEnforcementProfile` models an *imported* external fact: which
 //! enforcement dimensions an exact physical domain can actually enforce. Its
-//! only constructor is gated behind the same `provisioning-producer` feature as
-//! the imported provisioning evidence, so the default supported surface cannot
-//! mint enforcement facts (ADR-0014 §13).
+//! only constructors are gated behind the same `provisioning-producer` feature
+//! as the imported provisioning evidence. A **contract-only** host therefore has
+//! no way to mint enforcement facts. This is a supported-surface boundary, not
+//! an unforgeable capability: any host that also embeds `agentype-runtime` gets
+//! the constructors through Cargo feature unification, because the runtime is
+//! the importer. The load-bearing boundary is that no production API accepts a
+//! caller-supplied profile and the authority transaction re-proves imported
+//! facts (ADR-0014 §13).
 
 use crate::authority::EffectiveTaskAuthority;
 use crate::canonical::{
     adapter_binding_policy_content_digest, canonical_json_body_digest,
-    sandbox_policy_content_digest,
+    required_access_content_digest, sandbox_policy_content_digest,
 };
 use crate::error::ContractError;
 use crate::records::{
     AdapterBindingPolicy, ConfigDigest, ConfigStatus, SourceConfig, SourceConfigRef,
 };
 use crate::sandbox::{
-    CredentialAuthorizationId, EnforcementProfileRef, EnvironmentPolicy, FilePolicy,
-    NetworkEndpointSet, NormalizedSandboxPolicy, ResourceCeiling, ResourceLimitName, ToolPolicy,
+    check_required_access, required_access_from_claims, CredentialAuthorizationId,
+    EnforcementProfileRef, EnvironmentPolicy, FilePolicy, NetworkEndpointSet,
+    NormalizedSandboxPolicy, PolicyAccess, ResourceCeiling, ResourceLimitName, ToolPolicy,
     WorkingDirectory,
 };
 use agentype_core::{GenerationId, LogicalAgentId, TaskId, UnixTime};
@@ -289,9 +295,11 @@ impl EnforcementSupport {
 /// the physical domain's support matrix, and the subjects its claims are
 /// relative to.
 ///
-/// The constructor is compiled only under `provisioning-producer` because these
-/// are imported external facts. The supported production surface has no way to
-/// mint them.
+/// The constructors are compiled only under `provisioning-producer` because
+/// these are imported external facts. A **contract-only** host cannot name them;
+/// a host that also embeds the runtime can, because the runtime is the importer.
+/// Treat constructor visibility as a supported-surface convenience, never as the
+/// security proof: no production API accepts a caller-supplied profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedEnforcementProfile {
     reference: EnforcementProfileRef,
@@ -838,7 +846,7 @@ pub fn compile_execution_security(
 
 /// Qualify one candidate: prove the candidate's authored ceiling bounds the
 /// effective Task policy with the real policy order, re-check the Task's coarse
-/// modes on the complete policy, then compile.
+/// modes and its positive access floor on the complete policy, then compile.
 ///
 /// This is the acquisition-side predicate. It grants no Attempt/Lease
 /// authority; the authority transaction still owns that.
@@ -888,6 +896,30 @@ pub fn qualify_security_candidate(
         catalog,
     )?;
     authority.validate_coarse_modes(requirement)?;
+    // ADR-0013 §5 Candidate row: every positive Task requirement is
+    // re-evaluated against the complete `P_eff`. Admission proved the floor
+    // against `TaskAuthority(meet(P_generation, P_task))` only; the AgentType
+    // and SpawnSource terms can delete a capability the Task requires, so the
+    // floor MUST be rebuilt through the same catalog projection admission used
+    // and checked again here. A deficit is candidate-local
+    // (`SecurityUnenforceable`), never a Task failure.
+    let required_access =
+        required_access_from_claims(&requirement.hard.required_capabilities, catalog)?;
+    if required_access_content_digest(&required_access) != authority.required_access_digest() {
+        return Err(ContractError::EvidenceSubjectMismatch {
+            reason: "the composite authority was derived from a different Task access floor".into(),
+        });
+    }
+    check_required_access(
+        &required_access,
+        &PolicyAccess::from_policy(authority.policy()),
+    )
+    .map_err(|deficit| ContractError::SecurityUnenforceable {
+        reason: format!(
+            "the complete effective policy does not satisfy the Task's positive access floor: \
+             {deficit}"
+        ),
+    })?;
     compile_execution_security(authority, binding, profile)
 }
 

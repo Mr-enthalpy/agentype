@@ -39,12 +39,17 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Cargo test workspace
-        # The external-consumer boundary fixture is excluded here and run on
-        # its own below: `--all-features` switches `test-support` on, which is
-        # exactly the configuration its compile-fail probes must NOT run in.
-        run: cargo test --workspace --all-features --exclude agentype-public-api-boundary
+        # The external-consumer boundary fixtures are excluded here and run on
+        # their own below: `--all-features` switches `test-support` on, which is
+        # exactly the configuration their compile-fail probes must NOT run in.
+        run: cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only
       - name: Cargo test production API boundary fixture
         # Default features only. This is the compile-time evidence that a
         # consumer depending on `agentype-runtime` cannot construct a second
         # scheduler daemon, claim, or renewal control plane.
         run: cargo test -p agentype-public-api-boundary
+      - name: Cargo test contract-only boundary fixture
+        # Default features only, and no runtime in the dependency graph, so
+        # `provisioning-producer` stays off: the imported-enforcement
+        # constructor is then provably absent from the supported surface.
+        run: cargo test -p agentype-public-api-contract-only
