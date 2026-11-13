@@ -458,6 +458,14 @@ This matches the existing coarse rejection of
 fail at the same stage, not later during provisioning. An unsatisfiable Task
 must never become a durable semantic commitment.
 
+Admission itself MUST apply this re-evaluation to the admitted
+`meet(P_generation, P_task)` before the Task or its `TaskSecurityBinding` becomes
+durable. A Task whose `required_workspace` is `Write` MUST be rejected when the
+admitted policy has no writable region; `Restricted`/`Enabled` network modes MUST
+be rejected when the admitted policy allows no endpoint or is not unrestricted.
+A legal deny-all intersection is not a `PolicyConflict`; it is an unsatisfiable
+positive requirement at the admission stage.
+
 ### 6. Dimension rules for `meet`
 
 The algebra is defined dimension by dimension; "intersect the allowed sets" is
@@ -639,6 +647,18 @@ reference are unchanged. B5.1 thus implements this conservative subset of the
 §5 ordering; it does not claim the complete secured-execution qualification that
 B5.2/B5.4 own.
 
+B5.1 does **not** wire the mode-aware order into existing-agent preselection.
+`match_existing_agents_for_task` keeps the frozen `match_existing_agents`
+relation, which still compares policy references by equality for both
+`COARSE_V1` and `SECURITY_V1` requirements. Consequently a `SECURITY_V1`
+AgentType whose authored policy is a strict superset of the Task's effective
+policy is admissible under `can_execute_security_v1` but is not returned as an
+existing-agent candidate in B5.1. This is a pure semantic wiring gap, not an
+execution-authority leak: the coarse acquisition path cannot execute a
+`SECURITY_V1` Task. Mode-aware existing-agent matching and a policy-aware
+`more_specific_for` belong to B5.2. Until that lands, B5.1 MUST NOT claim that all
+four relations are policy-order aware.
+
 ### 10. `ActualAuthority` is defined by provable equality, not by a claim
 
 `ActualAuthority(E)` is not directly observable. Acceptance uses falsifiable
@@ -690,6 +710,14 @@ competing authority sources:
   carry a second mode marker or act as an alternative authority source. A copy
   kept for readability, if any, is derived and constrained equal; it never
   decides.
+
+`TaskSecurityBinding.policy` is the fine `P_eff` derivation, not the Task's
+complete authority. A `ReadOnly` Task under a `Write` Generation that authors no
+fine layer retains the Generation's write paths in the binding, while its durable
+`required_workspace` still says `ReadOnly`. B5.2/B5.4 execution compilation MUST
+therefore compose the binding policy with the durable Task coarse requirement
+(and the actual AgentType/SpawnSource terms); it MUST NOT treat the binding policy
+alone as the effective Task permission.
 
 Mode declarations are per-object immutable facts, fixed when the object is
 created or published — never a mutable "supports" label chosen at admission:
