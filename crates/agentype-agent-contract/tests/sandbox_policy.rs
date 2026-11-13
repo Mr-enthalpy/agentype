@@ -675,6 +675,20 @@ fn top_network_policy() -> NormalizedSandboxPolicy {
     .unwrap()
 }
 
+fn required_network<I>(endpoints: I) -> RequiredAccess
+where
+    I: IntoIterator<Item = NetworkEndpoint>,
+{
+    RequiredAccess::new(
+        Vec::<FileOperationClass>::new(),
+        Vec::<String>::new(),
+        endpoints,
+        Vec::<String>::new(),
+        Vec::<CredentialAuthorizationId>::new(),
+    )
+    .unwrap()
+}
+
 /// The union of several outer rules may cover one inner rule even when no single
 /// outer rule does. Containment is over allowed *sets*, not rule-by-rule
 /// subsumption.
@@ -787,4 +801,197 @@ fn network_order_is_a_preorder_with_a_greatest_lower_bound() {
             }
         }
     }
+}
+
+/// Requirement satisfaction MUST use the same union containment as the policy
+/// order. A required `ANY:*:443` rule is covered by the union of a TCP rule and
+/// a UDP rule, even though neither outer rule alone covers it.
+#[test]
+fn required_access_uses_network_union_containment() {
+    let split = network_only([
+        endpoint(NetworkTransport::Tcp, "*", Some(443)),
+        endpoint(NetworkTransport::Udp, "*", None),
+    ]);
+    let access = PolicyAccess::from_policy(&split);
+    let https_any_transport = endpoint(NetworkTransport::Any, "*", Some(443));
+
+    assert!(access.allows_endpoint(&https_any_transport));
+    let required = required_network([https_any_transport]);
+    assert!(check_required_access(&required, &access).is_ok());
+
+    // The split union does not cover every port on both transports.
+    let every_port = required_network([endpoint(NetworkTransport::Any, "*", None)]);
+    let deficit = check_required_access(&every_port, &access).unwrap_err();
+    assert_eq!(deficit.reasons().len(), 1);
+    assert!(deficit.reasons()[0].contains("network endpoint"));
+}
+
+/// `Any` and the explicit universal rule are one canonical value. Keeping both
+/// spellings would make the coarse projection and the policy order disagree.
+#[test]
+fn explicit_universal_network_rule_normalizes_to_any() {
+    let universal = endpoint(NetworkTransport::Any, "*", None);
+    let explicit = network_only([universal.clone()]);
+    let implicit = top_network_policy();
+
+    assert_eq!(explicit, implicit);
+    assert_eq!(explicit.network(), &NetworkEndpointSet::Any);
+    assert!(explicit.network().is_any());
+    assert_eq!(project_network(&explicit), NetworkPolicy::Enabled);
+    assert_eq!(project_network(&implicit), NetworkPolicy::Enabled);
+    assert!(is_within(&explicit, &implicit));
+    assert!(is_within(&implicit, &explicit));
+
+    // A universal rule subsumes every narrower rule, and the normalized bytes
+    // and digest are exactly the `Any` ones.
+    let mixed = network_only([
+        universal,
+        endpoint(NetworkTransport::Tcp, "registry.example.com", Some(443)),
+    ]);
+    assert_eq!(mixed, implicit);
+    assert_eq!(
+        canonical_sandbox_policy_bytes(&explicit),
+        canonical_sandbox_policy_bytes(&implicit)
+    );
+    assert_eq!(
+        sandbox_policy_content_digest(&explicit),
+        sandbox_policy_content_digest(&implicit)
+    );
+    assert_eq!(
+        sandbox_policy_content_digest(&explicit),
+        "sha256:262727a2a171589de44c15671defe0e08f13810122ae9c949b48f359a27b2693"
+    );
+}
+
+/// ADR-0013 §7 fixes visibility as directory observability, not an access
+/// precondition. A deny-all visible set therefore does not erase a writable
+/// operation region; visibility remains an independent ordering dimension.
+#[test]
+fn visibility_is_independent_of_file_operation_authority() {
+    let hidden = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::deny_all(),
+            PathSet::allowed([workspace(&["src"])]),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let visible = NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        files: FilePolicy::new(
+            PathSet::deny_all(),
+            PathSet::allowed([workspace(&["src"])]),
+            PathSet::deny_all(),
+            PathSet::deny_all(),
+            PathSet::any(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(project_workspace(&hidden), WorkspaceMode::Write);
+    assert_eq!(
+        project_security_contract(&hidden).workspace,
+        WorkspaceMode::Write
+    );
+    let access = PolicyAccess::from_policy(&hidden);
+    assert!(access.allows_file_operation(FileOperationClass::Write));
+    let required = RequiredAccess::new(
+        [FileOperationClass::Write],
+        Vec::<String>::new(),
+        Vec::<NetworkEndpoint>::new(),
+        Vec::<String>::new(),
+        Vec::<CredentialAuthorizationId>::new(),
+    )
+    .unwrap();
+    assert!(check_required_access(&required, &access).is_ok());
+
+    // Visibility still orders independently: the hidden policy is narrower.
+    assert!(is_within(&hidden, &visible));
+    assert!(!is_within(&visible, &hidden));
+}
+
+/// The constructor enforces the bounded v1 exact-host grammar before any policy
+/// reaches the containment algorithm.
+#[test]
+fn network_endpoint_hosts_are_bounded_tokens() {
+    let too_long = "a".repeat(MAX_NETWORK_HOST_LEN + 1);
+    for host in [
+        too_long.as_str(),
+        "bad\0host",
+        "bad\nhost",
+        "bad\thost",
+        "bad host",
+        "*.example.com",
+        "example.*",
+        "**",
+        "*foo",
+        "foo*",
+        "é.example.com",
+        "...",
+        "example.com:443",
+        "127.0.0.1:443",
+        "https://example.com",
+    ] {
+        assert!(
+            NetworkEndpoint::new(NetworkTransport::Tcp, host, Some(443)).is_err(),
+            "host {host:?} must be rejected"
+        );
+    }
+    for host in [
+        "*",
+        "example.com",
+        "REGISTRY.example.com",
+        "127.0.0.1",
+        "2001:db8::1",
+        "a_b.example.com",
+    ] {
+        assert!(
+            NetworkEndpoint::new(NetworkTransport::Tcp, host, Some(443)).is_ok(),
+            "host {host:?} must be accepted"
+        );
+    }
+    assert!(NetworkEndpoint::new(NetworkTransport::Tcp, "example.com", Some(0)).is_err());
+}
+
+/// Policy and requirement collections have the same finite bound, so no
+/// caller can make the host/port partition enumeration unbounded.
+#[test]
+fn network_endpoint_collections_are_bounded() {
+    let build = |count: usize| {
+        (0..count)
+            .map(|index| {
+                NetworkEndpoint::new(
+                    NetworkTransport::Tcp,
+                    format!("host{index}.example.com"),
+                    Some(443),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let at_limit = build(MAX_NETWORK_ENDPOINTS);
+    assert!(NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        network: NetworkEndpointSet::allowed(at_limit),
+        ..Default::default()
+    })
+    .is_ok());
+
+    let over_limit = build(MAX_NETWORK_ENDPOINTS + 1);
+    assert!(NormalizedSandboxPolicy::from_parts(SandboxPolicyParts {
+        network: NetworkEndpointSet::allowed(over_limit.iter().cloned()),
+        ..Default::default()
+    })
+    .is_err());
+    assert!(RequiredAccess::new(
+        Vec::<FileOperationClass>::new(),
+        Vec::<String>::new(),
+        over_limit,
+        Vec::<String>::new(),
+        Vec::<CredentialAuthorizationId>::new(),
+    )
+    .is_err());
 }

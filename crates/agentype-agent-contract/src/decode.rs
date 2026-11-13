@@ -20,6 +20,7 @@ use crate::capability::{
     CapabilityValue, FileOperationClass, MatcherKind, NetworkEndpoint, NetworkTransport,
     PolicyAccessDimension, PolicyOperation, PolicyProjection, Quantity, SecurityClass,
     CAPABILITY_DEFINITION_CANONICAL_VERSION_V1, CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
+    MAX_NETWORK_ENDPOINTS,
 };
 use crate::error::ContractError;
 use crate::provisioning::{BindingSnapshot, MaterializationDigest, ProvisioningBinding};
@@ -777,6 +778,11 @@ fn network_endpoint_set_from(value: &Value) -> Result<NetworkEndpointSet, Contra
         "ALLOWED" => {
             let mut endpoints = Vec::new();
             for item in array(field(document, "endpoints")?, "sandbox network endpoints")? {
+                if endpoints.len() == MAX_NETWORK_ENDPOINTS {
+                    return Err(err(format!(
+                        "sandbox network endpoint set exceeds the {MAX_NETWORK_ENDPOINTS}-rule bound"
+                    )));
+                }
                 endpoints.push(network_endpoint_from(item)?);
             }
             Ok(NetworkEndpointSet::allowed(endpoints))

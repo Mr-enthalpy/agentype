@@ -246,6 +246,85 @@ impl NetworkTransport {
     }
 }
 
+/// Longest exact network host token in bytes. A DNS name is bounded at 253
+/// bytes, which also bounds every v1 IPv4/IPv6 textual literal.
+pub const MAX_NETWORK_HOST_LEN: usize = 253;
+
+/// Maximum number of distinct endpoint rules in one normalized policy set or
+/// required-access set. The union-containment algorithm enumerates a finite
+/// host/port partition, so an unbounded set would make admission cost
+/// attacker-controlled. The bound applies to the *distinct* rules that survive
+/// deduplication, which is exactly the input size of that algorithm.
+pub const MAX_NETWORK_ENDPOINTS: usize = 256;
+
+/// Validate the v1 exact-host or single-wildcard grammar.
+///
+/// `*` is the only wildcard token. Every other host is a bounded ASCII token:
+/// 1 to [`MAX_NETWORK_HOST_LEN`] bytes from `[A-Za-z0-9._-]`, with at least one
+/// alphanumeric byte. A token containing `:` MUST parse as an IPv6 literal, so a
+/// `host:port` fragment is rejected and the port can only be a separate
+/// selector. The accepted alphabet covers DNS names and textual IPv4 / IPv6
+/// literals without admitting paths, URLs, quotes, whitespace, NUL or any other
+/// control byte. Case is preserved; the exact host is an opaque authorization
+/// token, not a DNS lookup key.
+fn validate_network_host(host: &str) -> Result<(), ContractError> {
+    if host == "*" {
+        return Ok(());
+    }
+    if host.is_empty() || host.len() > MAX_NETWORK_HOST_LEN {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "network endpoint host must be 1..={MAX_NETWORK_HOST_LEN} bytes, got {}",
+                host.len()
+            ),
+        });
+    }
+    if !host.is_ascii() {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "network endpoint host must be ASCII".into(),
+        });
+    }
+    if host.trim() != host {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "network endpoint host must not have leading or trailing whitespace".into(),
+        });
+    }
+    if host.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "network endpoint host must not contain NUL or control characters".into(),
+        });
+    }
+    if host.contains('*') {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "the only valid network host wildcard is the exact token \"*\"".into(),
+        });
+    }
+    if host.contains(':') {
+        // `:` is reserved for textual IPv6 literals. A `host:port` string is a
+        // URL fragment, not an exact host; the port is a separate selector.
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "network endpoint host {host:?} contains ':' but is not a valid IPv6 literal"
+                ),
+            });
+        }
+    } else if !host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "network endpoint host contains a character outside [A-Za-z0-9._-]".into(),
+        });
+    }
+    if !host.bytes().any(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: "network endpoint host must contain at least one alphanumeric byte".into(),
+        });
+    }
+    Ok(())
+}
+
 /// A finite network endpoint rule: exact host (or `*` for any host), an optional
 /// port and a transport selector. B5.1 does not implement regular expressions or
 /// arbitrary matching languages.
@@ -263,11 +342,7 @@ impl NetworkEndpoint {
         port: Option<u16>,
     ) -> Result<Self, ContractError> {
         let host = host.into();
-        if host.trim().is_empty() || host.trim() != host {
-            return Err(ContractError::InvalidSandboxPolicy {
-                reason: "network endpoint host must be a non-empty trimmed string".into(),
-            });
-        }
+        validate_network_host(&host)?;
         if port == Some(0) {
             return Err(ContractError::InvalidSandboxPolicy {
                 reason: "network endpoint port 0 is not a valid endpoint selector".into(),

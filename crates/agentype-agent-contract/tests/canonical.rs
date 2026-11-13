@@ -770,7 +770,8 @@ fn sandbox_policy_canonical_round_trips_and_normalizes() {
     // A covering selector removes the selectors it subsumes.
     assert_eq!(policy.files().read().selectors().unwrap().len(), 2);
     assert_eq!(policy.files().visible().selectors().unwrap().len(), 1);
-    assert_eq!(policy.network().endpoints().unwrap().len(), 1);
+    // An explicit universal rule is the same canonical value as `Any`.
+    assert!(policy.network().is_any());
 
     let bytes = canonical_sandbox_policy_bytes(&policy);
     let json = String::from_utf8(bytes.clone()).unwrap();
@@ -780,7 +781,7 @@ fn sandbox_policy_canonical_round_trips_and_normalizes() {
     assert_eq!(decoded.normalize().unwrap(), policy);
     assert_eq!(
         sandbox_policy_content_digest(&policy),
-        "sha256:514bf8f7170513fd2d490342d712d6c1c7b9b9be60cecb36908887a4f6be476e"
+        "sha256:84c0f64dd047e9d7551638269d4c9310ecd0cfaf4c14d11c7f025ab02ffb45f7"
     );
 }
 

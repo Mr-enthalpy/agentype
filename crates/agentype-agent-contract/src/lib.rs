@@ -53,7 +53,7 @@ pub use capability::{
     CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, FileOperationClass,
     MatcherKind, NetworkEndpoint, NetworkTransport, PolicyAccessDimension, PolicyOperation,
     PolicyProjection, Quantity, SecurityClass, CAPABILITY_DEFINITION_CANONICAL_VERSION_V1,
-    CAPABILITY_DEFINITION_CANONICAL_VERSION_V2,
+    CAPABILITY_DEFINITION_CANONICAL_VERSION_V2, MAX_NETWORK_ENDPOINTS, MAX_NETWORK_HOST_LEN,
 };
 pub use decode::{
     adapter_binding_policy_from_canonical_json, agent_type_from_canonical_json,

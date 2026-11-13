@@ -23,7 +23,7 @@
 
 use crate::capability::{
     CapabilityCatalog, CapabilityDefinition, CapabilityRef, CapabilityValue, FileOperationClass,
-    NetworkEndpoint, NetworkTransport, PolicyOperation,
+    NetworkEndpoint, NetworkTransport, PolicyOperation, MAX_NETWORK_ENDPOINTS,
 };
 use crate::error::ContractError;
 use crate::records::{NetworkPolicy, SandboxPolicyRef, SecurityContract};
@@ -328,8 +328,14 @@ impl NetworkEndpointSet {
     }
 
     /// A finite allowed set, normalized by merging an explicit `{TCP, UDP}` pair
-    /// at the same host/port into the equivalent `ANY` selector and then removing
-    /// endpoints covered by a broader rule.
+    /// at the same host/port into the equivalent `ANY` selector, normalizing the
+    /// explicit universal rule `ANY:*:*` to [`NetworkEndpointSet::Any`], and then
+    /// removing endpoints covered by a broader rule.
+    ///
+    /// `Any` and `Allowed([ANY:*:*])` denote exactly the same v1 network
+    /// universe (TCP/UDP × any host × any port), so they MUST not survive as two
+    /// canonical spellings. Keeping both would make `project_network` and the
+    /// policy order disagree about a semantically top policy.
     pub fn allowed<I>(endpoints: I) -> Self
     where
         I: IntoIterator<Item = NetworkEndpoint>,
@@ -353,6 +359,16 @@ impl NetworkEndpointSet {
                 }
             }
         }
+        // `ANY:*:*` is the whole v1 network operation domain, exactly like
+        // `Any`. No broader finite rule exists because `*` and "any port" are
+        // the only host/port wildcards.
+        if all.iter().any(|endpoint| {
+            endpoint.transport() == NetworkTransport::Any
+                && endpoint.host() == "*"
+                && endpoint.port().is_none()
+        }) {
+            return Self::Any;
+        }
         let all: Vec<NetworkEndpoint> = all.into_iter().collect();
         let kept = all
             .iter()
@@ -367,7 +383,12 @@ impl NetworkEndpointSet {
         Self::Allowed(kept)
     }
 
-    /// Whether some allowed rule covers `endpoint`.
+    /// Whether some single allowed rule covers `endpoint`.
+    ///
+    /// This is a rule-membership predicate, not the authority relation: authority
+    /// is union containment, so `ANY:*:443` is granted by
+    /// `TCP:*:443 ∪ UDP:*:*` even though `contains` returns `false` here. Use
+    /// [`PolicyAccess::allows_endpoint`] or [`is_within`] for authorization.
     pub fn contains(&self, endpoint: &NetworkEndpoint) -> bool {
         match self {
             Self::Any => true,
@@ -1008,6 +1029,9 @@ fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, Cont
         network: match &parts.network {
             NetworkEndpointSet::Any => NetworkEndpointSet::Any,
             NetworkEndpointSet::Allowed(endpoints) => {
+                // Bound the raw authored set before normalization's pairwise
+                // cover removal, not only after it.
+                validate_network_endpoint_count(endpoints.len())?;
                 NetworkEndpointSet::allowed(endpoints.iter().cloned())
             }
         },
@@ -1033,7 +1057,21 @@ fn normalize_name_set(set: &NameSet) -> Result<NameSet, ContractError> {
     }
 }
 
+fn validate_network_endpoint_count(count: usize) -> Result<(), ContractError> {
+    if count > MAX_NETWORK_ENDPOINTS {
+        return Err(ContractError::InvalidSandboxPolicy {
+            reason: format!(
+                "network endpoint set has {count} rules; at most {MAX_NETWORK_ENDPOINTS} are allowed"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_parts(parts: &SandboxPolicyParts) -> Result<(), ContractError> {
+    if let Some(endpoints) = parts.network.endpoints() {
+        validate_network_endpoint_count(endpoints.len())?;
+    }
     if let NameSet::Allowed(allowed) = &parts.environment.allowed_names {
         for name in parts.environment.required_values.keys() {
             if !allowed.contains(name) {
@@ -1419,10 +1457,11 @@ fn network_set_within(inner: &NetworkEndpointSet, outer: &NetworkEndpointSet) ->
 
 /// Host projection of the finite endpoint grammar. `*` is the only wildcard, so
 /// an exact host and the single "every other host" atom partition the host
-/// space without enumerating any concrete host twice.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// space without enumerating any concrete host twice. The exact atom indexes
+/// the shared named-host table built by the containment check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NetworkHostAtom {
-    Exact(String),
+    Exact(usize),
     Other,
 }
 
@@ -1439,9 +1478,14 @@ enum NetworkPortAtom {
 ///
 /// A single inner rule may be covered by several outer rules together, e.g.
 /// `ANY:*:443` is covered by `TCP:*:443 ∪ UDP:*:*`. The endpoint grammar is a
-/// product of finite transport, host and port partitions, so we mark the atoms
-/// covered by the outer union and require every inner atom to be marked. This is
-/// exact set containment, not "some single outer rule covers the whole rule".
+/// product of finite transport, host and port partitions, so we mark every atom
+/// covered by the outer union once and require every atom an inner rule covers
+/// to be marked. This is exact set containment, not "some single outer rule
+/// covers the whole rule".
+///
+/// Marking outer coverage once makes the cost `O((|inner| + |outer|) · atoms)`
+/// instead of `O(|inner| · |outer| · atoms)`. Together with
+/// [`MAX_NETWORK_ENDPOINTS`] this bounds the finite partition enumeration.
 fn network_allowed_union_within(
     inner: &BTreeSet<NetworkEndpoint>,
     outer: &BTreeSet<NetworkEndpoint>,
@@ -1456,39 +1500,59 @@ fn network_allowed_union_within(
             named_ports.insert(port);
         }
     }
-    let mut host_atoms: Vec<NetworkHostAtom> = named_hosts
-        .into_iter()
-        .map(NetworkHostAtom::Exact)
-        .collect();
+    let named_hosts: Vec<String> = named_hosts.into_iter().collect();
+    let named_ports: Vec<u16> = named_ports.into_iter().collect();
+    let mut host_atoms: Vec<NetworkHostAtom> =
+        (0..named_hosts.len()).map(NetworkHostAtom::Exact).collect();
     host_atoms.push(NetworkHostAtom::Other);
     let mut port_atoms: Vec<NetworkPortAtom> = named_ports
-        .into_iter()
+        .iter()
+        .copied()
         .map(NetworkPortAtom::Exact)
         .collect();
     port_atoms.push(NetworkPortAtom::Other);
     let transport_atoms = [NetworkTransport::Tcp, NetworkTransport::Udp];
+    let atom_index = |transport: usize, host: usize, port: usize| {
+        (transport * host_atoms.len() + host) * port_atoms.len() + port
+    };
+    let mut covered = vec![false; transport_atoms.len() * host_atoms.len() * port_atoms.len()];
+
+    for rule in outer {
+        for (transport_index, transport) in transport_atoms.iter().enumerate() {
+            if !network_transport_covers(rule.transport(), *transport) {
+                continue;
+            }
+            for (host_index, host) in host_atoms.iter().enumerate() {
+                if !network_host_covers(rule.host(), *host, &named_hosts) {
+                    continue;
+                }
+                for (port_index, port) in port_atoms.iter().enumerate() {
+                    if network_port_covers(rule.port(), *port) {
+                        covered[atom_index(transport_index, host_index, port_index)] = true;
+                    }
+                }
+            }
+        }
+    }
 
     inner.iter().all(|rule| {
-        transport_atoms.iter().all(|transport| {
-            if !network_transport_covers(rule.transport(), *transport) {
-                return true;
-            }
-            host_atoms.iter().all(|host| {
-                if !network_host_covers(rule.host(), host) {
+        transport_atoms
+            .iter()
+            .enumerate()
+            .all(|(transport_index, transport)| {
+                if !network_transport_covers(rule.transport(), *transport) {
                     return true;
                 }
-                port_atoms.iter().all(|port| {
-                    if !network_port_covers(rule.port(), *port) {
+                host_atoms.iter().enumerate().all(|(host_index, host)| {
+                    if !network_host_covers(rule.host(), *host, &named_hosts) {
                         return true;
                     }
-                    outer.iter().any(|allowed| {
-                        network_transport_covers(allowed.transport(), *transport)
-                            && network_host_covers(allowed.host(), host)
-                            && network_port_covers(allowed.port(), *port)
+                    port_atoms.iter().enumerate().all(|(port_index, port)| {
+                        !network_port_covers(rule.port(), *port)
+                            || covered[atom_index(transport_index, host_index, port_index)]
                     })
                 })
             })
-        })
     })
 }
 
@@ -1496,9 +1560,9 @@ fn network_transport_covers(rule: NetworkTransport, atom: NetworkTransport) -> b
     rule == NetworkTransport::Any || rule == atom
 }
 
-fn network_host_covers(rule: &str, atom: &NetworkHostAtom) -> bool {
+fn network_host_covers(rule: &str, atom: NetworkHostAtom, named_hosts: &[String]) -> bool {
     match atom {
-        NetworkHostAtom::Exact(host) => rule == "*" || rule == host,
+        NetworkHostAtom::Exact(index) => rule == "*" || rule == named_hosts[index].as_str(),
         NetworkHostAtom::Other => rule == "*",
     }
 }
@@ -1638,10 +1702,12 @@ impl RequiredAccess {
             validate_name_token(&name, "required environment name")?;
             environment.insert(name);
         }
+        let network_endpoints: BTreeSet<NetworkEndpoint> = network_endpoints.into_iter().collect();
+        validate_network_endpoint_count(network_endpoints.len())?;
         Ok(Self {
             file_operations: file_operations.into_iter().collect(),
             tools_commands: tools,
-            network_endpoints: network_endpoints.into_iter().collect(),
+            network_endpoints,
             environment_names: environment,
             credentials: credentials.into_iter().collect(),
         })
@@ -1671,6 +1737,7 @@ impl RequiredAccess {
                 }
             }
         }
+        validate_network_endpoint_count(access.network_endpoints.len())?;
         Ok(access)
     }
 
@@ -1783,8 +1850,15 @@ impl PolicyAccess {
         self.tools.allows(name)
     }
 
+    /// Whether the effective network set grants this exact required endpoint.
+    ///
+    /// A required endpoint is a singleton rule and MUST be checked against the
+    /// union of all effective rules, not against one covering rule. Otherwise
+    /// ordering and requirement satisfaction disagree: `ANY:*:443` is within
+    /// `TCP:*:443 ∪ UDP:*:*`, but no single outer rule covers it.
     pub fn allows_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
-        self.network.contains(endpoint)
+        let required = NetworkEndpointSet::Allowed(BTreeSet::from([endpoint.clone()]));
+        network_set_within(&required, &self.network)
     }
 
     pub fn allows_environment_name(&self, name: &str) -> bool {
