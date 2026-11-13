@@ -492,6 +492,84 @@ fn execute_without_guards(env: &Env, sql: &str) {
 }
 
 #[test]
+fn a_coarse_task_under_a_repointed_security_generation_fails_closed() {
+    let env = Env::new("coarse-repointed-generation");
+    let kernel = &env.kernel;
+    let reference = policy_ref("coarse-generation-policy");
+    // `deny_all` projects to the `ReadOnly` / `Disabled` ceiling below, so the
+    // policy row stays legal under either mode: only the recorded mode disagrees
+    // after the tamper, which is what this test isolates.
+    kernel
+        .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::deny_all())
+        .unwrap();
+    let pin = publish_agent_type(kernel, "reviewer");
+    // A COARSE_V1 Generation may carry an authored policy; its stored mode is
+    // still the coarse default, so this is the legacy typed admission path.
+    let generation = kernel
+        .create_generation_with_policy(json!({}), Some(generation_policy(reference)))
+        .unwrap();
+    let task = compile_and_admit(
+        kernel,
+        &generation.generation_id,
+        pin.clone(),
+        SecurityContractMode::CoarseV1,
+    );
+
+    // Pre-corruption the record is a valid coarse Task: the authoritative read
+    // succeeds and the frozen coarse readiness preflight accepts it.
+    assert_eq!(
+        kernel
+            .get_generation_security_mode(&generation.generation_id)
+            .unwrap(),
+        SecurityContractMode::CoarseV1
+    );
+    assert!(kernel.get_task_agent_requirement(&task).unwrap().is_some());
+    kernel.check_typed_acquisition_readiness(&task).unwrap();
+
+    // The mirror image of the SECURITY_V1 → COARSE_V1 tamper: the Generation is
+    // repointed to SECURITY_V1 while its policy stays a legal projection. The
+    // requirement reader used to refold this as a valid coarse Task because it
+    // never compared the Generation's mode.
+    execute_without_guards(
+        &env,
+        "UPDATE generation_policies SET security_contract_mode='SECURITY_V1'",
+    );
+
+    let error = kernel.get_task_agent_requirement(&task).unwrap_err();
+    assert!(
+        matches!(error, Error::InvariantViolation(_)),
+        "expected an invariant violation, got {error:?}"
+    );
+    assert!(error.to_string().contains("does not match"), "{error}");
+
+    // The binding getter returns `None` for a coarse Task, so it inherits the
+    // rejection from the requirement read instead of reporting "no binding".
+    let error = kernel.get_task_security_binding(&task).unwrap_err();
+    assert!(
+        matches!(error, Error::InvariantViolation(_)),
+        "expected an invariant violation, got {error:?}"
+    );
+    assert!(error.to_string().contains("does not match"), "{error}");
+
+    // The frozen coarse acquisition path reads the requirement, so it can no
+    // longer grant the contradictory record any Attempt or Lease either, even
+    // with a real catalog and a READY, type-bound agent.
+    let selection = catalog(kernel, "coarse-repointed");
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+    let error = kernel
+        .acquire_typed_task_existing(&task, &agent, &selection, &registry())
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvariantViolation(_)),
+        "expected an invariant violation, got {error:?}"
+    );
+    assert!(error.to_string().contains("does not match"), "{error}");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+#[test]
 fn a_typed_task_missing_its_requirement_row_fails_closed() {
     let env = Env::new("missing-requirement");
     let kernel = &env.kernel;
