@@ -664,8 +664,16 @@ impl FilePolicy {
     }
 }
 
-/// Tool and command allowlists. Both are finite name sets; `Any` means the
-/// layer adds no restriction.
+/// Tool and command allowlists.
+///
+/// They do not grant two independent capabilities. ADR-0013 §7 defines one
+/// abstract `ToolCommandSet`, whose members are the union of the two authored
+/// allowlists. Normalization therefore stores the union in `tools` and leaves
+/// `commands` deny-all, so `{tools: {git}, commands: {}}` and
+/// `{tools: {}, commands: {git}}` are the same canonical policy. Keeping two
+/// separate spellings would make `meet`, `is_within` and `PolicyAccess`
+/// disagree about the same abstract operation. `Any` in either field means the
+/// whole namespace, so normalization keeps both fields `Any`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPolicy {
     tools: NameSet,
@@ -1233,10 +1241,7 @@ fn normalize_parts(parts: SandboxPolicyParts) -> Result<SandboxPolicyParts, Cont
             normalize_path_set(&parts.files.delete),
             normalize_path_set(&parts.files.visible),
         ),
-        tools: ToolPolicy::new(
-            normalize_name_set(&parts.tools.tools)?,
-            normalize_name_set(&parts.tools.commands)?,
-        ),
+        tools: normalize_tool_policy(&parts.tools)?,
         network: match &parts.network {
             NetworkEndpointSet::Any => NetworkEndpointSet::Any,
             NetworkEndpointSet::Allowed(endpoints) => {
@@ -1265,6 +1270,27 @@ fn normalize_name_set(set: &NameSet) -> Result<NameSet, ContractError> {
     match set {
         NameSet::Any => Ok(NameSet::Any),
         NameSet::Allowed(names) => NameSet::allowed(names.iter().cloned()),
+    }
+}
+
+/// Collapse the two authored allowlists into the one canonical spelling of the
+/// v1 `ToolCommandSet`.
+///
+/// Both `Any` fields stay `Any` (the whole namespace). Otherwise the union is
+/// stored in `tools` and `commands` is explicit deny-all. This is what makes
+/// `{tools: {git}, commands: {}}`, `{tools: {}, commands: {git}}` and
+/// `{tools: {git}, commands: {git}}` one canonical policy with one digest.
+fn normalize_tool_policy(policy: &ToolPolicy) -> Result<ToolPolicy, ContractError> {
+    match (policy.tools(), policy.commands()) {
+        (NameSet::Any, _) | (_, NameSet::Any) => Ok(ToolPolicy::top()),
+        (NameSet::Allowed(tools), NameSet::Allowed(commands)) => {
+            let mut merged = tools.clone();
+            merged.extend(commands.iter().cloned());
+            Ok(ToolPolicy::new(
+                NameSet::allowed(merged)?,
+                NameSet::deny_all(),
+            ))
+        }
     }
 }
 
@@ -1720,10 +1746,7 @@ pub fn meet(
 ) -> Result<NormalizedSandboxPolicy, PolicyConflict> {
     let parts = SandboxPolicyParts {
         files: meet_file_policies(left.files(), right.files()),
-        tools: ToolPolicy::new(
-            intersect_name_sets(left.tools().tools(), right.tools().tools()),
-            intersect_name_sets(left.tools().commands(), right.tools().commands()),
-        ),
+        tools: meet_tool_commands(left.tools(), right.tools()),
         network: intersect_network_sets(left.network(), right.network()),
         environment: meet_environments(left.environment(), right.environment())?,
         credentials: meet_credentials(left.credentials(), right.credentials())?,
@@ -1758,6 +1781,48 @@ fn name_set_within(inner: &NameSet, outer: &NameSet) -> bool {
             NameSet::Any => true,
             NameSet::Allowed(outer) => inner.is_subset(outer),
         },
+    }
+}
+
+/// The `ToolCommandSet` a policy authorizes: the union of its `tools` and
+/// `commands` allowlists. `None` is the whole namespace (`Any` in either
+/// field); `Some` is the finite effective set.
+fn effective_tool_commands(policy: &ToolPolicy) -> Option<BTreeSet<String>> {
+    match (policy.tools(), policy.commands()) {
+        (NameSet::Any, _) | (_, NameSet::Any) => None,
+        (NameSet::Allowed(tools), NameSet::Allowed(commands)) => {
+            Some(tools.union(commands).cloned().collect())
+        }
+    }
+}
+
+fn tool_commands_within(inner: &ToolPolicy, outer: &ToolPolicy) -> bool {
+    match (
+        effective_tool_commands(inner),
+        effective_tool_commands(outer),
+    ) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some(inner), Some(outer)) => inner.is_subset(&outer),
+    }
+}
+
+/// Greatest lower bound of two `ToolCommandSet` policies over their shared
+/// effective namespace, returned in canonical form.
+fn meet_tool_commands(left: &ToolPolicy, right: &ToolPolicy) -> ToolPolicy {
+    match (
+        effective_tool_commands(left),
+        effective_tool_commands(right),
+    ) {
+        (None, None) => ToolPolicy::top(),
+        (None, Some(names)) | (Some(names), None) => {
+            ToolPolicy::new(NameSet::Allowed(names), NameSet::deny_all())
+        }
+        (Some(left), Some(right)) => ToolPolicy::new(
+            NameSet::Allowed(left.intersection(&right).cloned().collect()),
+            NameSet::deny_all(),
+        ),
     }
 }
 
@@ -1800,8 +1865,10 @@ enum NetworkPortAtom {
 /// covers the whole rule".
 ///
 /// Marking outer coverage once makes the cost `O((|inner| + |outer|) · atoms)`
-/// instead of `O(|inner| · |outer| · atoms)`. Together with
-/// [`MAX_NETWORK_ENDPOINTS`] this bounds the finite partition enumeration.
+/// instead of `O(|inner| · |outer| · atoms)`. Each rule first projects to the
+/// host and port atoms it covers, so an exact-port rule marks one port column
+/// per covered host rather than rescanning every atom to reject it. Together
+/// with [`MAX_NETWORK_ENDPOINTS`] this bounds the finite partition enumeration.
 fn network_allowed_union_within(
     inner: &BTreeSet<NetworkEndpoint>,
     outer: &BTreeSet<NetworkEndpoint>,
@@ -1833,41 +1900,51 @@ fn network_allowed_union_within(
     };
     let mut covered = vec![false; transport_atoms.len() * host_atoms.len() * port_atoms.len()];
 
+    let rule_host_atoms = |rule: &NetworkEndpoint| {
+        host_atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| network_host_covers(rule.host(), **host, &named_hosts))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    let rule_port_atoms = |rule: &NetworkEndpoint| {
+        port_atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, port)| network_port_covers(rule.port(), **port))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+
     for rule in outer {
+        let hosts = rule_host_atoms(rule);
+        let ports = rule_port_atoms(rule);
         for (transport_index, transport) in transport_atoms.iter().enumerate() {
             if !network_transport_covers(rule.transport(), *transport) {
                 continue;
             }
-            for (host_index, host) in host_atoms.iter().enumerate() {
-                if !network_host_covers(rule.host(), *host, &named_hosts) {
-                    continue;
-                }
-                for (port_index, port) in port_atoms.iter().enumerate() {
-                    if network_port_covers(rule.port(), *port) {
-                        covered[atom_index(transport_index, host_index, port_index)] = true;
-                    }
+            for &host_index in &hosts {
+                for &port_index in &ports {
+                    covered[atom_index(transport_index, host_index, port_index)] = true;
                 }
             }
         }
     }
 
     inner.iter().all(|rule| {
+        let hosts = rule_host_atoms(rule);
+        let ports = rule_port_atoms(rule);
         transport_atoms
             .iter()
             .enumerate()
             .all(|(transport_index, transport)| {
-                if !network_transport_covers(rule.transport(), *transport) {
-                    return true;
-                }
-                host_atoms.iter().enumerate().all(|(host_index, host)| {
-                    if !network_host_covers(rule.host(), *host, &named_hosts) {
-                        return true;
-                    }
-                    port_atoms.iter().enumerate().all(|(port_index, port)| {
-                        !network_port_covers(rule.port(), *port)
-                            || covered[atom_index(transport_index, host_index, port_index)]
+                !network_transport_covers(rule.transport(), *transport)
+                    || hosts.iter().all(|&host_index| {
+                        ports.iter().all(|&port_index| {
+                            covered[atom_index(transport_index, host_index, port_index)]
+                        })
                     })
-                })
             })
     })
 }
@@ -1941,8 +2018,7 @@ pub fn is_within(inner: &NormalizedSandboxPolicy, outer: &NormalizedSandboxPolic
         && path_set_within(inner.files().execute(), outer.files().execute())
         && path_set_within(inner.files().delete(), outer.files().delete())
         && path_set_within(inner.files().visible(), outer.files().visible())
-        && name_set_within(inner.tools().tools(), outer.tools().tools())
-        && name_set_within(inner.tools().commands(), outer.tools().commands())
+        && tool_commands_within(inner.tools(), outer.tools())
         && network_set_within(inner.network(), outer.network())
         && name_set_within(
             inner.environment().allowed_names(),
