@@ -391,7 +391,7 @@ satisfies_requirement(R_min, P, stage, candidate?)
 
 | Stage | Evaluated | Deliberately deferred |
 |---|---|---|
-| Typed admission | `RequiredAccess ⊆ ProjectAccess(meet(P_generation, P_task))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
+| Typed admission | `RequiredAccess ⊆ ProjectAccess(TaskAuthority(meet(P_generation, P_task)))`, `CoarseExecutionModes` compatibility with the Generation ceiling, Task-local coarse/fine consistency, and the pinned AgentType's authored policy compared against `TaskAuthority(meet(...))` | `RequiredCapabilities` (they need the actual AgentType), `PlacementConstraints`, and guarantees that require a physical candidate |
 | Candidate matching/acquisition | `RequiredCapabilities` against the actual AgentType claims through their catalog matchers, `RequiredGuarantees` physical eligibility, `PlacementConstraints` through the frozen M5 placement predicate, whole-policy `FeatureObligations` coverage, **and every positive Task requirement (`RequiredAccess`, `RequiredCapabilities`, `CoarseExecutionModes`) re-evaluated against the complete `P_eff`** | — |
 | Execution commitment | exact binding and the complete security contract, re-proven against the committed snapshot, including every positive Task requirement and `CoarseExecutionModes` against the committed `P_eff` | — |
 
@@ -408,6 +408,35 @@ all. A remaining `Pending` at Candidate is a whole-round defer when its subject 
 still legitimately unavailable, or a control-plane fault when the subject should
 exist; it is never treated as `Satisfied` and never authorizes execution
 commitment.
+
+The admission predicate MUST NOT use the fine-derived meet as if it were the
+complete Task authority. The durable `TaskSecurityBinding.policy` remains the
+fine-derived meet and its canonical bytes are unchanged, but every admission
+check uses the pure coarse-constrained view
+
+```text
+TaskAuthority(P) = P with write := ∅                 if required_workspace = ReadOnly
+                   P with network := ∅               if required_network = Disabled
+```
+
+which preserves reads, tools, environment, credentials and resource ceilings.
+`ReadOnly` and `Disabled` are upper bounds carried by the Task itself, so they
+apply to every layer the Task admits, including the Generation layer. This
+closes both directions of the combined-obligation error: a `ReadOnly` Task whose
+required capability projects to a write, or a `Disabled` Task whose required
+capability projects to an endpoint, is unsatisfiable even when the fine layer
+shows the operation; and a legal `ReadOnly` Task under a `Write` Generation is
+not rejected merely because the fine meet retains Generation write paths that
+the Task ceiling removes before the pinned AgentType comparison. A later
+Candidate or Execution stage re-applies the same view to the complete `P_eff`
+because a later meet can only narrow it.
+
+RequiredAccess is therefore checked as
+`RequiredAccess ⊆ ProjectAccess(TaskAuthority(meet(P_generation, P_task)))`, and
+`can_execute_security_v1` compares `TaskAuthority(meet(...))` with the pinned
+AgentType's authored policy. B5.1 does not weaken the `SECURITY_V1` strict
+ordering to obtain this result; it supplies the comparison with the complete,
+explainable Task constraint.
 
 `RequiredCapabilities` is deferred at admission because admission has only the
 Generation and Task policy objects, while the existing M6-B.2 matcher compares a
@@ -490,6 +519,28 @@ not sufficient:
 `P_eff` covers allowed operations and ceilings only. Guarantees live beside it:
 meeting two policies can never clear an isolation requirement, and an
 `EnforcementSupport` capability cannot create one (see §3).
+
+The authored policy isolation bit and the object's durable guarantee field are a
+single authority, not two independent representations. Consequently
+`validate_generation_coarse_fine` requires
+
+```text
+Generation.requires_attempt_isolation
+    ⇔ authored_policy.attempt_isolation
+```
+
+and the AgentType analogue requires the same equality. A Generation that authors
+isolation without declaring the guarantee, or declares it without authoring it,
+is rejected at publication; neither direction may leave `P_eff.attempt_isolation
+= true` while no requirement asks a committed execution to request isolation. A
+Task's optional fine policy MAY repeat the Task's own
+`required_attempt_isolation = true`, but MUST NOT introduce the guarantee when
+the Task does not declare it. `SpawnSource` has no isolation guarantee field, so
+its `P_source` MUST NOT set `attempt_isolation`; an unattributed source-level
+guarantee is rejected at publication rather than left for B5.2/B5.4 to
+interpret. Making fine-policy `true` *create* an isolation requirement would
+change the `I_required` composition and therefore requires a new ADR revision
+and algebra version.
 
 The credential dimension is the one dimension where absence is not `Top`. A
 `SECURITY_V1` AgentType ceiling that does not explicitly grant a secret scope
@@ -617,6 +668,19 @@ and the pinned `(canonical_version, algebra_version) = (1, 1)` golden vectors ar
 unchanged because none contains the explicit universal rule. A post-B5.1 change
 to these bytes MUST bump `SANDBOX_POLICY_SCHEMA_VERSION` and add new vectors
 rather than let an existing digest mean something new.
+
+#### v1 path bounds
+
+Path selectors are bounded by the same resource argument. One selector has at
+most 32 components, one component is at most 255 bytes, one normalized path set
+has at most 256 selectors, and one policy has at most 512 selectors across its
+five path sets (`read`, `write`, `execute`, `delete`, `visible`). The decoder and
+`PathSet::try_allowed` reject an oversized authored collection before pairwise
+cover removal, and `NormalizedSandboxPolicy::from_parts` re-checks both the
+per-set and aggregate counts. The bounds are part of the v1 grammar: raising them
+changes the accepted input language, not the canonical bytes of an already
+accepted policy, and still requires an explicit version decision rather than a
+silent relaxation.
 
 #### Visibility is observability, not an access precondition
 
