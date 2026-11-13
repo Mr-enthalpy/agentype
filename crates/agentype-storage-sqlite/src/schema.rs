@@ -21,10 +21,13 @@
 /// mode declarations, `capability_definitions.canonical_version`, and the
 /// `security_contract_mode` owner on `task_agent_requirements` and
 /// `generation_policies`, plus the write-once `task_security_bindings` child for
-/// a `SECURITY_V1` Task. Older files are rejected at open (fail closed);
+/// a `SECURITY_V1` Task. Version 10 adds the M6-B.5 B5.2
+/// `security_acquisition_blocks` diagnostic: one durable, operator-actionable
+/// row per Task whose complete `SECURITY_V1` candidate round cannot fit the
+/// fixed acquisition budget. Older files are rejected at open (fail closed);
 /// D-DB-MIGRATE is still unresolved, so there is deliberately no in-place
 /// upgrade.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1274,5 +1277,84 @@ WHEN (SELECT security_contract_mode FROM task_agent_requirements
       WHERE task_id=NEW.task_id) IS NOT 'SECURITY_V1'
 BEGIN
     SELECT RAISE(ABORT, 'a task security binding requires a SECURITY_V1 requirement');
+END;
+
+-- ============================================================================
+-- M6-B.5 B5.2 security acquisition blocks (schema v10)
+--
+-- One durable diagnostic row per Task whose *complete* SECURITY_V1 candidate
+-- round cannot fit the fixed acquisition budget. This is liveness diagnostics,
+-- not Task semantic authority: it creates no Attempt, emits no Task NACK and
+-- never selects among a compiled subset. A row is BLOCKED until an explicit
+-- operator action or a configuration/profile change releases it, and a released
+-- row for the same condition is never reopened.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS security_acquisition_blocks (
+    task_id TEXT PRIMARY KEY
+        REFERENCES task_agent_requirements(task_id) ON DELETE RESTRICT,
+    generation_id TEXT NOT NULL CHECK (length(trim(generation_id)) > 0),
+    candidate_domain_digest TEXT NOT NULL
+        CHECK (length(trim(candidate_domain_digest)) > 0),
+    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+    binding_profile_digest TEXT NOT NULL
+        CHECK (length(trim(binding_profile_digest)) > 0),
+    cost_candidates INTEGER NOT NULL CHECK (cost_candidates >= 0),
+    cost_compiles INTEGER NOT NULL CHECK (cost_compiles >= 0),
+    budget_max_candidates INTEGER NOT NULL CHECK (budget_max_candidates >= 1),
+    budget_max_compiles INTEGER NOT NULL CHECK (budget_max_compiles >= 1),
+    budget_limit TEXT NOT NULL
+        CHECK (budget_limit IN ('CANDIDATE_COUNT','COMPILE_COUNT')),
+    status TEXT NOT NULL CHECK (status IN ('BLOCKED','RELEASED')),
+    created_at REAL NOT NULL CHECK (created_at >= 0),
+    released_at REAL CHECK (released_at IS NULL OR released_at >= 0),
+    release_reason TEXT
+        CHECK (release_reason IS NULL
+               OR release_reason IN ('OPERATOR_ACTION','CONFIGURATION_CHANGED')),
+    CHECK (
+        (status='BLOCKED' AND released_at IS NULL AND release_reason IS NULL)
+        OR
+        (status='RELEASED' AND released_at IS NOT NULL AND release_reason IS NOT NULL)
+    )
+);
+
+-- A block belongs only to a SECURITY_V1 Task: the coarse typed path has no
+-- compiled candidate round, so it never produces this diagnostic.
+CREATE TRIGGER IF NOT EXISTS security_acquisition_blocks_require_security_parent
+BEFORE INSERT ON security_acquisition_blocks
+WHEN (SELECT security_contract_mode FROM task_agent_requirements
+      WHERE task_id=NEW.task_id) IS NOT 'SECURITY_V1'
+BEGIN
+    SELECT RAISE(ABORT, 'a security acquisition block requires a SECURITY_V1 requirement');
+END;
+
+-- Diagnostics are released, never deleted: deleting the row would let the same
+-- condition re-appear as a fresh block with no operator action.
+CREATE TRIGGER IF NOT EXISTS security_acquisition_blocks_immutable_delete
+BEFORE DELETE ON security_acquisition_blocks
+BEGIN
+    SELECT RAISE(ABORT, 'a security acquisition block is durable; release it instead');
+END;
+
+-- A diagnostic is keyed by its condition. The same released condition MUST stay
+-- released, so a raw writer cannot resurrect it; a *different* condition is a
+-- new diagnostic and may replace the old row's fields.
+CREATE TRIGGER IF NOT EXISTS security_acquisition_blocks_no_same_condition_reopen
+BEFORE UPDATE ON security_acquisition_blocks
+WHEN OLD.status='RELEASED' AND NEW.status='BLOCKED'
+     AND OLD.candidate_domain_digest=NEW.candidate_domain_digest
+     AND OLD.binding_profile_digest=NEW.binding_profile_digest
+BEGIN
+    SELECT RAISE(ABORT, 'a released security acquisition condition cannot be reopened');
+END;
+
+-- The release identity and time are final once written.
+CREATE TRIGGER IF NOT EXISTS security_acquisition_blocks_release_is_final
+BEFORE UPDATE ON security_acquisition_blocks
+WHEN OLD.status='RELEASED' AND NEW.status='RELEASED'
+     AND (NEW.released_at IS NOT OLD.released_at
+          OR NEW.release_reason IS NOT OLD.release_reason)
+BEGIN
+    SELECT RAISE(ABORT, 'a security acquisition release is final');
 END;
 "#;

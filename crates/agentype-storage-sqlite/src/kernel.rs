@@ -1048,6 +1048,42 @@ impl Kernel {
         self.tx(|tx, _| crate::requirement::task_security_mode(tx, task_id))
     }
 
+    /// Record one durable security-acquisition diagnostic (M6-B.5 B5.2).
+    ///
+    /// This is liveness diagnostics, not Task authority: it creates no Attempt
+    /// and emits no Task NACK. The same condition is one row; a different
+    /// condition replaces the diagnostic fields.
+    pub fn record_security_acquisition_block(
+        &self,
+        block: &agentype_agent_contract::SecurityAcquisitionBlock,
+    ) -> Result<(), Error> {
+        self.tx(|tx, _| crate::security_acquisition::record_security_acquisition_block(tx, block))
+    }
+
+    /// The durable security-acquisition diagnostic of a Task, if any.
+    pub fn get_security_acquisition_block(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<Option<agentype_agent_contract::SecurityAcquisitionBlock>, Error> {
+        self.tx(|tx, _| crate::security_acquisition::get_security_acquisition_block(tx, task_id))
+    }
+
+    /// Release a Task's diagnostic by explicit operator action or a
+    /// configuration/profile change. Returns whether this call changed the row;
+    /// an absent or already-released row is `Ok(false)`.
+    pub fn release_security_acquisition_block(
+        &self,
+        task_id: &agentype_core::TaskId,
+        release: agentype_agent_contract::SecurityAcquisitionRelease,
+        now: agentype_core::UnixTime,
+    ) -> Result<bool, Error> {
+        self.tx(|tx, _| {
+            crate::security_acquisition::release_security_acquisition_block(
+                tx, task_id, release, now,
+            )
+        })
+    }
+
     pub fn get_logical_agent_type_binding(
         &self,
         agent_id: &agentype_core::LogicalAgentId,
