@@ -4325,6 +4325,11 @@ impl Kernel {
     /// discharge a `SECURITY_V1` contract, so it must not begin work for one.
     /// The check reads the mode from its sole durable owner and never from
     /// policy presence, and it is re-proved transactionally at acquisition.
+    ///
+    /// The `agent_requirement_mode` mirror decides whether a requirement row is
+    /// expected at all: a `TYPED` Task whose requirement row is missing is
+    /// durable corruption (fail closed), while a `LEGACY` Task legitimately has
+    /// no mode and stays on the frozen coarse path.
     #[cfg(any(test, feature = "runtime-internal"))]
     pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
         let now = self.clock.now();
@@ -4334,17 +4339,35 @@ impl Kernel {
                 batch,
                 active,
                 next,
+                requirement_mode,
                 security_mode,
-            ): (String, Option<String>, Option<bool>, Option<f64>, Option<String>) = conn
+            ): (
+                String,
+                Option<String>,
+                Option<bool>,
+                Option<f64>,
+                String,
+                Option<String>,
+            ) = conn
                 .query_row(
-                    "SELECT t.state,b.state,p.active,t.next_eligible_at,r.security_contract_mode
+                    "SELECT t.state,b.state,p.active,t.next_eligible_at,
+                            t.agent_requirement_mode,r.security_contract_mode
                      FROM tasks t
                      LEFT JOIN batches b ON b.id=t.batch_id
                      LEFT JOIN pool_partitions p ON p.name=t.partition_name
                      LEFT JOIN task_agent_requirements r ON r.task_id=t.id
                      WHERE t.id=?1",
                     params![id.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(map_sqlite)?
@@ -4362,18 +4385,42 @@ impl Kernel {
                     "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
                 ));
             }
-            if let Some(stored) = security_mode {
-                let mode = agentype_agent_contract::SecurityContractMode::parse(&stored)
-                    .ok_or_else(|| {
+            match requirement_mode.as_str() {
+                "LEGACY" => {
+                    if security_mode.is_some() {
+                        return Err(Error::invariant(format!(
+                            "legacy task {} unexpectedly owns an agent requirement mode",
+                            id.as_str()
+                        )));
+                    }
+                }
+                "TYPED" => {
+                    let stored = security_mode.ok_or_else(|| {
                         Error::invariant(format!(
-                            "task {} records unsupported security_contract_mode {stored:?}",
+                            "typed task {} is missing its agent requirement mode row",
                             id.as_str()
                         ))
                     })?;
-                if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
-                    return Err(Error::invalid_authority(
-                        "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
-                    ));
+                    let mode =
+                        agentype_agent_contract::SecurityContractMode::parse(&stored).ok_or_else(
+                            || {
+                                Error::invariant(format!(
+                                    "task {} records unsupported security_contract_mode {stored:?}",
+                                    id.as_str()
+                                ))
+                            },
+                        )?;
+                    if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
+                        return Err(Error::invalid_authority(
+                            "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(Error::invariant(format!(
+                        "task {} records unknown agent_requirement_mode {other:?}",
+                        id.as_str()
+                    )))
                 }
             }
             Ok(())

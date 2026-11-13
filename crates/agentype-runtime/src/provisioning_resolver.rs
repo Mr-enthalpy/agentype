@@ -29,7 +29,8 @@ use agentype_agent_contract::{
     can_provision_task, AdapterBindingPolicy, AdapterPolicyRef, AgentTypeRef, BindingSnapshot,
     CapabilityRef, CapabilityValue, ConfigStatus, MaterializationDigest, NetworkPolicy,
     PhysicalSafety, ProvisioningBinding, ResolvedProvisioningEvidence, SandboxPolicyRef,
-    SourceConfig, SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
+    SecurityContractMode, SourceConfig, SourceConfigRef, SpawnSource, SpawnSourceRef,
+    RESOLVER_VERSION,
 };
 use agentype_core::{ExecutionId, TaskId, WorkspaceMode};
 use agentype_execution_config::ExecutionRegistry;
@@ -712,6 +713,13 @@ fn enumerate_candidates(
     // known unreadiness before any source-private I/O; the final transaction
     // still re-proves readiness and owns all Attempt/Lease authority.
     kernel.check_typed_acquisition_readiness(task_id)?;
+    // M6-B.5 B5.1 gate: a `SECURITY_V1` AgentType revision is a full-path
+    // identity the coarse acquisition path cannot execute, so it has no eligible
+    // coarse candidate. This is a candidate-local ineligibility, not a Task
+    // failure: the Task stays QUEUED for the B.5 execution path.
+    if kernel.agent_type_security_mode(&agent_type.type_ref)? == SecurityContractMode::SecurityV1 {
+        return Err(ProvisioningResolutionError::NoEligibleSource);
+    }
     let task = kernel.task(task_id)?;
     let partition = kernel.partition(task.partition.as_str())?;
     let (target, _profile) = agentype_execution_config::resolve_target_profile(
@@ -733,6 +741,13 @@ fn enumerate_candidates(
         let source = kernel
             .get_spawn_source(&source_ref)?
             .ok_or_else(|| ProvisioningResolutionError::MissingRevision("spawn_source".into()))?;
+        // M6-B.5 B5.1 gate: a `SECURITY_V1` source revision is a full-path
+        // source even when it adds no `P_source` narrowing. The coarse path
+        // cannot run its imported-enforcement coverage check, so the source is
+        // not a coarse candidate.
+        if kernel.spawn_source_security_mode(&source_ref)? == SecurityContractMode::SecurityV1 {
+            continue;
+        }
         let policy = kernel
             .get_adapter_binding_policy(&source.adapter_policy)?
             .ok_or_else(|| {
@@ -1487,7 +1502,8 @@ mod tests {
     use agentype_agent_contract::{
         canonical_json_body_digest, AffinityConstraint, AgentRequirementDraft, AgentType,
         AgentTypeContract, AgentTypeSelector, Budget, ConfigDigest, ContinuityMode, CredentialRef,
-        LifecycleMode, SecurityContract, SourceStatus,
+        EnforcementProfileRef, LifecycleMode, NormalizedSandboxPolicy, SecurityContract,
+        SourceStatus, SpawnSourceSecurityDeclaration,
     };
     use agentype_core::{
         Clock, FailureClass, LogicalAgentState, ManualClock, PartitionSpec, RawWorkIntent,
@@ -4612,6 +4628,141 @@ mod tests {
             .evidence
             .enforceable_safety()
             .enforces_workspace(WorkspaceMode::ReadOnly));
+    }
+
+    #[test]
+    fn a_security_v1_agent_type_has_no_coarse_candidate() {
+        let kernel = kernel();
+        // Publish an otherwise fully eligible coarse source/config so the only
+        // reason for exclusion is the AgentType's security mode.
+        let _coarse = publish(&kernel);
+        let reference = SandboxPolicyRef::new("agent-policy", 1).unwrap();
+        kernel
+            .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::deny_all())
+            .unwrap();
+        let agent = AgentType {
+            type_ref: AgentTypeRef::new("secure-reviewer", 1).unwrap(),
+            based_on: None,
+            contract: AgentTypeContract {
+                allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                required_capabilities: BTreeMap::new(),
+                affinity: AffinityConstraint::Any,
+                budget_ceiling: Budget::new(100.0).unwrap(),
+                security: SecurityContract {
+                    workspace: WorkspaceMode::ReadOnly,
+                    network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                },
+                lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+                continuity: ContinuityMode::None,
+                sandbox_policy: Some(reference),
+                anchor_constraint: None,
+            },
+        };
+        kernel
+            .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+            .unwrap();
+        let task = typed_task(&kernel, agent.type_ref);
+
+        // A SECURITY_V1 identity is not eligible for the coarse path even when a
+        // legal coarse source exists, and the failure is candidate-local so the
+        // Task stays QUEUED for the B.5 execution path.
+        let error = resolve_source_candidates(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProvisioningResolutionError::NoEligibleSource
+        ));
+        assert!(error.is_candidate_local_for_dispatch());
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_security_v1_source_is_not_a_coarse_candidate() {
+        let kernel = kernel();
+        let agent = AgentType {
+            type_ref: AgentTypeRef::new("reviewer", 1).unwrap(),
+            based_on: None,
+            contract: AgentTypeContract {
+                allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                required_capabilities: BTreeMap::new(),
+                affinity: AffinityConstraint::Any,
+                budget_ceiling: Budget::new(100.0).unwrap(),
+                security: SecurityContract {
+                    workspace: WorkspaceMode::ReadOnly,
+                    network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                },
+                lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+                continuity: ContinuityMode::None,
+                sandbox_policy: None,
+                anchor_constraint: None,
+            },
+        };
+        kernel.publish_agent_type(&agent).unwrap();
+
+        let policy = AdapterBindingPolicy {
+            policy_ref: AdapterPolicyRef::new("policy", 1).unwrap(),
+            adapter_kind: "default".into(),
+            binding_ref: "primary".into(),
+            required_safety: safety(),
+            status: ConfigStatus::Active,
+        };
+        kernel.publish_adapter_binding_policy(&policy).unwrap();
+        let source = SpawnSource {
+            source_ref: SpawnSourceRef::new("source", 1).unwrap(),
+            adapter_policy: policy.policy_ref.clone(),
+            lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
+            continuity_modes: [ContinuityMode::None].into_iter().collect(),
+            functional_envelope: BTreeMap::new(),
+            claims: Vec::new(),
+            status: SourceStatus::Active,
+        };
+        // `P_source = Top` adds no narrowing but never means "coarse eligible":
+        // the declaration itself makes the revision SECURITY_V1.
+        kernel
+            .publish_spawn_source_with_security(
+                &source,
+                Some(&SpawnSourceSecurityDeclaration::without_policy(
+                    EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
+                )),
+            )
+            .unwrap();
+
+        let body = json!({"model": "opaque"});
+        let config = SourceConfig {
+            config_ref: SourceConfigRef::new(source.source_ref.clone(), "config", 1).unwrap(),
+            config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: Vec::new(),
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        };
+        kernel
+            .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+            .unwrap();
+        let task = typed_task(&kernel, agent.type_ref);
+
+        let candidates = resolve_source_candidates(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
     }
 
     /// Materializer that fails, as an uninstalled source integration would.

@@ -615,6 +615,12 @@ pub fn active_catalog_frontier_digest(tx: &Transaction<'_>) -> Result<String, Er
             .ok_or_else(|| Error::invariant("active spawn source vanished"))?;
         let policy = crate::catalog::get_adapter_binding_policy(tx, &loaded.adapter_policy)?
             .ok_or_else(|| Error::invariant("active source policy vanished"))?;
+        // A source's security declaration is part of its selection identity: a
+        // new declaration (or a different authored `P_source`) can change which
+        // acquisition path may select it, so it must invalidate a stale
+        // resolver snapshot exactly like a new source/config revision does.
+        let security_mode = crate::catalog::spawn_source_security_mode(tx, &source)?;
+        let declaration = crate::catalog::spawn_source_security_declaration(tx, &source)?;
         entries.push(json!({
             "kind": "SOURCE",
             "source_id": source.id().as_str(),
@@ -623,6 +629,24 @@ pub fn active_catalog_frontier_digest(tx: &Transaction<'_>) -> Result<String, Er
             "policy_revision": loaded.adapter_policy.revision(),
             // Policy disposition affects durable eligibility (ACTIVE required).
             "policy_status": config_status_sql(policy.status),
+            "security_contract_mode": security_mode.as_str(),
+            "source_policy": declaration.as_ref().and_then(|d| d.source_policy()).map(|input| {
+                json!({
+                    "reference": input.reference().map(|r| json!({
+                        "id": r.id().as_str(),
+                        "revision": r.revision(),
+                    })),
+                    "digest": input.policy_digest(),
+                })
+            }),
+            "enforcement_profile": declaration.as_ref().map(|d| {
+                let profile = d.enforcement_profile();
+                json!({
+                    "protocol": profile.protocol(),
+                    "profile": profile.profile(),
+                    "version": profile.version(),
+                })
+            }),
         }));
         for config in list_active_source_config_refs(tx, &source)? {
             entries.push(json!({
@@ -1074,6 +1098,15 @@ fn finish_acquisition(
     }
     let (actual, _status) = crate::catalog::get_agent_type(tx, &bound)?
         .ok_or_else(|| Error::invariant("agent type binding references a missing revision"))?;
+    // M6-B.5 B5.1 gate: an AgentType revision whose immutable security mode is
+    // `SECURITY_V1` is a full-path identity. The coarse acquisition path cannot
+    // discharge its contract, so it MUST NOT execute under this type even though
+    // the type is semantically executable.
+    if crate::catalog::agent_type_security_mode(tx, &bound)? == SecurityContractMode::SecurityV1 {
+        return Err(Error::invalid_authority(
+            "a SECURITY_V1 agent type requires the B5 security execution path; the coarse typed acquisition path cannot execute it",
+        ));
+    }
     let catalog = crate::catalog::load_capability_catalog(tx)?;
     agentype_agent_contract::can_execute(&actual, &requirement.hard, &catalog)
         .map_err(acquisition_rejection)?;
@@ -1095,6 +1128,17 @@ fn finish_acquisition(
     // mutation between resolution and commitment cannot bypass them.
     let source = crate::catalog::load_spawn_source(tx, &selection.spawn_source)?
         .ok_or_else(|| Error::invariant("selected spawn source revision is missing"))?;
+    // M6-B.5 B5.1 gate: a `SECURITY_V1` source revision is a full-path source
+    // even when it declares no authored `P_source` ceiling (`P_source = Top`
+    // never means "eligible for the coarse path"). The coarse path cannot run
+    // its imported-enforcement coverage check, so it MUST NOT select one.
+    if crate::catalog::spawn_source_security_mode(tx, &selection.spawn_source)?
+        == SecurityContractMode::SecurityV1
+    {
+        return Err(Error::invalid_authority(
+            "a SECURITY_V1 spawn source requires the B5 security execution path; the coarse typed acquisition path cannot select it",
+        ));
+    }
     if source.adapter_policy != selection.adapter_policy {
         return Err(Error::invalid_authority(
             "selected adapter policy is not the source's policy",

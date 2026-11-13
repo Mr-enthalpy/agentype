@@ -11,10 +11,11 @@
 use agentype_agent_contract::{
     canonical_json_body_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
     AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget,
-    ConfigDigest, ConfigStatus, ContinuityMode, GenerationPolicy, LifecycleMode,
-    MaterializationDigest, NetworkPolicy, NormalizedSandboxPolicy, PhysicalSafety,
+    ConfigDigest, ConfigStatus, ContinuityMode, EnforcementProfileRef, GenerationPolicy,
+    LifecycleMode, MaterializationDigest, NetworkPolicy, NormalizedSandboxPolicy, PhysicalSafety,
     ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityContract, SecurityContractMode,
     SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
+    SpawnSourceSecurityDeclaration,
 };
 use agentype_core::{
     Clock, Error, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent, Retention,
@@ -131,9 +132,49 @@ fn publish_agent_type(kernel: &Kernel, id: &str) -> AgentTypeRef {
     agent.type_ref
 }
 
+/// Publish one `SECURITY_V1` AgentType whose authored policy projects to its
+/// `ReadOnly` / `Disabled` coarse contract.
+fn publish_security_agent_type(kernel: &Kernel, id: &str) -> AgentTypeRef {
+    let reference = policy_ref(&format!("agent-policy-{id}"));
+    kernel
+        .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::deny_all())
+        .unwrap();
+    let agent = AgentType {
+        type_ref: type_ref(id),
+        based_on: None,
+        contract: AgentTypeContract {
+            allowed_information_functions: vec![InformationFunction::Expand],
+            required_capabilities: BTreeMap::new(),
+            affinity: AffinityConstraint::Any,
+            budget_ceiling: Budget::new(100.0).unwrap(),
+            security: SecurityContract {
+                workspace: WorkspaceMode::ReadOnly,
+                network: NetworkPolicy::Disabled,
+                requires_attempt_isolation: false,
+            },
+            lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+            continuity: ContinuityMode::None,
+            sandbox_policy: Some(reference),
+            anchor_constraint: None,
+        },
+    };
+    kernel
+        .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+        .unwrap();
+    agent.type_ref
+}
+
 /// Publish one real `AdapterBindingPolicy` + `SpawnSource` + `SourceConfig` trio
 /// and return the resolver-shaped selection that matches it exactly.
 fn catalog(kernel: &Kernel, tag: &str) -> ResolvedProvisioningSelection {
+    catalog_with_security(kernel, tag, None)
+}
+
+fn catalog_with_security(
+    kernel: &Kernel,
+    tag: &str,
+    declaration: Option<&SpawnSourceSecurityDeclaration>,
+) -> ResolvedProvisioningSelection {
     let policy = AdapterBindingPolicy {
         policy_ref: AdapterPolicyRef::new(format!("policy-{tag}"), 1).unwrap(),
         adapter_kind: "default".into(),
@@ -152,7 +193,9 @@ fn catalog(kernel: &Kernel, tag: &str) -> ResolvedProvisioningSelection {
         claims: Vec::new(),
         status: SourceStatus::Active,
     };
-    kernel.publish_spawn_source(&source).unwrap();
+    kernel
+        .publish_spawn_source_with_security(&source, declaration)
+        .unwrap();
 
     let body = json!({"model": "opaque"});
     let config_digest = ConfigDigest::new(canonical_json_body_digest(&body)).unwrap();
@@ -303,6 +346,17 @@ fn admit_coarse_v1_task(kernel: &Kernel, type_id: &str) -> (TaskId, AgentTypeRef
     (task, pin)
 }
 
+/// Admit one `COARSE_V1` typed Task pinned to an already-published AgentType.
+fn admit_coarse_task_for_pin(kernel: &Kernel, pin: AgentTypeRef) -> TaskId {
+    let generation = kernel.create_generation(json!({})).unwrap();
+    compile_and_admit(
+        kernel,
+        &generation.generation_id,
+        pin,
+        SecurityContractMode::CoarseV1,
+    )
+}
+
 fn count(env: &Env, table: &str) -> i64 {
     env.raw()
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -418,4 +472,92 @@ fn coarse_and_legacy_tasks_are_not_gated() {
         .unwrap()
         .expect("legacy claim is unchanged");
     assert_eq!(claim.task_id, legacy);
+}
+
+/// Drop every trigger so a test can simulate a bypassing direct-SQL writer.
+fn execute_without_guards(env: &Env, sql: &str) {
+    let conn = env.raw();
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='trigger'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    for name in names {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))
+            .unwrap();
+    }
+    conn.execute(sql, []).unwrap();
+}
+
+#[test]
+fn a_typed_task_missing_its_requirement_row_fails_closed() {
+    let env = Env::new("missing-requirement");
+    let kernel = &env.kernel;
+    let (task, _pin) = admit_coarse_v1_task(kernel, "reviewer");
+    kernel.check_typed_acquisition_readiness(&task).unwrap();
+
+    // The TYPED mirror survives but the requirement row (the sole owner of the
+    // security mode) is gone: readiness must not silently treat this as LEGACY.
+    execute_without_guards(
+        &env,
+        &format!(
+            "DELETE FROM task_agent_requirements WHERE task_id='{}'",
+            task.as_str()
+        ),
+    );
+    let error = kernel.check_typed_acquisition_readiness(&task).unwrap_err();
+    assert!(
+        matches!(error, Error::InvariantViolation(_)),
+        "expected an invariant violation, got {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("missing its agent requirement mode"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_coarse_task_cannot_execute_a_security_v1_agent_type() {
+    let env = Env::new("security-type");
+    let kernel = &env.kernel;
+    let pin = publish_security_agent_type(kernel, "secure-auditor");
+    let task = admit_coarse_task_for_pin(kernel, pin.clone());
+    let selection = catalog(kernel, "security-type");
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    let error = kernel
+        .acquire_typed_task_existing(&task, &agent, &selection, &registry())
+        .unwrap_err();
+    assert_gate_rejection(&error);
+    assert!(error.to_string().contains("agent type"), "{error}");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+#[test]
+fn a_coarse_task_cannot_select_a_security_v1_source_even_without_a_ceiling() {
+    let env = Env::new("security-source");
+    let kernel = &env.kernel;
+    let (task, pin) = admit_coarse_v1_task(kernel, "reviewer");
+    // `P_source = Top` adds no narrowing but the revision is still SECURITY_V1;
+    // it must never fall back to the coarse path.
+    let declaration = SpawnSourceSecurityDeclaration::without_policy(
+        EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
+    );
+    let selection = catalog_with_security(kernel, "security-source", Some(&declaration));
+    let agent = kernel.ready_agent("general").unwrap();
+    kernel.bind_logical_agent_type(&agent, &pin).unwrap();
+
+    let error = kernel
+        .acquire_typed_task_existing(&task, &agent, &selection, &registry())
+        .unwrap_err();
+    assert_gate_rejection(&error);
+    assert!(error.to_string().contains("spawn source"), "{error}");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
 }
