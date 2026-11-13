@@ -698,6 +698,43 @@ changes the accepted input language, not the canonical bytes of an already
 accepted policy, and still requires an explicit version decision rather than a
 silent relaxation.
 
+#### v1 name, map and document bounds
+
+The remaining set and map dimensions use the same resource argument. One
+allowed-name set (`tools`, `commands` or allowed environment names) has at most
+256 distinct members; a policy's `required_values` map, credential grant map and
+resource ceiling map each have at most 256 entries; and one credential grant has
+at most 256 `uses` and 256 `audience` members. `NameSet::allowed`,
+`EnvironmentPolicy::new`, `CredentialGrant::new`, `RequiredAccess::new` and
+`NormalizedSandboxPolicy::from_parts` reject an oversized collection, and the
+decoder rejects it before constructing a partial policy.
+
+Those per-dimension bounds alone still allow a maximal policy to be physically
+large, so one canonical sandbox policy document is additionally limited to
+1,048,576 bytes. `sandbox_policy_from_canonical_json` checks the document length
+before parsing, and the catalog publisher checks the canonical encoding before
+hashing or storing it. An oversized document is rejected at the input boundary;
+it is never stored and then rejected on every read. As with the path bounds,
+these are v1 input-grammar limits: they do not change the canonical bytes of an
+accepted policy, and relaxing them requires an explicit version decision.
+
+#### v1 `ToolCommandSet` is one abstract operation namespace
+
+The v1 projection dimension is `ToolCommandSet`, not separate `Tool` and
+`Command` operations. A policy stores two authoring allowlists, `tools` and
+`commands`, but `PolicyAccess::allows_tool_or_command` and the capability
+projection use their union as one abstract operation namespace: a required
+operation named `"git"` is satisfied by `tools = {"git"}`, by
+`commands = {"git"}`, or by both. v1 does not distinguish a tool invocation from
+a command invocation that share a name, and it does not promise that a physical
+compiler can enforce that distinction.
+
+If B5.2/B5.4 need different enforceability guarantees for tool and command
+invocation, that requires a new policy canonical/schema version and separate
+versioned projection operations. The same string MUST NOT be reinterpreted as a
+tool or a command only by the physical compiler, because that would silently
+change the meaning of an already-published capability projection.
+
 #### Visibility is observability, not an access precondition
 
 `FilePolicy.visible` is the set of path regions the execution may observe while
