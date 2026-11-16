@@ -325,8 +325,9 @@ carrier. A plan whose policy bit is true without a matching guarantee must be
 unreachable under that composition; a defensive invariant rejects it if a future
 change breaks the disjunction.
 
-**Status.** Open in the record; fixed by PR #34, stacked on PR #31. Blocks B5.4's
-committed execution request, not the current acquisition gate.
+**Status.** Open in the record. Proposed in PR #34, stacked on PR #31; this
+record does not count the finding as closed until that pull request merges.
+Blocks B5.4's committed execution request, not the current acquisition gate.
 
 ### P2-1 — the profile is never bound to its adapter binding or its subject
 
@@ -473,8 +474,9 @@ SQL corruption test: insert a legal blocked row, lower its recorded cost below t
 budget with a raw `UPDATE`, and assert the validated read returns an invariant
 failure rather than a block.
 
-**Status.** Open in the record; fixed by PR #34, stacked on PR #31, which also
-validates the two timestamps. This is a truth gap in the diagnostic, not an
+**Status.** Open in the record. Proposed in PR #34, stacked on PR #31, which also
+validates the two timestamps; this record does not count the finding as closed
+until that pull request merges. This is a truth gap in the diagnostic, not an
 execution-authority bypass.
 
 ### Positive correction from the re-audit
