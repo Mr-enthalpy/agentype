@@ -109,6 +109,7 @@ meet_algorithm_version
 adapter_kind
 adapter_binding_key
 enforcement_profile_digest
+execution_guarantees_digest
 compiler_protocol_version
 ```
 
@@ -118,6 +119,19 @@ therefore explicit key components: an algorithm change cannot reuse a compile
 result produced under different semantics even when the resulting bytes happen to
 match. The derivation identity recorded in the snapshot and the cache key agree on
 the same two versions.
+
+The same reasoning binds the composed execution guarantees. A guarantee — the
+Task's durable requirement, the bound AgentType's contract, or the effective
+policy's own isolation bit — contributes obligations to
+`RequiredEnforcementFeatures` **without** changing the effective-policy bytes. A
+key built only from the policy digest would therefore let a result compiled
+without `ATTEMPT_ISOLATION` be reused for a plan that requires it. The key
+commits to the canonical guarantee document (`execution_guarantees_digest`)
+rather than to a single boolean so that a guarantee added later cannot enter the
+obligation relation while leaving the key unchanged. For the same reason the plan
+digest carries the guarantee, and `ENFORCEMENT_COMPILER_PROTOCOL` is
+`agentype-enforcement-compile/2`: a `/1` result carries neither the composed
+guarantee nor its digest and MUST NOT be reused.
 
 The key is scoped to a verifiable profile version and exact physical domain. The
 cache memoizes **only** the pure compile result. It is not an eligibility proof:
