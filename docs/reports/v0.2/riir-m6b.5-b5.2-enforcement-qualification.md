@@ -34,9 +34,9 @@ requirement on the complete effective policy.
 | Revision | Head | Change |
 |---|---|---|
 | 1 | `d14137f` | First audit record over `c0497eb..d3ab482`; docs-only. |
-| 2 | `a8117fc` | Records the independent re-audit: two revision-1 claims corrected, six findings added (two P1, four P2), B5.1 handoff table added. Still docs-only; no code, ADR, spec or index change. |
+| 2 | `6a3318d` | Records the independent re-audit: two revision-1 claims corrected, six findings added (two P1, four P2), B5.1 handoff table added. Still docs-only; no code, ADR, spec or index change. |
 | 3 | `aa2f3b8` | Records the P2-3 decision: ADR-0014 §4 and this record state that durable-block idempotence is scoped to the currently stored condition, instead of adding a per-condition history table. Docs-only; no code, schema, ADR `Status:` line, spec or index change. |
-| 4 | this commit | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
+| 4 | `983bc16` | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
