@@ -38,6 +38,12 @@ pub fn record_security_acquisition_block(
     tx: &Transaction<'_>,
     block: &SecurityAcquisitionBlock,
 ) -> Result<(), Error> {
+    // The write boundary re-proves the value object's over-budget truth before it
+    // reads any field. A hand-built or stale block must not become a durable
+    // diagnostic just because its release fields happen to be consistent.
+    block
+        .validate_durable_truth()
+        .map_err(|error| Error::invariant(error.to_string()))?;
     if !block.is_blocked() {
         return Err(Error::invalid_authority(
             "a released security acquisition block is not a current condition",

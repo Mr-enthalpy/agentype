@@ -1201,3 +1201,210 @@ fn a_durable_block_row_cannot_have_inconsistent_release_fields() {
     .unwrap_err();
     assert!(matches!(error, ContractError::InvariantViolation(_)));
 }
+
+// =============================================================================
+// The composed execution guarantee reaches the plan (ADR-0013 §3)
+// =============================================================================
+
+/// `confined_policy` plus the isolation bit, so a layer can author the guarantee
+/// without widening any operation set.
+fn isolating_policy() -> NormalizedSandboxPolicy {
+    let mut parts = confined_policy().parts().clone();
+    parts.attempt_isolation = true;
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+/// A fixture whose profile supports every feature, so an `AttemptIsolation`
+/// obligation is never rejected for lack of profile support.
+fn isolation_fixture() -> Fixture {
+    Fixture::compose(
+        confined_policy(),
+        requirement(),
+        full_support_profile(),
+        NormalizedSandboxPolicy::top(),
+        NormalizedSandboxPolicy::top(),
+        &RequiredAccess::empty(),
+    )
+}
+
+fn compile(fixture: &Fixture) -> CompiledExecutionSecurity {
+    compile_execution_security(
+        &fixture.authority(),
+        &adapter_binding(ConfigStatus::Active),
+        &fixture.profile,
+    )
+    .unwrap()
+}
+
+fn assert_agrees(compiled: &CompiledExecutionSecurity, expected: bool) {
+    let plan = compiled.plan();
+    assert_eq!(
+        plan.attempt_isolation(),
+        expected,
+        "the plan accessor must be the composed guarantee"
+    );
+    assert_eq!(
+        plan.guarantees().requires_attempt_isolation(),
+        expected,
+        "the carried guarantee must be the plan accessor's only source"
+    );
+    assert_eq!(
+        plan.obligations()
+            .contains(EnforcementFeature::AttemptIsolation),
+        expected,
+        "the obligation set must agree with the accessor"
+    );
+}
+
+#[test]
+fn the_plan_requests_isolation_from_the_composed_guarantee_not_the_policy_bit() {
+    // Neither the Task nor the AgentType asks for isolation, and no layer authors
+    // the policy bit: nothing requires it.
+    let baseline = compile(&isolation_fixture());
+    assert!(!baseline.plan().effective_policy().attempt_isolation());
+    assert_agrees(&baseline, false);
+
+    // Task-only: every authored policy bit stays false, so the old accessor
+    // (`effective_policy.attempt_isolation()`) would have returned `false` here.
+    // The composed guarantee is the only carrier of the requirement.
+    let mut task_only = isolation_fixture();
+    task_only.requirement.hard.required_attempt_isolation = true;
+    let authority = task_only.authority();
+    assert!(authority.requires_attempt_isolation());
+    assert!(!authority.policy().attempt_isolation());
+    let task = compile(&task_only);
+    assert_agrees(&task, true);
+
+    // AgentType-only: the bound contract requires isolation and its authored
+    // policy projects the same bit.
+    let mut agent_only = isolation_fixture();
+    agent_only
+        .agent
+        .contract
+        .security
+        .requires_attempt_isolation = true;
+    agent_only.agent_policy = isolating_policy();
+    let authority = agent_only.authority();
+    assert!(authority.requires_attempt_isolation());
+    let agent = compile(&agent_only);
+    assert_agrees(&agent, true);
+
+    // The guarantee bit is plan identity: the Task-only and AgentType-only
+    // digests differ from the unguarded one even though the operation sets are
+    // identical.
+    assert_ne!(baseline.plan().plan_digest(), task.plan().plan_digest());
+    assert_ne!(baseline.plan().plan_digest(), agent.plan().plan_digest());
+    assert_ne!(task.plan().plan_digest(), agent.plan().plan_digest());
+}
+
+#[test]
+fn a_policy_authored_isolation_bit_is_never_silently_dropped() {
+    // Only the SpawnSource ceiling authors isolation. `requires_attempt_isolation`
+    // (Task requirement ∨ AgentType contract) is false, so the guarantee must take
+    // the effective-policy bit as well; otherwise the plan would expose `false`
+    // while its own obligations contain `AttemptIsolation`.
+    let mut source_only = isolation_fixture();
+    source_only.source_policy = isolating_policy();
+    source_only.declaration = SpawnSourceSecurityDeclaration::with_policy(
+        PolicyInput::authored(policy_ref("source-policy", 1), &source_only.source_policy),
+        source_only.profile.reference().clone(),
+    );
+    let authority = source_only.authority();
+    assert!(!authority.requires_attempt_isolation());
+    assert!(authority.policy().attempt_isolation());
+
+    let compiled = compile(&source_only);
+    assert_agrees(&compiled, true);
+}
+
+// =============================================================================
+// The durable block re-proves its over-budget truth (ADR-0014 §4)
+// =============================================================================
+
+#[test]
+fn a_durable_block_whose_cost_is_inside_its_budget_is_rejected() {
+    // The in-memory producer cannot build this: `BudgetExhaustion` is only
+    // constructible by `require_whole_round`. The durable constructor must
+    // re-check, because a hand-written row reaches it field by field.
+    let error = SecurityAcquisitionBlock::from_durable_parts(
+        TaskId::from_string("task-1"),
+        GenerationId::from_string("generation-1"),
+        "sha256:domain".into(),
+        1,
+        "sha256:binding".into(),
+        AcquisitionCost::new(0, 0),
+        AcquisitionBudget::new(10, 10).unwrap(),
+        BudgetLimit::CandidateCount,
+        SecurityAcquisitionBlockStatus::Blocked,
+        100.0,
+        None,
+        None,
+    )
+    .unwrap_err();
+    let ContractError::InvariantViolation(reason) = error else {
+        panic!("a non-exhausted block must be an invariant violation");
+    };
+    assert!(reason.contains("inside its budget"), "{reason}");
+}
+
+#[test]
+fn a_durable_block_must_record_the_limit_that_was_actually_exceeded() {
+    // Candidates are over budget but the row claims the compile bound.
+    let error = SecurityAcquisitionBlock::from_durable_parts(
+        TaskId::from_string("task-1"),
+        GenerationId::from_string("generation-1"),
+        "sha256:domain".into(),
+        2,
+        "sha256:binding".into(),
+        AcquisitionCost::new(2, 0),
+        AcquisitionBudget::new(1, 10).unwrap(),
+        BudgetLimit::CompileCount,
+        SecurityAcquisitionBlockStatus::Blocked,
+        100.0,
+        None,
+        None,
+    )
+    .unwrap_err();
+    let ContractError::InvariantViolation(reason) = error else {
+        panic!("a mismatched limit must be an invariant violation");
+    };
+    assert!(reason.contains("CANDIDATE_COUNT"), "{reason}");
+    assert!(reason.contains("COMPILE_COUNT"), "{reason}");
+
+    // The same cost and budget with the correct limit is accepted.
+    SecurityAcquisitionBlock::from_durable_parts(
+        TaskId::from_string("task-1"),
+        GenerationId::from_string("generation-1"),
+        "sha256:domain".into(),
+        2,
+        "sha256:binding".into(),
+        AcquisitionCost::new(2, 0),
+        AcquisitionBudget::new(1, 10).unwrap(),
+        BudgetLimit::CandidateCount,
+        SecurityAcquisitionBlockStatus::Blocked,
+        100.0,
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_durable_block_rejects_an_invalid_timestamp() {
+    let error = SecurityAcquisitionBlock::from_durable_parts(
+        TaskId::from_string("task-1"),
+        GenerationId::from_string("generation-1"),
+        "sha256:domain".into(),
+        2,
+        "sha256:binding".into(),
+        AcquisitionCost::new(2, 2),
+        AcquisitionBudget::new(1, 1).unwrap(),
+        BudgetLimit::CandidateCount,
+        SecurityAcquisitionBlockStatus::Blocked,
+        f64::NAN,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ContractError::InvariantViolation(_)));
+}
