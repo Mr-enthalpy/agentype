@@ -312,14 +312,21 @@ isolation.
 
 **Required fix.** Carry `EffectiveExecutionGuarantees` on
 `PolicyEnforcementPlan`, make `attempt_isolation()` read the carried guarantee,
-add the guarantee bit to the plan digest, and expose it as plan identity. Add a
-Task-only / AgentType-only / neither matrix asserting that the plan accessor, the
-obligation set and the digest agree, including a direct compile where the policy
-bit is false and the guarantee is true. A plan whose policy bit is true without a
-guarantee should fail closed rather than silently drop the requirement.
+add the guarantee bit to the plan digest, and expose it as plan identity. The
+composed guarantee is the disjunction of the Task requirement, the AgentType
+contract and the effective policy bit, which already folds every authored layer
+(Generation, Task and SpawnSource): a Task-only or AgentType-only requirement
+then survives a wider policy, and a policy-authored bit is never silently
+dropped. Add a Task-only / AgentType-only / neither matrix asserting that the
+plan accessor, the obligation set and the digest agree, including a direct
+compile where every authored policy bit is false and only the Task requirement
+asks for isolation, plus a source-only case where the policy bit is the only
+carrier. A plan whose policy bit is true without a matching guarantee must be
+unreachable under that composition; a defensive invariant rejects it if a future
+change breaks the disjunction.
 
-**Status.** Open; fix in a follow-up code pull request. Blocks B5.4's committed
-execution request, not the current acquisition gate.
+**Status.** Open in the record; fixed by PR #34, stacked on PR #31. Blocks B5.4's
+committed execution request, not the current acquisition gate.
 
 ### P2-1 — the profile is never bound to its adapter binding or its subject
 
@@ -466,8 +473,9 @@ SQL corruption test: insert a legal blocked row, lower its recorded cost below t
 budget with a raw `UPDATE`, and assert the validated read returns an invariant
 failure rather than a block.
 
-**Status.** Open; fix in a follow-up code pull request. This is a truth gap in the
-diagnostic, not an execution-authority bypass.
+**Status.** Open in the record; fixed by PR #34, stacked on PR #31, which also
+validates the two timestamps. This is a truth gap in the diagnostic, not an
+execution-authority bypass.
 
 ### Positive correction from the re-audit
 
@@ -724,11 +732,11 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 |---|---|---|
 | 1 | Re-prove `RequiredAccess` on `P_eff` in `qualify_security_candidate` (P1-1) | tool, endpoint and file-operation negatives reject as `SecurityUnenforceable`; positive compiles. Proposed in PR #31, including the digest re-projection |
 | 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Proposed in PR #31 |
-| 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation |
+| 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
 | 4 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives |
 | 5 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
 | 6 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
-| 7 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read |
+| 7 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1` |
 
 Items 1–5 and 7 are code changes and belong in follow-up pull requests, not in
