@@ -42,10 +42,16 @@ use std::collections::BTreeSet;
 pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 1;
 /// Version tag of the compiled plan document.
 pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 2;
+/// Version tag of the canonical execution-guarantee document that the compile
+/// cache key commits to.
+pub const ENFORCEMENT_GUARANTEES_SCHEMA_VERSION: u32 = 1;
 /// The compiler protocol this build implements. It is part of the plan digest
 /// and the memoization key: a compiler semantic change cannot reuse an old
 /// result even when the inputs are byte-identical.
-pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/1";
+///
+/// `/2` records that the plan and the cache key now carry the composed
+/// execution guarantees, so a `/1` result must never be reused.
+pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/2";
 
 /// The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile identity
 /// (ADR-0014 §14). This is a positive minimum target, not a claim that a
@@ -190,6 +196,20 @@ impl EffectiveExecutionGuarantees {
     pub fn requires_attempt_isolation(&self) -> bool {
         self.requires_attempt_isolation
     }
+}
+
+/// Canonical identity of the composed execution guarantees.
+///
+/// A guarantee contributes obligations without changing the effective-policy
+/// bytes, so the policy digest alone cannot distinguish two compile inputs whose
+/// obligation sets differ. The compile cache key therefore commits to this
+/// digest is an explicit key component (ADR-0014 §4).
+pub fn effective_execution_guarantees_digest(guarantees: EffectiveExecutionGuarantees) -> String {
+    canonical_json_body_digest(&json!({
+        "kind": "EFFECTIVE_EXECUTION_GUARANTEES",
+        "schema": ENFORCEMENT_GUARANTEES_SCHEMA_VERSION,
+        "requires_attempt_isolation": guarantees.requires_attempt_isolation(),
+    }))
 }
 
 /// The obligations derived through the single normative relation
@@ -414,11 +434,13 @@ fn profile_digest(
     }))
 }
 
-/// The seven-part compile memoization key (ADR-0014 §4).
+/// The eight-part compile memoization key (ADR-0014 §4).
 ///
 /// The effective-policy digest commits to canonical bytes, not to the
 /// normalization and meet algorithm versions that produced them, so both
-/// versions are explicit components.
+/// versions are explicit components. The same reasoning applies to the composed
+/// guarantees: they change the obligations without changing the policy bytes, so
+/// their digest is an explicit component too.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompileCacheKey {
     effective_policy_digest: String,
@@ -427,6 +449,7 @@ pub struct CompileCacheKey {
     adapter_kind: String,
     adapter_binding_key: String,
     enforcement_profile_digest: String,
+    execution_guarantees_digest: String,
     compiler_protocol_version: String,
 }
 
@@ -438,6 +461,7 @@ impl CompileCacheKey {
         adapter_kind: impl Into<String>,
         adapter_binding_key: impl Into<String>,
         enforcement_profile_digest: impl Into<String>,
+        execution_guarantees_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
         let key = Self {
             effective_policy_digest: effective_policy_digest.into(),
@@ -446,6 +470,7 @@ impl CompileCacheKey {
             adapter_kind: adapter_kind.into(),
             adapter_binding_key: adapter_binding_key.into(),
             enforcement_profile_digest: enforcement_profile_digest.into(),
+            execution_guarantees_digest: execution_guarantees_digest.into(),
             compiler_protocol_version: ENFORCEMENT_COMPILER_PROTOCOL.to_string(),
         };
         for (value, what) in [
@@ -455,6 +480,10 @@ impl CompileCacheKey {
             (
                 &key.enforcement_profile_digest,
                 "enforcement profile digest",
+            ),
+            (
+                &key.execution_guarantees_digest,
+                "execution guarantees digest",
             ),
         ] {
             if value.trim().is_empty() {
@@ -493,6 +522,10 @@ impl CompileCacheKey {
 
     pub fn enforcement_profile_digest(&self) -> &str {
         &self.enforcement_profile_digest
+    }
+
+    pub fn execution_guarantees_digest(&self) -> &str {
+        &self.execution_guarantees_digest
     }
 
     pub fn compiler_protocol_version(&self) -> &str {
@@ -839,6 +872,7 @@ pub fn compile_execution_security(
         &binding.adapter_kind,
         &binding.binding_ref,
         profile.profile_digest(),
+        effective_execution_guarantees_digest(guarantees),
     )?;
     let plan = PolicyEnforcementPlan {
         effective_policy,

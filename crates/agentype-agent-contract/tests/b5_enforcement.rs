@@ -574,7 +574,7 @@ fn compilation_returns_a_root_relative_plan_and_a_partial_subject() {
     );
     assert!(plan.plan_digest().starts_with("sha256:"));
 
-    // The cache key commits to all seven components.
+    // The cache key commits to all eight components.
     let key = compiled.cache_key();
     assert_eq!(
         key.effective_policy_digest(),
@@ -593,6 +593,10 @@ fn compilation_returns_a_root_relative_plan_and_a_partial_subject() {
     assert_eq!(
         key.enforcement_profile_digest(),
         fixture.profile.profile_digest()
+    );
+    assert_eq!(
+        key.execution_guarantees_digest(),
+        effective_execution_guarantees_digest(plan.guarantees())
     );
     assert_eq!(
         key.compiler_protocol_version(),
@@ -729,6 +733,7 @@ fn the_cache_key_rejects_an_incomplete_component() {
             "",
             "binding",
             "sha256:profile",
+            "sha256:guarantees",
         )
         .unwrap_err(),
         ContractError::InvalidRef { .. }
@@ -741,6 +746,22 @@ fn the_cache_key_rejects_an_incomplete_component() {
             "local-process",
             "binding",
             "sha256:profile",
+            "sha256:guarantees",
+        )
+        .unwrap_err(),
+        ContractError::InvalidRef { .. }
+    ));
+    // The guarantee identity is not optional: a key without it would let a
+    // differently obligated plan reuse a compile result.
+    assert!(matches!(
+        CompileCacheKey::new(
+            "sha256:policy",
+            SANDBOX_POLICY_NORMALIZATION_VERSION,
+            SANDBOX_POLICY_MEET_ALGORITHM_VERSION,
+            "local-process",
+            "binding",
+            "sha256:profile",
+            "",
         )
         .unwrap_err(),
         ContractError::InvalidRef { .. }
@@ -1295,6 +1316,23 @@ fn the_plan_requests_isolation_from_the_composed_guarantee_not_the_policy_bit() 
     assert_ne!(baseline.plan().plan_digest(), task.plan().plan_digest());
     assert_ne!(baseline.plan().plan_digest(), agent.plan().plan_digest());
     assert_ne!(task.plan().plan_digest(), agent.plan().plan_digest());
+
+    // The compile cache key must distinguish the same inputs. A Task-only
+    // guarantee does not change the effective-policy bytes, so without the
+    // guarantee component the memoization key would be identical and a result
+    // compiled without `ATTEMPT_ISOLATION` could satisfy a plan that requires it
+    // (ADR-0014 §4 makes the guarantee identity a key component).
+    assert_eq!(
+        baseline.plan().effective_policy(),
+        task.plan().effective_policy(),
+        "the policy bytes are unchanged; only the guarantee differs"
+    );
+    assert_ne!(baseline.cache_key(), task.cache_key());
+    assert_ne!(baseline.cache_key(), agent.cache_key());
+    assert_ne!(
+        baseline.cache_key().execution_guarantees_digest(),
+        task.cache_key().execution_guarantees_digest()
+    );
 }
 
 #[test]
