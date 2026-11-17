@@ -260,13 +260,21 @@ fn coarse_task(kernel: &Kernel, tag: &str) -> (TaskId, GenerationId) {
     (task_id, generation.generation_id)
 }
 
+/// A legal whole-round defer.
+///
+/// The domain holds every observed candidate, so the candidate cost equals the
+/// domain size, and the fixed `(1, 1)` budget is exceeded on both bounds.
 fn defer_block(
     task_id: &TaskId,
     generation_id: &GenerationId,
     agents: &[&str],
-    observed: usize,
 ) -> SecurityAcquisitionBlock {
+    assert!(
+        agents.len() >= 2,
+        "a whole-round defer over a (1, 1) budget needs at least two candidates"
+    );
     let budget = AcquisitionBudget::new(1, 1).unwrap();
+    let observed = agents.len();
     let exhaustion = budget
         .require_whole_round(AcquisitionCost::new(observed, observed))
         .unwrap_err();
@@ -297,7 +305,7 @@ fn one_condition_is_one_durable_diagnostic() {
         .unwrap()
         .is_none());
 
-    let block = defer_block(&task_id, &generation_id, &["agent-a", "agent-b"], 2);
+    let block = defer_block(&task_id, &generation_id, &["agent-a", "agent-b"]);
     kernel.record_security_acquisition_block(&block).unwrap();
     let stored = kernel
         .get_security_acquisition_block(&task_id)
@@ -310,7 +318,7 @@ fn one_condition_is_one_durable_diagnostic() {
 
     // The same indistinguishable condition is a no-op: no second row and no
     // rewritten timestamp.
-    let same = defer_block(&task_id, &generation_id, &["agent-b", "agent-a"], 2);
+    let same = defer_block(&task_id, &generation_id, &["agent-b", "agent-a"]);
     kernel.record_security_acquisition_block(&same).unwrap();
     assert_eq!(db.row_count(), 1);
     assert_eq!(
@@ -323,14 +331,18 @@ fn one_condition_is_one_durable_diagnostic() {
 
     // A different candidate domain is a new condition: the diagnostic fields are
     // replaced in place.
-    let newer = defer_block(&task_id, &generation_id, &["agent-a"], 5);
+    let newer = defer_block(
+        &task_id,
+        &generation_id,
+        &["agent-a", "agent-b", "agent-c", "agent-d", "agent-e"],
+    );
     kernel.record_security_acquisition_block(&newer).unwrap();
     assert_eq!(db.row_count(), 1);
     let replaced = kernel
         .get_security_acquisition_block(&task_id)
         .unwrap()
         .unwrap();
-    assert_eq!(replaced.candidate_count(), 1);
+    assert_eq!(replaced.candidate_count(), 5);
     assert_eq!(replaced.cost(), AcquisitionCost::new(5, 5));
     assert!(replaced.is_blocked());
 }
@@ -341,7 +353,7 @@ fn a_released_condition_is_never_reopened() {
     let kernel = db.kernel(1);
     let (task_id, generation_id) = security_task(&kernel, "release");
 
-    let block = defer_block(&task_id, &generation_id, &["agent-a", "agent-b"], 2);
+    let block = defer_block(&task_id, &generation_id, &["agent-a", "agent-b"]);
     kernel.record_security_acquisition_block(&block).unwrap();
 
     assert!(kernel
@@ -385,7 +397,6 @@ fn a_released_condition_is_never_reopened() {
             &task_id,
             &generation_id,
             &["agent-a", "agent-b"],
-            2,
         ))
         .unwrap();
     let still = kernel
@@ -396,7 +407,7 @@ fn a_released_condition_is_never_reopened() {
     assert_eq!(still.released_at(), Some(1_010.0));
 
     // A genuinely different condition is a new diagnostic and starts BLOCKED.
-    let newer = defer_block(&task_id, &generation_id, &["agent-c"], 3);
+    let newer = defer_block(&task_id, &generation_id, &["agent-c", "agent-d", "agent-e"]);
     kernel.record_security_acquisition_block(&newer).unwrap();
     let reblocked = kernel
         .get_security_acquisition_block(&task_id)
@@ -405,7 +416,7 @@ fn a_released_condition_is_never_reopened() {
     assert!(reblocked.is_blocked());
     assert_eq!(reblocked.released_at(), None);
     assert_eq!(reblocked.release_reason(), None);
-    assert_eq!(reblocked.candidate_count(), 1);
+    assert_eq!(reblocked.candidate_count(), 3);
 }
 
 #[test]
@@ -420,15 +431,18 @@ fn a_block_names_only_its_own_task_generation_and_mode() {
         .record_security_acquisition_block(&defer_block(
             &task_id,
             &foreign_generation,
-            &["agent-a"],
-            2,
+            &["agent-a", "agent-b"],
         ))
         .unwrap_err();
     assert!(matches!(error, Error::InvalidAuthority(_)));
 
     // The real generation is accepted.
     kernel
-        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
         .unwrap();
 
     // The coarse typed path has no candidate-compilation round at all, so a
@@ -438,8 +452,7 @@ fn a_block_names_only_its_own_task_generation_and_mode() {
         .record_security_acquisition_block(&defer_block(
             &coarse_task,
             &coarse_generation,
-            &["agent-a"],
-            2,
+            &["agent-a", "agent-b"],
         ))
         .unwrap_err();
     assert!(matches!(error, Error::Conflict(_)));
@@ -460,7 +473,11 @@ fn a_release_timestamp_must_be_a_real_instant() {
     let kernel = db.kernel(1);
     let (task_id, generation_id) = security_task(&kernel, "timestamp");
     kernel
-        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
         .unwrap();
 
     assert!(kernel
@@ -483,7 +500,11 @@ fn the_durable_row_cannot_be_deleted_or_reopened_by_a_raw_writer() {
     let kernel = db.kernel(1);
     let (task_id, generation_id) = security_task(&kernel, "raw");
     kernel
-        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
         .unwrap();
     kernel
         .release_security_acquisition_block(
@@ -526,7 +547,11 @@ fn a_validated_read_rejects_a_block_whose_cost_is_inside_its_budget() {
     let kernel = db.kernel(2);
     let (task_id, generation_id) = security_task(&kernel, "truth");
     kernel
-        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
         .unwrap();
 
     // The legal row is readable before corruption.
@@ -535,12 +560,14 @@ fn a_validated_read_rejects_a_block_whose_cost_is_inside_its_budget() {
         .unwrap()
         .is_some());
 
-    // Lower the recorded cost below the fixed 1/1 budget with a raw writer. The
-    // row now claims BLOCKED for a round that never exceeded anything.
+    // Widen the recorded budget so the recorded cost no longer exceeds it. The
+    // row now claims BLOCKED for a round that never exceeded anything. Candidate
+    // count stays coherent with the cost on purpose: this test isolates the
+    // budget rule.
     db.raw()
         .execute(
             "UPDATE security_acquisition_blocks
-             SET cost_candidates=0, cost_compiles=0
+             SET budget_max_candidates=5, budget_max_compiles=5
              WHERE task_id=?1",
             [task_id.as_str()],
         )
@@ -557,7 +584,11 @@ fn a_validated_read_rejects_a_block_that_names_the_wrong_limit() {
     let kernel = db.kernel(2);
     let (task_id, generation_id) = security_task(&kernel, "limit");
     kernel
-        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
         .unwrap();
 
     // Both bounds are exceeded; the stored limit must still name the one
@@ -575,4 +606,89 @@ fn a_validated_read_rejects_a_block_that_names_the_wrong_limit() {
     let message = error.to_string();
     assert!(message.contains("CANDIDATE_COUNT"), "{message}");
     assert!(message.contains("COMPILE_COUNT"), "{message}");
+}
+
+#[test]
+fn a_validated_read_rejects_a_block_that_names_another_generation() {
+    let db = Db::new("generation-tamper");
+    let kernel = db.kernel(2);
+    let (task_id, generation_id) = security_task(&kernel, "generation-tamper");
+    kernel
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
+        .unwrap();
+
+    // Every other field stays valid: only the generation names another Task's
+    // dispatch generation, which the write path would have refused.
+    db.raw()
+        .execute(
+            "UPDATE security_acquisition_blocks
+             SET generation_id='generation-other'
+             WHERE task_id=?1",
+            [task_id.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel.get_security_acquisition_block(&task_id).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("Generation"), "{message}");
+}
+
+#[test]
+fn a_validated_read_rejects_a_block_whose_candidate_cost_is_incomplete() {
+    let db = Db::new("count-coherence");
+    let kernel = db.kernel(2);
+    let (task_id, generation_id) = security_task(&kernel, "count-coherence");
+    kernel
+        .record_security_acquisition_block(&defer_block(
+            &task_id,
+            &generation_id,
+            &["agent-a", "agent-b"],
+        ))
+        .unwrap();
+
+    // A whole-round defer observes the complete domain. A domain of five with a
+    // candidate cost of two is not a budget block, even though 2 > 1.
+    db.raw()
+        .execute(
+            "UPDATE security_acquisition_blocks
+             SET candidate_count=5
+             WHERE task_id=?1",
+            [task_id.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel.get_security_acquisition_block(&task_id).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("complete round"), "{message}");
+}
+
+#[test]
+fn a_same_condition_write_revalidates_the_existing_row() {
+    let db = Db::new("same-condition-tamper");
+    let kernel = db.kernel(2);
+    let (task_id, generation_id) = security_task(&kernel, "same-condition-tamper");
+    let block = defer_block(&task_id, &generation_id, &["agent-a", "agent-b"]);
+    kernel.record_security_acquisition_block(&block).unwrap();
+
+    // Corrupt the existing row without changing either key digest, so the
+    // condition is still "the same". A no-op that only compared digests would
+    // report success and leave the block unreadable.
+    db.raw()
+        .execute(
+            "UPDATE security_acquisition_blocks
+             SET budget_max_candidates=5, budget_max_compiles=5
+             WHERE task_id=?1",
+            [task_id.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel
+        .record_security_acquisition_block(&block)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("inside its budget"), "{message}");
 }

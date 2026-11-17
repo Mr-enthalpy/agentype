@@ -1927,6 +1927,14 @@ fn insert_spawn_source_declaration(
     reference: &SpawnSourceRef,
     declaration: &SpawnSourceSecurityDeclaration,
 ) -> Result<(), Error> {
+    // The declaration is provenance-bound to one source revision. The row is
+    // keyed by `(source id, revision)`, so accepting a foreign declaration here
+    // would silently re-bind another revision's ceiling and profile to this one.
+    if declaration.source_ref() != reference {
+        return Err(Error::invariant(
+            "a spawn source security declaration belongs to a different source revision",
+        ));
+    }
     let (policy_id, policy_revision, policy_digest) =
         validated_source_declaration(tx, declaration)?;
     let profile = declaration.enforcement_profile();
@@ -2087,6 +2095,7 @@ pub fn spawn_source_security_declaration(
         }
     };
     Ok(Some(SpawnSourceSecurityDeclaration::new(
+        reference.clone(),
         source_policy,
         enforcement_profile,
     )))

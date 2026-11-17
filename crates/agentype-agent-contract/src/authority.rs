@@ -269,6 +269,18 @@ impl EffectiveTaskAuthority {
             )
         })?;
 
+        // The declaration is provenance-bound to the source revision it was read
+        // for. Without this check a policy-less declaration from another source
+        // could erase this source's authored ceiling, and its enforcement profile
+        // could replace the one this source declared.
+        if source_declaration.source_ref() != &source.source_ref {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason:
+                    "the spawn source security declaration belongs to a different source revision"
+                        .into(),
+            });
+        }
+
         // The source declaration owns the imported profile identity and the
         // authored ceiling identity. A present declaration policy must describe
         // exactly the policy bytes the caller read for that reference; an absent

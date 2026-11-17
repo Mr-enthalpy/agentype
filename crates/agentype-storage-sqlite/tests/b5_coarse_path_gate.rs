@@ -623,8 +623,10 @@ fn a_coarse_task_cannot_select_a_security_v1_source_even_without_a_ceiling() {
     let kernel = &env.kernel;
     let (task, pin) = admit_coarse_v1_task(kernel, "reviewer");
     // `P_source = Top` adds no narrowing but the revision is still SECURITY_V1;
-    // it must never fall back to the coarse path.
+    // it must never fall back to the coarse path. The declaration names the exact
+    // revision `catalog_with_security` publishes.
     let declaration = SpawnSourceSecurityDeclaration::without_policy(
+        SpawnSourceRef::new("source-security-source", 1).unwrap(),
         EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
     );
     let selection = catalog_with_security(kernel, "security-source", Some(&declaration));

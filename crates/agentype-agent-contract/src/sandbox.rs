@@ -26,7 +26,7 @@ use crate::capability::{
     NetworkEndpoint, NetworkTransport, PolicyOperation, MAX_NETWORK_ENDPOINTS,
 };
 use crate::error::ContractError;
-use crate::records::{NetworkPolicy, SandboxPolicyRef, SecurityContract};
+use crate::records::{NetworkPolicy, SandboxPolicyRef, SecurityContract, SpawnSourceRef};
 use agentype_core::WorkspaceMode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2520,32 +2520,50 @@ impl EnforcementProfileRef {
 /// authored `P_source` ceiling, and `None` means `P_source = Top` — it adds no
 /// authored narrowing but still requires the complete full-path checks
 /// (ADR-0013 §11). It is never a "skip eligibility" marker.
+///
+/// The declaration carries the `SpawnSourceRef` it belongs to, so a declaration
+/// read for one revision cannot be composed into another revision's authority:
+/// the only way to obtain a valid one is the validated read, which keys on
+/// `(source id, revision)`. Without it the declaration would be a free-floating
+/// pair of facts, and a source with a narrower ceiling could silently inherit a
+/// policy-less declaration from a different source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnSourceSecurityDeclaration {
+    source_ref: SpawnSourceRef,
     source_policy: Option<PolicyInput>,
     enforcement_profile: EnforcementProfileRef,
 }
 
 impl SpawnSourceSecurityDeclaration {
     pub fn new(
+        source_ref: SpawnSourceRef,
         source_policy: Option<PolicyInput>,
         enforcement_profile: EnforcementProfileRef,
     ) -> Self {
         Self {
+            source_ref,
             source_policy,
             enforcement_profile,
         }
     }
 
-    pub fn without_policy(enforcement_profile: EnforcementProfileRef) -> Self {
-        Self::new(None, enforcement_profile)
+    pub fn without_policy(
+        source_ref: SpawnSourceRef,
+        enforcement_profile: EnforcementProfileRef,
+    ) -> Self {
+        Self::new(source_ref, None, enforcement_profile)
     }
 
     pub fn with_policy(
+        source_ref: SpawnSourceRef,
         source_policy: PolicyInput,
         enforcement_profile: EnforcementProfileRef,
     ) -> Self {
-        Self::new(Some(source_policy), enforcement_profile)
+        Self::new(source_ref, Some(source_policy), enforcement_profile)
+    }
+
+    pub fn source_ref(&self) -> &SpawnSourceRef {
+        &self.source_ref
     }
 
     pub fn source_policy(&self) -> Option<&PolicyInput> {

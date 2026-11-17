@@ -154,6 +154,7 @@ fn the_composite_folds_binding_agent_source_and_task_coarse_modes() {
     let source = source();
     let source_policy = policy(workspace(&["src", "tmp"]), NetworkEndpointSet::any());
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::authored(policy_ref("source-policy", 1), &source_policy),
         EnforcementProfileRef::new("enforcement", "profile", 1).unwrap(),
     );
@@ -232,6 +233,7 @@ fn a_write_task_keeps_only_the_intersection_of_all_three_layers() {
     let source = source();
     let source_policy = policy(workspace(&["src", "tmp"]), NetworkEndpointSet::any());
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::authored(policy_ref("source-policy", 1), &source_policy),
         EnforcementProfileRef::new("enforcement", "profile", 1).unwrap(),
     );
@@ -274,7 +276,9 @@ fn a_coarse_agent_revision_can_never_carry_security_v1_authority() {
         NetworkPolicy::Enabled,
     );
     let coarse = SecurityRevision::new(&agent, SecurityContractMode::CoarseV1, None).unwrap();
+    let source = source();
     let declaration = SpawnSourceSecurityDeclaration::without_policy(
+        source.source_ref.clone(),
         EnforcementProfileRef::new("enforcement", "profile", 1).unwrap(),
     );
 
@@ -286,7 +290,7 @@ fn a_coarse_agent_revision_can_never_carry_security_v1_authority() {
         &binding,
         &requirement,
         &coarse,
-        &source(),
+        &source,
         &declaration,
         None,
     )
@@ -360,7 +364,9 @@ fn the_source_layer_must_match_its_own_declaration() {
 
     let declared = policy(workspace(&["src"]), endpoint());
     let presented = policy(workspace(&["src", "tmp"]), endpoint());
+    let source = source();
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::authored(policy_ref("source-policy", 1), &declared),
         EnforcementProfileRef::new("enforcement", "profile", 1).unwrap(),
     );
@@ -373,7 +379,7 @@ fn the_source_layer_must_match_its_own_declaration() {
         &binding,
         &requirement,
         &agent_revision,
-        &source(),
+        &source,
         &declaration,
         Some(&presented),
     )
@@ -392,8 +398,37 @@ fn the_source_layer_must_match_its_own_declaration() {
         &binding,
         &requirement,
         &agent_revision,
-        &source(),
+        &source,
         &declaration,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    // A declaration read for a *different* source revision is refused even when
+    // it is internally consistent: otherwise a policy-less declaration from
+    // another source would erase this source's authored ceiling and replace its
+    // declared enforcement profile.
+    let mut other_source = source.clone();
+    other_source.source_ref = SpawnSourceRef::new("other-source", 2).unwrap();
+    assert_ne!(other_source.source_ref, source.source_ref);
+    let foreign_declaration = SpawnSourceSecurityDeclaration::without_policy(
+        other_source.source_ref.clone(),
+        EnforcementProfileRef::new("enforcement", "foreign-profile", 7).unwrap(),
+    );
+    let (task_id, generation_id, logical_agent_id) = identity();
+    let error = EffectiveTaskAuthority::new(
+        task_id,
+        generation_id,
+        logical_agent_id,
+        &binding,
+        &requirement,
+        &agent_revision,
+        &source,
+        &foreign_declaration,
         None,
     )
     .unwrap_err();
@@ -425,7 +460,9 @@ fn the_composite_rechecks_the_task_coarse_modes_after_the_meet() {
         Some(&agent_policy),
     )
     .unwrap();
+    let source = source();
     let declaration = SpawnSourceSecurityDeclaration::without_policy(
+        source.source_ref.clone(),
         EnforcementProfileRef::new("enforcement", "profile", 1).unwrap(),
     );
 
@@ -437,7 +474,7 @@ fn the_composite_rechecks_the_task_coarse_modes_after_the_meet() {
         &binding,
         &requirement,
         &agent_revision,
-        &source(),
+        &source,
         &declaration,
         None,
     )

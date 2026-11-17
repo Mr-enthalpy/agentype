@@ -1253,10 +1253,13 @@ impl SecurityAcquisitionBlock {
 
     /// Re-prove that this row is a real whole-round defer.
     ///
-    /// The recorded cost must actually exceed the recorded budget, and the
-    /// recorded limit must be exactly the bound that `require_whole_round`
-    /// reports. The in-memory producer path cannot reach an inconsistent state,
-    /// because `BudgetExhaustion` has private fields and only
+    /// The recorded cost must actually exceed the recorded budget, the recorded
+    /// limit must be exactly the bound that `require_whole_round` reports, and
+    /// the observed candidate cost must equal the recorded domain size: a budget
+    /// block means the complete candidate set was attempted, so a row that
+    /// records fewer attempted candidates than its domain describes is not a
+    /// budget block at all. The in-memory producer path cannot reach an
+    /// inconsistent state, because `BudgetExhaustion` has private fields and only
     /// `require_whole_round` constructs it; this check exists for the durable
     /// boundary, where the fields arrive independently and a hand-written row is
     /// indistinguishable from a real diagnostic without it.
@@ -1272,6 +1275,13 @@ impl SecurityAcquisitionBlock {
                     "a durable security acquisition block has an invalid release timestamp".into(),
                 ));
             }
+        }
+        if self.cost.candidates() != self.domain.candidate_count() {
+            return Err(ContractError::InvariantViolation(format!(
+                "a durable security acquisition block records {} observed candidates but a domain of {}: a budget block means the complete round was attempted",
+                self.cost.candidates(),
+                self.domain.candidate_count()
+            )));
         }
         match self.budget.require_whole_round(self.cost) {
             Ok(()) => Err(ContractError::InvariantViolation(

@@ -257,6 +257,7 @@ impl Fixture {
         let agent = agent_type_with_policy("pinned", policy_ref("agent-policy", 1));
         let source = spawn_source();
         let declaration = SpawnSourceSecurityDeclaration::with_policy(
+            source.source_ref.clone(),
             PolicyInput::authored(policy_ref("source-policy", 1), &source_policy),
             profile.reference().clone(),
         );
@@ -879,6 +880,7 @@ fn qualification_rechecks_the_task_coarse_modes_on_the_complete_policy() {
     })
     .unwrap();
     fixture.declaration = SpawnSourceSecurityDeclaration::with_policy(
+        fixture.source.source_ref.clone(),
         PolicyInput::authored(policy_ref("source-policy", 1), &fixture.source_policy),
         fixture.profile.reference().clone(),
     );
@@ -1127,7 +1129,7 @@ fn the_candidate_domain_digest_is_a_stable_identity_set() {
 fn a_block_is_released_only_by_operator_action_or_configuration_change() {
     let budget = AcquisitionBudget::new(1, 1).unwrap();
     let exhaustion = budget
-        .require_whole_round(AcquisitionCost::new(4, 4))
+        .require_whole_round(AcquisitionCost::new(2, 2))
         .unwrap_err();
     let domain = CandidateDomain::from_ids([
         LogicalAgentId::from_string("agent-a"),
@@ -1192,7 +1194,7 @@ fn a_durable_block_row_cannot_have_inconsistent_release_fields() {
         TaskId::from_string("task-1"),
         GenerationId::from_string("generation-1"),
         "sha256:domain".into(),
-        1,
+        4,
         "sha256:binding".into(),
         AcquisitionCost::new(4, 4),
         AcquisitionBudget::new(1, 1).unwrap(),
@@ -1209,7 +1211,7 @@ fn a_durable_block_row_cannot_have_inconsistent_release_fields() {
         TaskId::from_string("task-1"),
         GenerationId::from_string("generation-1"),
         "sha256:domain".into(),
-        1,
+        4,
         "".into(),
         AcquisitionCost::new(4, 4),
         AcquisitionBudget::new(1, 1).unwrap(),
@@ -1344,6 +1346,7 @@ fn a_policy_authored_isolation_bit_is_never_silently_dropped() {
     let mut source_only = isolation_fixture();
     source_only.source_policy = isolating_policy();
     source_only.declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source_only.source.source_ref.clone(),
         PolicyInput::authored(policy_ref("source-policy", 1), &source_only.source_policy),
         source_only.profile.reference().clone(),
     );
@@ -1368,7 +1371,7 @@ fn a_durable_block_whose_cost_is_inside_its_budget_is_rejected() {
         TaskId::from_string("task-1"),
         GenerationId::from_string("generation-1"),
         "sha256:domain".into(),
-        1,
+        0,
         "sha256:binding".into(),
         AcquisitionCost::new(0, 0),
         AcquisitionBudget::new(10, 10).unwrap(),
@@ -1425,6 +1428,33 @@ fn a_durable_block_must_record_the_limit_that_was_actually_exceeded() {
         None,
     )
     .unwrap();
+}
+
+#[test]
+fn a_durable_block_must_record_the_complete_domain_as_its_candidate_cost() {
+    // A whole-round defer attempts every candidate, so the recorded candidate
+    // cost is the recorded domain size. A row that says it observed fewer
+    // candidates than its domain describes is not a budget block, even when its
+    // cost still exceeds the budget.
+    let error = SecurityAcquisitionBlock::from_durable_parts(
+        TaskId::from_string("task-1"),
+        GenerationId::from_string("generation-1"),
+        "sha256:domain".into(),
+        5,
+        "sha256:binding".into(),
+        AcquisitionCost::new(2, 2),
+        AcquisitionBudget::new(1, 1).unwrap(),
+        BudgetLimit::CandidateCount,
+        SecurityAcquisitionBlockStatus::Blocked,
+        100.0,
+        None,
+        None,
+    )
+    .unwrap_err();
+    let ContractError::InvariantViolation(reason) = error else {
+        panic!("a partial candidate cost must be an invariant violation");
+    };
+    assert!(reason.contains("complete round"), "{reason}");
 }
 
 #[test]
