@@ -1,0 +1,18 @@
+[package]
+name = "agentype-public-api-contract-only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: a repository fixture that proves one supported-surface claim
+# about the contract-only feature set. It exists to fail the build, not to ship.
+publish = false
+description = "Contract-only boundary fixture: the imported-enforcement evidence constructor is absent without the runtime producer"
+
+# The point of this package is the dependency list: `agentype-agent-contract`
+# with DEFAULT features and nothing that could unify `provisioning-producer`
+# back on. Adding a dependency here is the only way to invalidate the probe.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+agentype-agent-contract = { path = "../../crates/agentype-agent-contract" }

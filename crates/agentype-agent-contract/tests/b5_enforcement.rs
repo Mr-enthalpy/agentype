@@ -5,6 +5,8 @@
 //!
 //! * obligations are derived from imposed restrictions, not from the mere
 //!   presence of a field;
+//! * qualification re-proves every positive Task access obligation on the
+//!   complete `EffectiveTaskAuthority` policy, not only at admission;
 //! * the frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` support matrix covers
 //!   workspace-write confinement and an environment allowlist, and nothing else;
 //! * compilation is pure and root-relative, returns a partial evidence subject,
@@ -165,12 +167,13 @@ fn reference_profile(subjects: [EnforcementSubject; 1]) -> ImportedEnforcementPr
     .unwrap()
 }
 
-fn task_binding(
+fn task_binding_with_floor(
     policy: NormalizedSandboxPolicy,
     reference: SandboxPolicyRef,
+    required_access: &RequiredAccess,
 ) -> TaskSecurityBinding {
     let input = PolicyInput::authored(reference, &policy);
-    let derivation = SecurityDerivation::new([input], &policy, &RequiredAccess::empty()).unwrap();
+    let derivation = SecurityDerivation::new([input], &policy, required_access).unwrap();
     TaskSecurityBinding::new(policy, derivation, []).unwrap()
 }
 
@@ -229,12 +232,30 @@ impl Fixture {
         requirement: TaskAgentRequirement,
         profile: ImportedEnforcementProfile,
     ) -> Self {
-        let reference = policy_ref("binding", 1);
-        let binding = task_binding(binding_policy.clone(), reference);
+        Self::compose(
+            binding_policy,
+            requirement,
+            profile,
+            NormalizedSandboxPolicy::top(),
+            NormalizedSandboxPolicy::top(),
+            &RequiredAccess::empty(),
+        )
+    }
+
+    /// Compose a candidate tuple with explicit agent/source layers and the exact
+    /// access floor recorded in the binding derivation.
+    fn compose(
+        binding_policy: NormalizedSandboxPolicy,
+        requirement: TaskAgentRequirement,
+        profile: ImportedEnforcementProfile,
+        agent_policy: NormalizedSandboxPolicy,
+        source_policy: NormalizedSandboxPolicy,
+        required_access: &RequiredAccess,
+    ) -> Self {
+        let binding =
+            task_binding_with_floor(binding_policy, policy_ref("binding", 1), required_access);
         let agent = agent_type_with_policy("pinned", policy_ref("agent-policy", 1));
-        let agent_policy = NormalizedSandboxPolicy::top();
         let source = spawn_source();
-        let source_policy = NormalizedSandboxPolicy::top();
         let declaration = SpawnSourceSecurityDeclaration::with_policy(
             PolicyInput::authored(policy_ref("source-policy", 1), &source_policy),
             profile.reference().clone(),
@@ -278,6 +299,150 @@ fn confined_fixture() -> Fixture {
         confined_policy(),
         requirement(),
         reference_profile([EnforcementSubject::ControlledPrimaryProcess]),
+    )
+}
+
+// =============================================================================
+// Access-floor fixtures (ADR-0013 §5, Candidate stage)
+// =============================================================================
+
+fn capability_ref(id: &str) -> CapabilityRef {
+    CapabilityRef::new(id, 1).unwrap()
+}
+
+/// A catalog whose one `sandbox.access` capability projects every member onto a
+/// concrete policy operation of the same dimension.
+fn sandbox_catalog(
+    dimension: PolicyAccessDimension,
+    members: [(&str, PolicyOperation); 1],
+) -> CapabilityCatalog {
+    let member_map = members
+        .into_iter()
+        .map(|(member, operation)| (member.to_string(), operation))
+        .collect();
+    let mut catalog = CapabilityCatalog::new();
+    catalog
+        .define_with_projection(
+            capability_ref("sandbox.access"),
+            MatcherKind::Set,
+            SecurityClass::Sandbox,
+            CapabilityPolarity::Ability,
+            Some(PolicyProjection::new(dimension, member_map).unwrap()),
+        )
+        .unwrap();
+    catalog
+}
+
+fn requirement_requiring_capability(
+    members: &[&str],
+    workspace: WorkspaceMode,
+    network: NetworkPolicy,
+) -> TaskAgentRequirement {
+    let mut requirement = requirement();
+    requirement.hard.required_workspace = workspace;
+    requirement.hard.required_network = network;
+    requirement.hard.required_capabilities = [(
+        capability_ref("sandbox.access"),
+        CapabilityValue::Set(members.iter().map(|member| (*member).to_string()).collect()),
+    )]
+    .into_iter()
+    .collect();
+    requirement
+}
+
+/// A profile that supports every enforcement feature.
+///
+/// The access-floor tests are about the positive Task floor, so the support
+/// matrix must not be the reason a candidate is rejected: with full support the
+/// only remaining candidate-local mismatch is a capability the complete policy
+/// no longer grants.
+fn full_support_profile() -> ImportedEnforcementProfile {
+    ImportedEnforcementProfile::import(
+        EnforcementProfileRef::new("test-enforcement", "test-full-support", 1).unwrap(),
+        1,
+        EnforcementSupport::new([
+            EnforcementFeature::WorkspaceWriteConfinement,
+            EnforcementFeature::FileReadConfinement,
+            EnforcementFeature::FileExecuteConfinement,
+            EnforcementFeature::FileVisibilityConfinement,
+            EnforcementFeature::ToolCommandAllowlist,
+            EnforcementFeature::NetworkEgressRestriction,
+            EnforcementFeature::EnvironmentAllowlist,
+            EnforcementFeature::ResourceLimit,
+            EnforcementFeature::AttemptIsolation,
+            EnforcementFeature::CredentialDelivery,
+        ]),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap()
+}
+
+fn policy_with_tools(tools: ToolPolicy) -> NormalizedSandboxPolicy {
+    let mut parts = confined_policy().parts().clone();
+    parts.tools = tools;
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+fn policy_with_execute(execute: PathSet) -> NormalizedSandboxPolicy {
+    let mut parts = confined_policy().parts().clone();
+    parts.files = FilePolicy::new(
+        parts.files.read().clone(),
+        parts.files.write().clone(),
+        execute,
+        parts.files.delete().clone(),
+        parts.files.visible().clone(),
+    );
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+fn policy_with_network(network: NetworkEndpointSet) -> NormalizedSandboxPolicy {
+    let mut parts = confined_policy().parts().clone();
+    parts.network = network;
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+/// Compose a fixture whose recorded binding floor is exactly the projection of
+/// its Task requirement, so the candidate-stage re-proof can match the digest.
+fn access_fixture(
+    requirement: &TaskAgentRequirement,
+    catalog: &CapabilityCatalog,
+    binding_policy: NormalizedSandboxPolicy,
+    source_policy: NormalizedSandboxPolicy,
+) -> Fixture {
+    let floor =
+        required_access_from_claims(&requirement.hard.required_capabilities, catalog).unwrap();
+    let mut fixture = Fixture::compose(
+        binding_policy,
+        requirement.clone(),
+        full_support_profile(),
+        NormalizedSandboxPolicy::top(),
+        source_policy,
+        &floor,
+    );
+    // The pinned AgentType must satisfy the same capability claims, otherwise
+    // the fine contract check rejects before the access floor is reached.
+    fixture.agent.contract.required_capabilities = requirement.hard.required_capabilities.clone();
+    fixture
+}
+
+fn qualify(
+    fixture: &Fixture,
+    catalog: &CapabilityCatalog,
+) -> Result<CompiledExecutionSecurity, ContractError> {
+    let authority = fixture.authority();
+    let revision = SecurityRevision::new(
+        &fixture.agent,
+        SecurityContractMode::SecurityV1,
+        Some(&fixture.agent_policy),
+    )
+    .unwrap();
+    qualify_security_candidate(
+        &authority,
+        &fixture.requirement,
+        &revision,
+        &adapter_binding(ConfigStatus::Active),
+        &fixture.profile,
+        catalog,
     )
 }
 
@@ -719,6 +884,172 @@ fn qualification_rechecks_the_task_coarse_modes_on_the_complete_policy() {
         .unwrap_err(),
         ContractError::SecurityUnenforceable { .. }
     ));
+}
+
+// =============================================================================
+// Access-floor re-proof on the complete effective policy (ADR-0013 §5)
+// =============================================================================
+
+#[test]
+fn qualification_rejects_a_source_ceiling_that_removes_a_required_tool() {
+    let catalog = sandbox_catalog(
+        PolicyAccessDimension::ToolCommandSet,
+        [("git", PolicyOperation::ToolCommand("git".into()))],
+    );
+    let requirement = requirement_requiring_capability(
+        &["git"],
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Disabled,
+    );
+    let binding = policy_with_tools(ToolPolicy::new(
+        NameSet::allowed(["git"]).unwrap(),
+        NameSet::deny_all(),
+    ));
+
+    // Every other layer and both coarse modes still admit the candidate; only
+    // the source ceiling deletes the tool the Task requires.
+    let denied = access_fixture(
+        &requirement,
+        &catalog,
+        binding.clone(),
+        policy_with_tools(ToolPolicy::deny_all()),
+    );
+    let error = qualify(&denied, &catalog).unwrap_err();
+    let ContractError::SecurityUnenforceable { reason } = &error else {
+        panic!("a removed required tool must be SecurityUnenforceable, got {error:?}");
+    };
+    assert!(reason.contains("positive access floor"), "{reason}");
+    assert!(reason.contains("git"), "{reason}");
+
+    // Keeping the tool qualifies: the rejection is the floor, not a coarse or
+    // support check that would reject either way.
+    let kept = access_fixture(
+        &requirement,
+        &catalog,
+        binding,
+        policy_with_tools(ToolPolicy::new(
+            NameSet::allowed(["git"]).unwrap(),
+            NameSet::deny_all(),
+        )),
+    );
+    qualify(&kept, &catalog).unwrap();
+}
+
+#[test]
+fn qualification_rejects_a_source_ceiling_that_removes_a_required_file_operation() {
+    let catalog = sandbox_catalog(
+        PolicyAccessDimension::FileOperationClass,
+        [(
+            "run",
+            PolicyOperation::FileOperation(FileOperationClass::Execute),
+        )],
+    );
+    let requirement = requirement_requiring_capability(
+        &["run"],
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Disabled,
+    );
+    let binding = policy_with_execute(workspace(&["src"]));
+
+    let denied = access_fixture(
+        &requirement,
+        &catalog,
+        binding.clone(),
+        policy_with_execute(PathSet::deny_all()),
+    );
+    let error = qualify(&denied, &catalog).unwrap_err();
+    let ContractError::SecurityUnenforceable { reason } = &error else {
+        panic!("a removed required file operation must be SecurityUnenforceable, got {error:?}");
+    };
+    assert!(reason.contains("positive access floor"), "{reason}");
+    assert!(reason.contains("file operation EXECUTE"), "{reason}");
+
+    let kept = access_fixture(
+        &requirement,
+        &catalog,
+        binding,
+        policy_with_execute(workspace(&["src"])),
+    );
+    qualify(&kept, &catalog).unwrap();
+}
+
+#[test]
+fn qualification_rejects_a_source_ceiling_that_removes_a_required_network_endpoint() {
+    let registry =
+        NetworkEndpoint::new(NetworkTransport::Tcp, "registry.example.com", Some(443)).unwrap();
+    let other =
+        NetworkEndpoint::new(NetworkTransport::Tcp, "other.example.com", Some(443)).unwrap();
+    let catalog = sandbox_catalog(
+        PolicyAccessDimension::NetworkEndpoint,
+        [(
+            "registry",
+            PolicyOperation::NetworkEndpoint(registry.clone()),
+        )],
+    );
+    // `Restricted` is the only coarse mode that can survive a usable-but-wrong
+    // egress set: the ceiling keeps one endpoint, so the mode check passes and
+    // only the exact required endpoint is missing.
+    let requirement = requirement_requiring_capability(
+        &["registry"],
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Restricted,
+    );
+    let binding = policy_with_network(NetworkEndpointSet::any());
+
+    let denied = access_fixture(
+        &requirement,
+        &catalog,
+        binding.clone(),
+        policy_with_network(NetworkEndpointSet::allowed([other])),
+    );
+    let error = qualify(&denied, &catalog).unwrap_err();
+    let ContractError::SecurityUnenforceable { reason } = &error else {
+        panic!("a removed required endpoint must be SecurityUnenforceable, got {error:?}");
+    };
+    assert!(reason.contains("positive access floor"), "{reason}");
+    assert!(reason.contains("registry.example.com:443"), "{reason}");
+
+    let kept = access_fixture(
+        &requirement,
+        &catalog,
+        binding,
+        policy_with_network(NetworkEndpointSet::allowed([registry])),
+    );
+    qualify(&kept, &catalog).unwrap();
+}
+
+#[test]
+fn qualification_rejects_an_authority_whose_recorded_floor_differs_from_the_requirement() {
+    // A binding whose derivation recorded no positive floor cannot qualify a
+    // requirement that declares one: the candidate re-proof recomputes the
+    // floor and refuses to read the stored digest as proof.
+    let catalog = sandbox_catalog(
+        PolicyAccessDimension::ToolCommandSet,
+        [("git", PolicyOperation::ToolCommand("git".into()))],
+    );
+    let requirement = requirement_requiring_capability(
+        &["git"],
+        WorkspaceMode::ReadOnly,
+        NetworkPolicy::Disabled,
+    );
+    let mut fixture = Fixture::compose(
+        policy_with_tools(ToolPolicy::new(
+            NameSet::allowed(["git"]).unwrap(),
+            NameSet::deny_all(),
+        )),
+        requirement.clone(),
+        full_support_profile(),
+        NormalizedSandboxPolicy::top(),
+        NormalizedSandboxPolicy::top(),
+        &RequiredAccess::empty(),
+    );
+    fixture.agent.contract.required_capabilities = requirement.hard.required_capabilities.clone();
+
+    let error = qualify(&fixture, &catalog).unwrap_err();
+    assert!(
+        matches!(error, ContractError::EvidenceSubjectMismatch { .. }),
+        "a mismatched recorded floor must be a subject mismatch, got {error:?}"
+    );
 }
 
 // =============================================================================
