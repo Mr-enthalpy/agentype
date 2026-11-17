@@ -1,10 +1,10 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 3 (2026-11-14) — records the P2-3 decision: the durable-block
-idempotence claim is narrowed, not implemented as a history table
+Revision: 5 (2026-11-16) — records the third re-audit: one new finding
+(P1-4) and the ADR-0014 §4 key-list amendment it needs
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`)
-Date: 2026-11-14
+Date: 2026-11-16
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
 Freeze state: **NOT FROZEN — no freeze gate has run**
 Not a specification. This file indexes merged code against ADR-0013 §5 and
@@ -17,7 +17,9 @@ root-relative enforcement compiler, and the schema-v10 durable acquisition-block
 diagnostic. An independent re-audit (revision 2) found two P1 gaps in the
 qualification chain and four P2 gaps in how its proofs are scoped, so the
 security qualification chain is **not closed** and B5.3/B5.4 executable paths
-must not be opened against it as-is.
+must not be opened against it as-is. Later passes added three more findings —
+P1-3 and P2-5 in revision 4, P1-4 in revision 5 — and none of them is closed by
+this record.
 
 The gaps are **latent, not live**. Typed acquisition still rejects
 `SECURITY_V1` at `provisioning.rs:734–741` (called at `1069` and `1342`), no
@@ -36,6 +38,8 @@ requirement on the complete effective policy.
 | 1 | `d14137f` | First audit record over `c0497eb..d3ab482`; docs-only. |
 | 2 | `6a3318d` | Records the independent re-audit: two revision-1 claims corrected, six findings added (two P1, four P2), B5.1 handoff table added. Still docs-only; no code, ADR, spec or index change. |
 | 3 | `aa2f3b8` | Records the P2-3 decision: ADR-0014 §4 and this record state that durable-block idempotence is scoped to the currently stored condition, instead of adding a per-condition history table. Docs-only; no code, schema, ADR `Status:` line, spec or index change. |
+| 4 | `983bc16` | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
+| 5 | `097f35d` | Records the third independent re-audit: P1-4 (the compile cache key omits the guarantee identity, so plans with different obligations share one memoization key). Amends the ADR-0014 §4 frozen key list in the P2-3 ADR pull request and fixes the key in the P1-3 code pull request. Docs-only here; no code, ADR `Status:` line, spec or index change in this pull request. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -46,6 +50,19 @@ Revision 3 resolves exactly one finding, and it resolves it by narrowing the
 claim rather than changing the encoding: P2-3. P1-1 and P1-2 have proposed fixes
 in PR #31, which was open and unmerged when this revision was written; this
 record does not count an unmerged fix as closure.
+
+Revision 4 records two findings the revision-2 pass missed and resolves none.
+Both were checked by static reading against the same merged code, `d3ab482`;
+this revision executed no new test. It also corrects revision 2's finding count:
+the table below has always listed two P1 and four P2 findings, not five.
+
+Revision 5 records one finding the earlier passes missed: the compile cache key.
+It resolves nothing; P1-4's fix is in a code pull request and its normative
+statement is an ADR amendment in the ADR pull request, neither of which this
+record counts as closure before merge. The finding is confirmed by the same kind
+of evidence as P1-3 — a temporary assertion in the isolation matrix that
+`baseline.cache_key() == task_only.cache_key()` while the plan digests differ —
+and that assertion is now part of the fixed matrix.
 
 ## Why this record exists
 
@@ -61,7 +78,7 @@ This record does **not** claim:
 
 - that B5.2 satisfies a freeze gate;
 - that the security qualification chain is complete (revision 2: it is not, see
-  [Re-audit findings](#re-audit-findings-revision-2));
+  [Re-audit findings](#re-audit-findings-revisions-2-4-and-5));
 - that ADR-0014 §6–§12 (physical binding, receipts, hold/release, recovery) is
   implemented — it is not, and it belongs to B5.4/B5.5;
 - that `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` is enforced by any OS mechanism;
@@ -98,21 +115,27 @@ What B5.2 explicitly does not own: `prepare`, physical root binding, secured
 start, the applied-security receipt, hold/release, and recovery. Those are
 ADR-0014 §6–§12 and remain unimplemented.
 
-## Re-audit findings (revision 2)
+## Re-audit findings (revisions 2, 4 and 5)
 
-Revision 2 re-read the merged code rather than the revision-1 prose. Every
-finding below was reproduced against `d3ab482`; none is inferred from a comment
-or a test name. Severity is stated for the qualification chain, not for the
-current build: while acquisition rejects `SECURITY_V1`, all of them are latent.
+Revision 2 re-read the merged code rather than the revision-1 prose and
+reproduced every finding against `d3ab482`. Revision 4 adds P1-3 and P2-5,
+checked by static reading against the same code. Revision 5 adds P1-4, the one
+gap those passes missed: a guarantee is plan identity but was not cache-key
+identity. None is inferred from a comment or a test name. Severity is stated for
+the qualification chain, not for the current build: while acquisition rejects
+`SECURITY_V1`, all of them are latent.
 
 | ID | Severity | Finding | Blocks |
 |---|---|---|---|
 | P1-1 | P1 | The four-term `P_eff` is never re-checked against the Task's positive `RequiredAccess` floor | Closing the qualification chain; opening B5.4 |
 | P1-2 | P1 | The "default build cannot mint an imported profile" claim is false, and public-API probe 31 cannot prove it | Using the record as a B5.4 gate input |
+| P1-3 | P1 | The attempt-isolation guarantee becomes an obligation but never becomes the plan's execution-request value, and it is not explicit in the plan digest | B5.4's committed execution request; reading a compiled plan as an applied-security claim |
+| P1-4 | P1 | The compile cache key omits the guarantee identity, so two plans with different obligations share one memoization key | Any reuse of a compile result; the ADR-0014 §4 memoization claim |
 | P2-1 | P2 | The compiler never checks that the profile was imported for this binding or that it covers the executing subject | Trustworthy `SECURITY_V1` evidence |
 | P2-2 | P2 | A credential *authorization* is treated as a credential *delivery* obligation | Correctness of candidate rejection (over-rejection) |
 | P2-3 | P2 | Durable-block idempotence holds only for the single stored condition, not across history | The ADR-0014 §4 statement the report quotes (**closed in revision 3 by narrowing the ADR**) |
 | P2-4 | P2 | Candidate preselection is implemented, but acquisition qualification is not wired (the fourth B5.1 handoff item) | Declaring B5.2 complete |
+| P2-5 | P2 | A durable acquisition block does not re-prove that its recorded cost actually exceeded its recorded budget | Trustworthiness of the operator-actionable budget diagnostic |
 
 ### P1-1 — the positive access floor is not re-proved on `P_eff`
 
@@ -184,6 +207,15 @@ reject with `SecurityUnenforceable`; one positive must still compile.
 
 **Status.** Open. Blocks P2-4 and any B5.4 executable path.
 
+**Revision 4 note.** The second re-audit's stricter acceptance — re-project the
+requirement's claims through the exact catalog and prove the digest before
+checking the floor — is already implemented in the unmerged PR #31:
+`required_access_from_claims` rebuilds `RequiredAccess`,
+`required_access_content_digest` is compared with
+`authority.required_access_digest()`, and only then does `check_required_access`
+run on `P_eff`. This record does not count the finding as closed until that pull
+request merges.
+
 ### P1-2 — the imported-profile constructor claim is false, and probe 31 is vacuous
 
 **What revision 1 said.** "The default build cannot mint an imported enforcement
@@ -236,6 +268,148 @@ facts.
 
 **Status.** Open; the record is corrected here, the probe and its comment in the
 follow-up code change.
+
+### P1-3 — the attempt-isolation guarantee never reaches the plan accessor
+
+**Normative sentence.** ADR-0013 §3 and spec `10-sandbox-and-security.md`: the
+execution guarantee is a disjunction, not an authorization intersection —
+
+```text
+I_required = I_AgentType ∨ I_Requirement ∨ I_SourceRequirement
+```
+
+— and it "must then reach `ExecutionTarget.attempt_isolation = true`, be proven
+enforceable by the exact adapter, and be requested by the committed execution."
+An `EnforcementSupport` capability that merely supports isolation must not create
+a requirement, and no policy meet may clear one.
+
+**What is implemented.** `EffectiveTaskAuthority` folds the Task requirement and
+the bound AgentType into `requires_attempt_isolation`
+(`authority.rs:337–342`, accessor `418–420`).
+`EffectiveExecutionGuarantees::from_authority` copies that value
+(`enforcement.rs:169–173`). `RequiredEnforcementFeatures::derive` inserts
+`AttemptIsolation` when either the policy bit or the guarantee says so
+(`enforcement.rs:220–222`), and `compile_execution_security` passes
+`EffectiveExecutionGuarantees::from_authority(authority)` into that relation
+(`enforcement.rs:780–783`). The support check therefore does see the guarantee.
+
+**What is missing.** `PolicyEnforcementPlan` stores only the effective policy,
+obligations, profile reference and digest (`enforcement.rs:489–494`).
+`PolicyEnforcementPlan::attempt_isolation()` returns
+`self.effective_policy.attempt_isolation()` (`enforcement.rs:531–533`), not the
+guarantee. The plan digest (`enforcement.rs:797–804`) records the effective-policy
+digest and the obligation set, but not the guarantee bit explicitly.
+
+Counterexample:
+
+```text
+Generation policy:   attempt_isolation = false
+AgentType policy:    attempt_isolation = false
+Task requirement:    required_attempt_isolation = true
+SpawnSource policy:  attempt_isolation = false
+
+authority.requires_attempt_isolation() = true
+obligations contain AttemptIsolation
+plan.attempt_isolation() = false
+```
+
+`compile_execution_security` accepts this authority if the imported profile
+supports `AttemptIsolation`: the obligation is satisfied, and the returned plan
+contradicts it. `qualify_security_candidate` currently rejects the same input
+earlier, because `can_execute_security_v1` checks
+`(agent.requires_attempt_isolation || task.required_attempt_isolation) &&
+!safety.attempt_isolation()` (`predicates.rs:564–565`). That makes the full
+qualification chain safe today, but it does not repair the compiler's own
+contract: a direct `compile_execution_security` caller — which B5.4 will be — can
+read `plan.attempt_isolation() == false` from a plan whose obligations require
+isolation.
+
+**Required fix.** Carry `EffectiveExecutionGuarantees` on
+`PolicyEnforcementPlan`, make `attempt_isolation()` read the carried guarantee,
+add the guarantee bit to the plan digest, and expose it as plan identity. The
+composed guarantee is the disjunction of the Task requirement, the AgentType
+contract and the effective policy bit, which already folds every authored layer
+(Generation, Task and SpawnSource): a Task-only or AgentType-only requirement
+then survives a wider policy, and a policy-authored bit is never silently
+dropped. Add a Task-only / AgentType-only / neither matrix asserting that the
+plan accessor, the obligation set and the digest agree, including a direct
+compile where every authored policy bit is false and only the Task requirement
+asks for isolation, plus a source-only case where the policy bit is the only
+carrier. A plan whose policy bit is true without a matching guarantee must be
+unreachable under that composition; a defensive invariant rejects it if a future
+change breaks the disjunction.
+
+**Status.** Open in the record. Proposed in PR #34, stacked on PR #31; this
+record does not count the finding as closed until that pull request merges.
+Blocks B5.4's committed execution request, not the current acquisition gate.
+
+### P1-4 — the compile cache key does not carry the guarantee identity
+
+**Normative sentence.** ADR-0014 §4 lists the compile cache key components and
+requires that a compile proof "is never reused across a changed profile or
+binding", and that "no cache key is allowed to make a stale disposition look
+current". `ENFORCEMENT_COMPILER_PROTOCOL`'s own contract adds the same rule for
+compiler semantics: a semantic change cannot reuse an old result even when the
+inputs are byte-identical.
+
+**What is implemented.** `CompileCacheKey` commits to the effective-policy
+digest, both derivation versions, the adapter kind, the adapter binding key, the
+enforcement-profile digest and the compiler protocol version
+(`enforcement.rs:406–420`, constructed at `805–813`). After the P1-3 fix, the
+*plan* digest also carries the composed guarantee
+(`enforcement.rs:832` in PR #34). So plan identity and key identity diverged:
+the plan is guarantee-distinguished, the memoization key is not.
+
+**What is missing.** No key component carries the guarantee, the obligation set,
+or any digest of either. The Task-only counterexample from P1-3 is also a
+counterexample here, because it changes no keyed input:
+
+```text
+baseline  : policy bits false, no Task/AgentType requirement
+task-only : policy bits false, Task requires isolation
+
+effective_policy_digest     equal      (the policy bytes are identical)
+normalization_version       equal
+meet_algorithm_version      equal
+adapter_kind / binding_key  equal
+enforcement_profile_digest  equal
+compiler_protocol_version   equal
+obligations                 differ     (ATTEMPT_ISOLATION present only in task-only)
+plan_digest                 differ
+cache_key                   equal      <- the gap
+```
+
+Confirmed by a temporary assertion inside the isolation matrix —
+`assert_eq!(baseline.cache_key(), task.cache_key())` passed while
+`assert_ne!(baseline.plan().plan_digest(), task.plan().plan_digest())` also
+passed — and removed again; the fixed matrix now asserts the opposite and that
+the policy bytes are unchanged.
+
+The consequence is not a wrong plan, it is a wrong *lookup*: any memoization
+layer keyed exactly as ADR-0014 §4 specifies would return a result compiled
+without `ATTEMPT_ISOLATION` for a plan whose obligations require it, and nothing
+in the compile path would detect the substitution. The finding is latent only
+because no production path memoizes today and `qualify_security_candidate` still
+has no caller.
+
+There is a second-order form of the same gap: the seven-part list was frozen
+before the guarantee existed, so a future guarantee added to the obligation
+relation would inherit the identical defect unless the key commits to the
+guarantee *document* rather than to today's single boolean.
+
+**Required fix.** Make the guarantee identity an explicit key component (a
+canonical, schema-versioned digest of `EffectiveExecutionGuarantees`), amend the
+ADR-0014 §4 list, and bump `ENFORCEMENT_COMPILER_PROTOCOL` to
+`agentype-enforcement-compile/2`: a `/1` result carries neither the guarantee
+nor its digest and MUST NOT be reused. The acceptance test is the P1-3 matrix
+extended with `assert_ne!(baseline.cache_key(), task.cache_key())` plus the
+assertion that the effective policies are still equal, so a regression cannot be
+"satisfied" by changing policy bytes instead.
+
+**Status.** Open in the record. Proposed in PR #34, stacked on PR #31; the
+normative key-list amendment is in the P2-3 ADR pull request (#32). This record
+counts neither as closure before both merge. Blocks the ADR-0014 §4 memoization
+claim and any B5.2 acquisition cache, not the current acquisition gate.
 
 ### P2-1 — the profile is never bound to its adapter binding or its subject
 
@@ -343,6 +517,50 @@ B5.1 handoff item — "`can_provision` / acquisition uses the same complete
 qualification for `SECURITY_V1`" — is **not** met. Candidate preselection being
 correct must not be read as acquisition qualification being complete.
 
+### P2-5 — a durable block does not re-prove its over-budget truth
+
+**Normative sentence.** ADR-0014 §4 makes the block the durable diagnostic of a
+*whole round* that cannot fit the fixed acquisition budget; the only producer of
+the diagnostic is `AcquisitionBudget::require_whole_round`.
+
+**What is sound.** `SecurityAcquisitionBlock::from_budget_defer`
+(`enforcement.rs:1075–1113`) consumes a `BudgetExhaustion`. Its fields are private
+and there is no public constructor, so the in-memory producer path can only carry
+a real exhaustion produced by `require_whole_round` (`enforcement.rs:964–982`).
+
+**What is missing.** `SecurityAcquisitionBlock::from_durable_parts`
+(`enforcement.rs:1115–1160`) validates only non-empty key digests and the
+release-field shape. It does not recompute whether `cost` exceeds `budget`, and it
+does not require the stored `limit` to be exactly the exceeded bound.
+`record_security_acquisition_block` (`security_acquisition.rs:37–118`) writes the
+object's fields without re-checking either. This record is therefore accepted:
+
+```text
+cost_candidates = 0, cost_compiles = 0
+budget_max_candidates = 10, budget_max_compiles = 10
+budget_limit = CANDIDATE_COUNT
+status = BLOCKED
+```
+
+**Why it is a real defect.** It cannot create an Attempt or a Lease, but it makes
+the "operator-actionable budget diagnostic" untrue: the validated read reports a
+legal block for a round that never exceeded any budget. A corrupted or
+hand-written row is indistinguishable from a real defer, and the write boundary
+does not reject a forged value object.
+
+**Required fix.** Share one validation function between `from_durable_parts` and
+`record_security_acquisition_block`: recompute the exhaustion through
+`require_whole_round`, require it to fail, and require the failure's limit to
+equal the stored limit. Reject the row as `InvariantViolation` otherwise. Add a
+SQL corruption test: insert a legal blocked row, lower its recorded cost below the
+budget with a raw `UPDATE`, and assert the validated read returns an invariant
+failure rather than a block.
+
+**Status.** Open in the record. Proposed in PR #34, stacked on PR #31, which also
+validates the two timestamps; this record does not count the finding as closed
+until that pull request merges. This is a truth gap in the diagnostic, not an
+execution-authority bypass.
+
 ### Positive correction from the re-audit
 
 The B5.1 audit found that Task→Generation security-mode agreement was checked in
@@ -393,7 +611,9 @@ implements it and the test that would fail if it were removed. Rows marked
 | Qualification re-proves the requirement digest, AgentType revision, agent policy digest, and `can_execute_security_v1` before compiling | `qualify_security_candidate` (lines 846–892) | `b5_enforcement::qualification_re_proves_the_requirement_and_agent_identity_before_compiling` | `cbab05f` |
 | Qualification re-checks the Task's coarse modes on the four-term `P_eff` | `qualify_security_candidate` → `authority.validate_coarse_modes` | `b5_enforcement::qualification_rechecks_the_task_coarse_modes_on_the_complete_policy` | `cbab05f` |
 | **(rev 2)** The profile was imported for this exact binding and covers the executing subject | **absent** — `covers_subject` and `is_inside_proven_domain` have no caller | **absent** | — (P2-1) |
-| The cache key has exactly the seven ADR components and rejects an empty one | `CompileCacheKey::new` | `b5_enforcement::the_cache_key_rejects_an_incomplete_component` | `cbab05f` |
+| **(rev 4)** The plan carries the composed attempt-isolation guarantee; its accessor and digest agree with the obligation set | **absent** — `PolicyEnforcementPlan::attempt_isolation` reads the effective policy; the digest omits the guarantee | **absent** | — (P1-3) |
+| The cache key commits to the ADR-0014 §4 components and rejects an empty one **(rev 5: the listed set was incomplete — see P1-4)** | `CompileCacheKey::new` | `b5_enforcement::the_cache_key_rejects_an_incomplete_component` | `cbab05f` |
+| **(rev 5)** The cache key distinguishes two compile inputs whose guarantees, and therefore obligations, differ | **absent** — the key has no guarantee component; only the plan digest carries it | **absent** | — (P1-4) |
 | The budget is whole-round only: there is no partial-success path | `AcquisitionBudget::require_whole_round` | `b5_enforcement::the_budget_has_no_partial_success_path` | `cbab05f` |
 | The candidate-domain digest is order-independent over distinct ids | `CandidateDomain::from_ids` | `b5_enforcement::the_candidate_domain_digest_is_a_stable_identity_set` | `cbab05f` |
 | The durable diagnostic binds Task, dispatch generation, domain digest/count, binding/profile digest, cost, budget, limit, status, timestamps | `schema.rs` `security_acquisition_blocks`; `security_acquisition.rs`; `kernel.rs` wrappers | `b5_acquisition_block::one_condition_is_one_durable_diagnostic`, `a_block_names_only_its_own_task_generation_and_mode` | `cbab05f`, `5f644b4` |
@@ -409,6 +629,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | Release is final: release identity and time cannot change | trigger `..._release_is_final` | `b5_enforcement::a_block_is_released_only_by_operator_action_or_configuration_change` | `5f644b4` |
 | Rows are released, never deleted; a raw writer cannot delete or reopen the stored condition | triggers `..._immutable_delete`, `..._no_same_condition_reopen` | `b5_acquisition_block::the_durable_row_cannot_be_deleted_or_reopened_by_a_raw_writer` | `5f644b4` |
 | The parent must be a `SECURITY_V1` requirement and the generation must be the durable dispatch generation | trigger `..._require_security_parent`; `record_security_acquisition_block` generation check | `b5_acquisition_block::a_block_names_only_its_own_task_generation_and_mode` | `5f644b4` |
+| **(rev 4)** The recorded cost actually exceeds the recorded budget, and `budget_limit` is exactly the exceeded bound | **absent** — `from_durable_parts` and `record_security_acquisition_block` re-check neither | **absent** | — (P2-5) |
 
 ### ADR-0014 §13–§14 — obligations and the policy-only reference profile
 
@@ -475,7 +696,7 @@ argument, and this record no longer uses it as one.
 ## Known gaps for the reviewer
 
 These are not hidden defects; they are the boundary of the slice. The first two
-are narrowed by [Re-audit findings](#re-audit-findings-revision-2) rather than
+are narrowed by [Re-audit findings](#re-audit-findings-revisions-2-4-and-5) rather than
 resolved.
 
 1. **The pure compiler does not cross-check the adapter policy.**
@@ -511,6 +732,23 @@ resolved.
    replacement evidence story.** P1-2. Until the runtime import and the
    authority transaction are the named proof, no `#[cfg]` visibility argument
    should appear in a milestone gate.
+8. **(rev 4)** **The plan's isolation accessor is not the composed guarantee.**
+   P1-3. The obligation set is derived from the guarantee, but
+   `PolicyEnforcementPlan::attempt_isolation()` reads the effective-policy bit.
+   A direct compiler caller can therefore read `false` from a plan that requires
+   isolation. The full qualification path currently rejects the contradicting
+   input first, so this is latent, not a live bypass.
+9. **(rev 4)** **The durable diagnostic does not re-prove its own budget
+   truth.** P2-5. `from_budget_defer` is sound, but the durable constructor and
+   write boundary accept a `BLOCKED` row whose cost never exceeded its budget.
+   The row cannot create Attempt/Lease authority; it is a false operator
+   diagnostic and must fail the validated read.
+10. **(rev 5)** **The memoization key is not plan identity.** P1-4. A Task-only
+    isolation guarantee changes the obligations and the plan digest but no cache
+    key component, so a memoized result compiled without `ATTEMPT_ISOLATION`
+    would be returned for a plan that requires it. Nothing memoizes yet, so this
+    is latent; it is nevertheless the first thing a B5.2 acquisition cache would
+    get wrong, and the ADR-0014 §4 list itself has to change.
 
 ## Verification
 
@@ -525,6 +763,7 @@ cargo test -p agentype-public-api-boundary
 ```
 
 Measured at revision 1's head (a docs-only change on top of `d3ab482`):
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all --check` | pass |
@@ -545,10 +784,26 @@ read-only checks that produced the findings:
 Revision 3 is also docs-only and re-runs none of these commands. It changes one
 ADR sentence and this record; no code, schema or test changed.
 
+Revision 4 is docs-only and re-runs none of these commands either. Its two
+findings come from the same static reading:
+
+| Check | Result |
+|---|---|
+| Source search for readers of `attempt_isolation` and `EffectiveExecutionGuarantees` | the guarantee reaches the obligation derivation but not `PolicyEnforcementPlan`; the plan digest omits it |
+| Source search for validation in `from_durable_parts` and `record_security_acquisition_block` | neither re-checks cost against budget or the recorded limit |
+
+Revision 5 is docs-only as well. Its finding is the only one in this record that
+was first confirmed by executing a temporary assertion rather than by reading:
+
+| Check | Result |
+|---|---|
+| `assert_eq!(baseline.cache_key(), task_only.cache_key())` inserted into the isolation matrix (temporary, then removed) | passes while the two plan digests differ |
+| Source search for every `CompileCacheKey` reads and writes | the guarantee appears in the plan digest, never in the key |
+
 The revision-1 suite result remains a record of that run. It is not re-attested
-by revision 2 or 3, and the re-auditor did not independently re-run it either.
-Once PR #31 lands, the workspace command above also excludes a second fixture,
-`agentype-public-api-contract-only`, for the same reason as
+by revision 2, 3, 4 or 5, and the re-auditor did not independently re-run it
+either. Once PR #31 lands, the workspace command above also excludes a second
+fixture, `agentype-public-api-contract-only`, for the same reason as
 `agentype-public-api-boundary`.
 
 The workspace suite includes the following new test modules, all green at
@@ -574,17 +829,22 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 
 | Order | Work | Acceptance |
 |---|---|---|
-| 1 | Re-prove `RequiredAccess` on `P_eff` in `qualify_security_candidate` (P1-1) | tool, endpoint and file-operation negatives reject as `SecurityUnenforceable`; positive compiles |
-| 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility |
-| 3 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives |
-| 4 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
-| 5 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
+| 1 | Re-prove `RequiredAccess` on `P_eff` in `qualify_security_candidate` (P1-1) | tool, endpoint and file-operation negatives reject as `SecurityUnenforceable`; positive compiles. Proposed in PR #31, including the digest re-projection |
+| 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Proposed in PR #31 |
+| 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
+| 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
+| 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives |
+| 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
+| 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
+| 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1` |
 
-Items 1–4 are code changes and belong in follow-up pull requests, not in this
-docs-only record. Item 5 was a design decision and is settled in revision 3 by
-narrowing the ADR rather than by adding history. This record is what those pull
-requests are reviewed against.
+Items 1–6 and 8 are code changes and belong in follow-up pull requests, not in
+this docs-only record. Item 7 was a design decision and is settled in revision 3
+by narrowing the ADR rather than by adding history; item 4 also needs its
+normative sentence in the ADR, which is why that part sits in the ADR pull
+request. The Gate is the B5.2 completion condition. This record is what those
+pull requests are reviewed against.
 
 ## Evidence index
 
@@ -593,6 +853,9 @@ requests are reviewed against.
 | Composite authority and policy order | `crates/agentype-agent-contract/src/authority.rs` |
 | Policy-order relations and qualified candidate | `crates/agentype-agent-contract/src/matching.rs`, `predicates.rs` |
 | Enforcement compiler, budget, block value object | `crates/agentype-agent-contract/src/enforcement.rs` |
+| Attempt-isolation guarantee and plan identity | `crates/agentype-agent-contract/src/enforcement.rs` (`EffectiveExecutionGuarantees`, `PolicyEnforcementPlan`) |
+| Compile memoization key and guarantee identity | `crates/agentype-agent-contract/src/enforcement.rs` (`CompileCacheKey`, `effective_execution_guarantees_digest`) |
+| Durable block truth validation | `crates/agentype-agent-contract/src/enforcement.rs` (`from_durable_parts`), `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
 | Access floor, projection and check | `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess`, `check_required_access`) |
 | Admission-time floor proof | `crates/agentype-storage-sqlite/src/requirement.rs` (lines 1341–1356, 1485–1509) |
 | Durable block read/write/release | `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
