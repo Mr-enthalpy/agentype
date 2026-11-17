@@ -212,6 +212,16 @@ and time are final for the stored row once written. Rows are released, never
 deleted, and the parent rule admits only a `SECURITY_V1` Task, because the coarse
 typed path has no compiled candidate round to defer.
 
+`candidate_count` and `cost_candidates` describe the same complete candidate set.
+A block exists only because the whole round was attempted, so the two MUST be
+equal, and a row that records fewer attempted candidates than its domain is not a
+budget defer. If a future round must distinguish attempted candidates from merely
+enumerated ones, that distinction MUST be defined here as separate fields with
+their own semantics; an arbitrary combination of the current two is invalid. A
+reader MUST rebuild the row through the same validation and re-bind
+`generation_id` to the Task's durable dispatch generation: the recorded generation
+is a consequence of that binding, not an independent input.
+
 The schema is fresh-only: version 10 rejects a v9 file at open under the existing
 D-DB-MIGRATE rule, and there is no in-place migration and no backfill of a
 historical block. A budget defer therefore leaves no durable trace until the

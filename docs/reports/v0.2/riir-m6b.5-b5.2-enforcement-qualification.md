@@ -1,10 +1,13 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 5 (2026-11-16) — records the third re-audit: one new finding
-(P1-4) and the ADR-0014 §4 key-list amendment it needs
+Revision: 6 (2026-11-18) — records the fourth re-audit: two new P2 findings
+(source-declaration provenance, durable-block read coherence), one premise that
+removes a proposed check (the Task security mode is write-once), and the
+candidate-domain identity model as a B5.3 design item; adds one ADR-0014 §4
+sentence on count coherence
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`)
-Date: 2026-11-16
+Date: 2026-11-18
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
 Freeze state: **NOT FROZEN — no freeze gate has run**
 Not a specification. This file indexes merged code against ADR-0013 §5 and
@@ -19,7 +22,9 @@ qualification chain and four P2 gaps in how its proofs are scoped, so the
 security qualification chain is **not closed** and B5.3/B5.4 executable paths
 must not be opened against it as-is. Later passes added three more findings —
 P1-3 and P2-5 in revision 4, P1-4 in revision 5 — and none of them is closed by
-this record.
+this record. Revision 6 adds findings A and B, whose fixes are in a code pull
+request stacked on the P1-3/P1-4 pull request; as with every earlier finding,
+this record counts no unmerged fix as closure.
 
 The gaps are **latent, not live**. Typed acquisition still rejects
 `SECURITY_V1` at `provisioning.rs:734–741` (called at `1069` and `1342`), no
@@ -40,6 +45,7 @@ requirement on the complete effective policy.
 | 3 | `aa2f3b8` | Records the P2-3 decision: ADR-0014 §4 and this record state that durable-block idempotence is scoped to the currently stored condition, instead of adding a per-condition history table. Docs-only; no code, schema, ADR `Status:` line, spec or index change. |
 | 4 | `983bc16` | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
 | 5 | `097f35d` | Records the third independent re-audit: P1-4 (the compile cache key omits the guarantee identity, so plans with different obligations share one memoization key). Amends the ADR-0014 §4 frozen key list in the P2-3 ADR pull request and fixes the key in the P1-3 code pull request. Docs-only here; no code, ADR `Status:` line, spec or index change in this pull request. |
+| 6 | `9b8d830` (code) | Records the fourth independent re-audit: A (a source declaration is not bound to its `SpawnSource` revision) and B (the durable block's validated read does not re-bind the generation, relate the candidate count to the cost, or validate the existing row on a same-condition record). Also records the write-once Task security mode premise and the candidate-domain identity model as a B5.3 design item, and adds the ADR-0014 §4 count-coherence sentence. Fixes are in the code pull request on `9b8d830`; docs-only here, no ADR `Status:` line, spec or index change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -64,6 +70,14 @@ of evidence as P1-3 — a temporary assertion in the isolation matrix that
 `baseline.cache_key() == task_only.cache_key()` while the plan digests differ —
 and that assertion is now part of the fixed matrix.
 
+Revision 6 records two findings from the fourth pass. Both were confirmed by
+reading the code at `6c8fd9c` and are fixed in a code pull request whose head is
+`9b8d830`; this record counts neither as closed before that pull request merges.
+It also records one check the audit asked for that the code does not need (the
+Task security mode is write-once, so a read-time re-check adds no guarantee) and
+one question the audit raised that is a design item, not a defect (the candidate
+identity model for a round over unmaterialised candidates).
+
 ## Why this record exists
 
 B5.2 was delivered as two merged pull requests without a milestone closure
@@ -78,7 +92,7 @@ This record does **not** claim:
 
 - that B5.2 satisfies a freeze gate;
 - that the security qualification chain is complete (revision 2: it is not, see
-  [Re-audit findings](#re-audit-findings-revisions-2-4-and-5));
+  [Re-audit findings](#re-audit-findings-revisions-2-4-5-and-6));
 - that ADR-0014 §6–§12 (physical binding, receipts, hold/release, recovery) is
   implemented — it is not, and it belongs to B5.4/B5.5;
 - that `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` is enforced by any OS mechanism;
@@ -115,7 +129,7 @@ What B5.2 explicitly does not own: `prepare`, physical root binding, secured
 start, the applied-security receipt, hold/release, and recovery. Those are
 ADR-0014 §6–§12 and remain unimplemented.
 
-## Re-audit findings (revisions 2, 4 and 5)
+## Re-audit findings (revisions 2, 4, 5 and 6)
 
 Revision 2 re-read the merged code rather than the revision-1 prose and
 reproduced every finding against `d3ab482`. Revision 4 adds P1-3 and P2-5,
@@ -561,6 +575,111 @@ validates the two timestamps; this record does not count the finding as closed
 until that pull request merges. This is a truth gap in the diagnostic, not an
 execution-authority bypass.
 
+### A — a source declaration is not bound to its `SpawnSource` revision
+
+**Normative sentence.** ADR-0013 §5: `P_eff` is the meet of the four authority
+terms, and the source term is the declared ceiling of one exact source revision.
+The declaration is the durable form of that term.
+
+**What is missing.** `EffectiveTaskAuthority::new` (`authority.rs:250–344`) takes
+`source: &SpawnSource`, `source_declaration: &SpawnSourceSecurityDeclaration` and
+`source_policy: Option<&NormalizedSandboxPolicy>` as independent parameters. The
+declaration carries only `source_policy` and `enforcement_profile`
+(`sandbox.rs:2524–2527`) and no `SpawnSourceRef`, so the constructor can prove
+that the declaration's policy digest matches the supplied policy bytes but not
+that the declaration belongs to the supplied source. This composes:
+
+```text
+source A      P_source = restrictive
+source B      P_source = Top
+
+new(source = A, declaration = B, source_policy = None)
+```
+
+The `(None, None)` arm matches, so A's authored ceiling never enters the meet.
+The mismatch is worse than the ceiling alone: `enforcement_profile` is also read
+from the declaration, so B's declared profile replaces A's while
+`spawn_source_ref` still records A.
+
+**Reachability.** No production acquisition calls the constructor, and the
+storage reader keys the declaration on `(source id, revision)`
+(`catalog.rs:2006–2023`), so the mismatch is not reachable through the validated
+read. This is a provenance gap in a public constructor, not a live escalation.
+
+**Required fix.** Bind the declaration to its revision: carry the
+`SpawnSourceRef` in the declaration, check it in `EffectiveTaskAuthority::new`
+before the policy/digest match, and check it at `insert_spawn_source_declaration`
+so a foreign declaration cannot occupy the `(source id, revision)` row either.
+The declaration has no canonical JSON encoding and no digest, so no format,
+schema or version constant changes.
+
+**Status.** Open in this record; fixed in the code pull request whose head is
+`9b8d830`. Tests: `b5_authority::the_source_layer_must_match_its_own_declaration`
+(foreign-revision case) and
+`b5_policy_catalog::a_source_declaration_cannot_be_published_under_another_revision`.
+The `ValidatedSourceSecurityRevision` composite read that the audit suggested is
+not introduced; the invariant is enforced at both boundaries, and the composite
+read remains the natural vehicle for P2-1.
+
+### B — the durable block's validated read is incomplete
+
+**Normative sentence.** ADR-0014 §4 makes the block the durable diagnostic of a
+complete round whose candidate set or compile cost exceeds the fixed budget,
+bound to the blocked Task and to its durable dispatch generation.
+
+**What is missing.** Three gaps at the two sides of one row:
+
+1. `get_security_acquisition_block` (`security_acquisition.rs:127–149`) passed
+   the SQL row to `RawBlock::into_block` and never compared the recorded
+   `generation_id` with the Task's `GenerationTaskBinding`. The write path does
+   compare it, so a raw `UPDATE` of that column is invisible to the validated
+   read: the row rebuilds into a legal-looking block that names a Generation the
+   Task is not bound to.
+2. `validate_durable_truth` never related `candidate_count` to `cost_candidates`.
+   `CandidateDomain` holds the digest and the count as independent fields, so a
+   row can describe a domain of N while recording M < N attempted candidates and
+   still read back as legal.
+3. The same-condition arm of `record_security_acquisition_block` compared the two
+   key digests and returned success. A row corrupted outside those two columns is
+   therefore reported as a current diagnostic and is never healed, even though
+   the same write carries a sound value object.
+
+**Why the read-time mode re-check is not one of the gaps.** See
+[the write-once premise](#task-security-mode-is-write-once-premise-not-a-finding).
+
+**Required fix.** Require `cost.candidates() == domain.candidate_count()` in
+`validate_durable_truth` — a whole-round defer attempts the complete set, so a
+partial candidate cost is not a budget block; re-bind the generation in the read
+path; and rebuild the existing row through the durable constructor before a
+same-condition record returns.
+
+**Status.** Open in this record; fixed in the code pull request whose head is
+`9b8d830`. Tests:
+`b5_enforcement::a_durable_block_must_record_the_complete_domain_as_its_candidate_cost`,
+`b5_acquisition_block::a_validated_read_rejects_a_block_that_names_another_generation`,
+`a_validated_read_rejects_a_block_whose_candidate_cost_is_incomplete` and
+`a_same_condition_write_revalidates_the_existing_row`.
+
+### Task security mode is write-once (premise, not a finding)
+
+The audit's third sub-claim — that the block read should also re-check that the
+Task's current durable mode is `SECURITY_V1` — does not hold, and no check was
+added. `task_agent_requirements.security_contract_mode` is written by exactly one
+`INSERT` (`requirement.rs:115`) and there is no `UPDATE` of that table anywhere in
+storage; `frontier.rs:1156` rejects a mode change on a committed Task. The mode
+is therefore immutable per Task, and the insert-time parent rule already admits
+only a `SECURITY_V1` Task. A read-time re-check would restate the trigger and add
+no guarantee, so it is recorded here as a premise instead.
+
+### Candidate-domain identity is a B5.3 design item
+
+`CandidateDomain::from_ids` takes only `LogicalAgentId` (`enforcement.rs:994`).
+A complete round over unmaterialised `SpawnSource × SourceConfig` candidates
+cannot be expressed with that identity. This is a design question, not a defect
+in the current diagnostic: while `SECURITY_V1` acquisition is unreachable, the
+domain only ever holds existing agents. The unified candidate identity model must
+be settled before acquisition wiring (P2-4); this record does not invent it.
+
 ### Positive correction from the re-audit
 
 The B5.1 audit found that Task→Generation security-mode agreement was checked in
@@ -593,6 +712,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | An unimplemented derivation/normalization/meet version is not authority | `authority.rs` `validate_binding_policy` → `SecurityDerivation::ensure_supported` | `b5_authority::an_unsupported_derivation_version_is_not_authority` | `a331a6a` |
 | `P_eff = TaskAuthority(meet(P_binding, P_agent, P_source))`, with the Task's coarse modes applied last | `authority.rs` `EffectiveTaskAuthority::new` (lines 250–344) | `b5_authority::the_composite_folds_binding_agent_source_and_task_coarse_modes`, `a_write_task_keeps_only_the_intersection_of_all_three_layers` | `a331a6a` |
 | A present source policy must be exactly the bytes its declaration names; presence must agree | `authority.rs` `EffectiveTaskAuthority::new` source-layer match | `b5_authority::the_source_layer_must_match_its_own_declaration` | `a331a6a` |
+| **(rev 6)** A source declaration belongs to exactly one source revision; the constructor and the writer both reject a foreign declaration | `sandbox.rs` `SpawnSourceSecurityDeclaration`; `authority.rs` `EffectiveTaskAuthority::new`; `catalog.rs` `insert_spawn_source_declaration` | `b5_authority::the_source_layer_must_match_its_own_declaration`, `b5_policy_catalog::a_source_declaration_cannot_be_published_under_another_revision` | `9b8d830` |
 | Coarse modes are re-checked on the complete `P_eff`, not reused from admission | `authority.rs` `validate_coarse_modes` | `b5_authority::the_composite_rechecks_the_task_coarse_modes_after_the_meet` | `a331a6a` |
 | `TaskSecurityCeiling` is the candidate-independent `TaskAuthority(meet(P_generation, P_task))` with identity recorded | `authority.rs` `TaskSecurityCeiling::from_binding` | `b5_authority::the_task_ceiling_applies_the_coarse_modes_and_records_identity` | `a331a6a` |
 | A legal candidate whose policy *reference* differs is ranked by the algebra, not by reference equality | `matching.rs` policy-order rank, `predicates.rs` policy-aware specificity | `b5_matching_order::policy_order_keeps_a_legal_candidate_whose_reference_differs`, `policy_aware_specificity_uses_the_algebra_not_the_reference` | `a331a6a` |
@@ -629,6 +749,9 @@ implements it and the test that would fail if it were removed. Rows marked
 | Release is final: release identity and time cannot change | trigger `..._release_is_final` | `b5_enforcement::a_block_is_released_only_by_operator_action_or_configuration_change` | `5f644b4` |
 | Rows are released, never deleted; a raw writer cannot delete or reopen the stored condition | triggers `..._immutable_delete`, `..._no_same_condition_reopen` | `b5_acquisition_block::the_durable_row_cannot_be_deleted_or_reopened_by_a_raw_writer` | `5f644b4` |
 | The parent must be a `SECURITY_V1` requirement and the generation must be the durable dispatch generation | trigger `..._require_security_parent`; `record_security_acquisition_block` generation check | `b5_acquisition_block::a_block_names_only_its_own_task_generation_and_mode` | `5f644b4` |
+| **(rev 6)** The validated read re-binds the recorded generation to the Task's durable dispatch generation | `security_acquisition.rs` `get_security_acquisition_block` | `b5_acquisition_block::a_validated_read_rejects_a_block_that_names_another_generation` | `9b8d830` |
+| **(rev 6)** The recorded candidate cost equals the recorded domain size; a partial candidate cost is not a whole-round defer | `enforcement.rs` `validate_durable_truth` | `b5_enforcement::a_durable_block_must_record_the_complete_domain_as_its_candidate_cost`, `b5_acquisition_block::a_validated_read_rejects_a_block_whose_candidate_cost_is_incomplete` | `9b8d830` |
+| **(rev 6)** A same-condition record revalidates the stored row instead of returning early on two digests | `security_acquisition.rs` `record_security_acquisition_block` | `b5_acquisition_block::a_same_condition_write_revalidates_the_existing_row` | `9b8d830` |
 | **(rev 4)** The recorded cost actually exceeds the recorded budget, and `budget_limit` is exactly the exceeded bound | **absent** — `from_durable_parts` and `record_security_acquisition_block` re-check neither | **absent** | — (P2-5) |
 
 ### ADR-0014 §13–§14 — obligations and the policy-only reference profile
@@ -696,7 +819,7 @@ argument, and this record no longer uses it as one.
 ## Known gaps for the reviewer
 
 These are not hidden defects; they are the boundary of the slice. The first two
-are narrowed by [Re-audit findings](#re-audit-findings-revisions-2-4-and-5) rather than
+are narrowed by [Re-audit findings](#re-audit-findings-revisions-2-4-5-and-6) rather than
 resolved.
 
 1. **The pure compiler does not cross-check the adapter policy.**
@@ -704,8 +827,9 @@ resolved.
    and that the profile matches the authority, but it does not compare
    `binding.policy_ref` with `SpawnSource.adapter_policy`. `EffectiveTaskAuthority`
    records only `SpawnSourceRef` (id + revision), and
-   `SpawnSourceSecurityDeclaration` carries only the source policy and enforcement
-   profile, so this information is not in the compiler's inputs. The binding's
+   `SpawnSourceSecurityDeclaration` carries the source ref, the source policy and
+   the enforcement profile, but not the adapter policy, so this information is
+   not in the compiler's inputs. The binding's
    `policy_ref` *is* in the evidence subject, so the ADR-0014 §5 authority
    transaction can re-read the source and reject the mismatch. Revision 2 groups
    this with P2-1: the same input extension that binds the profile to its
@@ -749,6 +873,16 @@ resolved.
     would be returned for a plan that requires it. Nothing memoizes yet, so this
     is latent; it is nevertheless the first thing a B5.2 acquisition cache would
     get wrong, and the ADR-0014 §4 list itself has to change.
+11. **(rev 6)** **A source declaration had no revision identity.** A. Being
+    policy/digest-correct was not the same as belonging to this source. The
+    declaration now carries its `SpawnSourceRef`, and both the constructor and the
+    storage writer reject a foreign one; the composite read is still the cleaner
+    long-term shape and remains the vehicle for P2-1.
+12. **(rev 6)** **The durable block trusted its own row.** B. A tampered
+    generation, a candidate cost smaller than the recorded domain, and a corrupt
+    same-condition row were all accepted. Each now fails closed; none of them
+    could create Attempt or Lease authority, so the fix is diagnostic truth, not
+    a privilege boundary.
 
 ## Verification
 
@@ -806,6 +940,29 @@ either. Once PR #31 lands, the workspace command above also excludes a second
 fixture, `agentype-public-api-contract-only`, for the same reason as
 `agentype-public-api-boundary`.
 
+Revision 6 is the first revision since 1 that ships code, in the companion pull
+request whose head is `9b8d830`. These commands were run at that head; the
+docs-only head of this revision re-runs none of them:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 57 suites, 1072 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only` | 3 passed, 0 failed |
+
+Each new guard was also mutation-checked: the guard was disabled, the affected
+tests were run, and each one failed for the expected reason.
+
+| Guard disabled | Failing tests |
+|---|---|
+| `cost.candidates() == candidate_count()` | the contract count test and the storage count test |
+| read-path generation re-bind | `a_validated_read_rejects_a_block_that_names_another_generation` |
+| same-condition rebuild (digest-only no-op restored) | `a_same_condition_write_revalidates_the_existing_row` |
+| constructor provenance check | `the_source_layer_must_match_its_own_declaration` |
+| writer provenance check | `a_source_declaration_cannot_be_published_under_another_revision` |
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -816,6 +973,10 @@ revision 1:
 | `crates/agentype-agent-contract/tests/b5_enforcement.rs` | 14 |
 | `crates/agentype-storage-sqlite/tests/b5_candidate_order.rs` | 3 |
 | `crates/agentype-storage-sqlite/tests/b5_acquisition_block.rs` | 5 |
+
+At revision 6's code head those modules hold `b5_authority` 8,
+`b5_enforcement` 24 and `b5_acquisition_block` 10 tests; `b5_policy_catalog`
+holds 25.
 
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
@@ -837,9 +998,11 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
+| 9 | Bind each source declaration to its source revision (A) | the constructor and the writer both reject a declaration from another revision, and the validated read still fills the ref from `(source id, revision)`. Proposed in PR #35 |
+| 10 | Complete the durable block's validated read and count coherence (B) | a tampered generation, a candidate cost smaller than the domain, and a corrupt same-condition row each fail closed on read or re-record. Proposed in PR #35 |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1` |
 
-Items 1–6 and 8 are code changes and belong in follow-up pull requests, not in
+Items 1–6, 8, 9 and 10 are code changes and belong in follow-up pull requests, not in
 this docs-only record. Item 7 was a design decision and is settled in revision 3
 by narrowing the ADR rather than by adding history; item 4 also needs its
 normative sentence in the ADR, which is why that part sits in the ADR pull
@@ -859,6 +1022,7 @@ pull requests are reviewed against.
 | Access floor, projection and check | `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess`, `check_required_access`) |
 | Admission-time floor proof | `crates/agentype-storage-sqlite/src/requirement.rs` (lines 1341–1356, 1485–1509) |
 | Durable block read/write/release | `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
+| Source-declaration provenance | `crates/agentype-agent-contract/src/sandbox.rs` (`SpawnSourceSecurityDeclaration`), `crates/agentype-agent-contract/src/authority.rs` (`EffectiveTaskAuthority::new`), `crates/agentype-storage-sqlite/src/catalog.rs` (`insert_spawn_source_declaration`) |
 | Schema v10 table and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (lines 1293–1359) |
 | Kernel wrappers | `crates/agentype-storage-sqlite/src/kernel.rs` (lines 1056–1081) |
 | Coarse acquisition gate | `crates/agentype-storage-sqlite/src/provisioning.rs` (lines 734–741, 1069, 1342) |
