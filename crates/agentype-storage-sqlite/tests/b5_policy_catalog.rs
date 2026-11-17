@@ -792,6 +792,7 @@ fn spawn_source_security_declaration_is_published_atomically_with_its_authored_c
         SecurityContractMode::CoarseV1
     );
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::authored(policy_reference, &policy),
         profile(),
     );
@@ -800,10 +801,16 @@ fn spawn_source_security_declaration_is_published_atomically_with_its_authored_c
         .unwrap_err();
     assert!(error.to_string().contains("immutable"), "{error}");
 
-    // A fresh revision publishes content and declaration atomically.
+    // A fresh revision publishes content and declaration atomically. The
+    // declaration names the exact revision it was authored for.
     let secure = source_at(3);
+    let secure_declaration = SpawnSourceSecurityDeclaration::with_policy(
+        secure.source_ref.clone(),
+        PolicyInput::authored(policy_ref("source-policy", 1), &policy),
+        profile(),
+    );
     kernel
-        .publish_spawn_source_with_security(&secure, Some(&declaration))
+        .publish_spawn_source_with_security(&secure, Some(&secure_declaration))
         .unwrap();
     assert_eq!(
         kernel
@@ -815,14 +822,15 @@ fn spawn_source_security_declaration_is_published_atomically_with_its_authored_c
         .spawn_source_security_declaration(&secure.source_ref)
         .unwrap()
         .unwrap();
-    assert_eq!(read, declaration);
+    assert_eq!(read, secure_declaration);
 
     // Republishing identical content is idempotent; different content needs a
     // new source revision.
     kernel
-        .publish_spawn_source_with_security(&secure, Some(&declaration))
+        .publish_spawn_source_with_security(&secure, Some(&secure_declaration))
         .unwrap();
     let changed = SpawnSourceSecurityDeclaration::new(
+        secure.source_ref.clone(),
         None,
         EnforcementProfileRef::new("agentype-enforcement", "policy-only", 2).unwrap(),
     );
@@ -840,7 +848,8 @@ fn spawn_source_declaration_without_ceiling_keeps_top_and_security_mode() {
     let kernel = memory_kernel();
     publish_adapter_policy(&kernel);
     let source = source_at(2);
-    let declaration = SpawnSourceSecurityDeclaration::without_policy(profile());
+    let declaration =
+        SpawnSourceSecurityDeclaration::without_policy(source.source_ref.clone(), profile());
     kernel
         .publish_spawn_source_with_security(&source, Some(&declaration))
         .unwrap();
@@ -861,6 +870,36 @@ fn spawn_source_declaration_without_ceiling_keeps_top_and_security_mode() {
 }
 
 #[test]
+fn a_source_declaration_cannot_be_published_under_another_revision() {
+    let kernel = memory_kernel();
+    publish_adapter_policy(&kernel);
+    let source = source_at(2);
+
+    // The declaration row is keyed by `(source id, revision)`. A declaration
+    // read for one revision must not be re-bound to another, or a policy-less
+    // foreign declaration would silently become this revision's ceiling and
+    // enforcement profile.
+    let foreign = SpawnSourceSecurityDeclaration::without_policy(
+        SpawnSourceRef::new("codex-local", 3).unwrap(),
+        profile(),
+    );
+    let error = kernel
+        .publish_spawn_source_with_security(&source, Some(&foreign))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("different source revision"),
+        "{error}"
+    );
+
+    // The rejected publication left no source and no declaration behind.
+    assert_eq!(kernel.get_spawn_source(&source.source_ref).unwrap(), None);
+    let missing = kernel
+        .spawn_source_security_declaration(&source.source_ref)
+        .unwrap_err();
+    assert!(missing.to_string().contains("does not exist"), "{missing}");
+}
+
+#[test]
 fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
     let kernel = memory_kernel();
     publish_adapter_policy(&kernel);
@@ -868,6 +907,7 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
 
     // A derived input has no authored identity and cannot be a P_source.
     let derived = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::derived(&NormalizedSandboxPolicy::top()),
         profile(),
     );
@@ -889,6 +929,7 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
         .publish_spawn_source_with_security(
             &source,
             Some(&SpawnSourceSecurityDeclaration::new(
+                source.source_ref.clone(),
                 Some(wrong_digest),
                 profile(),
             )),
@@ -898,6 +939,7 @@ fn spawn_source_declaration_rejects_an_unresolvable_or_mismatched_policy() {
 
     // An unresolvable reference is not a usable declaration.
     let missing = SpawnSourceSecurityDeclaration::new(
+        source.source_ref.clone(),
         Some(PolicyInput::from_parts(
             Some(policy_ref("absent-policy", 1)),
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -928,6 +970,7 @@ fn spawn_source_declaration_digest_corruption_fails_closed() {
         .publish_spawn_source_with_security(
             &source_at(2),
             Some(&SpawnSourceSecurityDeclaration::with_policy(
+                reference.clone(),
                 PolicyInput::authored(policy_reference, &policy),
                 profile(),
             )),
@@ -961,6 +1004,7 @@ fn spawn_source_declaration_isolation_corruption_fails_closed() {
         .publish_spawn_source_with_security(
             &source_at(2),
             Some(&SpawnSourceSecurityDeclaration::with_policy(
+                reference.clone(),
                 PolicyInput::authored(policy_reference, &policy),
                 profile(),
             )),
@@ -1016,7 +1060,10 @@ fn spawn_source_declaration_requires_the_parent_disposition_overlay() {
     kernel
         .publish_spawn_source_with_security(
             &source,
-            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+            Some(&SpawnSourceSecurityDeclaration::without_policy(
+                source.source_ref.clone(),
+                profile(),
+            )),
         )
         .unwrap();
 
@@ -1042,7 +1089,10 @@ fn spawn_source_declaration_rejects_an_untrusted_parent_source() {
     kernel
         .publish_spawn_source_with_security(
             &source,
-            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+            Some(&SpawnSourceSecurityDeclaration::without_policy(
+                source.source_ref.clone(),
+                profile(),
+            )),
         )
         .unwrap();
 
@@ -1069,11 +1119,15 @@ fn spawn_source_declaration_enforcement_version_must_fit_u32() {
     let db = Db::new("source-version-width");
     let kernel = db.kernel();
     publish_adapter_policy(&kernel);
-    let reference = source_at(2).source_ref;
+    let source = source_at(2);
+    let reference = source.source_ref.clone();
     kernel
         .publish_spawn_source_with_security(
-            &source_at(2),
-            Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+            &source,
+            Some(&SpawnSourceSecurityDeclaration::without_policy(
+                source.source_ref.clone(),
+                profile(),
+            )),
         )
         .unwrap();
 
@@ -1107,10 +1161,14 @@ fn declarations_survive_a_restart() {
         kernel
             .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
             .unwrap();
+        let source = source_at(2);
         kernel
             .publish_spawn_source_with_security(
-                &source_at(2),
-                Some(&SpawnSourceSecurityDeclaration::without_policy(profile())),
+                &source,
+                Some(&SpawnSourceSecurityDeclaration::without_policy(
+                    source.source_ref.clone(),
+                    profile(),
+                )),
             )
             .unwrap();
     }
@@ -1150,6 +1208,7 @@ fn spawn_source_policy_cannot_require_attempt_isolation() {
 
     let source = source_at(2);
     let declaration = SpawnSourceSecurityDeclaration::with_policy(
+        source.source_ref.clone(),
         PolicyInput::authored(reference, &policy),
         profile(),
     );

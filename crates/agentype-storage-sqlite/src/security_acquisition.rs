@@ -58,11 +58,12 @@ pub fn record_security_acquisition_block(
 
     let existing = query_opt(
         tx,
-        "SELECT candidate_domain_digest, binding_profile_digest
-         FROM security_acquisition_blocks WHERE task_id=?1",
+        SELECT_BLOCK,
         params![block.task_id().as_str()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    )?;
+        raw_block_row,
+    )?
+    .map(RawBlock::into_block)
+    .transpose()?;
 
     match existing {
         None => {
@@ -89,11 +90,13 @@ pub fn record_security_acquisition_block(
             )
             .map_err(map_sqlite)?;
         }
-        Some((domain, binding))
-            if domain == block.candidate_domain_digest()
-                && binding == block.binding_profile_digest() =>
+        Some(current)
+            if current.candidate_domain_digest() == block.candidate_domain_digest()
+                && current.binding_profile_digest() == block.binding_profile_digest() =>
         {
             // One indistinguishable condition is one diagnostic, released or not.
+            // The existing row was rebuilt through the validated constructor above,
+            // so a corrupted row fails here instead of being reported as current.
         }
         Some(_) => {
             tx.execute(
@@ -124,29 +127,26 @@ pub fn record_security_acquisition_block(
 }
 
 /// The durable diagnostic of a Task, if one exists.
+///
+/// The row is rebuilt through the validated constructor and then re-bound to its
+/// Task: a tampered `generation_id`, cost/domain mismatch, non-exhausted budget
+/// or inconsistent release fields fail closed instead of being returned as a
+/// current diagnostic.
 pub fn get_security_acquisition_block(
     tx: &Transaction<'_>,
     task_id: &TaskId,
 ) -> Result<Option<SecurityAcquisitionBlock>, Error> {
-    let row = query_opt(tx, SELECT_BLOCK, params![task_id.as_str()], |row| {
-        Ok(RawBlock {
-            task_id: row.get(0)?,
-            generation_id: row.get(1)?,
-            candidate_domain_digest: row.get(2)?,
-            candidate_count: row.get(3)?,
-            binding_profile_digest: row.get(4)?,
-            cost_candidates: row.get(5)?,
-            cost_compiles: row.get(6)?,
-            budget_max_candidates: row.get(7)?,
-            budget_max_compiles: row.get(8)?,
-            budget_limit: row.get(9)?,
-            status: row.get(10)?,
-            created_at: row.get(11)?,
-            released_at: row.get(12)?,
-            release_reason: row.get(13)?,
-        })
-    })?;
-    row.map(RawBlock::into_block).transpose()
+    let row = query_opt(tx, SELECT_BLOCK, params![task_id.as_str()], raw_block_row)?;
+    let Some(block) = row.map(RawBlock::into_block).transpose()? else {
+        return Ok(None);
+    };
+    let generation = task_generation(tx, block.task_id())?;
+    if &generation != block.generation_id() {
+        return Err(Error::invariant(
+            "a durable security acquisition block names a Generation the Task is not bound to",
+        ));
+    }
+    Ok(Some(block))
 }
 
 /// Release a Task's diagnostic.
@@ -226,6 +226,25 @@ struct RawBlock {
     created_at: f64,
     released_at: Option<f64>,
     release_reason: Option<String>,
+}
+
+fn raw_block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBlock> {
+    Ok(RawBlock {
+        task_id: row.get(0)?,
+        generation_id: row.get(1)?,
+        candidate_domain_digest: row.get(2)?,
+        candidate_count: row.get(3)?,
+        binding_profile_digest: row.get(4)?,
+        cost_candidates: row.get(5)?,
+        cost_compiles: row.get(6)?,
+        budget_max_candidates: row.get(7)?,
+        budget_max_compiles: row.get(8)?,
+        budget_limit: row.get(9)?,
+        status: row.get(10)?,
+        created_at: row.get(11)?,
+        released_at: row.get(12)?,
+        release_reason: row.get(13)?,
+    })
 }
 
 impl RawBlock {

@@ -4732,6 +4732,7 @@ mod tests {
             .publish_spawn_source_with_security(
                 &source,
                 Some(&SpawnSourceSecurityDeclaration::without_policy(
+                    source.source_ref.clone(),
                     EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
                 )),
             )
