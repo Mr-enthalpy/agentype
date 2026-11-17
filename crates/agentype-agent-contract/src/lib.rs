@@ -69,12 +69,13 @@ pub use decode::{
     task_agent_requirement_from_canonical_json,
 };
 pub use enforcement::{
-    binding_profile_digest, compile_execution_security, qualify_security_candidate,
-    AcquisitionBudget, AcquisitionCost, BudgetExhaustion, BudgetLimit, CandidateDomain,
-    CompileCacheKey, CompiledExecutionSecurity, EffectiveExecutionGuarantees, EnforcementFeature,
-    EnforcementSubject, EnforcementSupport, ImportedEnforcementProfile, PolicyEnforcementPlan,
-    RequiredEnforcementFeatures, SecurityAcquisitionBlock, SecurityAcquisitionBlockStatus,
-    SecurityAcquisitionRelease, SecurityEvidenceSubject, ENFORCEMENT_COMPILER_PROTOCOL,
+    binding_profile_digest, compile_execution_security, effective_execution_guarantees_digest,
+    qualify_security_candidate, AcquisitionBudget, AcquisitionCost, BudgetExhaustion, BudgetLimit,
+    CandidateDomain, CompileCacheKey, CompiledExecutionSecurity, EffectiveExecutionGuarantees,
+    EnforcementFeature, EnforcementSubject, EnforcementSupport, ImportedEnforcementProfile,
+    PolicyEnforcementPlan, RequiredEnforcementFeatures, SecurityAcquisitionBlock,
+    SecurityAcquisitionBlockStatus, SecurityAcquisitionRelease, SecurityEvidenceSubject,
+    ENFORCEMENT_COMPILER_PROTOCOL, ENFORCEMENT_GUARANTEES_SCHEMA_VERSION,
     ENFORCEMENT_PLAN_SCHEMA_VERSION, ENFORCEMENT_PROFILE_SCHEMA_VERSION,
     POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
 };

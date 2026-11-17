@@ -41,11 +41,17 @@ use std::collections::BTreeSet;
 /// Version tag of the canonical imported-profile document.
 pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 1;
 /// Version tag of the compiled plan document.
-pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 2;
+/// Version tag of the canonical execution-guarantee document that the compile
+/// cache key commits to.
+pub const ENFORCEMENT_GUARANTEES_SCHEMA_VERSION: u32 = 1;
 /// The compiler protocol this build implements. It is part of the plan digest
 /// and the memoization key: a compiler semantic change cannot reuse an old
 /// result even when the inputs are byte-identical.
-pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/1";
+///
+/// `/2` records that the plan and the cache key now carry the composed
+/// execution guarantees, so a `/1` result must never be reused.
+pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/2";
 
 /// The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile identity
 /// (ADR-0014 §14). This is a positive minimum target, not a claim that a
@@ -159,7 +165,14 @@ impl EnforcementSubject {
     }
 }
 
-/// The effective guarantees a Task imposes beyond its authored policy bytes.
+/// The composed execution guarantees a Task imposes.
+///
+/// A guarantee is a disjunction, not an authorization intersection. It is carried
+/// separately from the operation-set policy bytes so that a Task-only or
+/// AgentType-only requirement survives a wider effective policy, and it also
+/// includes the effective policy bit, which already folds every authored layer
+/// (Generation, Task and SpawnSource). The plan accessor and the obligation set
+/// therefore read the same value and cannot disagree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EffectiveExecutionGuarantees {
     requires_attempt_isolation: bool,
@@ -173,14 +186,30 @@ impl EffectiveExecutionGuarantees {
     }
 
     /// Derive the guarantees from the composite authority: the Task's durable
-    /// requirement and the bound AgentType's contract both count.
+    /// requirement, the bound AgentType's contract and the effective policy bit
+    /// all count. A meet is a disjunction for a guarantee, so no layer may clear
+    /// one.
     pub fn from_authority(authority: &EffectiveTaskAuthority) -> Self {
-        Self::new(authority.requires_attempt_isolation())
+        Self::new(authority.requires_attempt_isolation() || authority.policy().attempt_isolation())
     }
 
     pub fn requires_attempt_isolation(&self) -> bool {
         self.requires_attempt_isolation
     }
+}
+
+/// Canonical identity of the composed execution guarantees.
+///
+/// A guarantee contributes obligations without changing the effective-policy
+/// bytes, so the policy digest alone cannot distinguish two compile inputs whose
+/// obligation sets differ. The compile cache key therefore commits to this
+/// digest is an explicit key component (ADR-0014 §4).
+pub fn effective_execution_guarantees_digest(guarantees: EffectiveExecutionGuarantees) -> String {
+    canonical_json_body_digest(&json!({
+        "kind": "EFFECTIVE_EXECUTION_GUARANTEES",
+        "schema": ENFORCEMENT_GUARANTEES_SCHEMA_VERSION,
+        "requires_attempt_isolation": guarantees.requires_attempt_isolation(),
+    }))
 }
 
 /// The obligations derived through the single normative relation
@@ -405,11 +434,13 @@ fn profile_digest(
     }))
 }
 
-/// The seven-part compile memoization key (ADR-0014 §4).
+/// The eight-part compile memoization key (ADR-0014 §4).
 ///
 /// The effective-policy digest commits to canonical bytes, not to the
 /// normalization and meet algorithm versions that produced them, so both
-/// versions are explicit components.
+/// versions are explicit components. The same reasoning applies to the composed
+/// guarantees: they change the obligations without changing the policy bytes, so
+/// their digest is an explicit component too.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompileCacheKey {
     effective_policy_digest: String,
@@ -418,6 +449,7 @@ pub struct CompileCacheKey {
     adapter_kind: String,
     adapter_binding_key: String,
     enforcement_profile_digest: String,
+    execution_guarantees_digest: String,
     compiler_protocol_version: String,
 }
 
@@ -429,6 +461,7 @@ impl CompileCacheKey {
         adapter_kind: impl Into<String>,
         adapter_binding_key: impl Into<String>,
         enforcement_profile_digest: impl Into<String>,
+        execution_guarantees_digest: impl Into<String>,
     ) -> Result<Self, ContractError> {
         let key = Self {
             effective_policy_digest: effective_policy_digest.into(),
@@ -437,6 +470,7 @@ impl CompileCacheKey {
             adapter_kind: adapter_kind.into(),
             adapter_binding_key: adapter_binding_key.into(),
             enforcement_profile_digest: enforcement_profile_digest.into(),
+            execution_guarantees_digest: execution_guarantees_digest.into(),
             compiler_protocol_version: ENFORCEMENT_COMPILER_PROTOCOL.to_string(),
         };
         for (value, what) in [
@@ -446,6 +480,10 @@ impl CompileCacheKey {
             (
                 &key.enforcement_profile_digest,
                 "enforcement profile digest",
+            ),
+            (
+                &key.execution_guarantees_digest,
+                "execution guarantees digest",
             ),
         ] {
             if value.trim().is_empty() {
@@ -486,6 +524,10 @@ impl CompileCacheKey {
         &self.enforcement_profile_digest
     }
 
+    pub fn execution_guarantees_digest(&self) -> &str {
+        &self.execution_guarantees_digest
+    }
+
     pub fn compiler_protocol_version(&self) -> &str {
         &self.compiler_protocol_version
     }
@@ -496,6 +538,7 @@ impl CompileCacheKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyEnforcementPlan {
     effective_policy: NormalizedSandboxPolicy,
+    guarantees: EffectiveExecutionGuarantees,
     obligations: RequiredEnforcementFeatures,
     reference: EnforcementProfileRef,
     plan_digest: String,
@@ -536,8 +579,15 @@ impl PolicyEnforcementPlan {
         self.effective_policy.working_directory()
     }
 
+    /// The composed execution guarantees, not the bare effective-policy bit. A
+    /// Task-only or AgentType-only requirement therefore reaches the committed
+    /// execution request even when every authored policy bit is false.
+    pub fn guarantees(&self) -> EffectiveExecutionGuarantees {
+        self.guarantees
+    }
+
     pub fn attempt_isolation(&self) -> bool {
-        self.effective_policy.attempt_isolation()
+        self.guarantees.requires_attempt_isolation()
     }
 
     pub fn obligations(&self) -> &RequiredEnforcementFeatures {
@@ -785,10 +835,14 @@ pub fn compile_execution_security(
         });
     }
 
-    let obligations = RequiredEnforcementFeatures::derive(
-        authority.policy(),
-        EffectiveExecutionGuarantees::from_authority(authority),
-    );
+    let guarantees = EffectiveExecutionGuarantees::from_authority(authority);
+    if authority.policy().attempt_isolation() && !guarantees.requires_attempt_isolation() {
+        return Err(ContractError::InvariantViolation(
+            "the effective policy requires attempt isolation but no composed guarantee carries it"
+                .into(),
+        ));
+    }
+    let obligations = RequiredEnforcementFeatures::derive(authority.policy(), guarantees);
     let missing = profile.support().missing(&obligations);
     if !missing.is_empty() {
         let names: Vec<&str> = missing.iter().map(|feature| feature.as_str()).collect();
@@ -808,6 +862,7 @@ pub fn compile_execution_security(
         "compiler_protocol": ENFORCEMENT_COMPILER_PROTOCOL,
         "effective_policy_digest": authority.effective_policy_digest(),
         "enforcement_profile_digest": profile.profile_digest(),
+        "requires_attempt_isolation": guarantees.requires_attempt_isolation(),
         "obligations": obligations.features().iter().map(|f| f.as_str()).collect::<Vec<_>>(),
     }));
     let cache_key = CompileCacheKey::new(
@@ -817,9 +872,11 @@ pub fn compile_execution_security(
         &binding.adapter_kind,
         &binding.binding_ref,
         profile.profile_digest(),
+        effective_execution_guarantees_digest(guarantees),
     )?;
     let plan = PolicyEnforcementPlan {
         effective_policy,
+        guarantees,
         obligations,
         reference: profile.reference().clone(),
         plan_digest,
@@ -1127,7 +1184,7 @@ impl SecurityAcquisitionBlock {
                 field: "security acquisition block timestamp".into(),
             });
         }
-        Ok(Self {
+        let block = Self {
             task_id,
             generation_id,
             domain,
@@ -1139,7 +1196,9 @@ impl SecurityAcquisitionBlock {
             created_at: now,
             released_at: None,
             release_reason: None,
-        })
+        };
+        block.validate_durable_truth()?;
+        Ok(block)
     }
 
     /// Reconstruct a durable row. Used by the storage read path.
@@ -1172,7 +1231,7 @@ impl SecurityAcquisitionBlock {
                 ))
             }
         }
-        Ok(Self {
+        let block = Self {
             task_id,
             generation_id,
             domain: CandidateDomain {
@@ -1187,7 +1246,44 @@ impl SecurityAcquisitionBlock {
             created_at,
             released_at,
             release_reason,
-        })
+        };
+        block.validate_durable_truth()?;
+        Ok(block)
+    }
+
+    /// Re-prove that this row is a real whole-round defer.
+    ///
+    /// The recorded cost must actually exceed the recorded budget, and the
+    /// recorded limit must be exactly the bound that `require_whole_round`
+    /// reports. The in-memory producer path cannot reach an inconsistent state,
+    /// because `BudgetExhaustion` has private fields and only
+    /// `require_whole_round` constructs it; this check exists for the durable
+    /// boundary, where the fields arrive independently and a hand-written row is
+    /// indistinguishable from a real diagnostic without it.
+    pub fn validate_durable_truth(&self) -> Result<(), ContractError> {
+        if !self.created_at.is_finite() || self.created_at < 0.0 {
+            return Err(ContractError::InvariantViolation(
+                "a durable security acquisition block has an invalid creation timestamp".into(),
+            ));
+        }
+        if let Some(released_at) = self.released_at {
+            if !released_at.is_finite() || released_at < 0.0 {
+                return Err(ContractError::InvariantViolation(
+                    "a durable security acquisition block has an invalid release timestamp".into(),
+                ));
+            }
+        }
+        match self.budget.require_whole_round(self.cost) {
+            Ok(()) => Err(ContractError::InvariantViolation(
+                "a durable security acquisition block records a cost inside its budget".into(),
+            )),
+            Err(exhaustion) if exhaustion.limit() == self.limit => Ok(()),
+            Err(exhaustion) => Err(ContractError::InvariantViolation(format!(
+                "a durable security acquisition block records the {} limit but its budget is exhausted at {}",
+                self.limit.as_str(),
+                exhaustion.limit().as_str()
+            ))),
+        }
     }
 
     pub fn task_id(&self) -> &TaskId {

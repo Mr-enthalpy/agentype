@@ -519,3 +519,60 @@ fn the_durable_row_cannot_be_deleted_or_reopened_by_a_raw_writer() {
     assert_eq!(stored.status(), SecurityAcquisitionBlockStatus::Released);
     assert_eq!(db.row_count(), 1);
 }
+
+#[test]
+fn a_validated_read_rejects_a_block_whose_cost_is_inside_its_budget() {
+    let db = Db::new("truth");
+    let kernel = db.kernel(2);
+    let (task_id, generation_id) = security_task(&kernel, "truth");
+    kernel
+        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .unwrap();
+
+    // The legal row is readable before corruption.
+    assert!(kernel
+        .get_security_acquisition_block(&task_id)
+        .unwrap()
+        .is_some());
+
+    // Lower the recorded cost below the fixed 1/1 budget with a raw writer. The
+    // row now claims BLOCKED for a round that never exceeded anything.
+    db.raw()
+        .execute(
+            "UPDATE security_acquisition_blocks
+             SET cost_candidates=0, cost_compiles=0
+             WHERE task_id=?1",
+            [task_id.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel.get_security_acquisition_block(&task_id).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("inside its budget"), "{message}");
+}
+
+#[test]
+fn a_validated_read_rejects_a_block_that_names_the_wrong_limit() {
+    let db = Db::new("limit");
+    let kernel = db.kernel(2);
+    let (task_id, generation_id) = security_task(&kernel, "limit");
+    kernel
+        .record_security_acquisition_block(&defer_block(&task_id, &generation_id, &["agent-a"], 2))
+        .unwrap();
+
+    // Both bounds are exceeded; the stored limit must still name the one
+    // `require_whole_round` reports, which is the candidate bound.
+    db.raw()
+        .execute(
+            "UPDATE security_acquisition_blocks
+             SET budget_limit='COMPILE_COUNT'
+             WHERE task_id=?1",
+            [task_id.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel.get_security_acquisition_block(&task_id).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("CANDIDATE_COUNT"), "{message}");
+    assert!(message.contains("COMPILE_COUNT"), "{message}");
+}
