@@ -255,13 +255,20 @@ pub fn b5_composite_authority_surface() {}
 ///     revision: &SecurityRevision<'_>,
 ///     source: &SpawnSource,
 ///     binding: &AdapterBindingPolicy,
+///     adapter_binding_key: &str,
 ///     profile: &ImportedEnforcementProfile,
 ///     catalog: &CapabilityCatalog,
 /// ) {
 ///     // The compiler accepts only a tuple that already proves the binding is the
-///     // source's own adapter policy and the profile was imported for it.
-///     let domain =
-///         ValidatedSourceBinding::validate(source, binding, profile).expect("consistent tuple");
+///     // source's own adapter policy and the profile was imported for the same
+///     // resolved physical domain, not merely for the same alias.
+///     let domain = ValidatedSourceBinding::validate(
+///         source,
+///         binding,
+///         adapter_binding_key,
+///         profile,
+///     )
+///     .expect("consistent tuple");
 ///     let compiled =
 ///         compile_execution_security(authority, &domain).expect("candidate-local");
 ///     let plan: &PolicyEnforcementPlan = compiled.plan();
@@ -590,7 +597,7 @@ pub fn b5_compiled_security_surface() {}
 ///     .expect("the runtime host sees the producer constructor");
 ///     assert!(profile.covers_subject(EnforcementSubject::ControlledPrimaryProcess));
 ///     assert_eq!(profile.adapter_kind(), "local-process");
-///     assert_eq!(profile.binding_ref(), "runtime-boundary/binding");
+///     assert_eq!(profile.adapter_binding_key(), "runtime-boundary/binding");
 /// }
 /// ```
 pub fn probes() {}

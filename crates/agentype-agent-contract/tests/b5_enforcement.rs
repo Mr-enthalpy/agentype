@@ -176,12 +176,16 @@ fn reference_profile(subjects: [EnforcementSubject; 1]) -> ImportedEnforcementPr
 }
 
 /// Validate one source/binding/profile tuple, as the candidate path must.
+///
+/// Every fixture uses [`ADAPTER_BINDING`] as its resolved physical key; tests
+/// that exercise the alias/physical-key split call
+/// [`ValidatedSourceBinding::validate`] directly with an explicit key.
 fn validated(
     source: &SpawnSource,
     binding: &AdapterBindingPolicy,
     profile: &ImportedEnforcementProfile,
 ) -> ValidatedSourceBinding {
-    ValidatedSourceBinding::validate(source, binding, profile).unwrap()
+    ValidatedSourceBinding::validate(source, binding, ADAPTER_BINDING, profile).unwrap()
 }
 
 fn task_binding_with_floor(
@@ -943,11 +947,125 @@ fn a_profile_imported_for_another_binding_is_a_subject_mismatch() {
 
     let binding = adapter_binding(ConfigStatus::Active);
     assert!(matches!(
-        ValidatedSourceBinding::validate(&fixture.source, &binding, &foreign).unwrap_err(),
+        ValidatedSourceBinding::validate(&fixture.source, &binding, ADAPTER_BINDING, &foreign)
+            .unwrap_err(),
         ContractError::EvidenceSubjectMismatch { .. }
     ));
     // The matching tuple is accepted.
-    assert!(ValidatedSourceBinding::validate(&fixture.source, &binding, &fixture.profile).is_ok());
+    assert!(ValidatedSourceBinding::validate(
+        &fixture.source,
+        &binding,
+        ADAPTER_BINDING,
+        &fixture.profile
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_alias_resolving_to_the_profiles_physical_domain_is_accepted() {
+    let fixture = confined_fixture();
+    // B.4: `binding_ref` is only a stable alias. Here it resolves to `k2`, a
+    // different string than the profile's imported key would be if the two
+    // concepts were conflated.
+    let binding = AdapterBindingPolicy::new(
+        AdapterPolicyRef::new("codex-local-adapter", 1).unwrap(),
+        ADAPTER_KIND,
+        "primary",
+        adapter_binding(ConfigStatus::Active)
+            .required_safety
+            .clone(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    let profile = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        "k2",
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    let domain =
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "k2", &profile).unwrap();
+    assert_eq!(domain.adapter_binding_key(), "k2");
+    assert_ne!(domain.adapter_binding_key(), &binding.binding_ref);
+
+    let compiled = compile_execution_security(&fixture.authority(), &domain).unwrap();
+    // The cache key and the evidence subject commit to the resolved physical
+    // key, never to the alias.
+    assert_eq!(compiled.cache_key().adapter_binding_key(), "k2");
+    assert_eq!(compiled.evidence_subject().adapter_binding_key(), "k2");
+}
+
+#[test]
+fn a_profile_from_another_physical_domain_under_the_same_alias_is_rejected() {
+    let fixture = confined_fixture();
+    let binding = AdapterBindingPolicy::new(
+        AdapterPolicyRef::new("codex-local-adapter", 1).unwrap(),
+        ADAPTER_KIND,
+        "primary",
+        adapter_binding(ConfigStatus::Active)
+            .required_safety
+            .clone(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    // The profile was imported for physical domain `k1`; the selection resolved
+    // the same `primary` alias to `k2`. An alias-only comparison would accept
+    // this swap.
+    let profile = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        "k1",
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    assert!(matches!(
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "k2", &profile).unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+    // An empty resolved key is not a wildcard.
+    assert!(matches!(
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "  ", &fixture.profile)
+            .unwrap_err(),
+        ContractError::InvalidRef { .. }
+    ));
+}
+
+#[test]
+fn the_frozen_reference_profile_cannot_widen_its_support_matrix() {
+    // ADR-0014 §14: the reference profile is a fixed capability claim. Claiming
+    // network egress restriction under the same identity must fail at import,
+    // before a compiler could treat the wider matrix as covered.
+    assert!(matches!(
+        ImportedEnforcementProfile::import(
+            reference_profile_ref(),
+            1,
+            ADAPTER_KIND,
+            ADAPTER_BINDING,
+            EnforcementSupport::new([
+                EnforcementFeature::WorkspaceWriteConfinement,
+                EnforcementFeature::EnvironmentAllowlist,
+                EnforcementFeature::NetworkEgressRestriction,
+            ]),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        )
+        .unwrap_err(),
+        ContractError::InvalidSandboxPolicy { .. }
+    ));
+    // A stricter subset is still a valid conservative claim.
+    assert!(ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .is_ok());
 }
 
 #[test]
@@ -963,7 +1081,13 @@ fn a_binding_must_implement_the_sources_own_adapter_policy() {
     )
     .unwrap();
     assert!(matches!(
-        ValidatedSourceBinding::validate(&fixture.source, &foreign, &fixture.profile).unwrap_err(),
+        ValidatedSourceBinding::validate(
+            &fixture.source,
+            &foreign,
+            ADAPTER_BINDING,
+            &fixture.profile,
+        )
+        .unwrap_err(),
         ContractError::EvidenceSubjectMismatch { .. }
     ));
 }
@@ -978,6 +1102,7 @@ fn a_source_that_is_not_active_is_never_validated() {
             ValidatedSourceBinding::validate(
                 &source,
                 &adapter_binding(ConfigStatus::Active),
+                ADAPTER_BINDING,
                 &fixture.profile,
             )
             .unwrap_err(),
@@ -1084,14 +1209,14 @@ fn the_policy_only_reference_protocol_cannot_claim_an_external_subject() {
 }
 
 #[test]
-fn a_profile_must_name_its_adapter_binding() {
-    for (kind, binding_ref) in [("", ADAPTER_BINDING), (ADAPTER_KIND, "  ")] {
+fn a_profile_must_name_its_exact_physical_adapter_binding() {
+    for (kind, key) in [("", ADAPTER_BINDING), (ADAPTER_KIND, "  ")] {
         assert!(matches!(
             ImportedEnforcementProfile::import(
                 reference_profile_ref(),
                 1,
                 kind,
-                binding_ref,
+                key,
                 EnforcementSupport::policy_only_reference(),
                 [EnforcementSubject::ControlledPrimaryProcess],
             )
@@ -1209,7 +1334,13 @@ fn an_inactive_binding_is_never_validated() {
     let fixture = confined_fixture();
     let inactive = adapter_binding(ConfigStatus::Disabled);
     assert!(matches!(
-        ValidatedSourceBinding::validate(&fixture.source, &inactive, &fixture.profile).unwrap_err(),
+        ValidatedSourceBinding::validate(
+            &fixture.source,
+            &inactive,
+            ADAPTER_BINDING,
+            &fixture.profile,
+        )
+        .unwrap_err(),
         ContractError::SecurityUnenforceable { .. }
     ));
 }

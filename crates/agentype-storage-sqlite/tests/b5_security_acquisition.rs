@@ -40,9 +40,10 @@ use std::sync::Arc;
 
 const MAX_BYTES: usize = 16_384;
 const ADAPTER_KIND: &str = "default";
-/// The `AdapterBindingPolicy.binding_ref` of every fixture binding. The imported
-/// profile must name exactly this pair, not the evidence's opaque domain key.
-const BINDING_REF: &str = "k1";
+/// The resolved physical `adapter_binding_key` of every fixture binding. In
+/// these fixtures the B.4 alias and the physical key happen to be the same
+/// string; the imported profile must name this physical key, not the alias.
+const ADAPTER_BINDING_KEY: &str = "k1";
 
 fn nanos() -> u128 {
     std::time::SystemTime::now()
@@ -227,10 +228,34 @@ fn security_catalog(
     declared_profile: Option<&EnforcementProfileRef>,
     credential_refs: Vec<CredentialRef>,
 ) -> ResolvedProvisioningSelection {
+    security_catalog_with_binding(
+        kernel,
+        tag,
+        declared_profile,
+        credential_refs,
+        ADAPTER_BINDING_KEY,
+        ADAPTER_BINDING_KEY,
+    )
+}
+
+/// The same catalog with an explicit B.4 alias / resolved physical key pair.
+///
+/// The alias and the key are distinct concepts: the policy stores the alias,
+/// while the selection and the imported profile name the exact physical domain
+/// the alias resolved to.
+#[allow(clippy::too_many_arguments)]
+fn security_catalog_with_binding(
+    kernel: &Kernel,
+    tag: &str,
+    declared_profile: Option<&EnforcementProfileRef>,
+    credential_refs: Vec<CredentialRef>,
+    binding_alias: &str,
+    adapter_binding_key: &str,
+) -> ResolvedProvisioningSelection {
     let policy = AdapterBindingPolicy {
         policy_ref: AdapterPolicyRef::new(format!("policy-{tag}"), 1).unwrap(),
         adapter_kind: ADAPTER_KIND.into(),
-        binding_ref: BINDING_REF.into(),
+        binding_ref: binding_alias.into(),
         required_safety: safety(),
         status: ConfigStatus::Active,
     };
@@ -271,7 +296,7 @@ fn security_catalog(
     let evidence = ResolvedProvisioningEvidence::from_imported_binding(
         policy.policy_ref.clone(),
         ADAPTER_KIND,
-        BINDING_REF,
+        adapter_binding_key,
         source.source_ref.clone(),
         config.config_ref.clone(),
         config_digest,
@@ -287,7 +312,7 @@ fn security_catalog(
         adapter_policy: policy.policy_ref,
         evidence,
         adapter_kind: ADAPTER_KIND.into(),
-        adapter_binding_key: BINDING_REF.into(),
+        adapter_binding_key: adapter_binding_key.into(),
         provisioning_protocol: "agentype-test-source/1".into(),
         attested_materialization_digest: MaterializationDigest::new(format!(
             "sha256:{}",
@@ -341,12 +366,19 @@ fn full_support_without_credentials() -> EnforcementSupport {
 
 fn profile(
     reference: EnforcementProfileRef,
-    binding_ref: &str,
+    adapter_binding_key: &str,
     support: EnforcementSupport,
     subjects: impl IntoIterator<Item = EnforcementSubject>,
 ) -> ImportedEnforcementProfile {
-    ImportedEnforcementProfile::import(reference, 1, ADAPTER_KIND, binding_ref, support, subjects)
-        .unwrap()
+    ImportedEnforcementProfile::import(
+        reference,
+        1,
+        ADAPTER_KIND,
+        adapter_binding_key,
+        support,
+        subjects,
+    )
+    .unwrap()
 }
 
 fn selected(
@@ -487,7 +519,7 @@ fn a_qualified_candidate_is_selectable() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -512,6 +544,45 @@ fn a_qualified_candidate_is_selectable() {
 }
 
 #[test]
+fn the_binding_alias_resolves_to_the_selections_physical_key() {
+    let env = Env::new("alias_key");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "alias_key", pin);
+    let profile_ref = full_support_profile_ref();
+    // The policy stores the stable alias `primary`; the resolver selection and
+    // the imported profile name the exact physical key it resolved to, `k2`.
+    let provisioning = security_catalog_with_binding(
+        kernel,
+        "alias_key",
+        Some(&profile_ref),
+        Vec::new(),
+        "primary",
+        "k2",
+    );
+    assert_eq!(provisioning.adapter_binding_key, "k2");
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            "k2",
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    // The durable binding freezes the physical key, never the alias.
+    assert_eq!(acquired.provisioning_binding.adapter_binding_key, "k2");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+}
+
+#[test]
 fn an_uncovered_profile_is_rejected_before_attempt_or_lease() {
     let env = Env::new("uncovered");
     let kernel = &env.kernel;
@@ -527,7 +598,7 @@ fn an_uncovered_profile_is_rejected_before_attempt_or_lease() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             EnforcementSupport::policy_only_reference(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -558,7 +629,7 @@ fn an_uncovered_subject_is_rejected_before_attempt_or_lease() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::UnprovenExternalProcess],
         ),
@@ -575,7 +646,7 @@ fn an_uncovered_subject_is_rejected_before_attempt_or_lease() {
 }
 
 #[test]
-fn a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease() {
+fn a_profile_imported_for_another_physical_domain_is_rejected_before_attempt_or_lease() {
     let env = Env::new("binding");
     let kernel = &env.kernel;
     let pin = publish_agent_type(kernel, "pinned");
@@ -584,7 +655,8 @@ fn a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease() 
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "binding", Some(&profile_ref), Vec::new());
     // Same reference, support matrix and subject, but imported for a different
-    // adapter binding: the validated tuple must reject it.
+    // physical adapter domain than the selection resolved: the validated tuple
+    // must reject it.
     let candidate = selected(
         provisioning,
         profile(
@@ -600,7 +672,7 @@ fn a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease() 
     let error = kernel
         .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
         .unwrap_err();
-    assert_candidate_rejection(&error, "different adapter binding");
+    assert_candidate_rejection(&error, "different physical adapter binding");
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
     assert_no_acquisition_side_effects(&env);
 }
@@ -621,7 +693,7 @@ fn the_durable_declaration_wins_over_the_callers_profile() {
         provisioning,
         profile(
             full_support_profile_ref(),
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -663,7 +735,7 @@ fn a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver(
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -699,7 +771,7 @@ fn a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support_without_credentials(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -748,7 +820,7 @@ fn evidence_resolved_for_another_config_cannot_authorize_this_config() {
     provisioning.evidence = ResolvedProvisioningEvidence::from_imported_binding(
         provisioning.adapter_policy.clone(),
         ADAPTER_KIND,
-        BINDING_REF,
+        ADAPTER_BINDING_KEY,
         provisioning.spawn_source.clone(),
         other.config_ref.clone(),
         other_digest,
@@ -763,7 +835,7 @@ fn evidence_resolved_for_another_config_cannot_authorize_this_config() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -820,7 +892,7 @@ fn an_agent_type_capability_the_source_cannot_provide_is_rejected() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -858,7 +930,7 @@ fn a_config_that_cannot_realize_the_agent_type_continuity_is_rejected() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -894,7 +966,7 @@ fn a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -926,7 +998,7 @@ fn a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -980,7 +1052,7 @@ fn the_two_acquisition_chains_are_disjoint() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -1011,7 +1083,7 @@ fn a_coarse_agent_type_is_not_a_security_candidate() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -1050,7 +1122,7 @@ fn the_callers_subject_is_the_one_proved() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ExternallyDelegatedExecution],
         ),
@@ -1082,7 +1154,7 @@ fn a_coarse_source_cannot_provision_a_security_task() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),
@@ -1119,7 +1191,7 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
     let policy = AdapterBindingPolicy {
         policy_ref: AdapterPolicyRef::new("policy-source-ceiling", 1).unwrap(),
         adapter_kind: ADAPTER_KIND.into(),
-        binding_ref: BINDING_REF.into(),
+        binding_ref: ADAPTER_BINDING_KEY.into(),
         required_safety: safety(),
         status: ConfigStatus::Active,
     };
@@ -1164,7 +1236,7 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
     let evidence = ResolvedProvisioningEvidence::from_imported_binding(
         policy.policy_ref.clone(),
         ADAPTER_KIND,
-        BINDING_REF,
+        ADAPTER_BINDING_KEY,
         source.source_ref.clone(),
         config.config_ref.clone(),
         config_digest,
@@ -1179,7 +1251,7 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
         adapter_policy: policy.policy_ref,
         evidence,
         adapter_kind: ADAPTER_KIND.into(),
-        adapter_binding_key: BINDING_REF.into(),
+        adapter_binding_key: ADAPTER_BINDING_KEY.into(),
         provisioning_protocol: "agentype-test-source/1".into(),
         attested_materialization_digest: MaterializationDigest::new(format!(
             "sha256:{}",
@@ -1192,7 +1264,7 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
         provisioning,
         profile(
             profile_ref,
-            BINDING_REF,
+            ADAPTER_BINDING_KEY,
             full_support(),
             [EnforcementSubject::ControlledPrimaryProcess],
         ),

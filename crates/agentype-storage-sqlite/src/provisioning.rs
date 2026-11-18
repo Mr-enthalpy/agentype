@@ -1353,10 +1353,12 @@ fn finish_acquisition(
             // The caller supplies the imported profile, not the source or the
             // binding: those are re-loaded here. The validated tuple is therefore
             // the durable source's own adapter policy plus a profile that must
-            // have been imported for that exact `(adapter_kind, binding_ref)`.
+            // have been imported for the exact resolved physical domain, not
+            // merely for the same `binding_ref` alias.
             let domain = agentype_agent_contract::ValidatedSourceBinding::validate(
                 &source,
                 &policy,
+                &security.provisioning.adapter_binding_key,
                 &security.profile,
             )
             .map_err(acquisition_rejection)?;
