@@ -110,6 +110,25 @@ attested. Binding the attested config to the compiled plan therefore rejects a
 request the profile cannot deliver, while an empty request adds no obligation and
 leaves a policy-only profile eligible.
 
+The order above is not only a resolver convention. The authority-bearing
+acquisition transaction re-loads the Task security binding, the Task requirement,
+the actual bound AgentType revision with its authored policy, the source revision,
+its security declaration and its authored `P_source`; it derives the composite
+authority, then calls `ValidatedSourceBinding::validate` and
+`qualify_security_candidate` in this order, and only then creates an Attempt or a
+Lease. The imported enforcement profile and the requested enforcement subject are
+the only inputs the caller supplies that the transaction cannot re-derive; every
+durable field of the resolver selection is re-read and re-checked, so a resolver
+verdict is never authority. A qualification failure is candidate-local — the
+Task stays queued and no Attempt, Lease or `ProvisioningBinding` is written.
+
+`SECURITY_V1` and `COARSE_V1` acquisition are **disjoint chains**. The coarse
+entry point refuses a `SECURITY_V1` Task, AgentType or source and keeps its frozen
+exact-reference relation; the security entry point refuses a `COARSE_V1` one.
+Neither may "downgrade" the other's identity, because the full-path identity is
+what makes the security contract dischargeable at all, and a coarse candidate has
+no declaration, no imported profile and no `P_source` to qualify.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
