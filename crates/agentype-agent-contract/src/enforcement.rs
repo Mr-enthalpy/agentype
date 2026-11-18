@@ -57,8 +57,11 @@ pub const ENFORCEMENT_GUARANTEES_SCHEMA_VERSION: u32 = 1;
 /// result even when the inputs are byte-identical.
 ///
 /// `/2` records that the plan and the cache key now carry the composed
-/// execution guarantees, so a `/1` result must never be reused.
-pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/2";
+/// execution guarantees, so a `/1` result must never be reused. `/3` records
+/// that credential delivery is a request-scoped obligation checked against the
+/// attested `SourceConfig`, not a policy-derived one, so a `/2` plan for a
+/// credential-bearing policy is a different plan.
+pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/3";
 
 /// The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile identity
 /// (ADR-0014 §14). This is a positive minimum target, not a claim that a
@@ -93,7 +96,9 @@ pub enum EnforcementFeature {
     ResourceLimit,
     /// The Task or AgentType requires attempt isolation.
     AttemptIsolation,
-    /// The policy authorizes Agentype-managed credential delivery.
+    /// The domain can deliver an Agentype-managed credential when the exact
+    /// attested config requests one. Authorization alone does not create a
+    /// delivery obligation.
     CredentialDelivery,
 }
 
@@ -262,9 +267,13 @@ impl RequiredEnforcementFeatures {
         if policy.attempt_isolation() || guarantees.requires_attempt_isolation() {
             features.insert(EnforcementFeature::AttemptIsolation);
         }
-        if !policy.credentials().is_empty() {
-            features.insert(EnforcementFeature::CredentialDelivery);
-        }
+        // Credential delivery is deliberately *not* derived here. The effective
+        // policy's credential map is an authorization ceiling; only a non-empty
+        // `SourceConfig.credential_refs` requests a delivery (ADR-0013 §5), and
+        // that request is not known until the exact config is attested
+        // (ADR-0014 §3). Deriving the obligation from the ceiling would refuse a
+        // policy-only profile for a config that asks for no credential. The
+        // request is checked when the config is bound to the compiled plan.
         Self { features }
     }
 
@@ -930,6 +939,7 @@ pub struct CompiledExecutionSecurity {
     cache_key: CompileCacheKey,
     evidence_subject: SecurityEvidenceSubject,
     covered_subjects: BTreeSet<EnforcementSubject>,
+    supports_credential_delivery: bool,
 }
 
 impl CompiledExecutionSecurity {
@@ -949,9 +959,26 @@ impl CompiledExecutionSecurity {
         &self.evidence_subject
     }
 
-    /// Complete the evidence subject once the exact SourceConfig is attested.
+    /// Complete the evidence subject once the exact SourceConfig is attested,
+    /// and settle the one obligation the config itself decides.
+    ///
+    /// A non-empty `credential_refs` is a delivery request (ADR-0013 §5), not an
+    /// authorization. The compile step cannot see it, so this step refuses a
+    /// request the profile cannot deliver instead of silently compiling a
+    /// credential-bearing execution. No request means no obligation, which is
+    /// why an authorization ceiling alone never makes a candidate ineligible.
     pub fn with_source_config(mut self, config: &SourceConfig) -> Result<Self, ContractError> {
         self.evidence_subject = self.evidence_subject.with_source_config(config)?;
+        if !config.credential_refs.is_empty() && !self.supports_credential_delivery {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "the selected config requests {} credential reference(s) but enforcement \
+                     profile {} does not support credential delivery",
+                    config.credential_refs.len(),
+                    self.plan.reference.profile()
+                ),
+            });
+        }
         Ok(self)
     }
 
@@ -1126,6 +1153,9 @@ pub fn compile_execution_security(
         cache_key,
         evidence_subject,
         covered_subjects: profile.covered_subjects().clone(),
+        supports_credential_delivery: profile
+            .support()
+            .supports(EnforcementFeature::CredentialDelivery),
     })
 }
 

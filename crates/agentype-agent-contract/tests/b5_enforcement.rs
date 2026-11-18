@@ -918,6 +918,109 @@ fn a_profile_must_name_its_adapter_binding() {
     }
 }
 
+// =============================================================================
+// Credential delivery is a request, not an authorization (P2-2)
+// =============================================================================
+
+/// The confined policy plus one usable credential grant. The same grant is put
+/// on every authored layer so the meet keeps it: an omitted grant authorizes
+/// nothing, so the id must be granted by the AgentType ceiling and narrowed, not
+/// created, by the source.
+fn policy_with_credential_grant() -> NormalizedSandboxPolicy {
+    let id = CredentialAuthorizationId::new("vault", "codex-prod").unwrap();
+    let mut parts = confined_policy().parts().clone();
+    parts.credentials.insert(
+        id.clone(),
+        CredentialGrant::new(
+            id,
+            ["model.invoke".to_string()],
+            ["codex".to_string()],
+            [CredentialDeliveryMode::BrokeredAccess],
+        )
+        .unwrap(),
+    );
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+/// The same candidate with an authorized credential on every layer.
+fn credential_fixture(profile: ImportedEnforcementProfile) -> Fixture {
+    let policy = policy_with_credential_grant();
+    Fixture::compose(
+        policy.clone(),
+        requirement(),
+        profile,
+        policy.clone(),
+        policy,
+        &RequiredAccess::empty(),
+    )
+}
+
+fn config_requesting_credential(source: &SpawnSourceRef) -> SourceConfig {
+    let mut config = source_config(source);
+    config.credential_refs = vec![CredentialRef::new("vault://codex-prod").unwrap()];
+    config
+}
+
+#[test]
+fn an_authorized_credential_is_not_a_delivery_request() {
+    let fixture = credential_fixture(reference_profile([
+        EnforcementSubject::ControlledPrimaryProcess,
+    ]));
+    let authority = fixture.authority();
+    assert!(
+        !authority.policy().credentials().is_empty(),
+        "the fixture must authorize a credential for the distinction to matter"
+    );
+
+    // The authorization ceiling does not create a delivery obligation: only the
+    // selected config can request one (ADR-0013 §5, ADR-0014 §3).
+    let obligations = RequiredEnforcementFeatures::derive(
+        authority.policy(),
+        EffectiveExecutionGuarantees::new(false),
+    );
+    assert!(!obligations.contains(EnforcementFeature::CredentialDelivery));
+
+    // The policy-only reference profile therefore accepts this candidate while
+    // the exact config requests nothing.
+    let compiled = compile(&fixture);
+    let completed = compiled
+        .with_source_config(&source_config(&fixture.source.source_ref))
+        .unwrap();
+    assert!(completed.evidence_subject().is_complete());
+}
+
+#[test]
+fn a_requested_credential_needs_a_profile_that_can_deliver() {
+    let fixture = credential_fixture(reference_profile([
+        EnforcementSubject::ControlledPrimaryProcess,
+    ]));
+    let compiled = compile(&fixture);
+
+    let error = compiled
+        .with_source_config(&config_requesting_credential(&fixture.source.source_ref))
+        .unwrap_err();
+    match error {
+        ContractError::SecurityUnenforceable { reason } => {
+            assert!(reason.contains("credential delivery"), "{reason}");
+            assert!(reason.contains("1 credential reference"), "{reason}");
+        }
+        other => panic!("expected candidate-local ineligibility, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_requested_credential_completes_when_the_profile_delivers() {
+    let fixture = credential_fixture(full_support_profile());
+    let compiled = compile(&fixture);
+    let config = config_requesting_credential(&fixture.source.source_ref);
+    let completed = compiled.with_source_config(&config).unwrap();
+    assert!(completed.evidence_subject().is_complete());
+    assert_eq!(
+        completed.evidence_subject().source_config(),
+        Some(&config.config_ref)
+    );
+}
+
 #[test]
 fn an_inactive_binding_is_never_validated() {
     let fixture = confined_fixture();
