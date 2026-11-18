@@ -47,6 +47,8 @@ pub fn imported_enforcement_profile_is_consumable() {}
 ///     let _ = ImportedEnforcementProfile::import(
 ///         EnforcementProfileRef::new("contract-only", "contract-only", 1).unwrap(),
 ///         1,
+///         "local-process",
+///         "contract-only/binding",
 ///         EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
 ///         [EnforcementSubject::ControlledPrimaryProcess],
 ///     );
@@ -63,6 +65,8 @@ pub fn imported_enforcement_profile_is_consumable() {}
 ///     let _ = ImportedEnforcementProfile::from_parts(
 ///         EnforcementProfileRef::new("contract-only", "contract-only", 1).unwrap(),
 ///         1,
+///         "local-process",
+///         "contract-only/binding",
 ///         EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
 ///         [EnforcementSubject::ControlledPrimaryProcess],
 ///         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
