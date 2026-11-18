@@ -185,7 +185,10 @@ pub fn release_security_acquisition_block(
     Ok(changed == 1)
 }
 
-fn task_generation(tx: &Transaction<'_>, task_id: &TaskId) -> Result<GenerationId, Error> {
+pub(crate) fn task_generation(
+    tx: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<GenerationId, Error> {
     query_opt(
         tx,
         "SELECT generation_id FROM generation_task_bindings WHERE task_id=?1",

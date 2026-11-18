@@ -1196,6 +1196,30 @@ impl Kernel {
         })
     }
 
+    /// Acquire a `SECURITY_V1` Task through the B5.2 qualification chain
+    /// (authority-bearing). Rejected candidates grant no Attempt or Lease.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn acquire_security_v1_task_existing(
+        &self,
+        task_id: &agentype_core::TaskId,
+        agent_id: &agentype_core::LogicalAgentId,
+        chosen: &crate::provisioning::SecurityProvisioningSelection,
+        execution_registry: &agentype_execution_config::ExecutionRegistry,
+    ) -> Result<crate::provisioning::TypedAcquisition, Error> {
+        let lease_seconds = self.lease_seconds;
+        self.tx(|tx, now| {
+            crate::provisioning::acquire_security_v1_task_existing(
+                tx,
+                now,
+                lease_seconds,
+                task_id,
+                agent_id,
+                chosen,
+                execution_registry,
+            )
+        })
+    }
+
     // ------------------------------------------------------------------ topology
 
     pub fn upsert_partition(&self, spec: &PartitionSpec) -> Result<i64, Error> {
