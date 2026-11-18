@@ -47,6 +47,7 @@ requirement on the complete effective policy.
 | 5 | `097f35d` | Records the third independent re-audit: P1-4 (the compile cache key omits the guarantee identity, so plans with different obligations share one memoization key). Amends the ADR-0014 §4 frozen key list in the P2-3 ADR pull request and fixes the key in the P1-3 code pull request. Docs-only here; no code, ADR `Status:` line, spec or index change in this pull request. |
 | 6 | `9b8d830` (code) | Records the fourth independent re-audit: A (a source declaration is not bound to its `SpawnSource` revision) and B (the durable block's validated read does not re-bind the generation, relate the candidate count to the cost, or validate the existing row on a same-condition record). Also records the write-once Task security mode premise and the candidate-domain identity model as a B5.3 design item, and adds the ADR-0014 §4 count-coherence sentence. Fixes are in the code pull request on `9b8d830`; docs-only here, no ADR `Status:` line, spec or index change. |
 | 7 | `decb13a` (code) | Implements P2-1: an imported profile names the `(adapter_kind, binding_ref)` it was imported for, the compiler accepts only a validated source/binding/profile tuple, and a compiled plan is distinct from a proven subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`; ADR-0014 §2, §3, §5 and §14 state the tuple, the subject proof and the import-time subject bound. No ADR `Status:` line, spec status or index entry changes. |
+| 8 | `28d6592` (code) | Implements P2-2: credential delivery is a request-scoped obligation settled when the exact `SourceConfig` is attested, not a policy-derived one. `RequiredEnforcementFeatures::derive` no longer inserts `CREDENTIAL_DELIVERY` from the authorization ceiling; `CompiledExecutionSecurity::with_source_config` rejects a non-empty request the profile cannot deliver. `ENFORCEMENT_COMPILER_PROTOCOL` is `/3`; ADR-0014 §3 and §4 state the request/authorization split. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -86,6 +87,15 @@ its adapter binding, the profile schema tag moves to `/2` because the profile
 digest commits to that identity, and a successful compile is no longer readable
 as an applied-security claim for an unnamed subject. P2-2 and P2-4 remain open in
 the same pull request, so this record still does not declare B5.2 complete.
+
+Revision 8 carries the second fix: P2-2. It is also a code change with a
+normative ADR amendment. The credential dimension is split into its
+authorization (the effective policy's grant map) and its request (a non-empty
+`SourceConfig.credential_refs`), and only the request creates a delivery
+obligation. Because that changes which obligations the compiler derives, the
+compiler protocol tag moves `/2 -> /3`; deliberately, no durable format, cache
+key list or profile digest changes. P2-4 remains open in the same pull request,
+so the record still does not declare B5.2 complete or frozen.
 
 ## Why this record exists
 
@@ -155,7 +165,7 @@ the qualification chain, not for the current build: while acquisition rejects
 | P1-3 | P1 | The attempt-isolation guarantee becomes an obligation but never becomes the plan's execution-request value, and it is not explicit in the plan digest | B5.4's committed execution request; reading a compiled plan as an applied-security claim |
 | P1-4 | P1 | The compile cache key omits the guarantee identity, so two plans with different obligations share one memoization key | Any reuse of a compile result; the ADR-0014 §4 memoization claim |
 | P2-1 | P2 | The compiler never checks that the profile was imported for this binding or that it covers the executing subject | Trustworthy `SECURITY_V1` evidence (**fix proposed in revision 7, not closure before merge**) |
-| P2-2 | P2 | A credential *authorization* is treated as a credential *delivery* obligation | Correctness of candidate rejection (over-rejection) |
+| P2-2 | P2 | A credential *authorization* is treated as a credential *delivery* obligation | Correctness of candidate rejection (over-rejection) (**fix proposed in revision 8, not closure before merge**) |
 | P2-3 | P2 | Durable-block idempotence holds only for the single stored condition, not across history | The ADR-0014 §4 statement the report quotes (**closed in revision 3 by narrowing the ADR**) |
 | P2-4 | P2 | Candidate preselection is implemented, but acquisition qualification is not wired (the fourth B5.1 handoff item) | Declaring B5.2 complete |
 | P2-5 | P2 | A durable acquisition block does not re-prove that its recorded cost actually exceeded its recorded budget | Trustworthiness of the operator-actionable budget diagnostic |
@@ -489,7 +499,9 @@ separate but related:
 
 **Version consequence.** `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`. The plan
 schema, the eight-part compile cache key and `ENFORCEMENT_COMPILER_PROTOCOL`
-are unchanged: the plan's inputs are the same three facts, now related. The
+are unchanged **by P2-1**: the plan's inputs are the same three facts, now
+related. (Revision 8 changes the protocol tag for an unrelated reason: the
+credential obligation relation changed.) The
 profile digest is an input to the evidence subject, the plan digest, the cache
 key and the durable `binding_profile_digest`, so all of those change value.
 Nothing durable stores a profile digest today, and `SECURITY_V1` acquisition is
@@ -520,6 +532,32 @@ authorized set from the requested set before deriving `CredentialDelivery`
 now. Acceptance tests: authorized but empty `credential_refs` derives no
 delivery obligation; authorized and requested but unsupported is
 `SecurityUnenforceable`.
+
+**Landed shape (revision 8, code `28d6592`).** Because ADR-0014 §3 places the
+compile before `SourceConfig` attest, the request is genuinely not a compile-time
+fact, so the second option is implemented as a completion-time check rather than
+a new compiler parameter:
+
+- `RequiredEnforcementFeatures::derive` no longer inserts `CREDENTIAL_DELIVERY`
+  at all. The policy's credential map stays the authorization ceiling; an
+  omitted grant authorizes nothing, which is a grant question. The derivation no
+  longer contradicts `PolicyAccess::from_policy`.
+- `CompiledExecutionSecurity` keeps the profile's delivery capability, and
+  `with_source_config` — the step that first sees the exact attested config —
+  rejects a non-empty `credential_refs` when the profile cannot deliver. The
+  result is candidate-local `SecurityUnenforceable`, not a Task failure.
+- An empty request adds no obligation and leaves the policy-only profile
+  eligible; a request under a delivering profile completes; a request under the
+  reference profile is ineligible.
+
+**Version consequence.** `ENFORCEMENT_COMPILER_PROTOCOL` moves `/2 -> /3`: the
+obligations derived from a credential-bearing policy changed, and the protocol
+tag is the guard that prevents a `/2` result being reused. The plan schema, the
+eight-part cache key, `ENFORCEMENT_PROFILE_SCHEMA_VERSION` and every durable
+encoding are unchanged. The canonical `CredentialRequest` (refs + use + scope +
+digest) remains B5.3; this fix only consumes the request-presence fact the exact
+config already owns. Tests are named in the claim table. This is a proposed fix
+in an unmerged pull request, not a closure.
 
 ### P2-3 — durable-block idempotence is per-row, not per-history
 
@@ -805,7 +843,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | A missing dimension makes the candidate ineligible; it is not a Task failure and not partial enforcement | `compile_execution_security` → `SecurityUnenforceable` | `b5_enforcement::a_missing_dimension_makes_the_candidate_ineligible_not_the_task_failed` | `cbab05f` |
 | The policy-only reference profile supports exactly workspace-write confinement and environment allowlist | `EnforcementSupport::policy_only_reference` | `b5_enforcement::the_reference_profile_claims_only_workspace_write_and_environment` | `cbab05f` |
 | The enforcement subject is explicit and only the proven domain is inside the claim | `EnforcementSubject::is_inside_proven_domain`; `ImportedEnforcementProfile::import` | `b5_enforcement::the_policy_only_reference_protocol_cannot_claim_an_external_subject`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven` | `cbab05f`, `decb13a` |
-| **(rev 2)** `CredentialDelivery` is derived from the credential the selected config **requests**, not from the authorization ceiling | **absent** — `derive` keys on `policy.credentials()` | **absent** | — (P2-2) |
+| **(rev 2; implemented in revision 8)** `CredentialDelivery` is derived from the credential the selected config **requests**, not from the authorization ceiling | `RequiredEnforcementFeatures::derive` + `CompiledExecutionSecurity::with_source_config` | `b5_enforcement::an_authorized_credential_is_not_a_delivery_request`, `a_requested_credential_needs_a_profile_that_can_deliver`, `a_requested_credential_completes_when_the_profile_delivers` | `28d6592` |
 
 ## Fences preserved
 
@@ -955,7 +993,7 @@ read-only checks that produced the findings:
 | `cargo tree -p agentype-public-api-boundary -e features -i agentype-agent-contract` | `provisioning-producer` enabled through `agentype-runtime` |
 | `rustc` on a five-line generic-fn-item program | `error[E0283]: type annotations needed` |
 | Repository-wide content search for `check_required_access`, `covers_subject`, `is_inside_proven_domain`, `qualify_security_candidate` callers | as stated in P1-1, P2-1, P2-4. Revision 7 moves `covers_subject` into `CompiledExecutionSecurity::prove_subject` and `is_inside_proven_domain` into `ImportedEnforcementProfile::import`; `qualify_security_candidate` still has no production caller (P2-4) |
-| Repository-wide content search for the `credential` derivation and `PolicyAccess::from_policy` | as stated in P2-2 |
+| Repository-wide content search for the `credential` derivation and `PolicyAccess::from_policy` | as stated in P2-2; revision 8 removes the derivation entirely and settles the request at config completion |
 
 Revision 3 is also docs-only and re-runs none of these commands. It changes one
 ADR sentence and this record; no code, schema or test changed.
@@ -1061,7 +1099,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
 | 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
 | 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`); tests named in the claim table |
-| 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
+| 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation, a requested credential under a non-delivering profile is `SecurityUnenforceable`, and a requested credential under a delivering profile completes. Implemented in revision 8 (`28d6592`); tests named in the claim table |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
 | 9 | Bind each source declaration to its source revision (A) | the constructor and the writer both reject a declaration from another revision, and the validated read still fills the ref from `(source id, revision)`. Proposed in PR #35 |
@@ -1084,6 +1122,7 @@ pull requests are reviewed against.
 | Enforcement compiler, budget, block value object | `crates/agentype-agent-contract/src/enforcement.rs` |
 | Validated source/binding/profile tuple and subject proof | `crates/agentype-agent-contract/src/enforcement.rs` (`ValidatedSourceBinding`, `CompiledExecutionSecurity::prove_subject`, `ProvenExecutionSecurity`) |
 | Attempt-isolation guarantee and plan identity | `crates/agentype-agent-contract/src/enforcement.rs` (`EffectiveExecutionGuarantees`, `PolicyEnforcementPlan`) |
+| Credential authorization versus delivery request | `crates/agentype-agent-contract/src/enforcement.rs` (`RequiredEnforcementFeatures::derive`, `CompiledExecutionSecurity::with_source_config`), `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess::from_policy`) |
 | Compile memoization key and guarantee identity | `crates/agentype-agent-contract/src/enforcement.rs` (`CompileCacheKey`, `effective_execution_guarantees_digest`) |
 | Durable block truth validation | `crates/agentype-agent-contract/src/enforcement.rs` (`from_durable_parts`), `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
 | Access floor, projection and check | `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess`, `check_required_access`) |

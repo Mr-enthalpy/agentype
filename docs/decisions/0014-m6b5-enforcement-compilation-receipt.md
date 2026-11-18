@@ -102,6 +102,14 @@ absolute deadline. Known-ineligible candidates are removed before private I/O.
 Credential probing comes after local static/policy/enforcement work so an invalid
 config cannot cause an external broker call.
 
+For the same reason the compile step derives **no** credential-delivery
+obligation from the effective policy's credential map. That map is the
+authorization ceiling (ADR-0013 §5); only a non-empty `SourceConfig.credential_refs`
+is a delivery **request**, and the exact config is not known until it is
+attested. Binding the attested config to the compiled plan therefore rejects a
+request the profile cannot deliver, while an empty request adds no obligation and
+leaves a policy-only profile eligible.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
@@ -134,8 +142,9 @@ commits to the canonical guarantee document (`execution_guarantees_digest`)
 rather than to a single boolean so that a guarantee added later cannot enter the
 obligation relation while leaving the key unchanged. For the same reason the plan
 digest carries the guarantee, and `ENFORCEMENT_COMPILER_PROTOCOL` is
-`agentype-enforcement-compile/2`: a `/1` result carries neither the composed
-guarantee nor its digest and MUST NOT be reused.
+`agentype-enforcement-compile/3`: a `/1` result carries neither the composed
+guarantee nor its digest, and a `/2` result predates the request-scoped
+credential obligation, so neither MUST be reused.
 
 The key is scoped to a verifiable profile version and exact physical domain. The
 profile digest names the `(adapter_kind, binding_key)` the profile was imported
