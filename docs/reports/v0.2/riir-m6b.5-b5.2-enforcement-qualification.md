@@ -1,13 +1,15 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 9 (2026-11-18) — carries the third and last fix of the closing pull
-request, P2-4: a security acquisition entry point that re-loads the durable
-inputs, qualifies the candidate and settles the config request before any
-Attempt/Lease. Records P2-1's profile binding and subject proof (7), P2-2's
-credential request/authorization split (8), and this acquisition wiring, each
-with its own ADR-0014 amendment, gate run and mutation table. No ADR `Status:`
-line, spec status or index entry changes
+Revision: 10 (2026-11-18) — records the continuation audit over revision 9's
+draft pull request: P1-1 (the security branch replaced the frozen B.4 eligibility
+instead of intersecting it) and P1-2 (a profile's delivery capability was read as
+a credential authorization), both fixed with new acceptance tests. Also records
+the B5.4 handoff constraints on subject identity and trusted imported evidence.
+Carries P2-1's profile binding and subject proof (7), P2-2's credential
+request/authorization split (8), and the P2-4 acquisition wiring (9), each with
+its own ADR amendment, gate run and mutation table. No ADR `Status:` line, spec
+status or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 closing fixes proposed in draft PR #37)
 Date: 2026-11-18
@@ -27,8 +29,13 @@ must not be opened against it as-is. Later passes added three more findings —
 P1-3 and P2-5 in revision 4, P1-4 in revision 5 — and none of them is closed by
 this record. Revision 6 adds findings A and B, whose fixes are in a code pull
 request stacked on the P1-3/P1-4 pull request. Revisions 7, 8 and 9 carry the
-closing fixes P2-1, P2-2 and P2-4 in draft PR #37; as with every earlier
-finding, this record counts no unmerged fix as closure and does not freeze B5.2.
+closing fixes P2-1, P2-2 and P2-4 in draft PR #37, and revision 10 fixes the two
+P1 defects that the continuation audit then found in that same draft: an omitted
+B.4 eligibility conjunct and a credential delivery capability treated as an
+authorization. As with every earlier finding, this record counts no unmerged fix
+as closure and does not freeze B5.2. The current stage is *selected-candidate
+transactional qualification implemented; complete `SECURITY_V1` acquisition
+orchestration remains open*.
 
 The gaps are **latent, not live**. The coarse typed acquisition path still
 rejects `SECURITY_V1` at every stage, and the runtime resolver and daemon do not
@@ -53,6 +60,7 @@ positive-obligation requirement on the complete effective policy.
 | 7 | `decb13a` (code) | Implements P2-1: an imported profile names the `(adapter_kind, binding_ref)` it was imported for, the compiler accepts only a validated source/binding/profile tuple, and a compiled plan is distinct from a proven subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`; ADR-0014 §2, §3, §5 and §14 state the tuple, the subject proof and the import-time subject bound. No ADR `Status:` line, spec status or index entry changes. |
 | 8 | `28d6592` (code) | Implements P2-2: credential delivery is a request-scoped obligation settled when the exact `SourceConfig` is attested, not a policy-derived one. `RequiredEnforcementFeatures::derive` no longer inserts `CREDENTIAL_DELIVERY` from the authorization ceiling; `CompiledExecutionSecurity::with_source_config` rejects a non-empty request the profile cannot deliver. `ENFORCEMENT_COMPILER_PROTOCOL` is `/3`; ADR-0014 §3 and §4 state the request/authorization split. No ADR `Status:` line, spec status or index entry changes. |
 | 9 | `d4d8dc3` (code) | Implements P2-4: `acquire_security_v1_task_existing` is the first non-test caller of `qualify_security_candidate`. One fenced transaction re-loads the Task binding, requirement, actual AgentType revision and authored policy, source, declaration and `P_source`, builds the composite authority, validates the caller's imported profile against the durable binding, qualifies, settles the attested config's credential request, and only then creates the Attempt/Lease and freezes the `ProvisioningBinding`. The two acquisition chains are disjoint. ADR-0014 §3 states the acquisition order and the disjointness. No ADR `Status:` line, spec status or index entry changes. |
+| 10 | `0a0ed56` (code) | Records the continuation audit over `26a44f9`: P1-1 (the `SECURITY_V1` branch replaced the frozen B.4 provisioning eligibility instead of intersecting it) and P1-2 (delivery capability was read as a credential authorization). Extracts `can_provision_task_source_config` as the reusable B.4 conjunct, intersects it on the security path, and makes every non-empty `credential_refs` fail closed on both chains. Also records the P2 subject-identity and trusted-importer handoff constraints. ADR-0014 §3/§5 and ADR-0015 §5/§9 state the intersection and the fail-closed rule. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -101,7 +109,7 @@ obligation. Because that changes which obligations the compiler derives, the
 compiler protocol tag moves `/2 -> /3`; deliberately, no durable format, cache
 key list or profile digest changes.
 
-Revision 9 carries the third and last fix: P2-4. It is a code change with a
+Revision 9 carries the third closing fix: P2-4. It is a code change with a
 normative ADR amendment. The qualification chain now has an authority-bearing
 caller inside the acquisition transaction, so a `SECURITY_V1` Task can no longer
 be read as "preselected but unacquirable". This is deliberately **not** a claim
@@ -110,9 +118,20 @@ coarse path, so the security chain is reachable from the Kernel's
 `runtime-internal` surface and from tests, not from a live scheduler
 composition. Nor does it claim a secured start: the qualified value is
 discarded at the end of the transaction (B5.4 owns the durable plan/snapshot).
-P2-1, P2-2 and P2-4 are now all implemented in draft PR #37; this record still
-does not declare B5.2 complete or frozen, and the freeze gate remains the user's
-independent re-audit.
+As of revision 9, P2-1, P2-2 and P2-4 were all implemented in draft PR #37; this
+record still does not declare B5.2 complete or frozen, and the freeze gate
+remains the user's independent re-audit.
+
+Revision 10 carries the two P1 fixes the continuation audit found in that same
+draft. It is a code change with normative ADR amendments. The direction of P2-1,
+P2-2 and P2-4 is accepted; the defects are compositional: the new security branch
+had replaced the frozen B.4 source/config eligibility instead of intersecting it
+(P1-1), and it could grant Attempt/Lease to a credential-bearing config whose
+request no positive grant or broker qualification covered (P1-2). The audit's
+verdict on the stage is recorded verbatim in substance: **selected-candidate
+transactional qualification implemented; complete `SECURITY_V1` acquisition
+orchestration remains open.** Revision 10 does not claim B5.2 orchestration,
+B5.2 freeze or B5.4 secured execution.
 
 ## Why this record exists
 
@@ -573,6 +592,14 @@ Revision 9 is where that completion-time check first runs on an authority path:
 the Attempt/Lease, so a request the profile cannot deliver is refused while the
 Task is still `Queued`.
 
+Revision 10 corrects the authority-path reading of that check: it is necessary but
+not sufficient, because a profile **claim** can satisfy it. Every non-empty
+`credential_refs` is now refused at the acquisition entry, before the compile
+settlement, until B5.3 supplies the canonical `CredentialRequest`, the
+`CredentialEligibilityEvidence` and broker qualification. The two pure-component
+tests above still pass, so "the profile can deliver" and "this request is
+authorized" remain distinct facts. See the continuation re-audit's P1-2.
+
 **Version consequence.** `ENFORCEMENT_COMPILER_PROTOCOL` moves `/2 -> /3`: the
 obligations derived from a credential-bearing policy changed, and the protocol
 tag is the guard that prevents a `/2` result being reused. The plan schema, the
@@ -646,12 +673,18 @@ exist, and they are disjoint:
   a `COARSE_V1` Task, AgentType or source, then re-loads every durable input the
   composite authority needs (Task security binding, requirement, the actual
   AgentType revision with its mode and authored policy read in one validated
-  pass, source revision, its security declaration and authored `P_source`),
-  derives `EffectiveTaskAuthority`, validates the caller's imported profile with
+  pass, source revision, its security declaration and authored `P_source`).
+  Before deriving authority it proves the frozen B.4 provisioning conjunct
+  `can_provision_task_source_config` (revision 10, P1-1), then derives
+  `EffectiveTaskAuthority`, validates the caller's imported profile with
   `ValidatedSourceBinding::validate(source, durable_binding, profile)`, calls
-  `qualify_security_candidate`, and settles the exact config's credential
-  request with `with_source_config`. Only then does it run the shared
-  Attempt/Lease and `ProvisioningBinding` tail.
+  `qualify_security_candidate`, and completes the evidence subject with
+  `with_source_config`. Only then does it run the shared Attempt/Lease and
+  `ProvisioningBinding` tail.
+- The credential request is already fail-closed at the entry (revision 10,
+  P1-2): no credential-bearing config reaches the Attempt/Lease tail until B5.3.
+  `with_source_config` therefore only binds the exact config and re-checks the
+  profile's delivery capability as a defensive necessary condition.
 - The only caller-supplied facts with no durable row are the imported profile and
   the requested subject. The profile is re-checked for subject, version and
   validity; the binding, source, config and evidence are re-read from the catalog
@@ -661,10 +694,17 @@ exist, and they are disjoint:
   snapshot, and observing a secured start, remain B5.4; this transaction grants
   only the mechanical Attempt/Lease the coarse path also grants.
 
-**Status.** Implemented in draft PR #37 at `d4d8dc3`; **not closed** until that
-pull request merges and the user's independent re-audit accepts it. The Gate row
-below records the acceptance tests; the mutation table in [Verification](#verification)
-records that each new guard is load-bearing.
+**Status (revision 10).** *Selected-candidate transactional qualification
+implemented; complete `SECURITY_V1` acquisition orchestration remains open.* One
+qualified candidate is not a deterministic global winner: there is no complete
+`SECURITY_V1` candidate enumeration, no whole-round compile budget or defer
+wiring, no broker observation epoch, no `SECURITY_V1` new-agent acquisition and
+no resolver→scheduler production wiring. `catalog_frontier_digest` fences the
+source/config frontier; it does not prove the full `SECURITY_V1` candidate set.
+The work is implemented in draft PR #37 and is **not closed** until that pull
+request merges and the user's independent re-audit accepts it. The Gate row below
+records the acceptance tests; the mutation table in
+[Verification](#verification) records that each new guard is load-bearing.
 
 ### P2-5 — a durable block does not re-prove its over-budget truth
 
@@ -826,6 +866,100 @@ one direction only. `verify_generation_mode_agreement`
 Generation's mode and rejects any difference, so the Task reads cannot present a
 `SECURITY_V1` Generation as a dispatchable coarse Task. That B5.1 item is closed.
 
+## Continuation re-audit (revision 10)
+
+The continuation audit accepted the design direction of P2-1, P2-2 and P2-4 and
+every "what the draft did right" item, but found two P1 defects in the new
+authority path and rejected both direct merge and any B5.2 freeze claim. Both are
+fixed in `0a0ed56`; neither is counted as closed before the pull request merges
+and the user re-audits it.
+
+### P1-1 — the security branch replaced B.4 eligibility instead of intersecting it
+
+`finish_acquisition`'s `AcquisitionMode::SecurityV1` arm proved the new policy
+algebra, the validated binding/profile tuple, coverage, the compile and the
+subject, but it did **not** run `can_provision_task` — the frozen B.4 predicate
+that also checks the `SourceConfig` ACTIVE disposition, source/config ownership,
+the evidence subject/config digest, AgentType lifecycle, continuity, the
+functional envelope, security-class capability evidence and the Task restriction
+join. A `SECURITY_V1` Task with a `DISABLED` config, evidence resolved for
+another config digest, a missing functional capability, or an unsatisfiable
+continuity could therefore reach the shared Attempt/Lease tail.
+
+The defect is compositional, not a policy-algebra error: the new layer must
+**tighten** the frozen control plane, never omit its necessary conditions.
+
+**Landed shape.** `can_provision_task_source_config` is the extracted reusable
+B.4 conjunct. `can_provision_task` is now `can_execute` plus that conjunct, so the
+coarse path is byte-for-byte the same relation. The security path calls the
+conjunct **before** deriving the composite authority, then adds policy order, the
+positive access floor, coverage, compile and subject proof. Exactly two
+coarse-only relations are replaced, both by stronger proofs: the exact
+Task↔AgentType policy reference (`can_execute` → `can_execute_security_v1`) and
+the "evidence claims this exact authored policy reference" claim
+(`can_provision` → the obligation-coverage proof of
+`compile_execution_security`). Every other conjunct is shared.
+
+Acceptance tests (all in `b5_security_acquisition`): evidence for another config
+digest, a missing functional capability, unsatisfiable AgentType continuity and
+lifecycle, and a `DISABLED` config with a **refreshed frontier** (so the
+stale-frontier fence is not what rejects it). The contract-level
+`the_provisioning_conjunct_is_shared_by_both_paths` pins the same matrix, plus
+the deliberate difference: it accepts evidence that does not list the authored
+policy reference (the security compile replaces that claim), while the coarse
+predicate still refuses it. Each guard in that matrix was mutation-checked at
+`0a0ed56`; the table is in [Verification](#verification).
+
+### P1-2 — delivery capability was read as a credential authorization
+
+`CompiledExecutionSecurity::with_source_config` refused a request only when the
+profile did **not** claim `CredentialDelivery`. That correctly separated the
+authorization ceiling from the delivery request (P2-2), but it also meant:
+
+```text
+P_eff.credentials = {}
+SourceConfig.credential_refs = ["vault://codex-prod"]
+profile.support includes CredentialDelivery
+→ with_source_config passes
+→ SECURITY_V1 acquisition grants Attempt/Lease
+```
+
+No canonical `CredentialRequest`, `CredentialEligibilityEvidence`, scope/audience/
+use check or broker qualification exists yet. B5.3 being unimplemented does not
+make broker eligibility satisfied, and ADR-0015 §5/§9 make credential
+authorization positive and deny-by-default.
+
+**Landed shape.** The pure component keeps the delivery-capability check as a
+necessary condition for B5.3, so `a_requested_credential_needs_a_profile_that_can_deliver`
+and `a_requested_credential_completes_when_the_profile_delivers` still pass. The
+authority-bearing entry is fail-closed for **any** non-empty `credential_refs`,
+independent of the profile claim, and rejects as `InvalidAuthority` before the
+Attempt/Lease tail. The dangerous direction is now the pinned negative:
+`a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver`.
+Mutation-checking the gate back to "coarse-only" makes exactly that test fail, and
+the candidate acquires.
+
+### P2 handoff constraints for B5.4
+
+Two boundary facts are recorded as hard B5.4 conditions, not defects in B5.2:
+
+- **Subject identity is not in the evidence digest.**
+  `SecurityEvidenceSubject::digest()` commits to the profile identity, not to the
+  chosen `EnforcementSubject`, so two subject proofs over one profile share a
+  digest. That is sufficient for candidate qualification (the acquisition
+  re-checks the caller's subject and persists no proof), but B5.4 must define
+  `ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity, SubjectIdentity)`
+  or a versioned `subject_proof_digest`, and must not treat the existing digest as
+  full physical subject proof.
+- **`SelfConsistentProfile ≠ TrustedPhysicalEvidence`.** `import` accepts the
+  caller's support matrix and covered subjects. The code proves consistency with
+  the declared `(adapter_kind, binding_ref)` and, for the policy-only protocol,
+  the proven subject domain; it does not prove that a real trusted integration
+  enforces those restrictions. Trusted importer identity, exact domain ownership,
+  profile freshness and actual subject attestation are the B5.2→B5.4 handoff
+  conditions. Constructor visibility must not be reintroduced as the security
+  boundary (cf. #31).
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -833,7 +967,7 @@ Generation's mode and rejects any difference, so the Task reads cannot present a
 | `match_existing_agents_for_task` selects the relation from the Task security mode | met |
 | `more_specific_for_with_policies` uses the real policy order | met |
 | A differing sandbox policy reference does not lose a legal existing-agent candidate | met, differential test |
-| `can_provision` / acquisition uses the same complete qualification for `SECURITY_V1` | **met on the security chain in revision 9** (`d4d8dc3`): `acquire_security_v1_task_existing` qualifies before Attempt/Lease. The coarse chain stays deliberately disjoint and still refuses `SECURITY_V1`, and the runtime resolver does not call the security entry point |
+| `can_provision` / acquisition uses the same complete qualification for `SECURITY_V1` | **met on the security chain from revision 9** (`d4d8dc3`), and completed in revision 10 (`0a0ed56`): `acquire_security_v1_task_existing` now intersects the frozen B.4 eligibility conjunct before it qualifies, and only then creates an Attempt/Lease. The coarse chain stays deliberately disjoint and still refuses `SECURITY_V1`, and the runtime resolver does not call the security entry point |
 
 ## Claim → code → test → commit
 
@@ -880,6 +1014,8 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 9)** Typed acquisition has two disjoint chains: the coarse one refuses a `SECURITY_V1` Task, AgentType or source, and the security one refuses a `COARSE_V1` one | `provisioning.rs` `AcquisitionMode`, `reject_security_v1_coarse_acquisition`, `require_security_v1_acquisition` | `b5_coarse_path_gate::a_coarse_task_cannot_execute_a_security_v1_agent_type`, `a_coarse_task_cannot_select_a_security_v1_source_even_without_a_ceiling`, `b5_security_acquisition::the_two_acquisition_chains_are_disjoint`, `a_coarse_agent_type_is_not_a_security_candidate`, `a_coarse_source_cannot_provision_a_security_task` | `d4d8dc3` |
 | **(rev 9)** The authority transaction re-loads the binding, requirement, actual AgentType revision and policy, source, declaration and `P_source`, and qualifies before any Attempt/Lease; the only caller-supplied facts are the imported profile and the requested subject | `provisioning.rs` `acquire_security_v1_task_existing` / `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_security_acquisition::a_qualified_candidate_is_selectable`, `an_uncovered_profile_is_rejected_before_attempt_or_lease`, `an_uncovered_subject_is_rejected_before_attempt_or_lease`, `a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease`, `the_durable_declaration_wins_over_the_callers_profile`, `the_callers_subject_is_the_one_proved`, `an_impossible_source_ceiling_is_candidate_local_ineligibility` | `d4d8dc3` |
 | **(rev 9)** A credential request the selected profile cannot deliver is ineligible before Attempt/Lease, settled at the attested config | `provisioning.rs` `finish_acquisition` (`ProvenExecutionSecurity::with_source_config`) | `b5_security_acquisition::a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease` | `d4d8dc3` |
+| **(rev 10)** `SECURITY_V1` acquisition intersects the frozen B.4 source/config eligibility (ACTIVE dispositions, ownership, evidence subject/config digest, lifecycle, continuity, functional envelope, security-class evidence, Task safety/continuity/restriction join); only the coarse policy-reference relations are replaced by policy order and the compile | `predicates.rs` `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_provisioning_conjunct_is_shared_by_both_paths`, `b5_security_acquisition::evidence_resolved_for_another_config_cannot_authorize_this_config`, `an_agent_type_capability_the_source_cannot_provide_is_rejected`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` | `0a0ed56` |
+| **(rev 10)** A profile's delivery capability is never a credential authorization: any non-empty `credential_refs` is fail-closed at the authority-bearing entry until B5.3 | `provisioning.rs` `finish_acquisition` pre-authority gate; `enforcement.rs` `with_source_config` remains the pure necessary condition | `b5_security_acquisition::a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver`, `a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease`; `b5_enforcement::a_requested_credential_completes_when_the_profile_delivers` (pure component) | `0a0ed56` |
 
 ### ADR-0014 §4 durable encoding (schema v10)
 
@@ -1008,13 +1144,17 @@ the earlier boundary remains auditable.
    candidate-independent preselection; the compiler still requires the
    four-term `EffectiveTaskAuthority`. A reviewer should confirm no caller
    substitutes the ceiling for the composite.
-6. **(rev 2, amended rev 9)** **Qualification is on the security acquisition
-   path, but not on a runtime composition.** P2-4. The predicate now has exactly
-   one non-test caller, `acquire_security_v1_task_existing`, which re-proves the
-   whole chain inside the authority transaction. The coarse path still refuses
-   `SECURITY_V1`, and the runtime resolver/daemon does not call the security
-   entry point. The Gate's acceptance tests pass at `d4d8dc3`, but the finding
-   stays open until the pull request merges and is re-audited.
+6. **(rev 2, amended rev 9 and 10)** **Selected-candidate qualification is on the
+   security acquisition path; complete orchestration is not.** P2-4. The
+   predicate now has exactly one non-test caller,
+   `acquire_security_v1_task_existing`, which re-proves the whole chain inside the
+   authority transaction, including the B.4 conjunct from revision 10. The coarse
+   path still refuses `SECURITY_V1`, and the runtime resolver/daemon does not call
+   the security entry point. There is no complete candidate enumeration,
+   whole-round budget/defer wiring, broker observation epoch, or new-agent
+   security acquisition, and `catalog_frontier_digest` fences only the
+   source/config frontier. The Gate's acceptance tests pass at `0a0ed56`, but the
+   finding stays open until the pull request merges and is re-audited.
 7. **(rev 2)** **The supported-surface claim for imported evidence needs a
    replacement evidence story.** P1-2. Until the runtime import and the
    authority transaction are the named proof, no `#[cfg]` visibility argument
@@ -1046,6 +1186,17 @@ the earlier boundary remains auditable.
     same-condition row were all accepted. Each now fails closed; none of them
     could create Attempt or Lease authority, so the fix is diagnostic truth, not
     a privilege boundary.
+13. **(rev 10, B5.4 handoff)** **The subject proof has no durable identity.**
+    `SecurityEvidenceSubject::digest()` commits to the profile, not to the chosen
+    `EnforcementSubject`, so two subjects over one profile share a digest. Not a
+    B5.2 defect (the acquisition re-checks the caller's subject and persists no
+    proof), but B5.4 must bind `(PlanIdentity, ProfileIdentity, SubjectIdentity)`
+    or a versioned `subject_proof_digest`.
+14. **(rev 10, B5.4 handoff)** **A self-consistent profile is not trusted physical
+    evidence.** `import` still accepts the caller's support matrix and covered
+    subjects. Trusted importer identity, exact domain ownership, freshness and
+    actual subject attestation remain B5.4 conditions; constructor visibility is
+    not the boundary.
 
 ## Verification
 
@@ -1184,6 +1335,31 @@ The last two rows are deliberately cross-crate: they show that P2-1's binding
 check and the pre-existing B5.1 coarse gates are still load-bearing on the new
 production caller, not only in their original tests.
 
+Revision 10 ships code in the same draft pull request and re-runs the full gate at
+`0a0ed56`:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 58 suites, 1101 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+Each revision-10 guard was mutation-checked at `0a0ed56` the same way: the guard
+was disabled, the affected tests were run, and each failed for the expected
+reason.
+
+| Guard disabled | Failing tests |
+|---|---|
+| the security branch's `can_provision_task_source_config` call | the five P1-1 acquisition negatives: `evidence_resolved_for_another_config_cannot_authorize_this_config`, `an_agent_type_capability_the_source_cannot_provide_is_rejected`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` |
+| credential pre-authority gate (restored to `matches!(mode, Coarse)`) | `a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver` — the candidate acquires |
+| config/source ACTIVE disposition | `the_provisioning_conjunct_is_shared_by_both_paths`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` |
+| evidence source/config/digest identity | `the_provisioning_conjunct_is_shared_by_both_paths`, `evidence_resolved_for_another_config_cannot_authorize_this_config` |
+| AgentType continuity conjunct | `the_provisioning_conjunct_is_shared_by_both_paths`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected` |
+| AgentType lifecycle conjunct | `the_provisioning_conjunct_is_shared_by_both_paths`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected` |
+| functional-envelope miss (entry skipped) | `the_provisioning_conjunct_is_shared_by_both_paths`, `an_agent_type_capability_the_source_cannot_provide_is_rejected` |
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -1204,6 +1380,10 @@ At revision 9's code head `d4d8dc3`, the B5 modules hold `b5_authority` 8,
 `b5_acquisition_block` 10, `b5_policy_catalog` 25, `b5_admission_binding` 28,
 `b5_coarse_path_gate` 8 and the new `b5_security_acquisition` 11.
 
+At revision 10's code head `0a0ed56`, the same modules hold `b5_enforcement` 36
+(one new shared-conjunct test) and `b5_security_acquisition` 17 (six new P1
+negatives), with the other counts unchanged.
+
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
 - `b5_composite_authority_surface` — the composite-authority, qualified-candidate,
@@ -1221,20 +1401,27 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
 | 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
 | 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`); tests named in the claim table |
-| 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation, a requested credential under a non-delivering profile is `SecurityUnenforceable`, and a requested credential under a delivering profile completes. Implemented in revision 8 (`28d6592`); tests named in the claim table |
+| 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation, a requested credential under a non-delivering profile is `SecurityUnenforceable`, and a requested credential under a delivering profile **completes at the pure component only**. Implemented in revision 8 (`28d6592`); the authority path is further narrowed by revision 10 (P1-2) |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
 | 9 | Bind each source declaration to its source revision (A) | the constructor and the writer both reject a declaration from another revision, and the validated read still fills the ref from `(source id, revision)`. Proposed in PR #35 |
 | 10 | Complete the durable block's validated read and count coherence (B) | a tampered generation, a candidate cost smaller than the domain, and a corrupt same-condition row each fail closed on read or re-record. Proposed in PR #35 |
-| Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table |
+| 11 | Intersect the frozen B.4 source/config eligibility on the `SECURITY_V1` path (P1-1, rev 10) | disabled config, foreign evidence digest, missing functional capability, and unsatisfiable continuity/lifecycle each reject with no Attempt/Lease; the coarse path is unchanged. Implemented in revision 10 (`0a0ed56`) |
+| 12 | Keep credential-bearing acquisition fail-closed until B5.3 (P1-2, rev 10) | a delivering profile plus non-empty `credential_refs` is `InvalidAuthority` before Attempt/Lease; the pure-component delivery check and its positive test remain. Implemented in revision 10 (`0a0ed56`) |
+| Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
-Items 1–6, 8, 9 and 10 are code changes and belong in follow-up pull requests, not in
-this docs-only record. Item 7 was a design decision and is settled in revision 3
-by narrowing the ADR rather than by adding history; item 4 also needs its
-normative sentence in the ADR, which is why that part sits in the ADR pull
-request. The Gate is the B5.2 completion condition. Revision 9 implements it in
-an unmerged draft pull request: as with every finding in this record, the row is
-evidence for the re-audit, not a closure.
+Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
+Item 7 was a design decision and is settled in revision 3 by narrowing the ADR
+rather than by adding history; item 4 also needs its normative sentence in the
+ADR, which is why that part sits in the ADR pull request. Items 11 and 12 are
+implemented in revision 10 (`0a0ed56`), in the same unmerged draft pull request as
+the Gate.
+
+The Gate is the B5.2 completion condition. Revisions 9 and 10 implement
+*selected-candidate transactional qualification* in an unmerged draft pull
+request; complete `SECURITY_V1` acquisition orchestration is still open. As with
+every finding in this record, the row is evidence for the re-audit, not a
+closure.
 
 ## Evidence index
 

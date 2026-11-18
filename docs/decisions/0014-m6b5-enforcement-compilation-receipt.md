@@ -110,17 +110,50 @@ attested. Binding the attested config to the compiled plan therefore rejects a
 request the profile cannot deliver, while an empty request adds no obligation and
 leaves a policy-only profile eligible.
 
+Delivery capability is nevertheless only a **necessary** condition inside the
+pure qualification component. B5.3 owns credential qualification — the canonical
+`CredentialRequest`, the `CredentialEligibilityEvidence`, and broker
+qualification with scope, audience, use and freshness. Until those exist,
+ADR-0015 §5/§9's positive-authorization, default-deny rule governs the
+authority-bearing entry: **every** non-empty `credential_refs` is refused before
+any Attempt or Lease, whether or not the imported profile claims
+`CredentialDelivery`. A caller-supplied profile claim is never an authorization,
+so this entry can never mint delivery authority from it.
+
 The order above is not only a resolver convention. The authority-bearing
 acquisition transaction re-loads the Task security binding, the Task requirement,
 the actual bound AgentType revision with its authored policy, the source revision,
-its security declaration and its authored `P_source`; it derives the composite
-authority, then calls `ValidatedSourceBinding::validate` and
-`qualify_security_candidate` in this order, and only then creates an Attempt or a
-Lease. The imported enforcement profile and the requested enforcement subject are
-the only inputs the caller supplies that the transaction cannot re-derive; every
-durable field of the resolver selection is re-read and re-checked, so a resolver
-verdict is never authority. A qualification failure is candidate-local — the
-Task stays queued and no Attempt, Lease or `ProvisioningBinding` is written.
+its security declaration and its authored `P_source`. It then proves the frozen
+B.4 eligibility conjunct (below), derives the composite authority, calls
+`ValidatedSourceBinding::validate` and `qualify_security_candidate`, and completes
+the evidence subject with `with_source_config`. Only after all of that does it
+create an Attempt or a Lease. The imported enforcement profile and the requested
+enforcement subject are the only inputs the caller supplies that the transaction
+cannot re-derive; every durable field of the resolver selection is re-read and
+re-checked, so a resolver verdict is never authority. A qualification failure is
+candidate-local — the Task stays queued and no Attempt, Lease or
+`ProvisioningBinding` is written.
+
+B.5 eligibility **intersects** B.4; it does not replace it:
+
+```text
+Eligible_B5.2 = Eligible_B4,reusable
+              ∧ PolicyQualified
+              ∧ EnforcementQualified
+              ∧ CredentialQualified (when required)
+```
+
+`Eligible_B4,reusable` is the part of the frozen
+`can_provision_task_source_config` relation that is not a coarse exact-reference
+identity: source/config ownership and ACTIVE disposition, the evidence
+subject/config digest identity, AgentType lifecycle, continuity, the functional
+envelope, security-class capability evidence, and the Task's effective safety,
+continuity and restriction join. Only the coarse exact-policy-reference relation
+(`can_execute`'s Task↔AgentType policy match and `can_provision`'s "evidence
+claims this authored policy reference" claim) is replaced, by the real policy
+order and the obligation-coverage proof respectively. Dropping the rest would let
+the security path grant Attempt/Lease authority over a source/config the frozen
+B.4 control plane had already rejected.
 
 `SECURITY_V1` and `COARSE_V1` acquisition are **disjoint chains**. The coarse
 entry point refuses a `SECURITY_V1` Task, AgentType or source and keeps its frozen
@@ -310,6 +343,25 @@ against binding B even when the two bindings expose the same support matrix.
 profile identity. An uncovered subject, a foreign binding, and an inactive
 source or binding are candidate-local ineligibility: never partial enforcement
 and never a Task failure.
+
+The digest records the profile identity, not the chosen enforcement subject.
+Two subject proofs over one profile therefore share the same
+`SecurityEvidenceSubject::digest()`. That is sufficient for candidate
+qualification — the acquisition re-checks the caller's subject and persists no
+proof — but B5.4 MUST NOT treat the existing digest as a complete physical
+subject proof. B5.4 defines the Execution-scoped evidence as
+`ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity, SubjectIdentity)`,
+or adds a versioned `subject_proof_digest` that commits to the chosen subject,
+and binds it in the `ExecutionSecuritySnapshot`.
+
+`ImportedEnforcementProfile::import` still accepts the caller's declared support
+matrix and covered subjects, so `SelfConsistentProfile ≠ TrustedPhysicalEvidence`:
+the code proves that the profile is internally consistent with its declared
+`(adapter_kind, binding_ref)`, not that a real integration can enforce those
+restrictions. Trusted importer identity, exact domain ownership, profile
+freshness and actual enforcement-subject attestation are B5.2→B5.4 handoff
+conditions. Constructor visibility is not, and MUST NOT become, the security
+boundary (cf. #31).
 
 ### 6. Two time scales, and an explicit security snapshot
 
