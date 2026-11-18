@@ -1,15 +1,16 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 11 (2026-11-18) — records the identity/capability re-audit over
-revision 10's draft: a profile bound the B.4 `binding_ref` alias rather than the
-resolved physical `adapter_binding_key`, and the fixed
-`SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile could widen its declared support
-matrix. Both are fixed with positive and negative acceptance tests. Still no
-freeze claim. Carries P2-1's profile binding and subject proof (7), P2-2's
-credential request/authorization split (8), and the P2-4 acquisition wiring (9),
-each with its own ADR amendment, gate run and mutation table. No ADR `Status:`
-line, spec status or index entry changes
+Revision: 12 (2026-11-18) — records the conditional-acceptance review of the
+revision-11 draft head `181c9e0`. The review accepts the static identity and
+capability fixes and the B5.2-C/D/E decomposition, but not a B5.2 freeze. It sets
+two hard conditions for the follow-ups — trusted importer provenance (B5.2-C) and
+no physical start before the B5.4 snapshot/secured start (B5.2-E) — and requires
+the unified candidate identity before budget, cache and durable-block wiring
+(B5.2-D). No code change; the record still carries P2-1's profile binding and
+subject proof (7), P2-2's credential request/authorization split (8), and the
+P2-4 acquisition wiring (9), each with its own ADR amendment, gate run and
+mutation table. No ADR `Status:` line, spec status or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 closing fixes proposed in draft PR #37)
 Date: 2026-11-18
@@ -35,7 +36,10 @@ B.4 eligibility conjunct and a credential delivery capability treated as an
 authorization), and revision 11 fixes the two identity/capability defects the
 next audit found: the profile bound the source `binding_ref` alias instead of the
 resolved physical `adapter_binding_key`, and the fixed reference profile could
-widen its support matrix. As with every earlier finding, this record counts no
+widen its support matrix. Revision 12 records the conditional-acceptance review
+of that draft: the implemented parts and the B5.2-C/D/E decomposition are accepted
+for continuation, with two hard conditions carried into the follow-ups, and the
+PR draft stays open. As with every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
 *selected-candidate transactional qualification implemented; complete
 `SECURITY_V1` acquisition orchestration remains open*.
@@ -65,6 +69,7 @@ positive-obligation requirement on the complete effective policy.
 | 9 | `d4d8dc3` (code) | Implements P2-4: `acquire_security_v1_task_existing` is the first non-test caller of `qualify_security_candidate`. One fenced transaction re-loads the Task binding, requirement, actual AgentType revision and authored policy, source, declaration and `P_source`, builds the composite authority, validates the caller's imported profile against the durable binding, qualifies, settles the attested config's credential request, and only then creates the Attempt/Lease and freezes the `ProvisioningBinding`. The two acquisition chains are disjoint. ADR-0014 §3 states the acquisition order and the disjointness. No ADR `Status:` line, spec status or index entry changes. |
 | 10 | `0a0ed56` (code) | Records the continuation audit over `26a44f9`: P1-1 (the `SECURITY_V1` branch replaced the frozen B.4 provisioning eligibility instead of intersecting it) and P1-2 (delivery capability was read as a credential authorization). Extracts `can_provision_task_source_config` as the reusable B.4 conjunct, intersects it on the security path, and makes every non-empty `credential_refs` fail closed on both chains. Also records the P2 subject-identity and trusted-importer handoff constraints. ADR-0014 §3/§5 and ADR-0015 §5/§9 state the intersection and the fail-closed rule. No ADR `Status:` line, spec status or index entry changes. |
 | 11 | `39e85c5` (code) | Records the identity/capability re-audit over `015220a`: P1 (the profile was bound to `AdapterBindingPolicy.binding_ref`, an alias, rather than the resolved physical `adapter_binding_key`) and P2 (the frozen reference profile could claim dimensions outside its fixed support matrix). `ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)` now proves the profile names the same physical domain as the selection; the profile digest, compile cache key and evidence subject commit to that key. `ImportedEnforcementProfile::import` rejects `Support_imported ⊄ Support_reference` for the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/3`; ADR-0014 §2/§5/§14 state both rules. No ADR `Status:` line, spec status or index entry changes. |
+| 12 | `181c9e0` (reviewed head; docs-only) | Records the conditional-acceptance review of the revision-11 draft: the implemented B.4 intersection, physical key/alias split, reference ceiling, credential fail-closed boundary and selected-candidate transaction are accepted for continuation, and B5.2-C/D/E remain separate follow-up pull requests. Sets the two hard conditions (trusted importer provenance; no physical start before the B5.4 snapshot/secured start), requires the unified candidate identity as the first B5.2-D commit, and pins five follow-up acceptance cases. Docs-only; no ADR `Status:` line, spec status or index change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -151,6 +156,14 @@ verdict still governs: **selected-candidate transactional qualification
 implemented; complete `SECURITY_V1` acquisition orchestration remains open.**
 Revision 11 does not mark P2-1 fully closed, does not claim complete B5.2
 orchestration, and does not claim a B5.4 secured start or receipt.
+
+Revision 12 records the conditional-acceptance review of `181c9e0`. The review
+accepts #37 as a continuing B5.2 implementation draft, not as a freeze: the B.4
+intersection, the physical key/alias separation, the reference-profile ceiling,
+the credential fail-closed boundary and the single-candidate transaction are
+accepted, and B5.2-C/D/E are explicitly left to separate pull requests rather than
+required in this one. The review adds two hard conditions and two ordering rules,
+recorded below. No implementation is added to #37 by this revision.
 
 ## Why this record exists
 
@@ -1132,6 +1145,110 @@ feature gate and must not happen before B5.4's secured start: the current
 `ExecutionSecuritySnapshot`, and `SecurityEvidenceSubject::digest()` still does
 not include the chosen `EnforcementSubject`.
 
+## Conditional-acceptance review (revision 12)
+
+An external review of `181c9e0` accepted PR #37 as a continuing B5.2
+implementation draft, not as a B5.2 freeze. It confirmed the static alias/physical
+key split, the import-time reference ceiling, the B.4 conjunct, the credential
+fail-closed boundary and the single-candidate transaction, and agreed that
+B5.2-C/D/E belong in separate follow-up pull requests rather than in this one.
+The review found no new code defect in this draft. It added two hard conditions and
+two ordering rules, none of which is implemented here.
+
+### Hard condition 1 — trusted importer provenance is B5.2-C
+
+`import` still derives its facts from the caller:
+
+- `support`, `covered_subjects`, `adapter_kind` and `adapter_binding_key` are
+  caller-supplied;
+- the profile digest is a content-integrity identity, not a statement about who
+  produced the profile or whether that producer can enforce the claims;
+- the frozen reference identity now has a ceiling, but a differently named
+  profile can still over-claim relative to its real adapter.
+
+B5.2-C's completion definition is therefore:
+
+- the profile comes from a trusted local importer, not from the Scheduler or the
+  candidate caller;
+- the importer protocol version and the exact physical binding identity are
+  verifiable;
+- support and subject claims are produced by the importer's real capability, not
+  declared by the caller;
+- profile freshness has explicit invalidation conditions;
+- renaming a profile cannot be used to escape the reference-profile claim.
+
+B5.2-C proves *what the physical domain can implement*. Whether the restrictions
+were applied to one Execution remains B5.4. A self-consistent profile digest MUST
+NOT be consumed by B5.4 as physical qualification evidence without this proof.
+
+### Hard condition 2 — B5.2-E must not open a physical start before B5.4
+
+`acquire_security_v1_task_existing` re-proves the durable inputs in one
+transaction and then creates an Attempt/Lease/`ProvisioningBinding`, but it
+discards the compiled plan. It is an authority-transaction prototype, not a
+secured start.
+
+The follow-up MUST separate two states:
+
+| State | Meaning | Executable |
+|---|---|---|
+| `SECURED_QUALIFIED` | B5.2 qualification proof completed | **no** |
+| `SECURED_EXECUTION_COMMITTED` | B5.4 snapshot and secured start protocol present | yes |
+
+No ordinary M5 physical start path may run on `SECURED_QUALIFIED`. The review
+accepts explicit types and a feature gate instead of a new durable enum, but an
+Attempt/Lease MUST NOT be read as proof that secured execution is reachable.
+
+### B5.2-D — freeze candidate identity first
+
+The unified candidate identity is the first B5.2-D commit and the first acceptance
+test: `(LogicalAgent, exact SourceConfig, physical binding)` for existing agents,
+and `(pinned AgentType, exact SourceConfig, physical binding)` for new ones, with
+the exact source revision and config digest included. `CandidateDomain::from_ids`
+still counts only `LogicalAgentId`, so two configs or two physical bindings under
+one agent can be merged today. Budget, cache and durable-block wiring MUST NOT
+land before that identity is fixed.
+
+Credential-free enumeration may land in B5.2-D, and B5.3 may add the broker
+observation epoch and credential eligibility, but B5.3 MUST use the same complete
+candidate resolution; an asynchronous or failed broker check MUST NOT degrade to
+partial selection.
+
+### B5.4 — the subject identity is part of the execution commitment
+
+`ProvenExecutionSecurity` now requires the profile to cover the chosen
+`EnforcementSubject`, but `SecurityEvidenceSubject::digest()` still commits to the
+profile only, so two subjects over one profile share a digest. The review makes
+the handoff non-optional:
+
+```text
+ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity, SubjectIdentity)
+```
+
+The subject identity MUST enter the persisted snapshot and the receipt integrity
+chain, not merely a transaction-local argument. This is a B5.4 requirement and
+does not block this draft.
+
+### Follow-up acceptance cases the review asks to pin
+
+| Case | Required result |
+|---|---|
+| One alias resolves to different physical keys | the old profile cannot be reused; qualification fails |
+| A profile claims more than its real importer can do | no trusted evidence is produced |
+| One LogicalAgent with two source/config/binding candidates | candidate count and domain digest distinguish both |
+| One candidate's eligibility is unknown, the others qualify | no partial selection |
+| `SECURITY_V1` qualification succeeds with B5.4 disabled | no entry into the old physical start path |
+
+A resolution-epoch observation and the final authority-transaction revalidation
+are separate: the latter MUST NOT pretend to read external importer or broker
+mutable facts atomically inside SQLite.
+
+### Disposition
+
+PR #37 stays **draft**. Its implemented parts and the C/D/E decomposition are
+accepted for continuation; the freeze is not. No B5.2-C/D/E implementation is
+added to this draft.
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1398,6 +1515,25 @@ the earlier boundary remains auditable.
     target; it is not silently widened by this rule. Additional dimensions for the
     reference protocol require a new versioned profile, not a wider matrix on the
     frozen one.
+17. **(rev 12)** **A successful qualification is not execution authority.**
+    `acquire_security_v1_task_existing` creates an Attempt/Lease and a
+    `ProvisioningBinding`, but it discards the compiled plan and persists no
+    `ExecutionSecuritySnapshot`. Wiring this entry point to an ordinary M5
+    physical start before B5.4 would let `SECURED_QUALIFIED` masquerade as an
+    executable secured start. B5.2-E must keep the qualified state explicitly
+    non-executable — by type and feature gate, not only by convention — and only
+    B5.4's snapshot plus secured start protocol may produce the executable
+    `SECURED_EXECUTION_COMMITTED` state. The presence of an Attempt/Lease is not
+    proof that secured execution is reachable.
+18. **(rev 12)** **The candidate identity is not yet unified.** `CandidateDomain`
+    is built from `LogicalAgentId` alone, so two exact `SourceConfig`s or two
+    physical bindings under one logical agent can be counted as one candidate.
+    That would corrupt `AcquisitionCost.candidates`, the compile count, the
+    candidate-domain digest, the durable block's same-condition test, and the
+    no-partial-selection rule. B5.2-D must freeze
+    `(LogicalAgent/pinned AgentType, exact Source/Config, physical binding)` —
+    including source revision and config digest — before budget, cache or
+    durable-block wiring lands.
 
 ## Verification
 
@@ -1584,6 +1720,11 @@ reason.
 | compile cache key uses the alias instead of the physical key | `b5_enforcement::an_alias_resolving_to_the_profiles_physical_domain_is_accepted` |
 | evidence subject uses the alias instead of the physical key | `b5_enforcement::an_alias_resolving_to_the_profiles_physical_domain_is_accepted` |
 
+Revision 12 is docs-only and re-runs none of the gates. It adds no code, schema or
+test; it records the conditional-acceptance review of `181c9e0` and the two hard
+conditions carried into B5.2-C and B5.2-E. The revision-11 suite result above
+remains the last executed code gate and is not re-attested here.
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -1639,9 +1780,9 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 12 | Keep credential-bearing acquisition fail-closed until B5.3 (P1-2, rev 10) | a delivering profile plus non-empty `credential_refs` is `InvalidAuthority` before Attempt/Lease; the pure-component delivery check and its positive test remain. Implemented in revision 10 (`0a0ed56`) |
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
-| 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | unit is `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`; an unknown candidate or exhausted budget cannot partially select. Not implemented |
-| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the imported profile's capability/subject claims name their trusted source; an untrusted or stale profile is ineligible. Not implemented |
-| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; no non-security start path; feature-gated before B5.4 secured start. Not implemented |
+| 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. Not implemented |
+| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. Not implemented |
+| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated. Not implemented |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
@@ -1650,7 +1791,9 @@ rather than by adding history; item 4 also needs its normative sentence in the
 ADR, which is why that part sits in the ADR pull request. Items 11 and 12 are
 implemented in revision 10 (`0a0ed56`), items 13 and 14 in revision 11
 (`39e85c5`), in the same unmerged draft pull request as the Gate. Items 15–17 are
-the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision.
+the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision;
+revision 12 accepts that decomposition and carries the two hard conditions into
+the follow-ups without adding code.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
