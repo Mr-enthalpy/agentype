@@ -967,6 +967,13 @@ impl CompiledExecutionSecurity {
     /// request the profile cannot deliver instead of silently compiling a
     /// credential-bearing execution. No request means no obligation, which is
     /// why an authorization ceiling alone never makes a candidate ineligible.
+    ///
+    /// This is a **pure qualification** necessary condition, not an authority
+    /// grant: a profile that *claims* `CredentialDelivery` satisfies it without
+    /// proving that this exact request is authorized. The authority-bearing
+    /// acquisition entry therefore stays fail-closed for every non-empty
+    /// `credential_refs` until B5.3 introduces the canonical `CredentialRequest`,
+    /// `CredentialEligibilityEvidence` and broker qualification (ADR-0015 §5/§9).
     pub fn with_source_config(mut self, config: &SourceConfig) -> Result<Self, ContractError> {
         self.evidence_subject = self.evidence_subject.with_source_config(config)?;
         if !config.credential_refs.is_empty() && !self.supports_credential_delivery {

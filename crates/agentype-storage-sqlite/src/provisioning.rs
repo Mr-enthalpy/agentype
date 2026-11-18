@@ -1254,16 +1254,18 @@ fn finish_acquisition(
         crate::catalog::load_source_config_revision(tx, &selection.source_config)?
             .ok_or_else(|| Error::invariant("selected source config revision is missing"))?;
     let config = config_revision.config();
-    // B.3 entry boundary: credential availability is a pre-authority conjunct.
-    // M6-B.4 has no trusted, source-bound availability authority, and a caller
-    // must never mint that authority, so the coarse path still fails closed for
-    // credential-bearing configs. The security path settles the request against
-    // the imported profile below: a non-empty request the profile cannot deliver
-    // is candidate-local ineligibility, and an authorization ceiling alone adds
-    // no obligation (ADR-0014 §3).
-    if matches!(mode, AcquisitionMode::Coarse) && !config.credential_refs.is_empty() {
+    // Credential availability is a pre-authority conjunct on every chain. B5.3
+    // owns credential qualification (the canonical `CredentialRequest`, the
+    // `CredentialEligibilityEvidence` and broker qualification); until those
+    // exist no request can be authorized, and ADR-0015 §5/§9 make that a default
+    // deny. A profile's delivery capability is a necessary condition inside the
+    // pure compile, never an authorization, so the authority-bearing entry stays
+    // fail-closed for *any* non-empty request instead of minting delivery
+    // authority from the caller's profile claim.
+    if !config.credential_refs.is_empty() {
         return Err(Error::invalid_authority(
-            "credential availability is B.5; B.4 fails closed for credential-bearing configs",
+            "credential-bearing configs are fail-closed before B5.3 credential qualification; \
+             a delivery capability is not a credential authorization",
         ));
     }
     // The selected SourceConfig carries a source-integration materialization
@@ -1282,13 +1284,29 @@ fn finish_acquisition(
             )
             .map_err(acquisition_rejection)?;
         }
-        // ADR-0014 §3 order, over the exact durable inputs: derive the composite
-        // authority, validate the external source/binding/profile tuple against
-        // the durable source and binding, qualify (policy order, coarse modes,
-        // access floor, coverage, compile, subject proof), then settle the
-        // config's credential request. Every failure here is candidate-local
+        // ADR-0014 §3 order, over the exact durable inputs. B.4 eligibility is a
+        // *conjunct*, not an alternative: `SECURITY_V1` still has to prove the
+        // frozen source/config provisioning predicates (ownership and ACTIVE
+        // dispositions, the evidence subject/config digest identity, lifecycle,
+        // continuity, the functional envelope and the security-class evidence,
+        // plus the Task's effective safety and restriction join). Only the coarse
+        // exact-reference sandbox relation is replaced, by the real policy order
+        // inside the qualification below. Then derive the composite authority,
+        // validate the external source/binding/profile tuple against the durable
+        // source and binding, qualify (policy order, coarse modes, access floor,
+        // coverage, compile, subject proof), and complete the evidence subject
+        // with the attested config. Every failure here is candidate-local
         // (`InvalidAuthority`/`SecurityUnenforceable`), never a Task failure.
         AcquisitionMode::SecurityV1(security) => {
+            agentype_agent_contract::can_provision_task_source_config(
+                &actual,
+                &source,
+                config,
+                &selection.evidence,
+                &catalog,
+                &requirement.hard,
+            )
+            .map_err(acquisition_rejection)?;
             let generation_id = crate::security_acquisition::task_generation(tx, task_id)?;
             let declaration =
                 crate::catalog::spawn_source_security_declaration(tx, &source.source_ref)?
@@ -1351,9 +1369,11 @@ fn finish_acquisition(
                 &catalog,
             )
             .map_err(acquisition_rejection)?;
-            // The exact attested config is the first point the credential
-            // *request* exists (ADR-0013 §5): a non-empty request the profile
-            // cannot deliver is ineligible here, before Attempt/Lease.
+            // Complete the evidence subject with the exact attested config. The
+            // credential request gate already ran above: every non-empty request
+            // is fail-closed until B5.3, so this call only binds the config and
+            // re-checks the profile's delivery capability as a defensive
+            // necessary condition (ADR-0015 §5/§9).
             let _proven = proven
                 .with_source_config(config)
                 .map_err(acquisition_rejection)?;

@@ -707,6 +707,189 @@ fn the_subject_completes_only_with_its_own_source_config() {
     assert_ne!(other.evidence_subject().digest().unwrap(), digest);
 }
 
+/// ADR-0014 §3: the `SECURITY_V1` path intersects the frozen B.4 source/config
+/// eligibility, it does not replace it. These are the conjuncts the coarse path
+/// has always proven and the security path must not drop.
+#[test]
+fn the_provisioning_conjunct_is_shared_by_both_paths() {
+    let fixture = confined_fixture();
+    let binding = adapter_binding(ConfigStatus::Active);
+    let config = source_config(&fixture.source.source_ref);
+    let agent_policy = fixture
+        .agent
+        .contract
+        .sandbox_policy
+        .clone()
+        .expect("the fixture pins an authored policy");
+    let evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        vec![agent_policy.clone()],
+        Vec::new(),
+    )
+    .unwrap();
+    let catalog = CapabilityCatalog::new();
+
+    can_provision_task_source_config(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &evidence,
+        &catalog,
+        &fixture.requirement.hard,
+    )
+    .expect("the fixture is physically eligible");
+
+    // The coarse-only authored-policy reference claim is the conjunct the
+    // security path replaces: the shared conjunct accepts evidence that does not
+    // list the policy reference (the compile proves obligation coverage
+    // instead), while the coarse predicate still refuses it.
+    let coarse_evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    let conjunct = |agent: &AgentType,
+                    source: &SpawnSource,
+                    config: &SourceConfig,
+                    evidence: &ResolvedProvisioningEvidence,
+                    catalog: &CapabilityCatalog| {
+        can_provision_task_source_config(
+            agent,
+            source,
+            config,
+            evidence,
+            catalog,
+            &fixture.requirement.hard,
+        )
+    };
+
+    assert!(can_provision(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &coarse_evidence,
+        &catalog
+    )
+    .is_err());
+    assert!(conjunct(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &coarse_evidence,
+        &catalog
+    )
+    .is_ok());
+
+    // ACTIVE disposition: a disabled config is not eligible, so the security
+    // path cannot select one even when its caller refreshes the frontier.
+    let mut disabled = config.clone();
+    disabled.status = ConfigStatus::Disabled;
+    assert!(matches!(
+        conjunct(
+            &fixture.agent,
+            &fixture.source,
+            &disabled,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::SourceConfigInvalid { .. }
+    ));
+
+    // Evidence carries the exact source/config identity: evidence for another
+    // config digest must never authorize this config.
+    let foreign_digest = ConfigDigest::new(format!("sha256:{}", "2".repeat(64))).unwrap();
+    let foreign = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        foreign_digest,
+        binding.required_safety.clone(),
+        vec![agent_policy],
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(matches!(
+        conjunct(&fixture.agent, &fixture.source, &config, &foreign, &catalog).unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    // A functional capability the source envelope cannot provide.
+    let mut functional_catalog = CapabilityCatalog::new();
+    functional_catalog
+        .define(
+            capability_ref("process.spawn"),
+            MatcherKind::Bool,
+            SecurityClass::Functional,
+            CapabilityPolarity::Ability,
+        )
+        .unwrap();
+    let mut functional_agent = fixture.agent.clone();
+    functional_agent
+        .contract
+        .required_capabilities
+        .insert(capability_ref("process.spawn"), CapabilityValue::Bool(true));
+    assert!(matches!(
+        conjunct(
+            &functional_agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &functional_catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+
+    // The config's continuity envelope must realize the AgentType continuity.
+    let mut narrowed = config.clone();
+    narrowed.continuity_modes = Some([ContinuityMode::None].into_iter().collect());
+    let mut continuity_agent = fixture.agent.clone();
+    continuity_agent.contract.continuity = ContinuityMode::Logical;
+    assert!(matches!(
+        conjunct(
+            &continuity_agent,
+            &fixture.source,
+            &narrowed,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+
+    // The config's lifecycle must realize the AgentType lifecycle.
+    let mut lifecycle_agent = fixture.agent.clone();
+    lifecycle_agent.contract.lifecycle = [LifecycleMode::Revivable].into_iter().collect();
+    assert!(matches!(
+        conjunct(
+            &lifecycle_agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+}
+
 #[test]
 fn a_different_imported_profile_is_a_subject_mismatch() {
     let fixture = confined_fixture();

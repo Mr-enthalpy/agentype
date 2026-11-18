@@ -15,14 +15,14 @@
 use agentype_agent_contract::{
     canonical_json_body_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
     AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget,
-    ConfigDigest, ConfigStatus, ContinuityMode, CredentialRef, EnforcementFeature,
-    EnforcementProfileRef, EnforcementSubject, EnforcementSupport, GenerationPolicy,
-    ImportedEnforcementProfile, LifecycleMode, MaterializationDigest, NetworkPolicy,
-    NormalizedSandboxPolicy, PathSelector, PhysicalSafety, PolicyInput,
-    ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityContract, SecurityContractMode,
-    SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
-    SpawnSourceSecurityDeclaration, WorkingDirectory, POLICY_ONLY_REFERENCE_PROFILE,
-    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
+    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, ConfigDigest,
+    ConfigStatus, ContinuityMode, CredentialRef, EnforcementFeature, EnforcementProfileRef,
+    EnforcementSubject, EnforcementSupport, GenerationPolicy, ImportedEnforcementProfile,
+    LifecycleMode, MatcherKind, MaterializationDigest, NetworkPolicy, NormalizedSandboxPolicy,
+    PathSelector, PhysicalSafety, PolicyInput, ResolvedProvisioningEvidence, SandboxPolicyRef,
+    SecurityClass, SecurityContract, SecurityContractMode, SourceConfig, SourceConfigRef,
+    SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, WorkingDirectory,
+    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
 };
 use agentype_core::{
     Clock, Error, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent, Retention,
@@ -174,24 +174,39 @@ fn publish_security_agent_type_with_policy(
     kernel
         .publish_sandbox_policy(&reference, &authored)
         .unwrap();
+    publish_security_agent_type_with_contract(kernel, id, security_contract(reference))
+}
+
+/// The default `SECURITY_V1` contract over an already-published authored policy.
+/// Its coarse projection is `ReadOnly` / `Disabled`, so a deny-all effective
+/// policy is a legal projection of the Task requirement.
+fn security_contract(sandbox_policy: SandboxPolicyRef) -> AgentTypeContract {
+    AgentTypeContract {
+        allowed_information_functions: vec![InformationFunction::Expand],
+        required_capabilities: BTreeMap::new(),
+        affinity: AffinityConstraint::Any,
+        budget_ceiling: Budget::new(100.0).unwrap(),
+        security: SecurityContract {
+            workspace: WorkspaceMode::ReadOnly,
+            network: NetworkPolicy::Disabled,
+            requires_attempt_isolation: false,
+        },
+        lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+        continuity: ContinuityMode::None,
+        sandbox_policy: Some(sandbox_policy),
+        anchor_constraint: None,
+    }
+}
+
+fn publish_security_agent_type_with_contract(
+    kernel: &Kernel,
+    id: &str,
+    contract: AgentTypeContract,
+) -> AgentTypeRef {
     let agent = AgentType {
         type_ref: type_ref(id),
         based_on: None,
-        contract: AgentTypeContract {
-            allowed_information_functions: vec![InformationFunction::Expand],
-            required_capabilities: BTreeMap::new(),
-            affinity: AffinityConstraint::Any,
-            budget_ceiling: Budget::new(100.0).unwrap(),
-            security: SecurityContract {
-                workspace: WorkspaceMode::ReadOnly,
-                network: NetworkPolicy::Disabled,
-                requires_attempt_isolation: false,
-            },
-            lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
-            continuity: ContinuityMode::None,
-            sandbox_policy: Some(reference),
-            anchor_constraint: None,
-        },
+        contract,
     };
     kernel
         .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
@@ -622,6 +637,50 @@ fn the_durable_declaration_wins_over_the_callers_profile() {
     assert_no_acquisition_side_effects(&env);
 }
 
+/// P1-2: a profile's `CredentialDelivery` claim is a necessary condition inside
+/// the pure compile, never an authorization. The config requests
+/// `vault://codex-prod`, `P_eff.credentials` authorizes nothing, and B5.3 owns
+/// the canonical `CredentialRequest`, `CredentialEligibilityEvidence` and broker
+/// qualification that do not exist yet, so the authority-bearing entry MUST
+/// refuse before Attempt/Lease (ADR-0015 §5/§9).
+#[test]
+fn a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver() {
+    let env = Env::new("credential-capable");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "credential-capable", pin);
+    let profile_ref = full_support_profile_ref();
+    // The full-support matrix includes `CredentialDelivery`, so the request gate
+    // is the only thing that can refuse this candidate.
+    let provisioning = security_catalog(
+        kernel,
+        "credential-capable",
+        Some(&profile_ref),
+        vec![CredentialRef::new("vault://codex-prod").unwrap()],
+    );
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "credential");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// The same request is refused when the profile cannot deliver either: the
+/// fail-closed rule is unconditional, not a capability negotiation.
 #[test]
 fn a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease() {
     let env = Env::new("credential");
@@ -630,8 +689,6 @@ fn a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_
     let secure = publish_security_agent_type(kernel, "secure");
     let task = admit_security_v1_task(kernel, "credential", pin);
     let profile_ref = full_support_profile_ref();
-    // The config requests a credential; the profile covers every policy
-    // obligation except delivery, so only the request settlement can refuse it.
     let provisioning = security_catalog(
         kernel,
         "credential",
@@ -653,7 +710,241 @@ fn a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_
     let error = kernel
         .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
         .unwrap_err();
-    assert_candidate_rejection(&error, "credential delivery");
+    assert_candidate_rejection(&error, "credential");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// P1-1: the security path must intersect the frozen B.4 eligibility. Evidence
+/// resolved for a *different* `SourceConfig` is a real B.4 subject, just not
+/// this config's, and must never authorize the selected config. The frontier is
+/// refreshed so the stale-frontier fence is not what rejects the candidate.
+#[test]
+fn evidence_resolved_for_another_config_cannot_authorize_this_config() {
+    let env = Env::new("evidence-config");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "evidence-config", pin);
+    let profile_ref = full_support_profile_ref();
+    let mut provisioning =
+        security_catalog(kernel, "evidence-config", Some(&profile_ref), Vec::new());
+
+    let body = json!({"model": "another"});
+    let other_digest = ConfigDigest::new(canonical_json_body_digest(&body)).unwrap();
+    let other = SourceConfig {
+        config_ref: SourceConfigRef::new(provisioning.spawn_source.clone(), "config-other", 1)
+            .unwrap(),
+        config_digest: other_digest.clone(),
+        lifecycle_modes: None,
+        continuity_modes: None,
+        credential_refs: Vec::new(),
+        claims: Vec::new(),
+        status: ConfigStatus::Active,
+    };
+    kernel
+        .publish_source_config(&other, &SourceConfigBody::OpaqueJson(body))
+        .unwrap();
+    provisioning.evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        provisioning.adapter_policy.clone(),
+        ADAPTER_KIND,
+        BINDING_REF,
+        provisioning.spawn_source.clone(),
+        other.config_ref.clone(),
+        other_digest,
+        safety(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    provisioning.catalog_frontier_digest = kernel.catalog_frontier_digest().unwrap();
+
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "exact source config digest");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+fn publish_functional_capability(kernel: &Kernel) -> CapabilityRef {
+    let reference = CapabilityRef::new("process.spawn", 1).unwrap();
+    kernel
+        .publish_capability_definition(
+            &reference,
+            &CapabilityDefinition {
+                matcher_kind: MatcherKind::Bool,
+                security_class: SecurityClass::Functional,
+                polarity: CapabilityPolarity::Ability,
+                policy_projection: None,
+            },
+        )
+        .unwrap();
+    reference
+}
+
+/// P1-1: an AgentType functional capability the source/config envelope cannot
+/// provide is B.4 ineligibility. The Task itself does not require it, so only
+/// `can_provision` can reject it.
+#[test]
+fn an_agent_type_capability_the_source_cannot_provide_is_rejected() {
+    let env = Env::new("functional");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let reference = publish_functional_capability(kernel);
+    let authored = policy_ref("agent-policy-functional");
+    kernel
+        .publish_sandbox_policy(&authored, &NormalizedSandboxPolicy::deny_all())
+        .unwrap();
+    let mut contract = security_contract(authored);
+    contract
+        .required_capabilities
+        .insert(reference, CapabilityValue::Bool(true));
+    let secure = publish_security_agent_type_with_contract(kernel, "functional", contract);
+    let task = admit_security_v1_task(kernel, "functional", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "functional", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "process.spawn");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// P1-1: the config/source continuity envelope is a B.4 conjunct. The AgentType
+/// advertises `Logical` and the Task requires nothing, so the security policy
+/// qualification passes; only the physical continuity check can reject it.
+#[test]
+fn a_config_that_cannot_realize_the_agent_type_continuity_is_rejected() {
+    let env = Env::new("continuity");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let authored = policy_ref("agent-policy-continuity");
+    kernel
+        .publish_sandbox_policy(&authored, &NormalizedSandboxPolicy::deny_all())
+        .unwrap();
+    let mut contract = security_contract(authored);
+    contract.continuity = ContinuityMode::Logical;
+    let secure = publish_security_agent_type_with_contract(kernel, "continuity", contract);
+    let task = admit_security_v1_task(kernel, "continuity", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "continuity", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "continuity");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// P1-1: the source/config lifecycle must realize the AgentType lifecycle.
+#[test]
+fn a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected() {
+    let env = Env::new("lifecycle");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let authored = policy_ref("agent-policy-lifecycle");
+    kernel
+        .publish_sandbox_policy(&authored, &NormalizedSandboxPolicy::deny_all())
+        .unwrap();
+    let mut contract = security_contract(authored);
+    contract.lifecycle = [LifecycleMode::Resident].into_iter().collect();
+    let secure = publish_security_agent_type_with_contract(kernel, "lifecycle", contract);
+    let task = admit_security_v1_task(kernel, "lifecycle", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "lifecycle", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "lifecycle");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// P1-1: a `DISABLED` SourceConfig is not eligible even when the caller refreshes
+/// the frontier fence, so the ACTIVE disposition is a per-candidate conjunct and
+/// not merely an artifact of the selection snapshot.
+#[test]
+fn a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier() {
+    let env = Env::new("disabled-config");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "disabled-config", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "disabled-config", Some(&profile_ref), Vec::new());
+    let mut candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            BINDING_REF,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    kernel
+        .set_source_config_status(
+            &candidate.provisioning.source_config,
+            ConfigStatus::Disabled,
+        )
+        .unwrap();
+    candidate.provisioning.catalog_frontier_digest = kernel.catalog_frontier_digest().unwrap();
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "not active");
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
     assert_no_acquisition_side_effects(&env);
 }
