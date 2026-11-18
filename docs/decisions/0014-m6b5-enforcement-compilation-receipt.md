@@ -43,10 +43,14 @@ credentials.
 the normalized effective policy) and one validated source/binding/profile
 tuple. The tuple MUST prove that the exact adapter binding is the adapter policy
 the `SpawnSource` revision names, that both are active, and that the imported
-profile records the same `(adapter_kind, binding_key)` it was imported for. Its
-output is a **root-relative** plan: logical path selectors, not a concrete
-`agentype-jail-<request_id>` path. It MUST NOT create a directory or require
-one.
+profile records the same resolved `(adapter_kind, adapter_binding_key)` physical
+domain it was imported for. B.4 `AdapterBindingPolicy.binding_ref` is a stable
+alias that resolves to the physical key; the tuple MUST carry the resolved key
+explicitly, MUST prove the profile names that key, and MUST NOT accept an
+alias-only equality as the binding identity. The key, not the alias, is what the
+Execution and its `BindingSnapshot` freeze. Its output is a **root-relative**
+plan: logical path selectors, not a concrete `agentype-jail-<request_id>` path.
+It MUST NOT create a directory or require one.
 
 `prepare` binds the logical selectors to the attested jail base and workspace
 mapping and returns a descriptor. It MUST NOT claim to have observed the actual
@@ -336,13 +340,16 @@ SQLite transaction.
 A successful compilation is not yet an applied-security claim. Compilation proves
 that the profile's support matrix covers the obligations; the subject proof then
 requires the same profile to claim the exact `EnforcementSubject` of the
-execution (§14). The imported profile records the `(adapter_kind, binding_key)`
-pair it was imported for, so a profile imported for binding A cannot be compiled
-against binding B even when the two bindings expose the same support matrix.
-`ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2` because that pair is now part of the
-profile identity. An uncovered subject, a foreign binding, and an inactive
-source or binding are candidate-local ineligibility: never partial enforcement
-and never a Task failure.
+execution (§14). The imported profile records the resolved
+`(adapter_kind, adapter_binding_key)` pair it was imported for, so a profile
+imported for physical domain K1 cannot be compiled against a selection for K2,
+even when both are reached through the same `binding_ref` alias and expose the
+same support matrix. The compile cache key and the evidence subject MUST commit
+to that physical key, never to the alias. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is
+`/3` because the pair is part of the profile identity and `/2` committed to the
+alias. An uncovered subject, a foreign physical domain, and an inactive source or
+binding are candidate-local ineligibility: never partial enforcement and never a
+Task failure.
 
 The digest records the profile identity, not the chosen enforcement subject.
 Two subject proofs over one profile therefore share the same
@@ -357,8 +364,8 @@ and binds it in the `ExecutionSecuritySnapshot`.
 `ImportedEnforcementProfile::import` still accepts the caller's declared support
 matrix and covered subjects, so `SelfConsistentProfile ≠ TrustedPhysicalEvidence`:
 the code proves that the profile is internally consistent with its declared
-`(adapter_kind, binding_ref)`, not that a real integration can enforce those
-restrictions. Trusted importer identity, exact domain ownership, profile
+`(adapter_kind, adapter_binding_key)`, not that a real integration can enforce
+those restrictions. Trusted importer identity, exact domain ownership, profile
 freshness and actual enforcement-subject attestation are B5.2→B5.4 handoff
 conditions. Constructor visibility is not, and MUST NOT become, the security
 boundary (cf. #31).
@@ -1111,6 +1118,15 @@ for every claimed item, and B5.5 MUST verify it with positive and negative tests
 before the profile is cited in a freeze record. It is a positive claim in the
 further sense that a dimension not listed as supported is unsupported for this
 profile, even when it exists in the policy grammar.
+
+The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity is a **fixed**
+capability claim, not a floor to widen. A stricter platform-specific matrix is
+allowed; an imported profile for this exact identity MUST satisfy
+`Support_imported ⊆ Support_reference_profile`. `ImportedEnforcementProfile::import`
+MUST reject an over-claim at import time, not leave the widening for a later
+compiler to notice. A profile that needs any additional dimension MUST be a new,
+separately authored and versioned profile identity; it MUST NOT reuse this
+identity with a wider support matrix.
 
 Claimed supported:
 

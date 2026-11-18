@@ -1,15 +1,15 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 10 (2026-11-18) — records the continuation audit over revision 9's
-draft pull request: P1-1 (the security branch replaced the frozen B.4 eligibility
-instead of intersecting it) and P1-2 (a profile's delivery capability was read as
-a credential authorization), both fixed with new acceptance tests. Also records
-the B5.4 handoff constraints on subject identity and trusted imported evidence.
-Carries P2-1's profile binding and subject proof (7), P2-2's credential
-request/authorization split (8), and the P2-4 acquisition wiring (9), each with
-its own ADR amendment, gate run and mutation table. No ADR `Status:` line, spec
-status or index entry changes
+Revision: 11 (2026-11-18) — records the identity/capability re-audit over
+revision 10's draft: a profile bound the B.4 `binding_ref` alias rather than the
+resolved physical `adapter_binding_key`, and the fixed
+`SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile could widen its declared support
+matrix. Both are fixed with positive and negative acceptance tests. Still no
+freeze claim. Carries P2-1's profile binding and subject proof (7), P2-2's
+credential request/authorization split (8), and the P2-4 acquisition wiring (9),
+each with its own ADR amendment, gate run and mutation table. No ADR `Status:`
+line, spec status or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 closing fixes proposed in draft PR #37)
 Date: 2026-11-18
@@ -29,13 +29,16 @@ must not be opened against it as-is. Later passes added three more findings —
 P1-3 and P2-5 in revision 4, P1-4 in revision 5 — and none of them is closed by
 this record. Revision 6 adds findings A and B, whose fixes are in a code pull
 request stacked on the P1-3/P1-4 pull request. Revisions 7, 8 and 9 carry the
-closing fixes P2-1, P2-2 and P2-4 in draft PR #37, and revision 10 fixes the two
-P1 defects that the continuation audit then found in that same draft: an omitted
+closing fixes P2-1, P2-2 and P2-4 in draft PR #37, revision 10 fixes the two
+P1 defects that the continuation audit then found in that same draft (an omitted
 B.4 eligibility conjunct and a credential delivery capability treated as an
-authorization. As with every earlier finding, this record counts no unmerged fix
-as closure and does not freeze B5.2. The current stage is *selected-candidate
-transactional qualification implemented; complete `SECURITY_V1` acquisition
-orchestration remains open*.
+authorization), and revision 11 fixes the two identity/capability defects the
+next audit found: the profile bound the source `binding_ref` alias instead of the
+resolved physical `adapter_binding_key`, and the fixed reference profile could
+widen its support matrix. As with every earlier finding, this record counts no
+unmerged fix as closure and does not freeze B5.2. The current stage is
+*selected-candidate transactional qualification implemented; complete
+`SECURITY_V1` acquisition orchestration remains open*.
 
 The gaps are **latent, not live**. The coarse typed acquisition path still
 rejects `SECURITY_V1` at every stage, and the runtime resolver and daemon do not
@@ -57,10 +60,11 @@ positive-obligation requirement on the complete effective policy.
 | 4 | `983bc16` | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
 | 5 | `097f35d` | Records the third independent re-audit: P1-4 (the compile cache key omits the guarantee identity, so plans with different obligations share one memoization key). Amends the ADR-0014 §4 frozen key list in the P2-3 ADR pull request and fixes the key in the P1-3 code pull request. Docs-only here; no code, ADR `Status:` line, spec or index change in this pull request. |
 | 6 | `9b8d830` (code) | Records the fourth independent re-audit: A (a source declaration is not bound to its `SpawnSource` revision) and B (the durable block's validated read does not re-bind the generation, relate the candidate count to the cost, or validate the existing row on a same-condition record). Also records the write-once Task security mode premise and the candidate-domain identity model as a B5.3 design item, and adds the ADR-0014 §4 count-coherence sentence. Fixes are in the code pull request on `9b8d830`; docs-only here, no ADR `Status:` line, spec or index change. |
-| 7 | `decb13a` (code) | Implements P2-1: an imported profile names the `(adapter_kind, binding_ref)` it was imported for, the compiler accepts only a validated source/binding/profile tuple, and a compiled plan is distinct from a proven subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`; ADR-0014 §2, §3, §5 and §14 state the tuple, the subject proof and the import-time subject bound. No ADR `Status:` line, spec status or index entry changes. |
+| 7 | `decb13a` (code) | Implements P2-1: an imported profile names the `(adapter_kind, binding_ref)` it was imported for, the compiler accepts only a validated source/binding/profile tuple, and a compiled plan is distinct from a proven subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`; ADR-0014 §2, §3, §5 and §14 state the tuple, the subject proof and the import-time subject bound. Revision 11 supersedes the identity: the profile now names the resolved physical `adapter_binding_key`, and the schema tag is `/3`. No ADR `Status:` line, spec status or index entry changes. |
 | 8 | `28d6592` (code) | Implements P2-2: credential delivery is a request-scoped obligation settled when the exact `SourceConfig` is attested, not a policy-derived one. `RequiredEnforcementFeatures::derive` no longer inserts `CREDENTIAL_DELIVERY` from the authorization ceiling; `CompiledExecutionSecurity::with_source_config` rejects a non-empty request the profile cannot deliver. `ENFORCEMENT_COMPILER_PROTOCOL` is `/3`; ADR-0014 §3 and §4 state the request/authorization split. No ADR `Status:` line, spec status or index entry changes. |
 | 9 | `d4d8dc3` (code) | Implements P2-4: `acquire_security_v1_task_existing` is the first non-test caller of `qualify_security_candidate`. One fenced transaction re-loads the Task binding, requirement, actual AgentType revision and authored policy, source, declaration and `P_source`, builds the composite authority, validates the caller's imported profile against the durable binding, qualifies, settles the attested config's credential request, and only then creates the Attempt/Lease and freezes the `ProvisioningBinding`. The two acquisition chains are disjoint. ADR-0014 §3 states the acquisition order and the disjointness. No ADR `Status:` line, spec status or index entry changes. |
 | 10 | `0a0ed56` (code) | Records the continuation audit over `26a44f9`: P1-1 (the `SECURITY_V1` branch replaced the frozen B.4 provisioning eligibility instead of intersecting it) and P1-2 (delivery capability was read as a credential authorization). Extracts `can_provision_task_source_config` as the reusable B.4 conjunct, intersects it on the security path, and makes every non-empty `credential_refs` fail closed on both chains. Also records the P2 subject-identity and trusted-importer handoff constraints. ADR-0014 §3/§5 and ADR-0015 §5/§9 state the intersection and the fail-closed rule. No ADR `Status:` line, spec status or index entry changes. |
+| 11 | `39e85c5` (code) | Records the identity/capability re-audit over `015220a`: P1 (the profile was bound to `AdapterBindingPolicy.binding_ref`, an alias, rather than the resolved physical `adapter_binding_key`) and P2 (the frozen reference profile could claim dimensions outside its fixed support matrix). `ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)` now proves the profile names the same physical domain as the selection; the profile digest, compile cache key and evidence subject commit to that key. `ImportedEnforcementProfile::import` rejects `Support_imported ⊄ Support_reference` for the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/3`; ADR-0014 §2/§5/§14 state both rules. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -132,6 +136,21 @@ verdict on the stage is recorded verbatim in substance: **selected-candidate
 transactional qualification implemented; complete `SECURITY_V1` acquisition
 orchestration remains open.** Revision 10 does not claim B5.2 orchestration,
 B5.2 freeze or B5.4 secured execution.
+
+Revision 11 carries the two defects the next audit found in the same draft. It is
+a code change with normative ADR amendments. The audit accepted P1-1/P1-2 and the
+provisional soundness of P2-1, but showed that B.4 has two different identities:
+`AdapterBindingPolicy.binding_ref` is a stable alias, while the resolved
+`AdapterBindingKey` is what the Execution freezes. The validated tuple compared
+the profile with the alias, so a profile imported for physical domain K1 could be
+compiled against a selection resolved to K2 through the same alias. It also
+accepted the profile's support matrix without a ceiling, so the fixed
+policy-only reference identity could claim a dimension it does not declare. Both
+are corrected at the import boundary and in the validated tuple. The audit's
+verdict still governs: **selected-candidate transactional qualification
+implemented; complete `SECURITY_V1` acquisition orchestration remains open.**
+Revision 11 does not mark P2-1 fully closed, does not claim complete B5.2
+orchestration, and does not claim a B5.4 secured start or receipt.
 
 ## Why this record exists
 
@@ -546,6 +565,42 @@ block written by an older build would simply be a different condition. Tests are
 named in the claim table below. This is a proposed fix in an unmerged pull
 request, not a closure.
 
+**Revision 11 correction — the identity is the resolved key, not the alias.** The
+revision-7 shape above compared the profile with
+`AdapterBindingPolicy.binding_ref`. That string is only B.4's stable operator
+alias: the resolver resolves it through `resolve_binding_ref` to an exact
+`AdapterBindingKey`, and the Execution and its `BindingSnapshot` freeze the key
+(ADR-0008). A profile imported for physical domain `k1` could therefore be
+compiled against a selection whose policy still carries the alias `primary` but
+which resolved to `k2`. The correction keeps the alias as the source-policy input
+and adds the resolved key as the shared identity:
+
+- `ImportedEnforcementProfile` records and digests `(adapter_kind,
+  adapter_binding_key)`. `profile_digest` uses the physical key.
+- `ValidatedSourceBinding::validate(source, binding, adapter_binding_key,
+  profile)` takes the resolver's resolved key, rejects an empty key, and requires
+  the profile to name that same key. It cannot itself re-run resolution; the
+  authority transaction separately proves
+  `evidence.adapter_binding_key == selection.adapter_binding_key` and passes that
+  durable selection key in.
+- `compile_execution_security` writes `domain.adapter_binding_key()` into the
+  `CompileCacheKey` and the `SecurityEvidenceSubject`, so neither commits to the
+  alias.
+- `ENFORCEMENT_PROFILE_SCHEMA_VERSION` moves `/2 -> /3`. The plan schema and
+  compiler protocol are unchanged by this correction.
+- Tests: `an_alias_resolving_to_the_profiles_physical_domain_is_accepted`
+  (`primary -> k2`, asserts the cache key and subject carry `k2`), the negative
+  `a_profile_from_another_physical_domain_under_the_same_alias_is_rejected`, and
+  the storage-level `the_binding_alias_resolves_to_the_selections_physical_key`,
+  which proves the acquisition transaction passes the selection key rather than
+  the policy alias.
+
+This closes the *static* alias/key gap the audit named. It does **not** implement
+the trusted importer identity the same audit separates for B5.2-C/B5.4: `import`
+still accepts the caller's claims once they are key-bound and inside the fixed
+reference ceiling. P2-1 is implemented but not fully closed, and the B5.4 handoff
+below still applies.
+
 ### P2-2 — an authorized credential is treated as a requested delivery
 
 `RequiredEnforcementFeatures::derive` (`enforcement.rs:223–225`) inserts
@@ -953,12 +1008,129 @@ Two boundary facts are recorded as hard B5.4 conditions, not defects in B5.2:
   full physical subject proof.
 - **`SelfConsistentProfile ≠ TrustedPhysicalEvidence`.** `import` accepts the
   caller's support matrix and covered subjects. The code proves consistency with
-  the declared `(adapter_kind, binding_ref)` and, for the policy-only protocol,
-  the proven subject domain; it does not prove that a real trusted integration
-  enforces those restrictions. Trusted importer identity, exact domain ownership,
+  the declared `(adapter_kind, adapter_binding_key)` and, for the policy-only
+  protocol, the proven subject domain and the fixed support ceiling; it does not
+  prove that a real trusted integration enforces those restrictions. Trusted importer identity, exact domain ownership,
   profile freshness and actual subject attestation are the B5.2→B5.4 handoff
   conditions. Constructor visibility must not be reintroduced as the security
   boundary (cf. #31).
+
+## Identity and capability re-audit (revision 11)
+
+The next audit re-read `015220a` and accepted the P1-1/P1-2 fixes, the B.4
+intersection, the two disjoint acquisition modes, the root-relative compile and
+the selected-candidate transaction. It found two new defects in the identity and
+capability proofs, both fixed in `39e85c5`; neither is counted as B5.2 closure
+before merge and re-audit.
+
+### P1 — the profile was bound to the alias, not the physical adapter key
+
+B.4 deliberately distinguishes two identities:
+
+```text
+AdapterBindingPolicy.binding_ref = "primary"      stable operator alias
+        ↓ resolve_binding_ref(kind, alias)
+ImportedAdapterBinding.adapter_binding_key = "k2" exact physical domain
+        ↓
+ResolvedProvisioningSelection.adapter_binding_key = "k2"
+```
+
+The resolver and the authority transaction already carried the physical key, and
+`finish_acquisition` proved `evidence.adapter_binding_key ==
+selection.adapter_binding_key`. But revision 7's
+`ValidatedSourceBinding::validate` compared `profile.binding_ref()` with
+`binding.binding_ref`. Nothing related those two comparisons to each other, so a
+profile imported for physical domain K1 could pass validation for a selection
+resolved to K2 through the same alias. The existing tests mostly used
+`binding_ref == adapter_binding_key == "k1"`, so they could not see the split.
+
+**Landed shape.** `ImportedEnforcementProfile` records the resolved
+`(adapter_kind, adapter_binding_key)` and commits to it in `profile_digest`.
+`ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)`
+requires the resolver's resolved key, rejects an empty key, and requires the
+profile to name it. `ValidatedSourceBinding` stores the key; the compiler writes
+it into the cache key and the evidence subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION`
+is `/3`. The alias stays where B.4 puts it: in the source's
+`AdapterBindingPolicy`, resolved by the resolver, never in the compiled physical
+identity.
+
+**Acceptance tests.** In `b5_enforcement`:
+`an_alias_resolving_to_the_profiles_physical_domain_is_accepted` uses
+`binding_ref = "primary"` and physical key `"k2"`, and asserts the cache key and
+evidence subject both carry `"k2"`;
+`a_profile_from_another_physical_domain_under_the_same_alias_is_rejected` swaps
+in a profile imported for `"k1"` and requires `EvidenceSubjectMismatch`. In
+`b5_security_acquisition`,
+`the_binding_alias_resolves_to_the_selections_physical_key` runs the real
+authority transaction with `primary -> k2` and asserts the durable
+`ProvisioningBinding` freezes `"k2"`. Mutation checks at `39e85c5`: comparing
+only the profile's adapter kind, passing the policy alias at the call site, or
+writing the alias into either the cache key or the subject each fails the
+expected test.
+
+**Status.** This closes the *binding-identity comparison* defect. It is not a
+claim that P2-1 is fully closed: trusted importer identity, profile freshness and
+actual subject attestation are still B5.2-C/B5.4 handoffs, and the rest of the
+audit's B5.2-C/D/E decomposition below is not implemented.
+
+### P2 — the fixed reference profile could widen its support matrix
+
+`ImportedEnforcementProfile::import` accepted any caller `EnforcementSupport` for
+the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity. It already rejected a
+subject outside the proven domain, but not a capability outside the fixed claim.
+A profile could therefore declare `NetworkEgressRestriction` under the reference
+identity, and the compiler would then treat a network obligation as covered even
+though ADR-0014 §14 explicitly does not claim network egress restriction.
+
+**Landed shape.** For the exact reference identity (all of protocol, profile name
+and version), `import` enforces
+
+```text
+Support_imported ⊆ Support_reference_profile
+```
+
+and rejects an over-claim as `InvalidSandboxPolicy` before any compiler sees it.
+A stricter subset remains valid. A profile that needs an additional dimension
+must use a new versioned identity; reusing the frozen one with a wider matrix is
+not an upgrade path. `the_frozen_reference_profile_cannot_widen_its_support_matrix`
+pins both directions (network over-claim rejected, workspace-only subset
+accepted); disabling the ceiling fails that test.
+
+### Remaining B5.2 boundaries the audit named
+
+The audit's three-slice decomposition is recorded here as the follow-up shape.
+Revision 11 implements only the static alias/physical-key and reference-ceiling
+parts of B5.2-C; everything else in the table is not work this revision
+performed:
+
+| Slice | Work | Gate |
+|---|---|---|
+| B5.2-C | Alias/physical-key binding, the fixed reference-profile ceiling and trusted importer provenance | no cross-physical-domain reuse; no widening of the reference profile |
+| B5.2-D | Complete candidate identity, full enumeration, compile budget, cache, automatic durable block and defer | an unknown candidate or exhausted budget cannot partially select |
+| B5.2-E | Resolver→Scheduler production wiring, full candidate revalidation, existing/new-agent handling | every qualification proof closes before Attempt/Lease; no non-security start path |
+
+Two boundaries are explicitly **not** moved into B5.4:
+
+- **Trusted import.** B5.2 must distinguish *a profile that is self-consistent
+  and key-bound* from *evidence from a trusted exact physical binding*. Revision
+  11 improves the former; it does not implement the trusted importer identity,
+  evidence version or freshness proof. That proof belongs to B5.2-C.
+- **Applied receipt.** Whether the OS restrictions were actually applied to an
+  Execution instance, and the recoverable receipt for that, remains B5.4.
+
+`CandidateDomain::from_ids` still counts `LogicalAgentId` only. The audit records
+complete candidate identity as a **B5.2 remaining-design item**, not a B5.3
+deferral: a candidate is `LogicalAgent + exact Source/Config + physical binding`
+for existing agents, or `pinned AgentType + exact Source/Config + physical
+binding` for new ones. Full enumeration and a whole-round budget must use that
+unit before B5.2-E can be claimed. B5.3 may add the broker observation epoch and
+credential eligibility, but does not redefine B5.2's general candidate identity.
+
+Finally, wiring B5.2-E into the ordinary physical start path requires its own
+feature gate and must not happen before B5.4's secured start: the current
+`acquire_security_v1_task_existing` creates a real Attempt/Lease but persists no
+`ExecutionSecuritySnapshot`, and `SecurityEvidenceSubject::digest()` still does
+not include the chosen `EnforcementSubject`.
 
 ## B5.1 handoff acceptance, re-checked
 
@@ -1002,8 +1174,9 @@ implements it and the test that would fail if it were removed. Rows marked
 | An inactive or malformed binding is never compiled | `ValidatedSourceBinding::validate` (revision 7 moved this from the compiler) | `b5_enforcement::an_inactive_binding_is_never_validated`, `a_binding_must_implement_the_sources_own_adapter_policy` | `cbab05f`, `decb13a` |
 | Qualification re-proves the requirement digest, AgentType revision, agent policy digest, and `can_execute_security_v1` before compiling | `qualify_security_candidate` (lines 846–892) | `b5_enforcement::qualification_re_proves_the_requirement_and_agent_identity_before_compiling` | `cbab05f` |
 | Qualification re-checks the Task's coarse modes on the four-term `P_eff` | `qualify_security_candidate` → `authority.validate_coarse_modes` | `b5_enforcement::qualification_rechecks_the_task_coarse_modes_on_the_complete_policy` | `cbab05f` |
-| **(rev 2; implemented in revision 7)** The profile was imported for this exact binding and covers the executing subject | `ImportedEnforcementProfile` import-time binding identity; `ValidatedSourceBinding::validate`; `CompiledExecutionSecurity::prove_subject`; `qualify_security_candidate` | `b5_enforcement::a_profile_imported_for_another_binding_is_a_subject_mismatch`, `the_validated_tuple_must_describe_the_authoritys_own_source`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven`, `qualification_proves_the_subject_and_completes_its_own_config` | `decb13a` |
-| **(rev 7)** A source that is not active is never validated, and a profile must name the adapter binding it was imported for | `ValidatedSourceBinding::validate`; `ImportedEnforcementProfile::import` | `b5_enforcement::a_source_that_is_not_active_is_never_validated`, `a_profile_must_name_its_adapter_binding` | `decb13a` |
+| **(rev 2; implemented in revision 7, corrected in revision 11)** The profile was imported for this exact **physical** adapter domain and covers the executing subject | `ImportedEnforcementProfile` import-time `(adapter_kind, adapter_binding_key)` identity; `ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)`; `CompiledExecutionSecurity::prove_subject`; `qualify_security_candidate` | `b5_enforcement::a_profile_imported_for_another_binding_is_a_subject_mismatch`, `an_alias_resolving_to_the_profiles_physical_domain_is_accepted`, `a_profile_from_another_physical_domain_under_the_same_alias_is_rejected`, `the_validated_tuple_must_describe_the_authoritys_own_source`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven`, `qualification_proves_the_subject_and_completes_its_own_config`; `b5_security_acquisition::the_binding_alias_resolves_to_the_selections_physical_key` | `decb13a`, `39e85c5` |
+| **(rev 7, corrected rev 11)** A source that is not active is never validated, and a profile must name the exact physical adapter binding key it was imported for | `ValidatedSourceBinding::validate`; `ImportedEnforcementProfile::import` | `b5_enforcement::a_source_that_is_not_active_is_never_validated`, `a_profile_must_name_its_exact_physical_adapter_binding` | `decb13a`, `39e85c5` |
+| **(rev 11)** The resolved physical key, not the `binding_ref` alias, is the compiled identity: the cache key and the evidence subject commit to it | `ValidatedSourceBinding::adapter_binding_key`; `compile_execution_security` → `CompileCacheKey::new` / `SecurityEvidenceSubject::new` | `b5_enforcement::an_alias_resolving_to_the_profiles_physical_domain_is_accepted`, `a_profile_from_another_physical_domain_under_the_same_alias_is_rejected` | `39e85c5` |
 | **(rev 4)** The plan carries the composed attempt-isolation guarantee; its accessor and digest agree with the obligation set | **absent** — `PolicyEnforcementPlan::attempt_isolation` reads the effective policy; the digest omits the guarantee | **absent** | — (P1-3) |
 | The cache key commits to the ADR-0014 §4 components and rejects an empty one **(rev 5: the listed set was incomplete — see P1-4)** | `CompileCacheKey::new` | `b5_enforcement::the_cache_key_rejects_an_incomplete_component` | `cbab05f` |
 | **(rev 5)** The cache key distinguishes two compile inputs whose guarantees, and therefore obligations, differ | **absent** — the key has no guarantee component; only the plan digest carries it | **absent** | — (P1-4) |
@@ -1012,7 +1185,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | The durable diagnostic binds Task, dispatch generation, domain digest/count, binding/profile digest, cost, budget, limit, status, timestamps | `schema.rs` `security_acquisition_blocks`; `security_acquisition.rs`; `kernel.rs` wrappers | `b5_acquisition_block::one_condition_is_one_durable_diagnostic`, `a_block_names_only_its_own_task_generation_and_mode` | `cbab05f`, `5f644b4` |
 | The evidence subject binds the §5 tuple and is partial until `with_source_config` | `SecurityEvidenceSubject::new` / `with_source_config` / `digest` | `b5_enforcement::the_subject_completes_only_with_its_own_source_config`, `compilation_returns_a_root_relative_plan_and_a_partial_subject` | `cbab05f` |
 | **(rev 9)** Typed acquisition has two disjoint chains: the coarse one refuses a `SECURITY_V1` Task, AgentType or source, and the security one refuses a `COARSE_V1` one | `provisioning.rs` `AcquisitionMode`, `reject_security_v1_coarse_acquisition`, `require_security_v1_acquisition` | `b5_coarse_path_gate::a_coarse_task_cannot_execute_a_security_v1_agent_type`, `a_coarse_task_cannot_select_a_security_v1_source_even_without_a_ceiling`, `b5_security_acquisition::the_two_acquisition_chains_are_disjoint`, `a_coarse_agent_type_is_not_a_security_candidate`, `a_coarse_source_cannot_provision_a_security_task` | `d4d8dc3` |
-| **(rev 9)** The authority transaction re-loads the binding, requirement, actual AgentType revision and policy, source, declaration and `P_source`, and qualifies before any Attempt/Lease; the only caller-supplied facts are the imported profile and the requested subject | `provisioning.rs` `acquire_security_v1_task_existing` / `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_security_acquisition::a_qualified_candidate_is_selectable`, `an_uncovered_profile_is_rejected_before_attempt_or_lease`, `an_uncovered_subject_is_rejected_before_attempt_or_lease`, `a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease`, `the_durable_declaration_wins_over_the_callers_profile`, `the_callers_subject_is_the_one_proved`, `an_impossible_source_ceiling_is_candidate_local_ineligibility` | `d4d8dc3` |
+| **(rev 9)** The authority transaction re-loads the binding, requirement, actual AgentType revision and policy, source, declaration and `P_source`, and qualifies before any Attempt/Lease; the only caller-supplied facts are the imported profile and the requested subject | `provisioning.rs` `acquire_security_v1_task_existing` / `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_security_acquisition::a_qualified_candidate_is_selectable`, `an_uncovered_profile_is_rejected_before_attempt_or_lease`, `an_uncovered_subject_is_rejected_before_attempt_or_lease`, `a_profile_imported_for_another_physical_domain_is_rejected_before_attempt_or_lease`, `the_durable_declaration_wins_over_the_callers_profile`, `the_callers_subject_is_the_one_proved`, `an_impossible_source_ceiling_is_candidate_local_ineligibility`, `the_binding_alias_resolves_to_the_selections_physical_key` | `d4d8dc3`, `39e85c5` |
 | **(rev 9)** A credential request the selected profile cannot deliver is ineligible before Attempt/Lease, settled at the attested config | `provisioning.rs` `finish_acquisition` (`ProvenExecutionSecurity::with_source_config`) | `b5_security_acquisition::a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease` | `d4d8dc3` |
 | **(rev 10)** `SECURITY_V1` acquisition intersects the frozen B.4 source/config eligibility (ACTIVE dispositions, ownership, evidence subject/config digest, lifecycle, continuity, functional envelope, security-class evidence, Task safety/continuity/restriction join); only the coarse policy-reference relations are replaced by policy order and the compile | `predicates.rs` `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_provisioning_conjunct_is_shared_by_both_paths`, `b5_security_acquisition::evidence_resolved_for_another_config_cannot_authorize_this_config`, `an_agent_type_capability_the_source_cannot_provide_is_rejected`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` | `0a0ed56` |
 | **(rev 10)** A profile's delivery capability is never a credential authorization: any non-empty `credential_refs` is fail-closed at the authority-bearing entry until B5.3 | `provisioning.rs` `finish_acquisition` pre-authority gate; `enforcement.rs` `with_source_config` remains the pure necessary condition | `b5_security_acquisition::a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver`, `a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease`; `b5_enforcement::a_requested_credential_completes_when_the_profile_delivers` (pure component) | `0a0ed56` |
@@ -1038,7 +1211,8 @@ implements it and the test that would fail if it were removed. Rows marked
 |---|---|---|---|
 | Obligations are semantic: `Top`/unrestricted adds none; a concrete restriction adds one | `RequiredEnforcementFeatures::derive` | `b5_enforcement::obligations_follow_imposed_restrictions_not_field_presence` | `cbab05f` |
 | A missing dimension makes the candidate ineligible; it is not a Task failure and not partial enforcement | `compile_execution_security` → `SecurityUnenforceable` | `b5_enforcement::a_missing_dimension_makes_the_candidate_ineligible_not_the_task_failed` | `cbab05f` |
-| The policy-only reference profile supports exactly workspace-write confinement and environment allowlist | `EnforcementSupport::policy_only_reference` | `b5_enforcement::the_reference_profile_claims_only_workspace_write_and_environment` | `cbab05f` |
+| The policy-only reference profile supports exactly workspace-write confinement and environment allowlist | `EnforcementSupport::policy_only_reference`; `ImportedEnforcementProfile::import` | `b5_enforcement::the_reference_profile_claims_only_workspace_write_and_environment` | `cbab05f` |
+| **(rev 11)** The frozen reference profile identity cannot widen its support matrix; only a stricter subset is importable | `enforcement.rs` `is_policy_only_reference`, `EnforcementSupport::is_subset_of`, `ImportedEnforcementProfile::import` | `b5_enforcement::the_frozen_reference_profile_cannot_widen_its_support_matrix` | `39e85c5` |
 | The enforcement subject is explicit and only the proven domain is inside the claim | `EnforcementSubject::is_inside_proven_domain`; `ImportedEnforcementProfile::import` | `b5_enforcement::the_policy_only_reference_protocol_cannot_claim_an_external_subject`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven` | `cbab05f`, `decb13a` |
 | **(rev 2; implemented in revision 8)** `CredentialDelivery` is derived from the credential the selected config **requests**, not from the authorization ceiling | `RequiredEnforcementFeatures::derive` + `CompiledExecutionSecurity::with_source_config` | `b5_enforcement::an_authorized_credential_is_not_a_delivery_request`, `a_requested_credential_needs_a_profile_that_can_deliver`, `a_requested_credential_completes_when_the_profile_delivers` | `28d6592` |
 
@@ -1072,6 +1246,17 @@ its own, against `fb3641f..d4d8dc3`:
 | Durable format / schema version | unchanged in revisions 8 and 9; revision 7's profile digest is an opaque value, not a new column |
 | Compile cache key list | unchanged by revisions 8 and 9; revision 7's profile digest already entered it |
 | Coarse acquisition behavior | byte-for-byte the same relation and gates; `b5_coarse_path_gate` 8/8 and `b4_provisioning_binding` 56/56 pass unchanged |
+| Untracked files | not staged, not committed, not deleted |
+
+Revisions 10 and 11 add a fence check of their own, against `fb3641f..39e85c5`:
+
+| Fence | Result |
+|---|---|
+| `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
+| ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §2, §3, §5 and §14 and ADR-0015 §5 and §9 body text only) |
+| Durable format / schema version | unchanged; the profile digest and `security_acquisition_blocks.binding_profile_digest` stay opaque values, so no migration |
+| Compile cache key list | unchanged in shape; the adapter component carries the resolved physical key instead of the alias |
+| Coarse acquisition behavior | unchanged; the security chain remains disjoint and still refuses `COARSE_V1` |
 | Untracked files | not staged, not committed, not deleted |
 
 ## Deliberate non-reachability
@@ -1121,11 +1306,13 @@ resolved; the first is now fixed in an unmerged code commit and is kept here so
 the earlier boundary remains auditable.
 
 1. **The pure compiler does not cross-check the adapter policy.** **Closed in
-   revision 7 by the validated source/binding/profile tuple (`decb13a`).**
+   revision 7 by the validated source/binding/profile tuple (`decb13a`) and
+   corrected in revision 11 (`39e85c5`) to use the resolved physical key.**
    `compile_execution_security` no longer takes the binding and the profile as
    independent values: `ValidatedSourceBinding` proves that
    `binding.policy_ref == source.adapter_policy`, that source and binding are
-   active, and that the profile was imported for that exact binding. The
+   active, and that the profile was imported for the same resolved
+   `(adapter_kind, adapter_binding_key)` physical domain the selection names. The
    compiler also rejects a tuple whose source revision is not the authority's.
    The historical shape is kept for review: `EffectiveTaskAuthority` records only
    `SpawnSourceRef`, `SpawnSourceSecurityDeclaration` carries no adapter policy,
@@ -1194,9 +1381,23 @@ the earlier boundary remains auditable.
     or a versioned `subject_proof_digest`.
 14. **(rev 10, B5.4 handoff)** **A self-consistent profile is not trusted physical
     evidence.** `import` still accepts the caller's support matrix and covered
-    subjects. Trusted importer identity, exact domain ownership, freshness and
-    actual subject attestation remain B5.4 conditions; constructor visibility is
-    not the boundary.
+    subjects. Revision 11 key-binds that matrix and forbids widening the frozen
+    reference identity, but trusted importer identity, exact domain ownership,
+    freshness and actual subject attestation remain B5.2-C/B5.4 conditions;
+    constructor visibility is not the boundary.
+15. **(rev 11)** **P2-1 is implemented but not fully closed.** The physical
+    key/alias gap is fixed at the validated tuple, the cache key, the evidence
+    subject and the transaction, but the audit's P2-1 acceptance also requires a
+    trusted importer provenance proof. That proof is not implemented; the source
+    of `support`/`covered_subjects` is still the caller. Do not read revision 11
+    as "P2-1 closed" or as evidence reusable by B5.4 without that handoff.
+16. **(rev 11)** **The reference-profile ceiling is enforced at import, not
+    compiler-wide.** Only the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
+    identity is checked against the frozen matrix. A differently named or
+    versioned profile is a different identity and must carry its own authored
+    target; it is not silently widened by this rule. Additional dimensions for the
+    reference protocol require a new versioned profile, not a wider matrix on the
+    frozen one.
 
 ## Verification
 
@@ -1293,13 +1494,13 @@ the affected test was run, and it failed for the expected reason.
 
 | Guard disabled | Failing test |
 |---|---|
-| profile `(adapter_kind, binding_ref)` equality | `a_profile_imported_for_another_binding_is_a_subject_mismatch` |
+| profile `(adapter_kind, binding_ref)` equality (revision-7 shape; revision 11 compares the resolved physical key) | `a_profile_imported_for_another_binding_is_a_subject_mismatch` |
 | `binding.policy_ref == source.adapter_policy` | `a_binding_must_implement_the_sources_own_adapter_policy` |
 | source-activity check | `a_source_that_is_not_active_is_never_validated` |
 | tuple source identity vs the authority | `the_validated_tuple_must_describe_the_authoritys_own_source` |
 | `prove_subject` coverage check | `a_profile_that_does_not_claim_the_executing_subject_is_not_proven` |
 | policy-only reference subject bound | `the_policy_only_reference_protocol_cannot_claim_an_external_subject` |
-| non-blank profile binding identity | `a_profile_must_name_its_adapter_binding` |
+| non-blank profile binding identity | `a_profile_must_name_its_adapter_binding` (renamed `a_profile_must_name_its_exact_physical_adapter_binding` in revision 11) |
 
 Revisions 8 and 9 also ship code in the same draft pull request, which re-runs the
 full gate at `d4d8dc3` (P2-1, P2-2 and P2-4 together):
@@ -1328,7 +1529,7 @@ Each new P2-4 guard was mutation-checked the same way at `d4d8dc3`:
 | declared `P_source` loading (`source_policy.as_ref()`) | `an_impossible_source_ceiling_is_candidate_local_ineligibility` |
 | credential-request settlement (`with_source_config`) | `a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease` |
 | caller-supplied subject (`security.subject`) | `the_callers_subject_is_the_one_proved` |
-| profile binding identity (`ValidatedSourceBinding::validate`) | `a_profile_imported_for_another_binding_is_rejected_before_attempt_or_lease` |
+| profile binding identity (`ValidatedSourceBinding::validate`) | `a_profile_imported_for_another_physical_domain_is_rejected_before_attempt_or_lease` (renamed in revision 11) |
 | both coarse AgentType/source gates | `b5_coarse_path_gate::a_coarse_task_cannot_execute_a_security_v1_agent_type`, `a_coarse_task_cannot_select_a_security_v1_source_even_without_a_ceiling` |
 
 The last two rows are deliberately cross-crate: they show that P2-1's binding
@@ -1360,6 +1561,29 @@ reason.
 | AgentType lifecycle conjunct | `the_provisioning_conjunct_is_shared_by_both_paths`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected` |
 | functional-envelope miss (entry skipped) | `the_provisioning_conjunct_is_shared_by_both_paths`, `an_agent_type_capability_the_source_cannot_provide_is_rejected` |
 
+Revision 11 ships code in the same draft pull request and re-runs the full gate at
+`39e85c5`:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 58 suites, 1105 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+Each revision-11 guard was mutation-checked at `39e85c5` the same way: the guard
+was disabled, the affected tests were run, and each failed for the expected
+reason.
+
+| Guard disabled | Failing tests |
+|---|---|
+| profile `adapter_binding_key` equality (adapter-kind check alone) | `b5_enforcement::a_profile_imported_for_another_binding_is_a_subject_mismatch`, `a_profile_from_another_physical_domain_under_the_same_alias_is_rejected` |
+| reference-profile support ceiling | `b5_enforcement::the_frozen_reference_profile_cannot_widen_its_support_matrix` |
+| acquisition passes the policy alias instead of `selection.adapter_binding_key` | `b5_security_acquisition::the_binding_alias_resolves_to_the_selections_physical_key` — rejected as `EvidenceSubjectMismatch` |
+| compile cache key uses the alias instead of the physical key | `b5_enforcement::an_alias_resolving_to_the_profiles_physical_domain_is_accepted` |
+| evidence subject uses the alias instead of the physical key | `b5_enforcement::an_alias_resolving_to_the_profiles_physical_domain_is_accepted` |
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -1384,6 +1608,11 @@ At revision 10's code head `0a0ed56`, the same modules hold `b5_enforcement` 36
 (one new shared-conjunct test) and `b5_security_acquisition` 17 (six new P1
 negatives), with the other counts unchanged.
 
+At revision 11's code head `39e85c5`, `b5_enforcement` holds 39 (the alias/key
+positive, its cross-domain negative, and the reference-ceiling test) and
+`b5_security_acquisition` holds 18 (the real-transaction `primary -> k2` test);
+the other counts are unchanged.
+
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
 - `b5_composite_authority_surface` — the composite-authority, qualified-candidate,
@@ -1400,7 +1629,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Proposed in PR #31 |
 | 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
 | 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
-| 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`); tests named in the claim table |
+| 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`) and corrected in revision 11 (`39e85c5`) to bind the resolved physical key; tests named in the claim table |
 | 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation, a requested credential under a non-delivering profile is `SecurityUnenforceable`, and a requested credential under a delivering profile **completes at the pure component only**. Implemented in revision 8 (`28d6592`); the authority path is further narrowed by revision 10 (P1-2) |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
@@ -1408,20 +1637,27 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 10 | Complete the durable block's validated read and count coherence (B) | a tampered generation, a candidate cost smaller than the domain, and a corrupt same-condition row each fail closed on read or re-record. Proposed in PR #35 |
 | 11 | Intersect the frozen B.4 source/config eligibility on the `SECURITY_V1` path (P1-1, rev 10) | disabled config, foreign evidence digest, missing functional capability, and unsatisfiable continuity/lifecycle each reject with no Attempt/Lease; the coarse path is unchanged. Implemented in revision 10 (`0a0ed56`) |
 | 12 | Keep credential-bearing acquisition fail-closed until B5.3 (P1-2, rev 10) | a delivering profile plus non-empty `credential_refs` is `InvalidAuthority` before Attempt/Lease; the pure-component delivery check and its positive test remain. Implemented in revision 10 (`0a0ed56`) |
+| 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
+| 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
+| 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | unit is `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`; an unknown candidate or exhausted budget cannot partially select. Not implemented |
+| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the imported profile's capability/subject claims name their trusted source; an untrusted or stale profile is ineligible. Not implemented |
+| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; no non-security start path; feature-gated before B5.4 secured start. Not implemented |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
 Item 7 was a design decision and is settled in revision 3 by narrowing the ADR
 rather than by adding history; item 4 also needs its normative sentence in the
 ADR, which is why that part sits in the ADR pull request. Items 11 and 12 are
-implemented in revision 10 (`0a0ed56`), in the same unmerged draft pull request as
-the Gate.
+implemented in revision 10 (`0a0ed56`), items 13 and 14 in revision 11
+(`39e85c5`), in the same unmerged draft pull request as the Gate. Items 15–17 are
+the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision.
 
-The Gate is the B5.2 completion condition. Revisions 9 and 10 implement
+The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
 request; complete `SECURITY_V1` acquisition orchestration is still open. As with
 every finding in this record, the row is evidence for the re-audit, not a
-closure.
+closure. Revision 11 specifically does not claim P2-1 fully closed, because the
+trusted importer proof (item 16) remains open.
 
 ## Evidence index
 
@@ -1430,7 +1666,7 @@ closure.
 | Composite authority and policy order | `crates/agentype-agent-contract/src/authority.rs` |
 | Policy-order relations and qualified candidate | `crates/agentype-agent-contract/src/matching.rs`, `predicates.rs` |
 | Enforcement compiler, budget, block value object | `crates/agentype-agent-contract/src/enforcement.rs` |
-| Validated source/binding/profile tuple and subject proof | `crates/agentype-agent-contract/src/enforcement.rs` (`ValidatedSourceBinding`, `CompiledExecutionSecurity::prove_subject`, `ProvenExecutionSecurity`) |
+| Validated source/binding/profile tuple and subject proof | `crates/agentype-agent-contract/src/enforcement.rs` (`ImportedEnforcementProfile` import identity and reference ceiling, `ValidatedSourceBinding`, `CompiledExecutionSecurity::prove_subject`, `ProvenExecutionSecurity`) |
 | Attempt-isolation guarantee and plan identity | `crates/agentype-agent-contract/src/enforcement.rs` (`EffectiveExecutionGuarantees`, `PolicyEnforcementPlan`) |
 | Credential authorization versus delivery request | `crates/agentype-agent-contract/src/enforcement.rs` (`RequiredEnforcementFeatures::derive`, `CompiledExecutionSecurity::with_source_config`), `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess::from_policy`) |
 | Compile memoization key and guarantee identity | `crates/agentype-agent-contract/src/enforcement.rs` (`CompileCacheKey`, `effective_execution_guarantees_digest`) |
