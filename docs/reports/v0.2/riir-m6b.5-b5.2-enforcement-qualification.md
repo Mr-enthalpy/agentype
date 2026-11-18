@@ -46,6 +46,7 @@ requirement on the complete effective policy.
 | 4 | `983bc16` | Records the second independent re-audit: P1-3 (the attempt-isolation guarantee does not reach the plan accessor or its digest) and P2-5 (a durable block does not re-prove that its cost exceeded its budget). Also corrects revision 2's "five findings" to six. Docs-only; no code, ADR `Status:` line, spec or index change. |
 | 5 | `097f35d` | Records the third independent re-audit: P1-4 (the compile cache key omits the guarantee identity, so plans with different obligations share one memoization key). Amends the ADR-0014 §4 frozen key list in the P2-3 ADR pull request and fixes the key in the P1-3 code pull request. Docs-only here; no code, ADR `Status:` line, spec or index change in this pull request. |
 | 6 | `9b8d830` (code) | Records the fourth independent re-audit: A (a source declaration is not bound to its `SpawnSource` revision) and B (the durable block's validated read does not re-bind the generation, relate the candidate count to the cost, or validate the existing row on a same-condition record). Also records the write-once Task security mode premise and the candidate-domain identity model as a B5.3 design item, and adds the ADR-0014 §4 count-coherence sentence. Fixes are in the code pull request on `9b8d830`; docs-only here, no ADR `Status:` line, spec or index change. |
+| 7 | `decb13a` (code) | Implements P2-1: an imported profile names the `(adapter_kind, binding_ref)` it was imported for, the compiler accepts only a validated source/binding/profile tuple, and a compiled plan is distinct from a proven subject. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`; ADR-0014 §2, §3, §5 and §14 state the tuple, the subject proof and the import-time subject bound. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -77,6 +78,14 @@ It also records one check the audit asked for that the code does not need (the
 Task security mode is write-once, so a read-time re-check adds no guarantee) and
 one question the audit raised that is a design item, not a defect (the candidate
 identity model for a round over unmaterialised candidates).
+
+Revision 7 carries the first fix of the closing pull request: P2-1. It is a code
+change with a normative ADR amendment, so it is not docs-only. Three
+consequences are deliberate and recorded below: the imported profile now names
+its adapter binding, the profile schema tag moves to `/2` because the profile
+digest commits to that identity, and a successful compile is no longer readable
+as an applied-security claim for an unnamed subject. P2-2 and P2-4 remain open in
+the same pull request, so this record still does not declare B5.2 complete.
 
 ## Why this record exists
 
@@ -145,7 +154,7 @@ the qualification chain, not for the current build: while acquisition rejects
 | P1-2 | P1 | The "default build cannot mint an imported profile" claim is false, and public-API probe 31 cannot prove it | Using the record as a B5.4 gate input |
 | P1-3 | P1 | The attempt-isolation guarantee becomes an obligation but never becomes the plan's execution-request value, and it is not explicit in the plan digest | B5.4's committed execution request; reading a compiled plan as an applied-security claim |
 | P1-4 | P1 | The compile cache key omits the guarantee identity, so two plans with different obligations share one memoization key | Any reuse of a compile result; the ADR-0014 §4 memoization claim |
-| P2-1 | P2 | The compiler never checks that the profile was imported for this binding or that it covers the executing subject | Trustworthy `SECURITY_V1` evidence |
+| P2-1 | P2 | The compiler never checks that the profile was imported for this binding or that it covers the executing subject | Trustworthy `SECURITY_V1` evidence (**fix proposed in revision 7, not closure before merge**) |
 | P2-2 | P2 | A credential *authorization* is treated as a credential *delivery* obligation | Correctness of candidate rejection (over-rejection) |
 | P2-3 | P2 | Durable-block idempotence holds only for the single stored condition, not across history | The ADR-0014 §4 statement the report quotes (**closed in revision 3 by narrowing the ADR**) |
 | P2-4 | P2 | Candidate preselection is implemented, but acquisition qualification is not wired (the fourth B5.1 handoff item) | Declaring B5.2 complete |
@@ -455,6 +464,39 @@ closed by the same change.
 **Acceptance test.** Cross-binding swap rejected; only-`UnprovenExternalProcess`
 profile rejected for `ControlledPrimaryProcess`; matching profile accepted.
 
+**Landed shape (revision 7, code `decb13a`).** The fix keeps the three facts
+separate but related:
+
+- `ImportedEnforcementProfile` carries `(adapter_kind, binding_ref)` and commits
+  to them in its profile digest, so "imported for binding A" is a property of the
+  imported fact, not a claim made at check time.
+- `ValidatedSourceBinding::validate(source, binding, profile)` is the only
+  constructor of the compiler's physical input. It rejects an inactive source, an
+  inactive binding, a binding whose `policy_ref` is not the source's
+  `adapter_policy`, and a profile imported for another binding.
+- `compile_execution_security(authority, &ValidatedSourceBinding)` additionally
+  rejects a tuple whose source revision is not the authority's, then compiles.
+  `CompiledExecutionSecurity` carries the covered subject set but has no
+  `subject()` accessor: `prove_subject(subject)` is the only way to obtain
+  `ProvenExecutionSecurity`, so a successful compile cannot be read as an
+  applied-security claim.
+- `qualify_security_candidate` takes the tuple and the subject and returns the
+  proven value; `with_source_config` completes the evidence subject on it.
+- `import` rejects a policy-only reference profile that names a subject outside
+  the proven domain. That gives `is_inside_proven_domain` its caller and states
+  ADR-0014 §14 at the import boundary instead of leaving the escape hatch to a
+  wider subject set on the same protocol.
+
+**Version consequence.** `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2`. The plan
+schema, the eight-part compile cache key and `ENFORCEMENT_COMPILER_PROTOCOL`
+are unchanged: the plan's inputs are the same three facts, now related. The
+profile digest is an input to the evidence subject, the plan digest, the cache
+key and the durable `binding_profile_digest`, so all of those change value.
+Nothing durable stores a profile digest today, and `SECURITY_V1` acquisition is
+unreachable, so no migration exists to perform; a stored block written by an
+older build would simply be a different condition. Tests are named in the claim
+table below. This is a proposed fix in an unmerged pull request, not a closure.
+
 ### P2-2 — an authorized credential is treated as a requested delivery
 
 `RequiredEnforcementFeatures::derive` (`enforcement.rs:223–225`) inserts
@@ -727,10 +769,11 @@ implements it and the test that would fail if it were removed. Rows marked
 |---|---|---|---|
 | Compilation is pure and root-relative: logical selectors, no directory, no I/O | `enforcement.rs` `compile_execution_security` | `b5_enforcement::compilation_returns_a_root_relative_plan_and_a_partial_subject` | `cbab05f` |
 | The imported profile must be the one the source declared; otherwise subject mismatch | `compile_execution_security` first check | `b5_enforcement::a_different_imported_profile_is_a_subject_mismatch` | `cbab05f` |
-| An inactive or malformed binding is never compiled | `compile_execution_security` binding checks | `b5_enforcement::an_inactive_binding_is_never_compiled` | `cbab05f` |
+| An inactive or malformed binding is never compiled | `ValidatedSourceBinding::validate` (revision 7 moved this from the compiler) | `b5_enforcement::an_inactive_binding_is_never_validated`, `a_binding_must_implement_the_sources_own_adapter_policy` | `cbab05f`, `decb13a` |
 | Qualification re-proves the requirement digest, AgentType revision, agent policy digest, and `can_execute_security_v1` before compiling | `qualify_security_candidate` (lines 846–892) | `b5_enforcement::qualification_re_proves_the_requirement_and_agent_identity_before_compiling` | `cbab05f` |
 | Qualification re-checks the Task's coarse modes on the four-term `P_eff` | `qualify_security_candidate` → `authority.validate_coarse_modes` | `b5_enforcement::qualification_rechecks_the_task_coarse_modes_on_the_complete_policy` | `cbab05f` |
-| **(rev 2)** The profile was imported for this exact binding and covers the executing subject | **absent** — `covers_subject` and `is_inside_proven_domain` have no caller | **absent** | — (P2-1) |
+| **(rev 2; implemented in revision 7)** The profile was imported for this exact binding and covers the executing subject | `ImportedEnforcementProfile` import-time binding identity; `ValidatedSourceBinding::validate`; `CompiledExecutionSecurity::prove_subject`; `qualify_security_candidate` | `b5_enforcement::a_profile_imported_for_another_binding_is_a_subject_mismatch`, `the_validated_tuple_must_describe_the_authoritys_own_source`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven`, `qualification_proves_the_subject_and_completes_its_own_config` | `decb13a` |
+| **(rev 7)** A source that is not active is never validated, and a profile must name the adapter binding it was imported for | `ValidatedSourceBinding::validate`; `ImportedEnforcementProfile::import` | `b5_enforcement::a_source_that_is_not_active_is_never_validated`, `a_profile_must_name_its_adapter_binding` | `decb13a` |
 | **(rev 4)** The plan carries the composed attempt-isolation guarantee; its accessor and digest agree with the obligation set | **absent** — `PolicyEnforcementPlan::attempt_isolation` reads the effective policy; the digest omits the guarantee | **absent** | — (P1-3) |
 | The cache key commits to the ADR-0014 §4 components and rejects an empty one **(rev 5: the listed set was incomplete — see P1-4)** | `CompileCacheKey::new` | `b5_enforcement::the_cache_key_rejects_an_incomplete_component` | `cbab05f` |
 | **(rev 5)** The cache key distinguishes two compile inputs whose guarantees, and therefore obligations, differ | **absent** — the key has no guarantee component; only the plan digest carries it | **absent** | — (P1-4) |
@@ -761,7 +804,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | Obligations are semantic: `Top`/unrestricted adds none; a concrete restriction adds one | `RequiredEnforcementFeatures::derive` | `b5_enforcement::obligations_follow_imposed_restrictions_not_field_presence` | `cbab05f` |
 | A missing dimension makes the candidate ineligible; it is not a Task failure and not partial enforcement | `compile_execution_security` → `SecurityUnenforceable` | `b5_enforcement::a_missing_dimension_makes_the_candidate_ineligible_not_the_task_failed` | `cbab05f` |
 | The policy-only reference profile supports exactly workspace-write confinement and environment allowlist | `EnforcementSupport::policy_only_reference` | `b5_enforcement::the_reference_profile_claims_only_workspace_write_and_environment` | `cbab05f` |
-| The enforcement subject is explicit and only the proven domain is inside the claim | `EnforcementSubject::is_inside_proven_domain` | covered by `the_reference_profile_claims_only_workspace_write_and_environment` | `cbab05f` |
+| The enforcement subject is explicit and only the proven domain is inside the claim | `EnforcementSubject::is_inside_proven_domain`; `ImportedEnforcementProfile::import` | `b5_enforcement::the_policy_only_reference_protocol_cannot_claim_an_external_subject`, `a_profile_that_does_not_claim_the_executing_subject_is_not_proven` | `cbab05f`, `decb13a` |
 | **(rev 2)** `CredentialDelivery` is derived from the credential the selected config **requests**, not from the authorization ceiling | **absent** — `derive` keys on `policy.credentials()` | **absent** | — (P2-2) |
 
 ## Fences preserved
@@ -820,20 +863,19 @@ argument, and this record no longer uses it as one.
 
 These are not hidden defects; they are the boundary of the slice. The first two
 are narrowed by [Re-audit findings](#re-audit-findings-revisions-2-4-5-and-6) rather than
-resolved.
+resolved; the first is now fixed in an unmerged code commit and is kept here so
+the earlier boundary remains auditable.
 
-1. **The pure compiler does not cross-check the adapter policy.**
-   `compile_execution_security` proves that the binding is active and well-formed
-   and that the profile matches the authority, but it does not compare
-   `binding.policy_ref` with `SpawnSource.adapter_policy`. `EffectiveTaskAuthority`
-   records only `SpawnSourceRef` (id + revision), and
-   `SpawnSourceSecurityDeclaration` carries the source ref, the source policy and
-   the enforcement profile, but not the adapter policy, so this information is
-   not in the compiler's inputs. The binding's
-   `policy_ref` *is* in the evidence subject, so the ADR-0014 §5 authority
-   transaction can re-read the source and reject the mismatch. Revision 2 groups
-   this with P2-1: the same input extension that binds the profile to its
-   `(adapter_kind, binding_key)` should carry the expected adapter policy.
+1. **The pure compiler does not cross-check the adapter policy.** **Closed in
+   revision 7 by the validated source/binding/profile tuple (`decb13a`).**
+   `compile_execution_security` no longer takes the binding and the profile as
+   independent values: `ValidatedSourceBinding` proves that
+   `binding.policy_ref == source.adapter_policy`, that source and binding are
+   active, and that the profile was imported for that exact binding. The
+   compiler also rejects a tuple whose source revision is not the authority's.
+   The historical shape is kept for review: `EffectiveTaskAuthority` records only
+   `SpawnSourceRef`, `SpawnSourceSecurityDeclaration` carries no adapter policy,
+   and the binding's `policy_ref` alone was in the evidence subject.
 2. **The durable block is not wired.** `record_security_acquisition_block` has
    no production caller, so today a budget defer leaves no durable trace unless
    a test writes one. Its stated history property is narrower than revision 1
@@ -912,7 +954,7 @@ read-only checks that produced the findings:
 |---|---|
 | `cargo tree -p agentype-public-api-boundary -e features -i agentype-agent-contract` | `provisioning-producer` enabled through `agentype-runtime` |
 | `rustc` on a five-line generic-fn-item program | `error[E0283]: type annotations needed` |
-| Repository-wide content search for `check_required_access`, `covers_subject`, `is_inside_proven_domain`, `qualify_security_candidate` callers | as stated in P1-1, P2-1, P2-4 |
+| Repository-wide content search for `check_required_access`, `covers_subject`, `is_inside_proven_domain`, `qualify_security_candidate` callers | as stated in P1-1, P2-1, P2-4. Revision 7 moves `covers_subject` into `CompiledExecutionSecurity::prove_subject` and `is_inside_proven_domain` into `ImportedEnforcementProfile::import`; `qualify_security_candidate` still has no production caller (P2-4) |
 | Repository-wide content search for the `credential` derivation and `PolicyAccess::from_policy` | as stated in P2-2 |
 
 Revision 3 is also docs-only and re-runs none of these commands. It changes one
@@ -963,6 +1005,30 @@ tests were run, and each one failed for the expected reason.
 | constructor provenance check | `the_source_layer_must_match_its_own_declaration` |
 | writer provenance check | `a_source_declaration_cannot_be_published_under_another_revision` |
 
+Revision 7 also ships code, in this pull request, and re-runs the full gate at
+`decb13a`:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 57 suites, 1080 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+Each new P2-1 guard was mutation-checked the same way: the guard was disabled,
+the affected test was run, and it failed for the expected reason.
+
+| Guard disabled | Failing test |
+|---|---|
+| profile `(adapter_kind, binding_ref)` equality | `a_profile_imported_for_another_binding_is_a_subject_mismatch` |
+| `binding.policy_ref == source.adapter_policy` | `a_binding_must_implement_the_sources_own_adapter_policy` |
+| source-activity check | `a_source_that_is_not_active_is_never_validated` |
+| tuple source identity vs the authority | `the_validated_tuple_must_describe_the_authoritys_own_source` |
+| `prove_subject` coverage check | `a_profile_that_does_not_claim_the_executing_subject_is_not_proven` |
+| policy-only reference subject bound | `the_policy_only_reference_protocol_cannot_claim_an_external_subject` |
+| non-blank profile binding identity | `a_profile_must_name_its_adapter_binding` |
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -994,7 +1060,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Proposed in PR #31 |
 | 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
 | 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
-| 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives |
+| 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`); tests named in the claim table |
 | 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
 | 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
@@ -1016,6 +1082,7 @@ pull requests are reviewed against.
 | Composite authority and policy order | `crates/agentype-agent-contract/src/authority.rs` |
 | Policy-order relations and qualified candidate | `crates/agentype-agent-contract/src/matching.rs`, `predicates.rs` |
 | Enforcement compiler, budget, block value object | `crates/agentype-agent-contract/src/enforcement.rs` |
+| Validated source/binding/profile tuple and subject proof | `crates/agentype-agent-contract/src/enforcement.rs` (`ValidatedSourceBinding`, `CompiledExecutionSecurity::prove_subject`, `ProvenExecutionSecurity`) |
 | Attempt-isolation guarantee and plan identity | `crates/agentype-agent-contract/src/enforcement.rs` (`EffectiveExecutionGuarantees`, `PolicyEnforcementPlan`) |
 | Compile memoization key and guarantee identity | `crates/agentype-agent-contract/src/enforcement.rs` (`CompileCacheKey`, `effective_execution_guarantees_digest`) |
 | Durable block truth validation | `crates/agentype-agent-contract/src/enforcement.rs` (`from_durable_parts`), `crates/agentype-storage-sqlite/src/security_acquisition.rs` |

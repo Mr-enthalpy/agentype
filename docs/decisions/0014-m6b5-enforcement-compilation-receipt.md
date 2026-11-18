@@ -39,9 +39,12 @@ credentials.
 
 ### 2. Compilation is root-relative
 
-`compile_execution_security` MUST take only the normalized effective policy, the
-exact adapter binding, and the imported enforcement profile. Its output is a
-**root-relative** plan: logical path selectors, not a concrete
+`compile_execution_security` MUST take only the composite authority (which owns
+the normalized effective policy) and one validated source/binding/profile
+tuple. The tuple MUST prove that the exact adapter binding is the adapter policy
+the `SpawnSource` revision names, that both are active, and that the imported
+profile records the same `(adapter_kind, binding_key)` it was imported for. Its
+output is a **root-relative** plan: logical path selectors, not a concrete
 `agentype-jail-<request_id>` path. It MUST NOT create a directory or require
 one.
 
@@ -87,6 +90,7 @@ readiness preflight
     → effective policy derivation
     → imported profile coverage check
     → bounded root-relative compile
+    → subject proof (the profile claims the exact enforcement subject)
     → SourceConfig attest (read-only)
     → credential probe (when needed)
     → complete eligible candidate set
@@ -134,6 +138,9 @@ digest carries the guarantee, and `ENFORCEMENT_COMPILER_PROTOCOL` is
 guarantee nor its digest and MUST NOT be reused.
 
 The key is scoped to a verifiable profile version and exact physical domain. The
+profile digest names the `(adapter_kind, binding_key)` the profile was imported
+for, so one profile cannot be compiled, memoized or replayed against a different
+binding even when its support matrix and subject set are identical. The
 cache memoizes **only** the pure compile result. It is not an eligibility proof:
 source disposition, attestation, credential eligibility, lifecycle and every
 other candidate-qualification fact are re-read and revalidated in every
@@ -186,7 +193,9 @@ generation_id              the Task's durable GenerationTaskBinding generation
 candidate_domain_digest    order-independent digest of the distinct candidate ids
 candidate_count            distinct candidate identities seen in the round
 binding_profile_digest     digest of (adapter binding policy, imported profile,
-                           compiler protocol)
+                           compiler protocol); the profile digest in turn
+                           names the adapter kind and binding key it was
+                           imported for
 cost_candidates, cost_compiles
 budget_max_candidates, budget_max_compiles
 budget_limit               CANDIDATE_COUNT | COMPILE_COUNT
@@ -262,6 +271,17 @@ the actual bound AgentType, candidate frontier, exact binding, policy digest,
 profile digest, and evidence subject. External mutable facts are checked only
 for subject, version, and validity; they are not pretended to be part of the
 SQLite transaction.
+
+A successful compilation is not yet an applied-security claim. Compilation proves
+that the profile's support matrix covers the obligations; the subject proof then
+requires the same profile to claim the exact `EnforcementSubject` of the
+execution (§14). The imported profile records the `(adapter_kind, binding_key)`
+pair it was imported for, so a profile imported for binding A cannot be compiled
+against binding B even when the two bindings expose the same support matrix.
+`ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/2` because that pair is now part of the
+profile identity. An uncovered subject, a foreign binding, and an inactive
+source or binding are candidate-local ineligibility: never partial enforcement
+and never a Task failure.
 
 ### 6. Two time scales, and an explicit security snapshot
 
@@ -1055,9 +1075,12 @@ descendants, not every effect the harness can cause.
 profile. A Task whose effective policy or guarantees require enforcement over them
 is ineligible under this profile; supporting one requires an explicit, separately
 authored and proven enforcement subject, or a new profile, not an assumption that
-a harness subagent inherits the jail. File effects produced there are not covered
-by the content-write confinement claim, and formal authority MUST NOT appear
-broader than the physical subject that can prove it.
+a harness subagent inherits the jail. The policy-only reference protocol therefore
+cannot be imported with a subject outside its claimed domain: a wider subject set
+on the reference protocol is not the escape hatch, a separately authored profile
+is. File effects produced there are not covered by the content-write confinement
+claim, and formal authority MUST NOT appear broader than the physical subject that
+can prove it.
 
 "Credential-free execution" and "no credential authorization" in this profile mean
 exactly: no Agentype-managed credential grant, delivery or committed credential
