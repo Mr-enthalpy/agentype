@@ -14,21 +14,25 @@
 
 use agentype_agent_contract::{
     canonical_json_body_digest, AdapterBindingPolicy, AdapterPolicyRef, AffinityConstraint,
-    AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget,
-    CapabilityDefinition, CapabilityPolarity, CapabilityRef, CapabilityValue, ConfigDigest,
-    ConfigStatus, ContinuityMode, CredentialRef, EnforcementFeature, EnforcementProfileRef,
-    EnforcementSubject, EnforcementSupport, GenerationPolicy, ImportedEnforcementProfile,
-    LifecycleMode, MatcherKind, MaterializationDigest, NetworkPolicy, NormalizedSandboxPolicy,
-    PathSelector, PhysicalSafety, PolicyInput, ResolvedProvisioningEvidence, SandboxPolicyRef,
-    SecurityClass, SecurityContract, SecurityContractMode, SourceConfig, SourceConfigRef,
-    SourceStatus, SpawnSource, SpawnSourceRef, SpawnSourceSecurityDeclaration, WorkingDirectory,
-    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
+    AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector,
+    BindingSnapshot, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef,
+    CapabilityValue, ConfigDigest, ConfigStatus, ContinuityMode, CredentialRef, EnforcementFeature,
+    EnforcementProfileRef, EnforcementSubject, EnforcementSupport, GenerationPolicy,
+    ImportedEnforcementProfile, LifecycleMode, MatcherKind, MaterializationDigest, NetworkPolicy,
+    NormalizedSandboxPolicy, PathSelector, PhysicalSafety, PolicyInput,
+    ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityClass, SecurityContract,
+    SecurityContractMode, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
+    SpawnSourceSecurityDeclaration, WorkingDirectory, POLICY_ONLY_REFERENCE_PROFILE,
+    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION, RESOLVER_VERSION,
 };
 use agentype_core::{
-    Clock, Error, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent, Retention,
-    SemanticInputSet, TaskId, TaskSpec, TaskState, WorkspaceMode,
+    Clock, Error, ExecutionId, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent,
+    Retention, SemanticInputSet, TaskId, TaskSpec, TaskState, WorkspaceMode,
 };
-use agentype_execution_config::{ExecutionProfileConfig, ExecutionRegistry, ExecutionTargetConfig};
+use agentype_execution_config::{
+    resolve_execution_environment, AdapterBindingKey, ExecutionProfileConfig, ExecutionRegistry,
+    ExecutionResolutionMode, ExecutionTargetConfig,
+};
 use agentype_storage_sqlite::{
     Kernel, ResolvedProvisioningSelection, SecurityProvisioningSelection, SourceConfigBody,
 };
@@ -609,6 +613,144 @@ fn a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable() 
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
     assert_eq!(count(&env, "attempts"), 1);
     assert_eq!(count(&env, "leases"), 1);
+}
+
+#[test]
+fn a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path() {
+    let env = Env::new("b4_boundary");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "b4_boundary", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "b4_boundary", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    let claim = &acquired.claim;
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+
+    // Qualification produced a real Attempt/Lease, but no execution authority.
+    // The old B.4 snapshot path must refuse the Claim outright.
+    let authority = agentype_core::AuthoritativeExecutionBinding {
+        attempt_id: claim.attempt_id.clone(),
+        lease_epoch: claim.lease_epoch,
+        execution_target: claim.execution_target.clone(),
+        execution_profile: claim.execution_profile.clone(),
+    };
+    let physical =
+        resolve_execution_environment(ExecutionResolutionMode::DirectUnconfigured, &authority)
+            .unwrap()
+            .physical_binding(
+                AdapterBindingKey::new(candidate.provisioning.adapter_binding_key.clone()).unwrap(),
+            )
+            .unwrap();
+    let execution_id = ExecutionId::new();
+    let config_digest = ConfigDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap();
+    let snapshot = BindingSnapshot {
+        snapshot_id: format!("snap-{}", execution_id.as_str()),
+        execution_id: execution_id.clone(),
+        provisioning_binding_id: acquired
+            .provisioning_binding
+            .provisioning_binding_id
+            .clone(),
+        adapter_kind: physical.adapter_kind().to_string(),
+        adapter_binding_key: physical.adapter_binding_key().as_str().to_string(),
+        spawn_source: candidate.provisioning.spawn_source.clone(),
+        source_config: candidate.provisioning.source_config.clone(),
+        source_config_digest: config_digest,
+        attested_materialization_digest: candidate
+            .provisioning
+            .attested_materialization_digest
+            .clone(),
+        launch_descriptor: "env-handle".into(),
+        execution_target: claim.execution_target.clone(),
+        execution_profile: claim.execution_profile.clone(),
+        required_capabilities: BTreeMap::new(),
+        enforceable_security: safety(),
+        effective_isolation: false,
+        effective_workspace: WorkspaceMode::ReadOnly,
+        effective_network: NetworkPolicy::Disabled,
+        credential_refs_digest: None,
+        resolver_version: RESOLVER_VERSION.to_string(),
+    };
+
+    let error = kernel
+        .create_execution_with_snapshot(claim, physical, &snapshot)
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidAuthority(_)),
+        "expected invalid authority, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("SECURITY_V1"),
+        "the rejection must name the security boundary: {error}"
+    );
+    assert_eq!(count(&env, "executions"), 0);
+    assert_eq!(count(&env, "binding_snapshots"), 0);
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+
+    // A stale B.4 row cannot be promoted either: even when a STARTING Execution
+    // exists, RUNNING requires the B5.4 commitment and receipt.
+    env.raw()
+        .execute(
+            "INSERT INTO executions(id,request_id,task_id,attempt_id,incarnation_id,
+                execution_target,execution_profile,adapter_kind,adapter_binding_key,
+                state,started_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'STARTING',?10,?10)",
+            rusqlite::params![
+                execution_id.as_str(),
+                format!("request-{}", execution_id.as_str()),
+                task.as_str(),
+                claim.attempt_id.as_str(),
+                acquired.provisioning_binding.incarnation_id.as_str(),
+                claim.execution_target,
+                claim.execution_profile,
+                ADAPTER_KIND,
+                candidate.provisioning.adapter_binding_key,
+                1_000.0,
+            ],
+        )
+        .unwrap();
+
+    let error = kernel
+        .confirm_running_and_renew(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            &execution_id,
+            &json!({}),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidAuthority(_)),
+        "expected invalid authority, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("SECURITY_V1"),
+        "the rejection must name the security boundary: {error}"
+    );
+    let state: String = env
+        .raw()
+        .query_row(
+            "SELECT state FROM executions WHERE id=?1",
+            rusqlite::params![execution_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "STARTING", "RUNNING must not be written");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
 }
 
 #[test]

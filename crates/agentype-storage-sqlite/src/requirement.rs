@@ -158,6 +158,20 @@ pub fn task_security_mode(
     })
 }
 
+/// Whether a Task is a `SECURITY_V1` typed Task.
+///
+/// The execution-commitment boundary uses this to keep `SECURITY_V1` authority
+/// out of the frozen B.4 Execution paths until the B5.4 snapshot/secured start
+/// exists. A `LEGACY` Task has no security contract and is never security-v1;
+/// a `TYPED` Task must resolve its durable mode, so a typed Task whose
+/// requirement row is missing still fails closed.
+pub fn task_is_security_v1(tx: &Transaction<'_>, task_id: &TaskId) -> Result<bool, Error> {
+    if task_agent_requirement_mode(tx, task_id)? != "TYPED" {
+        return Ok(false);
+    }
+    Ok(task_security_mode(tx, task_id)? == SecurityContractMode::SecurityV1)
+}
+
 /// The single authoritative read of a Task's agent requirement.
 ///
 /// The parent Task's `agent_requirement_mode` and the child row are one
