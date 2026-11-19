@@ -1,16 +1,16 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 13 (2026-11-19) — records the third review pass over the
-revision-12 draft head `458e86c`. It found one new defect and fixed it: the
-`SECURITY_V1` path still ran the coarse exact-reference check on the **Task's own**
-authored sandbox policy, so a legal independent Task fine policy was refused
-before the effective-policy coverage proof. The reusable B.4 conjunct is now
-exported separately (`can_provision_task_source_config_reusable`); the coarse
-exact-reference claim stays in `can_provision_task_source_config` and the
-`COARSE_V1` chain. New positive acquisition test and contract-level split test,
-both mutation-checked. No freeze claim; B5.2-C/D/E remain separate follow-ups. No
-ADR `Status:` line, spec status or index entry changes
+Revision: 14 (2026-11-19) — records the execution-boundary review over the
+revision-13 draft head `35e817c`. It found a new P1: a `Claim` minted by
+`acquire_security_v1_task_existing` could still be taken to the frozen B.4
+Execution commit path and then to `RUNNING`, because qualification never produced
+a persisted `ExecutionSecuritySnapshot` or receipt. The Kernel now rejects every
+`SECURITY_V1` Task at `create_execution_in_tx` (so both `create_execution` and
+`create_execution_with_snapshot`) and at `confirm_running_and_renew` before any
+state write, with a Claim-based acceptance test covering both entrances. No freeze
+claim; B5.2-C/D/E remain separate follow-ups. No ADR `Status:` line, spec status
+or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 closing fixes proposed in draft PR #37)
 Date: 2026-11-18
@@ -43,8 +43,11 @@ PR draft stays open. Revision 13 records the third review pass, which found that
 the intersected B.4 conjunct still carried the coarse exact-reference check on the
 Task's own authored sandbox policy and therefore refused a legal independent Task
 fine policy; the reusable conjunct is now split out and the security path uses
-it, with the coarse exact-reference claim left intact on the coarse chain. As with
-every earlier finding, this record counts no
+it, with the coarse exact-reference claim left intact on the coarse chain.
+Revision 14 records the execution-boundary review: a qualified `Claim` could still
+be routed into the frozen B.4 Execution commit and to `RUNNING`, so the Kernel now
+rejects `SECURITY_V1` at both boundaries, independently of any scheduler caller.
+As with every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
 *selected-candidate transactional qualification implemented; complete
 `SECURITY_V1` acquisition orchestration remains open*.
@@ -76,6 +79,7 @@ positive-obligation requirement on the complete effective policy.
 | 11 | `39e85c5` (code) | Records the identity/capability re-audit over `015220a`: P1 (the profile was bound to `AdapterBindingPolicy.binding_ref`, an alias, rather than the resolved physical `adapter_binding_key`) and P2 (the frozen reference profile could claim dimensions outside its fixed support matrix). `ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)` now proves the profile names the same physical domain as the selection; the profile digest, compile cache key and evidence subject commit to that key. `ImportedEnforcementProfile::import` rejects `Support_imported ⊄ Support_reference` for the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/3`; ADR-0014 §2/§5/§14 state both rules. No ADR `Status:` line, spec status or index entry changes. |
 | 12 | `181c9e0` (reviewed head; docs-only) | Records the conditional-acceptance review of the revision-11 draft: the implemented B.4 intersection, physical key/alias split, reference ceiling, credential fail-closed boundary and selected-candidate transaction are accepted for continuation, and B5.2-C/D/E remain separate follow-up pull requests. Sets the two hard conditions (trusted importer provenance; no physical start before the B5.4 snapshot/secured start), requires the unified candidate identity as the first B5.2-D commit, and pins five follow-up acceptance cases. Docs-only; no ADR `Status:` line, spec status or index change. |
 | 13 | `458e86c` (reviewed head; code in this pull request) | Records the third review pass: the `SECURITY_V1` path intersected the frozen B.4 conjunct but that conjunct still carried the `COARSE_V1` exact-reference check on the Task's authored sandbox policy, so a legal independent Task fine policy was refused before the coverage proof. Splits `can_provision_task_source_config_reusable` (ownership/disposition/identity/lifecycle/continuity/envelope/evidence/Task join, no Task policy reference) from `can_provision_task_source_config` (+ the coarse Task reference claim); the security branch calls the reusable conjunct. Adds `b5_enforcement::the_task_policy_reference_is_coarse_only` and `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable`; ADR-0014 §3 names the third replaced relation. No ADR `Status:` line, spec status or index entry changes. |
+| 14 | `35e817c` (reviewed head; code in this pull request) | Records the execution-boundary review: P1 — a `Claim` from `acquire_security_v1_task_existing` could still be presented to the frozen B.4 `create_execution_with_snapshot` path and then to `confirm_running_and_renew`, because qualification persists no `ExecutionSecuritySnapshot` or receipt. `requirement::task_is_security_v1` reads the durable mode; `create_execution_in_tx` and `confirm_running_and_renew` now reject `SECURITY_V1` before any Execution insert or `RUNNING` write. Adds `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path`, which starts from the acquired `Claim`, asserts zero `executions`/`binding_snapshots`, and proves a stale `STARTING` row is not promoted. ADR-0014 §3 states the Kernel boundary. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -1316,6 +1320,59 @@ predicate fails the acquisition test with `Task sandbox policy ... is not enforc
 by imported evidence`, and removing the Task-reference flag from the coarse
 predicate fails the contract test.
 
+## Execution-commitment boundary audit (revision 14)
+
+The fourth review pass found a new **P1** combination: authority-bearing
+acquisition and the old execution entries were not closed against each other.
+
+`acquire_security_v1_task_existing` proves `Eligible_B5.2` and creates a real
+Attempt, Lease and `ProvisioningBinding`, but it discards the compiled
+`ProvenExecutionSecurity`; no `ExecutionSecuritySnapshot` and no B5.4 receipt are
+persisted. The B.4 entries remained open:
+
+```text
+acquired Claim
+   ├── create_execution_with_snapshot   (freezes only a BindingSnapshot)
+   │      └── create_execution_in_tx    ("typed ⇒ snapshot" only; no mode check)
+   └── confirm_running_and_renew        (writes RUNNING from ACTIVE lease)
+```
+
+The previous "no caller yet" observation is a reachability fact, not an authority
+boundary. Once B5.2-E wires the scheduler, a `Claim` from this entry could be
+presented to either path without the B5.4 commitment. This was a latent
+composition risk, not a live production path — the daemon still does not call the
+new acquisition entry — but it must not depend on caller convention.
+
+**Fix (Kernel authority boundary).**
+
+| Boundary | Change |
+|---|---|
+| `requirement::task_is_security_v1` | the single durable read: `LEGACY` is never security-v1; `TYPED` resolves `task_security_mode`, so a missing requirement row still fails closed |
+| `create_execution_in_tx` | rejects a `SECURITY_V1` Task after authority validation and before any insert, so both `create_execution` and `create_execution_with_snapshot` refuse it; a `BindingSnapshot` is not execution authority |
+| `confirm_running_and_renew` | rejects the same Task immediately after authority validation, before the `RUNNING`/task/incarnation/lease updates, so a stale `STARTING` Execution cannot be promoted |
+
+The guards read durable Task state, not the caller, so they hold for every
+runtime-internal entry and survive scheduler wiring. They stay until B5.4 commits
+the security snapshot and receipt chain; B5.2-E must not remove them.
+
+**Acceptance test.**
+`b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path`
+starts from the `Claim` produced by `acquire_security_v1_task_existing` and:
+
+1. calls `create_execution_with_snapshot` with a matching physical binding and a
+   `BindingSnapshot`; requires `InvalidAuthority` naming `SECURITY_V1`, leaves
+   `executions` and `binding_snapshots` empty, and keeps the Task `Leased`;
+2. inserts a stale `STARTING` Execution row for that Attempt and calls
+   `confirm_running_and_renew`; requires the same rejection and leaves the row
+   `STARTING` and the Task `Leased`.
+
+Both guards were mutation-checked:
+
+| Guard disabled | Observed failure |
+|---|---|
+| the `create_execution_in_tx` mode check | `create_execution_with_snapshot` proceeds to snapshot validation, failing the test on the missing `SECURITY_V1` rejection (`binding snapshot source config digest ...`) |
+| the `confirm_running_and_renew` mode check | the call returns `Ok(RunningAuthorityGrant)`; the test's `unwrap_err` fails, proving the path would have written `RUNNING` |
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1374,6 +1431,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 10)** `SECURITY_V1` acquisition intersects the frozen B.4 source/config eligibility (ACTIVE dispositions, ownership, evidence subject/config digest, lifecycle, continuity, functional envelope, security-class evidence, Task safety/continuity/restriction join); only the coarse policy-reference relations are replaced by policy order and the compile | `predicates.rs` `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_provisioning_conjunct_is_shared_by_both_paths`, `b5_security_acquisition::evidence_resolved_for_another_config_cannot_authorize_this_config`, `an_agent_type_capability_the_source_cannot_provide_is_rejected`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` | `0a0ed56` |
 | **(rev 10)** A profile's delivery capability is never a credential authorization: any non-empty `credential_refs` is fail-closed at the authority-bearing entry until B5.3 | `provisioning.rs` `finish_acquisition` pre-authority gate; `enforcement.rs` `with_source_config` remains the pure necessary condition | `b5_security_acquisition::a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver`, `a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease`; `b5_enforcement::a_requested_credential_completes_when_the_profile_delivers` (pure component) | `0a0ed56` |
 | **(rev 13)** The reusable B.4 conjunct excludes the Task authored-policy exact-reference claim: `SECURITY_V1` proves the Task layer through `P_eff` coverage, `COARSE_V1` keeps the reference claim | `predicates.rs` `can_provision_task_source_config_reusable` / `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_task_policy_reference_is_coarse_only`, `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` | this pull request (rev 13) |
+| **(rev 14)** Qualification is not execution authority: a `SECURITY_V1` `Claim` cannot commit an Execution or enter `RUNNING` through the frozen B.4 paths before B5.4 | `requirement.rs` `task_is_security_v1`; `kernel.rs` `create_execution_in_tx`, `confirm_running_and_renew` | `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path` | this pull request (rev 14) |
 
 ### ADR-0014 §4 durable encoding (schema v10)
 
@@ -1444,16 +1502,16 @@ Revisions 10 and 11 add a fence check of their own, against `fb3641f..39e85c5`:
 | Coarse acquisition behavior | unchanged; the security chain remains disjoint and still refuses `COARSE_V1` |
 | Untracked files | not staged, not committed, not deleted |
 
-Revisions 12 and 13 add a fence check of their own, against `fb3641f..458e86c`
-plus the revision-13 code:
+Revisions 12, 13 and 14 add a fence check of their own, against
+`fb3641f..458e86c` plus the revision-13 and revision-14 code:
 
 | Fence | Result |
 |---|---|
 | `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
 | ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §3 body text only) |
-| Durable format / schema version | unchanged up to `458e86c`; revision 13's split is a predicate/alias change, no schema or stored-format change |
+| Durable format / schema version | unchanged up to `458e86c`; revision 13's split is a predicate/alias change and revision 14 adds kernel checks, so no schema or stored-format change |
 | Compile cache key list | unchanged; the physical-key component from revision 11 stays |
-| Coarse acquisition behavior | byte-for-byte the same relation: `can_provision_task_source_config` keeps the Task exact-reference claim and `b5_enforcement`'s coarse assertions still fail without it |
+| Coarse acquisition behavior | byte-for-byte the same relation: `can_provision_task_source_config` keeps the Task exact-reference claim and `b5_enforcement`'s coarse assertions still fail without it; the revision-14 guards read the Task mode and leave `COARSE_V1`/`LEGACY` Execution paths unchanged |
 | Untracked files | not staged, not committed, not deleted |
 
 ## Deliberate non-reachability
@@ -1479,7 +1537,11 @@ in revision 2**: the original wording overstated the fence.
    `compile_execution_security` and `qualify_security_candidate`, but it is
    compiled under `runtime-internal` and neither `agentype-runtime`'s resolver nor
    its daemon invokes it: selection and acquisition still run through the coarse
-   path. It also grants no secured start; the compiled proof is discarded.
+   path. It also grants no secured start; the compiled proof is discarded. Since
+   revision 14 the Kernel reinforces this: `create_execution_in_tx` and
+   `confirm_running_and_renew` reject every `SECURITY_V1` Task, so even a `Claim`
+   produced by that entry cannot reach an Execution or `RUNNING` through the old
+   B.4 paths.
 3. **The durable block has no production caller.**
    `Kernel::record_security_acquisition_block` is a thin wrapper; the only
    callers are `b5_acquisition_block.rs` tests. Wiring the control plane to
@@ -1626,6 +1688,16 @@ the earlier boundary remains auditable.
     new acquisition test uses a real distinct Task reference. This is a
     candidate-eligibility correctness fix, not a privilege boundary: the leaked
     check over-rejected, it never granted authority.
+20. **(rev 14)** **Qualification was not execution authority.** A `Claim` from
+    `acquire_security_v1_task_existing` could be presented to the frozen B.4
+    `create_execution_with_snapshot` path and then to `confirm_running_and_renew`,
+    even though the acquisition persists no `ExecutionSecuritySnapshot` and no
+    B5.4 receipt. The daemon does not call the entry today, so this was not a live
+    production bypass, but it depended on caller convention. The Kernel now
+    rejects every `SECURITY_V1` Task at `create_execution_in_tx` and at
+    `confirm_running_and_renew` before any insert or `RUNNING` write. The guards
+    stay until B5.4 lands; B5.2-E must not remove them, and this record does not
+    treat the fix as B5.4 or as B5.2 completion.
 
 ## Verification
 
@@ -1835,6 +1907,23 @@ test was run, and it failed for the expected reason.
 | the security branch calls the coarse `can_provision_task_source_config` instead of the reusable conjunct | `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` — `InvalidAuthority("... Task sandbox policy task-fine-policy@1 is not enforced by imported evidence")` |
 | the coarse predicate's Task-reference flag forced off | `b5_enforcement::the_task_policy_reference_is_coarse_only` — the coarse predicate returns `Ok` |
 
+Revision 14 ships code in the same draft pull request and re-runs the full gate:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 58 suites, 1108 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+Each revision-14 guard was mutation-checked:
+
+| Guard disabled | Observed failure |
+|---|---|
+| `create_execution_in_tx` mode check | `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path` — the call reaches snapshot validation and fails on the missing `SECURITY_V1` rejection (`binding snapshot source config digest disagrees with the validated revision`) |
+| `confirm_running_and_renew` mode check | the same test — the call returns `Ok(RunningAuthorityGrant)`, demonstrating that `RUNNING` would have been written |
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -1864,7 +1953,9 @@ positive, its cross-domain negative, and the reference-ceiling test) and
 `b5_security_acquisition` holds 18 (the real-transaction `primary -> k2` test);
 the other counts are unchanged. At revision 13, `b5_enforcement` holds 40 (the
 coarse-only Task policy reference split) and `b5_security_acquisition` holds 19
-(the independent Task fine policy acquisition).
+(the independent Task fine policy acquisition). At revision 14,
+`b5_security_acquisition` holds 20 (the Kernel execution-boundary acceptance test);
+`b5_enforcement` stays 40.
 
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
@@ -1896,6 +1987,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. Not implemented |
 | 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated. Not implemented |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
+| 19 | Keep a qualified `SECURITY_V1` `Claim` out of the frozen B.4 Execution and `RUNNING` paths (rev 14) | starting from the acquired `Claim`, `create_execution_with_snapshot` fails before any `executions`/`binding_snapshots` row; a stale `STARTING` row is not promoted to `RUNNING`; the Task stays `Leased`. Implemented in revision 14 (this pull request); removed only by the B5.4 snapshot/secured start |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
@@ -1907,7 +1999,9 @@ implemented in revision 10 (`0a0ed56`), items 13 and 14 in revision 11
 the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision;
 revision 12 accepts that decomposition and carries the two hard conditions into
 the follow-ups without adding code. Item 18 is the revision-13 fix for the
-coarse Task exact-reference leak in the reusable conjunct.
+coarse Task exact-reference leak in the reusable conjunct; item 19 is the
+revision-14 Kernel boundary that keeps a qualified `SECURITY_V1` `Claim` out of
+the B.4 Execution and `RUNNING` paths.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
@@ -1916,7 +2010,9 @@ every finding in this record, the row is evidence for the re-audit, not a
 closure. Revision 11 specifically does not claim P2-1 fully closed, because the
 trusted importer proof (item 16) remains open. Revision 13 fixes a
 candidate-eligibility over-rejection in the same Gate and does not close it
-either.
+either. Revision 14 closes the composition gap between that Gate and the old
+execution entries at the Kernel boundary; it still grants no B5.4 snapshot,
+receipt or secured start, and complete `SECURITY_V1` orchestration remains open.
 
 ## Evidence index
 
@@ -1940,6 +2036,7 @@ either.
 | Security acquisition entry point | `crates/agentype-storage-sqlite/src/provisioning.rs` (`acquire_security_v1_task_existing`, the `finish_acquisition` security branch), `kernel.rs` (`Kernel::acquire_security_v1_task_existing`) |
 | Security acquisition conformance | `crates/agentype-storage-sqlite/tests/b5_security_acquisition.rs` |
 | Reusable B.4 provisioning conjunct vs the coarse Task policy reference | `crates/agentype-agent-contract/src/predicates.rs` (`can_provision_task_source_config_reusable`, `can_provision_task_source_config`), `crates/agentype-agent-contract/tests/b5_enforcement.rs` (`the_task_policy_reference_is_coarse_only`) |
+| Kernel execution-commitment boundary | `crates/agentype-storage-sqlite/src/requirement.rs` (`task_is_security_v1`), `crates/agentype-storage-sqlite/src/kernel.rs` (`create_execution_in_tx`, `confirm_running_and_renew`), `crates/agentype-storage-sqlite/tests/b5_security_acquisition.rs` (`a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path`) |
 | Supported-surface feature wiring | `crates/agentype-runtime/Cargo.toml`, `tests/public-api/Cargo.toml` |
 | Public-API probes | `tests/public-api/src/lib.rs` (probes 18 and 31) |
 | ADR — composite authority | `docs/decisions/0013-m6b5-policy-authority-algebra-identity.md` §5 |

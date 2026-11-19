@@ -175,6 +175,18 @@ Neither may "downgrade" the other's identity, because the full-path identity is
 what makes the security contract dischargeable at all, and a coarse candidate has
 no declaration, no imported profile and no `P_source` to qualify.
 
+A successful `SECURITY_V1` acquisition is **qualification**, not execution
+authority. Until B5.4 persists the `ExecutionSecuritySnapshot` and the receipt
+chain, the Kernel itself keeps that authority out of the frozen B.4 execution
+paths: `create_execution_in_tx` — and therefore both `create_execution` and
+`create_execution_with_snapshot` — rejects any Task whose durable requirement mode
+is `SECURITY_V1`, with or without a `BindingSnapshot`; `confirm_running_and_renew`
+rejects the same Task before it can write `RUNNING`, even when a stale `STARTING`
+Execution row exists. This is deliberately a Kernel authority-boundary check, not a
+scheduler convention: an unreachable caller today must not become a live bypass
+when B5.2-E wires the scheduler. Trusted importer provenance remains B5.2-C; the
+snapshot, secured start and receipt remain B5.4.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
