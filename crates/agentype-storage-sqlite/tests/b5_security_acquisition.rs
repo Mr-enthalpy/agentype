@@ -427,10 +427,28 @@ fn task_spec() -> TaskSpec {
 /// `deny_all`. `deny_all` is a legal projection of the `ReadOnly` / `Disabled`
 /// requirement and leaves an empty `RequiredAccess`.
 fn admit_security_v1_task(kernel: &Kernel, tag: &str, pin: AgentTypeRef) -> TaskId {
+    admit_security_v1_task_with_policy(kernel, tag, pin, None)
+}
+
+/// The same admission, optionally with an independent Task-authored fine policy
+/// reference. The policy is published here with `deny_all` bytes, so it meets
+/// the generation layer and `P_eff` stays `deny_all`: only the *reference*
+/// differs.
+fn admit_security_v1_task_with_policy(
+    kernel: &Kernel,
+    tag: &str,
+    pin: AgentTypeRef,
+    task_policy: Option<SandboxPolicyRef>,
+) -> TaskId {
     let reference = policy_ref(&format!("generation-policy-{tag}"));
     kernel
         .publish_sandbox_policy(&reference, &NormalizedSandboxPolicy::deny_all())
         .unwrap();
+    if let Some(policy) = &task_policy {
+        kernel
+            .publish_sandbox_policy(policy, &NormalizedSandboxPolicy::deny_all())
+            .unwrap();
+    }
     let generation = kernel
         .create_generation_with_security_mode(
             json!({}),
@@ -449,12 +467,14 @@ fn admit_security_v1_task(kernel: &Kernel, tag: &str, pin: AgentTypeRef) -> Task
     let proposal = kernel
         .compile_root_intent(&generation.generation_id, intent, "session", 1)
         .unwrap();
+    let mut requirement = draft(pin);
+    requirement.sandbox_policy = task_policy;
     kernel
         .admit_typed_proposal_with_security_mode(
             &proposal.proposal_id,
             0,
             None,
-            draft(pin),
+            requirement,
             SecurityContractMode::SecurityV1,
         )
         .unwrap()
@@ -539,6 +559,54 @@ fn a_qualified_candidate_is_selectable() {
     );
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
     assert_eq!(count(&env, "provisioning_bindings"), 1);
+    assert_eq!(count(&env, "attempts"), 1);
+    assert_eq!(count(&env, "leases"), 1);
+}
+
+#[test]
+fn a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable() {
+    let env = Env::new("task_fine");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    // The Task authors its own fine policy reference, distinct from the
+    // Generation's. The durable `TaskSecurityBinding` meets both into `P_eff`,
+    // but the imported evidence below claims no authored policy reference at
+    // all. The exact-reference check belongs to `COARSE_V1`; a `SECURITY_V1`
+    // candidate is proven by obligation coverage over `P_eff`.
+    let task_policy = policy_ref("task-fine-policy");
+    let task =
+        admit_security_v1_task_with_policy(kernel, "task_fine", pin, Some(task_policy.clone()));
+    let binding = kernel.get_task_security_binding(&task).unwrap().unwrap();
+    assert!(
+        binding
+            .derivation()
+            .inputs()
+            .iter()
+            .any(|input| input.reference() == Some(&task_policy)),
+        "the Task authored layer must be part of the admitted derivation"
+    );
+
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "task_fine", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+
+    assert_eq!(acquired.claim.task_id, task);
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
     assert_eq!(count(&env, "attempts"), 1);
     assert_eq!(count(&env, "leases"), 1);
 }

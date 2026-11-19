@@ -1290,15 +1290,19 @@ fn finish_acquisition(
         // dispositions, the evidence subject/config digest identity, lifecycle,
         // continuity, the functional envelope and the security-class evidence,
         // plus the Task's effective safety and restriction join). Only the coarse
-        // exact-reference sandbox relation is replaced, by the real policy order
-        // inside the qualification below. Then derive the composite authority,
+        // exact-reference sandbox relations are replaced, by the real policy order
+        // inside the qualification below: the AgentType authored reference, the
+        // Task authored reference, and the "evidence names this authored policy"
+        // claim. The Task layer is still proven, because `P_eff` already meets the
+        // Task authored policy inside `TaskSecurityBinding` and the compile proves
+        // obligation coverage over it. Then derive the composite authority,
         // validate the external source/binding/profile tuple against the durable
         // source and binding, qualify (policy order, coarse modes, access floor,
         // coverage, compile, subject proof), and complete the evidence subject
         // with the attested config. Every failure here is candidate-local
         // (`InvalidAuthority`/`SecurityUnenforceable`), never a Task failure.
         AcquisitionMode::SecurityV1(security) => {
-            agentype_agent_contract::can_provision_task_source_config(
+            agentype_agent_contract::can_provision_task_source_config_reusable(
                 &actual,
                 &source,
                 config,

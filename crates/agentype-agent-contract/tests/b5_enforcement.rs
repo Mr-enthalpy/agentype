@@ -771,7 +771,7 @@ fn the_provisioning_conjunct_is_shared_by_both_paths() {
                     config: &SourceConfig,
                     evidence: &ResolvedProvisioningEvidence,
                     catalog: &CapabilityCatalog| {
-        can_provision_task_source_config(
+        can_provision_task_source_config_reusable(
             agent,
             source,
             config,
@@ -891,6 +891,61 @@ fn the_provisioning_conjunct_is_shared_by_both_paths() {
         )
         .unwrap_err(),
         ContractError::CapabilityMismatch { .. }
+    ));
+}
+
+/// ADR-0014 §3: the Task's own authored sandbox-policy reference is a coarse
+/// exact-reference claim, not part of the reusable B.4 conjunct. A
+/// `SECURITY_V1` candidate whose Task layer is met into `P_eff` and covered by
+/// the imported profile must not be rejected for lacking that exact reference;
+/// the coarse predicate keeps the frozen semantics.
+#[test]
+fn the_task_policy_reference_is_coarse_only() {
+    let fixture = confined_fixture();
+    let binding = adapter_binding(ConfigStatus::Active);
+    let config = source_config(&fixture.source.source_ref);
+    // Evidence that claims no authored policy reference at all: the compile's
+    // obligation coverage is the only reason the security path may accept it.
+    let evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let catalog = CapabilityCatalog::new();
+
+    // The Task authored a fine policy distinct from the Generation's; the
+    // durable binding meets both into `P_eff`.
+    let mut requirement = fixture.requirement.clone();
+    requirement.hard.sandbox_policy = Some(policy_ref("task-fine", 1));
+
+    can_provision_task_source_config_reusable(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &evidence,
+        &catalog,
+        &requirement.hard,
+    )
+    .expect("the Task layer is covered by the effective policy, not by an exact reference");
+
+    assert!(matches!(
+        can_provision_task_source_config(
+            &fixture.agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &catalog,
+            &requirement.hard,
+        )
+        .unwrap_err(),
+        ContractError::SecurityUnenforceable { .. }
     ));
 }
 

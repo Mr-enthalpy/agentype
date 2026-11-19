@@ -91,9 +91,9 @@ pub use matching::{
 };
 pub use predicates::{
     can_execute, can_execute_security_v1, can_provision, can_provision_task,
-    can_provision_task_source_config, is_valid_refinement, is_valid_refinement_with_policies,
-    more_specific_for, more_specific_for_with_policies, validate_source_config,
-    validate_spawn_source,
+    can_provision_task_source_config, can_provision_task_source_config_reusable,
+    is_valid_refinement, is_valid_refinement_with_policies, more_specific_for,
+    more_specific_for_with_policies, validate_source_config, validate_spawn_source,
 };
 pub use provisioning::{
     BindingSnapshot, MaterializationDigest, ProvisioningBinding, RESOLVER_VERSION,

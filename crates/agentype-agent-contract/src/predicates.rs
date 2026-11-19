@@ -582,12 +582,33 @@ pub fn can_provision_task(
 /// capability evidence, and the Task's effective safety, continuity and
 /// restriction join.
 ///
-/// Two coarse-only conjuncts are excluded because `SECURITY_V1` proves stronger
-/// replacements: the exact sandbox-policy reference relation
-/// ([`can_execute`]/[`can_execute_security_v1`]) and the "imported evidence
-/// claims this exact authored policy reference" claim ([`can_provision`]),
-/// which the obligation-coverage proof of `compile_execution_security`
-/// supersedes. Everything else is shared (ADR-0014 §3).
+/// Three coarse-only conjuncts are excluded because `SECURITY_V1` proves
+/// stronger replacements: the exact sandbox-policy reference relation
+/// ([`can_execute`]/[`can_execute_security_v1`]), the "imported evidence claims
+/// this exact authored policy reference" claim ([`can_provision`]), and the
+/// exact-reference check on the *Task's* authored sandbox policy (kept only by
+/// [`can_provision_task_source_config`]). The obligation-coverage proof of
+/// `compile_execution_security` covers the Task layer through `P_eff`, which
+/// already meets the Task authored policy in `TaskSecurityBinding`. Everything
+/// else is shared (ADR-0014 §3).
+pub fn can_provision_task_source_config_reusable(
+    agent: &AgentType,
+    source: &SpawnSource,
+    config: &SourceConfig,
+    evidence: &ResolvedProvisioningEvidence,
+    catalog: &CapabilityCatalog,
+    task: &TaskRequirement,
+) -> Result<(), ContractError> {
+    can_provision_task_source_config_inner(agent, source, config, evidence, catalog, task, false)
+}
+
+/// [`can_provision_task_source_config_reusable`] plus the frozen `COARSE_V1`
+/// exact-reference claim on the Task's authored sandbox policy.
+///
+/// A `SECURITY_V1` Task with an independent fine policy of its own is a legal
+/// B5.1/B5.2 candidate: its Task layer is met into `P_eff` and proven by
+/// obligation coverage, so requiring the imported evidence to name that exact
+/// reference would reject a candidate the policy algebra admits.
 pub fn can_provision_task_source_config(
     agent: &AgentType,
     source: &SpawnSource,
@@ -595,6 +616,18 @@ pub fn can_provision_task_source_config(
     evidence: &ResolvedProvisioningEvidence,
     catalog: &CapabilityCatalog,
     task: &TaskRequirement,
+) -> Result<(), ContractError> {
+    can_provision_task_source_config_inner(agent, source, config, evidence, catalog, task, true)
+}
+
+fn can_provision_task_source_config_inner(
+    agent: &AgentType,
+    source: &SpawnSource,
+    config: &SourceConfig,
+    evidence: &ResolvedProvisioningEvidence,
+    catalog: &CapabilityCatalog,
+    task: &TaskRequirement,
+    require_task_policy_reference: bool,
 ) -> Result<(), ContractError> {
     can_provision_reusable(agent, source, config, evidence, catalog)?;
 
@@ -620,15 +653,17 @@ pub fn can_provision_task_source_config(
                 .into(),
         });
     }
-    if let Some(policy) = &task.sandbox_policy {
-        if !evidence.enforces_sandbox_policy(policy) {
-            return Err(ContractError::SecurityUnenforceable {
-                reason: format!(
-                    "Task sandbox policy {}@{} is not enforced by imported evidence",
-                    policy.id().as_str(),
-                    policy.revision()
-                ),
-            });
+    if require_task_policy_reference {
+        if let Some(policy) = &task.sandbox_policy {
+            if !evidence.enforces_sandbox_policy(policy) {
+                return Err(ContractError::SecurityUnenforceable {
+                    reason: format!(
+                        "Task sandbox policy {}@{} is not enforced by imported evidence",
+                        policy.id().as_str(),
+                        policy.revision()
+                    ),
+                });
+            }
         }
     }
     if !continuity_satisfies(

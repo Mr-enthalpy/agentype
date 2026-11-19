@@ -152,12 +152,21 @@ Eligible_B5.2 = Eligible_B4,reusable
 identity: source/config ownership and ACTIVE disposition, the evidence
 subject/config digest identity, AgentType lifecycle, continuity, the functional
 envelope, security-class capability evidence, and the Task's effective safety,
-continuity and restriction join. Only the coarse exact-policy-reference relation
-(`can_execute`'s Task↔AgentType policy match and `can_provision`'s "evidence
-claims this authored policy reference" claim) is replaced, by the real policy
-order and the obligation-coverage proof respectively. Dropping the rest would let
-the security path grant Attempt/Lease authority over a source/config the frozen
-B.4 control plane had already rejected.
+continuity and restriction join. Three coarse exact-reference relations are
+replaced: `can_execute`'s Task↔AgentType policy match, `can_provision`'s "evidence
+claims this authored policy reference" claim, and the exact-reference check on the
+**Task's own** authored sandbox policy inside
+`can_provision_task_source_config`. The last one is excluded because the Task
+layer already enters `P_eff` through `TaskSecurityBinding` (the Task authored
+policy is met with the Generation, AgentType and source layers), so the compile's
+obligation-coverage proof covers it; requiring imported evidence to name that
+exact reference would refuse a legal independent Task fine policy. The reusable
+conjunct is the exported
+`can_provision_task_source_config_reusable`; the coarse-only exact-reference
+claim stays in `can_provision_task_source_config` and in the `COARSE_V1` chain.
+Dropping the rest of the shared conjunct would let the security path grant
+Attempt/Lease authority over a source/config the frozen B.4 control plane had
+already rejected.
 
 `SECURITY_V1` and `COARSE_V1` acquisition are **disjoint chains**. The coarse
 entry point refuses a `SECURITY_V1` Task, AgentType or source and keeps its frozen
