@@ -1,16 +1,16 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 12 (2026-11-18) — records the conditional-acceptance review of the
-revision-11 draft head `181c9e0`. The review accepts the static identity and
-capability fixes and the B5.2-C/D/E decomposition, but not a B5.2 freeze. It sets
-two hard conditions for the follow-ups — trusted importer provenance (B5.2-C) and
-no physical start before the B5.4 snapshot/secured start (B5.2-E) — and requires
-the unified candidate identity before budget, cache and durable-block wiring
-(B5.2-D). No code change; the record still carries P2-1's profile binding and
-subject proof (7), P2-2's credential request/authorization split (8), and the
-P2-4 acquisition wiring (9), each with its own ADR amendment, gate run and
-mutation table. No ADR `Status:` line, spec status or index entry changes
+Revision: 13 (2026-11-19) — records the third review pass over the
+revision-12 draft head `458e86c`. It found one new defect and fixed it: the
+`SECURITY_V1` path still ran the coarse exact-reference check on the **Task's own**
+authored sandbox policy, so a legal independent Task fine policy was refused
+before the effective-policy coverage proof. The reusable B.4 conjunct is now
+exported separately (`can_provision_task_source_config_reusable`); the coarse
+exact-reference claim stays in `can_provision_task_source_config` and the
+`COARSE_V1` chain. New positive acquisition test and contract-level split test,
+both mutation-checked. No freeze claim; B5.2-C/D/E remain separate follow-ups. No
+ADR `Status:` line, spec status or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 closing fixes proposed in draft PR #37)
 Date: 2026-11-18
@@ -39,7 +39,12 @@ resolved physical `adapter_binding_key`, and the fixed reference profile could
 widen its support matrix. Revision 12 records the conditional-acceptance review
 of that draft: the implemented parts and the B5.2-C/D/E decomposition are accepted
 for continuation, with two hard conditions carried into the follow-ups, and the
-PR draft stays open. As with every earlier finding, this record counts no
+PR draft stays open. Revision 13 records the third review pass, which found that
+the intersected B.4 conjunct still carried the coarse exact-reference check on the
+Task's own authored sandbox policy and therefore refused a legal independent Task
+fine policy; the reusable conjunct is now split out and the security path uses
+it, with the coarse exact-reference claim left intact on the coarse chain. As with
+every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
 *selected-candidate transactional qualification implemented; complete
 `SECURITY_V1` acquisition orchestration remains open*.
@@ -70,6 +75,7 @@ positive-obligation requirement on the complete effective policy.
 | 10 | `0a0ed56` (code) | Records the continuation audit over `26a44f9`: P1-1 (the `SECURITY_V1` branch replaced the frozen B.4 provisioning eligibility instead of intersecting it) and P1-2 (delivery capability was read as a credential authorization). Extracts `can_provision_task_source_config` as the reusable B.4 conjunct, intersects it on the security path, and makes every non-empty `credential_refs` fail closed on both chains. Also records the P2 subject-identity and trusted-importer handoff constraints. ADR-0014 §3/§5 and ADR-0015 §5/§9 state the intersection and the fail-closed rule. No ADR `Status:` line, spec status or index entry changes. |
 | 11 | `39e85c5` (code) | Records the identity/capability re-audit over `015220a`: P1 (the profile was bound to `AdapterBindingPolicy.binding_ref`, an alias, rather than the resolved physical `adapter_binding_key`) and P2 (the frozen reference profile could claim dimensions outside its fixed support matrix). `ValidatedSourceBinding::validate(source, binding, adapter_binding_key, profile)` now proves the profile names the same physical domain as the selection; the profile digest, compile cache key and evidence subject commit to that key. `ImportedEnforcementProfile::import` rejects `Support_imported ⊄ Support_reference` for the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is `/3`; ADR-0014 §2/§5/§14 state both rules. No ADR `Status:` line, spec status or index entry changes. |
 | 12 | `181c9e0` (reviewed head; docs-only) | Records the conditional-acceptance review of the revision-11 draft: the implemented B.4 intersection, physical key/alias split, reference ceiling, credential fail-closed boundary and selected-candidate transaction are accepted for continuation, and B5.2-C/D/E remain separate follow-up pull requests. Sets the two hard conditions (trusted importer provenance; no physical start before the B5.4 snapshot/secured start), requires the unified candidate identity as the first B5.2-D commit, and pins five follow-up acceptance cases. Docs-only; no ADR `Status:` line, spec status or index change. |
+| 13 | `458e86c` (reviewed head; code in this pull request) | Records the third review pass: the `SECURITY_V1` path intersected the frozen B.4 conjunct but that conjunct still carried the `COARSE_V1` exact-reference check on the Task's authored sandbox policy, so a legal independent Task fine policy was refused before the coverage proof. Splits `can_provision_task_source_config_reusable` (ownership/disposition/identity/lifecycle/continuity/envelope/evidence/Task join, no Task policy reference) from `can_provision_task_source_config` (+ the coarse Task reference claim); the security branch calls the reusable conjunct. Adds `b5_enforcement::the_task_policy_reference_is_coarse_only` and `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable`; ADR-0014 §3 names the third replaced relation. No ADR `Status:` line, spec status or index entry changes. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -164,6 +170,13 @@ the credential fail-closed boundary and the single-candidate transaction are
 accepted, and B5.2-C/D/E are explicitly left to separate pull requests rather than
 required in this one. The review adds two hard conditions and two ordering rules,
 recorded below. No implementation is added to #37 by this revision.
+
+Revision 13 fixes one defect that a further review found in the revision-10
+intersection: the reusable B.4 conjunct still demanded the imported evidence's
+exact reference for the Task's own authored sandbox policy, which rejected a legal
+independent Task fine policy before the `P_eff` coverage proof. The conjunct is
+split; the coarse exact-reference claim is unchanged. Revision 13 still does not
+claim a B5.2 freeze, completion, or a B5.4 secured start.
 
 ## Why this record exists
 
@@ -1249,6 +1262,60 @@ PR #37 stays **draft**. Its implemented parts and the C/D/E decomposition are
 accepted for continuation; the freeze is not. No B5.2-C/D/E implementation is
 added to this draft.
 
+## Task fine-policy exact-reference audit (revision 13)
+
+The third review pass found one new policy-matching defect, in the conjunct
+revision 10 added:
+
+```text
+can_provision_task_source_config
+    ├── ownership / disposition / evidence identity / lifecycle / continuity
+    ├── functional envelope + security-class evidence
+    ├── Task safety, continuity and restriction join
+    └── if let Some(policy) = &task.sandbox_policy {
+            evidence.enforces_sandbox_policy(policy)   // COARSE_V1 exact reference
+        }
+```
+
+`SECURITY_V1` called that whole relation. A Task that authors its own fine policy
+`P_T` distinct from the Generation's `P_G` is therefore refused before
+`qualify_security_candidate` whenever the imported evidence does not list `P_T`'s
+exact reference, even when `meet(P_G, P_T, P_A, P_S)` is executable and the
+profile covers every obligation of `P_eff`. That is the `COARSE_V1` evidence
+relation, not the policy order B5.2 is migrating to, and it rejects exactly the
+independent Task fine policy B5.1 permits.
+
+The fixtures hid it: every acquisition fixture admitted a Task with
+`sandbox_policy: None`, so the branch never ran.
+
+**Fix.** The relation is split into two public names, so a `SECURITY_V1` caller
+cannot accidentally reach the coarse check:
+
+| Function | Contents | Caller |
+|---|---|---|
+| `can_provision_task_source_config_reusable` | everything except the Task authored-policy reference claim | `SECURITY_V1` acquisition |
+| `can_provision_task_source_config` | the reusable conjunct + `evidence.enforces_sandbox_policy(task.sandbox_policy)` | `COARSE_V1` (`can_provision_task`) |
+
+Both delegate to one private function whose flag only decides that check, so the
+coarse predicate keeps its exact ordering and error. The Task layer is still
+proven on the security path: `TaskSecurityBinding` already meets the Task authored
+policy into `P_eff`, and `compile_execution_security` proves obligation coverage
+over that policy. ADR-0014 §3 now names this as the third replaced relation
+alongside `can_execute`'s Task↔AgentType match and `can_provision`'s evidence
+reference claim.
+
+**Tests.**
+
+| Test | What it pins |
+|---|---|
+| `b5_enforcement::the_task_policy_reference_is_coarse_only` | evidence with no authored-policy claim: the reusable conjunct accepts, the coarse predicate rejects with `SecurityUnenforceable` |
+| `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` | a real admission with a distinct Task fine policy reference; the binding derivation carries that layer; acquisition reaches Leased with one Attempt/Lease |
+
+Both were mutation-checked: pointing the security branch back at the coarse
+predicate fails the acquisition test with `Task sandbox policy ... is not enforced
+by imported evidence`, and removing the Task-reference flag from the coarse
+predicate fails the contract test.
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1306,6 +1373,7 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 9)** A credential request the selected profile cannot deliver is ineligible before Attempt/Lease, settled at the attested config | `provisioning.rs` `finish_acquisition` (`ProvenExecutionSecurity::with_source_config`) | `b5_security_acquisition::a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease` | `d4d8dc3` |
 | **(rev 10)** `SECURITY_V1` acquisition intersects the frozen B.4 source/config eligibility (ACTIVE dispositions, ownership, evidence subject/config digest, lifecycle, continuity, functional envelope, security-class evidence, Task safety/continuity/restriction join); only the coarse policy-reference relations are replaced by policy order and the compile | `predicates.rs` `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_provisioning_conjunct_is_shared_by_both_paths`, `b5_security_acquisition::evidence_resolved_for_another_config_cannot_authorize_this_config`, `an_agent_type_capability_the_source_cannot_provide_is_rejected`, `a_config_that_cannot_realize_the_agent_type_continuity_is_rejected`, `a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected`, `a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier` | `0a0ed56` |
 | **(rev 10)** A profile's delivery capability is never a credential authorization: any non-empty `credential_refs` is fail-closed at the authority-bearing entry until B5.3 | `provisioning.rs` `finish_acquisition` pre-authority gate; `enforcement.rs` `with_source_config` remains the pure necessary condition | `b5_security_acquisition::a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver`, `a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_or_lease`; `b5_enforcement::a_requested_credential_completes_when_the_profile_delivers` (pure component) | `0a0ed56` |
+| **(rev 13)** The reusable B.4 conjunct excludes the Task authored-policy exact-reference claim: `SECURITY_V1` proves the Task layer through `P_eff` coverage, `COARSE_V1` keeps the reference claim | `predicates.rs` `can_provision_task_source_config_reusable` / `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_task_policy_reference_is_coarse_only`, `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` | this pull request (rev 13) |
 
 ### ADR-0014 §4 durable encoding (schema v10)
 
@@ -1374,6 +1442,18 @@ Revisions 10 and 11 add a fence check of their own, against `fb3641f..39e85c5`:
 | Durable format / schema version | unchanged; the profile digest and `security_acquisition_blocks.binding_profile_digest` stay opaque values, so no migration |
 | Compile cache key list | unchanged in shape; the adapter component carries the resolved physical key instead of the alias |
 | Coarse acquisition behavior | unchanged; the security chain remains disjoint and still refuses `COARSE_V1` |
+| Untracked files | not staged, not committed, not deleted |
+
+Revisions 12 and 13 add a fence check of their own, against `fb3641f..458e86c`
+plus the revision-13 code:
+
+| Fence | Result |
+|---|---|
+| `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
+| ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §3 body text only) |
+| Durable format / schema version | unchanged up to `458e86c`; revision 13's split is a predicate/alias change, no schema or stored-format change |
+| Compile cache key list | unchanged; the physical-key component from revision 11 stays |
+| Coarse acquisition behavior | byte-for-byte the same relation: `can_provision_task_source_config` keeps the Task exact-reference claim and `b5_enforcement`'s coarse assertions still fail without it |
 | Untracked files | not staged, not committed, not deleted |
 
 ## Deliberate non-reachability
@@ -1534,6 +1614,18 @@ the earlier boundary remains auditable.
     `(LogicalAgent/pinned AgentType, exact Source/Config, physical binding)` —
     including source revision and config digest — before budget, cache or
     durable-block wiring lands.
+19. **(rev 13)** **A coarse exact-reference claim had leaked into the reusable
+    B.4 conjunct.** `can_provision_task_source_config` still rejected a Task
+    whose authored `sandbox_policy` reference was absent from the imported
+    evidence. On `SECURITY_V1` that refused a legal independent Task fine policy
+    before the `P_eff` coverage proof, because the Task layer is already met into
+    `TaskSecurityBinding`. The relation is now split: the reusable conjunct is
+    exported separately for the security path, and the exact-reference claim
+    stays on the coarse predicate. Every acquisition fixture used
+    `sandbox_policy: None`, which is why the earlier suites did not see it; the
+    new acquisition test uses a real distinct Task reference. This is a
+    candidate-eligibility correctness fix, not a privilege boundary: the leaked
+    check over-rejected, it never granted authority.
 
 ## Verification
 
@@ -1722,8 +1814,26 @@ reason.
 
 Revision 12 is docs-only and re-runs none of the gates. It adds no code, schema or
 test; it records the conditional-acceptance review of `181c9e0` and the two hard
-conditions carried into B5.2-C and B5.2-E. The revision-11 suite result above
-remains the last executed code gate and is not re-attested here.
+conditions carried into B5.2-C and B5.2-E. Revision 13 re-runs the gate (below),
+so the revision-11 result is no longer the last executed code gate.
+
+Revision 13 ships code in the same draft pull request and re-runs the full gate:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 58 suites, 1107 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+Each revision-13 guard was mutation-checked: the guard was disabled, the affected
+test was run, and it failed for the expected reason.
+
+| Guard disabled | Failing test |
+|---|---|
+| the security branch calls the coarse `can_provision_task_source_config` instead of the reusable conjunct | `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` — `InvalidAuthority("... Task sandbox policy task-fine-policy@1 is not enforced by imported evidence")` |
+| the coarse predicate's Task-reference flag forced off | `b5_enforcement::the_task_policy_reference_is_coarse_only` — the coarse predicate returns `Ok` |
 
 The workspace suite includes the following new test modules, all green at
 revision 1:
@@ -1752,7 +1862,9 @@ negatives), with the other counts unchanged.
 At revision 11's code head `39e85c5`, `b5_enforcement` holds 39 (the alias/key
 positive, its cross-domain negative, and the reference-ceiling test) and
 `b5_security_acquisition` holds 18 (the real-transaction `primary -> k2` test);
-the other counts are unchanged.
+the other counts are unchanged. At revision 13, `b5_enforcement` holds 40 (the
+coarse-only Task policy reference split) and `b5_security_acquisition` holds 19
+(the independent Task fine policy acquisition).
 
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
@@ -1783,6 +1895,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. Not implemented |
 | 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. Not implemented |
 | 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated. Not implemented |
+| 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
@@ -1793,14 +1906,17 @@ implemented in revision 10 (`0a0ed56`), items 13 and 14 in revision 11
 (`39e85c5`), in the same unmerged draft pull request as the Gate. Items 15–17 are
 the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision;
 revision 12 accepts that decomposition and carries the two hard conditions into
-the follow-ups without adding code.
+the follow-ups without adding code. Item 18 is the revision-13 fix for the
+coarse Task exact-reference leak in the reusable conjunct.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
 request; complete `SECURITY_V1` acquisition orchestration is still open. As with
 every finding in this record, the row is evidence for the re-audit, not a
 closure. Revision 11 specifically does not claim P2-1 fully closed, because the
-trusted importer proof (item 16) remains open.
+trusted importer proof (item 16) remains open. Revision 13 fixes a
+candidate-eligibility over-rejection in the same Gate and does not close it
+either.
 
 ## Evidence index
 
@@ -1823,6 +1939,7 @@ trusted importer proof (item 16) remains open.
 | Coarse acquisition gate | `crates/agentype-storage-sqlite/src/provisioning.rs` (`reject_security_v1_coarse_acquisition` and the `AcquisitionMode::Coarse` branches) |
 | Security acquisition entry point | `crates/agentype-storage-sqlite/src/provisioning.rs` (`acquire_security_v1_task_existing`, the `finish_acquisition` security branch), `kernel.rs` (`Kernel::acquire_security_v1_task_existing`) |
 | Security acquisition conformance | `crates/agentype-storage-sqlite/tests/b5_security_acquisition.rs` |
+| Reusable B.4 provisioning conjunct vs the coarse Task policy reference | `crates/agentype-agent-contract/src/predicates.rs` (`can_provision_task_source_config_reusable`, `can_provision_task_source_config`), `crates/agentype-agent-contract/tests/b5_enforcement.rs` (`the_task_policy_reference_is_coarse_only`) |
 | Supported-surface feature wiring | `crates/agentype-runtime/Cargo.toml`, `tests/public-api/Cargo.toml` |
 | Public-API probes | `tests/public-api/src/lib.rs` (probes 18 and 31) |
 | ADR — composite authority | `docs/decisions/0013-m6b5-policy-authority-algebra-identity.md` §5 |
