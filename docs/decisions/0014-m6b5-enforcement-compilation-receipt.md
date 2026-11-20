@@ -299,11 +299,10 @@ shrink the candidate set, select among the compiled subset, or introduce a new
 semantic selection policy. A budget defer is an operator-visible liveness
 classification, never a security rejection of any candidate.
 
-#### Durable encoding (schema v10)
+#### Durable encoding (schema v11)
 
-The diagnostic is the `security_acquisition_blocks` table. It is the only new
-durable object B5.2 adds, and it carries no Attempt, Lease, Execution or Task
-authority:
+The diagnostic is the `security_acquisition_blocks` table. It carries no
+Attempt, Lease, Execution or Task authority:
 
 ```text
 task_id                    PRIMARY KEY, FK task_agent_requirements(task_id)
@@ -349,10 +348,37 @@ reader MUST rebuild the row through the same validation and re-bind
 `generation_id` to the Task's durable dispatch generation: the recorded generation
 is a consequence of that binding, not an independent input.
 
-The schema is fresh-only: version 10 rejects a v9 file at open under the existing
+The schema is fresh-only: version 11 rejects a v10 file at open under the existing
 D-DB-MIGRATE rule, and there is no in-place migration and no backfill of a
 historical block. A budget defer therefore leaves no durable trace until the
 control plane records one; it never mints a partial selection.
+
+#### Trusted-importer attestations (schema v11)
+
+Version 11 also adds `enforcement_profile_attestations`, the durable external
+fact that a profile digest alone cannot contain:
+
+```text
+attestation_digest         PRIMARY KEY; commits to every other field
+profile_digest             the exact imported-profile identity this covers
+importer_id                the trusted importer that observed the domain
+importer_protocol          agentype-enforcement-profile-attest/1
+adapter_kind               exact physical adapter kind
+adapter_binding_key        exact resolved physical key, never the B.4 alias
+issued_at, valid_until     half-open validity window (issued_at <= now < valid_until)
+recorded_at                durable write time; not part of freshness
+```
+
+The producer writes one immutable row per attestation, indexed by
+`(profile_digest, issued_at DESC)`. A refresh is a new row with a new identity
+and window; rows are never updated or deleted, and one profile digest cannot
+move its physical domain between rows. Acquisition re-reads the freshest row
+valid at its clock inside the same transaction and rebuilds it through the
+validated constructor, so a tampered or hand-written row fails closed instead of
+being trusted. Absence and expiry both reject the candidate with
+`InvalidAuthority` before qualification, config settlement or any Attempt/Lease.
+The row grants no Task authority by itself; it only says which importer
+observed that exact physical domain and when.
 
 Classification is strict:
 
@@ -404,6 +430,19 @@ alias. An uncovered subject, a foreign physical domain, and an inactive source o
 binding are candidate-local ineligibility: never partial enforcement and never a
 Task failure.
 
+B5.2-C closes the provenance gap that the profile digest left open. A digest
+proves only that the document is internally consistent: the same caller that
+supplies the support matrix, covered subjects and physical key also computes the
+digest. The acquired profile therefore MUST also have a fresh
+`enforcement_profile_attestations` row for its exact digest, importer identity,
+protocol and resolved physical domain (§4). The gate runs at the top of the
+`SECURITY_V1` acquisition branch, before the reusable B.4 conjunct,
+`ValidatedSourceBinding::validate`, qualification, config settlement or any
+Attempt/Lease. The caller cannot supply the attestation; it is re-read from the
+transaction. A wider support matrix, forged subject coverage, stale evidence, a
+foreign physical domain, and a physical key moved under a stable alias are all
+different profile identities and therefore all unattested.
+
 The digest records the profile identity, not the chosen enforcement subject.
 Two subject proofs over one profile therefore share the same
 `SecurityEvidenceSubject::digest()`. That is sufficient for candidate
@@ -418,10 +457,14 @@ and binds it in the `ExecutionSecuritySnapshot`.
 matrix and covered subjects, so `SelfConsistentProfile ≠ TrustedPhysicalEvidence`:
 the code proves that the profile is internally consistent with its declared
 `(adapter_kind, adapter_binding_key)`, not that a real integration can enforce
-those restrictions. Trusted importer identity, exact domain ownership, profile
-freshness and actual enforcement-subject attestation are B5.2→B5.4 handoff
-conditions. Constructor visibility is not, and MUST NOT become, the security
-boundary (cf. #31).
+those restrictions. B5.2-C now requires a durable trusted-importer attestation of
+that exact identity and domain before acquisition, but the importer's own
+observation is still an external claim. The remaining handoff condition is the
+actual enforcement-subject attestation at B5.4: the acquisition re-checks the
+caller's subject against the profile and persists no proof, so B5.4 MUST bind the
+`ExecutionSecurityEvidence` subject identity, not reuse the profile digest as if
+it were a physical subject proof. Constructor visibility is not, and MUST NOT
+become, the security boundary (cf. #31).
 
 ### 6. Two time scales, and an explicit security snapshot
 

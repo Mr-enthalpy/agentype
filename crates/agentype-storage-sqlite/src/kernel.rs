@@ -1084,13 +1084,45 @@ impl Kernel {
         })
     }
 
+    /// Record one immutable trusted-importer attestation (M6-B.5 B5.2).
+    ///
+    /// This is the provisioning producer's durable write path. The attestation
+    /// covers an exact imported profile digest and physical adapter domain;
+    /// acquisition reads the freshest currently valid row transactionally. The
+    /// write grants no Task authority by itself.
+    pub fn record_enforcement_profile_attestation(
+        &self,
+        attestation: &agentype_agent_contract::EnforcementProfileAttestation,
+        recorded_at: agentype_core::UnixTime,
+    ) -> Result<(), Error> {
+        self.tx(|tx, _| {
+            crate::profile_attestation::record_enforcement_profile_attestation(
+                tx,
+                attestation,
+                recorded_at,
+            )
+        })
+    }
+
+    /// The validated latest attestation for an exact imported profile digest.
+    ///
+    /// This is a diagnostic read without a freshness check; acquisition uses
+    /// the transactional current-attestation read instead.
+    pub fn get_enforcement_profile_attestation(
+        &self,
+        profile_digest: &str,
+    ) -> Result<Option<agentype_agent_contract::EnforcementProfileAttestation>, Error> {
+        self.tx(|tx, _| {
+            crate::profile_attestation::enforcement_profile_attestation(tx, profile_digest)
+        })
+    }
+
     pub fn get_logical_agent_type_binding(
         &self,
         agent_id: &agentype_core::LogicalAgentId,
     ) -> Result<Option<AgentTypeRef>, Error> {
         self.tx(|tx, _| crate::requirement::get_logical_agent_type_binding(tx, agent_id))
     }
-
     pub fn get_generation_policy(
         &self,
         generation_id: &agentype_core::GenerationId,

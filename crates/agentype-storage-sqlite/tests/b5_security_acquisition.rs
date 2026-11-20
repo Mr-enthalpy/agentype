@@ -17,13 +17,14 @@ use agentype_agent_contract::{
     AgentRequirementDraft, AgentType, AgentTypeContract, AgentTypeRef, AgentTypeSelector,
     BindingSnapshot, Budget, CapabilityDefinition, CapabilityPolarity, CapabilityRef,
     CapabilityValue, ConfigDigest, ConfigStatus, ContinuityMode, CredentialRef, EnforcementFeature,
-    EnforcementProfileRef, EnforcementSubject, EnforcementSupport, GenerationPolicy,
-    ImportedEnforcementProfile, LifecycleMode, MatcherKind, MaterializationDigest, NetworkPolicy,
-    NormalizedSandboxPolicy, PathSelector, PhysicalSafety, PolicyInput,
-    ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityClass, SecurityContract,
+    EnforcementProfileAttestation, EnforcementProfileRef, EnforcementSubject, EnforcementSupport,
+    GenerationPolicy, ImportedEnforcementProfile, LifecycleMode, MatcherKind,
+    MaterializationDigest, NetworkPolicy, NormalizedSandboxPolicy, PathSelector, PhysicalSafety,
+    PolicyInput, ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityClass, SecurityContract,
     SecurityContractMode, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
-    SpawnSourceSecurityDeclaration, WorkingDirectory, POLICY_ONLY_REFERENCE_PROFILE,
-    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION, RESOLVER_VERSION,
+    SpawnSourceSecurityDeclaration, WorkingDirectory, ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
+    RESOLVER_VERSION,
 };
 use agentype_core::{
     Clock, Error, ExecutionId, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent,
@@ -48,6 +49,12 @@ const ADAPTER_KIND: &str = "default";
 /// these fixtures the B.4 alias and the physical key happen to be the same
 /// string; the imported profile must name this physical key, not the alias.
 const ADAPTER_BINDING_KEY: &str = "k1";
+/// The trusted importer identity every fixture attestation names.
+const TEST_IMPORTER: &str = "test-local-importer";
+/// The attestation window the shared fixture helper records. It comfortably
+/// contains the `ManualClock` value `1_000.0` used by the acquisition tests.
+const ATTESTATION_ISSUED_AT: f64 = 900.0;
+const ATTESTATION_VALID_UNTIL: f64 = 2_000.0;
 
 fn nanos() -> u128 {
     std::time::SystemTime::now()
@@ -386,10 +393,25 @@ fn profile(
 }
 
 fn selected(
+    kernel: &Kernel,
     provisioning: ResolvedProvisioningSelection,
     profile: ImportedEnforcementProfile,
     subject: EnforcementSubject,
 ) -> SecurityProvisioningSelection {
+    // B5.2-C: a profile digest alone is self-consistent input, not trusted
+    // evidence. The shared fixture records the producer's attestation exactly as
+    // the runtime importer would, so each test exercises the acquisition gate.
+    let attestation = EnforcementProfileAttestation::new(
+        &profile,
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&attestation, ATTESTATION_ISSUED_AT)
+        .unwrap();
     SecurityProvisioningSelection {
         provisioning,
         profile,
@@ -540,6 +562,7 @@ fn a_qualified_candidate_is_selectable() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "qualified", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -594,6 +617,7 @@ fn a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable() 
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "task_fine", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -625,6 +649,7 @@ fn a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "b4_boundary", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -763,6 +788,7 @@ fn a_security_v1_claim_cannot_be_acknowledged_as_success() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "ack_boundary", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -872,6 +898,7 @@ fn the_binding_alias_resolves_to_the_selections_physical_key() {
     );
     assert_eq!(provisioning.adapter_binding_key, "k2");
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -904,6 +931,7 @@ fn an_uncovered_profile_is_rejected_before_attempt_or_lease() {
     let profile_ref = reference_profile_ref();
     let provisioning = security_catalog(kernel, "uncovered", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -935,6 +963,7 @@ fn an_uncovered_subject_is_rejected_before_attempt_or_lease() {
     // The profile covers every obligation but does not claim the executing
     // subject. The audit's P2-1 fix must turn that into ineligibility.
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -967,6 +996,7 @@ fn a_profile_imported_for_another_physical_domain_is_rejected_before_attempt_or_
     // physical adapter domain than the selection resolved: the validated tuple
     // must reject it.
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -999,6 +1029,7 @@ fn the_durable_declaration_wins_over_the_callers_profile() {
     let declared = reference_profile_ref();
     let provisioning = security_catalog(kernel, "declaration", Some(&declared), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             full_support_profile_ref(),
@@ -1041,6 +1072,7 @@ fn a_credential_bearing_config_is_fail_closed_even_when_the_profile_can_deliver(
         vec![CredentialRef::new("vault://codex-prod").unwrap()],
     );
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1077,6 +1109,7 @@ fn a_requested_credential_the_profile_cannot_deliver_is_rejected_before_attempt_
         vec![CredentialRef::new("vault://codex-prod").unwrap()],
     );
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1141,6 +1174,7 @@ fn evidence_resolved_for_another_config_cannot_authorize_this_config() {
     provisioning.catalog_frontier_digest = kernel.catalog_frontier_digest().unwrap();
 
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1198,6 +1232,7 @@ fn an_agent_type_capability_the_source_cannot_provide_is_rejected() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "functional", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1236,6 +1271,7 @@ fn a_config_that_cannot_realize_the_agent_type_continuity_is_rejected() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "continuity", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1272,6 +1308,7 @@ fn a_config_that_cannot_realize_the_agent_type_lifecycle_is_rejected() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "lifecycle", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1304,6 +1341,7 @@ fn a_disabled_source_config_is_rejected_even_with_a_refreshed_frontier() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "disabled-config", Some(&profile_ref), Vec::new());
     let mut candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1358,6 +1396,7 @@ fn the_two_acquisition_chains_are_disjoint() {
     let provisioning =
         security_catalog(kernel, "disjoint-security", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1389,6 +1428,7 @@ fn a_coarse_agent_type_is_not_a_security_candidate() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "coarse-agent", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1428,6 +1468,7 @@ fn the_callers_subject_is_the_one_proved() {
     let provisioning =
         security_catalog(kernel, "requested-subject", Some(&profile_ref), Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1460,6 +1501,7 @@ fn a_coarse_source_cannot_provision_a_security_task() {
     let profile_ref = full_support_profile_ref();
     let provisioning = security_catalog(kernel, "coarse-source", None, Vec::new());
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1570,6 +1612,7 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
         catalog_frontier_digest: kernel.catalog_frontier_digest().unwrap(),
     };
     let candidate = selected(
+        kernel,
         provisioning,
         profile(
             profile_ref,
@@ -1592,6 +1635,340 @@ fn an_impossible_source_ceiling_is_candidate_local_ineligibility() {
         .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
         .unwrap_err();
     assert_candidate_rejection(&error, "source ceiling and candidate policies do not meet");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+fn unattested(
+    provisioning: ResolvedProvisioningSelection,
+    profile: ImportedEnforcementProfile,
+    subject: EnforcementSubject,
+) -> SecurityProvisioningSelection {
+    SecurityProvisioningSelection {
+        provisioning,
+        profile,
+        subject,
+    }
+}
+
+fn record_attestation(
+    kernel: &Kernel,
+    profile: &ImportedEnforcementProfile,
+    issued_at: f64,
+    valid_until: f64,
+) {
+    let attestation = EnforcementProfileAttestation::new(
+        profile,
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        issued_at,
+        valid_until,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&attestation, issued_at)
+        .unwrap();
+}
+
+#[test]
+fn a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease() {
+    let env = Env::new("unattested");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "unattested", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "unattested", Some(&profile_ref), Vec::new());
+    let candidate = unattested(
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+#[test]
+fn a_stale_trusted_importer_attestation_is_rejected_until_a_fresh_row_exists() {
+    let env = Env::new("stale_attestation");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "stale_attestation", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning =
+        security_catalog(kernel, "stale_attestation", Some(&profile_ref), Vec::new());
+    let candidate = unattested(
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    // The observation ended before the acquisition clock (1_000.0).
+    record_attestation(kernel, &candidate.profile, 100.0, 500.0);
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+
+    // A refresh is a new immutable row for the same profile digest, not an
+    // update of the expired one.
+    record_attestation(
+        kernel,
+        &candidate.profile,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    );
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    assert_eq!(acquired.claim.task_id, task);
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+}
+
+#[test]
+fn a_wider_support_profile_cannot_borrow_a_narrower_attestation() {
+    let env = Env::new("wider_unattested");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "wider_unattested", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "wider_unattested", Some(&profile_ref), Vec::new());
+    let attested = profile(
+        profile_ref.clone(),
+        ADAPTER_BINDING_KEY,
+        full_support_without_credentials(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    record_attestation(
+        kernel,
+        &attested,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    );
+    // The caller now names a wider support matrix. Its digest is different, so
+    // the narrower attestation cannot cover it.
+    let wider = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let candidate = unattested(
+        provisioning,
+        wider,
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+#[test]
+fn an_attestation_for_another_physical_domain_cannot_authorize_this_binding() {
+    let env = Env::new("foreign_attestation");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "foreign_attestation", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(
+        kernel,
+        "foreign_attestation",
+        Some(&profile_ref),
+        Vec::new(),
+    );
+    let foreign = profile(
+        profile_ref.clone(),
+        "k2",
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    record_attestation(
+        kernel,
+        &foreign,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    );
+    // The durable selection resolves to k1. The k2 attestation cannot be reused
+    // for a profile that names k1.
+    let selected_profile = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let candidate = unattested(
+        provisioning,
+        selected_profile,
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+#[test]
+fn a_trusted_importer_attestation_is_write_once_and_tamper_evident() {
+    let env = Env::new("attestation_durable");
+    let kernel = &env.kernel;
+    let profile_ref = full_support_profile_ref();
+    let profile = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let attestation = EnforcementProfileAttestation::new(
+        &profile,
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&attestation, ATTESTATION_ISSUED_AT)
+        .unwrap();
+    // Re-recording the identical attestation is an idempotent no-op.
+    kernel
+        .record_enforcement_profile_attestation(&attestation, ATTESTATION_ISSUED_AT + 1.0)
+        .unwrap();
+    assert_eq!(count(&env, "enforcement_profile_attestations"), 1);
+    let stored = kernel
+        .get_enforcement_profile_attestation(profile.profile_digest())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, attestation);
+
+    // Attestations are immutable: neither an edit nor a delete is a refresh.
+    let raw = env.raw();
+    let update = raw
+        .execute(
+            "UPDATE enforcement_profile_attestations SET importer_id='evil'",
+            [],
+        )
+        .unwrap_err();
+    assert!(update.to_string().contains("immutable"), "{update}");
+    let delete = raw
+        .execute("DELETE FROM enforcement_profile_attestations", [])
+        .unwrap_err();
+    assert!(delete.to_string().contains("durable"), "{delete}");
+
+    // One profile digest cannot move its physical domain between rows.
+    let moved = raw
+        .execute(
+            "INSERT INTO enforcement_profile_attestations
+             (attestation_digest, profile_digest, importer_id, importer_protocol,
+              adapter_kind, adapter_binding_key, issued_at, valid_until, recorded_at)
+             VALUES ('sha256:moved', ?1, 'evil', ?2, 'default', 'k2', 900.0, 2000.0, 900.0)",
+            rusqlite::params![
+                profile.profile_digest(),
+                ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        moved
+            .to_string()
+            .contains("cannot move its physical domain"),
+        "{moved}"
+    );
+
+    // A row whose stored digest does not describe its parts fails closed on read
+    // instead of being returned as a trusted fact.
+    raw.execute(
+        "INSERT INTO enforcement_profile_attestations
+         (attestation_digest, profile_digest, importer_id, importer_protocol,
+          adapter_kind, adapter_binding_key, issued_at, valid_until, recorded_at)
+         VALUES ('sha256:tampered', 'sha256:other-profile', 'evil', ?1, 'default', 'k3', 900.0, 2000.0, 900.0)",
+        rusqlite::params![ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL],
+    )
+    .unwrap();
+    let error = kernel
+        .get_enforcement_profile_attestation("sha256:other-profile")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not describe its parts"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_forged_subject_coverage_cannot_borrow_the_attested_profile() {
+    let env = Env::new("subject_unattested");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "subject_unattested", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning =
+        security_catalog(kernel, "subject_unattested", Some(&profile_ref), Vec::new());
+    let attested = profile(
+        profile_ref.clone(),
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    record_attestation(
+        kernel,
+        &attested,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    );
+    // The caller names the same profile identity but a wider subject set. The
+    // profile digest commits to the subjects, so the narrower attestation cannot
+    // be reused.
+    let forged = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [
+            EnforcementSubject::ControlledPrimaryProcess,
+            EnforcementSubject::OsRestrictedDescendant,
+        ],
+    );
+    let candidate = unattested(
+        provisioning,
+        forged,
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
     assert_no_acquisition_side_effects(&env);
 }

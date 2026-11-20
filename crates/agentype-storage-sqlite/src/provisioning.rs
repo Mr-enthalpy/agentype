@@ -1025,8 +1025,11 @@ fn resolve_incarnation(
 /// The profile is an imported external fact (ADR-0014 §5): it has no durable
 /// row, so the acquisition transaction re-checks it for subject, version and
 /// validity against the durable catalog instead of pretending it is a SQLite
-/// input. The resolver selection inside is the same plain record the coarse path
-/// uses, and every conjunct over it is re-proved in the transaction.
+/// input. Its digest alone proves only internal consistency, so the transaction
+/// also requires a fresh durable trusted-importer attestation for that exact
+/// digest and physical domain (B5.2-C). The resolver selection inside is the
+/// same plain record the coarse path uses, and every conjunct over it is
+/// re-proved in the transaction.
 #[derive(Clone, Debug)]
 pub struct SecurityProvisioningSelection {
     pub provisioning: ResolvedProvisioningSelection,
@@ -1302,6 +1305,25 @@ fn finish_acquisition(
         // with the attested config. Every failure here is candidate-local
         // (`InvalidAuthority`/`SecurityUnenforceable`), never a Task failure.
         AcquisitionMode::SecurityV1(security) => {
+            // B5.2-C: the profile digest proves only that the document is
+            // internally consistent. The exact profile must also have a fresh
+            // durable trusted-importer attestation for its physical domain
+            // before any qualification, config settlement or Attempt/Lease
+            // work. The caller cannot supply that attestation; it is re-read
+            // here from the transaction.
+            let attestation = crate::profile_attestation::current_enforcement_profile_attestation(
+                tx,
+                security.profile.profile_digest(),
+                now,
+            )?
+            .ok_or_else(|| {
+                Error::invalid_authority(
+                    "the selected enforcement profile has no fresh trusted-importer attestation",
+                )
+            })?;
+            attestation
+                .validate_at(&security.profile, now)
+                .map_err(acquisition_rejection)?;
             agentype_agent_contract::can_provision_task_source_config_reusable(
                 &actual,
                 &source,

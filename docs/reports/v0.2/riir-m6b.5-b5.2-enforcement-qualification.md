@@ -1,19 +1,20 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 16 (2026-11-20) — records the continuation-baseline review over the
-revision-15 draft head `d37c887`. It finds no new P1: the revision-14/15 Kernel
-guards are accepted as the fail-closed authority boundary for this stage. It
-confirms that PR #30–#36 are merged, so the SpawnSource declaration binding and
-the durable-block read/coherence fixes are no longer pending on this draft, and it
-adds one B5.2-E acceptance condition: with B5.4 disabled, a `SECURITY_V1` Task must
-not be cycled from `QUEUED` into an unexecutable `LEASED` state. The two P2
-constraints the review asks to keep (credential delivery is only necessary; B5.4
-subject identity) were already recorded in revisions 10 and 11 and are confirmed
-rather than reworded. No new P1, no freeze claim; B5.2-C/D/E remain separate
-follow-ups. No ADR `Status:` line, spec status or index entry changes
+Revision: 17 (2026-11-20) — records PR #37's merge (`e68a771`) and the B5.2-C
+implementation on `agent/m6b5-b5.2-c-trusted-importer`. Revision 16's
+continuation-baseline review remains the audit baseline; no new P1 is claimed
+closed. B5.2-C adds the durable trusted-importer attestation
+(`enforcement_profile_attestations`, schema v11) and makes acquisition require a
+fresh row for the exact profile digest, importer protocol and resolved physical
+domain before any qualification, config settlement or Attempt/Lease. It closes
+the provenance face of follow-up item 16 and leaves B5.2-D (complete candidate
+identity and whole-round budget) and B5.2-E (resolver→scheduler wiring and
+liveness) open. No freeze claim; no ADR `Status:` line, spec status or index
+entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
-PR #30–#36 merged; closing fixes proposed in draft PR #37)
+PR #30–#37 merged, #37 at `e68a771`; B5.2-C on
+`agent/m6b5-b5.2-c-trusted-importer`)
 Date: 2026-11-18
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
 Freeze state: **NOT FROZEN — no freeze gate has run**
@@ -55,11 +56,16 @@ separates transactional re-proof from external physical evidence.
 Revision 16 records the continuation-baseline review: it finds no new P1, accepts
 the Kernel guards as the fail-closed boundary for this stage, confirms that PR
 #30–#36 are merged, and adds the B5.2-E liveness condition. It still accepts this
-draft only as a B5.2 continuation, never as a freeze.
+draft only as a B5.2 continuation, never as a freeze. Revision 17 records PR #37's
+merge (`e68a771`) and implements B5.2-C: acquisition re-reads a durable
+trusted-importer attestation for the exact profile digest and physical domain,
+and rejects an absent or stale row before any qualification or Attempt/Lease. The
+candidate round, its whole-round budget and the resolver→scheduler wiring remain
+B5.2-D and B5.2-E.
 As with every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
-*selected-candidate transactional qualification implemented; complete
-`SECURITY_V1` acquisition orchestration remains open*.
+*selected-candidate transactional qualification with trusted-importer provenance
+implemented; complete `SECURITY_V1` orchestration remains open*.
 
 The gaps are **latent, not live**. The coarse typed acquisition path still
 rejects `SECURITY_V1` at every stage, and the runtime resolver and daemon do not
@@ -91,6 +97,7 @@ positive-obligation requirement on the complete effective policy.
 | 14 | `35e817c` (reviewed head; code in this pull request) | Records the execution-boundary review: P1 — a `Claim` from `acquire_security_v1_task_existing` could still be presented to the frozen B.4 `create_execution_with_snapshot` path and then to `confirm_running_and_renew`, because qualification persists no `ExecutionSecuritySnapshot` or receipt. `requirement::task_is_security_v1` reads the durable mode; `create_execution_in_tx` and `confirm_running_and_renew` now reject `SECURITY_V1` before any Execution insert or `RUNNING` write. Adds `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path`, which starts from the acquired `Claim`, asserts zero `executions`/`binding_snapshots`, and proves a stale `STARTING` row is not promoted. ADR-0014 §3 states the Kernel boundary. No ADR `Status:` line, spec status or index entry changes. |
 | 15 | `2e6e5c9` (reviewed head; code in this pull request) | Records the semantic-completion review: P1 — a `SECURITY_V1` `Claim` could be acknowledged with `execution_id = None`, writing `SUCCEEDED`/`COMPLETED`, a Result and dependency release without any Execution, snapshot or receipt. `ack_success` now rejects `SECURITY_V1` before any state change; the B5.4 secured acknowledgement path must be defined explicitly. P2 — rewrites ADR-0014 §3 so the transaction re-proof covers durable truth and imported-fact consistency, not external physical truth, and records the four proof layers. Adds `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success`, which also proves a BLOCKED dependent is not released. Note: because a `SECURITY_V1` Task cannot currently reach an Execution, `ack_success` rejects it even when an `execution_id` is supplied, which is deliberate and conservative. No ADR `Status:` line, spec status or index entry changes. |
 | 16 | `d37c887` (reviewed head; docs-only) | Records the continuation-baseline review: no new P1; the Kernel execution/RUNNING/acknowledgement guards are accepted as the fail-closed authority boundary. Confirms PR #30–#36 merged, so items 1–4 and 8–10 of the follow-up list are landed rather than pending here. Adds the B5.2-E liveness acceptance condition (a `SECURITY_V1` Task must not cycle `QUEUED → LEASED → lease expiry` while B5.4 is disabled) to ADR-0014 §3 and to the follow-up list. Confirms, rather than rewords, the credential-necessity and B5.4 subject-identity constraints. Docs-only; no code, ADR `Status:` line, spec status or index entry change. |
+| 17 | `agent/m6b5-b5.2-c-trusted-importer` (code) | Implements B5.2-C after PR #37 merged at `e68a771`. Adds `EnforcementProfileAttestation` (`ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION = 1`, protocol `agentype-enforcement-profile-attest/1`) with a gated producer constructor and an ungated digest-recomputing durable read. Adds schema v11 `enforcement_profile_attestations`: immutable rows keyed by `attestation_digest`, indexed by `profile_digest`, write-once, with a physical-domain-stability trigger. `finish_acquisition`'s `SecurityV1` arm re-reads the freshest row valid at `now` and rejects absence or expiry with `InvalidAuthority` before the reusable B.4 conjunct, tuple validation or qualification. New negatives cover unattested, stale-then-refresh, wider support, forged subjects, foreign domain, and write-once/tamper evidence. ADR-0014 §4 (schema v11) and §5 state the row and gate. No ADR `Status:` line, spec status or index entry change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -1496,6 +1503,76 @@ into the snapshot and receipt (ADR-0014 §5). Both were already stated in revisi
 no B5.4 claim, and no conversion of this draft's single-candidate success test into
 production orchestration.
 
+## Trusted-importer provenance implementation (revision 17)
+
+PR #37 merged at `e68a771`, so the revision-16 baseline is now `main`. Revision 17
+implements the first hard boundary, B5.2-C, on
+`agent/m6b5-b5.2-c-trusted-importer`. It does not reopen the earlier findings and
+does not touch B5.2-D or B5.2-E.
+
+**The missing fact.** `ImportedEnforcementProfile::import` computes its digest from
+the caller's own support matrix, covered subjects and physical key. The digest
+therefore proves internal consistency, not that a trusted importer observed that
+domain. Revision 17 adds the separate durable fact:
+
+- `EnforcementProfileAttestation` commits to `(profile_digest, importer_id,
+  importer_protocol, adapter_kind, adapter_binding_key, issued_at, valid_until)`
+  through its own `attestation_digest`.
+  `ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION` is `1` and the accepted
+  protocol is `agentype-enforcement-profile-attest/1`; a row under another
+  protocol is rejected, not reinterpreted.
+- `new` is gated with `provisioning-producer` (the producer's write path);
+  `from_parts` is ungated so the storage library can rebuild a row without the
+  producer feature. `from_parts` recomputes the digest and rejects a stored value
+  that does not describe its parts, so a tampered row fails closed. The digest
+  function itself is private, so `from_parts` is a read/reconstruction path, not a
+  way for an ordinary caller to mint a new attestation identity; and even a
+  constructed value is not authority, because acquisition reads the durable row
+  rather than the caller's value.
+- Freshness is half-open (`issued_at <= now < valid_until`). A non-finite clock is
+  never fresh.
+
+**Durable encoding.** Schema v11 adds `enforcement_profile_attestations`, keyed by
+`attestation_digest` and indexed by `(profile_digest, issued_at DESC)`. Rows are
+write-once: UPDATE and DELETE are rejected, and one profile digest cannot move its
+`(adapter_kind, adapter_binding_key)` between rows. A refresh is a new immutable
+row, never an edit. `record_enforcement_profile_attestation` is idempotent for an
+identical digest and rejects a digest that describes different parts.
+
+**The gate.** `finish_acquisition`'s `AcquisitionMode::SecurityV1` arm now starts
+with the transactional read
+`current_enforcement_profile_attestation(tx, profile_digest, now)`. Absence and
+expiry both reject with `InvalidAuthority` before the reusable B.4 conjunct,
+`ValidatedSourceBinding::validate`, `qualify_security_candidate`, config
+settlement or any Attempt/Lease. The caller cannot supply the attestation. The
+selected profile must also name the same physical domain and pass `validate_at`;
+because the profile digest already commits to support and subjects, a wider
+matrix or forged subject set is a different digest and therefore unattested.
+
+**Acceptance cases pinned by revision 16.** The new negatives in
+`b5_security_acquisition` map directly:
+
+| Revision-16 case | Test |
+|---|---|
+| no forged provenance | `a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease` |
+| stale physical-domain evidence is not reusable | `a_stale_trusted_importer_attestation_is_rejected_until_a_fresh_row_exists` |
+| a caller cannot widen support | `a_wider_support_profile_cannot_borrow_a_narrower_attestation` |
+| forged subject coverage | `a_forged_subject_coverage_cannot_borrow_the_attested_profile` |
+| one alias cannot swap the physical key | `an_attestation_for_another_physical_domain_cannot_authorize_this_binding` |
+| immutability and tamper evidence | `a_trusted_importer_attestation_is_write_once_and_tamper_evident` |
+
+Contract-level tests in `b5_enforcement` pin the digest stability and recompute,
+blank identities and foreign protocol, non-finite/empty windows, exact
+profile/domain binding, and half-open freshness.
+
+**What remains open.** B5.2-C gates *selected-candidate* acquisition but does not
+enumerate a whole round, rank distinct configs/bindings under one agent, or make
+an exhausted budget durable; that is B5.2-D. It also does not wire the security
+entry point into the resolver or scheduler, so production acquisition still cannot
+select a `SECURITY_V1` Task and the B5.2-E liveness condition is unchanged. The
+attestation is the importer's external observation; the actual enforcement-subject
+attestation and the secured start remain B5.4 (ADR-0014 §5).
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1556,8 +1633,9 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 13)** The reusable B.4 conjunct excludes the Task authored-policy exact-reference claim: `SECURITY_V1` proves the Task layer through `P_eff` coverage, `COARSE_V1` keeps the reference claim | `predicates.rs` `can_provision_task_source_config_reusable` / `can_provision_task_source_config`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::the_task_policy_reference_is_coarse_only`, `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable` | this pull request (rev 13) |
 | **(rev 14)** Qualification is not execution authority: a `SECURITY_V1` `Claim` cannot commit an Execution or enter `RUNNING` through the frozen B.4 paths before B5.4 | `requirement.rs` `task_is_security_v1`; `kernel.rs` `create_execution_in_tx`, `confirm_running_and_renew` | `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path` | this pull request (rev 14) |
 | **(rev 15)** Qualification is not semantic completion authority: a `SECURITY_V1` `Claim` cannot be acknowledged into `COMPLETED`/Result/dependency release before B5.4 | `kernel.rs` `ack_success` (guard after authority validation) | `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success` | this pull request (rev 15) |
+| **(rev 17)** A profile digest is not provenance: `SECURITY_V1` acquisition requires a fresh durable trusted-importer attestation for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally before any qualification, config settlement or Attempt/Lease | `enforcement.rs` `EnforcementProfileAttestation`; `profile_attestation.rs` `current_enforcement_profile_attestation`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::an_attestation_digest_is_stable_and_recomputable`, `an_attestation_binds_the_exact_profile_and_physical_domain`, `an_attestation_is_fresh_only_inside_its_half_open_window`; `b5_security_acquisition::a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease`, `a_stale_trusted_importer_attestation_is_rejected_until_a_fresh_row_exists`, `a_wider_support_profile_cannot_borrow_a_narrower_attestation`, `a_forged_subject_coverage_cannot_borrow_the_attested_profile`, `an_attestation_for_another_physical_domain_cannot_authorize_this_binding`, `a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
 
-### ADR-0014 §4 durable encoding (schema v10)
+### ADR-0014 §4 durable encoding (schema v11)
 
 | Claim | Code | Test | Commit |
 |---|---|---|---|
@@ -1571,6 +1649,8 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 6)** The recorded candidate cost equals the recorded domain size; a partial candidate cost is not a whole-round defer | `enforcement.rs` `validate_durable_truth` | `b5_enforcement::a_durable_block_must_record_the_complete_domain_as_its_candidate_cost`, `b5_acquisition_block::a_validated_read_rejects_a_block_whose_candidate_cost_is_incomplete` | `9b8d830` |
 | **(rev 6)** A same-condition record revalidates the stored row instead of returning early on two digests | `security_acquisition.rs` `record_security_acquisition_block` | `b5_acquisition_block::a_same_condition_write_revalidates_the_existing_row` | `9b8d830` |
 | **(rev 4)** The recorded cost actually exceeds the recorded budget, and `budget_limit` is exactly the exceeded bound | **absent** — `from_durable_parts` and `record_security_acquisition_block` re-check neither | **absent** | — (P2-5) |
+| **(rev 17)** A trusted-importer attestation is immutable, write-once, keyed by its own digest and indexed by the exact profile digest; one profile digest cannot move its physical domain | `schema.rs` `enforcement_profile_attestations` + immutability/domain-stability triggers; `profile_attestation.rs` `record_enforcement_profile_attestation` | `b5_security_acquisition::a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
+| **(rev 17)** A durable attestation is rebuilt through the validated constructor, so a row whose stored digest does not describe its parts fails closed | `enforcement.rs` `EnforcementProfileAttestation::from_parts`; `profile_attestation.rs` `raw_attestation_row` | `b5_enforcement::an_attestation_digest_is_stable_and_recomputable`, `b5_security_acquisition::a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
 
 ### ADR-0014 §13–§14 — obligations and the policy-only reference profile
 
@@ -1636,6 +1716,18 @@ Revisions 12–16 add a fence check of their own, against
 | Durable format / schema version | unchanged up to `d37c887`; revision 13's split is a predicate/alias change and revisions 14–15 add kernel checks, so no schema or stored-format change; revision 16 is docs-only |
 | Compile cache key list | unchanged; the physical-key component from revision 11 stays |
 | Coarse acquisition behavior | byte-for-byte the same relation: `can_provision_task_source_config` keeps the Task exact-reference claim and `b5_enforcement`'s coarse assertions still fail without it; the revision-14/15 guards read the Task mode and leave `COARSE_V1`/`LEGACY` Execution and acknowledgement paths unchanged |
+| Untracked files | not staged, not committed, not deleted |
+
+Revision 17 adds a fence check of its own, against `e68a771..HEAD` on
+`agent/m6b5-b5.2-c-trusted-importer`:
+
+| Fence | Result |
+|---|---|
+| `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
+| ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §4 heading and §5 body text only) |
+| Durable format / schema version | **intentionally** `10 → 11`; adds only the `enforcement_profile_attestations` table, its profile index and its immutability/domain-stability triggers; no existing table, column or row changes, and the fresh-only open rule is unchanged |
+| Compile cache key list | unchanged; the physical-key component from revision 11 stays |
+| Coarse acquisition behavior | unchanged: the attestation gate is inside `AcquisitionMode::SecurityV1`, and `b5_coarse_path_gate` / `b4_provisioning_binding` pass |
 | Untracked files | not staged, not committed, not deleted |
 
 ## Deliberate non-reachability
@@ -1763,18 +1855,22 @@ the earlier boundary remains auditable.
     B5.2 defect (the acquisition re-checks the caller's subject and persists no
     proof), but B5.4 must bind `(PlanIdentity, ProfileIdentity, SubjectIdentity)`
     or a versioned `subject_proof_digest`.
-14. **(rev 10, B5.4 handoff)** **A self-consistent profile is not trusted physical
-    evidence.** `import` still accepts the caller's support matrix and covered
-    subjects. Revision 11 key-binds that matrix and forbids widening the frozen
-    reference identity, but trusted importer identity, exact domain ownership,
-    freshness and actual subject attestation remain B5.2-C/B5.4 conditions;
-    constructor visibility is not the boundary.
-15. **(rev 11)** **P2-1 is implemented but not fully closed.** The physical
-    key/alias gap is fixed at the validated tuple, the cache key, the evidence
-    subject and the transaction, but the audit's P2-1 acceptance also requires a
-    trusted importer provenance proof. That proof is not implemented; the source
-    of `support`/`covered_subjects` is still the caller. Do not read revision 11
-    as "P2-1 closed" or as evidence reusable by B5.4 without that handoff.
+14. **(rev 10, B5.4 handoff; amended rev 17)** **A self-consistent profile is
+    not trusted physical evidence.** `import` still accepts the caller's support
+    matrix and covered subjects. Revision 11 key-binds that matrix and forbids
+    widening the frozen reference identity. Revision 17 adds the trusted-importer
+    identity, exact domain ownership and freshness as a durable attestation gated
+    at acquisition, but the importer's observation is still external and the
+    actual subject attestation remains a B5.4 condition; constructor visibility is
+    not the boundary.
+15. **(rev 11; amended rev 17)** **P2-1 is implemented but not fully closed.** The
+    physical key/alias gap is fixed at the validated tuple, the cache key, the
+    evidence subject and the transaction. Revision 17 supplies the previously
+    missing trusted-importer provenance proof as a durable, fresh,
+    domain-bound attestation, so a caller can no longer self-declare support or
+    subjects into accepted acquisition evidence. The source of a *new* attestation
+    is still the producer, and B5.4 must bind the execution subject; do not read
+    revision 17 as a B5.4 evidence handoff.
 16. **(rev 11)** **The reference-profile ceiling is enforced at import, not
     compiler-wide.** Only the exact `SECURITY_V1_POLICY_ONLY_REFERENCE_V1`
     identity is checked against the frozen matrix. A differently named or
@@ -2087,6 +2183,29 @@ The revision-15 gate above remains the last executed local code gate at `69ad80a
 CI on the docs head `d37c887` re-ran the full workspace and the two doctest targets
 and passed.
 
+Revision 17 ships B5.2-C code after PR #37 merged and re-runs the full gate at the
+`agent/m6b5-b5.2-c-trusted-importer` head:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | pass |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+The schema-version assertion moved with the bump: `catalog_contract` now expects
+11, and `b4_provisioning_binding` reads `SCHEMA_VERSION` instead of a literal.
+
+Revision-17 mutation check: making the attestation rejection optional at the
+`SecurityV1` arm makes exactly the new provenance negatives fail
+(`a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease`,
+`a_stale_trusted_importer_attestation_is_rejected_until_a_fresh_row_exists`,
+`a_wider_support_profile_cannot_borrow_a_narrower_attestation`,
+`a_forged_subject_coverage_cannot_borrow_the_attested_profile`,
+`an_attestation_for_another_physical_domain_cannot_authorize_this_binding`); the
+gate was restored and the suite went green again.
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -2119,7 +2238,10 @@ coarse-only Task policy reference split) and `b5_security_acquisition` holds 19
 (the independent Task fine policy acquisition). At revision 14,
 `b5_security_acquisition` holds 20 (the Kernel execution-boundary acceptance test);
 `b5_enforcement` stays 40. At revision 15 it holds 21 (the semantic-completion
-acceptance test).
+acceptance test). At revision 17's code head, `b5_enforcement` holds 45 (five
+attestation contract tests) and `b5_security_acquisition` holds 27 (the six
+provenance negatives and the retained positive fixtures); the other counts are
+unchanged.
 
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
@@ -2148,7 +2270,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
 | 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. Not implemented |
-| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. Not implemented |
+| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case |
 | 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. Not implemented |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
 | 19 | Keep a qualified `SECURITY_V1` `Claim` out of the frozen B.4 Execution and `RUNNING` paths (rev 14) | starting from the acquired `Claim`, `create_execution_with_snapshot` fails before any `executions`/`binding_snapshots` row; a stale `STARTING` row is not promoted to `RUNNING`; the Task stays `Leased`. Implemented in revision 14 (this pull request); removed only by the B5.4 snapshot/secured start |
@@ -2187,7 +2309,9 @@ and restricts the ADR's transactional claim to durable and imported-fact
 consistency; it likewise grants no B5.4 authority. Revision 16 records the
 continuation-baseline review, which finds no new P1, confirms the merged
 PR #30–#36 baseline, and adds the B5.2-E liveness condition; it accepts this
-draft only as a B5.2 continuation.
+draft only as a B5.2 continuation. Revision 17 implements item 16's B5.2-C
+provenance gate after PR #37 merged; it leaves items 15 and 17 (B5.2-D/E) open
+and still does not claim the Gate as closed.
 
 ## Evidence index
 
@@ -2205,8 +2329,11 @@ draft only as a B5.2 continuation.
 | Admission-time floor proof | `crates/agentype-storage-sqlite/src/requirement.rs` (lines 1341–1356, 1485–1509) |
 | Durable block read/write/release | `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
 | Source-declaration provenance | `crates/agentype-agent-contract/src/sandbox.rs` (`SpawnSourceSecurityDeclaration`), `crates/agentype-agent-contract/src/authority.rs` (`EffectiveTaskAuthority::new`), `crates/agentype-storage-sqlite/src/catalog.rs` (`insert_spawn_source_declaration`) |
-| Schema v10 table and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (lines 1293–1359) |
-| Kernel wrappers | `crates/agentype-storage-sqlite/src/kernel.rs` (lines 1056–1081) |
+| Schema v10 block table and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`security_acquisition_blocks`) |
+| Schema v11 attestation table, index and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`enforcement_profile_attestations`) |
+| Trusted-importer attestation value object | `crates/agentype-agent-contract/src/enforcement.rs` (`EnforcementProfileAttestation`) |
+| Durable attestation read/write | `crates/agentype-storage-sqlite/src/profile_attestation.rs` |
+| Kernel wrappers | `crates/agentype-storage-sqlite/src/kernel.rs` (`record_enforcement_profile_attestation`, `get_enforcement_profile_attestation`, the block wrappers) |
 | Coarse acquisition gate | `crates/agentype-storage-sqlite/src/provisioning.rs` (`reject_security_v1_coarse_acquisition` and the `AcquisitionMode::Coarse` branches) |
 | Security acquisition entry point | `crates/agentype-storage-sqlite/src/provisioning.rs` (`acquire_security_v1_task_existing`, the `finish_acquisition` security branch), `kernel.rs` (`Kernel::acquire_security_v1_task_existing`) |
 | Security acquisition conformance | `crates/agentype-storage-sqlite/tests/b5_security_acquisition.rs` |
