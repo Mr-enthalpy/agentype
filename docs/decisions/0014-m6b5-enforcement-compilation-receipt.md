@@ -39,11 +39,18 @@ credentials.
 
 ### 2. Compilation is root-relative
 
-`compile_execution_security` MUST take only the normalized effective policy, the
-exact adapter binding, and the imported enforcement profile. Its output is a
-**root-relative** plan: logical path selectors, not a concrete
-`agentype-jail-<request_id>` path. It MUST NOT create a directory or require
-one.
+`compile_execution_security` MUST take only the composite authority (which owns
+the normalized effective policy) and one validated source/binding/profile
+tuple. The tuple MUST prove that the exact adapter binding is the adapter policy
+the `SpawnSource` revision names, that both are active, and that the imported
+profile records the same resolved `(adapter_kind, adapter_binding_key)` physical
+domain it was imported for. B.4 `AdapterBindingPolicy.binding_ref` is a stable
+alias that resolves to the physical key; the tuple MUST carry the resolved key
+explicitly, MUST prove the profile names that key, and MUST NOT accept an
+alias-only equality as the binding identity. The key, not the alias, is what the
+Execution and its `BindingSnapshot` freeze. Its output is a **root-relative**
+plan: logical path selectors, not a concrete `agentype-jail-<request_id>` path.
+It MUST NOT create a directory or require one.
 
 `prepare` binds the logical selectors to the attested jail base and workspace
 mapping and returns a descriptor. It MUST NOT claim to have observed the actual
@@ -87,6 +94,7 @@ readiness preflight
     → effective policy derivation
     → imported profile coverage check
     → bounded root-relative compile
+    → subject proof (the profile claims the exact enforcement subject)
     → SourceConfig attest (read-only)
     → credential probe (when needed)
     → complete eligible candidate set
@@ -97,6 +105,119 @@ readiness preflight
 absolute deadline. Known-ineligible candidates are removed before private I/O.
 Credential probing comes after local static/policy/enforcement work so an invalid
 config cannot cause an external broker call.
+
+For the same reason the compile step derives **no** credential-delivery
+obligation from the effective policy's credential map. That map is the
+authorization ceiling (ADR-0013 §5); only a non-empty `SourceConfig.credential_refs`
+is a delivery **request**, and the exact config is not known until it is
+attested. Binding the attested config to the compiled plan therefore rejects a
+request the profile cannot deliver, while an empty request adds no obligation and
+leaves a policy-only profile eligible.
+
+Delivery capability is nevertheless only a **necessary** condition inside the
+pure qualification component. B5.3 owns credential qualification — the canonical
+`CredentialRequest`, the `CredentialEligibilityEvidence`, and broker
+qualification with scope, audience, use and freshness. Until those exist,
+ADR-0015 §5/§9's positive-authorization, default-deny rule governs the
+authority-bearing entry: **every** non-empty `credential_refs` is refused before
+any Attempt or Lease, whether or not the imported profile claims
+`CredentialDelivery`. A caller-supplied profile claim is never an authorization,
+so this entry can never mint delivery authority from it.
+
+The order above is not only a resolver convention. The authority-bearing
+acquisition transaction re-loads the Task security binding, the Task requirement,
+the actual bound AgentType revision with its authored policy, the source revision,
+its security declaration and its authored `P_source`. It then proves the frozen
+B.4 eligibility conjunct (below), derives the composite authority, calls
+`ValidatedSourceBinding::validate` and `qualify_security_candidate`, and completes
+the evidence subject with `with_source_config`. Only after all of that does it
+create an Attempt or a Lease. A qualification failure is candidate-local — the
+Task stays queued and no Attempt, Lease or `ProvisioningBinding` is written.
+
+The transaction does **not** re-prove external physical truth. Its inputs include
+the imported enforcement profile, the requested enforcement subject, and
+resolver-observed facts (`ResolvedProvisioningEvidence`, the resolved physical
+binding key, `attested_materialization_digest`, `provisioning_protocol`). It can
+re-read the durable catalog and check their identity, version, consistency and
+digest against other imported facts; it cannot turn a self-consistent claim into
+trusted evidence. The four layers are distinct:
+
+| Layer | B5.2 responsibility |
+|---|---|
+| Durable truth | re-read and verify inside the transaction |
+| Imported observation | verify source, identity, version and freshness (B5.2-C) |
+| Physical enforcement | trusted importer / OS capability proof (B5.2-C) |
+| Applied enforcement | B5.4 secured start and receipt |
+
+A successful `Eligible_B5.2` verdict therefore proves only the durable and
+statically consistent parts. "The bytes match, the digest is right" is never
+"the physical capability is trustworthy" and never "the policy was applied".
+
+B.5 eligibility **intersects** B.4; it does not replace it:
+
+```text
+Eligible_B5.2 = Eligible_B4,reusable
+              ∧ PolicyQualified
+              ∧ EnforcementQualified
+              ∧ CredentialQualified (when required)
+```
+
+`Eligible_B4,reusable` is the part of the frozen
+`can_provision_task_source_config` relation that is not a coarse exact-reference
+identity: source/config ownership and ACTIVE disposition, the evidence
+subject/config digest identity, AgentType lifecycle, continuity, the functional
+envelope, security-class capability evidence, and the Task's effective safety,
+continuity and restriction join. Three coarse exact-reference relations are
+replaced: `can_execute`'s Task↔AgentType policy match, `can_provision`'s "evidence
+claims this authored policy reference" claim, and the exact-reference check on the
+**Task's own** authored sandbox policy inside
+`can_provision_task_source_config`. The last one is excluded because the Task
+layer already enters `P_eff` through `TaskSecurityBinding` (the Task authored
+policy is met with the Generation, AgentType and source layers), so the compile's
+obligation-coverage proof covers it; requiring imported evidence to name that
+exact reference would refuse a legal independent Task fine policy. The reusable
+conjunct is the exported
+`can_provision_task_source_config_reusable`; the coarse-only exact-reference
+claim stays in `can_provision_task_source_config` and in the `COARSE_V1` chain.
+Dropping the rest of the shared conjunct would let the security path grant
+Attempt/Lease authority over a source/config the frozen B.4 control plane had
+already rejected.
+
+`SECURITY_V1` and `COARSE_V1` acquisition are **disjoint chains**. The coarse
+entry point refuses a `SECURITY_V1` Task, AgentType or source and keeps its frozen
+exact-reference relation; the security entry point refuses a `COARSE_V1` one.
+Neither may "downgrade" the other's identity, because the full-path identity is
+what makes the security contract dischargeable at all, and a coarse candidate has
+no declaration, no imported profile and no `P_source` to qualify.
+
+A successful `SECURITY_V1` acquisition is **qualification**, not execution
+authority. Until B5.4 persists the `ExecutionSecuritySnapshot` and the receipt
+chain, the Kernel itself keeps that authority out of the frozen B.4 execution
+paths: `create_execution_in_tx` — and therefore both `create_execution` and
+`create_execution_with_snapshot` — rejects any Task whose durable requirement mode
+is `SECURITY_V1`, with or without a `BindingSnapshot`; `confirm_running_and_renew`
+rejects the same Task before it can write `RUNNING`, even when a stale `STARTING`
+Execution row exists. Semantic completion is the same boundary: `ack_success`
+rejects a `SECURITY_V1` Attempt before it can write `SUCCEEDED`/`COMPLETED`, insert
+a Result or release dependencies, whether or not the caller supplies an
+`execution_id`. Without that, a valid Claim would publish a Result and release the
+Batch without any Execution, snapshot, physical terminal state or receipt. A
+B5.4 secured acknowledgement path must replace this refusal explicitly; it must
+not be inferred from a Claim. This is deliberately a Kernel authority-boundary
+check, not a scheduler convention: an unreachable caller today must not become a
+live bypass when B5.2-E wires the scheduler. Trusted importer provenance remains
+B5.2-C; the snapshot, secured start and receipt remain B5.4. B5.4 must also define
+how recovery treats a `SECURITY_V1` `STARTING` Execution observed through
+`record_physical_outcome`: an observation is not a secured execution, so such a
+history is recovery-required rather than a successful acknowledgement.
+
+Scheduler liveness is a B5.2-E acceptance condition, not a B5.4 refinement. With
+B5.4 disabled, production acquisition MUST NOT repeatedly move a `SECURITY_V1`
+Task from `QUEUED` into a `LEASED` state that can only expire: an unexecutable
+qualification is not a runnable Claim. The scheduler either holds an explainable
+waiting state or declines production acquisition until the secured start exists.
+Kernel refusal protects authority; it does not by itself keep the scheduler
+live.
 
 ### 4. Compile budget, memoization, and no partial selection
 
@@ -130,10 +251,14 @@ commits to the canonical guarantee document (`execution_guarantees_digest`)
 rather than to a single boolean so that a guarantee added later cannot enter the
 obligation relation while leaving the key unchanged. For the same reason the plan
 digest carries the guarantee, and `ENFORCEMENT_COMPILER_PROTOCOL` is
-`agentype-enforcement-compile/2`: a `/1` result carries neither the composed
-guarantee nor its digest and MUST NOT be reused.
+`agentype-enforcement-compile/3`: a `/1` result carries neither the composed
+guarantee nor its digest, and a `/2` result predates the request-scoped
+credential obligation, so neither MUST be reused.
 
 The key is scoped to a verifiable profile version and exact physical domain. The
+profile digest names the `(adapter_kind, binding_key)` the profile was imported
+for, so one profile cannot be compiled, memoized or replayed against a different
+binding even when its support matrix and subject set are identical. The
 cache memoizes **only** the pure compile result. It is not an eligibility proof:
 source disposition, attestation, credential eligibility, lifecycle and every
 other candidate-qualification fact are re-read and revalidated in every
@@ -186,7 +311,9 @@ generation_id              the Task's durable GenerationTaskBinding generation
 candidate_domain_digest    order-independent digest of the distinct candidate ids
 candidate_count            distinct candidate identities seen in the round
 binding_profile_digest     digest of (adapter binding policy, imported profile,
-                           compiler protocol)
+                           compiler protocol); the profile digest in turn
+                           names the adapter kind and binding key it was
+                           imported for
 cost_candidates, cost_compiles
 budget_max_candidates, budget_max_compiles
 budget_limit               CANDIDATE_COUNT | COMPILE_COUNT
@@ -262,6 +389,39 @@ the actual bound AgentType, candidate frontier, exact binding, policy digest,
 profile digest, and evidence subject. External mutable facts are checked only
 for subject, version, and validity; they are not pretended to be part of the
 SQLite transaction.
+
+A successful compilation is not yet an applied-security claim. Compilation proves
+that the profile's support matrix covers the obligations; the subject proof then
+requires the same profile to claim the exact `EnforcementSubject` of the
+execution (§14). The imported profile records the resolved
+`(adapter_kind, adapter_binding_key)` pair it was imported for, so a profile
+imported for physical domain K1 cannot be compiled against a selection for K2,
+even when both are reached through the same `binding_ref` alias and expose the
+same support matrix. The compile cache key and the evidence subject MUST commit
+to that physical key, never to the alias. `ENFORCEMENT_PROFILE_SCHEMA_VERSION` is
+`/3` because the pair is part of the profile identity and `/2` committed to the
+alias. An uncovered subject, a foreign physical domain, and an inactive source or
+binding are candidate-local ineligibility: never partial enforcement and never a
+Task failure.
+
+The digest records the profile identity, not the chosen enforcement subject.
+Two subject proofs over one profile therefore share the same
+`SecurityEvidenceSubject::digest()`. That is sufficient for candidate
+qualification — the acquisition re-checks the caller's subject and persists no
+proof — but B5.4 MUST NOT treat the existing digest as a complete physical
+subject proof. B5.4 defines the Execution-scoped evidence as
+`ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity, SubjectIdentity)`,
+or adds a versioned `subject_proof_digest` that commits to the chosen subject,
+and binds it in the `ExecutionSecuritySnapshot`.
+
+`ImportedEnforcementProfile::import` still accepts the caller's declared support
+matrix and covered subjects, so `SelfConsistentProfile ≠ TrustedPhysicalEvidence`:
+the code proves that the profile is internally consistent with its declared
+`(adapter_kind, adapter_binding_key)`, not that a real integration can enforce
+those restrictions. Trusted importer identity, exact domain ownership, profile
+freshness and actual enforcement-subject attestation are B5.2→B5.4 handoff
+conditions. Constructor visibility is not, and MUST NOT become, the security
+boundary (cf. #31).
 
 ### 6. Two time scales, and an explicit security snapshot
 
@@ -1012,6 +1172,15 @@ before the profile is cited in a freeze record. It is a positive claim in the
 further sense that a dimension not listed as supported is unsupported for this
 profile, even when it exists in the policy grammar.
 
+The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity is a **fixed**
+capability claim, not a floor to widen. A stricter platform-specific matrix is
+allowed; an imported profile for this exact identity MUST satisfy
+`Support_imported ⊆ Support_reference_profile`. `ImportedEnforcementProfile::import`
+MUST reject an over-claim at import time, not leave the widening for a later
+compiler to notice. A profile that needs any additional dimension MUST be a new,
+separately authored and versioned profile identity; it MUST NOT reuse this
+identity with a wider support matrix.
+
 Claimed supported:
 
 - per-Execution workspace content-write confinement;
@@ -1055,9 +1224,12 @@ descendants, not every effect the harness can cause.
 profile. A Task whose effective policy or guarantees require enforcement over them
 is ineligible under this profile; supporting one requires an explicit, separately
 authored and proven enforcement subject, or a new profile, not an assumption that
-a harness subagent inherits the jail. File effects produced there are not covered
-by the content-write confinement claim, and formal authority MUST NOT appear
-broader than the physical subject that can prove it.
+a harness subagent inherits the jail. The policy-only reference protocol therefore
+cannot be imported with a subject outside its claimed domain: a wider subject set
+on the reference protocol is not the escape hatch, a separately authored profile
+is. File effects produced there are not covered by the content-write confinement
+claim, and formal authority MUST NOT appear broader than the physical subject that
+can prove it.
 
 "Credential-free execution" and "no credential authorization" in this profile mean
 exactly: no Agentype-managed credential grant, delivery or committed credential

@@ -157,14 +157,35 @@ fn reference_profile_ref() -> EnforcementProfileRef {
     .unwrap()
 }
 
+/// The adapter kind and binding key every fixture profile is imported for. They
+/// must equal the fixture's `AdapterBindingPolicy`, otherwise the validated
+/// composite rejects the tuple before compilation.
+const ADAPTER_KIND: &str = "local-process";
+const ADAPTER_BINDING: &str = "codex-local/binding";
+
 fn reference_profile(subjects: [EnforcementSubject; 1]) -> ImportedEnforcementProfile {
     ImportedEnforcementProfile::import(
         reference_profile_ref(),
         1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
         EnforcementSupport::policy_only_reference(),
         subjects,
     )
     .unwrap()
+}
+
+/// Validate one source/binding/profile tuple, as the candidate path must.
+///
+/// Every fixture uses [`ADAPTER_BINDING`] as its resolved physical key; tests
+/// that exercise the alias/physical-key split call
+/// [`ValidatedSourceBinding::validate`] directly with an explicit key.
+fn validated(
+    source: &SpawnSource,
+    binding: &AdapterBindingPolicy,
+    profile: &ImportedEnforcementProfile,
+) -> ValidatedSourceBinding {
+    ValidatedSourceBinding::validate(source, binding, ADAPTER_BINDING, profile).unwrap()
 }
 
 fn task_binding_with_floor(
@@ -358,9 +379,17 @@ fn requirement_requiring_capability(
 /// only remaining candidate-local mismatch is a capability the complete policy
 /// no longer grants.
 fn full_support_profile() -> ImportedEnforcementProfile {
+    full_support_profile_for([EnforcementSubject::ControlledPrimaryProcess])
+}
+
+fn full_support_profile_for(
+    subjects: impl IntoIterator<Item = EnforcementSubject>,
+) -> ImportedEnforcementProfile {
     ImportedEnforcementProfile::import(
         EnforcementProfileRef::new("test-enforcement", "test-full-support", 1).unwrap(),
         1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
         EnforcementSupport::new([
             EnforcementFeature::WorkspaceWriteConfinement,
             EnforcementFeature::FileReadConfinement,
@@ -373,7 +402,7 @@ fn full_support_profile() -> ImportedEnforcementProfile {
             EnforcementFeature::AttemptIsolation,
             EnforcementFeature::CredentialDelivery,
         ]),
-        [EnforcementSubject::ControlledPrimaryProcess],
+        subjects,
     )
     .unwrap()
 }
@@ -429,7 +458,7 @@ fn access_fixture(
 fn qualify(
     fixture: &Fixture,
     catalog: &CapabilityCatalog,
-) -> Result<CompiledExecutionSecurity, ContractError> {
+) -> Result<ProvenExecutionSecurity, ContractError> {
     let authority = fixture.authority();
     let revision = SecurityRevision::new(
         &fixture.agent,
@@ -441,8 +470,12 @@ fn qualify(
         &authority,
         &fixture.requirement,
         &revision,
-        &adapter_binding(ConfigStatus::Active),
-        &fixture.profile,
+        &validated(
+            &fixture.source,
+            &adapter_binding(ConfigStatus::Active),
+            &fixture.profile,
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
         catalog,
     )
 }
@@ -555,7 +588,11 @@ fn compilation_returns_a_root_relative_plan_and_a_partial_subject() {
     let fixture = confined_fixture();
     let authority = fixture.authority();
     let binding = adapter_binding(ConfigStatus::Active);
-    let compiled = compile_execution_security(&authority, &binding, &fixture.profile).unwrap();
+    let compiled = compile_execution_security(
+        &authority,
+        &validated(&fixture.source, &binding, &fixture.profile),
+    )
+    .unwrap();
 
     // The plan is the logical effective policy; no concrete jail path exists.
     let plan = compiled.plan();
@@ -626,7 +663,11 @@ fn compilation_returns_a_root_relative_plan_and_a_partial_subject() {
     );
 
     // The same inputs compile to the same bytes.
-    let again = compile_execution_security(&authority, &binding, &fixture.profile).unwrap();
+    let again = compile_execution_security(
+        &authority,
+        &validated(&fixture.source, &binding, &fixture.profile),
+    )
+    .unwrap();
     assert_eq!(again.plan_digest(), compiled.plan_digest());
     assert_eq!(again.cache_key(), compiled.cache_key());
 }
@@ -636,7 +677,11 @@ fn the_subject_completes_only_with_its_own_source_config() {
     let fixture = confined_fixture();
     let authority = fixture.authority();
     let binding = adapter_binding(ConfigStatus::Active);
-    let compiled = compile_execution_security(&authority, &binding, &fixture.profile).unwrap();
+    let compiled = compile_execution_security(
+        &authority,
+        &validated(&fixture.source, &binding, &fixture.profile),
+    )
+    .unwrap();
 
     let config = source_config(&fixture.source.source_ref);
     let completed = compiled.clone().with_source_config(&config).unwrap();
@@ -666,6 +711,244 @@ fn the_subject_completes_only_with_its_own_source_config() {
     assert_ne!(other.evidence_subject().digest().unwrap(), digest);
 }
 
+/// ADR-0014 §3: the `SECURITY_V1` path intersects the frozen B.4 source/config
+/// eligibility, it does not replace it. These are the conjuncts the coarse path
+/// has always proven and the security path must not drop.
+#[test]
+fn the_provisioning_conjunct_is_shared_by_both_paths() {
+    let fixture = confined_fixture();
+    let binding = adapter_binding(ConfigStatus::Active);
+    let config = source_config(&fixture.source.source_ref);
+    let agent_policy = fixture
+        .agent
+        .contract
+        .sandbox_policy
+        .clone()
+        .expect("the fixture pins an authored policy");
+    let evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        vec![agent_policy.clone()],
+        Vec::new(),
+    )
+    .unwrap();
+    let catalog = CapabilityCatalog::new();
+
+    can_provision_task_source_config(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &evidence,
+        &catalog,
+        &fixture.requirement.hard,
+    )
+    .expect("the fixture is physically eligible");
+
+    // The coarse-only authored-policy reference claim is the conjunct the
+    // security path replaces: the shared conjunct accepts evidence that does not
+    // list the policy reference (the compile proves obligation coverage
+    // instead), while the coarse predicate still refuses it.
+    let coarse_evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    let conjunct = |agent: &AgentType,
+                    source: &SpawnSource,
+                    config: &SourceConfig,
+                    evidence: &ResolvedProvisioningEvidence,
+                    catalog: &CapabilityCatalog| {
+        can_provision_task_source_config_reusable(
+            agent,
+            source,
+            config,
+            evidence,
+            catalog,
+            &fixture.requirement.hard,
+        )
+    };
+
+    assert!(can_provision(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &coarse_evidence,
+        &catalog
+    )
+    .is_err());
+    assert!(conjunct(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &coarse_evidence,
+        &catalog
+    )
+    .is_ok());
+
+    // ACTIVE disposition: a disabled config is not eligible, so the security
+    // path cannot select one even when its caller refreshes the frontier.
+    let mut disabled = config.clone();
+    disabled.status = ConfigStatus::Disabled;
+    assert!(matches!(
+        conjunct(
+            &fixture.agent,
+            &fixture.source,
+            &disabled,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::SourceConfigInvalid { .. }
+    ));
+
+    // Evidence carries the exact source/config identity: evidence for another
+    // config digest must never authorize this config.
+    let foreign_digest = ConfigDigest::new(format!("sha256:{}", "2".repeat(64))).unwrap();
+    let foreign = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        foreign_digest,
+        binding.required_safety.clone(),
+        vec![agent_policy],
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(matches!(
+        conjunct(&fixture.agent, &fixture.source, &config, &foreign, &catalog).unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    // A functional capability the source envelope cannot provide.
+    let mut functional_catalog = CapabilityCatalog::new();
+    functional_catalog
+        .define(
+            capability_ref("process.spawn"),
+            MatcherKind::Bool,
+            SecurityClass::Functional,
+            CapabilityPolarity::Ability,
+        )
+        .unwrap();
+    let mut functional_agent = fixture.agent.clone();
+    functional_agent
+        .contract
+        .required_capabilities
+        .insert(capability_ref("process.spawn"), CapabilityValue::Bool(true));
+    assert!(matches!(
+        conjunct(
+            &functional_agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &functional_catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+
+    // The config's continuity envelope must realize the AgentType continuity.
+    let mut narrowed = config.clone();
+    narrowed.continuity_modes = Some([ContinuityMode::None].into_iter().collect());
+    let mut continuity_agent = fixture.agent.clone();
+    continuity_agent.contract.continuity = ContinuityMode::Logical;
+    assert!(matches!(
+        conjunct(
+            &continuity_agent,
+            &fixture.source,
+            &narrowed,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+
+    // The config's lifecycle must realize the AgentType lifecycle.
+    let mut lifecycle_agent = fixture.agent.clone();
+    lifecycle_agent.contract.lifecycle = [LifecycleMode::Revivable].into_iter().collect();
+    assert!(matches!(
+        conjunct(
+            &lifecycle_agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &catalog
+        )
+        .unwrap_err(),
+        ContractError::CapabilityMismatch { .. }
+    ));
+}
+
+/// ADR-0014 §3: the Task's own authored sandbox-policy reference is a coarse
+/// exact-reference claim, not part of the reusable B.4 conjunct. A
+/// `SECURITY_V1` candidate whose Task layer is met into `P_eff` and covered by
+/// the imported profile must not be rejected for lacking that exact reference;
+/// the coarse predicate keeps the frozen semantics.
+#[test]
+fn the_task_policy_reference_is_coarse_only() {
+    let fixture = confined_fixture();
+    let binding = adapter_binding(ConfigStatus::Active);
+    let config = source_config(&fixture.source.source_ref);
+    // Evidence that claims no authored policy reference at all: the compile's
+    // obligation coverage is the only reason the security path may accept it.
+    let evidence = ResolvedProvisioningEvidence::from_imported_binding(
+        binding.policy_ref.clone(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        fixture.source.source_ref.clone(),
+        config.config_ref.clone(),
+        config.config_digest.clone(),
+        binding.required_safety.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let catalog = CapabilityCatalog::new();
+
+    // The Task authored a fine policy distinct from the Generation's; the
+    // durable binding meets both into `P_eff`.
+    let mut requirement = fixture.requirement.clone();
+    requirement.hard.sandbox_policy = Some(policy_ref("task-fine", 1));
+
+    can_provision_task_source_config_reusable(
+        &fixture.agent,
+        &fixture.source,
+        &config,
+        &evidence,
+        &catalog,
+        &requirement.hard,
+    )
+    .expect("the Task layer is covered by the effective policy, not by an exact reference");
+
+    assert!(matches!(
+        can_provision_task_source_config(
+            &fixture.agent,
+            &fixture.source,
+            &config,
+            &evidence,
+            &catalog,
+            &requirement.hard,
+        )
+        .unwrap_err(),
+        ContractError::SecurityUnenforceable { .. }
+    ));
+}
+
 #[test]
 fn a_different_imported_profile_is_a_subject_mismatch() {
     let fixture = confined_fixture();
@@ -680,24 +963,439 @@ fn a_different_imported_profile_is_a_subject_mismatch() {
         )
         .unwrap(),
         1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
         EnforcementSupport::policy_only_reference(),
         [EnforcementSubject::ControlledPrimaryProcess],
     )
     .unwrap();
 
     assert!(matches!(
-        compile_execution_security(&authority, &binding, &other).unwrap_err(),
+        compile_execution_security(&authority, &validated(&fixture.source, &binding, &other))
+            .unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+}
+
+// =============================================================================
+// The validated compiler inputs and the candidate-local failures they replace
+// (P2-1): a source/binding/profile mismatch and an uncovered subject are
+// ineligibility, not a Task failure.
+// =============================================================================
+
+#[test]
+fn a_profile_imported_for_another_binding_is_a_subject_mismatch() {
+    let fixture = confined_fixture();
+    // Same profile reference, support matrix and subject; imported for a
+    // different physical binding. The support matrix is not binding-scoped by
+    // itself, so only the import-time identity can reject this swap.
+    let foreign = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        "other-adapter/binding",
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    assert_ne!(foreign.profile_digest(), fixture.profile.profile_digest());
+
+    let binding = adapter_binding(ConfigStatus::Active);
+    assert!(matches!(
+        ValidatedSourceBinding::validate(&fixture.source, &binding, ADAPTER_BINDING, &foreign)
+            .unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+    // The matching tuple is accepted.
+    assert!(ValidatedSourceBinding::validate(
+        &fixture.source,
+        &binding,
+        ADAPTER_BINDING,
+        &fixture.profile
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_alias_resolving_to_the_profiles_physical_domain_is_accepted() {
+    let fixture = confined_fixture();
+    // B.4: `binding_ref` is only a stable alias. Here it resolves to `k2`, a
+    // different string than the profile's imported key would be if the two
+    // concepts were conflated.
+    let binding = AdapterBindingPolicy::new(
+        AdapterPolicyRef::new("codex-local-adapter", 1).unwrap(),
+        ADAPTER_KIND,
+        "primary",
+        adapter_binding(ConfigStatus::Active)
+            .required_safety
+            .clone(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    let profile = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        "k2",
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    let domain =
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "k2", &profile).unwrap();
+    assert_eq!(domain.adapter_binding_key(), "k2");
+    assert_ne!(domain.adapter_binding_key(), &binding.binding_ref);
+
+    let compiled = compile_execution_security(&fixture.authority(), &domain).unwrap();
+    // The cache key and the evidence subject commit to the resolved physical
+    // key, never to the alias.
+    assert_eq!(compiled.cache_key().adapter_binding_key(), "k2");
+    assert_eq!(compiled.evidence_subject().adapter_binding_key(), "k2");
+}
+
+#[test]
+fn a_profile_from_another_physical_domain_under_the_same_alias_is_rejected() {
+    let fixture = confined_fixture();
+    let binding = AdapterBindingPolicy::new(
+        AdapterPolicyRef::new("codex-local-adapter", 1).unwrap(),
+        ADAPTER_KIND,
+        "primary",
+        adapter_binding(ConfigStatus::Active)
+            .required_safety
+            .clone(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    // The profile was imported for physical domain `k1`; the selection resolved
+    // the same `primary` alias to `k2`. An alias-only comparison would accept
+    // this swap.
+    let profile = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        "k1",
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    assert!(matches!(
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "k2", &profile).unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+    // An empty resolved key is not a wildcard.
+    assert!(matches!(
+        ValidatedSourceBinding::validate(&fixture.source, &binding, "  ", &fixture.profile)
+            .unwrap_err(),
+        ContractError::InvalidRef { .. }
+    ));
+}
+
+#[test]
+fn the_frozen_reference_profile_cannot_widen_its_support_matrix() {
+    // ADR-0014 §14: the reference profile is a fixed capability claim. Claiming
+    // network egress restriction under the same identity must fail at import,
+    // before a compiler could treat the wider matrix as covered.
+    assert!(matches!(
+        ImportedEnforcementProfile::import(
+            reference_profile_ref(),
+            1,
+            ADAPTER_KIND,
+            ADAPTER_BINDING,
+            EnforcementSupport::new([
+                EnforcementFeature::WorkspaceWriteConfinement,
+                EnforcementFeature::EnvironmentAllowlist,
+                EnforcementFeature::NetworkEgressRestriction,
+            ]),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        )
+        .unwrap_err(),
+        ContractError::InvalidSandboxPolicy { .. }
+    ));
+    // A stricter subset is still a valid conservative claim.
+    assert!(ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_binding_must_implement_the_sources_own_adapter_policy() {
+    let fixture = confined_fixture();
+    let template = adapter_binding(ConfigStatus::Active);
+    let foreign = AdapterBindingPolicy::new(
+        AdapterPolicyRef::new("another-adapter", 1).unwrap(),
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        template.required_safety.clone(),
+        ConfigStatus::Active,
+    )
+    .unwrap();
+    assert!(matches!(
+        ValidatedSourceBinding::validate(
+            &fixture.source,
+            &foreign,
+            ADAPTER_BINDING,
+            &fixture.profile,
+        )
+        .unwrap_err(),
         ContractError::EvidenceSubjectMismatch { .. }
     ));
 }
 
 #[test]
-fn an_inactive_binding_is_never_compiled() {
+fn a_source_that_is_not_active_is_never_validated() {
+    for status in [SourceStatus::Draining, SourceStatus::Disabled] {
+        let fixture = confined_fixture();
+        let mut source = fixture.source.clone();
+        source.status = status;
+        assert!(matches!(
+            ValidatedSourceBinding::validate(
+                &source,
+                &adapter_binding(ConfigStatus::Active),
+                ADAPTER_BINDING,
+                &fixture.profile,
+            )
+            .unwrap_err(),
+            ContractError::SecurityUnenforceable { .. }
+        ));
+    }
+}
+
+#[test]
+fn the_validated_tuple_must_describe_the_authoritys_own_source() {
     let fixture = confined_fixture();
     let authority = fixture.authority();
+    // Every field of the tuple is internally consistent, but the source
+    // revision is not the one the composite authority was built from.
+    let mut other_source = fixture.source.clone();
+    other_source.source_ref = SpawnSourceRef::new("codex-local", 2).unwrap();
+    let domain = validated(
+        &other_source,
+        &adapter_binding(ConfigStatus::Active),
+        &fixture.profile,
+    );
+    assert!(matches!(
+        compile_execution_security(&authority, &domain).unwrap_err(),
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_profile_that_does_not_claim_the_executing_subject_is_not_proven() {
+    let fixture = Fixture::new(
+        confined_policy(),
+        requirement(),
+        full_support_profile_for([EnforcementSubject::UnprovenExternalProcess]),
+    );
+    let authority = fixture.authority();
+    let domain = validated(
+        &fixture.source,
+        &adapter_binding(ConfigStatus::Active),
+        &fixture.profile,
+    );
+    // Support is complete, so compilation succeeds: a successful compile is not
+    // an applied-security claim for any particular subject.
+    let compiled = compile_execution_security(&authority, &domain).unwrap();
+
+    let error = compiled
+        .clone()
+        .prove_subject(EnforcementSubject::ControlledPrimaryProcess)
+        .unwrap_err();
+    match error {
+        ContractError::SecurityUnenforceable { reason } => {
+            assert!(reason.contains("CONTROLLED_PRIMARY_PROCESS"), "{reason}");
+        }
+        other => panic!("expected candidate-local ineligibility, got {other:?}"),
+    }
+
+    // The subject the profile does claim is accepted, and the proof keeps it.
+    let proven = compiled
+        .prove_subject(EnforcementSubject::UnprovenExternalProcess)
+        .unwrap();
+    assert_eq!(
+        proven.subject(),
+        EnforcementSubject::UnprovenExternalProcess
+    );
+    assert_eq!(proven.cache_key(), proven.compiled().cache_key());
+    // Dropping the proof yields only a compile, never a subject claim.
+    let _: CompiledExecutionSecurity = proven.into_compiled();
+}
+
+#[test]
+fn qualification_proves_the_subject_and_completes_its_own_config() {
+    let fixture = confined_fixture();
+    let proven = qualify(&fixture, &CapabilityCatalog::new()).unwrap();
+    assert_eq!(
+        proven.subject(),
+        EnforcementSubject::ControlledPrimaryProcess
+    );
+    assert!(!proven.evidence_subject().is_complete());
+
+    let completed = proven
+        .with_source_config(&source_config(&fixture.source.source_ref))
+        .unwrap();
+    assert!(completed.evidence_subject().is_complete());
+    assert_eq!(
+        completed.evidence_subject().digest().unwrap(),
+        completed.compiled().evidence_subject().digest().unwrap()
+    );
+}
+
+#[test]
+fn the_policy_only_reference_protocol_cannot_claim_an_external_subject() {
+    // ADR-0014 §14: externally delegated and unproven subjects are outside the
+    // policy-only reference profile. Widening the subject set is not the escape
+    // hatch; a separately authored profile is.
+    let error = ImportedEnforcementProfile::import(
+        reference_profile_ref(),
+        1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        EnforcementSupport::policy_only_reference(),
+        [EnforcementSubject::UnprovenExternalProcess],
+    )
+    .unwrap_err();
+    assert!(matches!(error, ContractError::InvalidSandboxPolicy { .. }));
+}
+
+#[test]
+fn a_profile_must_name_its_exact_physical_adapter_binding() {
+    for (kind, key) in [("", ADAPTER_BINDING), (ADAPTER_KIND, "  ")] {
+        assert!(matches!(
+            ImportedEnforcementProfile::import(
+                reference_profile_ref(),
+                1,
+                kind,
+                key,
+                EnforcementSupport::policy_only_reference(),
+                [EnforcementSubject::ControlledPrimaryProcess],
+            )
+            .unwrap_err(),
+            ContractError::InvalidRef { .. }
+        ));
+    }
+}
+
+// =============================================================================
+// Credential delivery is a request, not an authorization (P2-2)
+// =============================================================================
+
+/// The confined policy plus one usable credential grant. The same grant is put
+/// on every authored layer so the meet keeps it: an omitted grant authorizes
+/// nothing, so the id must be granted by the AgentType ceiling and narrowed, not
+/// created, by the source.
+fn policy_with_credential_grant() -> NormalizedSandboxPolicy {
+    let id = CredentialAuthorizationId::new("vault", "codex-prod").unwrap();
+    let mut parts = confined_policy().parts().clone();
+    parts.credentials.insert(
+        id.clone(),
+        CredentialGrant::new(
+            id,
+            ["model.invoke".to_string()],
+            ["codex".to_string()],
+            [CredentialDeliveryMode::BrokeredAccess],
+        )
+        .unwrap(),
+    );
+    NormalizedSandboxPolicy::from_parts(parts).unwrap()
+}
+
+/// The same candidate with an authorized credential on every layer.
+fn credential_fixture(profile: ImportedEnforcementProfile) -> Fixture {
+    let policy = policy_with_credential_grant();
+    Fixture::compose(
+        policy.clone(),
+        requirement(),
+        profile,
+        policy.clone(),
+        policy,
+        &RequiredAccess::empty(),
+    )
+}
+
+fn config_requesting_credential(source: &SpawnSourceRef) -> SourceConfig {
+    let mut config = source_config(source);
+    config.credential_refs = vec![CredentialRef::new("vault://codex-prod").unwrap()];
+    config
+}
+
+#[test]
+fn an_authorized_credential_is_not_a_delivery_request() {
+    let fixture = credential_fixture(reference_profile([
+        EnforcementSubject::ControlledPrimaryProcess,
+    ]));
+    let authority = fixture.authority();
+    assert!(
+        !authority.policy().credentials().is_empty(),
+        "the fixture must authorize a credential for the distinction to matter"
+    );
+
+    // The authorization ceiling does not create a delivery obligation: only the
+    // selected config can request one (ADR-0013 §5, ADR-0014 §3).
+    let obligations = RequiredEnforcementFeatures::derive(
+        authority.policy(),
+        EffectiveExecutionGuarantees::new(false),
+    );
+    assert!(!obligations.contains(EnforcementFeature::CredentialDelivery));
+
+    // The policy-only reference profile therefore accepts this candidate while
+    // the exact config requests nothing.
+    let compiled = compile(&fixture);
+    let completed = compiled
+        .with_source_config(&source_config(&fixture.source.source_ref))
+        .unwrap();
+    assert!(completed.evidence_subject().is_complete());
+}
+
+#[test]
+fn a_requested_credential_needs_a_profile_that_can_deliver() {
+    let fixture = credential_fixture(reference_profile([
+        EnforcementSubject::ControlledPrimaryProcess,
+    ]));
+    let compiled = compile(&fixture);
+
+    let error = compiled
+        .with_source_config(&config_requesting_credential(&fixture.source.source_ref))
+        .unwrap_err();
+    match error {
+        ContractError::SecurityUnenforceable { reason } => {
+            assert!(reason.contains("credential delivery"), "{reason}");
+            assert!(reason.contains("1 credential reference"), "{reason}");
+        }
+        other => panic!("expected candidate-local ineligibility, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_requested_credential_completes_when_the_profile_delivers() {
+    let fixture = credential_fixture(full_support_profile());
+    let compiled = compile(&fixture);
+    let config = config_requesting_credential(&fixture.source.source_ref);
+    let completed = compiled.with_source_config(&config).unwrap();
+    assert!(completed.evidence_subject().is_complete());
+    assert_eq!(
+        completed.evidence_subject().source_config(),
+        Some(&config.config_ref)
+    );
+}
+
+#[test]
+fn an_inactive_binding_is_never_validated() {
+    let fixture = confined_fixture();
     let inactive = adapter_binding(ConfigStatus::Disabled);
     assert!(matches!(
-        compile_execution_security(&authority, &inactive, &fixture.profile).unwrap_err(),
+        ValidatedSourceBinding::validate(
+            &fixture.source,
+            &inactive,
+            ADAPTER_BINDING,
+            &fixture.profile,
+        )
+        .unwrap_err(),
         ContractError::SecurityUnenforceable { .. }
     ));
 }
@@ -712,8 +1410,11 @@ fn a_missing_dimension_makes_the_candidate_ineligible_not_the_task_failed() {
     let authority = fixture.authority();
     let error = compile_execution_security(
         &authority,
-        &adapter_binding(ConfigStatus::Active),
-        &fixture.profile,
+        &validated(
+            &fixture.source,
+            &adapter_binding(ConfigStatus::Active),
+            &fixture.profile,
+        ),
     )
     .unwrap_err();
     match error {
@@ -778,6 +1479,7 @@ fn qualification_re_proves_the_requirement_and_agent_identity_before_compiling()
     let fixture = confined_fixture();
     let authority = fixture.authority();
     let binding = adapter_binding(ConfigStatus::Active);
+    let domain = validated(&fixture.source, &binding, &fixture.profile);
     let catalog = CapabilityCatalog::new();
     let revision = SecurityRevision::new(
         &fixture.agent,
@@ -790,16 +1492,19 @@ fn qualification_re_proves_the_requirement_and_agent_identity_before_compiling()
         &authority,
         &fixture.requirement,
         &revision,
-        &binding,
-        &fixture.profile,
+        &domain,
+        EnforcementSubject::ControlledPrimaryProcess,
         &catalog,
     )
     .unwrap();
     assert_eq!(
         qualified.plan_digest(),
-        compile_execution_security(&authority, &binding, &fixture.profile)
-            .unwrap()
-            .plan_digest()
+        compile_execution_security(
+            &authority,
+            &validated(&fixture.source, &binding, &fixture.profile),
+        )
+        .unwrap()
+        .plan_digest()
     );
 
     // A different Task requirement cannot borrow this composite.
@@ -810,8 +1515,8 @@ fn qualification_re_proves_the_requirement_and_agent_identity_before_compiling()
             &authority,
             &other_requirement,
             &revision,
-            &binding,
-            &fixture.profile,
+            &domain,
+            EnforcementSubject::ControlledPrimaryProcess,
             &catalog,
         )
         .unwrap_err(),
@@ -831,8 +1536,8 @@ fn qualification_re_proves_the_requirement_and_agent_identity_before_compiling()
             &authority,
             &fixture.requirement,
             &other_revision,
-            &binding,
-            &fixture.profile,
+            &domain,
+            EnforcementSubject::ControlledPrimaryProcess,
             &catalog,
         )
         .unwrap_err(),
@@ -848,8 +1553,8 @@ fn qualification_re_proves_the_requirement_and_agent_identity_before_compiling()
             &authority,
             &fixture.requirement,
             &coarse,
-            &binding,
-            &fixture.profile,
+            &domain,
+            EnforcementSubject::ControlledPrimaryProcess,
             &catalog,
         )
         .unwrap_err(),
@@ -900,8 +1605,12 @@ fn qualification_rechecks_the_task_coarse_modes_on_the_complete_policy() {
             &authority,
             &fixture.requirement,
             &revision,
-            &adapter_binding(ConfigStatus::Active),
-            &fixture.profile,
+            &validated(
+                &fixture.source,
+                &adapter_binding(ConfigStatus::Active),
+                &fixture.profile,
+            ),
+            EnforcementSubject::ControlledPrimaryProcess,
             &CapabilityCatalog::new(),
         )
         .unwrap_err(),
@@ -1253,8 +1962,11 @@ fn isolation_fixture() -> Fixture {
 fn compile(fixture: &Fixture) -> CompiledExecutionSecurity {
     compile_execution_security(
         &fixture.authority(),
-        &adapter_binding(ConfigStatus::Active),
-        &fixture.profile,
+        &validated(
+            &fixture.source,
+            &adapter_binding(ConfigStatus::Active),
+            &fixture.profile,
+        ),
     )
     .unwrap()
 }

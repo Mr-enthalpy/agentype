@@ -241,9 +241,10 @@ pub fn b5_composite_authority_surface() {}
 /// use agentype_agent_contract::{
 ///     binding_profile_digest, compile_execution_security, qualify_security_candidate,
 ///     AcquisitionBudget, AcquisitionCost, AdapterBindingPolicy, CandidateDomain,
-///     CapabilityCatalog, EffectiveTaskAuthority, ImportedEnforcementProfile,
-///     PolicyEnforcementPlan, SecurityAcquisitionBlock, SecurityAcquisitionRelease,
-///     SecurityRevision, TaskAgentRequirement,
+///     CapabilityCatalog, EffectiveTaskAuthority, EnforcementSubject,
+///     ImportedEnforcementProfile, PolicyEnforcementPlan, ProvenExecutionSecurity,
+///     SecurityAcquisitionBlock, SecurityAcquisitionRelease, SecurityRevision, SpawnSource,
+///     TaskAgentRequirement, ValidatedSourceBinding,
 /// };
 /// use agentype_core::GenerationId;
 ///
@@ -252,12 +253,24 @@ pub fn b5_composite_authority_surface() {}
 ///     authority: &EffectiveTaskAuthority,
 ///     requirement: &TaskAgentRequirement,
 ///     revision: &SecurityRevision<'_>,
+///     source: &SpawnSource,
 ///     binding: &AdapterBindingPolicy,
+///     adapter_binding_key: &str,
 ///     profile: &ImportedEnforcementProfile,
 ///     catalog: &CapabilityCatalog,
 /// ) {
+///     // The compiler accepts only a tuple that already proves the binding is the
+///     // source's own adapter policy and the profile was imported for the same
+///     // resolved physical domain, not merely for the same alias.
+///     let domain = ValidatedSourceBinding::validate(
+///         source,
+///         binding,
+///         adapter_binding_key,
+///         profile,
+///     )
+///     .expect("consistent tuple");
 ///     let compiled =
-///         compile_execution_security(authority, binding, profile).expect("candidate-local");
+///         compile_execution_security(authority, &domain).expect("candidate-local");
 ///     let plan: &PolicyEnforcementPlan = compiled.plan();
 ///     let _ = plan.plan_digest();
 ///     let _ = plan.obligations();
@@ -265,8 +278,17 @@ pub fn b5_composite_authority_surface() {}
 ///     let _ = compiled.evidence_subject().is_complete();
 ///     let _ = binding_profile_digest(binding, profile);
 ///     let _ = qualify_security_candidate(
-///         authority, requirement, revision, binding, profile, catalog,
+///         authority,
+///         requirement,
+///         revision,
+///         &domain,
+///         EnforcementSubject::ControlledPrimaryProcess,
+///         catalog,
 ///     );
+///     // Compilation proves support; only a covered subject is proven security.
+///     let proven: Result<ProvenExecutionSecurity, _> =
+///         compiled.prove_subject(EnforcementSubject::ControlledPrimaryProcess);
+///     let _ = proven.map(|proven| proven.subject());
 ///
 ///     let budget = AcquisitionBudget::new(8, 8).expect("non-zero budget");
 ///     if let Err(exhaustion) = budget.require_whole_round(AcquisitionCost::new(9, 9)) {
@@ -567,11 +589,15 @@ pub fn b5_compiled_security_surface() {}
 ///     let profile = ImportedEnforcementProfile::import(
 ///         EnforcementProfileRef::new("runtime-boundary", "runtime-boundary", 1).unwrap(),
 ///         1,
+///         "local-process",
+///         "runtime-boundary/binding",
 ///         EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
 ///         [EnforcementSubject::ControlledPrimaryProcess],
 ///     )
 ///     .expect("the runtime host sees the producer constructor");
 ///     assert!(profile.covers_subject(EnforcementSubject::ControlledPrimaryProcess));
+///     assert_eq!(profile.adapter_kind(), "local-process");
+///     assert_eq!(profile.adapter_binding_key(), "runtime-boundary/binding");
 /// }
 /// ```
 pub fn probes() {}

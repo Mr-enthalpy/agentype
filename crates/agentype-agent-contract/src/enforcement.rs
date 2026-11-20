@@ -2,11 +2,12 @@
 //! compiler (ADR-0014 §2–§5, §13–§14).
 //!
 //! Nothing in this module performs I/O or creates physical objects. The
-//! compiler consumes an [`EffectiveTaskAuthority`], the exact
-//! [`AdapterBindingPolicy`], and an [`ImportedEnforcementProfile`], and returns
-//! a **root-relative** [`PolicyEnforcementPlan`] plus the evidence subject and
-//! the memoization key. `prepare` and physical start are later phases with
-//! different powers.
+//! compiler consumes an [`EffectiveTaskAuthority`] and a
+//! [`ValidatedSourceBinding`] — the source's own adapter policy, the exact
+//! [`AdapterBindingPolicy`], and the [`ImportedEnforcementProfile`] that was
+//! imported for that binding — and returns a **root-relative**
+//! [`PolicyEnforcementPlan`] plus the evidence subject and the memoization key.
+//! `prepare` and physical start are later phases with different powers.
 //!
 //! `ImportedEnforcementProfile` models an *imported* external fact: which
 //! enforcement dimensions an exact physical domain can actually enforce. Its
@@ -26,7 +27,8 @@ use crate::canonical::{
 };
 use crate::error::ContractError;
 use crate::records::{
-    AdapterBindingPolicy, ConfigDigest, ConfigStatus, SourceConfig, SourceConfigRef,
+    AdapterBindingPolicy, ConfigDigest, ConfigStatus, SourceConfig, SourceConfigRef, SourceStatus,
+    SpawnSource,
 };
 use crate::sandbox::{
     check_required_access, required_access_from_claims, CredentialAuthorizationId,
@@ -39,7 +41,15 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 /// Version tag of the canonical imported-profile document.
-pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 1;
+///
+/// `/2` records that a profile names the adapter binding it was imported for.
+/// `/3` corrects *which* identity that is: B.4 `binding_ref` is a stable alias
+/// that resolves to the exact installed physical `adapter_binding_key`, so the
+/// profile, the evidence subject and the compile cache key must commit to the
+/// resolved physical key, not the alias. A `/2` profile digest and every digest
+/// that commits to it (the evidence subject, the compile cache key, the plan,
+/// and the durable binding/profile key) are different identities.
+pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 3;
 /// Version tag of the compiled plan document.
 pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 2;
 /// Version tag of the canonical execution-guarantee document that the compile
@@ -50,8 +60,11 @@ pub const ENFORCEMENT_GUARANTEES_SCHEMA_VERSION: u32 = 1;
 /// result even when the inputs are byte-identical.
 ///
 /// `/2` records that the plan and the cache key now carry the composed
-/// execution guarantees, so a `/1` result must never be reused.
-pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/2";
+/// execution guarantees, so a `/1` result must never be reused. `/3` records
+/// that credential delivery is a request-scoped obligation checked against the
+/// attested `SourceConfig`, not a policy-derived one, so a `/2` plan for a
+/// credential-bearing policy is a different plan.
+pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/3";
 
 /// The frozen `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` profile identity
 /// (ADR-0014 §14). This is a positive minimum target, not a claim that a
@@ -59,6 +72,20 @@ pub const ENFORCEMENT_COMPILER_PROTOCOL: &str = "agentype-enforcement-compile/2"
 pub const POLICY_ONLY_REFERENCE_PROTOCOL: &str = "agentype-enforcement";
 pub const POLICY_ONLY_REFERENCE_PROFILE: &str = "SECURITY_V1_POLICY_ONLY_REFERENCE_V1";
 pub const POLICY_ONLY_REFERENCE_VERSION: u32 = 1;
+
+/// Whether `reference` is the *exact* frozen
+/// `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` identity.
+///
+/// The comparison is over all three identity components. A profile that reuses
+/// the name with another protocol or version is a different profile and is not
+/// silently held to (or excused from) the frozen ceiling; only the exact
+/// identity carries the fixed capability claim of ADR-0014 §14.
+#[cfg(any(test, feature = "provisioning-producer"))]
+fn is_policy_only_reference(reference: &EnforcementProfileRef) -> bool {
+    reference.protocol() == POLICY_ONLY_REFERENCE_PROTOCOL
+        && reference.profile() == POLICY_ONLY_REFERENCE_PROFILE
+        && reference.version() == POLICY_ONLY_REFERENCE_VERSION
+}
 
 /// One enforceable policy dimension.
 ///
@@ -86,7 +113,9 @@ pub enum EnforcementFeature {
     ResourceLimit,
     /// The Task or AgentType requires attempt isolation.
     AttemptIsolation,
-    /// The policy authorizes Agentype-managed credential delivery.
+    /// The domain can deliver an Agentype-managed credential when the exact
+    /// attested config requests one. Authorization alone does not create a
+    /// delivery obligation.
     CredentialDelivery,
 }
 
@@ -255,9 +284,13 @@ impl RequiredEnforcementFeatures {
         if policy.attempt_isolation() || guarantees.requires_attempt_isolation() {
             features.insert(EnforcementFeature::AttemptIsolation);
         }
-        if !policy.credentials().is_empty() {
-            features.insert(EnforcementFeature::CredentialDelivery);
-        }
+        // Credential delivery is deliberately *not* derived here. The effective
+        // policy's credential map is an authorization ceiling; only a non-empty
+        // `SourceConfig.credential_refs` requests a delivery (ADR-0013 §5), and
+        // that request is not known until the exact config is attested
+        // (ADR-0014 §3). Deriving the obligation from the ceiling would refuse a
+        // policy-only profile for a config that asks for no credential. The
+        // request is checked when the config is bound to the compiled plan.
         Self { features }
     }
 
@@ -305,6 +338,12 @@ impl EnforcementSupport {
         &self.supported
     }
 
+    /// `self ⊆ ceiling`. A profile may be more conservative than its reference
+    /// matrix, never wider.
+    pub fn is_subset_of(&self, ceiling: &Self) -> bool {
+        self.supported.is_subset(&ceiling.supported)
+    }
+
     pub fn missing(&self, required: &RequiredEnforcementFeatures) -> BTreeSet<EnforcementFeature> {
         required
             .features
@@ -321,8 +360,17 @@ impl EnforcementSupport {
 }
 
 /// An exact imported enforcement profile: the policy/receipt protocol identity,
-/// the physical domain's support matrix, and the subjects its claims are
-/// relative to.
+/// the exact physical adapter domain it was imported for, the domain's support
+/// matrix, and the subjects its claims are relative to.
+///
+/// A profile is an imported fact about one physical domain, so it records the
+/// `(adapter_kind, adapter_binding_key)` pair that domain was imported under.
+/// B.4 `AdapterBindingPolicy.binding_ref` is only a stable alias that resolves to
+/// that key, and the key — not the alias — is what the Execution and its
+/// `BindingSnapshot` freeze (ADR-0008). A profile imported for physical domain
+/// K1 therefore cannot be compiled against a selection for K2, even when both
+/// are reached through the same alias: the [`ValidatedSourceBinding`] composite
+/// cross-checks both fields before the support matrix is used.
 ///
 /// The constructors are compiled only under `provisioning-producer` because
 /// these are imported external facts. A **contract-only** host cannot name them;
@@ -333,6 +381,8 @@ impl EnforcementSupport {
 pub struct ImportedEnforcementProfile {
     reference: EnforcementProfileRef,
     protocol_version: u32,
+    adapter_kind: String,
+    adapter_binding_key: String,
     support: EnforcementSupport,
     covered_subjects: BTreeSet<EnforcementSubject>,
     profile_digest: String,
@@ -345,6 +395,8 @@ impl ImportedEnforcementProfile {
     pub fn import(
         reference: EnforcementProfileRef,
         protocol_version: u32,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: impl Into<String>,
         support: EnforcementSupport,
         covered_subjects: impl IntoIterator<Item = EnforcementSubject>,
     ) -> Result<Self, ContractError> {
@@ -353,17 +405,75 @@ impl ImportedEnforcementProfile {
                 reason: "enforcement protocol version must be at least 1".into(),
             });
         }
+        let adapter_kind = adapter_kind.into();
+        if adapter_kind.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "an imported enforcement profile must name its adapter kind".into(),
+            });
+        }
+        let adapter_binding_key = adapter_binding_key.into();
+        if adapter_binding_key.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "an imported enforcement profile must name its exact adapter binding key"
+                    .into(),
+            });
+        }
         let covered_subjects: BTreeSet<EnforcementSubject> = covered_subjects.into_iter().collect();
         if covered_subjects.is_empty() {
             return Err(ContractError::InvalidSandboxPolicy {
                 reason: "an imported enforcement profile must name its subject".into(),
             });
         }
-        let profile_digest =
-            profile_digest(&reference, protocol_version, &support, &covered_subjects);
+        // ADR-0014 §14: the frozen reference profile is a **fixed** capability
+        // claim, not a floor to widen. It is a positive minimum target for a
+        // single policy/receipt protocol, and the platform may be more
+        // conservative, never broader. A profile that needs another dimension
+        // must be a new versioned profile identity, not a wider support matrix
+        // on this one.
+        if is_policy_only_reference(&reference)
+            && !support.is_subset_of(&EnforcementSupport::policy_only_reference())
+        {
+            let over: Vec<&str> = support
+                .features()
+                .iter()
+                .filter(|feature| !EnforcementSupport::policy_only_reference().supports(**feature))
+                .map(|feature| feature.as_str())
+                .collect();
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: format!(
+                    "the frozen {} profile cannot claim {}",
+                    POLICY_ONLY_REFERENCE_PROFILE,
+                    over.join(", ")
+                ),
+            });
+        }
+        // ADR-0014 §14: the policy-only reference protocol claims only the proven
+        // domain. An externally delegated or unproven subject requires a
+        // separately authored profile, not a wider subject set on this protocol.
+        if reference.protocol() == POLICY_ONLY_REFERENCE_PROTOCOL
+            && covered_subjects
+                .iter()
+                .any(|subject| !subject.is_inside_proven_domain())
+        {
+            return Err(ContractError::InvalidSandboxPolicy {
+                reason: "the policy-only reference protocol cannot claim a subject outside the \
+                         proven domain"
+                    .into(),
+            });
+        }
+        let profile_digest = profile_digest(
+            &reference,
+            protocol_version,
+            &adapter_kind,
+            &adapter_binding_key,
+            &support,
+            &covered_subjects,
+        );
         Ok(Self {
             reference,
             protocol_version,
+            adapter_kind,
+            adapter_binding_key,
             support,
             covered_subjects,
             profile_digest,
@@ -377,11 +487,20 @@ impl ImportedEnforcementProfile {
     pub fn from_parts(
         reference: EnforcementProfileRef,
         protocol_version: u32,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: impl Into<String>,
         support: EnforcementSupport,
         covered_subjects: impl IntoIterator<Item = EnforcementSubject>,
         expected_digest: &str,
     ) -> Result<Self, ContractError> {
-        let profile = Self::import(reference, protocol_version, support, covered_subjects)?;
+        let profile = Self::import(
+            reference,
+            protocol_version,
+            adapter_kind,
+            adapter_binding_key,
+            support,
+            covered_subjects,
+        )?;
         if profile.profile_digest() != expected_digest {
             return Err(ContractError::EvidenceSubjectMismatch {
                 reason: "imported enforcement profile digest does not describe its parts".into(),
@@ -396,6 +515,20 @@ impl ImportedEnforcementProfile {
 
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
+    }
+
+    /// The adapter kind this profile was imported for.
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+
+    /// The exact physical adapter binding key this profile was imported for.
+    ///
+    /// This is the resolved `AdapterBindingKey`, never the B.4 `binding_ref`
+    /// alias: the alias can point at a different physical domain after
+    /// re-resolution, while the key is what the Execution freezes.
+    pub fn adapter_binding_key(&self) -> &str {
+        &self.adapter_binding_key
     }
 
     pub fn support(&self) -> &EnforcementSupport {
@@ -419,6 +552,8 @@ impl ImportedEnforcementProfile {
 fn profile_digest(
     reference: &EnforcementProfileRef,
     protocol_version: u32,
+    adapter_kind: &str,
+    adapter_binding_key: &str,
     support: &EnforcementSupport,
     covered_subjects: &BTreeSet<EnforcementSubject>,
 ) -> String {
@@ -429,9 +564,119 @@ fn profile_digest(
         "profile": reference.profile(),
         "profile_version": reference.version(),
         "protocol_version": protocol_version,
+        "adapter_kind": adapter_kind,
+        "adapter_binding_key": adapter_binding_key,
         "supported": support.features().iter().map(|f| f.as_str()).collect::<Vec<_>>(),
         "subjects": covered_subjects.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     }))
+}
+
+/// One validated source/binding/profile triple.
+///
+/// The compiler's physical inputs are related facts, not independent values: the
+/// exact adapter binding policy must be the policy the [`SpawnSource`] names,
+/// both must be active, and the imported profile must have been imported for
+/// that exact `(adapter_kind, adapter_binding_key)` physical domain. This type
+/// is the only way to reach [`compile_execution_security`], so a caller cannot
+/// compile a profile against a binding it was not imported for, nor a binding
+/// the source does not own.
+///
+/// B.4 distinguishes the `AdapterBindingPolicy.binding_ref` **alias** from the
+/// resolved physical `AdapterBindingKey`. The alias is a source-policy input;
+/// the key is what the Execution and its `BindingSnapshot` freeze. This type
+/// therefore carries the resolved key explicitly and requires the imported
+/// profile to name that same key. The resolution itself (alias → key) belongs to
+/// the resolver, which produced the durable selection; the authority transaction
+/// separately proves `evidence.adapter_binding_key == selection.adapter_binding_key`.
+/// Here the key is the shared identity that ties the profile to the same
+/// physical domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedSourceBinding {
+    source: crate::records::SpawnSourceRef,
+    adapter_policy: crate::records::AdapterPolicyRef,
+    binding: AdapterBindingPolicy,
+    adapter_binding_key: String,
+    profile: ImportedEnforcementProfile,
+}
+
+impl ValidatedSourceBinding {
+    /// The only constructor. Every mismatch is rejected here, before policy
+    /// composition or obligation derivation, so a successful value is a
+    /// consistent physical description.
+    ///
+    /// `adapter_binding_key` is the resolver-resolved physical key for
+    /// `binding.binding_ref`. It must be the key the imported profile names;
+    /// an alias-only match is not sufficient, because the same alias can resolve
+    /// to a different physical domain.
+    pub fn validate(
+        source: &SpawnSource,
+        binding: &AdapterBindingPolicy,
+        adapter_binding_key: &str,
+        profile: &ImportedEnforcementProfile,
+    ) -> Result<Self, ContractError> {
+        binding.validate()?;
+        if source.status != SourceStatus::Active {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: "the spawn source is not active".into(),
+            });
+        }
+        if binding.status != ConfigStatus::Active {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: "the exact adapter binding is not active".into(),
+            });
+        }
+        if binding.policy_ref != source.adapter_policy {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason: "the adapter binding does not implement the source's adapter policy".into(),
+            });
+        }
+        if adapter_binding_key.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason:
+                    "the validated source binding requires the resolved exact adapter binding key"
+                        .into(),
+            });
+        }
+        if profile.adapter_kind() != binding.adapter_kind
+            || profile.adapter_binding_key() != adapter_binding_key
+        {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason: "the imported enforcement profile was imported for a different physical \
+                         adapter binding"
+                    .into(),
+            });
+        }
+        Ok(Self {
+            source: source.source_ref.clone(),
+            adapter_policy: source.adapter_policy.clone(),
+            binding: binding.clone(),
+            adapter_binding_key: adapter_binding_key.to_string(),
+            profile: profile.clone(),
+        })
+    }
+
+    /// The source revision the binding belongs to.
+    pub fn source(&self) -> &crate::records::SpawnSourceRef {
+        &self.source
+    }
+
+    /// The adapter policy the source declares and the binding implements.
+    pub fn adapter_policy(&self) -> &crate::records::AdapterPolicyRef {
+        &self.adapter_policy
+    }
+
+    pub fn binding(&self) -> &AdapterBindingPolicy {
+        &self.binding
+    }
+
+    /// The resolved exact physical domain this tuple was validated against.
+    pub fn adapter_binding_key(&self) -> &str {
+        &self.adapter_binding_key
+    }
+
+    pub fn profile(&self) -> &ImportedEnforcementProfile {
+        &self.profile
+    }
 }
 
 /// The eight-part compile memoization key (ADR-0014 §4).
@@ -769,11 +1014,17 @@ impl SecurityEvidenceSubject {
 }
 
 /// The pure result of one bounded compile.
+///
+/// Compilation proves the profile's support matrix covers the obligations of the
+/// effective policy. It does **not** yet name the enforcement subject the claim
+/// is relative to; call [`CompiledExecutionSecurity::prove_subject`] for that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledExecutionSecurity {
     plan: PolicyEnforcementPlan,
     cache_key: CompileCacheKey,
     evidence_subject: SecurityEvidenceSubject,
+    covered_subjects: BTreeSet<EnforcementSubject>,
+    supports_credential_delivery: bool,
 }
 
 impl CompiledExecutionSecurity {
@@ -793,45 +1044,141 @@ impl CompiledExecutionSecurity {
         &self.evidence_subject
     }
 
-    /// Complete the evidence subject once the exact SourceConfig is attested.
+    /// Complete the evidence subject once the exact SourceConfig is attested,
+    /// and settle the one obligation the config itself decides.
+    ///
+    /// A non-empty `credential_refs` is a delivery request (ADR-0013 §5), not an
+    /// authorization. The compile step cannot see it, so this step refuses a
+    /// request the profile cannot deliver instead of silently compiling a
+    /// credential-bearing execution. No request means no obligation, which is
+    /// why an authorization ceiling alone never makes a candidate ineligible.
+    ///
+    /// This is a **pure qualification** necessary condition, not an authority
+    /// grant: a profile that *claims* `CredentialDelivery` satisfies it without
+    /// proving that this exact request is authorized. The authority-bearing
+    /// acquisition entry therefore stays fail-closed for every non-empty
+    /// `credential_refs` until B5.3 introduces the canonical `CredentialRequest`,
+    /// `CredentialEligibilityEvidence` and broker qualification (ADR-0015 §5/§9).
     pub fn with_source_config(mut self, config: &SourceConfig) -> Result<Self, ContractError> {
         self.evidence_subject = self.evidence_subject.with_source_config(config)?;
+        if !config.credential_refs.is_empty() && !self.supports_credential_delivery {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "the selected config requests {} credential reference(s) but enforcement \
+                     profile {} does not support credential delivery",
+                    config.credential_refs.len(),
+                    self.plan.reference.profile()
+                ),
+            });
+        }
+        Ok(self)
+    }
+
+    /// Prove that the profile this plan was compiled with claims the exact
+    /// enforcement subject (ADR-0014 §14).
+    ///
+    /// A covered subject is a candidate qualification fact, not a receipt: the
+    /// returned value still carries no Attempt/Lease authority and no claim that
+    /// the restrictions were applied to a live process.
+    pub fn prove_subject(
+        self,
+        subject: EnforcementSubject,
+    ) -> Result<ProvenExecutionSecurity, ContractError> {
+        if !self.covered_subjects.contains(&subject) {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: format!(
+                    "the imported enforcement profile does not claim the executing subject {}",
+                    subject.as_str()
+                ),
+            });
+        }
+        Ok(ProvenExecutionSecurity {
+            compiled: self,
+            subject,
+        })
+    }
+}
+
+/// A compiled candidate whose profile claims the exact execution subject.
+///
+/// This is the strongest value the B5.2 compiler can produce: the plan, the
+/// memoization key, and the subject are all bound together, so a caller cannot
+/// read a successful [`CompiledExecutionSecurity`] as an applied-security claim
+/// for a subject the profile never named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenExecutionSecurity {
+    compiled: CompiledExecutionSecurity,
+    subject: EnforcementSubject,
+}
+
+impl ProvenExecutionSecurity {
+    /// The exact subject the profile's claims are relative to.
+    pub fn subject(&self) -> EnforcementSubject {
+        self.subject
+    }
+
+    pub fn compiled(&self) -> &CompiledExecutionSecurity {
+        &self.compiled
+    }
+
+    /// Drop the subject proof. The result is a plain compile, not evidence.
+    pub fn into_compiled(self) -> CompiledExecutionSecurity {
+        self.compiled
+    }
+
+    pub fn plan(&self) -> &PolicyEnforcementPlan {
+        self.compiled.plan()
+    }
+
+    pub fn plan_digest(&self) -> &str {
+        self.compiled.plan_digest()
+    }
+
+    pub fn cache_key(&self) -> &CompileCacheKey {
+        self.compiled.cache_key()
+    }
+
+    pub fn evidence_subject(&self) -> &SecurityEvidenceSubject {
+        self.compiled.evidence_subject()
+    }
+
+    /// Complete the evidence subject once the exact SourceConfig is attested.
+    pub fn with_source_config(mut self, config: &SourceConfig) -> Result<Self, ContractError> {
+        self.compiled = self.compiled.with_source_config(config)?;
         Ok(self)
     }
 }
 
 /// Compile the root-relative plan and the evidence subject.
 ///
-/// Steps, in the ADR-0014 §3 order:
-/// 1. the imported profile must be the one the SpawnSource declaration named;
-/// 2. the exact adapter binding must be active and belong to the profile's
-///    protocol family;
+/// The input is a [`ValidatedSourceBinding`], so the physical facts are already
+/// related: the binding is the source's own adapter policy, both are active,
+/// and the profile was imported for the same resolved physical
+/// `(adapter_kind, adapter_binding_key)` domain as the selection. Steps, in the
+/// ADR-0014 §3 order:
+/// 1. the validated tuple must describe the authority's own spawn source;
+/// 2. the imported profile must be the one the SpawnSource declaration named;
 /// 3. the effective policy's obligations must be covered by the profile;
 /// 4. the plan is the logical effective policy; its digest commits to the
 ///    policy, the profile, and the compiler protocol.
 ///
 /// A missing feature is a deterministic candidate ineligibility
-/// (`SecurityUnenforceable`). A profile/authority mismatch is a subject
+/// (`SecurityUnenforceable`). A profile/authority/source mismatch is a subject
 /// mismatch. Neither is a Task failure.
 pub fn compile_execution_security(
     authority: &EffectiveTaskAuthority,
-    binding: &AdapterBindingPolicy,
-    profile: &ImportedEnforcementProfile,
+    domain: &ValidatedSourceBinding,
 ) -> Result<CompiledExecutionSecurity, ContractError> {
+    if domain.source() != authority.spawn_source_ref() {
+        return Err(ContractError::EvidenceSubjectMismatch {
+            reason: "the validated source/binding belongs to a different spawn source".into(),
+        });
+    }
+    let profile = domain.profile();
+    let binding = domain.binding();
     if authority.enforcement_profile() != profile.reference() {
         return Err(ContractError::EvidenceSubjectMismatch {
             reason: "the imported enforcement profile is not the one the source declared".into(),
-        });
-    }
-    binding.validate()?;
-    if binding.status != ConfigStatus::Active {
-        return Err(ContractError::SecurityUnenforceable {
-            reason: "the exact adapter binding is not active".into(),
-        });
-    }
-    if binding.adapter_kind.trim().is_empty() {
-        return Err(ContractError::InvalidRef {
-            reason: "adapter binding kind cannot be empty".into(),
         });
     }
 
@@ -870,7 +1217,7 @@ pub fn compile_execution_security(
         authority.normalization_version(),
         authority.meet_algorithm_version(),
         &binding.adapter_kind,
-        &binding.binding_ref,
+        domain.adapter_binding_key(),
         profile.profile_digest(),
         effective_execution_guarantees_digest(guarantees),
     )?;
@@ -887,7 +1234,7 @@ pub fn compile_execution_security(
         authority.spawn_source_ref().clone(),
         binding.policy_ref.clone(),
         binding.adapter_kind.clone(),
-        binding.binding_ref.clone(),
+        domain.adapter_binding_key().to_string(),
         authority.effective_policy_digest().to_string(),
         profile.reference().clone(),
         profile.profile_digest().to_string(),
@@ -898,12 +1245,17 @@ pub fn compile_execution_security(
         plan,
         cache_key,
         evidence_subject,
+        covered_subjects: profile.covered_subjects().clone(),
+        supports_credential_delivery: profile
+            .support()
+            .supports(EnforcementFeature::CredentialDelivery),
     })
 }
 
 /// Qualify one candidate: prove the candidate's authored ceiling bounds the
 /// effective Task policy with the real policy order, re-check the Task's coarse
-/// modes and its positive access floor on the complete policy, then compile.
+/// modes and its positive access floor on the complete policy, then compile and
+/// prove the profile claims the executing subject.
 ///
 /// This is the acquisition-side predicate. It grants no Attempt/Lease
 /// authority; the authority transaction still owns that.
@@ -912,10 +1264,10 @@ pub fn qualify_security_candidate(
     authority: &EffectiveTaskAuthority,
     requirement: &crate::requirement::TaskAgentRequirement,
     agent: &crate::authority::SecurityRevision<'_>,
-    binding: &AdapterBindingPolicy,
-    profile: &ImportedEnforcementProfile,
+    domain: &ValidatedSourceBinding,
+    subject: EnforcementSubject,
     catalog: &crate::capability::CapabilityCatalog,
-) -> Result<CompiledExecutionSecurity, ContractError> {
+) -> Result<ProvenExecutionSecurity, ContractError> {
     if authority.requirement_digest()
         != crate::canonical::task_agent_requirement_content_digest(requirement)
     {
@@ -977,7 +1329,7 @@ pub fn qualify_security_candidate(
              {deficit}"
         ),
     })?;
-    compile_execution_security(authority, binding, profile)
+    compile_execution_security(authority, domain)?.prove_subject(subject)
 }
 
 /// The ordered, deduplicated candidate identity set one acquisition round sees.

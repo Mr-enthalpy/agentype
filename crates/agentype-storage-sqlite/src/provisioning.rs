@@ -1019,6 +1019,51 @@ fn resolve_incarnation(
     }
 }
 
+/// The imported facts a `SECURITY_V1` acquisition must prove in addition to the
+/// durable resolver selection.
+///
+/// The profile is an imported external fact (ADR-0014 §5): it has no durable
+/// row, so the acquisition transaction re-checks it for subject, version and
+/// validity against the durable catalog instead of pretending it is a SQLite
+/// input. The resolver selection inside is the same plain record the coarse path
+/// uses, and every conjunct over it is re-proved in the transaction.
+#[derive(Clone, Debug)]
+pub struct SecurityProvisioningSelection {
+    pub provisioning: ResolvedProvisioningSelection,
+    /// The exact imported enforcement profile of the selected physical domain.
+    pub profile: agentype_agent_contract::ImportedEnforcementProfile,
+    /// The exact subject the profile's claims must cover (ADR-0014 §14).
+    pub subject: agentype_agent_contract::EnforcementSubject,
+}
+
+/// Which qualification chain this acquisition transaction must prove before it
+/// grants Attempt/Lease authority.
+#[cfg(any(test, feature = "runtime-internal"))]
+#[derive(Clone, Copy)]
+enum AcquisitionMode<'a> {
+    /// The frozen `COARSE_V1` relation (`can_execute` + `can_provision_task`).
+    Coarse,
+    /// The B5.2 `SECURITY_V1` chain: composite authority, validated tuple,
+    /// qualification, and the request-scoped config settlement.
+    SecurityV1(&'a SecurityProvisioningSelection),
+}
+
+/// The inverse of [`reject_security_v1_coarse_acquisition`]: the security path
+/// only acquires a `SECURITY_V1` Task, never a coarse one. The mode is read from
+/// its sole durable owner and never inferred from policy presence.
+///
+/// A legacy Task is already rejected by the shared `TYPED` gate in
+/// [`finish_acquisition`], before this check runs.
+#[cfg(any(test, feature = "runtime-internal"))]
+fn require_security_v1_acquisition(tx: &Transaction<'_>, task_id: &TaskId) -> Result<(), Error> {
+    if crate::requirement::task_security_mode(tx, task_id)? != SecurityContractMode::SecurityV1 {
+        return Err(Error::invalid_authority(
+            "the security acquisition path only acquires a SECURITY_V1 task",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "runtime-internal"))]
 fn finish_acquisition(
     tx: &Transaction<'_>,
@@ -1028,6 +1073,7 @@ fn finish_acquisition(
     agent_id: &LogicalAgentId,
     selection: &ResolvedProvisioningSelection,
     execution_registry: &agentype_execution_config::ExecutionRegistry,
+    mode: AcquisitionMode<'_>,
 ) -> Result<TypedAcquisition, Error> {
     let task = required_task(tx, task_id.as_str())?;
     let batch_state: String = tx
@@ -1049,24 +1095,27 @@ fn finish_acquisition(
             "typed acquisition requires a ready Task in an ACTIVE Batch and partition",
         ));
     }
-    let mode: String = query_opt(
+    let requirement_mode: String = query_opt(
         tx,
         "SELECT agent_requirement_mode FROM tasks WHERE id=?1",
         params![task_id.as_str()],
         |row| row.get(0),
     )?
     .ok_or_else(|| Error::not_found(format!("task {task_id} not found")))?;
-    if mode != "TYPED" {
+    if requirement_mode != "TYPED" {
         return Err(Error::invalid_transition(
             "typed acquisition requires a TYPED task",
         ));
     }
-    // M6-B.5 B5.1 gate: the coarse typed acquisition path has no security
-    // execution support, so a SECURITY_V1 Task MUST NOT gain Attempt/Lease
-    // authority through it. Checked after the shared readiness predicate and
-    // before any requirement, agent, catalog, attestation, credential, or
-    // private-I/O work.
-    reject_security_v1_coarse_acquisition(tx, task_id)?;
+    // The security mode picks the chain. The coarse path MUST NOT grant a
+    // SECURITY_V1 Task authority, and the security path MUST NOT acquire a
+    // coarse or legacy Task. Both checks come after the shared readiness
+    // predicate and before any requirement, agent, catalog, attestation,
+    // credential, or private-I/O work.
+    match mode {
+        AcquisitionMode::Coarse => reject_security_v1_coarse_acquisition(tx, task_id)?,
+        AcquisitionMode::SecurityV1(_) => require_security_v1_acquisition(tx, task_id)?,
+    }
     let requirement = crate::requirement::get_task_agent_requirement(tx, task_id)?
         .ok_or_else(|| Error::invariant("a TYPED task is missing its agent requirement"))?;
 
@@ -1096,20 +1145,35 @@ fn finish_acquisition(
             "agent is not M5-placeable for this task",
         ));
     }
-    let (actual, _status) = crate::catalog::get_agent_type(tx, &bound)?
-        .ok_or_else(|| Error::invariant("agent type binding references a missing revision"))?;
-    // M6-B.5 B5.1 gate: an AgentType revision whose immutable security mode is
-    // `SECURITY_V1` is a full-path identity. The coarse acquisition path cannot
-    // discharge its contract, so it MUST NOT execute under this type even though
-    // the type is semantically executable.
-    if crate::catalog::agent_type_security_mode(tx, &bound)? == SecurityContractMode::SecurityV1 {
-        return Err(Error::invalid_authority(
-            "a SECURITY_V1 agent type requires the B5 security execution path; the coarse typed acquisition path cannot execute it",
-        ));
-    }
+    // The mode and the authored policy come from the same validated read as the
+    // contract, so the security chain can never pair one revision's bytes with
+    // another revision's mode.
+    let (actual, _status, actual_mode, actual_policy) =
+        crate::catalog::get_agent_type_security_view(tx, &bound)?
+            .ok_or_else(|| Error::invariant("agent type binding references a missing revision"))?;
     let catalog = crate::catalog::load_capability_catalog(tx)?;
-    agentype_agent_contract::can_execute(&actual, &requirement.hard, &catalog)
-        .map_err(acquisition_rejection)?;
+    match mode {
+        // M6-B.5 B5.1 gate: an AgentType revision whose immutable security mode
+        // is `SECURITY_V1` is a full-path identity. The coarse acquisition path
+        // cannot discharge its contract, so it MUST NOT execute under this type
+        // even though the type is semantically executable.
+        AcquisitionMode::Coarse => {
+            if actual_mode == SecurityContractMode::SecurityV1 {
+                return Err(Error::invalid_authority(
+                    "a SECURITY_V1 agent type requires the B5 security execution path; the coarse typed acquisition path cannot execute it",
+                ));
+            }
+            agentype_agent_contract::can_execute(&actual, &requirement.hard, &catalog)
+                .map_err(acquisition_rejection)?;
+        }
+        AcquisitionMode::SecurityV1(_) => {
+            if actual_mode != SecurityContractMode::SecurityV1 {
+                return Err(Error::invalid_authority(
+                    "a COARSE_V1 agent type cannot execute a SECURITY_V1 task",
+                ));
+            }
+        }
+    }
 
     // Selection linearization fence: the active candidate frontier must be
     // unchanged since the resolver picked the winner, so a concurrent publish
@@ -1131,13 +1195,24 @@ fn finish_acquisition(
     // M6-B.5 B5.1 gate: a `SECURITY_V1` source revision is a full-path source
     // even when it declares no authored `P_source` ceiling (`P_source = Top`
     // never means "eligible for the coarse path"). The coarse path cannot run
-    // its imported-enforcement coverage check, so it MUST NOT select one.
-    if crate::catalog::spawn_source_security_mode(tx, &selection.spawn_source)?
-        == SecurityContractMode::SecurityV1
-    {
-        return Err(Error::invalid_authority(
-            "a SECURITY_V1 spawn source requires the B5 security execution path; the coarse typed acquisition path cannot select it",
-        ));
+    // its imported-enforcement coverage check, so it MUST NOT select one; the
+    // security path must select exactly such a source.
+    let source_mode = crate::catalog::spawn_source_security_mode(tx, &selection.spawn_source)?;
+    match mode {
+        AcquisitionMode::Coarse => {
+            if source_mode == SecurityContractMode::SecurityV1 {
+                return Err(Error::invalid_authority(
+                    "a SECURITY_V1 spawn source requires the B5 security execution path; the coarse typed acquisition path cannot select it",
+                ));
+            }
+        }
+        AcquisitionMode::SecurityV1(_) => {
+            if source_mode != SecurityContractMode::SecurityV1 {
+                return Err(Error::invalid_authority(
+                    "a COARSE_V1 spawn source cannot provision a SECURITY_V1 task",
+                ));
+            }
+        }
     }
     if source.adapter_policy != selection.adapter_policy {
         return Err(Error::invalid_authority(
@@ -1179,28 +1254,141 @@ fn finish_acquisition(
         crate::catalog::load_source_config_revision(tx, &selection.source_config)?
             .ok_or_else(|| Error::invariant("selected source config revision is missing"))?;
     let config = config_revision.config();
-    // B.3 entry boundary: credential availability is a pre-authority conjunct.
-    // M6-B.4 has no trusted, source-bound availability authority, and a caller
-    // must never mint that authority, so any config that declares credential
-    // refs fails closed here. Trusted resolution/availability/brokering is B.5.
+    // Credential availability is a pre-authority conjunct on every chain. B5.3
+    // owns credential qualification (the canonical `CredentialRequest`, the
+    // `CredentialEligibilityEvidence` and broker qualification); until those
+    // exist no request can be authorized, and ADR-0015 §5/§9 make that a default
+    // deny. A profile's delivery capability is a necessary condition inside the
+    // pure compile, never an authorization, so the authority-bearing entry stays
+    // fail-closed for *any* non-empty request instead of minting delivery
+    // authority from the caller's profile claim.
     if !config.credential_refs.is_empty() {
         return Err(Error::invalid_authority(
-            "credential availability is B.5; B.4 fails closed for credential-bearing configs",
+            "credential-bearing configs are fail-closed before B5.3 credential qualification; \
+             a delivery capability is not a credential authorization",
         ));
     }
     // The selected SourceConfig carries a source-integration materialization
     // attestation for the exact physical domain (`MaterializationDigest` already
     // enforces the canonical `sha256:<64 hex>` grammar at construction); a config
     // identity/digest alone is not a materialized environment.
-    agentype_agent_contract::can_provision_task(
-        &actual,
-        &source,
-        config,
-        &selection.evidence,
-        &catalog,
-        &requirement.hard,
-    )
-    .map_err(acquisition_rejection)?;
+    match mode {
+        AcquisitionMode::Coarse => {
+            agentype_agent_contract::can_provision_task(
+                &actual,
+                &source,
+                config,
+                &selection.evidence,
+                &catalog,
+                &requirement.hard,
+            )
+            .map_err(acquisition_rejection)?;
+        }
+        // ADR-0014 §3 order, over the exact durable inputs. B.4 eligibility is a
+        // *conjunct*, not an alternative: `SECURITY_V1` still has to prove the
+        // frozen source/config provisioning predicates (ownership and ACTIVE
+        // dispositions, the evidence subject/config digest identity, lifecycle,
+        // continuity, the functional envelope and the security-class evidence,
+        // plus the Task's effective safety and restriction join). Only the coarse
+        // exact-reference sandbox relations are replaced, by the real policy order
+        // inside the qualification below: the AgentType authored reference, the
+        // Task authored reference, and the "evidence names this authored policy"
+        // claim. The Task layer is still proven, because `P_eff` already meets the
+        // Task authored policy inside `TaskSecurityBinding` and the compile proves
+        // obligation coverage over it. Then derive the composite authority,
+        // validate the external source/binding/profile tuple against the durable
+        // source and binding, qualify (policy order, coarse modes, access floor,
+        // coverage, compile, subject proof), and complete the evidence subject
+        // with the attested config. Every failure here is candidate-local
+        // (`InvalidAuthority`/`SecurityUnenforceable`), never a Task failure.
+        AcquisitionMode::SecurityV1(security) => {
+            agentype_agent_contract::can_provision_task_source_config_reusable(
+                &actual,
+                &source,
+                config,
+                &selection.evidence,
+                &catalog,
+                &requirement.hard,
+            )
+            .map_err(acquisition_rejection)?;
+            let generation_id = crate::security_acquisition::task_generation(tx, task_id)?;
+            let declaration =
+                crate::catalog::spawn_source_security_declaration(tx, &source.source_ref)?
+                    .ok_or_else(|| {
+                        Error::invariant(
+                            "a SECURITY_V1 spawn source is missing its security declaration",
+                        )
+                    })?;
+            let source_policy = match declaration
+                .source_policy()
+                .and_then(|input| input.reference())
+            {
+                Some(reference) => Some(
+                    crate::catalog::get_sandbox_policy(tx, reference)?.ok_or_else(|| {
+                        Error::invariant(
+                            "the spawn source declaration references a missing sandbox policy",
+                        )
+                    })?,
+                ),
+                None => None,
+            };
+            let binding =
+                crate::requirement::get_task_security_binding(tx, task_id)?.ok_or_else(|| {
+                    Error::invariant("a SECURITY_V1 task is missing its security binding")
+                })?;
+            let revision = agentype_agent_contract::SecurityRevision::new(
+                &actual,
+                actual_mode,
+                actual_policy.as_ref(),
+            )
+            .map_err(acquisition_rejection)?;
+            let authority = agentype_agent_contract::EffectiveTaskAuthority::new(
+                task_id.clone(),
+                generation_id,
+                LogicalAgentId::from_string(agent.id.clone()),
+                &binding,
+                &requirement,
+                &revision,
+                &source,
+                &declaration,
+                source_policy.as_ref(),
+            )
+            .map_err(acquisition_rejection)?;
+            // The caller supplies the imported profile, not the source or the
+            // binding: those are re-loaded here. The validated tuple is therefore
+            // the durable source's own adapter policy plus a profile that must
+            // have been imported for the exact resolved physical domain, not
+            // merely for the same `binding_ref` alias.
+            let domain = agentype_agent_contract::ValidatedSourceBinding::validate(
+                &source,
+                &policy,
+                &security.provisioning.adapter_binding_key,
+                &security.profile,
+            )
+            .map_err(acquisition_rejection)?;
+            let proven = agentype_agent_contract::qualify_security_candidate(
+                &authority,
+                &requirement,
+                &revision,
+                &domain,
+                security.subject,
+                &catalog,
+            )
+            .map_err(acquisition_rejection)?;
+            // Complete the evidence subject with the exact attested config. The
+            // credential request gate already ran above: every non-empty request
+            // is fail-closed until B5.3, so this call only binds the config and
+            // re-checks the profile's delivery capability as a defensive
+            // necessary condition (ADR-0015 §5/§9).
+            let _proven = proven
+                .with_source_config(config)
+                .map_err(acquisition_rejection)?;
+            // `_proven` is qualification evidence, not an applied-security
+            // receipt. Persisting the security plan/snapshot and claiming the
+            // secured start is B5.4; this transaction grants only the mechanical
+            // Attempt/Lease the coarse path also grants.
+        }
+    }
 
     // The partition target/profile must be a valid authoritative environment and
     // the target must agree with the policy on the adapter kind before any
@@ -1318,6 +1506,42 @@ pub fn acquire_typed_task_existing(
         agent_id,
         selection,
         execution_registry,
+        AcquisitionMode::Coarse,
+    )
+}
+
+/// Acquire a `SECURITY_V1` Task for an existing, READY, unassigned, type-bound
+/// LogicalAgent through the B5.2 qualification chain.
+///
+/// This is the B5 acquisition entry point. It re-loads the composite authority's
+/// durable inputs (Task security binding, requirement, the agent's actual
+/// `SECURITY_V1` AgentType revision and authored policy, the source revision and
+/// its security declaration), validates the caller-supplied imported profile and
+/// subject against them, qualifies the candidate, settles the exact config's
+/// credential request, and only then creates the Attempt/Lease and freezes the
+/// `ProvisioningBinding` — all in one transaction with no external I/O.
+///
+/// It does not claim a secured start, an applied-security receipt or recovery:
+/// those are B5.4. A rejected candidate grants nothing.
+#[cfg(any(test, feature = "runtime-internal"))]
+pub fn acquire_security_v1_task_existing(
+    tx: &Transaction<'_>,
+    now: UnixTime,
+    lease_seconds: f64,
+    task_id: &TaskId,
+    agent_id: &LogicalAgentId,
+    selection: &SecurityProvisioningSelection,
+    execution_registry: &agentype_execution_config::ExecutionRegistry,
+) -> Result<TypedAcquisition, Error> {
+    finish_acquisition(
+        tx,
+        now,
+        lease_seconds,
+        task_id,
+        agent_id,
+        &selection.provisioning,
+        execution_registry,
+        AcquisitionMode::SecurityV1(selection),
     )
 }
 
@@ -1359,5 +1583,6 @@ pub fn acquire_typed_task_new_agent(
         &agent_id,
         selection,
         execution_registry,
+        AcquisitionMode::Coarse,
     )
 }

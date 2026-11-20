@@ -73,11 +73,12 @@ pub use enforcement::{
     qualify_security_candidate, AcquisitionBudget, AcquisitionCost, BudgetExhaustion, BudgetLimit,
     CandidateDomain, CompileCacheKey, CompiledExecutionSecurity, EffectiveExecutionGuarantees,
     EnforcementFeature, EnforcementSubject, EnforcementSupport, ImportedEnforcementProfile,
-    PolicyEnforcementPlan, RequiredEnforcementFeatures, SecurityAcquisitionBlock,
-    SecurityAcquisitionBlockStatus, SecurityAcquisitionRelease, SecurityEvidenceSubject,
-    ENFORCEMENT_COMPILER_PROTOCOL, ENFORCEMENT_GUARANTEES_SCHEMA_VERSION,
-    ENFORCEMENT_PLAN_SCHEMA_VERSION, ENFORCEMENT_PROFILE_SCHEMA_VERSION,
-    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
+    PolicyEnforcementPlan, ProvenExecutionSecurity, RequiredEnforcementFeatures,
+    SecurityAcquisitionBlock, SecurityAcquisitionBlockStatus, SecurityAcquisitionRelease,
+    SecurityEvidenceSubject, ValidatedSourceBinding, ENFORCEMENT_COMPILER_PROTOCOL,
+    ENFORCEMENT_GUARANTEES_SCHEMA_VERSION, ENFORCEMENT_PLAN_SCHEMA_VERSION,
+    ENFORCEMENT_PROFILE_SCHEMA_VERSION, POLICY_ONLY_REFERENCE_PROFILE,
+    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;
@@ -89,9 +90,10 @@ pub use matching::{
     QualifiedExistingAgentCandidate, TaskPlacement,
 };
 pub use predicates::{
-    can_execute, can_execute_security_v1, can_provision, can_provision_task, is_valid_refinement,
-    is_valid_refinement_with_policies, more_specific_for, more_specific_for_with_policies,
-    validate_source_config, validate_spawn_source,
+    can_execute, can_execute_security_v1, can_provision, can_provision_task,
+    can_provision_task_source_config, can_provision_task_source_config_reusable,
+    is_valid_refinement, is_valid_refinement_with_policies, more_specific_for,
+    more_specific_for_with_policies, validate_source_config, validate_spawn_source,
 };
 pub use provisioning::{
     BindingSnapshot, MaterializationDigest, ProvisioningBinding, RESOLVER_VERSION,

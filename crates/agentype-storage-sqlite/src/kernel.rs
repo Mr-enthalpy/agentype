@@ -1196,6 +1196,30 @@ impl Kernel {
         })
     }
 
+    /// Acquire a `SECURITY_V1` Task through the B5.2 qualification chain
+    /// (authority-bearing). Rejected candidates grant no Attempt or Lease.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn acquire_security_v1_task_existing(
+        &self,
+        task_id: &agentype_core::TaskId,
+        agent_id: &agentype_core::LogicalAgentId,
+        chosen: &crate::provisioning::SecurityProvisioningSelection,
+        execution_registry: &agentype_execution_config::ExecutionRegistry,
+    ) -> Result<crate::provisioning::TypedAcquisition, Error> {
+        let lease_seconds = self.lease_seconds;
+        self.tx(|tx, now| {
+            crate::provisioning::acquire_security_v1_task_existing(
+                tx,
+                now,
+                lease_seconds,
+                task_id,
+                agent_id,
+                chosen,
+                execution_registry,
+            )
+        })
+    }
+
     // ------------------------------------------------------------------ topology
 
     pub fn upsert_partition(&self, spec: &PartitionSpec) -> Result<i64, Error> {
@@ -2406,6 +2430,19 @@ impl Kernel {
                 "a typed Task must commit through create_execution_with_snapshot",
             ));
         }
+        // B5.2-E / B5.4 boundary: a `SECURITY_V1` Task may never commit through
+        // the frozen B.4 Execution path, with or without a `BindingSnapshot`.
+        // `acquire_security_v1_task_existing` proves qualification inside its own
+        // transaction, but it neither persists an `ExecutionSecuritySnapshot` nor
+        // a B5.4 receipt, so a `Claim` from it is not execution authority. This is
+        // checked against durable Task state, not the caller, so it holds for the
+        // legacy path and `create_execution_with_snapshot` alike.
+        if crate::requirement::task_is_security_v1(tx, &TaskId::from_string(&attempt.task_id))? {
+            return Err(Error::invalid_authority(
+                "a SECURITY_V1 Task cannot commit through the B.4 Execution path; it requires \
+                 the B5.4 ExecutionSecuritySnapshot and secured start",
+            ));
+        }
         // Attempt-bound proof: a safety fact minted for a different
         // attempt (or a different lease epoch) is rejected even when the
         // target and profile names coincide, closing cross-attempt
@@ -2572,6 +2609,18 @@ impl Kernel {
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            // B5.2-E / B5.4 boundary: a `SECURITY_V1` Execution cannot enter
+            // RUNNING on an ordinary `BindingSnapshot`. The B5.4 receipt chain
+            // (`ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity,
+            // SubjectIdentity)` plus the applied-security receipt) does not exist
+            // yet, so this entry fails closed before any state change rather than
+            // treating a successful qualification as start authority.
+            if crate::requirement::task_is_security_v1(tx, &TaskId::from_string(&task.id))? {
+                return Err(Error::invalid_authority(
+                    "a SECURITY_V1 Execution cannot enter RUNNING without the B5.4 \
+                     ExecutionSecuritySnapshot and applied-security receipt",
+                ));
+            }
             let execution = required_execution(tx, execution_id.as_str())?;
             if execution.attempt_id != attempt.id {
                 return Err(Error::stale("execution does not belong to current attempt"));
@@ -2805,6 +2854,20 @@ impl Kernel {
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            // B5.2-E / B5.4 boundary: a successful `SECURITY_V1` acquisition is
+            // not semantic completion authority either. Acknowledgement without
+            // an Execution would publish a Result and release dependencies from a
+            // Claim that never committed an `ExecutionSecuritySnapshot`, a
+            // physical terminal state or a B5.4 receipt. The optional
+            // `execution_id` is not proof, so this fails closed before any state
+            // change until B5.4 defines the secured acknowledgement path.
+            if crate::requirement::task_is_security_v1(tx, &TaskId::from_string(&task.id))? {
+                return Err(Error::invalid_authority(
+                    "a SECURITY_V1 Task cannot be acknowledged as succeeded without the \
+                     B5.4 ExecutionSecuritySnapshot, physical terminal state and \
+                     applied-security receipt",
+                ));
+            }
             let execution = execution_for_attempt(
                 tx,
                 &attempt.id,

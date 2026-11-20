@@ -240,6 +240,16 @@ trusted source-local resolver from the exact `SourceConfig` revision (section 2)
 B5.3 MUST NOT derive scope, audience, use, or delivery mode from a broker
 response, and MUST NOT treat a successful probe as authorization.
 
+Until that canonical request, the `CredentialEligibilityEvidence` and broker
+qualification exist, the authority-bearing acquisition entry is **fail-closed for
+every non-empty `SourceConfig.credential_refs`**, whether or not the imported
+profile claims `CredentialDelivery`. The delivery-capability check inside the
+pure compile is a necessary condition for B5.3, never an authorization: a profile
+claim must not be able to mint Attempt/Lease authority for a credential-bearing
+config that no positive grant covers. A caller-assembled credential-bearing
+selection is `InvalidAuthority`; the Task stays queued and no Attempt, Lease or
+`ProvisioningBinding` is written.
+
 If the winner's eligibility becomes invalid before commit, the default is defer,
 not reselection. Only a new complete observation epoch may select again, with a
 bounded retry/backoff limit.
@@ -395,7 +405,8 @@ the complete policy commit/start/receipt/recovery protocol.
 | `policy` only | credential-free `SECURITY_V1` may execute within `SECURITY_V1_POLICY_ONLY_REFERENCE_V1` |
 | `policy` + `credential_brokered` | credential tasks satisfying the brokered contract may execute |
 | `policy` + `credential_transient_raw` | raw delivery only where explicitly allowed (not enabled in v1 production) |
-| config has credential refs but no delivery capability | B.4 fail-closed behavior; no Attempt is created |
+| config has credential refs, even with delivery capability | B5.3 not implemented: `SECURITY_V1` acquisition is fail-closed; no Attempt is created |
+| config has credential refs but no delivery capability | fail-closed on both chains; no Attempt is created |
 
 A gate does not mean every policy dimension is enforceable; the
 `EnforcementSupport` matrix still applies to the derived `FeatureObligations`, as
