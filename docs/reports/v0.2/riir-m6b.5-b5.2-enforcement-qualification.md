@@ -1,14 +1,17 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 19 (2026-11-20) — continues the C → D → E order after PR #38's B5.2-C
+Revision: 22 (2026-11-20) — continues the C → D → E order after PR #38's B5.2-C
 and PR #39's B5.2-D. Revision 19 implements B5.2-E: the resolver is wired into the
 typed acquisition facade with mode-aware enumeration, a complete-round
 `SecurityHold` for `SECURITY_V1` Tasks, and a dedicated `security_hold_cooldown`.
 With B5.4 disabled a `SECURITY_V1` Task is held `QUEUED` with no Attempt or Lease
-instead of cycling `QUEUED → LEASED → lease expiry`. B5.2 is still not frozen and
-B5.4 (snapshot, secured start, `ExecutionSecurityEvidence`) remains open. No ADR
-`Status:` line, spec status or index entry changes
+instead of cycling `QUEUED → LEASED → lease expiry`. Revisions 21–22 fix the
+round-3 audit's code findings: provisional holds for a timed-out probe or a
+catalog/roster drift, a one-hour attestation-validity ceiling, and a per-mode
+readiness proof. B5.2 is still not frozen and B5.4 (snapshot, secured start,
+`ExecutionSecurityEvidence`) remains open. No ADR `Status:` line, spec status or
+index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
 PR #30–#37 merged, #37 at `e68a771`; B5.2-C in PR #38; B5.2-D in PR #39; B5.2-E on
 `agent/m6b5-b5.2-e-scheduler-wiring`)
@@ -68,10 +71,23 @@ attestation writer now rejects a self-consistent value rebuilt from public parts
 only the trusted producer can record physical evidence, and a held `SECURITY_V1`
 Task no longer consumes the typed dispatch cycle ahead of runnable coarse work.
 As with every earlier finding, this record counts no
-unmerged fix as closure and does not freeze B5.2. The current stage is
+unmerged fix as closure and does not freeze B5.2. Revision 21 fixes the round-3
+audit's code defect: a read-only security probe that exceeded its deadline now
+returns a provisional hold instead of aborting the typed cycle, so unrelated coarse
+work still dispatches while integrity faults still fail closed. Revision 22 fixes
+the remaining three code-level findings of that audit: the attestation claim is
+bounded to one hour on construction and on the durable read, the hold's "complete"
+round is fenced by a catalog/roster snapshot and reports `CatalogDrift` when it
+cannot be coherent, and each readiness probe proves its own Task mode instead of
+sharing a one-way `reject_security_v1` flag. It also adds the audit's requested
+`probe_limit=1` multi-hold load test. Revision 22 records the audit's §四 scope
+choice: the original B5.2 gate stands, so the trusted registry, the installation
+epoch and the runtime whole-round budget are still B5.2 acceptance conditions and
+B5.2 remains unfrozen. The current stage is
 *selected-candidate transactional qualification with trusted-importer provenance,
-complete candidate identity and an explainable security hold implemented; the
-secured acquisition/start and `ExecutionSecurityEvidence` remain B5.4*.
+complete candidate identity, a bounded freshness claim and an explainable security
+hold implemented; the trusted registry/epoch, production budget/defer, secured
+acquisition/start and `ExecutionSecurityEvidence` remain open*.
 
 The gaps are **latent, not live**. The coarse typed acquisition path still
 rejects `SECURITY_V1` at every stage, and although the runtime resolver now
@@ -114,6 +130,7 @@ which was false while the durable writer accepted it.
 | 19 | `agent/m6b5-b5.2-e-scheduler-wiring` (code) | Implements B5.2-E after PR #39's B5.2-D branch. Adds `CandidateMode::{Coarse, SecurityV1}` and the `resolve_security_source_candidates{,_for_agent}` entry points, which apply `can_provision_task_source_config_reusable` and `Kernel::check_typed_security_readiness` while the coarse path keeps its frozen predicate and the B5.1 `SECURITY_V1` readiness rejection. `acquire_typed_task` reads the durable Task mode first and refuses a `SECURITY_V1` Task with `ProvisioningResolutionError::SecurityHold` after enumerating the complete round; the runtime reports `DispatchOneOutcome::TypedDeferred` and a dedicated `security_hold_cooldown` (default 30 s). The Task stays `QUEUED` with no Attempt/Lease/binding/NACK across cycles and lease expiry. New liveness tests cover a populated and an empty security round. ADR-0014 §3/§4 state the hold, the readiness split and the deferred durable block. No schema bump, no ADR `Status:` line, spec status or index entry change. |
 | 20 | `agent/m6b5-b5.2-e-scheduler-wiring` (code) | Records the joint B5.2-C/D/E audit and fixes its two actionable findings. **P1:** a digest-correct attestation built from public parts (`from_parts`) could be written as trusted physical evidence. `EnforcementProfileAttestation` now carries a private `producer_sealed` flag that only the gated `new` constructor sets; the durable read stays unsealed, `record_enforcement_profile_attestation` rejects an unsealed value with `InvalidAuthority` and writes no row, and `PartialEq` compares the attested facts so write-once idempotence still works without making the read path writable. **P2:** a held `SECURITY_V1` Task returned `TypedDeferred` immediately and consumed the cycle's only typed probe slot ahead of a runnable `COARSE_V1` Task. `TypedCandidateAttempt::{Outcome, Deferred, Held}` makes a hold candidate-local: it cools the Task down, keeps scanning, and reports the hold detail only when nothing in the window was started. New tests: `b5_security_acquisition::a_self_consistent_attestation_without_producer_provenance_is_rejected` and `provisioning_resolver::tests::a_held_security_task_does_not_starve_a_runnable_coarse_task`. ADR-0014 §3/§5 state both. No durable-format, ADR `Status:`, spec status or index change. Not a B5.2 freeze: runtime whole-round budget enforcement and the B5.4 secured start remain open. |
 | 21 | `agent/m6b5-b5.2-e-scheduler-wiring` (code) | Records the round-3 audit of `a451839` and fixes its single actionable code finding. **P1:** a `SECURITY_V1` hold whose read-only `SourceConfig::attest` exceeded the cycle deadline returned `ProvisioningDeadlineExceeded`, which `defer_or_fail_typed` treated as fatal, so `control::cycle`'s `dispatch_typed_one(...)?` aborted the round and starved an unrelated runnable `COARSE_V1` Task. Attestation redaction now preserves that category with a fixed message; `security_hold` stops scanning the shared-deadline probe and returns a **provisional** hold (`SecurityHold::is_provisional`) whose diagnostic reports a lower bound and "the round is not complete". Integrity, storage and authority faults still propagate and fail closed. New tests: `provisioning_resolver::tests::a_security_hold_with_timed_out_attestation_does_not_block_runnable_coarse_task` and `a_security_hold_integrity_fault_still_fails_closed`. ADR-0014 §3 states the provisional hold. No durable-format, ADR `Status:`, spec status or index change. Still not a B5.2 freeze: importer registration/observation authority, runtime whole-round budget enforcement and the B5.4 secured start remain open. |
+| 22 | `agent/m6b5-b5.2-e-scheduler-wiring` (code) | Fixes the three code-level findings of the round-3 audit over `7dca374` and adds its requested load test. **P2-C:** attestations had no validity ceiling, so one observation could claim to outlive the installation it describes; `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS` (3600 s) is enforced in `validated_parts`, i.e. on construction *and* on the durable read. **P2-D/E:** `security_hold` is several consecutive reads, so a concurrent publish could make the reported union never have existed; `HoldProbeSnapshot` (catalog frontier digest, pinned `AgentTypeRef`, sorted matched roster) is compared before and after enumeration, and drift yields `HoldProvisionalCause::CatalogDrift`. **P2-E:** `TypedReadinessMode::{CoarseAcquisition, SecurityV1}` replaces `reject_security_v1: bool`, so each probe proves its own Task mode and rejects the other's (and `LEGACY`). New tests: over-long window rejected at both constructors; `each_readiness_probe_requires_its_own_mode`; catalog-drift drift ⇒ provisional; `held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` (`probe_limit=1`, near-deadline attestations). The `probe_limit=1` test is a bounded-cycle liveness proof, not a latency guarantee. ADR-0014 §3/§4/§5 state the fence, the mode proof and the ceiling. No durable-format, ADR `Status:`, spec status or index change. Scope decision recorded: the original B5.2 gate stands (registry, installation epoch and runtime budget stay B5.2; B5.4 only commits/executes), so B5.2 is still not frozen. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -1849,7 +1866,8 @@ failure. Revision 21 therefore separates "the external probe did not finish" fro
   existing redaction tests still pass.
 - `security_hold` catches that category, stops scanning (the deadline is shared by
   the whole probe, so every later attestation would fail for the same reason), and
-  returns `SecurityHold` with `provisional = true`.
+  returns `SecurityHold` with `provisional = Some(HoldProvisionalCause::ProbeDeadline)`
+  (revision 22 replaced the boolean with a typed cause).
 - `SecurityHold::is_provisional()` exposes the distinction. The complete-hold text
   is unchanged; a provisional hold says "at least N candidate(s) in provisional
   domain D (... the round is not complete)".
@@ -1892,6 +1910,141 @@ The arms were restored and the test went green again.
 - **B5.2 aggregate closure.** Revision 21 closes one code defect. It does not make
   B5.2 a frozen stage, does not provide a production secured acquisition path, and
   does not claim B5.4 capability.
+
+## Round-3 audit fixes (revision 22)
+
+The round-3 audit over `7dca374` accepted the hold direction and named three
+code-level findings plus one requested load test:
+
+- **P2-C:** an attestation had no independent validity ceiling, so one claimed
+  observation could outlive the physical installation it describes.
+- **P2-D/E:** `security_hold`'s "complete domain" was assembled from several
+  consecutive reads with no common observation snapshot.
+- **P2-E:** `check_typed_security_readiness` was `typed_readiness(id, false)`, which
+  meant only "do not reject `SECURITY_V1`" and therefore also accepted a
+  `COARSE_V1` Task.
+- The requested test: `probe_limit=1` with multiple `SECURITY_V1` Tasks whose
+  attestation consumes nearly the whole budget must still let coarse work run.
+
+Revision 22 fixes all four. The two stage-acceptance conditions the audit repeated
+(trusted importer registry, production whole-round budget) remain open and are
+recorded below.
+
+### P2-C — an attestation window is now bounded, not only checked against `now`
+
+`EnforcementProfileAttestation` required `issued_at < valid_until` and
+`issued_at <= now < valid_until`. Both are point/structure checks: nothing bounded
+`valid_until - issued_at`, so a producer could name a window years long and the
+row would stay "fresh" after the adapter was reinstalled, the execution domain
+moved, or the trusted importer changed. Revision 22 adds
+`ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS = 3600.0` and enforces it inside
+`validated_parts`, the single path shared by the gated producer constructor `new`
+and the public durable read `from_parts`. An over-long window is `InvalidNumber` at
+both boundaries, so an old or hostile row fails closed instead of being trusted.
+Exactly one hour remains legal; one second more does not.
+
+The ceiling is deliberately **not** an installation-epoch proof. Re-installing the
+physical adapter must invalidate older rows even inside the window, and that fact
+cannot be derived from an attestation value: it needs a trusted registry binding
+an importer to the exact `AdapterBinding` plus an explicit installed epoch. Without
+that registry an epoch would be one more caller-supplied string, so it is recorded
+as part of the same P1-C acceptance condition (row 16) rather than added as an
+unproven field.
+
+### P2-D/E — the hold's claimed round is fenced by an observation snapshot
+
+`security_hold` enumerated each matched existing owner, then the pinned new-agent
+route, as separate reads and unioned the identities. A concurrent publish could
+therefore produce a domain that never existed at one instant:
+
+```text
+T1 existing path observes source A
+T2 A deactivates, source B activates
+T3 new-agent path observes source B
+reported complete domain = {A, B}
+```
+
+That union is still only an operator diagnostic today (no Attempt/Lease), but it
+must not be read as a frozen round when B5.4 converts it into a durable block.
+Revision 22 adds `HoldProbeSnapshot`: the active catalog frontier digest, the
+Task's exact pinned `AgentTypeRef`, and the sorted matched-agent roster
+(`LogicalAgentId`, bound `AgentTypeRef`). The probe takes it before and after
+enumeration. The roster is included because `catalog_frontier_digest` covers
+active sources, configs, policies, security declarations and policy digests but
+**not** agent bindings, so a changed binding would otherwise be invisible.
+Equality is a coherence fence for "this union was observed across a stable catalog
+and roster", not a transaction and not a proof of physical truth.
+
+`SecurityHold.provisional` becomes `Option<HoldProvisionalCause>` with
+`ProbeDeadline` and `CatalogDrift`; `provisional_cause()` exposes the distinction
+and the `Display` text varies by cause. A drifted hold keeps its enumerated count
+as a lower bound, does not spend a second snapshot read when the deadline was
+already hit, and remains non-fatal: no Attempt, Lease, `ProvisioningBinding` or
+NACK, so unrelated coarse work still dispatches.
+
+### P2-E — each readiness probe proves its own Task mode
+
+`reject_security_v1: bool` could express only one of the two directions: `false`
+meant "do not reject `SECURITY_V1`", so `check_typed_security_readiness` returned
+success for a ready `COARSE_V1` Task. The production entry
+`acquire_typed_task` reads the durable mode first, so this was an interface hazard
+for future (B5.4) callers rather than a live bypass. Revision 22 replaces the flag
+with `TypedReadinessMode::{CoarseAcquisition, SecurityV1}`; `typed_readiness`
+mechanically rejects the other path's Task, and the security arm also rejects a
+`LEGACY` Task (no security contract). Both public probes are thin named wrappers, so
+a caller cannot select a mode without naming it.
+
+### Requested load test — bounded liveness under `probe_limit=1`
+
+`held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` queues three
+`SECURITY_V1` Tasks (each attestation burns up to a 30 ms budget and then misses
+it), then a runnable `COARSE_V1` Task, with `probe_limit = 1` and a 5 s hold
+cooldown. Each cycle probes at most one held Task; the earlier Tasks stay cooling
+while the window advances, so the coarse Task is reached in a bounded number of
+cycles (asserted `<= 6`, actually four). Every held Task stays `QUEUED` with zero
+Attempts throughout. This is a bounded-cycle proof, not a wall-clock latency
+guarantee: the attestation budget itself is the latency bound.
+
+### Scope decision (audit §四)
+
+The audit asked for a formal choice between (1) keeping the original B5.2 gate —
+trusted importer, installation epoch and production qualification/budget inside
+B5.2, with B5.4 only committing and executing — and (2) redefining B5.2 as
+non-executing substrate plus scheduler hold. This revision takes **(1)**: the
+B5.2 completion condition keeps the trusted importer registry, the physical
+installation epoch, and a production whole-round budget that binds before
+selection. Consequence: B5.2 is **not frozen** by revisions 19–22. The hold,
+provisional diagnostics and identity kernel are a continuing substrate, not a
+stage closure, and the durable budget-defer row stays open until the B5.4 imported
+profile exists.
+
+### What revision 22 does not settle
+
+- **Trusted importer registration, observation authority and installation epoch
+  (P1-C).** `producer_sealed` fences the writer, and the one-hour ceiling bounds
+  the claim, but `importer_id` is still caller-supplied and no composition root
+  binds an importer to the exact `AdapterBinding` it observed. The required
+  reverse test remains unwritten. This stays a B5.2-C stage-acceptance condition.
+- **Production whole-round budget and durable defer (P1-D).** `SecurityCandidateRound`,
+  `require_whole_round` and `budget_defer_block` remain pure data-model proofs;
+  no production path writes `security_acquisition_blocks`, which needs the B5.4
+  imported profile for `binding_profile_digest`. A provisional hold (deadline or
+  drift) is explicitly a lower bound and cannot be converted without re-enumeration.
+- **B5.2 aggregate closure.** Revision 22 closes three code defects and adds the
+  requested liveness case. It does not freeze B5.2, does not deliver a production
+  secured acquisition, and does not claim B5.4 capability.
+
+| Case | Test |
+|---|---|
+| an over-long attestation window is rejected by the producer constructor and by the durable read; exactly one hour is accepted | `b5_enforcement::an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling` |
+| the security probe accepts only `SECURITY_V1`, rejects `COARSE_V1` and `LEGACY`; the coarse probe rejects `SECURITY_V1`; no probe creates authority | `b5_coarse_path_gate::each_readiness_probe_requires_its_own_mode` |
+| a catalog publish during hold enumeration makes the hold provisional with `CatalogDrift`, not a complete round, while leaving one enumerated candidate | `provisioning_resolver::tests::a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round` |
+| `probe_limit=1`, three near-deadline `SECURITY_V1` holds, one coarse Task: coarse runs within a bounded number of cycles, holds stay `QUEUED` with zero Attempts | `provisioning_resolver::tests::held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` |
+
+**Mutation check.** Disabling the post-enumeration snapshot comparison
+(`else if false && hold_probe_snapshot(...) != before`) makes the drift test fail at
+`assert!(hold.is_provisional())`; the comparison was restored and the test went
+green again.
 
 ## B5.1 handoff acceptance, re-checked
 
@@ -1954,6 +2107,8 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 14)** Qualification is not execution authority: a `SECURITY_V1` `Claim` cannot commit an Execution or enter `RUNNING` through the frozen B.4 paths before B5.4 | `requirement.rs` `task_is_security_v1`; `kernel.rs` `create_execution_in_tx`, `confirm_running_and_renew` | `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path` | this pull request (rev 14) |
 | **(rev 15)** Qualification is not semantic completion authority: a `SECURITY_V1` `Claim` cannot be acknowledged into `COMPLETED`/Result/dependency release before B5.4 | `kernel.rs` `ack_success` (guard after authority validation) | `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success` | this pull request (rev 15) |
 | **(rev 17)** A profile digest is not provenance: `SECURITY_V1` acquisition requires a fresh durable trusted-importer attestation for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally before any qualification, config settlement or Attempt/Lease | `enforcement.rs` `EnforcementProfileAttestation`; `profile_attestation.rs` `current_enforcement_profile_attestation`; `provisioning.rs` `finish_acquisition` (`AcquisitionMode::SecurityV1`) | `b5_enforcement::an_attestation_digest_is_stable_and_recomputable`, `an_attestation_binds_the_exact_profile_and_physical_domain`, `an_attestation_is_fresh_only_inside_its_half_open_window`; `b5_security_acquisition::a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease`, `a_stale_trusted_importer_attestation_is_rejected_until_a_fresh_row_exists`, `a_wider_support_profile_cannot_borrow_a_narrower_attestation`, `a_forged_subject_coverage_cannot_borrow_the_attested_profile`, `an_attestation_for_another_physical_domain_cannot_authorize_this_binding`, `a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
+| **(rev 22)** An attestation's claimed validity window is at most one hour: an over-long window is `InvalidNumber` on producer construction and on the durable read, while exactly one hour remains legal | `enforcement.rs` `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS`, `validated_parts` | `b5_enforcement::an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling` | this pull request (rev 22) |
+| **(rev 22)** Each typed readiness probe proves its own Task mode: the security probe refuses a `COARSE_V1` or `LEGACY` Task, and the coarse probe still refuses `SECURITY_V1`; neither grants authority | `kernel.rs` `TypedReadinessMode`, `typed_readiness`, `check_typed_{acquisition,security}_readiness` | `b5_coarse_path_gate::each_readiness_probe_requires_its_own_mode` | this pull request (rev 22) |
 
 ### ADR-0014 §4 durable encoding (schema v11)
 
@@ -1972,6 +2127,8 @@ implements it and the test that would fail if it were removed. Rows marked
 | **(rev 17)** A trusted-importer attestation is immutable, write-once, keyed by its own digest and indexed by the exact profile digest; one profile digest cannot move its physical domain | `schema.rs` `enforcement_profile_attestations` + immutability/domain-stability triggers; `profile_attestation.rs` `record_enforcement_profile_attestation` | `b5_security_acquisition::a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
 | **(rev 17)** A durable attestation is rebuilt through the validated constructor, so a row whose stored digest does not describe its parts fails closed | `enforcement.rs` `EnforcementProfileAttestation::from_parts`; `profile_attestation.rs` `raw_attestation_row` | `b5_enforcement::an_attestation_digest_is_stable_and_recomputable`, `b5_security_acquisition::a_trusted_importer_attestation_is_write_once_and_tamper_evident` | this pull request (rev 17) |
 | **(rev 20)** A digest-correct attestation rebuilt from public parts is not producer authority: the writer rejects it with `InvalidAuthority` and writes no row, while the producer's row stays readable and equal on facts | `enforcement.rs` `EnforcementProfileAttestation::{producer_sealed,is_producer_sealed}`, manual `PartialEq`; `profile_attestation.rs` `record_enforcement_profile_attestation` seal check | `b5_security_acquisition::a_self_consistent_attestation_without_producer_provenance_is_rejected` | this pull request (rev 20) |
+| **(rev 22)** A hold claims a complete round only if the catalog frontier, pinned AgentType and matched roster were identical before and after enumeration; drift yields a provisional lower bound (`CatalogDrift`) | `provisioning_resolver.rs` `HoldProbeSnapshot`, `hold_probe_snapshot`, `security_hold`, `SecurityHold::provisional_cause` | `provisioning_resolver::tests::a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round` | this pull request (rev 22) |
+| **(rev 22)** With `probe_limit=1`, several `SECURITY_V1` holds whose attestation nearly exhausts its budget do not starve a runnable coarse Task; the coarse Task runs within a bounded number of cycles and every hold stays `QUEUED` with zero Attempts | `provisioning_resolver.rs` `security_hold`; `lib.rs` `dispatch_typed_one`, `defer_or_fail_typed` hold arm, `TypedDispatchState::cooling_ids` | `provisioning_resolver::tests::held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` | this pull request (rev 22) |
 
 ### ADR-0014 §13–§14 — obligations and the policy-only reference profile
 
@@ -2712,6 +2869,27 @@ revision-21 mutation check is recorded in the
 `ProvisioningDeadlineExceeded` arms from `security_hold` fails the timeout test at
 the dispatch step with the redacted deadline message.
 
+Revision 22 re-runs the same gate on the same branch with the three audit fixes:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | pass, 0 failed; 1133 passed in 58 suites |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+At revision 22 the runtime lib suite holds 308
+(`a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round` and
+`held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` are the new
+ones), `b5_enforcement` holds 47
+(`an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling`), and
+`b5_coarse_path_gate` holds 9 (`each_readiness_probe_requires_its_own_mode`). The
+revision-22 mutation check is recorded in the
+[Round-3 audit fixes](#round-3-audit-fixes-revision-22) section: disabling the
+post-enumeration snapshot comparison fails the drift test at
+`assert!(hold.is_provisional())`.
+
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
 - `b5_composite_authority_surface` — the composite-authority, qualified-candidate,
@@ -2739,13 +2917,13 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
 | 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. **Implemented in revision 18** as `SecurityCandidateIdentity` / `CandidateDomain::from_identities` and the resolver's frozen `SecurityCandidateRound`; a budget below the complete round is a whole-round defer and the durable block binds the same domain. The acceptance table in the revision-18 section names each case |
-| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case. **Revision 20 adds the writer fence**: only the gated producer constructor seals a value, a digest-correct value rebuilt from public parts is rejected with `InvalidAuthority` and leaves no row, and the durable read stays unsealed. Which importers are registered, and that they actually observed the domain, remains the trusted composition root's responsibility and B5.4's subject attestation |
-| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. **Implemented in revision 19** for the hold/decline half: the durable Task mode selects a mode-aware resolver, the complete security round is enumerated, and `acquire_typed_task` refuses before any Attempt/Lease/binding/NACK. The full secured acquisition/start remains B5.4, so this row is **not** a B5.2 freeze |
+| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case. **Revision 20 adds the writer fence**: only the gated producer constructor seals a value, a digest-correct value rebuilt from public parts is rejected with `InvalidAuthority` and leaves no row, and the durable read stays unsealed. **Revision 22 bounds the claim**: an attestation window longer than `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS` (3600 s) is `InvalidNumber` on construction and on the durable read, so freshness cannot be widened into an unexpiring claim. **Still open:** which importers are registered, that they actually observed the domain, and the physical installation epoch (one hour is not an epoch proof); the registry must bind an importer and installed epoch to the exact `AdapterBinding`, and the reverse test (an internal caller knowing every field and digest still cannot publish an acquirable attestation) is not written |
+| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. **Implemented in revision 19** for the hold/decline half: the durable Task mode selects a mode-aware resolver, the complete security round is enumerated, and `acquire_typed_task` refuses before any Attempt/Lease/binding/NACK. **Revision 22 makes the readiness half a mode proof**: `TypedReadinessMode::{CoarseAcquisition, SecurityV1}` replaces the one-way `reject_security_v1` flag, so the security probe refuses a `COARSE_V1`/`LEGACY` Task and cannot qualify the wrong contract for a future caller. The full secured acquisition/start remains B5.4, so this row is **not** a B5.2 freeze |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
 | 19 | Keep a qualified `SECURITY_V1` `Claim` out of the frozen B.4 Execution and `RUNNING` paths (rev 14) | starting from the acquired `Claim`, `create_execution_with_snapshot` fails before any `executions`/`binding_snapshots` row; a stale `STARTING` row is not promoted to `RUNNING`; the Task stays `Leased`. Implemented in revision 14 (this pull request); removed only by the B5.4 snapshot/secured start |
 | 20 | Keep a qualified `SECURITY_V1` `Claim` out of the semantic completion path (rev 15) | starting from the acquired `Claim`, `ack_success` with no `execution_id` fails; Task/Attempt/Lease keep their state, no Result is inserted and a blocked dependent is not released. Implemented in revision 15 (this pull request); replaced only by an explicit B5.4 secured acknowledgement path |
-| 21 | Keep a non-executable `SECURITY_V1` qualification from cycling as an ordinary lease (B5.2-E liveness, rev 16) | with B5.4 disabled, production acquisition either holds an explainable waiting state or refuses acquisition; a `SECURITY_V1` Task is not moved `QUEUED → LEASED` only to expire, and the qualification is not presented as a runnable Claim. **Implemented in revision 19**: `SecurityHold` + `security_hold_cooldown`; the Task stays `QUEUED` with zero Attempts across a lease-expiry sweep and a second cycle, for both a populated and an empty security round. **Revision 20 adds the fairness half**: a hold is candidate-local, the typed scan continues, and a held `SECURITY_V1` Task ahead of a runnable `COARSE_V1` Task no longer consumes the cycle. **Revision 21 adds the timeout half**: a read-only probe that exceeds the shared deadline returns a provisional hold instead of a fatal resolution error, so the typed cycle is not aborted and unrelated coarse work still dispatches; integrity faults still fail closed. The durable block still awaits the B5.4 profile |
-| 22 | Make the whole-round budget an actual runtime discipline, not only a pure component (rev 20 audit) | a real `SECURITY_V1` round must come from a complete trusted enumeration; the budget must bind **before** selection; no candidate may be selected while its qualification is unknown; a true over-budget outcome must leave a re-verifiable durable `security_acquisition_blocks` defer. **Open, gated on B5.4**: the durable row is keyed by `binding_profile_digest(binding, profile)`, so it cannot be written before the imported profile exists. A revision-21 provisional hold is a lower bound, not a complete round, so it can never be converted into this durable block without re-enumeration |
+| 21 | Keep a non-executable `SECURITY_V1` qualification from cycling as an ordinary lease (B5.2-E liveness, rev 16) | with B5.4 disabled, production acquisition either holds an explainable waiting state or refuses acquisition; a `SECURITY_V1` Task is not moved `QUEUED → LEASED` only to expire, and the qualification is not presented as a runnable Claim. **Implemented in revision 19**: `SecurityHold` + `security_hold_cooldown`; the Task stays `QUEUED` with zero Attempts across a lease-expiry sweep and a second cycle, for both a populated and an empty security round. **Revision 20 adds the fairness half**: a hold is candidate-local, the typed scan continues, and a held `SECURITY_V1` Task ahead of a runnable `COARSE_V1` Task no longer consumes the cycle. **Revision 21 adds the timeout half**: a read-only probe that exceeds the shared deadline returns a provisional hold instead of a fatal resolution error, so the typed cycle is not aborted and unrelated coarse work still dispatches; integrity faults still fail closed. **Revision 22 adds the coherence and window-bound halves**: catalog/roster drift during enumeration makes the hold provisional (`CatalogDrift`) instead of "complete", and `held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` proves the `probe_limit=1` multi-hold case with near-deadline attestations. The durable block still awaits the B5.4 profile |
+| 22 | Make the whole-round budget an actual runtime discipline, not only a pure component (rev 20 audit) | a real `SECURITY_V1` round must come from a complete trusted enumeration; the budget must bind **before** selection; no candidate may be selected while its qualification is unknown; a true over-budget outcome must leave a re-verifiable durable `security_acquisition_blocks` defer. **Open, gated on B5.4**: the durable row is keyed by `binding_profile_digest(binding, profile)`, so it cannot be written before the imported profile exists. A revision-21 provisional hold is a lower bound, not a complete round, so it can never be converted into this durable block without re-enumeration; revision 22's snapshot fence makes that lower-bound claim checkable but does not make the enumeration a trusted complete round |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record
@@ -2779,6 +2957,13 @@ a new item: the provisional hold is not a whole-round result, so it does not cha
 item 22, and it does not supply importer registration authority, so it does not
 close item 16. Revision 21 still does not freeze B5.2, does not deliver the
 production secured acquisition path, and does not claim B5.4 capability.
+Revision 22 completes item 16's freshness bound and item 21's coherence and
+`probe_limit=1` liveness cases, and makes item 17's readiness probe a mode proof;
+it does not add a new item because the trusted registry, the physical installation
+epoch and the production whole-round budget remain the named B5.2 acceptance
+conditions under the audit's §四 option 1. Revision 22 therefore does **not** freeze
+B5.2, does not deliver the production secured acquisition path, and does not claim
+B5.4 capability.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
@@ -2824,12 +3009,12 @@ and no freeze is claimed.
 | Complete candidate identity and domain | `crates/agentype-agent-contract/src/enforcement.rs` (`SecurityCandidateOwner`, `SecurityCandidateIdentity`, `CandidateDomain::from_identities`, `acquisition_cost`) |
 | Whole-round resolver round and defer | `crates/agentype-runtime/src/provisioning_resolver.rs` (`SecurityCandidateRound`, `SourceProvisioningCandidate::security_identity`, `prepare_selection`) |
 | B5.2-D conformance | `crates/agentype-agent-contract/tests/b5_enforcement.rs` (`the_candidate_domain_digest_is_a_stable_full_identity_set`, `the_whole_round_budget_is_measured_in_full_candidate_identities`), `crates/agentype-runtime/src/provisioning_resolver.rs` (`a_security_round_counts_full_candidate_identities_not_agents`), `crates/agentype-storage-sqlite/tests/b5_acquisition_block.rs` (`one_agent_with_a_different_config_or_binding_is_a_new_condition`) |
-| B5.2-E mode-aware enumeration and hold | `crates/agentype-runtime/src/provisioning_resolver.rs` (`CandidateMode`, `resolve_security_source_candidates{,_for_agent}`, `SecurityHold`, `security_hold`, `ProvisioningResolutionError::SecurityHold`, the `acquire_typed_task` interception), `crates/agentype-runtime/src/lib.rs` (`TypedCandidateAttempt`, `TypedDispatchConfig::security_hold_cooldown`, `defer_or_fail_typed` hold arm, the scan-on-hold loop in `dispatch_typed_one`), `crates/agentype-storage-sqlite/src/kernel.rs` (`task_security_mode`, `check_typed_security_readiness`) |
-| B5.2-E liveness and fairness conformance | `crates/agentype-runtime/src/provisioning_resolver.rs` (`a_security_v1_task_is_held_without_an_attempt_across_cycles`, `a_security_v1_task_without_a_security_candidate_is_held_not_failed`, `a_held_security_task_does_not_starve_a_runnable_coarse_task`) |
+| B5.2-E mode-aware enumeration and hold | `crates/agentype-runtime/src/provisioning_resolver.rs` (`CandidateMode`, `resolve_security_source_candidates{,_for_agent}`, `SecurityHold`, `HoldProvisionalCause`, `HoldProbeSnapshot`, `security_hold`, `ProvisioningResolutionError::SecurityHold`, the `acquire_typed_task` interception), `crates/agentype-runtime/src/lib.rs` (`TypedCandidateAttempt`, `TypedDispatchConfig::security_hold_cooldown`, `defer_or_fail_typed` hold arm, the scan-on-hold loop in `dispatch_typed_one`), `crates/agentype-storage-sqlite/src/kernel.rs` (`task_security_mode`, `TypedReadinessMode`, `check_typed_security_readiness`) |
+| B5.2-E liveness and fairness conformance | `crates/agentype-runtime/src/provisioning_resolver.rs` (`a_security_v1_task_is_held_without_an_attempt_across_cycles`, `a_security_v1_task_without_a_security_candidate_is_held_not_failed`, `a_held_security_task_does_not_starve_a_runnable_coarse_task`, `a_security_hold_with_timed_out_attestation_does_not_block_runnable_coarse_task`, `a_security_hold_integrity_fault_still_fails_closed`, `a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round`, `held_security_tasks_yield_to_coarse_work_under_a_single_probe_window`) |
 | Source-declaration provenance | `crates/agentype-agent-contract/src/sandbox.rs` (`SpawnSourceSecurityDeclaration`), `crates/agentype-agent-contract/src/authority.rs` (`EffectiveTaskAuthority::new`), `crates/agentype-storage-sqlite/src/catalog.rs` (`insert_spawn_source_declaration`) |
 | Schema v10 block table and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`security_acquisition_blocks`) |
 | Schema v11 attestation table, index and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`enforcement_profile_attestations`) |
-| Trusted-importer attestation value object | `crates/agentype-agent-contract/src/enforcement.rs` (`EnforcementProfileAttestation`, `producer_sealed` / `is_producer_sealed`) |
+| Trusted-importer attestation value object | `crates/agentype-agent-contract/src/enforcement.rs` (`EnforcementProfileAttestation`, `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS`, `producer_sealed` / `is_producer_sealed`) |
 | Durable attestation read/write | `crates/agentype-storage-sqlite/src/profile_attestation.rs` (validated read; the writer's producer-seal check) |
 | Kernel wrappers | `crates/agentype-storage-sqlite/src/kernel.rs` (`record_enforcement_profile_attestation`, `get_enforcement_profile_attestation`, the block wrappers) |
 | Coarse acquisition gate | `crates/agentype-storage-sqlite/src/provisioning.rs` (`reject_security_v1_coarse_acquisition` and the `AcquisitionMode::Coarse` branches) |

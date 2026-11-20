@@ -34,7 +34,7 @@ use agentype_agent_contract::{
     SecurityCandidateIdentity, SecurityCandidateOwner, SecurityContractMode, SourceConfig,
     SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
 };
-use agentype_core::{ExecutionId, GenerationId, TaskId, UnixTime, WorkspaceMode};
+use agentype_core::{ExecutionId, GenerationId, LogicalAgentId, TaskId, UnixTime, WorkspaceMode};
 use agentype_execution_config::ExecutionRegistry;
 use agentype_storage_sqlite::Kernel;
 use std::collections::BTreeMap;
@@ -130,18 +130,21 @@ impl std::fmt::Display for ProvisioningResolutionError {
         match self {
             Self::NotTypedTask => write!(f, "task has no typed agent requirement"),
             Self::AgentNotBound => write!(f, "agent has no exact type binding"),
-            Self::SecurityHold(hold) if hold.is_provisional() => write!(
-                f,
-                "SECURITY_V1 acquisition is held until the B5.4 secured start exists: at least {} candidate(s) in provisional domain {} (the read-only qualification probe exceeded its deadline; the round is not complete)",
-                hold.candidates(),
-                hold.domain_digest()
-            ),
-            Self::SecurityHold(hold) => write!(
-                f,
-                "SECURITY_V1 acquisition is held until the B5.4 secured start exists: {} complete candidate(s) in domain {}",
-                hold.candidates(),
-                hold.domain_digest()
-            ),
+            Self::SecurityHold(hold) => match hold.provisional {
+                Some(cause) => write!(
+                    f,
+                    "SECURITY_V1 acquisition is held until the B5.4 secured start exists: at least {} candidate(s) in provisional domain {} ({}; the round is not complete)",
+                    hold.candidates(),
+                    hold.domain_digest(),
+                    cause.describe()
+                ),
+                None => write!(
+                    f,
+                    "SECURITY_V1 acquisition is held until the B5.4 secured start exists: {} complete candidate(s) in domain {}",
+                    hold.candidates(),
+                    hold.domain_digest()
+                ),
+            },
             Self::NoEligibleSource => write!(f, "no eligible source/config candidate"),
             Self::AgentTypeMissing(r) => {
                 write!(
@@ -466,6 +469,28 @@ impl SecurityCandidateRound {
     }
 }
 
+/// Why a `SECURITY_V1` hold could not claim a complete round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldProvisionalCause {
+    /// A read-only qualification probe exhausted the cycle's shared deadline.
+    ProbeDeadline,
+    /// The catalog frontier or the matched-agent roster changed while the round
+    /// was being enumerated, so the reported union may never have existed at one
+    /// instant.
+    CatalogDrift,
+}
+
+impl HoldProvisionalCause {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ProbeDeadline => "the read-only qualification probe exceeded its deadline",
+            Self::CatalogDrift => {
+                "the catalog or the matched-agent roster changed during enumeration"
+            }
+        }
+    }
+}
+
 /// The `SECURITY_V1` candidate round a Task would acquire from, held before any
 /// authority exists.
 ///
@@ -473,22 +498,23 @@ impl SecurityCandidateRound {
 /// snapshot/secured start does not exist. It carries only the domain's count and
 /// opaque digest: no profile, no qualification, no Attempt, no Lease.
 ///
-/// The probe is bounded by the cycle's attestation deadline. If a source-private
-/// attestation does not finish in time, the hold is **provisional**: it reports
-/// a lower bound rather than claiming that the round is complete. A provisional
-/// hold is still a non-executable hold, so it must never abort the typed cycle
-/// for unrelated coarse work, and it must never be mistaken for a full round by
-/// a later durable-block conversion.
+/// The hold is **provisional** when it cannot claim to have observed one complete
+/// round: the probe is bounded by the cycle's attestation deadline, and the
+/// enumeration is several consecutive reads, so a concurrent catalog publish or
+/// agent-binding change can make the union incoherent. A provisional hold reports
+/// a lower bound. It is still a non-executable hold, so it must never abort the
+/// typed cycle for unrelated coarse work, and it must never be mistaken for a
+/// full round by a later durable-block conversion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityHold {
     candidates: usize,
     domain_digest: String,
-    provisional: bool,
+    provisional: Option<HoldProvisionalCause>,
 }
 
 impl SecurityHold {
     /// The number of distinct full candidate identities observed. Provisional
-    /// (timed-out) holds report only what was enumerated before the deadline.
+    /// holds report only what was enumerated before the probe stopped or drifted.
     pub fn candidates(&self) -> usize {
         self.candidates
     }
@@ -498,11 +524,17 @@ impl SecurityHold {
         &self.domain_digest
     }
 
-    /// Whether the complete round was enumerated. `false` means the read-only
-    /// qualification probe exceeded its deadline, so `candidates()` is a lower
-    /// bound and B5.4 must re-enumerate before writing a durable block.
+    /// Whether the complete round was observed in one coherent pass. `false`
+    /// means `candidates()` is a lower bound: B5.4 must re-enumerate before
+    /// writing a durable block or selecting from this domain.
     pub fn is_provisional(&self) -> bool {
-        self.provisional
+        self.provisional.is_some()
+    }
+
+    /// The provisional cause, for diagnostics and tests. `None` for a complete
+    /// round.
+    pub fn provisional_cause(&self) -> Option<&'static str> {
+        self.provisional.map(HoldProvisionalCause::describe)
     }
 }
 
@@ -1362,6 +1394,13 @@ pub(crate) struct TypedAcquisitionOutcome {
 /// returned as **provisional** with the identities observed so far. Integrity,
 /// storage and authority faults still propagate, because they are not "the probe
 /// was slow" and must fail closed.
+///
+/// Provisional is also the honest answer when the observation itself drifted:
+/// the existing-owner loop and the pinned new-agent route are consecutive reads,
+/// so a concurrent catalog publish or agent-binding change can produce a union
+/// that never existed at one instant. The probe therefore snapshots the active
+/// catalog frontier, the Task's pinned type and the matched roster before and
+/// after enumeration, and reports a provisional hold on any change.
 fn security_hold(
     kernel: &Kernel,
     task_id: &TaskId,
@@ -1373,8 +1412,9 @@ fn security_hold(
     let requirement = kernel
         .get_task_agent_requirement(task_id)?
         .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let before = hold_probe_snapshot(kernel, task_id, &requirement)?;
     let mut identities: Vec<SecurityCandidateIdentity> = Vec::new();
-    let mut provisional = false;
+    let mut deadline_hit = false;
     'round: {
         for existing in kernel.match_existing_agents_for_task(task_id)? {
             match resolve_security_source_candidates_for_agent(
@@ -1399,7 +1439,7 @@ fn security_hold(
                 // Stop and report what was observed instead of pretending the
                 // remaining routes are empty.
                 Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
-                    provisional = true;
+                    deadline_hit = true;
                     break 'round;
                 }
                 Err(err) => return Err(err),
@@ -1422,17 +1462,69 @@ fn security_hold(
             }
             Err(err) if err.is_candidate_local_for_dispatch() => {}
             Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
-                provisional = true;
+                deadline_hit = true;
             }
             Err(err) => return Err(err),
         }
     }
+    // An aborted probe already reports a lower bound; there is no point spending
+    // another snapshot read on it.
+    let provisional = if deadline_hit {
+        Some(HoldProvisionalCause::ProbeDeadline)
+    } else if hold_probe_snapshot(kernel, task_id, &requirement)? != before {
+        Some(HoldProvisionalCause::CatalogDrift)
+    } else {
+        None
+    };
     let domain = CandidateDomain::from_identities(identities);
     let cost = domain.acquisition_cost();
     Ok(SecurityHold {
         candidates: cost.candidates(),
         domain_digest: domain.digest().to_string(),
         provisional,
+    })
+}
+
+/// The durable facts the hold probe is an observation of: the active
+/// source/config frontier, the Task's exact pinned type, and the matched-agent
+/// roster (identity plus bound `AgentType` revision).
+///
+/// Equality between the value taken before enumeration and the one taken after
+/// it is the coherence fence for the reported round. It is not a transaction and
+/// proves nothing about physical truth; it only makes "this union was observed
+/// across a stable catalog and roster" a checkable claim instead of an assumption.
+#[derive(Debug, PartialEq, Eq)]
+struct HoldProbeSnapshot {
+    catalog_frontier: String,
+    required_type: AgentTypeRef,
+    roster: Vec<(LogicalAgentId, AgentTypeRef)>,
+}
+
+fn hold_probe_snapshot(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    requirement: &agentype_agent_contract::TaskAgentRequirement,
+) -> Result<HoldProbeSnapshot, ProvisioningResolutionError> {
+    let mut roster: Vec<(LogicalAgentId, AgentTypeRef)> = kernel
+        .match_existing_agents_for_task(task_id)?
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.logical_agent_id,
+                candidate.agent_type.type_ref.clone(),
+            )
+        })
+        .collect();
+    roster.sort_by(|a, b| {
+        a.0.as_str()
+            .cmp(b.0.as_str())
+            .then_with(|| a.1.id().as_str().cmp(b.1.id().as_str()))
+            .then_with(|| a.1.revision().cmp(&b.1.revision()))
+    });
+    Ok(HoldProbeSnapshot {
+        catalog_frontier: kernel.catalog_frontier_digest()?,
+        required_type: requirement.required_type.clone(),
+        roster,
     })
 }
 
@@ -5563,6 +5655,216 @@ mod tests {
         assert_public_error_is_redacted(&error);
         assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
         assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// Publishes one extra active source during the security probe, simulating a
+    /// concurrent publisher landing between the hold's before/after snapshots.
+    struct CatalogDriftPublish {
+        kernel: Arc<Kernel>,
+        published: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceConfigIntegration for CatalogDriftPublish {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            if revision.config().config_ref.source().id().as_str() == "security-source"
+                && !self
+                    .published
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A coarse-only source: the drift is in the frontier, not in the
+                // security candidate set, which is exactly the incoherent union
+                // the fence must catch.
+                publish(&self.kernel);
+            }
+            EchoMaterializer.attest(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+    }
+
+    /// The hold is several consecutive reads, so a catalog publish or an
+    /// agent-binding change can make the union it reports never have existed at
+    /// one instant. It must then say "provisional", not claim a complete round.
+    #[test]
+    fn a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round() {
+        let kernel = Arc::new(kernel());
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let integrations = si(CatalogDriftPublish {
+            kernel: kernel.clone(),
+            published: std::sync::atomic::AtomicBool::new(false),
+        });
+        let error = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &integrations,
+            &deadline(),
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        let ProvisioningResolutionError::SecurityHold(hold) = error else {
+            panic!("a security probe must still be a hold, got {error:?}");
+        };
+        assert!(hold.is_provisional());
+        assert_eq!(
+            hold.provisional_cause(),
+            Some("the catalog or the matched-agent roster changed during enumeration")
+        );
+        // The candidate itself was still enumerated; only the claim of one
+        // coherent observation is withdrawn.
+        assert_eq!(hold.candidates(), 1);
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// Attestations that burn almost the whole probe budget and then miss it.
+    /// This is the load shape the audit asked for: real attestation work, not an
+    /// instantly-failing stub, with several held Tasks ahead of runnable work.
+    struct SecurityAttestNearDeadline;
+
+    impl SourceConfigIntegration for SecurityAttestNearDeadline {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            if revision.config().config_ref.source().id().as_str() == "security-source" {
+                while deadline.remaining() > Duration::from_millis(2) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ));
+            }
+            EchoMaterializer.attest(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+    }
+
+    /// B5.2-E liveness under the tightest probe window: `probe_limit=1`, three
+    /// held `SECURITY_V1` Tasks (each spending almost its full attest budget),
+    /// then a runnable `COARSE_V1` Task. Every held Task must stay QUEUED with no
+    /// Attempt/Lease, and the coarse Task must run within a bounded number of
+    /// cycles instead of waiting on the hold cooldown.
+    #[test]
+    fn held_security_tasks_yield_to_coarse_work_under_a_single_probe_window() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = {
+            let clock: Arc<dyn Clock> = clock.clone();
+            let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
+            kernel
+                .upsert_partition(&PartitionSpec::new(
+                    "general",
+                    0,
+                    Retention::Ephemeral,
+                    "local",
+                    "default",
+                ))
+                .unwrap();
+            kernel
+        };
+        let (security_pin, policy_ref) = publish_security_fixture(&kernel);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(security_typed_task(
+                &kernel,
+                security_pin.clone(),
+                policy_ref.clone(),
+            ));
+            // `created_at ASC` ordering: creation order is probe order.
+            clock.advance(1.0);
+        }
+        let coarse_pin = publish(&kernel);
+        let coarse_task = typed_task(&kernel, coarse_pin);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(SecurityAttestNearDeadline);
+        let config = crate::TypedDispatchConfig::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_millis(30),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        // Long enough that earlier held Tasks stay cooled while the window
+        // advances; the coarse Task is never cooled, so it cannot be starved.
+        .with_security_hold_cooldown(Duration::from_secs(5));
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        // At most one held Task is probed per cycle. Four cycles cover three
+        // holds plus the coarse Task; assert the bound, not just eventual success.
+        let mut cycles = 0;
+        loop {
+            cycles += 1;
+            assert!(
+                cycles <= 6,
+                "coarse work must run within a bounded number of cycles"
+            );
+            let outcome = dispatcher
+                .dispatch_typed_one(&integrations, &config, &state)
+                .expect("a timed-out security probe must not abort the typed cycle");
+            if kernel.attempt_count_for_task(&coarse_task).unwrap() > 0 {
+                assert!(
+                    !matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+                    "the coarse Task must be the cycle's outcome: {outcome:?}"
+                );
+                break;
+            }
+            assert!(
+                matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+                "with one probe slot and only held work left, the cycle defers: {outcome:?}"
+            );
+            for task in &held {
+                assert_eq!(kernel.task(task).unwrap().state, TaskState::Queued);
+                assert_eq!(kernel.attempt_count_for_task(task).unwrap(), 0);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // A hold never became an Attempt/Lease that could only expire.
+        for task in &held {
+            assert_eq!(kernel.task(task).unwrap().state, TaskState::Queued);
+            assert_eq!(kernel.attempt_count_for_task(task).unwrap(), 0);
+        }
     }
 
     #[test]

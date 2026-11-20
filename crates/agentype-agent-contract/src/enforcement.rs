@@ -60,6 +60,19 @@ pub const ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
 /// observation is valid. A row written under another protocol cannot be
 /// interpreted under these rules and is rejected rather than reinterpreted.
 pub const ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL: &str = "agentype-enforcement-profile-attest/1";
+/// The longest validity window a trusted-importer attestation may claim, in
+/// seconds (one hour).
+///
+/// A freshness check alone does not bound how long an observation may be
+/// claimed: a row could name a `valid_until` years away and still satisfy
+/// `issued_at <= now < valid_until`. That would let one observation outlive the
+/// physical adapter installation it describes, so the window is capped in the
+/// value itself — on construction and on the durable read — instead of relying on
+/// each producer to choose a sane interval. The trusted registry still owns the
+/// installation epoch: re-installing or moving the physical domain must
+/// invalidate older rows even inside this window, and that cannot be proven from
+/// an attestation alone.
+pub const ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS: f64 = 3_600.0;
 /// Version tag of the compiled plan document.
 pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 2;
 /// Version tag of the canonical execution-guarantee document that the compile
@@ -639,6 +652,12 @@ impl PartialEq for EnforcementProfileAttestation {
 impl EnforcementProfileAttestation {
     /// Attest one imported profile. Only the internal provisioning producer
     /// may write this fact.
+    ///
+    /// The claimed window is bounded by
+    /// [`ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS`]: a producer cannot
+    /// assert a freshness interval longer than one hour, and the durable read
+    /// applies the same ceiling, so an over-long row fails closed instead of
+    /// outliving the physical installation it describes.
     #[cfg(any(test, feature = "provisioning-producer"))]
     pub fn new(
         profile: &ImportedEnforcementProfile,
@@ -736,6 +755,11 @@ impl EnforcementProfileAttestation {
         if !valid_until.is_finite() || valid_until <= issued_at {
             return Err(ContractError::InvalidNumber {
                 field: "trusted-importer attestation valid_until".into(),
+            });
+        }
+        if valid_until - issued_at > ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS {
+            return Err(ContractError::InvalidNumber {
+                field: "trusted-importer attestation validity window".into(),
             });
         }
         let attestation_digest = attestation_digest(
