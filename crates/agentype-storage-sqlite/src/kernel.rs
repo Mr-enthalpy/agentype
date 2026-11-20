@@ -2854,6 +2854,20 @@ impl Kernel {
         self.tx(|tx, now| {
             let (attempt, lease, task) =
                 validate_authority_tx(tx, attempt_id.as_str(), lease_epoch.get(), now)?;
+            // B5.2-E / B5.4 boundary: a successful `SECURITY_V1` acquisition is
+            // not semantic completion authority either. Acknowledgement without
+            // an Execution would publish a Result and release dependencies from a
+            // Claim that never committed an `ExecutionSecuritySnapshot`, a
+            // physical terminal state or a B5.4 receipt. The optional
+            // `execution_id` is not proof, so this fails closed before any state
+            // change until B5.4 defines the secured acknowledgement path.
+            if crate::requirement::task_is_security_v1(tx, &TaskId::from_string(&task.id))? {
+                return Err(Error::invalid_authority(
+                    "a SECURITY_V1 Task cannot be acknowledged as succeeded without the \
+                     B5.4 ExecutionSecuritySnapshot, physical terminal state and \
+                     applied-security receipt",
+                ));
+            }
             let execution = execution_for_attempt(
                 tx,
                 &attempt.id,

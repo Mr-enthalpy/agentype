@@ -754,6 +754,105 @@ fn a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path() {
 }
 
 #[test]
+fn a_security_v1_claim_cannot_be_acknowledged_as_success() {
+    let env = Env::new("ack_boundary");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "ack_boundary", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(kernel, "ack_boundary", Some(&profile_ref), Vec::new());
+    let candidate = selected(
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    let claim = &acquired.claim;
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+
+    // A BLOCKED dependent in the same Batch would be released by a successful
+    // acknowledgement, so it makes the "no semantic completion" claim observable.
+    let (_, dependent_ids) = kernel
+        .submit_batch(&[TaskSpec::new("dependent", json!({}))])
+        .unwrap();
+    let dependent = dependent_ids.values().next().unwrap();
+    let batch_id = kernel.task(&task).unwrap().batch_id;
+    env.raw()
+        .execute(
+            "UPDATE tasks SET batch_id=?1,state='BLOCKED' WHERE id=?2",
+            rusqlite::params![batch_id.as_str(), dependent.as_str()],
+        )
+        .unwrap();
+    env.raw()
+        .execute(
+            "INSERT INTO task_dependencies(task_id,depends_on_task_id) VALUES(?1,?2)",
+            rusqlite::params![dependent.as_str(), task.as_str()],
+        )
+        .unwrap();
+
+    let error = kernel
+        .ack_success(
+            &claim.attempt_id,
+            claim.lease_epoch,
+            None,
+            &json!({"produced": true}),
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidAuthority(_)),
+        "expected invalid authority, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("SECURITY_V1"),
+        "the rejection must name the security boundary: {error}"
+    );
+
+    // No completion, no Result, no dependency release, no fake physical terminal.
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+    let attempt_state: String = env
+        .raw()
+        .query_row(
+            "SELECT state FROM attempts WHERE id=?1",
+            rusqlite::params![claim.attempt_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, "ACTIVE");
+    let lease_state: String = env
+        .raw()
+        .query_row(
+            "SELECT state FROM leases WHERE attempt_id=?1",
+            rusqlite::params![claim.attempt_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_state, "ACTIVE");
+    assert_eq!(count(&env, "results"), 0);
+    let dependent_state: String = env
+        .raw()
+        .query_row(
+            "SELECT state FROM tasks WHERE id=?1",
+            rusqlite::params![dependent.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dependent_state, "BLOCKED");
+}
+
+#[test]
 fn the_binding_alias_resolves_to_the_selections_physical_key() {
     let env = Env::new("alias_key");
     let kernel = &env.kernel;
