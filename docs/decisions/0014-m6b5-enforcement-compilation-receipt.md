@@ -243,8 +243,9 @@ starve coarse work, and a later candidate's failure does not convert an earlier
 hold into a Task failure.
 
 The hold enumerates the **complete** security round before refusing, using the
-mode-aware resolver entry points. `CandidateMode::Coarse` keeps the B5.1 gates
-(including the coarse readiness rejection of `SECURITY_V1`) and the frozen
+mode-aware resolver entry points — or reports a **provisional** lower bound when
+the shared probe deadline expires (below). `CandidateMode::Coarse` keeps the B5.1
+gates (including the coarse readiness rejection of `SECURITY_V1`) and the frozen
 `can_provision_task` relation; `CandidateMode::SecurityV1` applies the reusable
 `can_provision_task_source_config_reusable` conjunct, adds no coarse
 exact-reference claim, and uses
@@ -260,9 +261,27 @@ consumes no authority: no Attempt or Lease is created.
 The hold is not the durable budget-defer diagnostic of §4. That row is keyed by
 `binding_profile_digest(binding, profile)` and therefore needs the imported
 enforcement profile that B5.4 owns; writing it now would require inventing a
-profile. The hold carries only the complete domain's candidate count and opaque
+profile. The hold carries only the observed domain's candidate count and opaque
 digest, so B5.4 can attach the missing profile and convert it into the durable
 block without changing the identity facts.
+
+The hold probe is bounded by the cycle's absolute attestation deadline, and a
+probe that exceeds it must not turn a non-executable Task's diagnostic into a
+cycle abort. `security_hold` therefore treats `ProvisioningDeadlineExceeded` from
+the read-only `SourceConfig` probe as **provisional**: it stops scanning (the
+deadline is shared by the whole probe, so every later attestation would fail for
+the same reason) and returns a hold marked `is_provisional()`, whose diagnostic
+reports "at least N candidate(s) ... the round is not complete". A provisional
+hold is still a hold: it creates no Attempt or Lease, so `control::cycle`'s
+`dispatch_typed_one(...)?` never receives a fatal resolution error for it, and
+unrelated `COARSE_V1` work still dispatches within the same probe window. Only
+the category "the external probe did not finish" is softened. Integrity, storage
+and authority faults raised by the same probe still propagate and fail closed;
+attestation redaction preserves `ProvisioningDeadlineExceeded` (with a fixed
+message, so no private diagnostic escapes) precisely so that distinction survives
+the seam. Because the observed set may be a strict subset of the eligible domain,
+a provisional hold is not a frozen round: B5.4 must re-enumerate before converting
+it into the §4 durable block.
 
 ### 4. Compile budget, memoization, and no partial selection
 
@@ -472,7 +491,14 @@ than the seal, so a durable-read row still compares equal to the producer's valu
 for write-once idempotence without making the read path writable. This is a
 mechanical fence at the persistence boundary, not a claim that the importer
 registry itself is complete: which importers exist and how they are registered
-remains the provisioning composition root's responsibility.
+remains the provisioning composition root's responsibility. `importer_id` is still
+a caller-supplied string, so B5.2-C MUST NOT be recorded as closed until a trusted
+registry binds an importer to an exact `AdapterBinding` and the importer's actual
+observation, and until a reverse test proves that an internal caller knowing every
+profile field and digest still cannot publish an acquirable attestation without
+that authority. Only that registry makes
+`RegisteredImporter → ExactAdapterBinding → ObservedProfile → Attestation` a chain
+rather than four independently forgeable facts.
 
 Classification is strict:
 
