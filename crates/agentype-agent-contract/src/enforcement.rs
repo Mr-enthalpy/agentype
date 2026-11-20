@@ -597,9 +597,11 @@ fn profile_digest(
 /// The constructor is gated with the profile importer because it is the
 /// producer's write path. [`Self::from_parts`] is the durable read path: it
 /// recomputes the digest from the stored parts rather than trusting the stored
-/// value, so a tampered row fails closed. Constructing an attestation is not
-/// authority by itself; only the durable row that acquisition re-reads is.
-#[derive(Clone, Debug, PartialEq)]
+/// value, so a tampered row fails closed. It is also the public shape a caller
+/// could rebuild, and a self-consistent digest is not authority: only a value
+/// sealed by [`Self::new`] may be recorded, and only the durable row that
+/// acquisition re-reads authorizes a candidate.
+#[derive(Clone, Debug)]
 pub struct EnforcementProfileAttestation {
     profile_digest: String,
     importer_id: String,
@@ -609,6 +611,29 @@ pub struct EnforcementProfileAttestation {
     issued_at: UnixTime,
     valid_until: UnixTime,
     attestation_digest: String,
+    /// True only for a value produced by the gated [`Self::new`] constructor.
+    ///
+    /// A durable read rebuilds the same facts through [`Self::from_parts`] and
+    /// is deliberately unsealed: a self-consistent value reconstructed from
+    /// public parts is evidence, not authority to record a trusted physical
+    /// observation. The durable writer rejects an unsealed value.
+    producer_sealed: bool,
+}
+
+impl PartialEq for EnforcementProfileAttestation {
+    /// Compares the attested facts, not how the value was produced. This keeps a
+    /// durable-read (unsealed) row equal to the producer's (sealed) value for
+    /// write-once idempotence without letting the read path write itself back.
+    fn eq(&self, other: &Self) -> bool {
+        self.profile_digest == other.profile_digest
+            && self.importer_id == other.importer_id
+            && self.importer_protocol == other.importer_protocol
+            && self.adapter_kind == other.adapter_kind
+            && self.adapter_binding_key == other.adapter_binding_key
+            && self.issued_at == other.issued_at
+            && self.valid_until == other.valid_until
+            && self.attestation_digest == other.attestation_digest
+    }
 }
 
 impl EnforcementProfileAttestation {
@@ -630,12 +655,17 @@ impl EnforcementProfileAttestation {
             profile.adapter_binding_key().to_string(),
             issued_at,
             valid_until,
+            true,
         )
     }
 
     /// Reconstruct an attestation from its durable parts and verify that the
     /// stored digest describes them. This is the read path; it never trusts a
     /// stored digest on its own.
+    ///
+    /// The rebuilt value is **unsealed**: it can be inspected and compared, but
+    /// the durable writer refuses it. Only [`Self::new`], available solely to
+    /// the trusted provisioning composition root, produces a writable value.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         profile_digest: impl Into<String>,
@@ -655,6 +685,7 @@ impl EnforcementProfileAttestation {
             adapter_binding_key.into(),
             issued_at,
             valid_until,
+            false,
         )?;
         if attestation.attestation_digest() != expected_digest {
             return Err(ContractError::EvidenceSubjectMismatch {
@@ -664,6 +695,7 @@ impl EnforcementProfileAttestation {
         Ok(attestation)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validated_parts(
         profile_digest: String,
         importer_id: String,
@@ -672,6 +704,7 @@ impl EnforcementProfileAttestation {
         adapter_binding_key: String,
         issued_at: UnixTime,
         valid_until: UnixTime,
+        producer_sealed: bool,
     ) -> Result<Self, ContractError> {
         if profile_digest.trim().is_empty() {
             return Err(ContractError::InvalidRef {
@@ -723,7 +756,18 @@ impl EnforcementProfileAttestation {
             issued_at,
             valid_until,
             attestation_digest,
+            producer_sealed,
         })
+    }
+
+    /// Whether this value came from the trusted provisioning producer.
+    ///
+    /// The durable writer requires this precondition. A caller can build a
+    /// digest-correct attestation from public parts with [`Self::from_parts`],
+    /// but that value is unsealed and can never be recorded as trusted physical
+    /// evidence.
+    pub fn is_producer_sealed(&self) -> bool {
+        self.producer_sealed
     }
 
     /// The exact imported profile digest this attestation covers.

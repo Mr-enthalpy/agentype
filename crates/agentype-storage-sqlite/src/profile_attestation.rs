@@ -35,6 +35,15 @@ pub fn record_enforcement_profile_attestation(
     attestation: &EnforcementProfileAttestation,
     recorded_at: UnixTime,
 ) -> Result<(), Error> {
+    // A digest-correct value is not authority to record trusted physical
+    // capability. The read path reconstructs an unsealed value from the same
+    // public parts; only the gated provisioning-producer constructor seals it.
+    // This check is the durable boundary for that distinction.
+    if !attestation.is_producer_sealed() {
+        return Err(Error::invalid_authority(
+            "a trusted-importer attestation must be produced by the trusted provisioning producer, not reconstructed from its parts",
+        ));
+    }
     if !recorded_at.is_finite() || recorded_at < 0.0 {
         return Err(Error::invariant(
             "a trusted-importer attestation requires a finite write time",

@@ -1106,6 +1106,11 @@ impl Kernel {
     /// covers an exact imported profile digest and physical adapter domain;
     /// acquisition reads the freshest currently valid row transactionally. The
     /// write grants no Task authority by itself.
+    ///
+    /// The value must be producer-sealed. A digest-correct attestation rebuilt
+    /// from its durable/public parts is unsealed and is rejected here, so a
+    /// caller that can only construct parts cannot mint trusted physical
+    /// evidence.
     pub fn record_enforcement_profile_attestation(
         &self,
         attestation: &agentype_agent_contract::EnforcementProfileAttestation,

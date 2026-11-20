@@ -229,6 +229,19 @@ Attempt, Lease, `ProvisioningBinding` or Task NACK. The refusal is
 Task therefore stays `QUEUED` across cycles and lease-expiry sweeps: the hold is a
 bounded, explainable waiting state, not a known-failing acquisition attempt.
 
+A hold is **candidate-local**, exactly like an ordinary deferral. The typed probe
+window is ordered (`priority DESC`, `created_at ASC`) and bounded by
+`probe_limit`, so returning as soon as the first held Task is seen would let a
+`SECURITY_V1` Task consume the cycle's only probe slot ahead of a runnable
+`COARSE_V1` Task behind it; a run of such Tasks would delay the coarse work once
+per Task, per cooldown. `dispatch_typed_one` therefore records the hold detail,
+applies the hold cooldown, and **continues scanning** the remaining candidates. It
+reports `TypedDeferred` with the hold detail only when nothing in the window was
+actually started, and the generic deferral when only ordinary candidates
+deferred. Independence holds in both directions: held security Tasks do not
+starve coarse work, and a later candidate's failure does not convert an earlier
+hold into a Task failure.
+
 The hold enumerates the **complete** security round before refusing, using the
 mode-aware resolver entry points. `CandidateMode::Coarse` keeps the B5.1 gates
 (including the coarse readiness rejection of `SECURITY_V1`) and the frozen
@@ -444,6 +457,22 @@ being trusted. Absence and expiry both reject the candidate with
 `InvalidAuthority` before qualification, config settlement or any Attempt/Lease.
 The row grants no Task authority by itself; it only says which importer
 observed that exact physical domain and when.
+
+**Provenance is fenced at the writer, not inferred from a digest.** The schema
+tag, protocol string, field names and canonical digest function are public, and
+the read path must rebuild a row from those same public parts. A digest-correct
+value is therefore evidence, never authority. `EnforcementProfileAttestation::new`
+is the only constructor that marks a value producer-sealed, and it stays behind
+`provisioning-producer`; the public `from_parts` read path always returns an
+**unsealed** value. `record_enforcement_profile_attestation` rejects an unsealed
+attestation with `InvalidAuthority` and writes no row, so a caller limited to
+public constructors cannot mint a trusted physical observation even with a
+perfectly self-consistent digest. Equality compares the attested facts rather
+than the seal, so a durable-read row still compares equal to the producer's value
+for write-once idempotence without making the read path writable. This is a
+mechanical fence at the persistence boundary, not a claim that the importer
+registry itself is complete: which importers exist and how they are registered
+remains the provisioning composition root's responsibility.
 
 Classification is strict:
 

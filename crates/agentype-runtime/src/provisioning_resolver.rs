@@ -5307,6 +5307,60 @@ mod tests {
         assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
     }
 
+    /// A held `SECURITY_V1` Task must not consume the typed cycle. The probe
+    /// limit is a window over ordered Tasks; if a hold returned immediately, a
+    /// runnable `COARSE_V1` Task behind it would wait for the hold's cooldown.
+    #[test]
+    fn a_held_security_task_does_not_starve_a_runnable_coarse_task() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = {
+            let clock: Arc<dyn Clock> = clock.clone();
+            let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
+            kernel
+                .upsert_partition(&PartitionSpec::new(
+                    "general",
+                    0,
+                    Retention::Ephemeral,
+                    "local",
+                    "default",
+                ))
+                .unwrap();
+            kernel
+        };
+        let (security_pin, policy_ref) = publish_security_fixture(&kernel);
+        let security_task = security_typed_task(&kernel, security_pin, policy_ref);
+        // `list_typed_dispatch_candidates` orders by (`priority DESC`,
+        // `created_at ASC`). Advancing the clock makes the security Task strictly
+        // older, so it is the first probe and the coarse Task is behind it.
+        clock.advance(1.0);
+        let coarse_pin = publish(&kernel);
+        let coarse_task = typed_task(&kernel, coarse_pin);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let outcome = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        assert!(
+            !matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+            "a held Task must not consume the cycle ahead of a runnable Task: {outcome:?}"
+        );
+        assert!(
+            kernel.attempt_count_for_task(&coarse_task).unwrap() > 0,
+            "the runnable coarse Task must still be attempted: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.task(&security_task).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(kernel.attempt_count_for_task(&security_task).unwrap(), 0);
+    }
+
     #[test]
     fn a_security_v1_agent_type_has_no_coarse_candidate() {
         let kernel = kernel();
