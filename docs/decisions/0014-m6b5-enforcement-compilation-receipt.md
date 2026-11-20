@@ -307,8 +307,10 @@ Attempt, Lease, Execution or Task authority:
 ```text
 task_id                    PRIMARY KEY, FK task_agent_requirements(task_id)
 generation_id              the Task's durable GenerationTaskBinding generation
-candidate_domain_digest    order-independent digest of the distinct candidate ids
-candidate_count            distinct candidate identities seen in the round
+candidate_domain_digest    order-independent digest of the distinct complete
+                           candidate identities (owner + exact source/config
+                           revision + config digest + physical binding)
+candidate_count            distinct complete candidate identities in the round
 binding_profile_digest     digest of (adapter binding policy, imported profile,
                            compiler protocol); the profile digest in turn
                            names the adapter kind and binding key it was
@@ -320,6 +322,28 @@ status                     BLOCKED | RELEASED
 created_at, released_at, release_reason
                            release_reason: OPERATOR_ACTION | CONFIGURATION_CHANGED
 ```
+
+A candidate identity is **not** an agent id. It is:
+
+```text
+SecurityCandidateIdentity = (
+    owner,                 # exact LogicalAgentId, or the pinned AgentType revision
+    source revision,       # exact SpawnSource id + revision
+    config revision,       # exact SourceConfig id + revision
+    config digest,         # opaque body/locator identity, not only the config id
+    physical binding,      # resolved (adapter_kind, adapter_binding_key), never the alias
+)
+```
+
+`CandidateDomain::from_identities` is the only constructor. Two configs or two
+physical bindings under one agent are therefore two candidates, not one, and
+changing any component changes the domain digest and the durable-block
+condition. The resolver freezes this complete round before ranking: selection is
+a function of the whole round, never of a truncated list. A fixed budget is
+checked with `AcquisitionBudget::require_whole_round` against the round's
+complete cost, and an exhausted or unknown round produces a defer over the whole
+domain rather than a winner from the qualifying subset. The durable row binds
+that same complete domain, so a restart re-observing it is one condition.
 
 The row is owned by the acquisition control plane, not by runtime-local
 `TypedDispatchState.cooldowns`, so it survives restart. A Task holds exactly one

@@ -7,12 +7,13 @@
 
 use agentype_agent_contract::{
     AcquisitionBudget, AcquisitionCost, AffinityConstraint, AgentRequirementDraft, AgentType,
-    AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CandidateDomain, ContinuityMode,
-    EnvironmentPolicy, FilePolicy, GenerationPolicy, LifecycleMode, NetworkEndpoint,
-    NetworkEndpointSet, NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy, PathSet,
-    SandboxPolicyParts, SandboxPolicyRef, SecurityAcquisitionBlock, SecurityAcquisitionBlockStatus,
-    SecurityAcquisitionRelease, SecurityContract, SecurityContractMode, ToolPolicy,
-    WorkingDirectory,
+    AgentTypeContract, AgentTypeRef, AgentTypeSelector, Budget, CandidateDomain, ConfigDigest,
+    ContinuityMode, EnvironmentPolicy, FilePolicy, GenerationPolicy, LifecycleMode,
+    NetworkEndpoint, NetworkEndpointSet, NetworkPolicy, NetworkTransport, NormalizedSandboxPolicy,
+    PathSet, SandboxPolicyParts, SandboxPolicyRef, SecurityAcquisitionBlock,
+    SecurityAcquisitionBlockStatus, SecurityAcquisitionRelease, SecurityCandidateIdentity,
+    SecurityCandidateOwner, SecurityContract, SecurityContractMode, SourceConfigRef,
+    SpawnSourceRef, ToolPolicy, WorkingDirectory,
 };
 use agentype_core::{
     Clock, Error, GenerationId, InformationFunction, LogicalAgentId, ManualClock, PartitionSpec,
@@ -278,11 +279,52 @@ fn defer_block(
     let exhaustion = budget
         .require_whole_round(AcquisitionCost::new(observed, observed))
         .unwrap_err();
-    let domain = CandidateDomain::from_ids(
-        agents
-            .iter()
-            .map(|agent| LogicalAgentId::from_string(*agent)),
-    );
+    let domain = CandidateDomain::from_identities(agents.iter().map(|agent| {
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::ExistingAgent(LogicalAgentId::from_string(*agent)),
+            SourceConfigRef::new(
+                SpawnSourceRef::new("source-a", 1).unwrap(),
+                format!("config-{agent}"),
+                1,
+            )
+            .unwrap(),
+            ConfigDigest::new(format!("sha256:config-{agent}")).unwrap(),
+            "local-process",
+            "key-1",
+        )
+        .unwrap()
+    }));
+    SecurityAcquisitionBlock::from_budget_defer(
+        task_id.clone(),
+        generation_id.clone(),
+        domain,
+        BINDING_PROFILE_DIGEST,
+        exhaustion,
+        1_000.0,
+    )
+    .unwrap()
+}
+
+fn identity(agent: &str, config: &str, binding: &str) -> SecurityCandidateIdentity {
+    SecurityCandidateIdentity::new(
+        SecurityCandidateOwner::ExistingAgent(LogicalAgentId::from_string(agent)),
+        SourceConfigRef::new(SpawnSourceRef::new("source-a", 1).unwrap(), config, 1).unwrap(),
+        ConfigDigest::new(format!("sha256:{config}")).unwrap(),
+        "local-process",
+        binding,
+    )
+    .unwrap()
+}
+
+fn defer_block_for_domain(
+    task_id: &TaskId,
+    generation_id: &GenerationId,
+    domain: CandidateDomain,
+) -> SecurityAcquisitionBlock {
+    let budget = AcquisitionBudget::new(1, 1).unwrap();
+    let exhaustion = budget
+        .require_whole_round(domain.acquisition_cost())
+        .unwrap_err();
     SecurityAcquisitionBlock::from_budget_defer(
         task_id.clone(),
         generation_id.clone(),
@@ -345,6 +387,93 @@ fn one_condition_is_one_durable_diagnostic() {
     assert_eq!(replaced.candidate_count(), 5);
     assert_eq!(replaced.cost(), AcquisitionCost::new(5, 5));
     assert!(replaced.is_blocked());
+}
+
+#[test]
+fn one_agent_with_a_different_config_or_binding_is_a_new_condition() {
+    let db = Db::new("full-identity");
+    let kernel = db.kernel(1);
+    let (task_id, generation_id) = security_task(&kernel, "full-identity");
+
+    // Two exact configs of the same agent are two candidates, so the domain is
+    // large enough for the fixed (1, 1) budget to defer.
+    let first = CandidateDomain::from_identities([
+        identity("agent-a", "config-a", "key-1"),
+        identity("agent-a", "config-b", "key-1"),
+    ]);
+    assert_eq!(first.candidate_count(), 2);
+    let block = defer_block_for_domain(&task_id, &generation_id, first.clone());
+    kernel.record_security_acquisition_block(&block).unwrap();
+    assert_eq!(block.candidate_count(), 2);
+
+    // Re-observing the same identities in another order is the same condition.
+    let reordered = CandidateDomain::from_identities([
+        identity("agent-a", "config-b", "key-1"),
+        identity("agent-a", "config-a", "key-1"),
+    ]);
+    kernel
+        .record_security_acquisition_block(&defer_block_for_domain(
+            &task_id,
+            &generation_id,
+            reordered,
+        ))
+        .unwrap();
+    assert_eq!(db.row_count(), 1);
+    assert_eq!(
+        kernel
+            .get_security_acquisition_block(&task_id)
+            .unwrap()
+            .unwrap()
+            .candidate_domain_digest(),
+        first.digest()
+    );
+
+    // The same agent and config set over another physical binding is a new
+    // condition: the alias cannot hide a different key.
+    let binding_changed = CandidateDomain::from_identities([
+        identity("agent-a", "config-a", "key-2"),
+        identity("agent-a", "config-b", "key-1"),
+    ]);
+    assert_ne!(binding_changed.digest(), first.digest());
+    kernel
+        .record_security_acquisition_block(&defer_block_for_domain(
+            &task_id,
+            &generation_id,
+            binding_changed.clone(),
+        ))
+        .unwrap();
+    assert_eq!(db.row_count(), 1);
+    assert_eq!(
+        kernel
+            .get_security_acquisition_block(&task_id)
+            .unwrap()
+            .unwrap()
+            .candidate_domain_digest(),
+        binding_changed.digest()
+    );
+
+    // A changed config digest is also a new condition.
+    let config_changed = CandidateDomain::from_identities([
+        identity("agent-a", "config-a2", "key-1"),
+        identity("agent-a", "config-b", "key-1"),
+    ]);
+    assert_ne!(config_changed.digest(), binding_changed.digest());
+    kernel
+        .record_security_acquisition_block(&defer_block_for_domain(
+            &task_id,
+            &generation_id,
+            config_changed.clone(),
+        ))
+        .unwrap();
+    assert_eq!(db.row_count(), 1);
+    assert_eq!(
+        kernel
+            .get_security_acquisition_block(&task_id)
+            .unwrap()
+            .unwrap()
+            .candidate_domain_digest(),
+        config_changed.digest()
+    );
 }
 
 #[test]

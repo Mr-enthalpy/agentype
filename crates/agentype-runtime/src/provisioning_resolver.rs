@@ -26,13 +26,14 @@ use crate::{AdapterRegistry, ResolvedAdapterBinding};
 use agentype_adapter_api::AdapterDeadline;
 use agentype_adapter_api::NetworkEnforcement;
 use agentype_agent_contract::{
-    can_provision_task, AdapterBindingPolicy, AdapterPolicyRef, AgentTypeRef, BindingSnapshot,
-    CapabilityRef, CapabilityValue, ConfigStatus, MaterializationDigest, NetworkPolicy,
-    PhysicalSafety, ProvisioningBinding, ResolvedProvisioningEvidence, SandboxPolicyRef,
-    SecurityContractMode, SourceConfig, SourceConfigRef, SpawnSource, SpawnSourceRef,
-    RESOLVER_VERSION,
+    can_provision_task, AcquisitionBudget, AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef,
+    AgentTypeRef, BindingSnapshot, BudgetExhaustion, CandidateDomain, CapabilityRef,
+    CapabilityValue, ConfigStatus, MaterializationDigest, NetworkPolicy, PhysicalSafety,
+    ProvisioningBinding, ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
+    SecurityCandidateIdentity, SecurityCandidateOwner, SecurityContractMode, SourceConfig,
+    SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
 };
-use agentype_core::{ExecutionId, TaskId, WorkspaceMode};
+use agentype_core::{ExecutionId, GenerationId, TaskId, UnixTime, WorkspaceMode};
 use agentype_execution_config::ExecutionRegistry;
 use agentype_storage_sqlite::Kernel;
 use std::collections::BTreeMap;
@@ -325,6 +326,127 @@ pub struct SourceProvisioningCandidate {
     /// for the exact config and physical domain (an expected identity, not proof
     /// of materialization).
     pub attested_materialization_digest: MaterializationDigest,
+}
+
+impl SourceProvisioningCandidate {
+    /// Project this eligible candidate onto the complete security identity
+    /// (ADR-0014 §4). The owner is supplied by the round: an exact existing
+    /// `LogicalAgentId`, or the pinned `AgentType` revision of a new agent.
+    fn security_identity(
+        &self,
+        owner: &SecurityCandidateOwner,
+    ) -> Result<SecurityCandidateIdentity, ProvisioningResolutionError> {
+        SecurityCandidateIdentity::new(
+            owner.clone(),
+            self.source_config.config_ref.clone(),
+            self.source_config.config_digest.clone(),
+            self.adapter_kind.clone(),
+            self.adapter_binding_key.clone(),
+        )
+        .map_err(ProvisioningResolutionError::Evidence)
+    }
+}
+
+/// One complete security acquisition round.
+///
+/// The round is the unit of identity, cost and defer. It keeps every enumerated
+/// candidate together with its full identity, so two configs or two physical
+/// bindings under one agent are distinct candidates and cannot be collapsed by a
+/// later step. Selection MUST consume a round: a caller cannot construct a
+/// "winner" from a subset, and budget exhaustion is reported for the whole round
+/// rather than for the candidate the caller wanted to try next.
+#[derive(Clone, Debug)]
+pub struct SecurityCandidateRound {
+    candidates: Vec<SourceProvisioningCandidate>,
+    identities: Vec<SecurityCandidateIdentity>,
+    domain: CandidateDomain,
+}
+
+impl SecurityCandidateRound {
+    /// Build a round over every enumerated candidate.
+    ///
+    /// Duplicate identities are deduplicated (the durable domain is a set), but
+    /// a new-agent round refuses a candidate whose pinned AgentType differs from
+    /// the round's owner: that would make the round represent more than one
+    /// pinned identity.
+    pub fn new(
+        owner: SecurityCandidateOwner,
+        candidates: Vec<SourceProvisioningCandidate>,
+    ) -> Result<Self, ProvisioningResolutionError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut identities = Vec::new();
+        let mut unique = Vec::new();
+        for candidate in candidates {
+            if let SecurityCandidateOwner::NewAgentType(pinned) = &owner {
+                if &candidate.agent_type != pinned {
+                    return Err(ProvisioningResolutionError::Evidence(
+                        agentype_agent_contract::ContractError::InvariantViolation(
+                            "a new-agent security round contains a candidate for another AgentType revision"
+                                .into(),
+                        ),
+                    ));
+                }
+            }
+            let identity = candidate.security_identity(&owner)?;
+            if seen.insert(identity.digest()) {
+                identities.push(identity);
+                unique.push(candidate);
+            }
+        }
+        let domain = CandidateDomain::from_identities(identities.clone());
+        Ok(Self {
+            candidates: unique,
+            identities,
+            domain,
+        })
+    }
+
+    pub fn domain(&self) -> &CandidateDomain {
+        &self.domain
+    }
+
+    pub fn identities(&self) -> &[SecurityCandidateIdentity] {
+        &self.identities
+    }
+
+    pub fn candidates(&self) -> &[SourceProvisioningCandidate] {
+        &self.candidates
+    }
+
+    /// The observed cost of this complete round: every distinct candidate once.
+    pub fn cost(&self) -> AcquisitionCost {
+        self.domain.acquisition_cost()
+    }
+
+    /// Require that the whole round fits the fixed budget. There is no
+    /// partial-success path: `Err` is a whole-round defer, and no candidate may
+    /// be selected from the truncated set.
+    pub fn require_whole_round(&self, budget: AcquisitionBudget) -> Result<(), BudgetExhaustion> {
+        budget.require_whole_round(self.cost())
+    }
+
+    /// Build the durable diagnostic for a fixed-budget defer. The row binds the
+    /// complete round's domain digest and count, so a later round that sees the
+    /// same full identity set is the same condition, while any changed source,
+    /// config digest or physical binding is a new condition.
+    pub fn budget_defer_block(
+        &self,
+        task_id: TaskId,
+        generation_id: GenerationId,
+        binding_profile_digest: impl Into<String>,
+        exhaustion: BudgetExhaustion,
+        now: UnixTime,
+    ) -> Result<SecurityAcquisitionBlock, ProvisioningResolutionError> {
+        SecurityAcquisitionBlock::from_budget_defer(
+            task_id,
+            generation_id,
+            self.domain.clone(),
+            binding_profile_digest,
+            exhaustion,
+            now,
+        )
+        .map_err(ProvisioningResolutionError::Evidence)
+    }
 }
 
 /// Source-private config resolution / attestation seam.
@@ -981,7 +1103,20 @@ fn prepare_selection(
     };
     // Enumeration completes all known hard filters before attestation and
     // returns only physically eligible candidates. Ranking adds no eligibility.
-    let winner = select_candidate(&eligible)?;
+    // Freeze the complete identity set before selection: two configs or two
+    // physical bindings under one agent are distinct candidates, and a winner is
+    // only ever taken from this full round.
+    let owner = match agent_id {
+        Some(agent) => SecurityCandidateOwner::ExistingAgent(agent.clone()),
+        None => {
+            let first = eligible
+                .first()
+                .ok_or(ProvisioningResolutionError::NoEligibleSource)?;
+            SecurityCandidateOwner::NewAgentType(first.agent_type.clone())
+        }
+    };
+    let round = SecurityCandidateRound::new(owner, eligible)?;
+    let winner = select_candidate(round.candidates())?;
 
     // The winner's exact binding must still be resolvable in the live runtime.
     let policy = kernel
@@ -1506,8 +1641,8 @@ mod tests {
         SourceStatus, SpawnSourceSecurityDeclaration,
     };
     use agentype_core::{
-        Clock, FailureClass, LogicalAgentState, ManualClock, PartitionSpec, RawWorkIntent,
-        Retention, SemanticInputSet, TaskId, TaskSpec, TaskState,
+        Clock, FailureClass, LogicalAgentId, LogicalAgentState, ManualClock, PartitionSpec,
+        RawWorkIntent, Retention, SemanticInputSet, TaskId, TaskSpec, TaskState,
     };
     use agentype_execution_config::{
         AdapterBindingKey, ExecutionProfileConfig, ExecutionRegistry, ExecutionTargetConfig,
@@ -4628,6 +4763,101 @@ mod tests {
             .evidence
             .enforceable_safety()
             .enforces_workspace(WorkspaceMode::ReadOnly));
+    }
+
+    #[test]
+    fn a_security_round_counts_full_candidate_identities_not_agents() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        let task = typed_task(&kernel, pin);
+        let adapters = adapters_with_binding();
+        let candidates = resolve_source_candidates(
+            &kernel,
+            &task,
+            &adapters,
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+        let first = candidates.into_iter().next().expect("one candidate");
+        let owner = SecurityCandidateOwner::ExistingAgent(LogicalAgentId::from_string("agent-a"));
+
+        // The exact same candidate is one identity; a different config revision
+        // or a different physical key is a distinct one, even under one agent.
+        let identical = first.clone();
+        let mut other_config = first.clone();
+        other_config.source_config.config_ref = SourceConfigRef::new(
+            first.source_config.config_ref.source().clone(),
+            "another-config",
+            1,
+        )
+        .unwrap();
+        other_config.source_config.config_digest = ConfigDigest::new("sha256:another").unwrap();
+        let mut other_binding = first.clone();
+        other_binding.adapter_binding_key = "another-key".into();
+
+        let single = SecurityCandidateRound::new(owner.clone(), vec![first.clone()]).unwrap();
+        assert_eq!(single.domain().candidate_count(), 1);
+        assert_eq!(single.cost(), AcquisitionCost::new(1, 1));
+
+        let deduped =
+            SecurityCandidateRound::new(owner.clone(), vec![first.clone(), identical]).unwrap();
+        assert_eq!(deduped.domain().candidate_count(), 1);
+
+        let two_configs =
+            SecurityCandidateRound::new(owner.clone(), vec![first.clone(), other_config]).unwrap();
+        assert_eq!(two_configs.domain().candidate_count(), 2);
+        assert_eq!(two_configs.candidates().len(), 2);
+        assert_ne!(two_configs.domain().digest(), single.domain().digest());
+
+        let two_bindings =
+            SecurityCandidateRound::new(owner.clone(), vec![first.clone(), other_binding]).unwrap();
+        assert_eq!(two_bindings.domain().candidate_count(), 2);
+        assert_ne!(
+            two_bindings.domain().digest(),
+            two_configs.domain().digest()
+        );
+
+        // A fixed budget below the complete round is a whole-round defer. The
+        // defer no longer exists as a per-candidate concern: the diagnostic
+        // records the full domain and count.
+        let exhaustion = two_configs
+            .require_whole_round(AcquisitionBudget::new(1, 2).unwrap())
+            .unwrap_err();
+        assert_eq!(
+            exhaustion.limit(),
+            agentype_agent_contract::BudgetLimit::CandidateCount
+        );
+        assert_eq!(exhaustion.cost(), AcquisitionCost::new(2, 2));
+        let block = two_configs
+            .budget_defer_block(
+                TaskId::from_string("task-1"),
+                GenerationId::from_string("generation-1"),
+                "sha256:binding-profile",
+                exhaustion,
+                1_000.0,
+            )
+            .unwrap();
+        assert_eq!(block.candidate_count(), 2);
+        assert_eq!(
+            block.limit(),
+            agentype_agent_contract::BudgetLimit::CandidateCount
+        );
+        assert_eq!(
+            block.candidate_domain_digest(),
+            two_configs.domain().digest()
+        );
+        block.validate_durable_truth().unwrap();
+
+        // A new-agent round may only describe one pinned AgentType revision.
+        let mut wrong_type = first.clone();
+        wrong_type.agent_type = AgentTypeRef::new("another-type", 1).unwrap();
+        assert!(SecurityCandidateRound::new(
+            SecurityCandidateOwner::NewAgentType(first.agent_type.clone()),
+            vec![wrong_type],
+        )
+        .is_err());
     }
 
     #[test]

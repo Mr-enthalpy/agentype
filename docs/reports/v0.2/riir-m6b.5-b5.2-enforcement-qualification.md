@@ -1,20 +1,20 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 17 (2026-11-20) — records PR #37's merge (`e68a771`) and the B5.2-C
-implementation on `agent/m6b5-b5.2-c-trusted-importer`. Revision 16's
-continuation-baseline review remains the audit baseline; no new P1 is claimed
-closed. B5.2-C adds the durable trusted-importer attestation
-(`enforcement_profile_attestations`, schema v11) and makes acquisition require a
-fresh row for the exact profile digest, importer protocol and resolved physical
-domain before any qualification, config settlement or Attempt/Lease. It closes
-the provenance face of follow-up item 16 and leaves B5.2-D (complete candidate
-identity and whole-round budget) and B5.2-E (resolver→scheduler wiring and
-liveness) open. No freeze claim; no ADR `Status:` line, spec status or index
+Revision: 18 (2026-11-20) — continues the C → D → E order after PR #38's B5.2-C
+implementation. Revision 18 implements B5.2-D: the complete candidate identity
+(`SecurityCandidateIdentity` / `CandidateDomain::from_identities`), the
+whole-round `SecurityCandidateRound` in the resolver, and the durable-block
+builder bound to the complete round. Agent-only candidate identity is removed, so
+two configs or two physical bindings under one agent are distinct candidates and
+produce different durable-block conditions. The resolver freezes the full round
+before ranking; a budget below the complete round is a whole-round defer. B5.2-E
+(resolver→scheduler wiring, full revalidation and the liveness condition) and
+B5.4 remain open. No freeze claim; no ADR `Status:` line, spec status or index
 entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
-PR #30–#37 merged, #37 at `e68a771`; B5.2-C on
-`agent/m6b5-b5.2-c-trusted-importer`)
+PR #30–#37 merged, #37 at `e68a771`; B5.2-C in PR #38; B5.2-D on
+`agent/m6b5-b5.2-d-candidate-identity`)
 Date: 2026-11-18
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
 Freeze state: **NOT FROZEN — no freeze gate has run**
@@ -59,13 +59,17 @@ the Kernel guards as the fail-closed boundary for this stage, confirms that PR
 draft only as a B5.2 continuation, never as a freeze. Revision 17 records PR #37's
 merge (`e68a771`) and implements B5.2-C: acquisition re-reads a durable
 trusted-importer attestation for the exact profile digest and physical domain,
-and rejects an absent or stale row before any qualification or Attempt/Lease. The
-candidate round, its whole-round budget and the resolver→scheduler wiring remain
-B5.2-D and B5.2-E.
+and rejects an absent or stale row before any qualification or Attempt/Lease.
+Revision 18 implements B5.2-D: full candidate identity and a whole-round
+`SecurityCandidateRound`, so two configs or two physical bindings under one agent
+are distinct and selection is only ever taken from the complete round. The
+resolver→scheduler wiring, full production revalidation and the liveness condition
+remain B5.2-E.
 As with every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
 *selected-candidate transactional qualification with trusted-importer provenance
-implemented; complete `SECURITY_V1` orchestration remains open*.
+and complete candidate identity implemented; complete `SECURITY_V1` orchestration
+remains open*.
 
 The gaps are **latent, not live**. The coarse typed acquisition path still
 rejects `SECURITY_V1` at every stage, and the runtime resolver and daemon do not
@@ -98,6 +102,7 @@ positive-obligation requirement on the complete effective policy.
 | 15 | `2e6e5c9` (reviewed head; code in this pull request) | Records the semantic-completion review: P1 — a `SECURITY_V1` `Claim` could be acknowledged with `execution_id = None`, writing `SUCCEEDED`/`COMPLETED`, a Result and dependency release without any Execution, snapshot or receipt. `ack_success` now rejects `SECURITY_V1` before any state change; the B5.4 secured acknowledgement path must be defined explicitly. P2 — rewrites ADR-0014 §3 so the transaction re-proof covers durable truth and imported-fact consistency, not external physical truth, and records the four proof layers. Adds `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success`, which also proves a BLOCKED dependent is not released. Note: because a `SECURITY_V1` Task cannot currently reach an Execution, `ack_success` rejects it even when an `execution_id` is supplied, which is deliberate and conservative. No ADR `Status:` line, spec status or index entry changes. |
 | 16 | `d37c887` (reviewed head; docs-only) | Records the continuation-baseline review: no new P1; the Kernel execution/RUNNING/acknowledgement guards are accepted as the fail-closed authority boundary. Confirms PR #30–#36 merged, so items 1–4 and 8–10 of the follow-up list are landed rather than pending here. Adds the B5.2-E liveness acceptance condition (a `SECURITY_V1` Task must not cycle `QUEUED → LEASED → lease expiry` while B5.4 is disabled) to ADR-0014 §3 and to the follow-up list. Confirms, rather than rewords, the credential-necessity and B5.4 subject-identity constraints. Docs-only; no code, ADR `Status:` line, spec status or index entry change. |
 | 17 | `agent/m6b5-b5.2-c-trusted-importer` (code) | Implements B5.2-C after PR #37 merged at `e68a771`. Adds `EnforcementProfileAttestation` (`ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION = 1`, protocol `agentype-enforcement-profile-attest/1`) with a gated producer constructor and an ungated digest-recomputing durable read. Adds schema v11 `enforcement_profile_attestations`: immutable rows keyed by `attestation_digest`, indexed by `profile_digest`, write-once, with a physical-domain-stability trigger. `finish_acquisition`'s `SecurityV1` arm re-reads the freshest row valid at `now` and rejects absence or expiry with `InvalidAuthority` before the reusable B.4 conjunct, tuple validation or qualification. New negatives cover unattested, stale-then-refresh, wider support, forged subjects, foreign domain, and write-once/tamper evidence. ADR-0014 §4 (schema v11) and §5 state the row and gate. No ADR `Status:` line, spec status or index entry change. |
+| 18 | `agent/m6b5-b5.2-d-candidate-identity` (code) | Implements B5.2-D after PR #38's B5.2-C branch. Adds `SecurityCandidateIdentity` (`owner` = exact `LogicalAgentId` or pinned `AgentType` revision, exact source/config revision, config digest, resolved physical binding) and replaces `CandidateDomain::from_ids` with `from_identities`. Adds the resolver `SecurityCandidateRound`: it freezes every enumerated candidate with its full identity, deduplicates only exact identities, exposes the complete round cost, rejects a budget below the whole round, and builds the durable `security_acquisition_blocks` defer from the complete domain. `prepare_selection` now ranks only the frozen round, so an agent with two configs or two bindings cannot be collapsed. New tests pin identity components, same-agent distinct configs/bindings, whole-round budget exhaustion, and durable same-condition behavior. ADR-0014 §4 states the identity and round. No schema bump (the durable digest is opaque), no ADR `Status:` line, spec status or index entry change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -1573,6 +1578,61 @@ select a `SECURITY_V1` Task and the B5.2-E liveness condition is unchanged. The
 attestation is the importer's external observation; the actual enforcement-subject
 attestation and the secured start remain B5.4 (ADR-0014 §5).
 
+## Complete candidate identity implementation (revision 18)
+
+Revision 18 implements B5.2-D, which revision 17 left open: the
+candidate is no longer an agent id. `CandidateDomain::from_ids` is removed. Its
+replacement, `CandidateDomain::from_identities`, consumes
+`SecurityCandidateIdentity`:
+
+```text
+owner              exact LogicalAgentId, or the pinned AgentType id + revision
+source revision    exact SpawnSource id + revision
+config revision    exact SourceConfig id + revision
+config digest      opaque body/locator identity, not only the readable config id
+physical binding   resolved (adapter_kind, adapter_binding_key), never the alias
+```
+
+Every component is in `SecurityCandidateIdentity::digest()`, and the domain is the
+ordered set of those digests. Two config revisions or two physical bindings under
+one agent therefore count as two candidates and produce a different domain digest;
+reordering the same identities does not.
+
+**The round.** `SecurityCandidateRound` is the resolver's frozen unit of identity,
+cost and defer. It keeps every enumerated candidate with its full identity,
+deduplicates only exact identities, refuses a new-agent round whose candidates do
+not share the pinned `AgentType` revision, and exposes the complete cost. Its
+`require_whole_round` delegates to `AcquisitionBudget`; there is no API that
+selects a winner from a subset or spends a narrowed budget on the first few
+successes. `prepare_selection` now builds the round and ranks only
+`round.candidates()`, so the coarse path cannot collapse distinct configs either.
+
+**The durable defer.** `SecurityCandidateRound::budget_defer_block` builds the
+existing `security_acquisition_blocks` row from the complete domain and cost. It
+adds no schema: the domain digest is opaque, so the durable row already binds the
+full identity set. The block's same-condition test now distinguishes two configs
+or two bindings under one agent. A new row is still required only when the
+complete identity set changes.
+
+**Tests pinned by revision 18.**
+
+| Case | Test |
+|---|---|
+| identity commits to owner kind/revision, source and config revision, config digest and physical key | `b5_enforcement::the_candidate_domain_digest_is_a_stable_full_identity_set` |
+| one agent with two configs is two candidates | the same test |
+| one config with two physical bindings is two candidates | the same test |
+| the whole-round cost is the full identity count, and one short on either bound defers | `b5_enforcement::the_whole_round_budget_is_measured_in_full_candidate_identities` |
+| a durable block's same-condition identity changes with a config or binding | `b5_enforcement::a_block_is_released_only_by_operator_action_or_configuration_change`; `b5_acquisition_block::one_agent_with_a_different_config_or_binding_is_a_new_condition` |
+| the resolver round deduplicates exact identities, rejects a foreign pinned type and defers the whole round | `provisioning_resolver::tests::a_security_round_counts_full_candidate_identities_not_agents` |
+
+**What remains open.** The round is defined and used by the resolver's selection
+path, but the security entry point is still not wired into the Scheduler: the
+production resolver continues to reject `SECURITY_V1`, and no control-plane caller
+writes the durable defer automatically. That is B5.2-E, together with the liveness
+condition (with B5.4 disabled, a `SECURITY_V1` Task must not cycle
+`QUEUED → LEASED → lease expiry`). B5.4 still owns the subject-bound
+`ExecutionSecurityEvidence` and the secured start.
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1728,6 +1788,20 @@ Revision 17 adds a fence check of its own, against `e68a771..HEAD` on
 | Durable format / schema version | **intentionally** `10 → 11`; adds only the `enforcement_profile_attestations` table, its profile index and its immutability/domain-stability triggers; no existing table, column or row changes, and the fresh-only open rule is unchanged |
 | Compile cache key list | unchanged; the physical-key component from revision 11 stays |
 | Coarse acquisition behavior | unchanged: the attestation gate is inside `AcquisitionMode::SecurityV1`, and `b5_coarse_path_gate` / `b4_provisioning_binding` pass |
+| Untracked files | not staged, not committed, not deleted |
+
+Revision 18 adds a fence check of its own, against
+`e68a771..HEAD` on `agent/m6b5-b5.2-d-candidate-identity` (stacked on the
+revision-17 branch):
+
+| Fence | Result |
+|---|---|
+| `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
+| ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §4 body text only) |
+| Durable format / schema version | unchanged at 11: `candidate_domain_digest`, `candidate_count` and the budget/cost columns already exist, and the richer digest stays an opaque value, so no table or migration change |
+| Compile cache key list | unchanged; the physical-key component from revision 11 stays |
+| Coarse acquisition behavior | unchanged: the round is built only on the security enumeration/selection path, and `prepare_selection` still selects the same ranked winner when no two identities collide |
+| Durable-block identity | the same `security_acquisition_blocks` row and triggers; only the set of identities represented by the opaque domain digest is richer |
 | Untracked files | not staged, not committed, not deleted |
 
 ## Deliberate non-reachability
@@ -1896,7 +1970,10 @@ the earlier boundary remains auditable.
     no-partial-selection rule. B5.2-D must freeze
     `(LogicalAgent/pinned AgentType, exact Source/Config, physical binding)` —
     including source revision and config digest — before budget, cache or
-    durable-block wiring lands.
+    durable-block wiring lands. **Implemented in revision 18:** the agent-only
+    constructor is gone, every identity component feeds the candidate digest, the
+    resolver freezes the complete round before ranking, and the durable block is
+    built from that same domain.
 19. **(rev 13)** **A coarse exact-reference claim had leaked into the reusable
     B.4 conjunct.** `can_provision_task_source_config` still rejected a Task
     whose authored `sandbox_policy` reference was absent from the imported
@@ -2197,6 +2274,29 @@ Revision 17 ships B5.2-C code after PR #37 merged and re-runs the full gate at t
 The schema-version assertion moved with the bump: `catalog_contract` now expects
 11, and `b4_provisioning_binding` reads `SCHEMA_VERSION` instead of a literal.
 
+Revision 18 ships B5.2-D code on `agent/m6b5-b5.2-d-candidate-identity` (stacked
+on the revision-17 branch) and re-runs the full gate:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | 58 suites, 1123 passed, 0 failed |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+The only public-surface adjustment is the `b5_compiled_security_surface` doctest,
+which now names `CandidateDomain::from_identities` instead of the removed
+agent-only constructor.
+
+Revision-18 mutation check: collapsing the identity back to its owner (mapping
+each candidate to `owner.id_str()` in `CandidateDomain::from_identities`) makes
+`the_candidate_domain_digest_is_a_stable_full_identity_set`,
+`the_whole_round_budget_is_measured_in_full_candidate_identities` and
+`a_security_round_counts_full_candidate_identities_not_agents` fail on the
+two-configs/two-bindings cases; the identity was restored and the suites went
+green again.
+
 Revision-17 mutation check: making the attestation rejection optional at the
 `SecurityV1` arm makes exactly the new provenance negatives fail
 (`a_profile_without_a_trusted_importer_attestation_is_rejected_before_attempt_or_lease`,
@@ -2241,7 +2341,12 @@ coarse-only Task policy reference split) and `b5_security_acquisition` holds 19
 acceptance test). At revision 17's code head, `b5_enforcement` holds 45 (five
 attestation contract tests) and `b5_security_acquisition` holds 27 (the six
 provenance negatives and the retained positive fixtures); the other counts are
-unchanged.
+unchanged. At revision 18's code head, `b5_enforcement` holds 46 (the full
+identity/domain test and the whole-round budget test replace the old domain
+test) and `b5_acquisition_block` holds 11 (the full-identity same-condition
+test); `agentype-runtime`'s lib suite holds 301, including
+`provisioning_resolver::tests::a_security_round_counts_full_candidate_identities_not_agents`.
+The workspace total is 1123 passed in 58 suites.
 
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
@@ -2269,7 +2374,7 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 12 | Keep credential-bearing acquisition fail-closed until B5.3 (P1-2, rev 10) | a delivering profile plus non-empty `credential_refs` is `InvalidAuthority` before Attempt/Lease; the pure-component delivery check and its positive test remain. Implemented in revision 10 (`0a0ed56`) |
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
-| 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. Not implemented |
+| 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. **Implemented in revision 18** as `SecurityCandidateIdentity` / `CandidateDomain::from_identities` and the resolver's frozen `SecurityCandidateRound`; a budget below the complete round is a whole-round defer and the durable block binds the same domain. The acceptance table in the revision-18 section names each case |
 | 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case |
 | 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. Not implemented |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
@@ -2285,8 +2390,9 @@ rather than by adding history; item 4 also needs its normative sentence in the
 ADR, which is why that part sits in the ADR pull request. Items 11 and 12 are
 implemented in revision 10 (`0a0ed56`), items 13 and 14 in revision 11
 (`39e85c5`), in the same unmerged draft pull request as the Gate. Items 15–17 are
-the audit's B5.2-C/D/E decomposition and are **not implemented** by this revision;
-revision 12 accepts that decomposition and carries the two hard conditions into
+the audit's B5.2-C/D/E decomposition: item 15 (B5.2-D) is implemented in
+revision 18, item 16 (B5.2-C) in revision 17, and item 17 (B5.2-E) remains open.
+Revision 12 accepted the decomposition and carried the two hard conditions into
 the follow-ups without adding code. Item 18 is the revision-13 fix for the
 coarse Task exact-reference leak in the reusable conjunct; item 19 is the
 revision-14 Kernel boundary that keeps a qualified `SECURITY_V1` `Claim` out of
@@ -2310,8 +2416,9 @@ consistency; it likewise grants no B5.4 authority. Revision 16 records the
 continuation-baseline review, which finds no new P1, confirms the merged
 PR #30–#36 baseline, and adds the B5.2-E liveness condition; it accepts this
 draft only as a B5.2 continuation. Revision 17 implements item 16's B5.2-C
-provenance gate after PR #37 merged; it leaves items 15 and 17 (B5.2-D/E) open
-and still does not claim the Gate as closed.
+provenance gate after PR #37 merged; revision 18 implements item 15's B5.2-D
+candidate identity and whole-round defer, leaving item 17 (B5.2-E) open, and
+neither revision claims the Gate as closed.
 
 ## Evidence index
 
@@ -2328,6 +2435,9 @@ and still does not claim the Gate as closed.
 | Access floor, projection and check | `crates/agentype-agent-contract/src/sandbox.rs` (`PolicyAccess`, `check_required_access`) |
 | Admission-time floor proof | `crates/agentype-storage-sqlite/src/requirement.rs` (lines 1341–1356, 1485–1509) |
 | Durable block read/write/release | `crates/agentype-storage-sqlite/src/security_acquisition.rs` |
+| Complete candidate identity and domain | `crates/agentype-agent-contract/src/enforcement.rs` (`SecurityCandidateOwner`, `SecurityCandidateIdentity`, `CandidateDomain::from_identities`, `acquisition_cost`) |
+| Whole-round resolver round and defer | `crates/agentype-runtime/src/provisioning_resolver.rs` (`SecurityCandidateRound`, `SourceProvisioningCandidate::security_identity`, `prepare_selection`) |
+| B5.2-D conformance | `crates/agentype-agent-contract/tests/b5_enforcement.rs` (`the_candidate_domain_digest_is_a_stable_full_identity_set`, `the_whole_round_budget_is_measured_in_full_candidate_identities`), `crates/agentype-runtime/src/provisioning_resolver.rs` (`a_security_round_counts_full_candidate_identities_not_agents`), `crates/agentype-storage-sqlite/tests/b5_acquisition_block.rs` (`one_agent_with_a_different_config_or_binding_is_a_new_condition`) |
 | Source-declaration provenance | `crates/agentype-agent-contract/src/sandbox.rs` (`SpawnSourceSecurityDeclaration`), `crates/agentype-agent-contract/src/authority.rs` (`EffectiveTaskAuthority::new`), `crates/agentype-storage-sqlite/src/catalog.rs` (`insert_spawn_source_declaration`) |
 | Schema v10 block table and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`security_acquisition_blocks`) |
 | Schema v11 attestation table, index and triggers | `crates/agentype-storage-sqlite/src/schema.rs` (`enforcement_profile_attestations`) |

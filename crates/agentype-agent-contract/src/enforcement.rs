@@ -27,8 +27,8 @@ use crate::canonical::{
 };
 use crate::error::ContractError;
 use crate::records::{
-    AdapterBindingPolicy, ConfigDigest, ConfigStatus, SourceConfig, SourceConfigRef, SourceStatus,
-    SpawnSource,
+    AdapterBindingPolicy, AgentTypeRef, ConfigDigest, ConfigStatus, SourceConfig, SourceConfigRef,
+    SourceStatus, SpawnSource,
 };
 use crate::sandbox::{
     check_required_access, required_access_from_claims, CredentialAuthorizationId,
@@ -1594,6 +1594,130 @@ pub fn qualify_security_candidate(
     compile_execution_security(authority, domain)?.prove_subject(subject)
 }
 
+/// What a security candidate would acquire, before it is materialized.
+///
+/// An existing agent is selected by its exact `LogicalAgentId`; a new agent is
+/// created from the Task's pinned `AgentType` revision. The two are distinct
+/// identities even when they resolve to the same source/config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecurityCandidateOwner {
+    ExistingAgent(LogicalAgentId),
+    NewAgentType(AgentTypeRef),
+}
+
+impl SecurityCandidateOwner {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::ExistingAgent(_) => "LOGICAL_AGENT",
+            Self::NewAgentType(_) => "AGENT_TYPE",
+        }
+    }
+
+    pub fn id_str(&self) -> &str {
+        match self {
+            Self::ExistingAgent(id) => id.as_str(),
+            Self::NewAgentType(reference) => reference.id().as_str(),
+        }
+    }
+
+    /// The AgentType revision, for a new-agent candidate. An existing agent has
+    /// no single pinned type here: its actual binding is re-read from the
+    /// durable agent row during acquisition.
+    pub fn revision(&self) -> Option<u64> {
+        match self {
+            Self::ExistingAgent(_) => None,
+            Self::NewAgentType(reference) => Some(reference.revision()),
+        }
+    }
+}
+
+/// The complete identity of one security candidate (ADR-0014 §4).
+///
+/// A candidate is not identified by its agent alone. Two `SourceConfig`
+/// revisions or two physical bindings under one agent are different candidates,
+/// with different compile cost, quality rank and durable-block identity. The
+/// identity therefore commits to:
+///
+/// * the owner: exact `LogicalAgentId`, or the pinned `AgentType` revision of a
+///   new agent;
+/// * the exact source and source-config revision;
+/// * the opaque source-config digest (two revisions may share a readable
+///   `config_id` while differing in body/locator);
+/// * the resolved physical `(adapter_kind, adapter_binding_key)`, never the
+///   B.4 `binding_ref` alias.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityCandidateIdentity {
+    owner: SecurityCandidateOwner,
+    source_config: SourceConfigRef,
+    config_digest: ConfigDigest,
+    adapter_kind: String,
+    adapter_binding_key: String,
+}
+
+impl SecurityCandidateIdentity {
+    pub fn new(
+        owner: SecurityCandidateOwner,
+        source_config: SourceConfigRef,
+        config_digest: ConfigDigest,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let adapter_kind = adapter_kind.into();
+        let adapter_binding_key = adapter_binding_key.into();
+        if adapter_kind.trim().is_empty() || adapter_binding_key.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "a security candidate identity needs a nonblank physical binding".into(),
+            });
+        }
+        Ok(Self {
+            owner,
+            source_config,
+            config_digest,
+            adapter_kind,
+            adapter_binding_key,
+        })
+    }
+
+    pub fn owner(&self) -> &SecurityCandidateOwner {
+        &self.owner
+    }
+
+    pub fn source_config(&self) -> &SourceConfigRef {
+        &self.source_config
+    }
+
+    pub fn config_digest(&self) -> &ConfigDigest {
+        &self.config_digest
+    }
+
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+
+    pub fn adapter_binding_key(&self) -> &str {
+        &self.adapter_binding_key
+    }
+
+    /// Canonical digest of every identity component. The domain digest below is
+    /// built from these per-candidate digests, so any changed component changes
+    /// the domain and therefore the durable diagnostic condition.
+    pub fn digest(&self) -> String {
+        canonical_json_body_digest(&json!({
+            "kind": "SECURITY_CANDIDATE_IDENTITY",
+            "owner_kind": self.owner.kind_str(),
+            "owner_id": self.owner.id_str(),
+            "owner_revision": self.owner.revision(),
+            "source_id": self.source_config.source().id().as_str(),
+            "source_revision": self.source_config.source().revision(),
+            "config_id": self.source_config.config_id().as_str(),
+            "config_revision": self.source_config.revision(),
+            "config_digest": self.config_digest.as_str(),
+            "adapter_kind": self.adapter_kind,
+            "adapter_binding_key": self.adapter_binding_key,
+        }))
+    }
+}
+
 /// The ordered, deduplicated candidate identity set one acquisition round sees.
 ///
 /// The digest is stable under input order, so two rounds that see the same
@@ -1605,22 +1729,35 @@ pub struct CandidateDomain {
 }
 
 impl CandidateDomain {
-    pub fn from_ids(ids: impl IntoIterator<Item = LogicalAgentId>) -> Self {
-        let ids: Vec<String> = ids
+    /// Build the domain from complete candidate identities.
+    ///
+    /// There is deliberately no agent-only constructor: collapsing two configs
+    /// or two physical bindings under one agent would corrupt the candidate
+    /// count, the whole-round budget, and the durable-block condition.
+    pub fn from_identities(
+        identities: impl IntoIterator<Item = SecurityCandidateIdentity>,
+    ) -> Self {
+        let candidates: Vec<String> = identities
             .into_iter()
-            .map(|id| id.as_str().to_string())
+            .map(|identity| identity.digest())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let candidate_count = ids.len();
+        let candidate_count = candidates.len();
         let digest = canonical_json_body_digest(&json!({
             "kind": "SECURITY_CANDIDATE_DOMAIN",
-            "agents": ids,
+            "candidates": candidates,
         }));
         Self {
             digest,
             candidate_count,
         }
+    }
+
+    /// The observed cost of attempting this complete domain once. Every
+    /// enumerated candidate is compiled once during qualification.
+    pub fn acquisition_cost(&self) -> AcquisitionCost {
+        AcquisitionCost::new(self.candidate_count, self.candidate_count)
     }
 
     pub fn digest(&self) -> &str {
