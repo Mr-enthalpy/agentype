@@ -1,17 +1,19 @@
 # RIIR M6-B.5 B5.2 — Enforcement Qualification Audit Record
 
 Status: Historical Report — audit record, not a freeze
-Revision: 15 (2026-11-20) — records the semantic-completion review over the
-revision-14 draft head `2e6e5c9`. It found a new P1: a `SECURITY_V1` `Claim` could
-still be passed to `Kernel::ack_success` with `execution_id = None`, publishing a
-Result and completing the Task without any Execution, security snapshot or receipt.
-`ack_success` now rejects `SECURITY_V1` before any state change. The revision also
-tightens the ADR's transaction-re-proof wording (P2): durable truth, imported
-observation, physical enforcement and applied enforcement are separate layers. No
-freeze claim; B5.2-C/D/E remain separate follow-ups. No ADR `Status:` line, spec
-status or index entry changes
+Revision: 16 (2026-11-20) — records the continuation-baseline review over the
+revision-15 draft head `d37c887`. It finds no new P1: the revision-14/15 Kernel
+guards are accepted as the fail-closed authority boundary for this stage. It
+confirms that PR #30–#36 are merged, so the SpawnSource declaration binding and
+the durable-block read/coherence fixes are no longer pending on this draft, and it
+adds one B5.2-E acceptance condition: with B5.4 disabled, a `SECURITY_V1` Task must
+not be cycled from `QUEUED` into an unexecutable `LEASED` state. The two P2
+constraints the review asks to keep (credential delivery is only necessary; B5.4
+subject identity) were already recorded in revisions 10 and 11 and are confirmed
+rather than reworded. No new P1, no freeze claim; B5.2-C/D/E remain separate
+follow-ups. No ADR `Status:` line, spec status or index entry changes
 Applies to: V0.2 / M6-B.5 B5.2 (PR #28 merge `ce96c87`, PR #29 merge `d3ab482`;
-closing fixes proposed in draft PR #37)
+PR #30–#36 merged; closing fixes proposed in draft PR #37)
 Date: 2026-11-18
 Canonical path: `docs/reports/v0.2/riir-m6b.5-b5.2-enforcement-qualification.md`
 Freeze state: **NOT FROZEN — no freeze gate has run**
@@ -50,6 +52,10 @@ Revision 15 records the semantic-completion review: the same `Claim` could still
 acknowledged with no Execution at all, publishing a Result and releasing the Batch.
 `ack_success` now rejects `SECURITY_V1` before any state change, and the ADR
 separates transactional re-proof from external physical evidence.
+Revision 16 records the continuation-baseline review: it finds no new P1, accepts
+the Kernel guards as the fail-closed boundary for this stage, confirms that PR
+#30–#36 are merged, and adds the B5.2-E liveness condition. It still accepts this
+draft only as a B5.2 continuation, never as a freeze.
 As with every earlier finding, this record counts no
 unmerged fix as closure and does not freeze B5.2. The current stage is
 *selected-candidate transactional qualification implemented; complete
@@ -84,6 +90,7 @@ positive-obligation requirement on the complete effective policy.
 | 13 | `458e86c` (reviewed head; code in this pull request) | Records the third review pass: the `SECURITY_V1` path intersected the frozen B.4 conjunct but that conjunct still carried the `COARSE_V1` exact-reference check on the Task's authored sandbox policy, so a legal independent Task fine policy was refused before the coverage proof. Splits `can_provision_task_source_config_reusable` (ownership/disposition/identity/lifecycle/continuity/envelope/evidence/Task join, no Task policy reference) from `can_provision_task_source_config` (+ the coarse Task reference claim); the security branch calls the reusable conjunct. Adds `b5_enforcement::the_task_policy_reference_is_coarse_only` and `b5_security_acquisition::a_task_fine_policy_without_an_exact_evidence_reference_is_still_selectable`; ADR-0014 §3 names the third replaced relation. No ADR `Status:` line, spec status or index entry changes. |
 | 14 | `35e817c` (reviewed head; code in this pull request) | Records the execution-boundary review: P1 — a `Claim` from `acquire_security_v1_task_existing` could still be presented to the frozen B.4 `create_execution_with_snapshot` path and then to `confirm_running_and_renew`, because qualification persists no `ExecutionSecuritySnapshot` or receipt. `requirement::task_is_security_v1` reads the durable mode; `create_execution_in_tx` and `confirm_running_and_renew` now reject `SECURITY_V1` before any Execution insert or `RUNNING` write. Adds `b5_security_acquisition::a_security_v1_claim_cannot_enter_the_b4_execution_or_running_path`, which starts from the acquired `Claim`, asserts zero `executions`/`binding_snapshots`, and proves a stale `STARTING` row is not promoted. ADR-0014 §3 states the Kernel boundary. No ADR `Status:` line, spec status or index entry changes. |
 | 15 | `2e6e5c9` (reviewed head; code in this pull request) | Records the semantic-completion review: P1 — a `SECURITY_V1` `Claim` could be acknowledged with `execution_id = None`, writing `SUCCEEDED`/`COMPLETED`, a Result and dependency release without any Execution, snapshot or receipt. `ack_success` now rejects `SECURITY_V1` before any state change; the B5.4 secured acknowledgement path must be defined explicitly. P2 — rewrites ADR-0014 §3 so the transaction re-proof covers durable truth and imported-fact consistency, not external physical truth, and records the four proof layers. Adds `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success`, which also proves a BLOCKED dependent is not released. Note: because a `SECURITY_V1` Task cannot currently reach an Execution, `ack_success` rejects it even when an `execution_id` is supplied, which is deliberate and conservative. No ADR `Status:` line, spec status or index entry changes. |
+| 16 | `d37c887` (reviewed head; docs-only) | Records the continuation-baseline review: no new P1; the Kernel execution/RUNNING/acknowledgement guards are accepted as the fail-closed authority boundary. Confirms PR #30–#36 merged, so items 1–4 and 8–10 of the follow-up list are landed rather than pending here. Adds the B5.2-E liveness acceptance condition (a `SECURITY_V1` Task must not cycle `QUEUED → LEASED → lease expiry` while B5.4 is disabled) to ADR-0014 §3 and to the follow-up list. Confirms, rather than rewords, the credential-necessity and B5.4 subject-identity constraints. Docs-only; no code, ADR `Status:` line, spec status or index entry change. |
 
 Revision 2 does not resolve any finding. Each one is recorded with the code it
 touches, the test that does not cover it, and the acceptance test that would
@@ -1428,6 +1435,67 @@ observation against an existing `STARTING` row; the revision-14 guard covers onl
 security snapshot as recovery-required, not as a valid secured execution. No code
 change is made here, because no `SECURITY_V1` Execution can be created.
 
+## Continuation-baseline audit (revision 16)
+
+The sixth review pass examines the revision-15 head `d37c887` and finds **no new
+P1** in the paths it re-checks. It accepts the three Kernel guards — Execution
+creation, `RUNNING`, acknowledgement — as a fail-closed authority boundary for
+this stage, and accepts the draft only as a B5.2 continuation.
+
+**Baseline correction.** PR #30–#36 are merged at the merge-base `535b278` of this
+branch. PR #35 bound each source declaration to its `SpawnSource` revision and
+completed the durable block's validated read; PR #36 recorded that pass. Items 1–4
+and 8–10 of the follow-up list below therefore describe landed work, not pending
+work in this draft. The revision-9 acquisition entry and the revision-14/15 Kernel
+guards remain the only unmerged parts of this chain.
+
+**What the review confirms.** The lockout is at the Kernel, not at the scheduler
+call site: a valid Claim is not authority for a later transition, and each
+transition names its own proof. `create_execution_in_tx`,
+`confirm_running_and_renew` and `ack_success` each reject `SECURITY_V1` before
+their writes, and `a_security_v1_claim_cannot_be_acknowledged_as_success` shows
+that no Result, dependency release or state change escapes the refusal. The
+review's split between "can this be a trusted base for continued B5.2 work" and
+"is B5.2 complete" matches the record: the first is conditionally accepted, the
+second is not.
+
+**Three hard boundaries stay.** They are P1 conditions for the follow-ups, not
+defects this draft can close:
+
+1. **B5.2-C — trusted importer.** A self-consistent profile digest cannot replace
+   provenance, physical-domain ownership and freshness. The acceptance cases must
+   prove that a caller cannot widen support, forge subject coverage, reuse stale
+   physical-domain evidence, or swap the physical key under one alias and still
+   produce trusted evidence.
+2. **B5.2-D — complete candidate identity.** `CandidateDomain::from_ids` still
+   counts only `LogicalAgentId`, so one agent with two SourceConfigs or two
+   physical bindings cannot be ranked correctly. The first commit and test must
+   freeze `(AgentType/LogicalAgent, source revision, config revision + digest,
+   physical binding)`, and no candidate may be selected from a partial set or a
+   silently narrowed budget.
+3. **B5.2-E — scheduler wiring and liveness.** Wiring must revalidate the whole
+   round before Attempt/Lease and keep `SECURED_QUALIFIED` non-executable. The
+   review adds a liveness condition: with B5.4 disabled, production acquisition
+   must not repeatedly move a `SECURITY_V1` Task from `QUEUED` to a `LEASED` state
+   that can only expire. The scheduler must either hold an explainable waiting
+   state or decline production acquisition; an unexecutable qualification must not
+   be presented as an ordinary runnable Claim. This is now recorded in ADR-0014 §3
+   and as follow-up item 21.
+
+**Two P2 constraints remain recorded, unchanged.** Credential delivery in the pure
+component is only a necessary condition: `with_source_config` may settle a request
+against a delivering profile, but authority-bearing acquisition still refuses every
+non-empty `credential_refs` until B5.3 supplies the broker proof (follow-up item 6
+and ADR-0014 §3). And `SecurityEvidenceSubject::digest()` still commits to the
+profile, not the chosen subject, so B5.4 must bind
+`ExecutionSecurityEvidence = (PlanIdentity, ProfileIdentity, SubjectIdentity)`
+into the snapshot and receipt (ADR-0014 §5). Both were already stated in revisions
+10 and 11; revision 16 confirms them rather than re-deriving them.
+
+**Verdict.** Conditional acceptance as a B5.2 continuation draft; no B5.2 freeze,
+no B5.4 claim, and no conversion of this draft's single-candidate success test into
+production orchestration.
+
 ## B5.1 handoff acceptance, re-checked
 
 | Acceptance condition | Revision 2 |
@@ -1558,14 +1626,14 @@ Revisions 10 and 11 add a fence check of their own, against `fb3641f..39e85c5`:
 | Coarse acquisition behavior | unchanged; the security chain remains disjoint and still refuses `COARSE_V1` |
 | Untracked files | not staged, not committed, not deleted |
 
-Revisions 12, 13, 14 and 15 add a fence check of their own, against
-`fb3641f..2e6e5c9` plus the revision-13, revision-14 and revision-15 code:
+Revisions 12–16 add a fence check of their own, against
+`fb3641f..d37c887` plus the revision-13, revision-14 and revision-15 code:
 
 | Fence | Result |
 |---|---|
 | `agentype-core`, `canonical.rs`, `CANONICAL_FORMAT_VERSION`, `SANDBOX_POLICY_SCHEMA_VERSION` / normalization / meet versions | unchanged |
 | ADR `Status:` lines, spec statuses, index entries | unchanged (ADR-0014 §3 body text only) |
-| Durable format / schema version | unchanged up to `2e6e5c9`; revision 13's split is a predicate/alias change and revisions 14–15 add kernel checks, so no schema or stored-format change |
+| Durable format / schema version | unchanged up to `d37c887`; revision 13's split is a predicate/alias change and revisions 14–15 add kernel checks, so no schema or stored-format change; revision 16 is docs-only |
 | Compile cache key list | unchanged; the physical-key component from revision 11 stays |
 | Coarse acquisition behavior | byte-for-byte the same relation: `can_provision_task_source_config` keeps the Task exact-reference claim and `b5_enforcement`'s coarse assertions still fail without it; the revision-14/15 guards read the Task mode and leave `COARSE_V1`/`LEGACY` Execution and acknowledgement paths unchanged |
 | Untracked files | not staged, not committed, not deleted |
@@ -1765,6 +1833,13 @@ the earlier boundary remains auditable.
     acknowledgement explicitly; it cannot be inferred from the Claim.
     `record_physical_outcome` on a `SECURITY_V1` `STARTING` history remains a
     B5.4 recovery-required case, not a success path.
+22. **(rev 16)** **A non-executable qualification must not look like a runnable
+    Claim.** This is not a defect in the current draft, which has no production
+    scheduler caller, but it is an acceptance condition for B5.2-E. With B5.4
+    disabled, production acquisition must not cycle a `SECURITY_V1` Task from
+    `QUEUED` to `LEASED` and then let the lease expire. It must either keep an
+    explainable waiting state or refuse production acquisition. Kernel refusal is
+    enough for authority safety; it is not enough for scheduler liveness.
 
 ## Verification
 
@@ -2007,6 +2082,11 @@ Revision-15 mutation check:
 |---|---|
 | `ack_success` mode check | `b5_security_acquisition::a_security_v1_claim_cannot_be_acknowledged_as_success` — the call returns `Ok(Some(ResultId(...)))`, proving the path would have published a Result and released the Batch |
 
+Revision 16 is docs-only (this record and ADR-0014 §3) and re-runs no code gate.
+The revision-15 gate above remains the last executed local code gate at `69ad80a`;
+CI on the docs head `d37c887` re-ran the full workspace and the two doctest targets
+and passed.
+
 The workspace suite includes the following new test modules, all green at
 revision 1:
 
@@ -2053,29 +2133,31 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 
 | Order | Work | Acceptance |
 |---|---|---|
-| 1 | Re-prove `RequiredAccess` on `P_eff` in `qualify_security_candidate` (P1-1) | tool, endpoint and file-operation negatives reject as `SecurityUnenforceable`; positive compiles. Proposed in PR #31, including the digest re-projection |
-| 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Proposed in PR #31 |
-| 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Proposed in PR #34 |
-| 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Proposed in PR #34, ADR list amended in PR #32 |
+| 1 | Re-prove `RequiredAccess` on `P_eff` in `qualify_security_candidate` (P1-1) | tool, endpoint and file-operation negatives reject as `SecurityUnenforceable`; positive compiles. Merged in PR #31, including the digest re-projection |
+| 2 | Replace probe 31 and correct its comment (P1-2) | contract-only fixture rejects; runtime+contract fixture records visibility. Merged in PR #31 |
+| 3 | Carry the attempt-isolation guarantee into the plan accessor and digest (P1-3) | Task-only, AgentType-only and neither matrix: plan accessor, obligations and digest agree; a direct compile with a false policy bit and a true guarantee returns isolation. Merged in PR #34 |
+| 4 | Carry the guarantee identity into the compile cache key and amend ADR-0014 §4 (P1-4) | the same matrix asserts equal effective policies and different cache keys; an empty guarantee digest is rejected; the compiler protocol records the semantic change. Merged in PR #34; ADR list merged in PR #32 |
 | 5 | Bind the profile to its adapter binding and execution subject (P2-1) | cross-binding and unproven-subject negatives. Implemented in revision 7 (`decb13a`) and corrected in revision 11 (`39e85c5`) to bind the resolved physical key; tests named in the claim table |
 | 6 | Separate credential authorization from delivery request (P2-2) | empty `credential_refs` adds no obligation, a requested credential under a non-delivering profile is `SecurityUnenforceable`, and a requested credential under a delivering profile **completes at the pure component only**. Implemented in revision 8 (`28d6592`); the authority path is further narrowed by revision 10 (P1-2) |
 | 7 | ~~Decide durable-block history semantics (P2-3)~~ **decided in revision 3: narrow ADR-0014 §4** | the stored released condition is never reopened; `A → release A → B → A` is specified to start a new diagnostic, not to retry the released one |
-| 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Proposed in PR #34 |
-| 9 | Bind each source declaration to its source revision (A) | the constructor and the writer both reject a declaration from another revision, and the validated read still fills the ref from `(source id, revision)`. Proposed in PR #35 |
-| 10 | Complete the durable block's validated read and count coherence (B) | a tampered generation, a candidate cost smaller than the domain, and a corrupt same-condition row each fail closed on read or re-record. Proposed in PR #35 |
+| 8 | Re-prove the durable block's over-budget truth at construction and at the write boundary (P2-5) | a non-exhausted or limit-mismatched row is rejected; a raw-SQL corruption fails the validated read. Merged in PR #34 |
+| 9 | Bind each source declaration to its source revision (A) | the constructor and the writer both reject a declaration from another revision, and the validated read still fills the ref from `(source id, revision)`. Merged in PR #35 |
+| 10 | Complete the durable block's validated read and count coherence (B) | a tampered generation, a candidate cost smaller than the domain, and a corrupt same-condition row each fail closed on read or re-record. Merged in PR #35 |
 | 11 | Intersect the frozen B.4 source/config eligibility on the `SECURITY_V1` path (P1-1, rev 10) | disabled config, foreign evidence digest, missing functional capability, and unsatisfiable continuity/lifecycle each reject with no Attempt/Lease; the coarse path is unchanged. Implemented in revision 10 (`0a0ed56`) |
 | 12 | Keep credential-bearing acquisition fail-closed until B5.3 (P1-2, rev 10) | a delivering profile plus non-empty `credential_refs` is `InvalidAuthority` before Attempt/Lease; the pure-component delivery check and its positive test remain. Implemented in revision 10 (`0a0ed56`) |
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
 | 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. Not implemented |
 | 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. Not implemented |
-| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated. Not implemented |
+| 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. Not implemented |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
 | 19 | Keep a qualified `SECURITY_V1` `Claim` out of the frozen B.4 Execution and `RUNNING` paths (rev 14) | starting from the acquired `Claim`, `create_execution_with_snapshot` fails before any `executions`/`binding_snapshots` row; a stale `STARTING` row is not promoted to `RUNNING`; the Task stays `Leased`. Implemented in revision 14 (this pull request); removed only by the B5.4 snapshot/secured start |
 | 20 | Keep a qualified `SECURITY_V1` `Claim` out of the semantic completion path (rev 15) | starting from the acquired `Claim`, `ack_success` with no `execution_id` fails; Task/Attempt/Lease keep their state, no Result is inserted and a blocked dependent is not released. Implemented in revision 15 (this pull request); replaced only by an explicit B5.4 secured acknowledgement path |
+| 21 | Keep a non-executable `SECURITY_V1` qualification from cycling as an ordinary lease (B5.2-E liveness, rev 16) | with B5.4 disabled, production acquisition either holds an explainable waiting state or refuses acquisition; a `SECURITY_V1` Task is not moved `QUEUED → LEASED` only to expire, and the qualification is not presented as a runnable Claim. Not implemented; required by B5.2-E |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
-Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record.
+Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record
+and have since merged in PR #30–#36; they are not pending on this draft.
 Item 7 was a design decision and is settled in revision 3 by narrowing the ADR
 rather than by adding history; item 4 also needs its normative sentence in the
 ADR, which is why that part sits in the ADR pull request. Items 11 and 12 are
@@ -2087,7 +2169,8 @@ the follow-ups without adding code. Item 18 is the revision-13 fix for the
 coarse Task exact-reference leak in the reusable conjunct; item 19 is the
 revision-14 Kernel boundary that keeps a qualified `SECURITY_V1` `Claim` out of
 the B.4 Execution and `RUNNING` paths; item 20 is the revision-15 boundary that
-keeps it out of semantic completion.
+keeps it out of semantic completion; item 21 is the revision-16 liveness condition
+for B5.2-E.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull
@@ -2101,7 +2184,10 @@ execution entries at the Kernel boundary; it still grants no B5.4 snapshot,
 receipt or secured start, and complete `SECURITY_V1` orchestration remains open.
 Revision 15 closes the semantic-completion face of the same gap (`ack_success`)
 and restricts the ADR's transactional claim to durable and imported-fact
-consistency; it likewise grants no B5.4 authority.
+consistency; it likewise grants no B5.4 authority. Revision 16 records the
+continuation-baseline review, which finds no new P1, confirms the merged
+PR #30–#36 baseline, and adds the B5.2-E liveness condition; it accepts this
+draft only as a B5.2 continuation.
 
 ## Evidence index
 

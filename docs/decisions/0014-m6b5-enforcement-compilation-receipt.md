@@ -211,6 +211,14 @@ how recovery treats a `SECURITY_V1` `STARTING` Execution observed through
 `record_physical_outcome`: an observation is not a secured execution, so such a
 history is recovery-required rather than a successful acknowledgement.
 
+Scheduler liveness is a B5.2-E acceptance condition, not a B5.4 refinement. With
+B5.4 disabled, production acquisition MUST NOT repeatedly move a `SECURITY_V1`
+Task from `QUEUED` into a `LEASED` state that can only expire: an unexecutable
+qualification is not a runnable Claim. The scheduler either holds an explainable
+waiting state or declines production acquisition until the secured start exists.
+Kernel refusal protects authority; it does not by itself keep the scheduler
+live.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
