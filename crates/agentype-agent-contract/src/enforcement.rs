@@ -50,6 +50,16 @@ use std::collections::BTreeSet;
 /// that commits to it (the evidence subject, the compile cache key, the plan,
 /// and the durable binding/profile key) are different identities.
 pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 3;
+/// Version tag of the canonical trusted-importer attestation document.
+pub const ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+/// The attestation protocol this build accepts.
+///
+/// An attestation is a separate imported fact from the profile it names: the
+/// profile digest proves only internal consistency, while the attestation says
+/// which trusted importer observed that exact physical domain and when the
+/// observation is valid. A row written under another protocol cannot be
+/// interpreted under these rules and is rejected rather than reinterpreted.
+pub const ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL: &str = "agentype-enforcement-profile-attest/1";
 /// Version tag of the compiled plan document.
 pub const ENFORCEMENT_PLAN_SCHEMA_VERSION: u32 = 2;
 /// Version tag of the canonical execution-guarantee document that the compile
@@ -568,6 +578,258 @@ fn profile_digest(
         "adapter_binding_key": adapter_binding_key,
         "supported": support.features().iter().map(|f| f.as_str()).collect::<Vec<_>>(),
         "subjects": covered_subjects.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    }))
+}
+
+/// A trusted-importer attestation for one exact imported profile.
+///
+/// A profile digest proves only that the document is internally consistent: the
+/// same caller that supplies the support matrix, covered subjects and physical
+/// binding key also computes the digest. This record is the missing external
+/// fact. The provisioning producer writes it once, keyed by the exact profile
+/// digest, and binds it to the importer identity, the attestation protocol, the
+/// exact physical domain and a validity window. Acquisition reads it
+/// transactionally and rejects a profile with no matching fresh row, so a caller
+/// cannot widen support, forge subject coverage, replay stale physical-domain
+/// evidence, or move the physical key under a stable alias and still be
+/// accepted.
+///
+/// The constructor is gated with the profile importer because it is the
+/// producer's write path. [`Self::from_parts`] is the durable read path: it
+/// recomputes the digest from the stored parts rather than trusting the stored
+/// value, so a tampered row fails closed. Constructing an attestation is not
+/// authority by itself; only the durable row that acquisition re-reads is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnforcementProfileAttestation {
+    profile_digest: String,
+    importer_id: String,
+    importer_protocol: String,
+    adapter_kind: String,
+    adapter_binding_key: String,
+    issued_at: UnixTime,
+    valid_until: UnixTime,
+    attestation_digest: String,
+}
+
+impl EnforcementProfileAttestation {
+    /// Attest one imported profile. Only the internal provisioning producer
+    /// may write this fact.
+    #[cfg(any(test, feature = "provisioning-producer"))]
+    pub fn new(
+        profile: &ImportedEnforcementProfile,
+        importer_id: impl Into<String>,
+        importer_protocol: impl Into<String>,
+        issued_at: UnixTime,
+        valid_until: UnixTime,
+    ) -> Result<Self, ContractError> {
+        Self::validated_parts(
+            profile.profile_digest().to_string(),
+            importer_id.into(),
+            importer_protocol.into(),
+            profile.adapter_kind().to_string(),
+            profile.adapter_binding_key().to_string(),
+            issued_at,
+            valid_until,
+        )
+    }
+
+    /// Reconstruct an attestation from its durable parts and verify that the
+    /// stored digest describes them. This is the read path; it never trusts a
+    /// stored digest on its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        profile_digest: impl Into<String>,
+        importer_id: impl Into<String>,
+        importer_protocol: impl Into<String>,
+        adapter_kind: impl Into<String>,
+        adapter_binding_key: impl Into<String>,
+        issued_at: UnixTime,
+        valid_until: UnixTime,
+        expected_digest: &str,
+    ) -> Result<Self, ContractError> {
+        let attestation = Self::validated_parts(
+            profile_digest.into(),
+            importer_id.into(),
+            importer_protocol.into(),
+            adapter_kind.into(),
+            adapter_binding_key.into(),
+            issued_at,
+            valid_until,
+        )?;
+        if attestation.attestation_digest() != expected_digest {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason: "trusted-importer attestation digest does not describe its parts".into(),
+            });
+        }
+        Ok(attestation)
+    }
+
+    fn validated_parts(
+        profile_digest: String,
+        importer_id: String,
+        importer_protocol: String,
+        adapter_kind: String,
+        adapter_binding_key: String,
+        issued_at: UnixTime,
+        valid_until: UnixTime,
+    ) -> Result<Self, ContractError> {
+        if profile_digest.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "a trusted-importer attestation must name its imported profile".into(),
+            });
+        }
+        if importer_id.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "a trusted-importer attestation must name its importer".into(),
+            });
+        }
+        if importer_protocol != ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason: "the trusted-importer attestation names an unsupported protocol".into(),
+            });
+        }
+        if adapter_kind.trim().is_empty() || adapter_binding_key.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason:
+                    "a trusted-importer attestation must name the exact physical adapter domain"
+                        .into(),
+            });
+        }
+        if !issued_at.is_finite() || issued_at < 0.0 {
+            return Err(ContractError::InvalidNumber {
+                field: "trusted-importer attestation issued_at".into(),
+            });
+        }
+        if !valid_until.is_finite() || valid_until <= issued_at {
+            return Err(ContractError::InvalidNumber {
+                field: "trusted-importer attestation valid_until".into(),
+            });
+        }
+        let attestation_digest = attestation_digest(
+            &profile_digest,
+            &importer_id,
+            &importer_protocol,
+            &adapter_kind,
+            &adapter_binding_key,
+            issued_at,
+            valid_until,
+        );
+        Ok(Self {
+            profile_digest,
+            importer_id,
+            importer_protocol,
+            adapter_kind,
+            adapter_binding_key,
+            issued_at,
+            valid_until,
+            attestation_digest,
+        })
+    }
+
+    /// The exact imported profile digest this attestation covers.
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+
+    /// The trusted importer that observed this physical domain.
+    pub fn importer_id(&self) -> &str {
+        &self.importer_id
+    }
+
+    pub fn importer_protocol(&self) -> &str {
+        &self.importer_protocol
+    }
+
+    /// The exact adapter kind the profile was imported for.
+    pub fn adapter_kind(&self) -> &str {
+        &self.adapter_kind
+    }
+
+    /// The exact resolved physical adapter binding key the profile was imported
+    /// for. This is never the B.4 `binding_ref` alias.
+    pub fn adapter_binding_key(&self) -> &str {
+        &self.adapter_binding_key
+    }
+
+    pub fn issued_at(&self) -> UnixTime {
+        self.issued_at
+    }
+
+    pub fn valid_until(&self) -> UnixTime {
+        self.valid_until
+    }
+
+    pub fn attestation_digest(&self) -> &str {
+        &self.attestation_digest
+    }
+
+    /// Whether the observation is valid at `now`. The interval is half-open:
+    /// `issued_at <= now < valid_until`.
+    pub fn is_fresh(&self, now: UnixTime) -> bool {
+        now.is_finite() && now >= self.issued_at && now < self.valid_until
+    }
+
+    /// Whether this attestation covers exactly `profile` and its physical
+    /// domain. The digest already commits to the support matrix and subjects,
+    /// so an internally consistent but wider profile cannot match.
+    pub fn validate_for_profile(
+        &self,
+        profile: &ImportedEnforcementProfile,
+    ) -> Result<(), ContractError> {
+        if self.profile_digest != profile.profile_digest() {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason: "the trusted-importer attestation names a different imported profile"
+                    .into(),
+            });
+        }
+        if self.adapter_kind != profile.adapter_kind()
+            || self.adapter_binding_key != profile.adapter_binding_key()
+        {
+            return Err(ContractError::EvidenceSubjectMismatch {
+                reason:
+                    "the trusted-importer attestation names a different physical adapter domain"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The acquisition check: exact profile, exact physical domain, and a
+    /// currently valid observation.
+    pub fn validate_at(
+        &self,
+        profile: &ImportedEnforcementProfile,
+        now: UnixTime,
+    ) -> Result<(), ContractError> {
+        self.validate_for_profile(profile)?;
+        if !self.is_fresh(now) {
+            return Err(ContractError::SecurityUnenforceable {
+                reason: "the trusted-importer attestation is not fresh at acquisition time".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn attestation_digest(
+    profile_digest: &str,
+    importer_id: &str,
+    importer_protocol: &str,
+    adapter_kind: &str,
+    adapter_binding_key: &str,
+    issued_at: UnixTime,
+    valid_until: UnixTime,
+) -> String {
+    canonical_json_body_digest(&json!({
+        "kind": "ENFORCEMENT_PROFILE_ATTESTATION",
+        "schema": ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION,
+        "protocol": importer_protocol,
+        "importer_id": importer_id,
+        "profile_digest": profile_digest,
+        "adapter_kind": adapter_kind,
+        "adapter_binding_key": adapter_binding_key,
+        "issued_at": issued_at,
+        "valid_until": valid_until,
     }))
 }
 

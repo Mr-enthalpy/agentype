@@ -24,10 +24,13 @@
 /// a `SECURITY_V1` Task. Version 10 adds the M6-B.5 B5.2
 /// `security_acquisition_blocks` diagnostic: one durable, operator-actionable
 /// row per Task whose complete `SECURITY_V1` candidate round cannot fit the
-/// fixed acquisition budget. Older files are rejected at open (fail closed);
-/// D-DB-MIGRATE is still unresolved, so there is deliberately no in-place
-/// upgrade.
-pub const SCHEMA_VERSION: i64 = 10;
+/// fixed acquisition budget. Version 11 adds the M6-B.5 B5.2 durable
+/// `enforcement_profile_attestations` rows: immutable trusted-importer evidence
+/// keyed by the exact imported profile digest and physical adapter domain, with
+/// a validity window that acquisition re-checks. Older files are rejected at
+/// open (fail closed); D-DB-MIGRATE is still unresolved, so there is
+/// deliberately no in-place upgrade.
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1356,5 +1359,65 @@ WHEN OLD.status='RELEASED' AND NEW.status='RELEASED'
           OR NEW.release_reason IS NOT OLD.release_reason)
 BEGIN
     SELECT RAISE(ABORT, 'a security acquisition release is final');
+END;
+
+-- ============================================================================
+-- M6-B.5 B5.2 trusted-importer attestations (schema v11)
+--
+-- A profile digest proves only that an imported profile document is internally
+-- consistent. These rows are the separate external fact: which trusted importer
+-- observed that exact physical domain and until when the observation is valid.
+-- One immutable row per attestation, indexed by the exact profile digest it
+-- covers. Acquisition reads the freshest row valid at its clock and rejects a
+-- profile with none. A new window is a new immutable row; nothing is edited or
+-- deleted.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS enforcement_profile_attestations (
+    attestation_digest TEXT PRIMARY KEY
+        CHECK (length(trim(attestation_digest)) > 0),
+    profile_digest TEXT NOT NULL
+        CHECK (length(trim(profile_digest)) > 0),
+    importer_id TEXT NOT NULL CHECK (length(trim(importer_id)) > 0),
+    importer_protocol TEXT NOT NULL
+        CHECK (length(trim(importer_protocol)) > 0),
+    adapter_kind TEXT NOT NULL CHECK (length(trim(adapter_kind)) > 0),
+    adapter_binding_key TEXT NOT NULL
+        CHECK (length(trim(adapter_binding_key)) > 0),
+    issued_at REAL NOT NULL CHECK (issued_at >= 0),
+    valid_until REAL NOT NULL CHECK (valid_until > issued_at),
+    recorded_at REAL NOT NULL CHECK (recorded_at >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS enforcement_profile_attestations_by_profile
+    ON enforcement_profile_attestations(profile_digest, issued_at DESC);
+
+-- One profile digest cannot move its physical domain between attestations. The
+-- profile digest already commits to the adapter identity, so a mismatch would
+-- only ever be a corrupt or forged row; fail it at the write boundary too.
+CREATE TRIGGER IF NOT EXISTS enforcement_profile_attestations_domain_is_stable
+BEFORE INSERT ON enforcement_profile_attestations
+WHEN EXISTS (
+    SELECT 1 FROM enforcement_profile_attestations
+    WHERE profile_digest=NEW.profile_digest
+      AND (adapter_kind IS NOT NEW.adapter_kind
+           OR adapter_binding_key IS NOT NEW.adapter_binding_key)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'one imported profile digest cannot move its physical domain');
+END;
+
+-- An attestation is an imported observation, not a mutable overlay. A refresh
+-- is a new row with its own identity and window.
+CREATE TRIGGER IF NOT EXISTS enforcement_profile_attestations_immutable_update
+BEFORE UPDATE ON enforcement_profile_attestations
+BEGIN
+    SELECT RAISE(ABORT, 'a trusted-importer attestation is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS enforcement_profile_attestations_immutable_delete
+BEFORE DELETE ON enforcement_profile_attestations
+BEGIN
+    SELECT RAISE(ABORT, 'a trusted-importer attestation is durable; record a new one');
 END;
 "#;

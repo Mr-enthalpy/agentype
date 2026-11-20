@@ -28,6 +28,7 @@ pub mod catalog;
 pub mod frontier;
 mod kernel;
 mod preparation;
+pub mod profile_attestation;
 pub mod provisioning;
 pub mod requirement;
 mod schema;

@@ -2188,3 +2188,208 @@ fn a_durable_block_rejects_an_invalid_timestamp() {
     .unwrap_err();
     assert!(matches!(error, ContractError::InvariantViolation(_)));
 }
+
+const ATT_IMPORTER: &str = "test-importer";
+const ATT_ISSUED: f64 = 1_000.0;
+const ATT_UNTIL: f64 = 2_000.0;
+
+fn attestation(profile: &ImportedEnforcementProfile) -> EnforcementProfileAttestation {
+    EnforcementProfileAttestation::new(
+        profile,
+        ATT_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATT_ISSUED,
+        ATT_UNTIL,
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_attestation_digest_is_stable_and_recomputable() {
+    let profile = full_support_profile();
+    let first = attestation(&profile);
+    let second = attestation(&profile);
+    assert_eq!(first.attestation_digest(), second.attestation_digest());
+    assert_eq!(first.profile_digest(), profile.profile_digest());
+    assert_eq!(first.adapter_kind(), ADAPTER_KIND);
+    assert_eq!(first.adapter_binding_key(), ADAPTER_BINDING);
+
+    let rebuilt = EnforcementProfileAttestation::from_parts(
+        first.profile_digest(),
+        first.importer_id(),
+        first.importer_protocol(),
+        first.adapter_kind(),
+        first.adapter_binding_key(),
+        first.issued_at(),
+        first.valid_until(),
+        first.attestation_digest(),
+    )
+    .unwrap();
+    assert_eq!(rebuilt, first);
+
+    let error = EnforcementProfileAttestation::from_parts(
+        first.profile_digest(),
+        first.importer_id(),
+        first.importer_protocol(),
+        first.adapter_kind(),
+        first.adapter_binding_key(),
+        first.issued_at(),
+        first.valid_until(),
+        "sha256:not-the-digest",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+}
+
+#[test]
+fn an_attestation_rejects_blank_identities_and_a_foreign_protocol() {
+    let profile = full_support_profile();
+    for importer in ["", "   "] {
+        let error = EnforcementProfileAttestation::new(
+            &profile,
+            importer,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ATT_ISSUED,
+            ATT_UNTIL,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ContractError::InvalidRef { .. }));
+    }
+    let error = EnforcementProfileAttestation::new(
+        &profile,
+        ATT_IMPORTER,
+        "agentype-enforcement-profile-attest/0",
+        ATT_ISSUED,
+        ATT_UNTIL,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    for (profile_digest, kind, key) in [
+        ("", ADAPTER_KIND, ADAPTER_BINDING),
+        ("sha256:profile", "", ADAPTER_BINDING),
+        ("sha256:profile", ADAPTER_KIND, " "),
+    ] {
+        let error = EnforcementProfileAttestation::from_parts(
+            profile_digest,
+            ATT_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            kind,
+            key,
+            ATT_ISSUED,
+            ATT_UNTIL,
+            "sha256:attestation",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ContractError::InvalidRef { .. }));
+    }
+}
+
+#[test]
+fn an_attestation_rejects_a_non_finite_or_empty_window() {
+    let profile = full_support_profile();
+    for (issued, until) in [
+        (f64::NAN, ATT_UNTIL),
+        (f64::INFINITY, ATT_UNTIL),
+        (-1.0, ATT_UNTIL),
+        (ATT_ISSUED, f64::NAN),
+        (ATT_ISSUED, f64::INFINITY),
+        (ATT_ISSUED, ATT_ISSUED),
+        (ATT_ISSUED, ATT_ISSUED - 1.0),
+    ] {
+        let error = EnforcementProfileAttestation::new(
+            &profile,
+            ATT_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            issued,
+            until,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ContractError::InvalidNumber { .. }));
+    }
+}
+
+#[test]
+fn an_attestation_binds_the_exact_profile_and_physical_domain() {
+    let profile = full_support_profile();
+    let attestation = attestation(&profile);
+    attestation.validate_for_profile(&profile).unwrap();
+
+    // A wider or narrower support matrix is a different profile digest even
+    // under the same reference and physical domain.
+    let narrower = ImportedEnforcementProfile::import(
+        EnforcementProfileRef::new("test-enforcement", "test-full-support", 1).unwrap(),
+        1,
+        ADAPTER_KIND,
+        ADAPTER_BINDING,
+        EnforcementSupport::new([EnforcementFeature::WorkspaceWriteConfinement]),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    let error = attestation.validate_for_profile(&narrower).unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    // Forged subject coverage is the same identity break.
+    let wider_subjects = full_support_profile_for([
+        EnforcementSubject::ControlledPrimaryProcess,
+        EnforcementSubject::OsRestrictedDescendant,
+    ]);
+    let error = attestation
+        .validate_for_profile(&wider_subjects)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+
+    // Moving the physical key under the same alias is also a different domain.
+    let moved = ImportedEnforcementProfile::import(
+        EnforcementProfileRef::new("test-enforcement", "test-full-support", 1).unwrap(),
+        1,
+        ADAPTER_KIND,
+        "other-adapter/binding",
+        EnforcementSupport::new([
+            EnforcementFeature::WorkspaceWriteConfinement,
+            EnforcementFeature::FileReadConfinement,
+            EnforcementFeature::FileExecuteConfinement,
+            EnforcementFeature::FileVisibilityConfinement,
+            EnforcementFeature::ToolCommandAllowlist,
+            EnforcementFeature::NetworkEgressRestriction,
+            EnforcementFeature::EnvironmentAllowlist,
+            EnforcementFeature::ResourceLimit,
+            EnforcementFeature::AttemptIsolation,
+            EnforcementFeature::CredentialDelivery,
+        ]),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    )
+    .unwrap();
+    let error = attestation.validate_for_profile(&moved).unwrap_err();
+    assert!(matches!(
+        error,
+        ContractError::EvidenceSubjectMismatch { .. }
+    ));
+}
+
+#[test]
+fn an_attestation_is_fresh_only_inside_its_half_open_window() {
+    let profile = full_support_profile();
+    let attestation = attestation(&profile);
+    assert!(attestation.is_fresh(ATT_ISSUED));
+    assert!(attestation.is_fresh(ATT_UNTIL - 1.0));
+    assert!(!attestation.is_fresh(ATT_ISSUED - 1.0));
+    assert!(!attestation.is_fresh(ATT_UNTIL));
+    assert!(!attestation.is_fresh(f64::NAN));
+
+    attestation.validate_at(&profile, ATT_ISSUED).unwrap();
+    let error = attestation.validate_at(&profile, ATT_UNTIL).unwrap_err();
+    assert!(matches!(error, ContractError::SecurityUnenforceable { .. }));
+}

@@ -23,7 +23,9 @@ use agentype_execution_config::{
     ExecutionResolutionMode, ExecutionTargetConfig, FrozenPhysicalExecutionBinding,
     NetworkEnforcement,
 };
-use agentype_storage_sqlite::{Kernel, ResolvedProvisioningSelection, SourceConfigBody};
+use agentype_storage_sqlite::{
+    Kernel, ResolvedProvisioningSelection, SourceConfigBody, SCHEMA_VERSION,
+};
 use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1887,7 +1889,7 @@ fn current_schema_reopen_reinstalls_additive_preparation_fault_guards() {
         raw.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        10
+        SCHEMA_VERSION
     );
     let guards: i64 = raw
         .query_row(
