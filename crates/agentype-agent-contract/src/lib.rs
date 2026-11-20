@@ -75,11 +75,12 @@ pub use enforcement::{
     EnforcementFeature, EnforcementProfileAttestation, EnforcementSubject, EnforcementSupport,
     ImportedEnforcementProfile, PolicyEnforcementPlan, ProvenExecutionSecurity,
     RequiredEnforcementFeatures, SecurityAcquisitionBlock, SecurityAcquisitionBlockStatus,
-    SecurityAcquisitionRelease, SecurityEvidenceSubject, ValidatedSourceBinding,
-    ENFORCEMENT_COMPILER_PROTOCOL, ENFORCEMENT_GUARANTEES_SCHEMA_VERSION,
-    ENFORCEMENT_PLAN_SCHEMA_VERSION, ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
-    ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION, ENFORCEMENT_PROFILE_SCHEMA_VERSION,
-    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
+    SecurityAcquisitionRelease, SecurityCandidateIdentity, SecurityCandidateOwner,
+    SecurityEvidenceSubject, ValidatedSourceBinding, ENFORCEMENT_COMPILER_PROTOCOL,
+    ENFORCEMENT_GUARANTEES_SCHEMA_VERSION, ENFORCEMENT_PLAN_SCHEMA_VERSION,
+    ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL, ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION,
+    ENFORCEMENT_PROFILE_SCHEMA_VERSION, POLICY_ONLY_REFERENCE_PROFILE,
+    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
 };
 pub use error::ContractError;
 pub use evidence::ResolvedProvisioningEvidence;

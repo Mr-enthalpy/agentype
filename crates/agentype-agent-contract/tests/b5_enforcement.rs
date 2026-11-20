@@ -1818,20 +1818,146 @@ fn the_budget_has_no_partial_success_path() {
 }
 
 #[test]
-fn the_candidate_domain_digest_is_a_stable_identity_set() {
-    let a = LogicalAgentId::from_string("agent-a");
-    let b = LogicalAgentId::from_string("agent-b");
+fn the_candidate_domain_digest_is_a_stable_full_identity_set() {
+    let agent_a = LogicalAgentId::from_string("agent-a");
+    let agent_b = LogicalAgentId::from_string("agent-b");
 
-    let forward = CandidateDomain::from_ids([a.clone(), b.clone()]);
-    let reverse = CandidateDomain::from_ids([b.clone(), a.clone()]);
+    let identity = |agent: &LogicalAgentId,
+                    source_revision: u64,
+                    config_id: &str,
+                    config_revision: u64,
+                    config_digest: &str,
+                    binding_key: &str| {
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::ExistingAgent(agent.clone()),
+            SourceConfigRef::new(
+                SpawnSourceRef::new("source-a", source_revision).unwrap(),
+                config_id,
+                config_revision,
+            )
+            .unwrap(),
+            ConfigDigest::new(config_digest).unwrap(),
+            "local-process",
+            binding_key,
+        )
+        .unwrap()
+    };
+
+    let a = identity(&agent_a, 1, "config-a", 1, "sha256:config-a", "key-1");
+    let b = identity(&agent_b, 1, "config-b", 1, "sha256:config-b", "key-1");
+
+    let forward = CandidateDomain::from_identities([a.clone(), b.clone()]);
+    let reverse = CandidateDomain::from_identities([b.clone(), a.clone()]);
     assert_eq!(forward.digest(), reverse.digest());
     assert_eq!(forward.candidate_count(), 2);
 
     // Duplicates are one identity, and a different set is a different domain.
-    let deduped = CandidateDomain::from_ids([a.clone(), b.clone(), a.clone()]);
+    let deduped = CandidateDomain::from_identities([a.clone(), b.clone(), a.clone()]);
     assert_eq!(deduped.digest(), forward.digest());
-    assert_ne!(CandidateDomain::from_ids([a]).digest(), forward.digest());
-    assert_eq!(CandidateDomain::from_ids([]).candidate_count(), 0);
+    assert_ne!(
+        CandidateDomain::from_identities([a.clone()]).digest(),
+        forward.digest()
+    );
+    assert_eq!(CandidateDomain::from_identities([]).candidate_count(), 0);
+
+    // One agent with two exact configs is two candidates, not one. This is the
+    // defect the agent-only constructor had.
+    let same_agent_second_config =
+        identity(&agent_a, 1, "config-a2", 1, "sha256:config-a2", "key-1");
+    let two_configs = CandidateDomain::from_identities([a.clone(), same_agent_second_config]);
+    assert_eq!(two_configs.candidate_count(), 2);
+    assert_ne!(
+        two_configs.digest(),
+        CandidateDomain::from_identities([a.clone()]).digest()
+    );
+
+    // The same config over a different physical binding is also a different
+    // candidate: the alias is never the identity.
+    let same_config_other_binding =
+        identity(&agent_a, 1, "config-a", 1, "sha256:config-a", "key-2");
+    let two_bindings = CandidateDomain::from_identities([a.clone(), same_config_other_binding]);
+    assert_eq!(two_bindings.candidate_count(), 2);
+    assert_ne!(two_bindings.digest(), two_configs.digest());
+
+    // Every component participates in the identity digest.
+    let baseline = a.digest();
+    let variants = [
+        identity(&agent_b, 1, "config-a", 1, "sha256:config-a", "key-1"),
+        identity(&agent_a, 2, "config-a", 1, "sha256:config-a", "key-1"),
+        identity(&agent_a, 1, "config-a", 2, "sha256:config-a", "key-1"),
+        identity(&agent_a, 1, "config-a", 1, "sha256:config-changed", "key-1"),
+        identity(&agent_a, 1, "config-a", 1, "sha256:config-a", "key-3"),
+    ];
+    for variant in variants {
+        assert_ne!(variant.digest(), baseline);
+    }
+
+    // A new-agent owner names the pinned type revision, so two revisions of one
+    // type are distinct candidates.
+    let typed = |revision: u64| {
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::NewAgentType(type_ref("type-a", revision)),
+            SourceConfigRef::new(SpawnSourceRef::new("source-a", 1).unwrap(), "config-a", 1)
+                .unwrap(),
+            ConfigDigest::new("sha256:config-a").unwrap(),
+            "local-process",
+            "key-1",
+        )
+        .unwrap()
+    };
+    assert_ne!(typed(1).digest(), typed(2).digest());
+
+    // An unborn/blank physical binding is never an identity.
+    assert!(matches!(
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::ExistingAgent(agent_a),
+            SourceConfigRef::new(SpawnSourceRef::new("source-a", 1).unwrap(), "config-a", 1,)
+                .unwrap(),
+            ConfigDigest::new("sha256:config-a").unwrap(),
+            "local-process",
+            "  ",
+        )
+        .unwrap_err(),
+        ContractError::InvalidRef { .. }
+    ));
+}
+
+#[test]
+fn the_whole_round_budget_is_measured_in_full_candidate_identities() {
+    let agent = LogicalAgentId::from_string("agent-a");
+    let identity = |config_id: &str, binding_key: &str| {
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::ExistingAgent(agent.clone()),
+            SourceConfigRef::new(SpawnSourceRef::new("source-a", 1).unwrap(), config_id, 1)
+                .unwrap(),
+            ConfigDigest::new(format!("sha256:{config_id}")).unwrap(),
+            "local-process",
+            binding_key,
+        )
+        .unwrap()
+    };
+
+    // One agent, two configs and two bindings: a complete round of four.
+    let domain = CandidateDomain::from_identities([
+        identity("config-a", "key-1"),
+        identity("config-a", "key-2"),
+        identity("config-b", "key-1"),
+        identity("config-b", "key-2"),
+    ]);
+    assert_eq!(domain.candidate_count(), 4);
+    assert_eq!(domain.acquisition_cost(), AcquisitionCost::new(4, 4));
+
+    let exact = AcquisitionBudget::new(4, 4).unwrap();
+    assert!(exact.require_whole_round(domain.acquisition_cost()).is_ok());
+
+    // One short on either bound defers the whole round. There is no way to
+    // spend that budget on a narrower subset and still select a winner.
+    let narrow = AcquisitionBudget::new(3, 4).unwrap();
+    let exhaustion = narrow
+        .require_whole_round(domain.acquisition_cost())
+        .unwrap_err();
+    assert_eq!(exhaustion.limit(), BudgetLimit::CandidateCount);
+    assert_eq!(exhaustion.cost(), domain.acquisition_cost());
 }
 
 #[test]
@@ -1840,9 +1966,20 @@ fn a_block_is_released_only_by_operator_action_or_configuration_change() {
     let exhaustion = budget
         .require_whole_round(AcquisitionCost::new(2, 2))
         .unwrap_err();
-    let domain = CandidateDomain::from_ids([
-        LogicalAgentId::from_string("agent-a"),
-        LogicalAgentId::from_string("agent-b"),
+    let identity = |agent: &str, config_id: &str, binding_key: &str| {
+        SecurityCandidateIdentity::new(
+            SecurityCandidateOwner::ExistingAgent(LogicalAgentId::from_string(agent)),
+            SourceConfigRef::new(SpawnSourceRef::new("source-a", 1).unwrap(), config_id, 1)
+                .unwrap(),
+            ConfigDigest::new(format!("sha256:{config_id}")).unwrap(),
+            "local-process",
+            binding_key,
+        )
+        .unwrap()
+    };
+    let domain = CandidateDomain::from_identities([
+        identity("agent-a", "config-a", "key-1"),
+        identity("agent-b", "config-b", "key-1"),
     ]);
     let binding_profile = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1866,8 +2003,18 @@ fn a_block_is_released_only_by_operator_action_or_configuration_change() {
     // The same indistinguishable condition is one diagnostic; a different
     // candidate domain is a new condition, not a retry of the old one.
     assert!(block.same_condition(&domain, binding_profile));
-    let other = CandidateDomain::from_ids([LogicalAgentId::from_string("agent-a")]);
-    assert!(!block.same_condition(&other, binding_profile));
+    // Same agent set and same count, but one exact config/binding changed: this
+    // is a new condition, not a retry of the stored one.
+    let binding_changed = CandidateDomain::from_identities([
+        identity("agent-a", "config-a", "key-2"),
+        identity("agent-b", "config-b", "key-1"),
+    ]);
+    assert!(!block.same_condition(&binding_changed, binding_profile));
+    let config_changed = CandidateDomain::from_identities([
+        identity("agent-a", "config-a2", "key-1"),
+        identity("agent-b", "config-b", "key-1"),
+    ]);
+    assert!(!block.same_condition(&config_changed, binding_profile));
 
     block
         .release(SecurityAcquisitionRelease::OperatorAction, 101.0)

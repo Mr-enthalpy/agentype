@@ -295,7 +295,7 @@ pub fn b5_composite_authority_surface() {}
 ///         let block = SecurityAcquisitionBlock::from_budget_defer(
 ///             authority.task_id().clone(),
 ///             GenerationId::from_string("generation"),
-///             CandidateDomain::from_ids([]),
+///             CandidateDomain::from_identities([]),
 ///             "sha256:binding",
 ///             exhaustion,
 ///             0.0,
