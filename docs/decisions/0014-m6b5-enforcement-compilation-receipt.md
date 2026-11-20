@@ -131,12 +131,27 @@ its security declaration and its authored `P_source`. It then proves the frozen
 B.4 eligibility conjunct (below), derives the composite authority, calls
 `ValidatedSourceBinding::validate` and `qualify_security_candidate`, and completes
 the evidence subject with `with_source_config`. Only after all of that does it
-create an Attempt or a Lease. The imported enforcement profile and the requested
-enforcement subject are the only inputs the caller supplies that the transaction
-cannot re-derive; every durable field of the resolver selection is re-read and
-re-checked, so a resolver verdict is never authority. A qualification failure is
-candidate-local — the Task stays queued and no Attempt, Lease or
-`ProvisioningBinding` is written.
+create an Attempt or a Lease. A qualification failure is candidate-local — the
+Task stays queued and no Attempt, Lease or `ProvisioningBinding` is written.
+
+The transaction does **not** re-prove external physical truth. Its inputs include
+the imported enforcement profile, the requested enforcement subject, and
+resolver-observed facts (`ResolvedProvisioningEvidence`, the resolved physical
+binding key, `attested_materialization_digest`, `provisioning_protocol`). It can
+re-read the durable catalog and check their identity, version, consistency and
+digest against other imported facts; it cannot turn a self-consistent claim into
+trusted evidence. The four layers are distinct:
+
+| Layer | B5.2 responsibility |
+|---|---|
+| Durable truth | re-read and verify inside the transaction |
+| Imported observation | verify source, identity, version and freshness (B5.2-C) |
+| Physical enforcement | trusted importer / OS capability proof (B5.2-C) |
+| Applied enforcement | B5.4 secured start and receipt |
+
+A successful `Eligible_B5.2` verdict therefore proves only the durable and
+statically consistent parts. "The bytes match, the digest is right" is never
+"the physical capability is trustworthy" and never "the policy was applied".
 
 B.5 eligibility **intersects** B.4; it does not replace it:
 
@@ -182,10 +197,19 @@ paths: `create_execution_in_tx` — and therefore both `create_execution` and
 `create_execution_with_snapshot` — rejects any Task whose durable requirement mode
 is `SECURITY_V1`, with or without a `BindingSnapshot`; `confirm_running_and_renew`
 rejects the same Task before it can write `RUNNING`, even when a stale `STARTING`
-Execution row exists. This is deliberately a Kernel authority-boundary check, not a
-scheduler convention: an unreachable caller today must not become a live bypass
-when B5.2-E wires the scheduler. Trusted importer provenance remains B5.2-C; the
-snapshot, secured start and receipt remain B5.4.
+Execution row exists. Semantic completion is the same boundary: `ack_success`
+rejects a `SECURITY_V1` Attempt before it can write `SUCCEEDED`/`COMPLETED`, insert
+a Result or release dependencies, whether or not the caller supplies an
+`execution_id`. Without that, a valid Claim would publish a Result and release the
+Batch without any Execution, snapshot, physical terminal state or receipt. A
+B5.4 secured acknowledgement path must replace this refusal explicitly; it must
+not be inferred from a Claim. This is deliberately a Kernel authority-boundary
+check, not a scheduler convention: an unreachable caller today must not become a
+live bypass when B5.2-E wires the scheduler. Trusted importer provenance remains
+B5.2-C; the snapshot, secured start and receipt remain B5.4. B5.4 must also define
+how recovery treats a `SECURITY_V1` `STARTING` Execution observed through
+`record_physical_outcome`: an observation is not a secured execution, so such a
+history is recovery-required rather than a successful acknowledgement.
 
 ### 4. Compile budget, memoization, and no partial selection
 
