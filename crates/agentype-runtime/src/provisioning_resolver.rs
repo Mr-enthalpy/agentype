@@ -26,14 +26,15 @@ use crate::{AdapterRegistry, ResolvedAdapterBinding};
 use agentype_adapter_api::AdapterDeadline;
 use agentype_adapter_api::NetworkEnforcement;
 use agentype_agent_contract::{
-    can_provision_task, AcquisitionBudget, AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef,
-    AgentTypeRef, BindingSnapshot, BudgetExhaustion, CandidateDomain, CapabilityRef,
-    CapabilityValue, ConfigStatus, MaterializationDigest, NetworkPolicy, PhysicalSafety,
-    ProvisioningBinding, ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
+    can_provision_task, can_provision_task_source_config_reusable, AcquisitionBudget,
+    AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef, AgentTypeRef, BindingSnapshot,
+    BudgetExhaustion, CandidateDomain, CapabilityRef, CapabilityValue, ConfigStatus,
+    MaterializationDigest, NetworkPolicy, PhysicalSafety, ProvisioningBinding,
+    ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
     SecurityCandidateIdentity, SecurityCandidateOwner, SecurityContractMode, SourceConfig,
     SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
 };
-use agentype_core::{ExecutionId, GenerationId, TaskId, UnixTime, WorkspaceMode};
+use agentype_core::{ExecutionId, GenerationId, LogicalAgentId, TaskId, UnixTime, WorkspaceMode};
 use agentype_execution_config::ExecutionRegistry;
 use agentype_storage_sqlite::Kernel;
 use std::collections::BTreeMap;
@@ -96,6 +97,10 @@ impl IntegrationFailure {
 pub enum ProvisioningResolutionError {
     NotTypedTask,
     AgentNotBound,
+    /// A `SECURITY_V1` Task is held before acquisition: the B5.4 snapshot and
+    /// secured start do not exist, so no production path may create an Attempt
+    /// or Lease for it. This is a liveness hold, never a Task failure.
+    SecurityHold(SecurityHold),
     NoEligibleSource,
     AgentTypeMissing(AgentTypeRef),
     MissingRevision(String),
@@ -125,6 +130,21 @@ impl std::fmt::Display for ProvisioningResolutionError {
         match self {
             Self::NotTypedTask => write!(f, "task has no typed agent requirement"),
             Self::AgentNotBound => write!(f, "agent has no exact type binding"),
+            Self::SecurityHold(hold) => match hold.provisional {
+                Some(cause) => write!(
+                    f,
+                    "SECURITY_V1 acquisition is held until the B5.4 secured start exists: at least {} candidate(s) in provisional domain {} ({}; the round is not complete)",
+                    hold.candidates(),
+                    hold.domain_digest(),
+                    cause.describe()
+                ),
+                None => write!(
+                    f,
+                    "SECURITY_V1 acquisition is held until the B5.4 secured start exists: {} complete candidate(s) in domain {}",
+                    hold.candidates(),
+                    hold.domain_digest()
+                ),
+            },
             Self::NoEligibleSource => write!(f, "no eligible source/config candidate"),
             Self::AgentTypeMissing(r) => {
                 write!(
@@ -446,6 +466,75 @@ impl SecurityCandidateRound {
             now,
         )
         .map_err(ProvisioningResolutionError::Evidence)
+    }
+}
+
+/// Why a `SECURITY_V1` hold could not claim a complete round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldProvisionalCause {
+    /// A read-only qualification probe exhausted the cycle's shared deadline.
+    ProbeDeadline,
+    /// The catalog frontier or the matched-agent roster changed while the round
+    /// was being enumerated, so the reported union may never have existed at one
+    /// instant.
+    CatalogDrift,
+}
+
+impl HoldProvisionalCause {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ProbeDeadline => "the read-only qualification probe exceeded its deadline",
+            Self::CatalogDrift => {
+                "the catalog or the matched-agent roster changed during enumeration"
+            }
+        }
+    }
+}
+
+/// The `SECURITY_V1` candidate round a Task would acquire from, held before any
+/// authority exists.
+///
+/// B5.2-E uses this as the scheduler's honest waiting state while the B5.4
+/// snapshot/secured start does not exist. It carries only the domain's count and
+/// opaque digest: no profile, no qualification, no Attempt, no Lease.
+///
+/// The hold is **provisional** when it cannot claim to have observed one complete
+/// round: the probe is bounded by the cycle's attestation deadline, and the
+/// enumeration is several consecutive reads, so a concurrent catalog publish or
+/// agent-binding change can make the union incoherent. A provisional hold reports
+/// a lower bound. It is still a non-executable hold, so it must never abort the
+/// typed cycle for unrelated coarse work, and it must never be mistaken for a
+/// full round by a later durable-block conversion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityHold {
+    candidates: usize,
+    domain_digest: String,
+    provisional: Option<HoldProvisionalCause>,
+}
+
+impl SecurityHold {
+    /// The number of distinct full candidate identities observed. Provisional
+    /// holds report only what was enumerated before the probe stopped or drifted.
+    pub fn candidates(&self) -> usize {
+        self.candidates
+    }
+
+    /// The opaque digest of the observed candidate domain.
+    pub fn domain_digest(&self) -> &str {
+        &self.domain_digest
+    }
+
+    /// Whether the complete round was observed in one coherent pass. `false`
+    /// means `candidates()` is a lower bound: B5.4 must re-enumerate before
+    /// writing a durable block or selecting from this domain.
+    pub fn is_provisional(&self) -> bool {
+        self.provisional.is_some()
+    }
+
+    /// The provisional cause, for diagnostics and tests. `None` for a complete
+    /// round.
+    pub fn provisional_cause(&self) -> Option<&'static str> {
+        self.provisional.map(HoldProvisionalCause::describe)
     }
 }
 
@@ -784,6 +873,43 @@ pub(crate) fn resolve_source_candidates(
         execution_registry,
         integrations,
         deadline,
+        CandidateMode::Coarse,
+    )
+}
+
+/// Enumerate the complete `SECURITY_V1` candidate set for an admitted typed
+/// Task, evaluating the reusable B.4 conjunct over the **Task pin** AgentType.
+///
+/// This is a pure, authority-free read used by the B5.2-E scheduler hold. It
+/// applies no qualification and consumes no imported profile: the B5.4 secured
+/// path owns those proofs. Its only job is to make the complete candidate
+/// identity set observable before any Attempt/Lease.
+pub(crate) fn resolve_security_source_candidates(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let (agent_type, _status) = kernel
+        .get_agent_type(&requirement.required_type)?
+        .ok_or_else(|| {
+            ProvisioningResolutionError::AgentTypeMissing(requirement.required_type.clone())
+        })?;
+    enumerate_candidates(
+        kernel,
+        task_id,
+        &requirement,
+        &agent_type,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+        CandidateMode::SecurityV1,
     )
 }
 
@@ -817,7 +943,53 @@ pub(crate) fn resolve_source_candidates_for_agent(
         execution_registry,
         integrations,
         deadline,
+        CandidateMode::Coarse,
     )
+}
+
+/// [`resolve_source_candidates_for_agent`] for the `SECURITY_V1` path.
+pub(crate) fn resolve_security_source_candidates_for_agent(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    agent_id: &agentype_core::LogicalAgentId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let bound = kernel
+        .get_logical_agent_type_binding(agent_id)?
+        .ok_or(ProvisioningResolutionError::AgentNotBound)?;
+    let (agent_type, _status) = kernel
+        .get_agent_type(&bound)?
+        .ok_or_else(|| ProvisioningResolutionError::AgentTypeMissing(bound.clone()))?;
+    enumerate_candidates(
+        kernel,
+        task_id,
+        &requirement,
+        &agent_type,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+        CandidateMode::SecurityV1,
+    )
+}
+
+/// Which execution contract a candidate set is enumerated for.
+///
+/// The two paths are disjoint by durable mode, not by caller convention: the
+/// coarse path refuses a `SECURITY_V1` AgentType or source, and the security
+/// path refuses a `COARSE_V1` one. This mirrors the acquisition transaction's
+/// re-proof, so an enumeration cannot offer a candidate the durable authority
+/// would reject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateMode {
+    Coarse,
+    SecurityV1,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -830,16 +1002,27 @@ fn enumerate_candidates(
     execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
+    mode: CandidateMode,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
     // Internal enumeration is also used outside the acquisition facade. Reject
     // known unreadiness before any source-private I/O; the final transaction
-    // still re-proves readiness and owns all Attempt/Lease authority.
-    kernel.check_typed_acquisition_readiness(task_id)?;
-    // M6-B.5 B5.1 gate: a `SECURITY_V1` AgentType revision is a full-path
-    // identity the coarse acquisition path cannot execute, so it has no eligible
-    // coarse candidate. This is a candidate-local ineligibility, not a Task
-    // failure: the Task stays QUEUED for the B.5 execution path.
-    if kernel.agent_type_security_mode(&agent_type.type_ref)? == SecurityContractMode::SecurityV1 {
+    // still re-proves readiness and owns all Attempt/Lease authority. The coarse
+    // gate also rejects `SECURITY_V1`; the security path proves the same
+    // readiness without that coarse-only rejection.
+    match mode {
+        CandidateMode::Coarse => kernel.check_typed_acquisition_readiness(task_id)?,
+        CandidateMode::SecurityV1 => kernel.check_typed_security_readiness(task_id)?,
+    }
+    // M6-B.5 B5.1 gate: the coarse path cannot execute a `SECURITY_V1`
+    // AgentType revision, and the security path cannot execute a `COARSE_V1`
+    // one. This is a candidate-local ineligibility, not a Task failure: the
+    // Task stays QUEUED for the path that owns its mode.
+    let agent_mode = kernel.agent_type_security_mode(&agent_type.type_ref)?;
+    let agent_mode_matches = match mode {
+        CandidateMode::Coarse => agent_mode != SecurityContractMode::SecurityV1,
+        CandidateMode::SecurityV1 => agent_mode == SecurityContractMode::SecurityV1,
+    };
+    if !agent_mode_matches {
         return Err(ProvisioningResolutionError::NoEligibleSource);
     }
     let task = kernel.task(task_id)?;
@@ -863,11 +1046,16 @@ fn enumerate_candidates(
         let source = kernel
             .get_spawn_source(&source_ref)?
             .ok_or_else(|| ProvisioningResolutionError::MissingRevision("spawn_source".into()))?;
-        // M6-B.5 B5.1 gate: a `SECURITY_V1` source revision is a full-path
-        // source even when it adds no `P_source` narrowing. The coarse path
-        // cannot run its imported-enforcement coverage check, so the source is
-        // not a coarse candidate.
-        if kernel.spawn_source_security_mode(&source_ref)? == SecurityContractMode::SecurityV1 {
+        // M6-B.5 B5.1 gate: the source mode must match the path. A
+        // `SECURITY_V1` source is a full-path source even when it adds no
+        // `P_source` narrowing, and a `COARSE_V1` source cannot provision a
+        // `SECURITY_V1` Task.
+        let source_mode = kernel.spawn_source_security_mode(&source_ref)?;
+        let source_mode_matches = match mode {
+            CandidateMode::Coarse => source_mode != SecurityContractMode::SecurityV1,
+            CandidateMode::SecurityV1 => source_mode == SecurityContractMode::SecurityV1,
+        };
+        if !source_mode_matches {
             continue;
         }
         let policy = kernel
@@ -932,14 +1120,29 @@ fn enumerate_candidates(
                 Err(err) if err.is_candidate_ineligible() => continue,
                 Err(err) => return Err(err),
             };
-            match can_provision_task(
-                agent_type,
-                &source,
-                &config,
-                &evidence,
-                &catalog,
-                &requirement.hard,
-            ) {
+            // The coarse path keeps the frozen `COARSE_V1` relation; the
+            // security path intersects the reusable B.4 conjunct and adds no
+            // coarse exact-reference claim. Qualification over `P_eff` and the
+            // imported profile is B5.4's, so it is not attempted here.
+            let eligibility = match mode {
+                CandidateMode::Coarse => can_provision_task(
+                    agent_type,
+                    &source,
+                    &config,
+                    &evidence,
+                    &catalog,
+                    &requirement.hard,
+                ),
+                CandidateMode::SecurityV1 => can_provision_task_source_config_reusable(
+                    agent_type,
+                    &source,
+                    &config,
+                    &evidence,
+                    &catalog,
+                    &requirement.hard,
+                ),
+            };
+            match eligibility {
                 Ok(()) => {}
                 Err(err) => {
                     let err = ProvisioningResolutionError::Evidence(err);
@@ -972,6 +1175,18 @@ fn enumerate_candidates(
             let attestation = match attestation {
                 Ok(value) => value,
                 Err(err) if err.is_candidate_ineligible() => None,
+                // A read-only probe that ran out of budget is temporary
+                // unavailability, not a producer fault. Keep the category (with a
+                // fixed message, so no private diagnostic escapes) instead of
+                // collapsing it into an untyped `Unavailable` failure: a
+                // B5.2-E hold can then tell "the probe did not finish" apart from
+                // catalog or durable corruption.
+                Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
+                    return Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                        "the source integration did not finish attestation before its deadline"
+                            .into(),
+                    ));
+                }
                 Err(err) => return Err(err.redact_integration_error()),
             };
             if deadline.is_expired() {
@@ -1165,6 +1380,154 @@ pub(crate) struct TypedAcquisitionOutcome {
     pub launch_descriptor: String,
 }
 
+/// Enumerate the `SECURITY_V1` candidate set for a Task and freeze its identity
+/// domain, without creating any authority.
+///
+/// The round spans every existing bound agent the Task matches (the same
+/// existing-first relation the acquisition uses) and the pinned new-agent route.
+/// Each owner is its own round because the owner is part of the identity; the
+/// hold carries the union of every round's identities. An owner with no
+/// candidate contributes nothing, while a global fault propagates.
+///
+/// A read-only attestation that exceeds the cycle's absolute deadline does not
+/// abort the cycle: the Task cannot execute under B5.4 anyway, so the hold is
+/// returned as **provisional** with the identities observed so far. Integrity,
+/// storage and authority faults still propagate, because they are not "the probe
+/// was slow" and must fail closed.
+///
+/// Provisional is also the honest answer when the observation itself drifted:
+/// the existing-owner loop and the pinned new-agent route are consecutive reads,
+/// so a concurrent catalog publish or agent-binding change can produce a union
+/// that never existed at one instant. The probe therefore snapshots the active
+/// catalog frontier, the Task's pinned type and the matched roster before and
+/// after enumeration, and reports a provisional hold on any change.
+fn security_hold(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<SecurityHold, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let before = hold_probe_snapshot(kernel, task_id, &requirement)?;
+    let mut identities: Vec<SecurityCandidateIdentity> = Vec::new();
+    let mut deadline_hit = false;
+    'round: {
+        for existing in kernel.match_existing_agents_for_task(task_id)? {
+            match resolve_security_source_candidates_for_agent(
+                kernel,
+                task_id,
+                &existing.logical_agent_id,
+                adapters,
+                execution_registry,
+                integrations,
+                deadline,
+            ) {
+                Ok(candidates) => {
+                    let round = SecurityCandidateRound::new(
+                        SecurityCandidateOwner::ExistingAgent(existing.logical_agent_id),
+                        candidates,
+                    )?;
+                    identities.extend(round.identities().iter().cloned());
+                }
+                Err(err) if err.is_candidate_local_for_dispatch() => {}
+                // The deadline is shared by the whole hold probe, so once it is
+                // spent every later attestation would fail for the same reason.
+                // Stop and report what was observed instead of pretending the
+                // remaining routes are empty.
+                Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
+                    deadline_hit = true;
+                    break 'round;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        match resolve_security_source_candidates(
+            kernel,
+            task_id,
+            adapters,
+            execution_registry,
+            integrations,
+            deadline,
+        ) {
+            Ok(candidates) => {
+                let round = SecurityCandidateRound::new(
+                    SecurityCandidateOwner::NewAgentType(requirement.required_type.clone()),
+                    candidates,
+                )?;
+                identities.extend(round.identities().iter().cloned());
+            }
+            Err(err) if err.is_candidate_local_for_dispatch() => {}
+            Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
+                deadline_hit = true;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    // An aborted probe already reports a lower bound; there is no point spending
+    // another snapshot read on it.
+    let provisional = if deadline_hit {
+        Some(HoldProvisionalCause::ProbeDeadline)
+    } else if hold_probe_snapshot(kernel, task_id, &requirement)? != before {
+        Some(HoldProvisionalCause::CatalogDrift)
+    } else {
+        None
+    };
+    let domain = CandidateDomain::from_identities(identities);
+    let cost = domain.acquisition_cost();
+    Ok(SecurityHold {
+        candidates: cost.candidates(),
+        domain_digest: domain.digest().to_string(),
+        provisional,
+    })
+}
+
+/// The durable facts the hold probe is an observation of: the active
+/// source/config frontier, the Task's exact pinned type, and the matched-agent
+/// roster (identity plus bound `AgentType` revision).
+///
+/// Equality between the value taken before enumeration and the one taken after
+/// it is the coherence fence for the reported round. It is not a transaction and
+/// proves nothing about physical truth; it only makes "this union was observed
+/// across a stable catalog and roster" a checkable claim instead of an assumption.
+#[derive(Debug, PartialEq, Eq)]
+struct HoldProbeSnapshot {
+    catalog_frontier: String,
+    required_type: AgentTypeRef,
+    roster: Vec<(LogicalAgentId, AgentTypeRef)>,
+}
+
+fn hold_probe_snapshot(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    requirement: &agentype_agent_contract::TaskAgentRequirement,
+) -> Result<HoldProbeSnapshot, ProvisioningResolutionError> {
+    let mut roster: Vec<(LogicalAgentId, AgentTypeRef)> = kernel
+        .match_existing_agents_for_task(task_id)?
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.logical_agent_id,
+                candidate.agent_type.type_ref.clone(),
+            )
+        })
+        .collect();
+    roster.sort_by(|a, b| {
+        a.0.as_str()
+            .cmp(b.0.as_str())
+            .then_with(|| a.1.id().as_str().cmp(b.1.id().as_str()))
+            .then_with(|| a.1.revision().cmp(&b.1.revision()))
+    });
+    Ok(HoldProbeSnapshot {
+        catalog_frontier: kernel.catalog_frontier_digest()?,
+        required_type: requirement.required_type.clone(),
+        roster,
+    })
+}
+
 /// The single, Scheduler-owned authority-bearing typed acquisition.
 ///
 /// It applies the frozen spec 06 existing-first order: the B.3 ranked READY
@@ -1186,6 +1549,26 @@ pub(crate) fn acquire_typed_task(
 ) -> Result<TypedAcquisitionOutcome, ProvisioningResolutionError> {
     // Readiness rejection must win over semantic/source resolution faults for
     // work that cannot be dispatched. This read grants no acquisition authority.
+    //
+    // B5.2-E: production acquisition of a `SECURITY_V1` Task belongs to the
+    // B5.4 snapshot/secured start, which does not exist. Prove the same
+    // readiness without the coarse-only mode rejection, enumerate the complete
+    // security round so the hold is explainable and the identity facts are
+    // ready for B5.4, then refuse before any Attempt, Lease, ProvisioningBinding
+    // or Task NACK. The Task stays QUEUED, so repeated cycles cannot turn a
+    // non-executable qualification into an ordinary `QUEUED -> LEASED ->
+    // expiry` claim.
+    if kernel.task_security_mode(task_id)? == Some(SecurityContractMode::SecurityV1) {
+        kernel.check_typed_security_readiness(task_id)?;
+        return Err(ProvisioningResolutionError::SecurityHold(security_hold(
+            kernel,
+            task_id,
+            adapters,
+            execution_registry,
+            integrations,
+            attest_deadline,
+        )?));
+    }
     kernel.check_typed_acquisition_readiness(task_id)?;
     let existing = kernel.match_existing_agents_for_task(task_id)?;
     let mut last_error: Option<ProvisioningResolutionError> = None;
@@ -4858,6 +5241,630 @@ mod tests {
             vec![wrong_type],
         )
         .is_err());
+    }
+
+    /// Publish one `SECURITY_V1` AgentType and one `SECURITY_V1` source/config
+    /// that the reusable B.4 conjunct accepts. The authored policy reference is
+    /// returned so the Generation policy can reuse the same deny-all bytes.
+    fn publish_security_fixture(kernel: &Kernel) -> (AgentTypeRef, SandboxPolicyRef) {
+        let policy_ref = SandboxPolicyRef::new("security-agent-policy", 1).unwrap();
+        kernel
+            .publish_sandbox_policy(&policy_ref, &NormalizedSandboxPolicy::deny_all())
+            .unwrap();
+        let agent = AgentType {
+            type_ref: AgentTypeRef::new("secure-reviewer", 1).unwrap(),
+            based_on: None,
+            contract: AgentTypeContract {
+                allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                required_capabilities: BTreeMap::new(),
+                affinity: AffinityConstraint::Any,
+                budget_ceiling: Budget::new(100.0).unwrap(),
+                security: SecurityContract {
+                    workspace: WorkspaceMode::ReadOnly,
+                    network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                },
+                lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+                continuity: ContinuityMode::None,
+                sandbox_policy: Some(policy_ref.clone()),
+                anchor_constraint: None,
+            },
+        };
+        kernel
+            .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+            .unwrap();
+        publish_security_source(kernel);
+        (agent.type_ref, policy_ref)
+    }
+
+    fn publish_security_source(kernel: &Kernel) {
+        let policy = AdapterBindingPolicy {
+            policy_ref: AdapterPolicyRef::new("security-policy", 1).unwrap(),
+            adapter_kind: "default".into(),
+            binding_ref: "primary".into(),
+            required_safety: safety(),
+            status: ConfigStatus::Active,
+        };
+        kernel.publish_adapter_binding_policy(&policy).unwrap();
+        let source = SpawnSource {
+            source_ref: SpawnSourceRef::new("security-source", 1).unwrap(),
+            adapter_policy: policy.policy_ref.clone(),
+            lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
+            continuity_modes: [ContinuityMode::None].into_iter().collect(),
+            functional_envelope: BTreeMap::new(),
+            claims: Vec::new(),
+            status: SourceStatus::Active,
+        };
+        kernel
+            .publish_spawn_source_with_security(
+                &source,
+                Some(&SpawnSourceSecurityDeclaration::without_policy(
+                    source.source_ref.clone(),
+                    EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
+                )),
+            )
+            .unwrap();
+        let body = json!({"model": "opaque"});
+        let config = SourceConfig {
+            config_ref: SourceConfigRef::new(source.source_ref.clone(), "config", 1).unwrap(),
+            config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: Vec::new(),
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        };
+        kernel
+            .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+            .unwrap();
+    }
+
+    fn security_typed_task(
+        kernel: &Kernel,
+        pin: AgentTypeRef,
+        policy_ref: SandboxPolicyRef,
+    ) -> TaskId {
+        let generation = kernel
+            .create_generation_with_security_mode(
+                json!({}),
+                Some(agentype_agent_contract::GenerationPolicy {
+                    allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                    max_workspace: WorkspaceMode::ReadOnly,
+                    max_network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                    min_continuity: ContinuityMode::None,
+                    sandbox_policy: Some(policy_ref),
+                    budget_ceiling: Budget::new(100.0).unwrap(),
+                    allowed_affinity: None,
+                    anchor_constraint: None,
+                }),
+                SecurityContractMode::SecurityV1,
+            )
+            .unwrap();
+        let intent = RawWorkIntent {
+            raw_intent_key: "security-work".into(),
+            objective: "security work".into(),
+            information_function: agentype_core::InformationFunction::Expand,
+            semantic_input_set: SemanticInputSet::new(),
+            rationale: None,
+            suggested_task_spec: Some(TaskSpec::new("audit", json!({})).partition("general")),
+        };
+        let proposal = kernel
+            .compile_root_intent(&generation.generation_id, intent, "session", 1)
+            .unwrap();
+        kernel
+            .admit_typed_proposal_with_security_mode(
+                &proposal.proposal_id,
+                0,
+                None,
+                AgentRequirementDraft {
+                    required_type: AgentTypeSelector::Exact(pin),
+                    required_capabilities: BTreeMap::new(),
+                    required_network: NetworkPolicy::Disabled,
+                    required_attempt_isolation: false,
+                    sandbox_policy: None,
+                    required_anchor: None,
+                    budget: Budget::new(50.0).unwrap(),
+                },
+                SecurityContractMode::SecurityV1,
+            )
+            .unwrap()
+    }
+
+    /// B5.2-E liveness: with B5.4 absent, the scheduler must hold a
+    /// `SECURITY_V1` Task with an explainable reason and never create an
+    /// Attempt/Lease that could only expire.
+    #[test]
+    fn a_security_v1_task_is_held_without_an_attempt_across_cycles() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let first = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        let crate::DispatchOneOutcome::TypedDeferred { detail } = first else {
+            panic!("a SECURITY_V1 Task must be held, got {first:?}");
+        };
+        assert!(detail.contains("SECURITY_V1"), "{detail}");
+        assert!(
+            detail.contains("held until the B5.4 secured start exists"),
+            "{detail}"
+        );
+        assert!(detail.contains("1 complete candidate(s)"), "{detail}");
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+
+        // The control loop's expiry sweep must not convert the hold into a
+        // failure or a lease; the Task is unchanged after another cycle.
+        kernel.expire_leases(false).unwrap();
+        let second = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        assert!(matches!(
+            second,
+            crate::DispatchOneOutcome::NoWork | crate::DispatchOneOutcome::TypedDeferred { .. }
+        ));
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// The empty round is still a hold, never a fallback to a `COARSE_V1`
+    /// source and never a Task failure.
+    #[test]
+    fn a_security_v1_task_without_a_security_candidate_is_held_not_failed() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        // A coarse source is present, so an empty security round can only be
+        // explained by mode filtering, not by a missing catalog.
+        let _coarse = publish(&kernel);
+        let source_ref = SourceConfigRef::new(
+            SpawnSourceRef::new("security-source", 1).unwrap(),
+            "config",
+            1,
+        )
+        .unwrap();
+        kernel
+            .set_source_config_status(&source_ref, ConfigStatus::Disabled)
+            .unwrap();
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let outcome = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        let crate::DispatchOneOutcome::TypedDeferred { detail } = outcome else {
+            panic!("an empty SECURITY_V1 round must still be held, got {outcome:?}");
+        };
+        assert!(detail.contains("0 complete candidate(s)"), "{detail}");
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// A held `SECURITY_V1` Task must not consume the typed cycle. The probe
+    /// limit is a window over ordered Tasks; if a hold returned immediately, a
+    /// runnable `COARSE_V1` Task behind it would wait for the hold's cooldown.
+    #[test]
+    fn a_held_security_task_does_not_starve_a_runnable_coarse_task() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = {
+            let clock: Arc<dyn Clock> = clock.clone();
+            let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
+            kernel
+                .upsert_partition(&PartitionSpec::new(
+                    "general",
+                    0,
+                    Retention::Ephemeral,
+                    "local",
+                    "default",
+                ))
+                .unwrap();
+            kernel
+        };
+        let (security_pin, policy_ref) = publish_security_fixture(&kernel);
+        let security_task = security_typed_task(&kernel, security_pin, policy_ref);
+        // `list_typed_dispatch_candidates` orders by (`priority DESC`,
+        // `created_at ASC`). Advancing the clock makes the security Task strictly
+        // older, so it is the first probe and the coarse Task is behind it.
+        clock.advance(1.0);
+        let coarse_pin = publish(&kernel);
+        let coarse_task = typed_task(&kernel, coarse_pin);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let outcome = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        assert!(
+            !matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+            "a held Task must not consume the cycle ahead of a runnable Task: {outcome:?}"
+        );
+        assert!(
+            kernel.attempt_count_for_task(&coarse_task).unwrap() > 0,
+            "the runnable coarse Task must still be attempted: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.task(&security_task).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(kernel.attempt_count_for_task(&security_task).unwrap(), 0);
+    }
+
+    /// Attestation times out for the security source only. The hold probe must
+    /// treat that as provisional, while the coarse source still attests.
+    struct SecurityAttestTimeout;
+
+    impl SourceConfigIntegration for SecurityAttestTimeout {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            if revision.config().config_ref.source().id().as_str() == "security-source" {
+                return Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ));
+            }
+            EchoMaterializer.attest(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+    }
+
+    /// A `SECURITY_V1` hold whose read-only qualification probe exceeds its
+    /// deadline must not abort the typed cycle. The Task cannot execute under
+    /// B5.4 however the probe ends, so a provisional hold is the honest and
+    /// non-blocking outcome; a runnable coarse Task behind it must still run.
+    #[test]
+    fn a_security_hold_with_timed_out_attestation_does_not_block_runnable_coarse_task() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = {
+            let clock: Arc<dyn Clock> = clock.clone();
+            let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
+            kernel
+                .upsert_partition(&PartitionSpec::new(
+                    "general",
+                    0,
+                    Retention::Ephemeral,
+                    "local",
+                    "default",
+                ))
+                .unwrap();
+            kernel
+        };
+        let (security_pin, policy_ref) = publish_security_fixture(&kernel);
+        let security_task = security_typed_task(&kernel, security_pin, policy_ref);
+        // `created_at ASC` ordering: the security Task is the first probe.
+        clock.advance(1.0);
+        let coarse_pin = publish(&kernel);
+        let coarse_task = typed_task(&kernel, coarse_pin);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(SecurityAttestTimeout);
+
+        // The timed-out probe is still a hold, never a fatal resolution fault,
+        // and it does not claim to have observed the complete round.
+        let error = acquire_typed_task(
+            &kernel,
+            &security_task,
+            &adapters,
+            &registry,
+            &integrations,
+            &deadline(),
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("provisional domain")
+                && error.to_string().contains("not complete"),
+            "{error}"
+        );
+        let ProvisioningResolutionError::SecurityHold(hold) = error else {
+            panic!("a timed-out security probe must still be a hold");
+        };
+        assert!(hold.is_provisional());
+        assert_eq!(hold.candidates(), 0);
+        assert_eq!(
+            kernel.task(&security_task).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(kernel.attempt_count_for_task(&security_task).unwrap(), 0);
+
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+        let outcome = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .expect("a timed-out security probe must not abort the typed cycle");
+        assert!(
+            !matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+            "a timed-out hold must not consume the cycle: {outcome:?}"
+        );
+        assert!(
+            kernel.attempt_count_for_task(&coarse_task).unwrap() > 0,
+            "the runnable coarse Task must still be attempted: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.task(&security_task).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(kernel.attempt_count_for_task(&security_task).unwrap(), 0);
+    }
+
+    /// Only "the probe was slow" becomes provisional. An integrity fault during
+    /// the same probe still fails closed: it must not be masked as a hold.
+    #[test]
+    fn a_security_hold_integrity_fault_still_fails_closed() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+        let integrations = si(CandidateAttestationFault {
+            error: ProvisioningResolutionError::Storage(agentype_core::Error::InvariantViolation(
+                PRIVATE_DIAGNOSTIC.into(),
+            )),
+            visited: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+
+        let error = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &integrations,
+            &deadline(),
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            !matches!(error, ProvisioningResolutionError::SecurityHold(_)),
+            "an integrity fault must not become a hold: {error:?}"
+        );
+        assert_public_error_is_redacted(&error);
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// Publishes one extra active source during the security probe, simulating a
+    /// concurrent publisher landing between the hold's before/after snapshots.
+    struct CatalogDriftPublish {
+        kernel: Arc<Kernel>,
+        published: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceConfigIntegration for CatalogDriftPublish {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            if revision.config().config_ref.source().id().as_str() == "security-source"
+                && !self
+                    .published
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A coarse-only source: the drift is in the frontier, not in the
+                // security candidate set, which is exactly the incoherent union
+                // the fence must catch.
+                publish(&self.kernel);
+            }
+            EchoMaterializer.attest(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+    }
+
+    /// The hold is several consecutive reads, so a catalog publish or an
+    /// agent-binding change can make the union it reports never have existed at
+    /// one instant. It must then say "provisional", not claim a complete round.
+    #[test]
+    fn a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round() {
+        let kernel = Arc::new(kernel());
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let integrations = si(CatalogDriftPublish {
+            kernel: kernel.clone(),
+            published: std::sync::atomic::AtomicBool::new(false),
+        });
+        let error = acquire_typed_task(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &integrations,
+            &deadline(),
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        let ProvisioningResolutionError::SecurityHold(hold) = error else {
+            panic!("a security probe must still be a hold, got {error:?}");
+        };
+        assert!(hold.is_provisional());
+        assert_eq!(
+            hold.provisional_cause(),
+            Some("the catalog or the matched-agent roster changed during enumeration")
+        );
+        // The candidate itself was still enumerated; only the claim of one
+        // coherent observation is withdrawn.
+        assert_eq!(hold.candidates(), 1);
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// Attestations that burn almost the whole probe budget and then miss it.
+    /// This is the load shape the audit asked for: real attestation work, not an
+    /// instantly-failing stub, with several held Tasks ahead of runnable work.
+    struct SecurityAttestNearDeadline;
+
+    impl SourceConfigIntegration for SecurityAttestNearDeadline {
+        fn protocol(&self) -> &str {
+            crate::TEST_PROVISIONING_PROTOCOL
+        }
+
+        fn attest(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<Option<MaterializationDigest>, ProvisioningResolutionError> {
+            if revision.config().config_ref.source().id().as_str() == "security-source" {
+                while deadline.remaining() > Duration::from_millis(2) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(
+                    PRIVATE_DIAGNOSTIC.into(),
+                ));
+            }
+            EchoMaterializer.attest(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+
+        fn prepare(
+            &self,
+            revision: &agentype_storage_sqlite::SourceConfigRevision,
+            adapter_kind: &str,
+            adapter_binding_key: &str,
+            deadline: &AdapterDeadline,
+        ) -> Result<PreparedSource, ProvisioningResolutionError> {
+            EchoMaterializer.prepare(revision, adapter_kind, adapter_binding_key, deadline)
+        }
+    }
+
+    /// B5.2-E liveness under the tightest probe window: `probe_limit=1`, three
+    /// held `SECURITY_V1` Tasks (each spending almost its full attest budget),
+    /// then a runnable `COARSE_V1` Task. Every held Task must stay QUEUED with no
+    /// Attempt/Lease, and the coarse Task must run within a bounded number of
+    /// cycles instead of waiting on the hold cooldown.
+    #[test]
+    fn held_security_tasks_yield_to_coarse_work_under_a_single_probe_window() {
+        let clock = Arc::new(ManualClock::new(1_000.0));
+        let kernel = {
+            let clock: Arc<dyn Clock> = clock.clone();
+            let kernel = Kernel::open_memory(clock, 10.0, MAX_BYTES).unwrap();
+            kernel
+                .upsert_partition(&PartitionSpec::new(
+                    "general",
+                    0,
+                    Retention::Ephemeral,
+                    "local",
+                    "default",
+                ))
+                .unwrap();
+            kernel
+        };
+        let (security_pin, policy_ref) = publish_security_fixture(&kernel);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(security_typed_task(
+                &kernel,
+                security_pin.clone(),
+                policy_ref.clone(),
+            ));
+            // `created_at ASC` ordering: creation order is probe order.
+            clock.advance(1.0);
+        }
+        let coarse_pin = publish(&kernel);
+        let coarse_task = typed_task(&kernel, coarse_pin);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(SecurityAttestNearDeadline);
+        let config = crate::TypedDispatchConfig::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_millis(30),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        // Long enough that earlier held Tasks stay cooled while the window
+        // advances; the coarse Task is never cooled, so it cannot be starved.
+        .with_security_hold_cooldown(Duration::from_secs(5));
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        // At most one held Task is probed per cycle. Four cycles cover three
+        // holds plus the coarse Task; assert the bound, not just eventual success.
+        let mut cycles = 0;
+        loop {
+            cycles += 1;
+            assert!(
+                cycles <= 6,
+                "coarse work must run within a bounded number of cycles"
+            );
+            let outcome = dispatcher
+                .dispatch_typed_one(&integrations, &config, &state)
+                .expect("a timed-out security probe must not abort the typed cycle");
+            if kernel.attempt_count_for_task(&coarse_task).unwrap() > 0 {
+                assert!(
+                    !matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+                    "the coarse Task must be the cycle's outcome: {outcome:?}"
+                );
+                break;
+            }
+            assert!(
+                matches!(&outcome, crate::DispatchOneOutcome::TypedDeferred { .. }),
+                "with one probe slot and only held work left, the cycle defers: {outcome:?}"
+            );
+            for task in &held {
+                assert_eq!(kernel.task(task).unwrap().state, TaskState::Queued);
+                assert_eq!(kernel.attempt_count_for_task(task).unwrap(), 0);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // A hold never became an Attempt/Lease that could only expire.
+        for task in &held {
+            assert_eq!(kernel.task(task).unwrap().state, TaskState::Queued);
+            assert_eq!(kernel.attempt_count_for_task(task).unwrap(), 0);
+        }
     }
 
     #[test]

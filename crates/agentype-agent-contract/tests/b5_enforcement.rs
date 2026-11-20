@@ -2463,6 +2463,48 @@ fn an_attestation_rejects_a_non_finite_or_empty_window() {
 }
 
 #[test]
+fn an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling() {
+    let profile = full_support_profile();
+    // Exactly at the ceiling is still a legal producer claim.
+    EnforcementProfileAttestation::new(
+        &profile,
+        ATT_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATT_ISSUED,
+        ATT_ISSUED + ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS,
+    )
+    .unwrap();
+
+    // One second beyond it is not: a single observation may not claim to outlive
+    // the physical adapter installation it describes.
+    let error = EnforcementProfileAttestation::new(
+        &profile,
+        ATT_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATT_ISSUED,
+        ATT_ISSUED + ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS + 1.0,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ContractError::InvalidNumber { .. }));
+
+    // The durable read applies the same ceiling, so an over-long row written by an
+    // older or hostile producer fails closed instead of being trusted.
+    let attestation = attestation(&profile);
+    let error = EnforcementProfileAttestation::from_parts(
+        attestation.profile_digest(),
+        attestation.importer_id(),
+        attestation.importer_protocol(),
+        attestation.adapter_kind(),
+        attestation.adapter_binding_key(),
+        ATT_ISSUED,
+        ATT_ISSUED + ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS + 1.0,
+        attestation.attestation_digest(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ContractError::InvalidNumber { .. }));
+}
+
+#[test]
 fn an_attestation_binds_the_exact_profile_and_physical_domain() {
     let profile = full_support_profile();
     let attestation = attestation(&profile);

@@ -48,7 +48,7 @@ pub use provisioning_admin::ProvisioningAdmin;
 // `Kernel` and are owned by the production `ControlLoopService`. Only the
 // source-integration SPI and the diagnostic candidate value are public here.
 pub use provisioning_resolver::{
-    PreparedSource, ProvisioningResolutionError, SourceConfigIntegration,
+    PreparedSource, ProvisioningResolutionError, SecurityHold, SourceConfigIntegration,
     SourceIntegrationRegistry, SourceProvisioningCandidate,
 };
 // M6-B operator catalog administration: publish the immutable B.2 capability /
@@ -1489,6 +1489,11 @@ pub struct TypedDispatchConfig {
     probe_limit: usize,
     candidate_cooldown: Duration,
     ambiguous_cooldown: Duration,
+    /// Long re-probe bound for a `SECURITY_V1` Task held before its B5.4
+    /// secured acquisition path exists. The condition changes only when the
+    /// binary or the catalog does, so a short coarse-style cooldown would turn
+    /// the hold into unnecessary attestation work.
+    security_hold_cooldown: Duration,
     attest_budget: Duration,
     prepare_budget: Duration,
 }
@@ -1511,9 +1516,22 @@ impl TypedDispatchConfig {
             probe_limit,
             candidate_cooldown,
             ambiguous_cooldown,
+            security_hold_cooldown: Duration::from_secs(30),
             attest_budget,
             prepare_budget,
         })
+    }
+
+    /// Set the re-probe bound for a held `SECURITY_V1` Task. A zero bound is
+    /// raised to the default: the hold must stay a bounded waiting state, not a
+    /// busy loop that re-enumerates the round every cycle.
+    pub fn with_security_hold_cooldown(mut self, value: Duration) -> Self {
+        self.security_hold_cooldown = if value.is_zero() {
+            Duration::from_secs(30)
+        } else {
+            value
+        };
+        self
     }
 
     pub fn probe_limit(&self) -> usize {
@@ -1526,6 +1544,10 @@ impl TypedDispatchConfig {
 
     pub fn ambiguous_cooldown(&self) -> Duration {
         self.ambiguous_cooldown
+    }
+
+    pub fn security_hold_cooldown(&self) -> Duration {
+        self.security_hold_cooldown
     }
 
     pub fn attest_budget(&self) -> Duration {
@@ -1543,6 +1565,7 @@ impl Default for TypedDispatchConfig {
             probe_limit: 8,
             candidate_cooldown: Duration::from_secs(1),
             ambiguous_cooldown: Duration::from_secs(30),
+            security_hold_cooldown: Duration::from_secs(30),
             attest_budget: Duration::from_secs(5),
             prepare_budget: Duration::from_secs(5),
         }
@@ -1636,6 +1659,21 @@ pub struct Dispatcher<'a> {
     execution_registry: &'a ExecutionRegistry,
     adapters: &'a AdapterRegistry,
     gate: Option<&'a crate::control::DispatchGate>,
+}
+
+/// The result of trying one enumerated typed Task within one dispatch cycle.
+///
+/// `Held` and `Deferred` both keep the Task `QUEUED` without authority, but only
+/// `Held` carries an operator-explainable reason. `dispatch_typed_one` keeps
+/// scanning after either so a held Task cannot consume the cycle's only probe
+/// slot ahead of a runnable coarse Task.
+enum TypedCandidateAttempt {
+    /// A terminal outcome for this cycle.
+    Outcome(DispatchOneOutcome),
+    /// The Task was deferred locally; scan the remaining candidates.
+    Deferred,
+    /// The security path holds the Task; scan on, but remember the detail.
+    Held(String),
 }
 
 impl<'a> Dispatcher<'a> {
@@ -1832,29 +1870,40 @@ impl<'a> Dispatcher<'a> {
         if candidates.is_empty() {
             return Ok(DispatchOneOutcome::NoWork);
         }
-        let mut deferred: Option<String> = None;
+        let mut deferred = false;
+        let mut held: Option<String> = None;
         for task_id in candidates {
             match self.dispatch_typed_candidate(&task_id, integrations, config, state)? {
-                Some(outcome) => return Ok(outcome),
-                None => deferred = Some("typed candidate is not currently provisionable".into()),
+                TypedCandidateAttempt::Outcome(outcome) => return Ok(outcome),
+                TypedCandidateAttempt::Deferred => deferred = true,
+                TypedCandidateAttempt::Held(detail) => {
+                    deferred = true;
+                    held = Some(detail);
+                }
             }
         }
-        Ok(match deferred {
-            Some(detail) => DispatchOneOutcome::TypedDeferred { detail },
-            None => DispatchOneOutcome::NoWork,
+        // A held Task is the most informative deferral, but it never pre-empts a
+        // runnable candidate behind it. Only when the whole probe found nothing
+        // runnable do we report the hold (or the generic deferral).
+        Ok(match (held, deferred) {
+            (Some(detail), _) => DispatchOneOutcome::TypedDeferred { detail },
+            (None, true) => DispatchOneOutcome::TypedDeferred {
+                detail: "typed candidate is not currently provisionable".into(),
+            },
+            (None, false) => DispatchOneOutcome::NoWork,
         })
     }
 
-    /// Try one enumerated typed Task. `Ok(None)` means the Task is deferred
-    /// without fabricating authority or a Task failure; `Err` is a confirmed
-    /// control-plane fault that must fail closed.
+    /// Try one enumerated typed Task. A non-terminal `Deferred`/`Held` means the
+    /// Task is deferred without fabricating authority or a Task failure; `Err`
+    /// is a confirmed control-plane fault that must fail closed.
     fn dispatch_typed_candidate(
         &self,
         task_id: &TaskId,
         integrations: &SourceIntegrationRegistry,
         config: &TypedDispatchConfig,
         state: &TypedDispatchState,
-    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+    ) -> Result<TypedCandidateAttempt, DispatchError> {
         let attest = AdapterDeadline::after(config.attest_budget()).map_err(|_| {
             DispatchError::Persistence(Error::invariant(
                 "validated typed attest budget became invalid",
@@ -1898,12 +1947,14 @@ impl<'a> Dispatcher<'a> {
                     task_id.clone(),
                     cooldown_until(Instant::now(), config.candidate_cooldown()),
                 );
-                return Ok(Some(DispatchOneOutcome::TypedDeferred { detail }));
+                return Ok(TypedCandidateAttempt::Outcome(
+                    DispatchOneOutcome::TypedDeferred { detail },
+                ));
             }
         };
         let (launch, adapter_binding) = prepared.into_dispatch();
         self.start_prepared(&claim, &adapter_binding, launch)
-            .map(Some)
+            .map(TypedCandidateAttempt::Outcome)
     }
 
     /// Classify a pre-start typed acquisition error.
@@ -1917,15 +1968,33 @@ impl<'a> Dispatcher<'a> {
     /// NACK; the Task stays QUEUED and is re-probed after the ambiguity
     /// cooldown or a catalog-frontier change. A post-acquisition failure is a
     /// different outcome handled by the Attempt's ACK/NACK path.
+    ///
+    /// A `SecurityHold` is a non-terminal `Held`: the Task is cooled down but
+    /// the dispatcher still scans the remaining candidates, so a held Task
+    /// ahead of a runnable one does not consume the cycle.
     fn defer_or_fail_typed(
         &self,
         task_id: &TaskId,
         err: ProvisioningResolutionError,
         config: &TypedDispatchConfig,
         state: &TypedDispatchState,
-    ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
+    ) -> Result<TypedCandidateAttempt, DispatchError> {
         use ProvisioningResolutionError as P;
         match &err {
+            // B5.2-E: a `SECURITY_V1` Task has no production acquisition path
+            // until the B5.4 snapshot/secured start exists. The resolver has
+            // already enumerated the complete candidate round without creating
+            // authority. Carry the hold detail, cool the Task down, and leave it
+            // QUEUED: no Attempt, Lease, ProvisioningBinding or NACK is created,
+            // so no cycle can convert this into an expiring Claim. Dispatch
+            // continues scanning so the hold cannot starve a runnable candidate.
+            P::SecurityHold(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.security_hold_cooldown()),
+                );
+                Ok(TypedCandidateAttempt::Held(err.to_string()))
+            }
             // The authority transaction committed a claim, then pure
             // preparation reported unavailability or authority loss. The
             // settlement/recovery consequence already belongs to that claim.
@@ -1934,7 +2003,7 @@ impl<'a> Dispatcher<'a> {
                     task_id.clone(),
                     cooldown_until(Instant::now(), config.candidate_cooldown()),
                 );
-                Ok(None)
+                Ok(TypedCandidateAttempt::Deferred)
             }
             // ADR-0010: a tie in the frozen selection order is a pre-acquisition
             // resolution deferral, never permission to skip to a lower-ranked
@@ -1946,7 +2015,7 @@ impl<'a> Dispatcher<'a> {
                     task_id.clone(),
                     cooldown_until(Instant::now(), config.ambiguous_cooldown()),
                 );
-                Ok(None)
+                Ok(TypedCandidateAttempt::Deferred)
             }
             // The authority-free enumeration raced a Task/Batch/partition
             // readiness change. No authority was created.
@@ -1955,14 +2024,14 @@ impl<'a> Dispatcher<'a> {
                     task_id.clone(),
                     cooldown_until(Instant::now(), config.candidate_cooldown()),
                 );
-                Ok(None)
+                Ok(TypedCandidateAttempt::Deferred)
             }
             _ if err.is_candidate_local_for_dispatch() => {
                 state.defer(
                     task_id.clone(),
                     cooldown_until(Instant::now(), config.candidate_cooldown()),
                 );
-                Ok(None)
+                Ok(TypedCandidateAttempt::Deferred)
             }
             _ => Err(DispatchError::TypedPreparation(
                 "confirmed fatal typed provisioning fault".into(),

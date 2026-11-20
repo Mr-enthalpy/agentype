@@ -23,8 +23,8 @@ use agentype_agent_contract::{
     PolicyInput, ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityClass, SecurityContract,
     SecurityContractMode, SourceConfig, SourceConfigRef, SourceStatus, SpawnSource, SpawnSourceRef,
     SpawnSourceSecurityDeclaration, WorkingDirectory, ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
-    POLICY_ONLY_REFERENCE_PROFILE, POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION,
-    RESOLVER_VERSION,
+    ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION, POLICY_ONLY_REFERENCE_PROFILE,
+    POLICY_ONLY_REFERENCE_PROTOCOL, POLICY_ONLY_REFERENCE_VERSION, RESOLVER_VERSION,
 };
 use agentype_core::{
     Clock, Error, ExecutionId, InformationFunction, ManualClock, PartitionSpec, RawWorkIntent,
@@ -1668,6 +1668,74 @@ fn record_attestation(
     kernel
         .record_enforcement_profile_attestation(&attestation, issued_at)
         .unwrap();
+}
+
+/// A digest-correct value reconstructed from public parts is not authority to
+/// record trusted physical evidence. The write path must reject it and leave no
+/// row, so a caller that can only construct parts cannot make acquisition see a
+/// trusted importer.
+#[test]
+fn a_self_consistent_attestation_without_producer_provenance_is_rejected() {
+    let env = Env::new("forged_attestation");
+    let kernel = &env.kernel;
+    let profile_ref = full_support_profile_ref();
+    let imported = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    // The schema tag, protocol, field names and canonical digest function are
+    // all public. This is exactly what a caller limited to `from_parts` can
+    // compute to produce a self-consistent attestation.
+    let forged_digest = canonical_json_body_digest(&json!({
+        "kind": "ENFORCEMENT_PROFILE_ATTESTATION",
+        "schema": ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION,
+        "protocol": ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        "importer_id": TEST_IMPORTER,
+        "profile_digest": imported.profile_digest(),
+        "adapter_kind": imported.adapter_kind(),
+        "adapter_binding_key": imported.adapter_binding_key(),
+        "issued_at": ATTESTATION_ISSUED_AT,
+        "valid_until": ATTESTATION_VALID_UNTIL,
+    }));
+    let forged = EnforcementProfileAttestation::from_parts(
+        imported.profile_digest(),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        imported.adapter_kind(),
+        imported.adapter_binding_key(),
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+        &forged_digest,
+    )
+    .unwrap();
+    assert!(!forged.is_producer_sealed());
+
+    let error = kernel
+        .record_enforcement_profile_attestation(&forged, ATTESTATION_ISSUED_AT)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+    assert!(kernel
+        .get_enforcement_profile_attestation(imported.profile_digest())
+        .unwrap()
+        .is_none());
+
+    // The producer's row is still readable and compares equal on facts; only
+    // the reconstructed value is non-writable.
+    record_attestation(
+        kernel,
+        &imported,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    );
+    let read = kernel
+        .get_enforcement_profile_attestation(imported.profile_digest())
+        .unwrap()
+        .unwrap();
+    assert!(!read.is_producer_sealed());
+    assert_eq!(read.attestation_digest(), forged.attestation_digest());
+    assert_eq!(read.profile_digest(), forged.profile_digest());
 }
 
 #[test]

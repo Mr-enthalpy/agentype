@@ -520,6 +520,20 @@ pub struct Kernel {
     continuity_max_bytes: usize,
 }
 
+/// Which typed acquisition path a readiness probe is proving.
+///
+/// A bare `reject_security_v1: bool` cannot express "this probe *is* the security
+/// path": `false` only meant "do not reject `SECURITY_V1`", so the coarse and
+/// security probes differed by one polarity and the security probe also succeeded
+/// for an ordinary coarse Task. Both probes now name the mode they expect, and
+/// each rejects the other's Task.
+#[cfg(any(test, feature = "runtime-internal"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedReadinessMode {
+    CoarseAcquisition,
+    SecurityV1,
+}
+
 impl Kernel {
     pub fn open(
         path: impl AsRef<Path>,
@@ -914,6 +928,22 @@ impl Kernel {
         self.tx(|tx, _| crate::catalog::agent_type_security_mode(tx, reference))
     }
 
+    /// The durable `SecurityContractMode` of a typed Task, or `None` for a
+    /// `LEGACY` Task with no agent requirement.
+    ///
+    /// B5.2-E reads this before typed acquisition so a `SECURITY_V1` Task is
+    /// held without an Attempt/Lease instead of falling into the coarse path.
+    /// A `TYPED` Task whose requirement row is missing stays a corruption
+    /// failure rather than a silent `None`.
+    pub fn task_security_mode(&self, id: &TaskId) -> Result<Option<SecurityContractMode>, Error> {
+        self.tx(|tx, _| {
+            if crate::requirement::task_agent_requirement_mode(tx, id)? != "TYPED" {
+                return Ok(None);
+            }
+            Ok(Some(crate::requirement::task_security_mode(tx, id)?))
+        })
+    }
+
     pub fn spawn_source_security_declaration(
         &self,
         reference: &SpawnSourceRef,
@@ -1090,6 +1120,11 @@ impl Kernel {
     /// covers an exact imported profile digest and physical adapter domain;
     /// acquisition reads the freshest currently valid row transactionally. The
     /// write grants no Task authority by itself.
+    ///
+    /// The value must be producer-sealed. A digest-correct attestation rebuilt
+    /// from its durable/public parts is unsealed and is rejected here, so a
+    /// caller that can only construct parts cannot mint trusted physical
+    /// evidence.
     pub fn record_enforcement_profile_attestation(
         &self,
         attestation: &agentype_agent_contract::EnforcementProfileAttestation,
@@ -4463,6 +4498,24 @@ impl Kernel {
     /// no mode and stays on the frozen coarse path.
     #[cfg(any(test, feature = "runtime-internal"))]
     pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
+        self.typed_readiness(id, TypedReadinessMode::CoarseAcquisition)
+    }
+
+    /// Readiness-only gate for the `SECURITY_V1` path (B5.2-E).
+    ///
+    /// Identical to [`check_typed_acquisition_readiness`] except that it expects
+    /// a `SECURITY_V1` Task: the runtime has already selected the security path
+    /// from the durable mode, and the security path still needs the same
+    /// Task/Batch/partition/backoff readiness proof. It grants no authority and
+    /// creates nothing. A `LEGACY` or `COARSE_V1` Task is rejected, so the two
+    /// probes cannot be swapped for one another.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn check_typed_security_readiness(&self, id: &TaskId) -> Result<(), Error> {
+        self.typed_readiness(id, TypedReadinessMode::SecurityV1)
+    }
+
+    #[cfg(any(test, feature = "runtime-internal"))]
+    fn typed_readiness(&self, id: &TaskId, expectation: TypedReadinessMode) -> Result<(), Error> {
         let now = self.clock.now();
         self.store.query(|conn| {
             let (
@@ -4524,6 +4577,11 @@ impl Kernel {
                             id.as_str()
                         )));
                     }
+                    if expectation == TypedReadinessMode::SecurityV1 {
+                        return Err(Error::invalid_authority(
+                            "the B5 security readiness gate requires a SECURITY_V1 task; a legacy task has no security contract",
+                        ));
+                    }
                 }
                 "TYPED" => {
                     let stored = security_mode.ok_or_else(|| {
@@ -4541,10 +4599,24 @@ impl Kernel {
                                 ))
                             },
                         )?;
-                    if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
-                        return Err(Error::invalid_authority(
-                            "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
-                        ));
+                    match expectation {
+                        TypedReadinessMode::CoarseAcquisition
+                            if mode
+                                == agentype_agent_contract::SecurityContractMode::SecurityV1 =>
+                        {
+                            return Err(Error::invalid_authority(
+                                "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
+                            ));
+                        }
+                        TypedReadinessMode::SecurityV1
+                            if mode
+                                != agentype_agent_contract::SecurityContractMode::SecurityV1 =>
+                        {
+                            return Err(Error::invalid_authority(
+                                "the B5 security readiness gate requires a SECURITY_V1 task; a coarse task cannot be qualified by the security path",
+                            ));
+                        }
+                        _ => {}
                     }
                 }
                 other => {

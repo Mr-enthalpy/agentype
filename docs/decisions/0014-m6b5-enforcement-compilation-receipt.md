@@ -219,6 +219,98 @@ waiting state or declines production acquisition until the secured start exists.
 Kernel refusal protects authority; it does not by itself keep the scheduler
 live.
 
+B5.2-E implements the hold at the acquisition facade. `acquire_typed_task` reads
+the Task's durable mode first: a `LEGACY`/`COARSE_V1` Task keeps the frozen coarse
+path, and a `SECURITY_V1` Task is enumerated and then **refused before** any
+Attempt, Lease, `ProvisioningBinding` or Task NACK. The refusal is
+`ProvisioningResolutionError::SecurityHold`, which the runtime reports as
+`DispatchOneOutcome::TypedDeferred` and backs with a dedicated
+`security_hold_cooldown` (default 30 s) rather than the 1 s candidate cooldown. The
+Task therefore stays `QUEUED` across cycles and lease-expiry sweeps: the hold is a
+bounded, explainable waiting state, not a known-failing acquisition attempt.
+
+A hold is **candidate-local**, exactly like an ordinary deferral. The typed probe
+window is ordered (`priority DESC`, `created_at ASC`) and bounded by
+`probe_limit`, so returning as soon as the first held Task is seen would let a
+`SECURITY_V1` Task consume the cycle's only probe slot ahead of a runnable
+`COARSE_V1` Task behind it; a run of such Tasks would delay the coarse work once
+per Task, per cooldown. `dispatch_typed_one` therefore records the hold detail,
+applies the hold cooldown, and **continues scanning** the remaining candidates. It
+reports `TypedDeferred` with the hold detail only when nothing in the window was
+actually started, and the generic deferral when only ordinary candidates
+deferred. Independence holds in both directions: held security Tasks do not
+starve coarse work, and a later candidate's failure does not convert an earlier
+hold into a Task failure.
+
+The hold enumerates the **complete** security round before refusing, using the
+mode-aware resolver entry points — or reports a **provisional** lower bound when
+the shared probe deadline expires or the observation drifts (below).
+`CandidateMode::Coarse` keeps the B5.1 gates (including the coarse readiness
+rejection of `SECURITY_V1`) and the frozen `can_provision_task` relation;
+`CandidateMode::SecurityV1` applies the reusable
+`can_provision_task_source_config_reusable` conjunct, adds no coarse
+exact-reference claim, and uses `Kernel::check_typed_security_readiness`. That
+split is required because the coarse-only `SECURITY_V1` readiness rejection would
+otherwise turn the security path's own readiness proof into a failure, while the
+coarse `sandbox_policy_within` exact-reference check would wrongly reject a legal
+narrower Task policy. The security path still deliberately omits `can_execute` for
+the same reason; the whole-round identity and `Eligible_B4,reusable` facts are
+proven, qualification over `P_eff` and the imported profile remains B5.4's.
+Omitting `can_execute` here consumes no authority: no Attempt or Lease is created.
+
+The two readiness probes are **mode proofs**, not two polarities of one check.
+A bare `reject_security_v1: bool` could only mean "do not reject `SECURITY_V1`",
+so the security probe also accepted an ordinary `COARSE_V1` Task: it proved
+readiness without proving *which* contract the Task holds. Both entries now name
+the durable mode they expect (`TypedReadinessMode::CoarseAcquisition` or
+`SecurityV1`), and each rejects the other's Task — and the security probe rejects
+a `LEGACY` Task, which has no security contract at all. The production
+`acquire_typed_task` already reads the durable mode before choosing a path, so
+this is a defence against future callers, not a live bypass today.
+
+The hold is not the durable budget-defer diagnostic of §4. That row is keyed by
+`binding_profile_digest(binding, profile)` and therefore needs the imported
+enforcement profile that B5.4 owns; writing it now would require inventing a
+profile. The hold carries only the observed domain's candidate count and opaque
+digest, so B5.4 can attach the missing profile and convert it into the durable
+block without changing the identity facts.
+
+The hold probe is bounded by the cycle's absolute attestation deadline, and a
+probe that exceeds it must not turn a non-executable Task's diagnostic into a
+cycle abort. `security_hold` therefore treats `ProvisioningDeadlineExceeded` from
+the read-only `SourceConfig` probe as **provisional**: it stops scanning (the
+deadline is shared by the whole probe, so every later attestation would fail for
+the same reason) and returns a hold marked `is_provisional()`, whose diagnostic
+reports "at least N candidate(s) ... the round is not complete". A provisional
+hold is still a hold: it creates no Attempt or Lease, so `control::cycle`'s
+`dispatch_typed_one(...)?` never receives a fatal resolution error for it, and
+unrelated `COARSE_V1` work still dispatches within the same probe window. Only
+the category "the external probe did not finish" is softened. Integrity, storage
+and authority faults raised by the same probe still propagate and fail closed;
+attestation redaction preserves `ProvisioningDeadlineExceeded` (with a fixed
+message, so no private diagnostic escapes) precisely so that distinction survives
+the seam. Because the observed set may be a strict subset of the eligible domain,
+a provisional hold is not a frozen round: B5.4 must re-enumerate before converting
+it into the §4 durable block.
+
+A hold is also provisional when the **observation itself drifted**. The probe is
+not one transaction: it enumerates each matched existing owner and then the pinned
+new-agent route as consecutive reads, so a concurrent catalog publish or an
+agent-binding change can make the union it reports never have existed at one
+instant (observed source A from the existing path at T1, A replaced by B at T2,
+B observed from the new-agent path at T3, reported domain `{A, B}`). The probe
+therefore snapshots the active catalog frontier digest, the Task's pinned
+`AgentTypeRef`, and the sorted matched-agent roster (identity plus bound AgentType
+revision) before and after enumeration, and reports a provisional hold when any
+component changed. Equality of that snapshot is a coherence fence for the claim
+"this union was observed across a stable catalog and roster", not a transactional
+read and not a proof of physical truth; the roster is included because the
+catalog frontier digest covers active sources, configs, policies and security
+declarations but **not** agent bindings. A drifted hold keeps its enumerated count
+as a lower bound and does not spend a second snapshot read when the probe already
+hit its deadline. Neither provisional cause turns into a fatal resolution error:
+both create no Attempt or Lease, so unrelated coarse work still dispatches.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
@@ -345,6 +437,15 @@ complete cost, and an exhausted or unknown round produces a defer over the whole
 domain rather than a winner from the qualifying subset. The durable row binds
 that same complete domain, so a restart re-observing it is one condition.
 
+B5.2-E reuses exactly this construction for the security hold. `security_hold`
+enumerates every existing owner the Task matches plus the pinned new-agent route,
+builds each owner's `SecurityCandidateRound`, and unions the identities into one
+`CandidateDomain`. The reported count and digest are therefore the same
+whole-round facts the durable block would carry, and the hold is never a partial
+selection over whichever owner happened to enumerate first. Because no Attempt or
+Lease exists, a hold is also not a candidate rejection: each owner's own round is
+kept intact for B5.4 to qualify.
+
 The row is owned by the acquisition control plane, not by runtime-local
 `TypedDispatchState.cooldowns`, so it survives restart. A Task holds exactly one
 diagnostic, and its identity is the **currently stored** condition, not the
@@ -389,7 +490,8 @@ importer_id                the trusted importer that observed the domain
 importer_protocol          agentype-enforcement-profile-attest/1
 adapter_kind               exact physical adapter kind
 adapter_binding_key        exact resolved physical key, never the B.4 alias
-issued_at, valid_until     half-open validity window (issued_at <= now < valid_until)
+issued_at, valid_until     half-open validity window (issued_at <= now < valid_until),
+                           at most 3600 s long
 recorded_at                durable write time; not part of freshness
 ```
 
@@ -403,6 +505,63 @@ being trusted. Absence and expiry both reject the candidate with
 `InvalidAuthority` before qualification, config settlement or any Attempt/Lease.
 The row grants no Task authority by itself; it only says which importer
 observed that exact physical domain and when.
+
+**Provenance is fenced at the writer, not inferred from a digest.** The schema
+tag, protocol string, field names and canonical digest function are public, and
+the read path must rebuild a row from those same public parts. A digest-correct
+value is therefore evidence, never authority. `EnforcementProfileAttestation::new`
+is the only constructor that marks a value producer-sealed, and it stays behind
+`provisioning-producer`; the public `from_parts` read path always returns an
+**unsealed** value. `record_enforcement_profile_attestation` rejects an unsealed
+attestation with `InvalidAuthority` and writes no row, so a caller limited to
+public constructors cannot mint a trusted physical observation even with a
+perfectly self-consistent digest. Equality compares the attested facts rather
+than the seal, so a durable-read row still compares equal to the producer's value
+for write-once idempotence without making the read path writable. This is a
+mechanical fence at the persistence boundary, not a claim that the importer
+registry itself is complete: which importers exist and how they are registered
+remains the provisioning composition root's responsibility. `importer_id` is still
+a caller-supplied string, so B5.2-C MUST NOT be recorded as closed until a trusted
+registry binds an importer to an exact `AdapterBinding` and the importer's actual
+observation, and until a reverse test proves that an internal caller knowing every
+profile field and digest still cannot publish an acquirable attestation without
+that authority. Only that registry makes
+`RegisteredImporter → ExactAdapterBinding → ObservedProfile → Attestation` a chain
+rather than four independently forgeable facts.
+
+**B5.2 keeps that registry, the installation epoch and the production whole-round
+budget inside its own gate.** An earlier draft considered moving production
+qualification and budget to B5.4 and leaving B5.2 as non-executing substrate plus a
+scheduler hold. That is not the chosen boundary: B5.2 closes when the trusted
+importer registry binds an importer and installed epoch to the exact
+`AdapterBinding`, when the complete candidate round comes from a controlled
+enumeration rather than a caller-supplied list, and when the budget binds before
+selection in the runtime. B5.4 then commits (`ExecutionSecurityEvidence`) and
+starts physically; it MUST NOT have to re-implement B5.2's candidate-qualification
+control plane. The hold, provisional diagnostics and candidate-identity kernel
+shipped in B5.2-C/D/E are therefore a substrate, not a stage freeze.
+
+**A freshness check needs a validity ceiling, not only an interval.** Requiring
+`issued_at < valid_until` and `issued_at <= now < valid_until` says a row is valid
+*now*; it does not bound how long the observation may be claimed. A producer could
+name a `valid_until` years away, so one observation would outlive the physical
+adapter installation, platform security support, or trusted importer version it
+describes. `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS` (3600 s) is
+therefore enforced inside `validated_parts`, which both `new` and the durable
+`from_parts` read go through: an over-long window is `InvalidNumber` on
+construction **and** on read, so an older or hostile row fails closed instead of
+being trusted. The cap is a value property, not a producer convention, because a
+convention cannot be checked at the persistence boundary.
+
+The ceiling does not replace the installation epoch. Re-installing the physical
+adapter, moving the execution domain, or changing the trusted importer version
+must invalidate older rows even inside one hour, and that cannot be proven from an
+attestation value: it needs a trusted registry that binds `importer identity` and
+an explicit `installation epoch` to the exact `AdapterBinding`, and an acquisition
+check that the row's epoch is the currently installed one. Without a trusted
+registry an epoch would be one more caller-supplied string, which is why the epoch
+is part of the same open P1-C acceptance condition as importer registration rather
+than a separate field added now.
 
 Classification is strict:
 
@@ -459,7 +618,10 @@ proves only that the document is internally consistent: the same caller that
 supplies the support matrix, covered subjects and physical key also computes the
 digest. The acquired profile therefore MUST also have a fresh
 `enforcement_profile_attestations` row for its exact digest, importer identity,
-protocol and resolved physical domain (§4). The gate runs at the top of the
+protocol and resolved physical domain (§4), where "fresh" means valid at the
+acquisition clock **and** inside the one-hour validity ceiling: a window that is
+merely long enough to contain `now` is not a freshness proof. The gate runs at the
+top of the
 `SECURITY_V1` acquisition branch, before the reusable B.4 conjunct,
 `ValidatedSourceBinding::validate`, qualification, config settlement or any
 Attempt/Lease. The caller cannot supply the attestation; it is re-read from the
@@ -1377,6 +1539,11 @@ feature against this profile as proven, limited, or unsupported.
   extend to `externally_delegated_execution`.
 - No new Scheduler authority, no worker-originated Result transport, and no
   in-place migration.
+- B5.2 is not frozen by the C/D/E substrate. The trusted importer registry and
+  physical installation epoch, the controlled complete-round enumeration, and
+  runtime whole-round budget defer remain B5.2 acceptance conditions; their absence
+  is not covered by `producer_sealed`, by a bounded attestation window, or by the
+  provisional security hold.
 
 ## Consequences
 

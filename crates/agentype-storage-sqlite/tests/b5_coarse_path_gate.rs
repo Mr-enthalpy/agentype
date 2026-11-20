@@ -474,6 +474,44 @@ fn coarse_and_legacy_tasks_are_not_gated() {
     assert_eq!(claim.task_id, legacy);
 }
 
+/// The two typed readiness probes are mode proofs, not two polarities of one
+/// check: neither may qualify the other path's Task.
+#[test]
+fn each_readiness_probe_requires_its_own_mode() {
+    let env = Env::new("readiness-mode");
+    let kernel = &env.kernel;
+
+    // The security probe accepts exactly a SECURITY_V1 Task.
+    let (security, _pin) = admit_security_v1_task(kernel, "auditor");
+    kernel.check_typed_security_readiness(&security).unwrap();
+
+    // ... and refuses a COARSE_V1 Task: the coarse path owns that authority.
+    let (coarse, _pin) = admit_coarse_v1_task(kernel, "reviewer");
+    let error = kernel.check_typed_security_readiness(&coarse).unwrap_err();
+    assert_gate_rejection(&error);
+
+    // ... and a legacy Task, which has no security contract at all.
+    let (_batch, ids) = kernel
+        .submit_batch(&[TaskSpec::new("legacy", json!({})).partition("general")])
+        .unwrap();
+    let legacy = ids.values().next().unwrap().clone();
+    let error = kernel.check_typed_security_readiness(&legacy).unwrap_err();
+    assert_gate_rejection(&error);
+
+    // The coarse probe stays correct in both directions.
+    kernel.check_typed_acquisition_readiness(&coarse).unwrap();
+    kernel.check_typed_acquisition_readiness(&legacy).unwrap();
+    let error = kernel
+        .check_typed_acquisition_readiness(&security)
+        .unwrap_err();
+    assert_gate_rejection(&error);
+
+    // No probe granted anything.
+    assert_eq!(kernel.task(&security).unwrap().state, TaskState::Queued);
+    assert_eq!(kernel.task(&coarse).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
 /// Drop every trigger so a test can simulate a bypassing direct-SQL writer.
 fn execute_without_guards(env: &Env, sql: &str) {
     let conn = env.raw();
