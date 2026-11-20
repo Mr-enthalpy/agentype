@@ -26,10 +26,11 @@ use crate::{AdapterRegistry, ResolvedAdapterBinding};
 use agentype_adapter_api::AdapterDeadline;
 use agentype_adapter_api::NetworkEnforcement;
 use agentype_agent_contract::{
-    can_provision_task, AcquisitionBudget, AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef,
-    AgentTypeRef, BindingSnapshot, BudgetExhaustion, CandidateDomain, CapabilityRef,
-    CapabilityValue, ConfigStatus, MaterializationDigest, NetworkPolicy, PhysicalSafety,
-    ProvisioningBinding, ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
+    can_provision_task, can_provision_task_source_config_reusable, AcquisitionBudget,
+    AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef, AgentTypeRef, BindingSnapshot,
+    BudgetExhaustion, CandidateDomain, CapabilityRef, CapabilityValue, ConfigStatus,
+    MaterializationDigest, NetworkPolicy, PhysicalSafety, ProvisioningBinding,
+    ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
     SecurityCandidateIdentity, SecurityCandidateOwner, SecurityContractMode, SourceConfig,
     SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
 };
@@ -96,6 +97,10 @@ impl IntegrationFailure {
 pub enum ProvisioningResolutionError {
     NotTypedTask,
     AgentNotBound,
+    /// A `SECURITY_V1` Task is held before acquisition: the B5.4 snapshot and
+    /// secured start do not exist, so no production path may create an Attempt
+    /// or Lease for it. This is a liveness hold, never a Task failure.
+    SecurityHold(SecurityHold),
     NoEligibleSource,
     AgentTypeMissing(AgentTypeRef),
     MissingRevision(String),
@@ -125,6 +130,12 @@ impl std::fmt::Display for ProvisioningResolutionError {
         match self {
             Self::NotTypedTask => write!(f, "task has no typed agent requirement"),
             Self::AgentNotBound => write!(f, "agent has no exact type binding"),
+            Self::SecurityHold(hold) => write!(
+                f,
+                "SECURITY_V1 acquisition is held until the B5.4 secured start exists: {} complete candidate(s) in domain {}",
+                hold.candidates(),
+                hold.domain_digest()
+            ),
             Self::NoEligibleSource => write!(f, "no eligible source/config candidate"),
             Self::AgentTypeMissing(r) => {
                 write!(
@@ -446,6 +457,30 @@ impl SecurityCandidateRound {
             now,
         )
         .map_err(ProvisioningResolutionError::Evidence)
+    }
+}
+
+/// The complete `SECURITY_V1` candidate round a Task would acquire from, held
+/// before any authority exists.
+///
+/// B5.2-E uses this as the scheduler's honest waiting state while the B5.4
+/// snapshot/secured start does not exist. It carries only the complete domain's
+/// count and opaque digest: no profile, no qualification, no Attempt, no Lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityHold {
+    candidates: usize,
+    domain_digest: String,
+}
+
+impl SecurityHold {
+    /// The number of distinct full candidate identities in the complete round.
+    pub fn candidates(&self) -> usize {
+        self.candidates
+    }
+
+    /// The opaque digest of the complete candidate domain.
+    pub fn domain_digest(&self) -> &str {
+        &self.domain_digest
     }
 }
 
@@ -784,6 +819,43 @@ pub(crate) fn resolve_source_candidates(
         execution_registry,
         integrations,
         deadline,
+        CandidateMode::Coarse,
+    )
+}
+
+/// Enumerate the complete `SECURITY_V1` candidate set for an admitted typed
+/// Task, evaluating the reusable B.4 conjunct over the **Task pin** AgentType.
+///
+/// This is a pure, authority-free read used by the B5.2-E scheduler hold. It
+/// applies no qualification and consumes no imported profile: the B5.4 secured
+/// path owns those proofs. Its only job is to make the complete candidate
+/// identity set observable before any Attempt/Lease.
+pub(crate) fn resolve_security_source_candidates(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let (agent_type, _status) = kernel
+        .get_agent_type(&requirement.required_type)?
+        .ok_or_else(|| {
+            ProvisioningResolutionError::AgentTypeMissing(requirement.required_type.clone())
+        })?;
+    enumerate_candidates(
+        kernel,
+        task_id,
+        &requirement,
+        &agent_type,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+        CandidateMode::SecurityV1,
     )
 }
 
@@ -817,7 +889,53 @@ pub(crate) fn resolve_source_candidates_for_agent(
         execution_registry,
         integrations,
         deadline,
+        CandidateMode::Coarse,
     )
+}
+
+/// [`resolve_source_candidates_for_agent`] for the `SECURITY_V1` path.
+pub(crate) fn resolve_security_source_candidates_for_agent(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    agent_id: &agentype_core::LogicalAgentId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let bound = kernel
+        .get_logical_agent_type_binding(agent_id)?
+        .ok_or(ProvisioningResolutionError::AgentNotBound)?;
+    let (agent_type, _status) = kernel
+        .get_agent_type(&bound)?
+        .ok_or_else(|| ProvisioningResolutionError::AgentTypeMissing(bound.clone()))?;
+    enumerate_candidates(
+        kernel,
+        task_id,
+        &requirement,
+        &agent_type,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+        CandidateMode::SecurityV1,
+    )
+}
+
+/// Which execution contract a candidate set is enumerated for.
+///
+/// The two paths are disjoint by durable mode, not by caller convention: the
+/// coarse path refuses a `SECURITY_V1` AgentType or source, and the security
+/// path refuses a `COARSE_V1` one. This mirrors the acquisition transaction's
+/// re-proof, so an enumeration cannot offer a candidate the durable authority
+/// would reject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateMode {
+    Coarse,
+    SecurityV1,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -830,16 +948,27 @@ fn enumerate_candidates(
     execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
+    mode: CandidateMode,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
     // Internal enumeration is also used outside the acquisition facade. Reject
     // known unreadiness before any source-private I/O; the final transaction
-    // still re-proves readiness and owns all Attempt/Lease authority.
-    kernel.check_typed_acquisition_readiness(task_id)?;
-    // M6-B.5 B5.1 gate: a `SECURITY_V1` AgentType revision is a full-path
-    // identity the coarse acquisition path cannot execute, so it has no eligible
-    // coarse candidate. This is a candidate-local ineligibility, not a Task
-    // failure: the Task stays QUEUED for the B.5 execution path.
-    if kernel.agent_type_security_mode(&agent_type.type_ref)? == SecurityContractMode::SecurityV1 {
+    // still re-proves readiness and owns all Attempt/Lease authority. The coarse
+    // gate also rejects `SECURITY_V1`; the security path proves the same
+    // readiness without that coarse-only rejection.
+    match mode {
+        CandidateMode::Coarse => kernel.check_typed_acquisition_readiness(task_id)?,
+        CandidateMode::SecurityV1 => kernel.check_typed_security_readiness(task_id)?,
+    }
+    // M6-B.5 B5.1 gate: the coarse path cannot execute a `SECURITY_V1`
+    // AgentType revision, and the security path cannot execute a `COARSE_V1`
+    // one. This is a candidate-local ineligibility, not a Task failure: the
+    // Task stays QUEUED for the path that owns its mode.
+    let agent_mode = kernel.agent_type_security_mode(&agent_type.type_ref)?;
+    let agent_mode_matches = match mode {
+        CandidateMode::Coarse => agent_mode != SecurityContractMode::SecurityV1,
+        CandidateMode::SecurityV1 => agent_mode == SecurityContractMode::SecurityV1,
+    };
+    if !agent_mode_matches {
         return Err(ProvisioningResolutionError::NoEligibleSource);
     }
     let task = kernel.task(task_id)?;
@@ -863,11 +992,16 @@ fn enumerate_candidates(
         let source = kernel
             .get_spawn_source(&source_ref)?
             .ok_or_else(|| ProvisioningResolutionError::MissingRevision("spawn_source".into()))?;
-        // M6-B.5 B5.1 gate: a `SECURITY_V1` source revision is a full-path
-        // source even when it adds no `P_source` narrowing. The coarse path
-        // cannot run its imported-enforcement coverage check, so the source is
-        // not a coarse candidate.
-        if kernel.spawn_source_security_mode(&source_ref)? == SecurityContractMode::SecurityV1 {
+        // M6-B.5 B5.1 gate: the source mode must match the path. A
+        // `SECURITY_V1` source is a full-path source even when it adds no
+        // `P_source` narrowing, and a `COARSE_V1` source cannot provision a
+        // `SECURITY_V1` Task.
+        let source_mode = kernel.spawn_source_security_mode(&source_ref)?;
+        let source_mode_matches = match mode {
+            CandidateMode::Coarse => source_mode != SecurityContractMode::SecurityV1,
+            CandidateMode::SecurityV1 => source_mode == SecurityContractMode::SecurityV1,
+        };
+        if !source_mode_matches {
             continue;
         }
         let policy = kernel
@@ -932,14 +1066,29 @@ fn enumerate_candidates(
                 Err(err) if err.is_candidate_ineligible() => continue,
                 Err(err) => return Err(err),
             };
-            match can_provision_task(
-                agent_type,
-                &source,
-                &config,
-                &evidence,
-                &catalog,
-                &requirement.hard,
-            ) {
+            // The coarse path keeps the frozen `COARSE_V1` relation; the
+            // security path intersects the reusable B.4 conjunct and adds no
+            // coarse exact-reference claim. Qualification over `P_eff` and the
+            // imported profile is B5.4's, so it is not attempted here.
+            let eligibility = match mode {
+                CandidateMode::Coarse => can_provision_task(
+                    agent_type,
+                    &source,
+                    &config,
+                    &evidence,
+                    &catalog,
+                    &requirement.hard,
+                ),
+                CandidateMode::SecurityV1 => can_provision_task_source_config_reusable(
+                    agent_type,
+                    &source,
+                    &config,
+                    &evidence,
+                    &catalog,
+                    &requirement.hard,
+                ),
+            };
+            match eligibility {
                 Ok(()) => {}
                 Err(err) => {
                     let err = ProvisioningResolutionError::Evidence(err);
@@ -1165,6 +1314,73 @@ pub(crate) struct TypedAcquisitionOutcome {
     pub launch_descriptor: String,
 }
 
+/// Enumerate the complete `SECURITY_V1` candidate set for a Task and freeze its
+/// full identity domain, without creating any authority.
+///
+/// The round spans every existing bound agent the Task matches (the same
+/// existing-first relation the acquisition uses) and the pinned new-agent route.
+/// Each owner is its own round because the owner is part of the identity; the
+/// hold carries the union of every round's identities. An owner with no
+/// candidate contributes nothing, while a global fault propagates.
+fn security_hold(
+    kernel: &Kernel,
+    task_id: &TaskId,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<SecurityHold, ProvisioningResolutionError> {
+    let requirement = kernel
+        .get_task_agent_requirement(task_id)?
+        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
+    let mut identities: Vec<SecurityCandidateIdentity> = Vec::new();
+    for existing in kernel.match_existing_agents_for_task(task_id)? {
+        match resolve_security_source_candidates_for_agent(
+            kernel,
+            task_id,
+            &existing.logical_agent_id,
+            adapters,
+            execution_registry,
+            integrations,
+            deadline,
+        ) {
+            Ok(candidates) => {
+                let round = SecurityCandidateRound::new(
+                    SecurityCandidateOwner::ExistingAgent(existing.logical_agent_id),
+                    candidates,
+                )?;
+                identities.extend(round.identities().iter().cloned());
+            }
+            Err(err) if err.is_candidate_local_for_dispatch() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    match resolve_security_source_candidates(
+        kernel,
+        task_id,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+    ) {
+        Ok(candidates) => {
+            let round = SecurityCandidateRound::new(
+                SecurityCandidateOwner::NewAgentType(requirement.required_type.clone()),
+                candidates,
+            )?;
+            identities.extend(round.identities().iter().cloned());
+        }
+        Err(err) if err.is_candidate_local_for_dispatch() => {}
+        Err(err) => return Err(err),
+    }
+    let domain = CandidateDomain::from_identities(identities);
+    let cost = domain.acquisition_cost();
+    Ok(SecurityHold {
+        candidates: cost.candidates(),
+        domain_digest: domain.digest().to_string(),
+    })
+}
+
 /// The single, Scheduler-owned authority-bearing typed acquisition.
 ///
 /// It applies the frozen spec 06 existing-first order: the B.3 ranked READY
@@ -1186,6 +1402,26 @@ pub(crate) fn acquire_typed_task(
 ) -> Result<TypedAcquisitionOutcome, ProvisioningResolutionError> {
     // Readiness rejection must win over semantic/source resolution faults for
     // work that cannot be dispatched. This read grants no acquisition authority.
+    //
+    // B5.2-E: production acquisition of a `SECURITY_V1` Task belongs to the
+    // B5.4 snapshot/secured start, which does not exist. Prove the same
+    // readiness without the coarse-only mode rejection, enumerate the complete
+    // security round so the hold is explainable and the identity facts are
+    // ready for B5.4, then refuse before any Attempt, Lease, ProvisioningBinding
+    // or Task NACK. The Task stays QUEUED, so repeated cycles cannot turn a
+    // non-executable qualification into an ordinary `QUEUED -> LEASED ->
+    // expiry` claim.
+    if kernel.task_security_mode(task_id)? == Some(SecurityContractMode::SecurityV1) {
+        kernel.check_typed_security_readiness(task_id)?;
+        return Err(ProvisioningResolutionError::SecurityHold(security_hold(
+            kernel,
+            task_id,
+            adapters,
+            execution_registry,
+            integrations,
+            attest_deadline,
+        )?));
+    }
     kernel.check_typed_acquisition_readiness(task_id)?;
     let existing = kernel.match_existing_agents_for_task(task_id)?;
     let mut last_error: Option<ProvisioningResolutionError> = None;
@@ -4858,6 +5094,217 @@ mod tests {
             vec![wrong_type],
         )
         .is_err());
+    }
+
+    /// Publish one `SECURITY_V1` AgentType and one `SECURITY_V1` source/config
+    /// that the reusable B.4 conjunct accepts. The authored policy reference is
+    /// returned so the Generation policy can reuse the same deny-all bytes.
+    fn publish_security_fixture(kernel: &Kernel) -> (AgentTypeRef, SandboxPolicyRef) {
+        let policy_ref = SandboxPolicyRef::new("security-agent-policy", 1).unwrap();
+        kernel
+            .publish_sandbox_policy(&policy_ref, &NormalizedSandboxPolicy::deny_all())
+            .unwrap();
+        let agent = AgentType {
+            type_ref: AgentTypeRef::new("secure-reviewer", 1).unwrap(),
+            based_on: None,
+            contract: AgentTypeContract {
+                allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                required_capabilities: BTreeMap::new(),
+                affinity: AffinityConstraint::Any,
+                budget_ceiling: Budget::new(100.0).unwrap(),
+                security: SecurityContract {
+                    workspace: WorkspaceMode::ReadOnly,
+                    network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                },
+                lifecycle: [LifecycleMode::Ephemeral].into_iter().collect(),
+                continuity: ContinuityMode::None,
+                sandbox_policy: Some(policy_ref.clone()),
+                anchor_constraint: None,
+            },
+        };
+        kernel
+            .publish_agent_type_with_security(&agent, SecurityContractMode::SecurityV1)
+            .unwrap();
+        publish_security_source(kernel);
+        (agent.type_ref, policy_ref)
+    }
+
+    fn publish_security_source(kernel: &Kernel) {
+        let policy = AdapterBindingPolicy {
+            policy_ref: AdapterPolicyRef::new("security-policy", 1).unwrap(),
+            adapter_kind: "default".into(),
+            binding_ref: "primary".into(),
+            required_safety: safety(),
+            status: ConfigStatus::Active,
+        };
+        kernel.publish_adapter_binding_policy(&policy).unwrap();
+        let source = SpawnSource {
+            source_ref: SpawnSourceRef::new("security-source", 1).unwrap(),
+            adapter_policy: policy.policy_ref.clone(),
+            lifecycle_modes: [LifecycleMode::Ephemeral].into_iter().collect(),
+            continuity_modes: [ContinuityMode::None].into_iter().collect(),
+            functional_envelope: BTreeMap::new(),
+            claims: Vec::new(),
+            status: SourceStatus::Active,
+        };
+        kernel
+            .publish_spawn_source_with_security(
+                &source,
+                Some(&SpawnSourceSecurityDeclaration::without_policy(
+                    source.source_ref.clone(),
+                    EnforcementProfileRef::new("agentype-enforcement", "policy-only", 1).unwrap(),
+                )),
+            )
+            .unwrap();
+        let body = json!({"model": "opaque"});
+        let config = SourceConfig {
+            config_ref: SourceConfigRef::new(source.source_ref.clone(), "config", 1).unwrap(),
+            config_digest: ConfigDigest::new(canonical_json_body_digest(&body)).unwrap(),
+            lifecycle_modes: None,
+            continuity_modes: None,
+            credential_refs: Vec::new(),
+            claims: Vec::new(),
+            status: ConfigStatus::Active,
+        };
+        kernel
+            .publish_source_config(&config, &SourceConfigBody::OpaqueJson(body))
+            .unwrap();
+    }
+
+    fn security_typed_task(
+        kernel: &Kernel,
+        pin: AgentTypeRef,
+        policy_ref: SandboxPolicyRef,
+    ) -> TaskId {
+        let generation = kernel
+            .create_generation_with_security_mode(
+                json!({}),
+                Some(agentype_agent_contract::GenerationPolicy {
+                    allowed_information_functions: vec![agentype_core::InformationFunction::Expand],
+                    max_workspace: WorkspaceMode::ReadOnly,
+                    max_network: NetworkPolicy::Disabled,
+                    requires_attempt_isolation: false,
+                    min_continuity: ContinuityMode::None,
+                    sandbox_policy: Some(policy_ref),
+                    budget_ceiling: Budget::new(100.0).unwrap(),
+                    allowed_affinity: None,
+                    anchor_constraint: None,
+                }),
+                SecurityContractMode::SecurityV1,
+            )
+            .unwrap();
+        let intent = RawWorkIntent {
+            raw_intent_key: "security-work".into(),
+            objective: "security work".into(),
+            information_function: agentype_core::InformationFunction::Expand,
+            semantic_input_set: SemanticInputSet::new(),
+            rationale: None,
+            suggested_task_spec: Some(TaskSpec::new("audit", json!({})).partition("general")),
+        };
+        let proposal = kernel
+            .compile_root_intent(&generation.generation_id, intent, "session", 1)
+            .unwrap();
+        kernel
+            .admit_typed_proposal_with_security_mode(
+                &proposal.proposal_id,
+                0,
+                None,
+                AgentRequirementDraft {
+                    required_type: AgentTypeSelector::Exact(pin),
+                    required_capabilities: BTreeMap::new(),
+                    required_network: NetworkPolicy::Disabled,
+                    required_attempt_isolation: false,
+                    sandbox_policy: None,
+                    required_anchor: None,
+                    budget: Budget::new(50.0).unwrap(),
+                },
+                SecurityContractMode::SecurityV1,
+            )
+            .unwrap()
+    }
+
+    /// B5.2-E liveness: with B5.4 absent, the scheduler must hold a
+    /// `SECURITY_V1` Task with an explainable reason and never create an
+    /// Attempt/Lease that could only expire.
+    #[test]
+    fn a_security_v1_task_is_held_without_an_attempt_across_cycles() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let first = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        let crate::DispatchOneOutcome::TypedDeferred { detail } = first else {
+            panic!("a SECURITY_V1 Task must be held, got {first:?}");
+        };
+        assert!(detail.contains("SECURITY_V1"), "{detail}");
+        assert!(
+            detail.contains("held until the B5.4 secured start exists"),
+            "{detail}"
+        );
+        assert!(detail.contains("1 complete candidate(s)"), "{detail}");
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+
+        // The control loop's expiry sweep must not convert the hold into a
+        // failure or a lease; the Task is unchanged after another cycle.
+        kernel.expire_leases(false).unwrap();
+        let second = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        assert!(matches!(
+            second,
+            crate::DispatchOneOutcome::NoWork | crate::DispatchOneOutcome::TypedDeferred { .. }
+        ));
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
+    }
+
+    /// The empty round is still a hold, never a fallback to a `COARSE_V1`
+    /// source and never a Task failure.
+    #[test]
+    fn a_security_v1_task_without_a_security_candidate_is_held_not_failed() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        // A coarse source is present, so an empty security round can only be
+        // explained by mode filtering, not by a missing catalog.
+        let _coarse = publish(&kernel);
+        let source_ref = SourceConfigRef::new(
+            SpawnSourceRef::new("security-source", 1).unwrap(),
+            "config",
+            1,
+        )
+        .unwrap();
+        kernel
+            .set_source_config_status(&source_ref, ConfigStatus::Disabled)
+            .unwrap();
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let adapters = adapters_with_binding();
+        let registry = execution_registry();
+        let integrations = si(EchoMaterializer);
+        let config = crate::TypedDispatchConfig::default();
+        let state = crate::TypedDispatchState::new();
+        let dispatcher = crate::Dispatcher::for_tests(&kernel, &registry, &adapters);
+
+        let outcome = dispatcher
+            .dispatch_typed_one(&integrations, &config, &state)
+            .unwrap();
+        let crate::DispatchOneOutcome::TypedDeferred { detail } = outcome else {
+            panic!("an empty SECURITY_V1 round must still be held, got {outcome:?}");
+        };
+        assert!(detail.contains("0 complete candidate(s)"), "{detail}");
+        assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+        assert_eq!(kernel.attempt_count_for_task(&task).unwrap(), 0);
     }
 
     #[test]

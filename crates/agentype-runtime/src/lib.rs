@@ -48,7 +48,7 @@ pub use provisioning_admin::ProvisioningAdmin;
 // `Kernel` and are owned by the production `ControlLoopService`. Only the
 // source-integration SPI and the diagnostic candidate value are public here.
 pub use provisioning_resolver::{
-    PreparedSource, ProvisioningResolutionError, SourceConfigIntegration,
+    PreparedSource, ProvisioningResolutionError, SecurityHold, SourceConfigIntegration,
     SourceIntegrationRegistry, SourceProvisioningCandidate,
 };
 // M6-B operator catalog administration: publish the immutable B.2 capability /
@@ -1489,6 +1489,11 @@ pub struct TypedDispatchConfig {
     probe_limit: usize,
     candidate_cooldown: Duration,
     ambiguous_cooldown: Duration,
+    /// Long re-probe bound for a `SECURITY_V1` Task held before its B5.4
+    /// secured acquisition path exists. The condition changes only when the
+    /// binary or the catalog does, so a short coarse-style cooldown would turn
+    /// the hold into unnecessary attestation work.
+    security_hold_cooldown: Duration,
     attest_budget: Duration,
     prepare_budget: Duration,
 }
@@ -1511,9 +1516,22 @@ impl TypedDispatchConfig {
             probe_limit,
             candidate_cooldown,
             ambiguous_cooldown,
+            security_hold_cooldown: Duration::from_secs(30),
             attest_budget,
             prepare_budget,
         })
+    }
+
+    /// Set the re-probe bound for a held `SECURITY_V1` Task. A zero bound is
+    /// raised to the default: the hold must stay a bounded waiting state, not a
+    /// busy loop that re-enumerates the round every cycle.
+    pub fn with_security_hold_cooldown(mut self, value: Duration) -> Self {
+        self.security_hold_cooldown = if value.is_zero() {
+            Duration::from_secs(30)
+        } else {
+            value
+        };
+        self
     }
 
     pub fn probe_limit(&self) -> usize {
@@ -1526,6 +1544,10 @@ impl TypedDispatchConfig {
 
     pub fn ambiguous_cooldown(&self) -> Duration {
         self.ambiguous_cooldown
+    }
+
+    pub fn security_hold_cooldown(&self) -> Duration {
+        self.security_hold_cooldown
     }
 
     pub fn attest_budget(&self) -> Duration {
@@ -1543,6 +1565,7 @@ impl Default for TypedDispatchConfig {
             probe_limit: 8,
             candidate_cooldown: Duration::from_secs(1),
             ambiguous_cooldown: Duration::from_secs(30),
+            security_hold_cooldown: Duration::from_secs(30),
             attest_budget: Duration::from_secs(5),
             prepare_budget: Duration::from_secs(5),
         }
@@ -1926,6 +1949,21 @@ impl<'a> Dispatcher<'a> {
     ) -> Result<Option<DispatchOneOutcome>, DispatchError> {
         use ProvisioningResolutionError as P;
         match &err {
+            // B5.2-E: a `SECURITY_V1` Task has no production acquisition path
+            // until the B5.4 snapshot/secured start exists. The resolver has
+            // already enumerated the complete candidate round without creating
+            // authority. Report the hold with its full-domain fact and leave the
+            // Task QUEUED: no Attempt, Lease, ProvisioningBinding or NACK is
+            // created, so no cycle can convert this into an expiring Claim.
+            P::SecurityHold(_) => {
+                state.defer(
+                    task_id.clone(),
+                    cooldown_until(Instant::now(), config.security_hold_cooldown()),
+                );
+                Ok(Some(DispatchOneOutcome::TypedDeferred {
+                    detail: err.to_string(),
+                }))
+            }
             // The authority transaction committed a claim, then pure
             // preparation reported unavailability or authority loss. The
             // settlement/recovery consequence already belongs to that claim.

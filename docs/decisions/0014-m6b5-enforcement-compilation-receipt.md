@@ -219,6 +219,38 @@ waiting state or declines production acquisition until the secured start exists.
 Kernel refusal protects authority; it does not by itself keep the scheduler
 live.
 
+B5.2-E implements the hold at the acquisition facade. `acquire_typed_task` reads
+the Task's durable mode first: a `LEGACY`/`COARSE_V1` Task keeps the frozen coarse
+path, and a `SECURITY_V1` Task is enumerated and then **refused before** any
+Attempt, Lease, `ProvisioningBinding` or Task NACK. The refusal is
+`ProvisioningResolutionError::SecurityHold`, which the runtime reports as
+`DispatchOneOutcome::TypedDeferred` and backs with a dedicated
+`security_hold_cooldown` (default 30 s) rather than the 1 s candidate cooldown. The
+Task therefore stays `QUEUED` across cycles and lease-expiry sweeps: the hold is a
+bounded, explainable waiting state, not a known-failing acquisition attempt.
+
+The hold enumerates the **complete** security round before refusing, using the
+mode-aware resolver entry points. `CandidateMode::Coarse` keeps the B5.1 gates
+(including the coarse readiness rejection of `SECURITY_V1`) and the frozen
+`can_provision_task` relation; `CandidateMode::SecurityV1` applies the reusable
+`can_provision_task_source_config_reusable` conjunct, adds no coarse
+exact-reference claim, and uses
+`Kernel::check_typed_security_readiness`. That split is required because the
+coarse-only `SECURITY_V1` readiness rejection would otherwise turn the security
+path's own readiness proof into a failure, while the coarse `sandbox_policy_within`
+exact-reference check would wrongly reject a legal narrower Task policy. The
+security path still deliberately omits `can_execute` for the same reason; the
+whole-round identity and `Eligible_B4,reusable` facts are proven, qualification
+over `P_eff` and the imported profile remains B5.4's. Omitting `can_execute` here
+consumes no authority: no Attempt or Lease is created.
+
+The hold is not the durable budget-defer diagnostic of §4. That row is keyed by
+`binding_profile_digest(binding, profile)` and therefore needs the imported
+enforcement profile that B5.4 owns; writing it now would require inventing a
+profile. The hold carries only the complete domain's candidate count and opaque
+digest, so B5.4 can attach the missing profile and convert it into the durable
+block without changing the identity facts.
+
 ### 4. Compile budget, memoization, and no partial selection
 
 Compilation cache key:
@@ -344,6 +376,15 @@ checked with `AcquisitionBudget::require_whole_round` against the round's
 complete cost, and an exhausted or unknown round produces a defer over the whole
 domain rather than a winner from the qualifying subset. The durable row binds
 that same complete domain, so a restart re-observing it is one condition.
+
+B5.2-E reuses exactly this construction for the security hold. `security_hold`
+enumerates every existing owner the Task matches plus the pinned new-agent route,
+builds each owner's `SecurityCandidateRound`, and unions the identities into one
+`CandidateDomain`. The reported count and digest are therefore the same
+whole-round facts the durable block would carry, and the hold is never a partial
+selection over whichever owner happened to enumerate first. Because no Attempt or
+Lease exists, a hold is also not a candidate rejection: each owner's own round is
+kept intact for B5.4 to qualify.
 
 The row is owned by the acquisition control plane, not by runtime-local
 `TypedDispatchState.cooldowns`, so it survives restart. A Task holds exactly one

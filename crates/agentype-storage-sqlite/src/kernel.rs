@@ -914,6 +914,22 @@ impl Kernel {
         self.tx(|tx, _| crate::catalog::agent_type_security_mode(tx, reference))
     }
 
+    /// The durable `SecurityContractMode` of a typed Task, or `None` for a
+    /// `LEGACY` Task with no agent requirement.
+    ///
+    /// B5.2-E reads this before typed acquisition so a `SECURITY_V1` Task is
+    /// held without an Attempt/Lease instead of falling into the coarse path.
+    /// A `TYPED` Task whose requirement row is missing stays a corruption
+    /// failure rather than a silent `None`.
+    pub fn task_security_mode(&self, id: &TaskId) -> Result<Option<SecurityContractMode>, Error> {
+        self.tx(|tx, _| {
+            if crate::requirement::task_agent_requirement_mode(tx, id)? != "TYPED" {
+                return Ok(None);
+            }
+            Ok(Some(crate::requirement::task_security_mode(tx, id)?))
+        })
+    }
+
     pub fn spawn_source_security_declaration(
         &self,
         reference: &SpawnSourceRef,
@@ -4463,6 +4479,23 @@ impl Kernel {
     /// no mode and stays on the frozen coarse path.
     #[cfg(any(test, feature = "runtime-internal"))]
     pub fn check_typed_acquisition_readiness(&self, id: &TaskId) -> Result<(), Error> {
+        self.typed_readiness(id, true)
+    }
+
+    /// Readiness-only gate for the `SECURITY_V1` path (B5.2-E).
+    ///
+    /// Identical to [`check_typed_acquisition_readiness`] except that it does
+    /// not reject a `SECURITY_V1` Task: the runtime has already selected the
+    /// security path from the durable mode, and the security path still needs
+    /// the same Task/Batch/partition/backoff readiness proof. It grants no
+    /// authority and creates nothing.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn check_typed_security_readiness(&self, id: &TaskId) -> Result<(), Error> {
+        self.typed_readiness(id, false)
+    }
+
+    #[cfg(any(test, feature = "runtime-internal"))]
+    fn typed_readiness(&self, id: &TaskId, reject_security_v1: bool) -> Result<(), Error> {
         let now = self.clock.now();
         self.store.query(|conn| {
             let (
@@ -4541,7 +4574,9 @@ impl Kernel {
                                 ))
                             },
                         )?;
-                    if mode == agentype_agent_contract::SecurityContractMode::SecurityV1 {
+                    if reject_security_v1
+                        && mode == agentype_agent_contract::SecurityContractMode::SecurityV1
+                    {
                         return Err(Error::invalid_authority(
                             "a SECURITY_V1 task requires the B5 security execution path; the coarse typed acquisition path cannot grant it authority",
                         ));
