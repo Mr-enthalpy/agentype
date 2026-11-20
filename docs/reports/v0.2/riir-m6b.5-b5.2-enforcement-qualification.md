@@ -2890,6 +2890,45 @@ revision-22 mutation check is recorded in the
 post-enumeration snapshot comparison fails the drift test at
 `assert!(hold.is_provisional())`.
 
+Revision 23 ships the P1-C registry/installation epoch and the P1-D
+single-observation round and budget gate on a new branch from `main` after PR
+#38–#40 merged, and re-runs the full gate:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --all-features --exclude agentype-public-api-boundary --exclude agentype-public-api-contract-only` | pass, 0 failed; 1142 passed in 58 suites |
+| `cargo test -p agentype-public-api-boundary --doc` | 38 passed, 0 failed |
+| `cargo test -p agentype-public-api-contract-only --doc` | 3 passed, 0 failed |
+
+At revision 23 the runtime lib suite holds 310
+(`a_complete_security_round_is_built_from_one_observation` and
+`a_complete_security_round_checks_the_budget_before_selecting_a_candidate` are the
+new ones), `b5_security_acquisition` holds 35
+(`an_attestation_must_name_a_registered_installation_epoch`,
+`an_attestation_must_match_its_epochs_importer_and_physical_domain`,
+`a_retired_installation_epoch_invalidates_every_older_attestation`,
+`knowing_every_field_and_the_old_epoch_cannot_publish_an_acquirable_attestation`,
+`an_installation_epoch_is_immutable_and_cannot_move_backwards`,
+`a_protocol_upgrade_retires_the_previous_epoch_for_the_same_domain`, and
+`a_stale_expected_enforcement_plan_digest_is_rejected_before_any_authority`), and
+`b5_enforcement` holds 47 unchanged.
+
+Revision-23 mutation checks, both reverted before the gate run above:
+
+- dropping the `expected_plan_digest` comparison makes
+  `a_stale_expected_enforcement_plan_digest_is_rejected_before_any_authority`
+  acquire successfully instead of rejecting;
+- dropping the post-enumeration observation-digest comparison fails
+  `a_security_hold_reports_provisional_when_the_catalog_drifts_mid_round` at
+  `assert!(hold.is_provisional())`.
+
+Revision 23 therefore closes item 16's registry and epoch condition and item 22's
+enumeration and pure-gate half, but it still does **not** freeze B5.2, does not
+deliver the production secured acquisition path, does not write a production
+durable budget defer, and does not claim B5.4 capability.
+
 Public-API probes added in `tests/public-api/src/lib.rs`:
 
 - `b5_composite_authority_surface` — the composite-authority, qualified-candidate,
@@ -2917,13 +2956,13 @@ Public-API probes added in `tests/public-api/src/lib.rs`:
 | 13 | Bind the imported profile to the resolved physical `adapter_binding_key`, not the B.4 alias (P1, rev 11) | `primary -> k2` positive with cache key and subject carrying `k2`; a profile imported for `k1` under the same alias is rejected; the acquisition transactions pass the selection key. Implemented in revision 11 (`39e85c5`) |
 | 14 | Enforce `Support_imported ⊆ Support_reference_profile` for the fixed reference identity (P2, rev 11) | a reference-identity profile claiming `NetworkEgressRestriction` fails at import; a stricter subset remains valid. Implemented in revision 11 (`39e85c5`) |
 | 15 | Define the complete candidate identity and enumerate every candidate under a whole-round budget (B5.2-D) | **first commit and first test freeze the unified identity**: `LogicalAgent/pinned AgentType + exact Source/Config + physical binding`, including source revision and config digest; two configs or bindings under one agent are distinct; an unknown candidate or exhausted budget cannot partially select. **Implemented in revision 18** as `SecurityCandidateIdentity` / `CandidateDomain::from_identities` and the resolver's frozen `SecurityCandidateRound`; a budget below the complete round is a whole-round defer and the durable block binds the same domain. The acceptance table in the revision-18 section names each case |
-| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case. **Revision 20 adds the writer fence**: only the gated producer constructor seals a value, a digest-correct value rebuilt from public parts is rejected with `InvalidAuthority` and leaves no row, and the durable read stays unsealed. **Revision 22 bounds the claim**: an attestation window longer than `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS` (3600 s) is `InvalidNumber` on construction and on the durable read, so freshness cannot be widened into an unexpiring claim. **Still open:** which importers are registered, that they actually observed the domain, and the physical installation epoch (one hour is not an epoch proof); the registry must bind an importer and installed epoch to the exact `AdapterBinding`, and the reverse test (an internal caller knowing every field and digest still cannot publish an acquirable attestation) is not written |
+| 16 | Prove trusted importer provenance, profile freshness and exact physical-domain ownership (B5.2-C) | the profile is produced by a trusted local importer whose protocol version and physical-domain ownership are verifiable; capability/subject claims cannot be self-declared; freshness has invalidation conditions; renaming cannot escape the reference claim. **Implemented in revision 17** as a durable `enforcement_profile_attestations` row for the exact profile digest, importer protocol and resolved physical domain, re-read transactionally and gated before qualification/Attempt/Lease; the negatives named in the revision-17 acceptance table cover each case. **Revision 20 adds the writer fence**: only the gated producer constructor seals a value, a digest-correct value rebuilt from public parts is rejected with `InvalidAuthority` and leaves no row, and the durable read stays unsealed. **Revision 22 bounds the claim**: an attestation window longer than `ENFORCEMENT_PROFILE_ATTESTATION_MAX_VALIDITY_SECS` (3600 s) is `InvalidNumber` on construction and on the durable read, so freshness cannot be widened into an unexpiring claim. **Revision 23 closes the registry and epoch**: schema v12 adds `enforcement_importer_installations` (one ACTIVE epoch per importer and exact physical domain; immutable identity; retirement final and rows undeletable), the attestation carries `installation_id` and its schema is `2`, the writer requires a matching ACTIVE epoch and `issued_at >= installed_at`, and the acquisition read joins the epoch so a retired installation invalidates every older row even inside the one-hour window. The reverse test now exists: an internal caller knowing every public field and the exact digest, and able to rebuild the old epoch, cannot publish a row acquisition accepts. **Still outside B5.2:** the production provider of imported profiles, and any claim of production secured enforcement |
 | 17 | Wire resolver→Scheduler, revalidate the full candidate set, and handle existing/new agents (B5.2-E) | all qualification proofs close before Attempt/Lease; `SECURED_QUALIFIED` remains non-executable and no ordinary physical start path runs on it; production execution requires the B5.4 snapshot/secured start; feature-gated; with B5.4 disabled the scheduler must not cycle a `SECURITY_V1` Task `QUEUED → LEASED → lease expiry` or present it as runnable. **Implemented in revision 19** for the hold/decline half: the durable Task mode selects a mode-aware resolver, the complete security round is enumerated, and `acquire_typed_task` refuses before any Attempt/Lease/binding/NACK. **Revision 22 makes the readiness half a mode proof**: `TypedReadinessMode::{CoarseAcquisition, SecurityV1}` replaces the one-way `reject_security_v1` flag, so the security probe refuses a `COARSE_V1`/`LEGACY` Task and cannot qualify the wrong contract for a future caller. The full secured acquisition/start remains B5.4, so this row is **not** a B5.2 freeze |
 | 18 | Keep the Task authored-policy exact-reference claim off the reusable B.4 conjunct (rev 13) | a `SECURITY_V1` Task with an independent fine policy, and evidence naming no authored reference, acquires; the coarse predicate still refuses the same input; the binding derivation carries the Task layer. Implemented in revision 13 (this pull request) |
 | 19 | Keep a qualified `SECURITY_V1` `Claim` out of the frozen B.4 Execution and `RUNNING` paths (rev 14) | starting from the acquired `Claim`, `create_execution_with_snapshot` fails before any `executions`/`binding_snapshots` row; a stale `STARTING` row is not promoted to `RUNNING`; the Task stays `Leased`. Implemented in revision 14 (this pull request); removed only by the B5.4 snapshot/secured start |
 | 20 | Keep a qualified `SECURITY_V1` `Claim` out of the semantic completion path (rev 15) | starting from the acquired `Claim`, `ack_success` with no `execution_id` fails; Task/Attempt/Lease keep their state, no Result is inserted and a blocked dependent is not released. Implemented in revision 15 (this pull request); replaced only by an explicit B5.4 secured acknowledgement path |
 | 21 | Keep a non-executable `SECURITY_V1` qualification from cycling as an ordinary lease (B5.2-E liveness, rev 16) | with B5.4 disabled, production acquisition either holds an explainable waiting state or refuses acquisition; a `SECURITY_V1` Task is not moved `QUEUED → LEASED` only to expire, and the qualification is not presented as a runnable Claim. **Implemented in revision 19**: `SecurityHold` + `security_hold_cooldown`; the Task stays `QUEUED` with zero Attempts across a lease-expiry sweep and a second cycle, for both a populated and an empty security round. **Revision 20 adds the fairness half**: a hold is candidate-local, the typed scan continues, and a held `SECURITY_V1` Task ahead of a runnable `COARSE_V1` Task no longer consumes the cycle. **Revision 21 adds the timeout half**: a read-only probe that exceeds the shared deadline returns a provisional hold instead of a fatal resolution error, so the typed cycle is not aborted and unrelated coarse work still dispatches; integrity faults still fail closed. **Revision 22 adds the coherence and window-bound halves**: catalog/roster drift during enumeration makes the hold provisional (`CatalogDrift`) instead of "complete", and `held_security_tasks_yield_to_coarse_work_under_a_single_probe_window` proves the `probe_limit=1` multi-hold case with near-deadline attestations. The durable block still awaits the B5.4 profile |
-| 22 | Make the whole-round budget an actual runtime discipline, not only a pure component (rev 20 audit) | a real `SECURITY_V1` round must come from a complete trusted enumeration; the budget must bind **before** selection; no candidate may be selected while its qualification is unknown; a true over-budget outcome must leave a re-verifiable durable `security_acquisition_blocks` defer. **Open, gated on B5.4**: the durable row is keyed by `binding_profile_digest(binding, profile)`, so it cannot be written before the imported profile exists. A revision-21 provisional hold is a lower bound, not a complete round, so it can never be converted into this durable block without re-enumeration; revision 22's snapshot fence makes that lower-bound claim checkable but does not make the enumeration a trusted complete round |
+| 22 | Make the whole-round budget an actual runtime discipline, not only a pure component (rev 20 audit) | a real `SECURITY_V1` round must come from a complete trusted enumeration; the budget must bind **before** selection; no candidate may be selected while its qualification is unknown; a true over-budget outcome must leave a re-verifiable durable `security_acquisition_blocks` defer. **Revision 23 closes the enumeration and gate half**: the hold no longer unions consecutive reads; `Kernel::security_candidate_observation` loads every durable input in one transaction, `CompleteSecurityCandidateRound` is built from that one observation, `select_first` refuses a deadline-truncated round and checks the complete cost before returning any candidate, and the post-enumeration digest re-read is the drift fence. The pure gate is therefore real, but it is **not** a production durable defer. **Open, gated on B5.4**: the durable row is keyed by `binding_profile_digest(binding, profile)`, so it cannot be written before the imported profile exists |
 | Gate | Wire the qualification chain into acquisition (P2-4) | a qualified candidate is selectable; an unqualified one is rejected before Attempt/Lease; the coarse gate still rejects `SECURITY_V1`. Implemented in revision 9 (`d4d8dc3`) as `acquire_security_v1_task_existing`; tests named in the claim table. This is **selected-candidate transactional qualification**; complete `SECURITY_V1` orchestration remains a later row |
 
 Items 1–6, 8, 9 and 10 are code changes delivered outside the revision-1 record
@@ -2963,7 +3002,12 @@ it does not add a new item because the trusted registry, the physical installati
 epoch and the production whole-round budget remain the named B5.2 acceptance
 conditions under the audit's §四 option 1. Revision 22 therefore does **not** freeze
 B5.2, does not deliver the production secured acquisition path, and does not claim
-B5.4 capability.
+B5.4 capability. Revision 23 implements the trusted registry and installation
+epoch (schema v12) and the single-observation round with the budget-before-selection
+gate, so those two named conditions move from "open design" to implemented
+substrate; the production whole-round durable defer and the production secured
+acquisition path still require B5.4's imported profile, so revision 23 does **not**
+freeze B5.2 and does not claim B5.4 capability.
 
 The Gate is the B5.2 completion condition. Revisions 9, 10 and 11 implement
 *selected-candidate transactional qualification* in an unmerged draft pull

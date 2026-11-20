@@ -1037,6 +1037,19 @@ pub struct SecurityProvisioningSelection {
     pub profile: agentype_agent_contract::ImportedEnforcementProfile,
     /// The exact subject the profile's claims must cover (ADR-0014 §14).
     pub subject: agentype_agent_contract::EnforcementSubject,
+    /// The enforcement-plan digest the selector computed, if it computed one.
+    ///
+    /// The plan is a pure function of the transaction's own durable inputs (the
+    /// exact `AgentType`/policy revision, the `EffectiveTaskAuthority`, the
+    /// validated source/binding/profile tuple and the attested config), so the
+    /// transaction recomputes it and MUST reject a value that does not match. A
+    /// stale or hand-built plan therefore cannot ride along with a different
+    /// durable selection.
+    ///
+    /// B5.2's mechanical acquisition binds no secured-start plan, so it supplies
+    /// `None` and the transaction only records nothing to compare. B5.4, which
+    /// commits the plan, MUST require `Some` here.
+    pub expected_plan_digest: Option<String>,
 }
 
 /// Which qualification chain this acquisition transaction must prove before it
@@ -1405,6 +1418,19 @@ fn finish_acquisition(
             let _proven = proven
                 .with_source_config(config)
                 .map_err(acquisition_rejection)?;
+            // B5.2-D: a selector that computed the enforcement plan pins its
+            // digest. The plan is a pure function of this transaction's own
+            // durable inputs, so a value that does not match the plan recomputed
+            // here is a stale or hand-built selection and must not acquire. A
+            // `None` is the B5.2 mechanical path, which binds no plan; B5.4,
+            // which commits the plan, requires `Some`.
+            if let Some(expected) = security.expected_plan_digest.as_deref() {
+                if expected != _proven.plan_digest() {
+                    return Err(Error::invalid_authority(
+                        "the selection's expected enforcement plan digest does not match the plan recomputed in the acquisition transaction",
+                    ));
+                }
+            }
             // `_proven` is qualification evidence, not an applied-security
             // receipt. Persisting the security plan/snapshot and claiming the
             // secured start is B5.4; this transaction grants only the mechanical

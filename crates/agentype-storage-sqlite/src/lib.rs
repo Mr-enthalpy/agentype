@@ -26,6 +26,7 @@
 
 pub mod catalog;
 pub mod frontier;
+pub mod importer_installation;
 mod kernel;
 mod preparation;
 pub mod profile_attestation;
@@ -33,6 +34,7 @@ pub mod provisioning;
 pub mod requirement;
 mod schema;
 pub mod security_acquisition;
+pub mod security_observation;
 mod store;
 pub mod txutil;
 

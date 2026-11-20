@@ -437,14 +437,28 @@ complete cost, and an exhausted or unknown round produces a defer over the whole
 domain rather than a winner from the qualifying subset. The durable row binds
 that same complete domain, so a restart re-observing it is one condition.
 
-B5.2-E reuses exactly this construction for the security hold. `security_hold`
-enumerates every existing owner the Task matches plus the pinned new-agent route,
-builds each owner's `SecurityCandidateRound`, and unions the identities into one
-`CandidateDomain`. The reported count and digest are therefore the same
-whole-round facts the durable block would carry, and the hold is never a partial
-selection over whichever owner happened to enumerate first. Because no Attempt or
-Lease exists, a hold is also not a candidate rejection: each owner's own round is
-kept intact for B5.4 to qualify.
+B5.2-E reuses exactly this construction for the security hold, but no longer by
+unioning several consecutive reads. `Kernel::security_candidate_observation` loads
+every durable input of a round inside **one** storage transaction: the Task
+requirement, the pinned `AgentType` and mode, the partition, the capability
+catalog, the matched roster with each bound type and mode, every active source
+with its source/policy/mode and all active config revisions, and the active
+frontier digest. `CompleteSecurityCandidateRound::from_observation` then builds
+each owner's `SecurityCandidateRound` and the union `CandidateDomain` from that
+single observation, so the reported count and digest describe an identity set that
+actually existed at one instant. Enumeration still performs bounded, read-only
+attestation; the observation digest is therefore re-read afterwards and any change
+is reported as provisional catalog drift rather than folded into the earlier
+round. Because no Attempt or Lease exists, a hold is not a candidate rejection:
+each owner's own round is kept intact for B5.4 to qualify.
+
+The whole-round budget gate is `CompleteSecurityCandidateRound::require_whole_round`
+and `select_first`: `select_first` refuses a deadline-truncated round outright and
+checks the complete cost before returning any candidate, so an over-budget round
+has no partial winner. This is a pure gate over one observation, not yet a
+production durable defer: writing `security_acquisition_blocks` still needs the
+B5.4 imported profile for `binding_profile_digest`, so no production path records a
+block in B5.2.
 
 The row is owned by the acquisition control plane, not by runtime-local
 `TypedDispatchState.cooldowns`, so it survives restart. A Task holds exactly one
@@ -473,21 +487,23 @@ reader MUST rebuild the row through the same validation and re-bind
 `generation_id` to the Task's durable dispatch generation: the recorded generation
 is a consequence of that binding, not an independent input.
 
-The schema is fresh-only: version 11 rejects a v10 file at open under the existing
-D-DB-MIGRATE rule, and there is no in-place migration and no backfill of a
-historical block. A budget defer therefore leaves no durable trace until the
+The schema is fresh-only: version 12 rejects an older file at open under the
+existing D-DB-MIGRATE rule, and there is no in-place migration and no backfill of
+a historical block. A budget defer therefore leaves no durable trace until the
 control plane records one; it never mints a partial selection.
 
-#### Trusted-importer attestations (schema v11)
+#### Trusted-importer attestations (schema v11, extended in v12)
 
 Version 11 also adds `enforcement_profile_attestations`, the durable external
-fact that a profile digest alone cannot contain:
+fact that a profile digest alone cannot contain; version 12 adds its
+`installation_id` epoch column and the installation registry below.
 
 ```text
 attestation_digest         PRIMARY KEY; commits to every other field
 profile_digest             the exact imported-profile identity this covers
+installation_id            the importer installation epoch that observed it (v12)
 importer_id                the trusted importer that observed the domain
-importer_protocol          agentype-enforcement-profile-attest/1
+importer_protocol          agentype-enforcement-profile-attest/2
 adapter_kind               exact physical adapter kind
 adapter_binding_key        exact resolved physical key, never the B.4 alias
 issued_at, valid_until     half-open validity window (issued_at <= now < valid_until),
@@ -517,29 +533,57 @@ attestation with `InvalidAuthority` and writes no row, so a caller limited to
 public constructors cannot mint a trusted physical observation even with a
 perfectly self-consistent digest. Equality compares the attested facts rather
 than the seal, so a durable-read row still compares equal to the producer's value
-for write-once idempotence without making the read path writable. This is a
-mechanical fence at the persistence boundary, not a claim that the importer
-registry itself is complete: which importers exist and how they are registered
-remains the provisioning composition root's responsibility. `importer_id` is still
-a caller-supplied string, so B5.2-C MUST NOT be recorded as closed until a trusted
-registry binds an importer to an exact `AdapterBinding` and the importer's actual
-observation, and until a reverse test proves that an internal caller knowing every
-profile field and digest still cannot publish an acquirable attestation without
-that authority. Only that registry makes
-`RegisteredImporter → ExactAdapterBinding → ObservedProfile → Attestation` a chain
-rather than four independently forgeable facts.
+for write-once idempotence without making the read path writable.
 
-**B5.2 keeps that registry, the installation epoch and the production whole-round
-budget inside its own gate.** An earlier draft considered moving production
-qualification and budget to B5.4 and leaving B5.2 as non-executing substrate plus a
-scheduler hold. That is not the chosen boundary: B5.2 closes when the trusted
-importer registry binds an importer and installed epoch to the exact
-`AdapterBinding`, when the complete candidate round comes from a controlled
-enumeration rather than a caller-supplied list, and when the budget binds before
-selection in the runtime. B5.4 then commits (`ExecutionSecurityEvidence`) and
-starts physically; it MUST NOT have to re-implement B5.2's candidate-qualification
-control plane. The hold, provisional diagnostics and candidate-identity kernel
-shipped in B5.2-C/D/E are therefore a substrate, not a stage freeze.
+**The writer fence alone is not importer authority (schema v12).** A sealed value
+still names a caller-supplied `importer_id`, protocol and physical domain, so
+sealing proves *who called the constructor*, not *who may observe this domain*.
+Version 12 therefore adds `enforcement_importer_installations`:
+
+```text
+installation_id            PRIMARY KEY; the importer's installed epoch
+importer_id                trusted importer identity
+importer_protocol          the observation protocol that epoch speaks
+adapter_kind               exact physical adapter kind
+adapter_binding_key        exact resolved physical key, never the B.4 alias
+installed_at               the epoch start
+retired_at                 NULL while current; retirement is final
+recorded_at                durable write time
+```
+
+A partial unique index admits at most one ACTIVE row per
+`(importer_id, adapter_kind, adapter_binding_key)`. Trigger-enforced invariants
+make the identity immutable, retirement a single final transition, and rows
+undeletable. Registration of a new epoch for the same importer and domain —
+including a new importer protocol version — retires the previous one at the new
+`installed_at`, and an epoch cannot move backwards.
+`register_enforcement_importer_installation` and its retirement counterpart are
+`runtime-internal` (the trusted composition root); the ungated read is a history
+read that grants nothing.
+
+The attestation now carries `installation_id`, and
+`ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION` is `2`. The writer requires a
+registered ACTIVE installation whose importer, protocol and physical domain match
+the document and whose `installed_at` is not after `issued_at`; the acquisition
+read joins the installation and requires the same match plus `retired_at IS NULL`.
+A retired epoch therefore invalidates every older row even inside the one-hour
+window, and re-installing or moving the domain is a real invalidation rather than
+a convention. This is the chain the earlier draft asked for:
+`RegisteredImporter → ExactAdapterBinding → ObservedProfile → Attestation`.
+The reverse test is in place: a caller that knows every public field and the exact
+canonical digest, and can rebuild the old epoch, still cannot publish a row that
+acquisition accepts. What remains outside B5.2 is the *production provider* of
+imported profiles and therefore any claim of production secured enforcement.
+
+**B5.2 keeps the registry, the installation epoch and the whole-round budget
+inside its own gate.** An earlier draft considered moving production qualification
+and budget to B5.4 and leaving B5.2 as non-executing substrate plus a scheduler
+hold. That is not the chosen boundary: the trusted importer registry and installed
+epoch now bind an observation to the exact `AdapterBinding`, the complete candidate
+round comes from one storage observation rather than several consecutive reads, and
+the budget gate runs before selection. B5.4 then commits
+(`ExecutionSecurityEvidence`) and starts physically; it MUST NOT have to
+re-implement B5.2's candidate-qualification control plane.
 
 **A freshness check needs a validity ceiling, not only an interval.** Requiring
 `issued_at < valid_until` and `issued_at <= now < valid_until` says a row is valid
@@ -553,15 +597,11 @@ construction **and** on read, so an older or hostile row fails closed instead of
 being trusted. The cap is a value property, not a producer convention, because a
 convention cannot be checked at the persistence boundary.
 
-The ceiling does not replace the installation epoch. Re-installing the physical
-adapter, moving the execution domain, or changing the trusted importer version
-must invalidate older rows even inside one hour, and that cannot be proven from an
-attestation value: it needs a trusted registry that binds `importer identity` and
-an explicit `installation epoch` to the exact `AdapterBinding`, and an acquisition
-check that the row's epoch is the currently installed one. Without a trusted
-registry an epoch would be one more caller-supplied string, which is why the epoch
-is part of the same open P1-C acceptance condition as importer registration rather
-than a separate field added now.
+The ceiling does not replace the installation epoch: it bounds *how long one
+observation may be claimed*, while the epoch decides *which installation may
+observe right now*. Both are required. The epoch check is what makes a reinstall,
+a moved execution domain, or a new importer version invalidate the previous row
+immediately, which no window length can express.
 
 Classification is strict:
 
@@ -599,6 +639,17 @@ profile digest, and evidence subject. External mutable facts are checked only
 for subject, version, and validity; they are not pretended to be part of the
 SQLite transaction.
 
+A selector that computed the enforcement plan pins its digest in
+`SecurityProvisioningSelection::expected_plan_digest`. The plan is a pure function
+of the transaction's own durable inputs — the exact `AgentType`/policy revision,
+the `EffectiveTaskAuthority`, the validated source/binding/profile tuple and the
+attested config — so the transaction recomputes it after qualification and rejects
+a `Some` value that does not match, before any Attempt or Lease. A stale or
+hand-built plan therefore cannot ride along with a different durable selection.
+B5.2's mechanical acquisition binds no secured-start plan and supplies `None`; the
+transaction then has nothing to compare. B5.4, which commits the plan, MUST
+require `Some` here.
+
 A successful compilation is not yet an applied-security claim. Compilation proves
 that the profile's support matrix covers the obligations; the subject proof then
 requires the same profile to claim the exact `EnforcementSubject` of the
@@ -618,9 +669,11 @@ proves only that the document is internally consistent: the same caller that
 supplies the support matrix, covered subjects and physical key also computes the
 digest. The acquired profile therefore MUST also have a fresh
 `enforcement_profile_attestations` row for its exact digest, importer identity,
-protocol and resolved physical domain (§4), where "fresh" means valid at the
-acquisition clock **and** inside the one-hour validity ceiling: a window that is
-merely long enough to contain `now` is not a freshness proof. The gate runs at the
+protocol, installation epoch and resolved physical domain (§4), where "fresh" means
+valid at the acquisition clock, inside the one-hour validity ceiling, and issued
+by the currently ACTIVE installation epoch: a window that is merely long enough to
+contain `now`, or a row whose epoch has since been retired, is not a freshness
+proof. The gate runs at the
 top of the
 `SECURITY_V1` acquisition branch, before the reusable B.4 conjunct,
 `ValidatedSourceBinding::validate`, qualification, config settlement or any

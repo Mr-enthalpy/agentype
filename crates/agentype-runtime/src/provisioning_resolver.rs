@@ -27,15 +27,16 @@ use agentype_adapter_api::AdapterDeadline;
 use agentype_adapter_api::NetworkEnforcement;
 use agentype_agent_contract::{
     can_provision_task, can_provision_task_source_config_reusable, AcquisitionBudget,
-    AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef, AgentTypeRef, BindingSnapshot,
-    BudgetExhaustion, CandidateDomain, CapabilityRef, CapabilityValue, ConfigStatus,
-    MaterializationDigest, NetworkPolicy, PhysicalSafety, ProvisioningBinding,
+    AcquisitionCost, AdapterBindingPolicy, AdapterPolicyRef, AgentType, AgentTypeRef,
+    BindingSnapshot, BudgetExhaustion, CandidateDomain, CapabilityRef, CapabilityValue,
+    ConfigStatus, MaterializationDigest, NetworkPolicy, PhysicalSafety, ProvisioningBinding,
     ResolvedProvisioningEvidence, SandboxPolicyRef, SecurityAcquisitionBlock,
     SecurityCandidateIdentity, SecurityCandidateOwner, SecurityContractMode, SourceConfig,
     SourceConfigRef, SpawnSource, SpawnSourceRef, RESOLVER_VERSION,
 };
 use agentype_core::{ExecutionId, GenerationId, LogicalAgentId, TaskId, UnixTime, WorkspaceMode};
 use agentype_execution_config::ExecutionRegistry;
+use agentype_storage_sqlite::security_observation::SecurityCandidateObservation;
 use agentype_storage_sqlite::Kernel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -469,7 +470,211 @@ impl SecurityCandidateRound {
     }
 }
 
-/// Why a `SECURITY_V1` hold could not claim a complete round.
+/// A complete `SECURITY_V1` round born from **one** durable observation.
+///
+/// Unlike [`SecurityCandidateRound`], which is one owner's candidate set, this
+/// value is the union of every matched existing owner and the pinned new-agent
+/// route, all enumerated from a single [`SecurityCandidateObservation`]
+/// transaction. It exists so a hold or a later selection can say "this complete
+/// identity set was observed at one instant" instead of unioning several
+/// consecutive reads.
+///
+/// The round is authority-free. It creates no Attempt, Lease or
+/// `ProvisioningBinding`, and its budget gate is a precondition for selection,
+/// not a production durable defer.
+pub struct CompleteSecurityCandidateRound {
+    observation_digest: String,
+    existing: Vec<(LogicalAgentId, SecurityCandidateRound)>,
+    new_agent: Option<SecurityCandidateRound>,
+    domain: CandidateDomain,
+    deadline_hit: bool,
+}
+
+impl CompleteSecurityCandidateRound {
+    /// Build the complete round from **one** observation.
+    ///
+    /// Existing owners are enumerated in the observation's ranked roster order,
+    /// then the Task's pinned new-agent route, all against the same observation
+    /// facts. Only owners with at least one eligible candidate contribute a
+    /// round, so the union domain is exactly the observed candidate set.
+    ///
+    /// The returned flag is `true` when the shared probe deadline was hit, in
+    /// which case the round is a lower bound and MUST NOT be treated as complete.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_observation(
+        observation: &SecurityCandidateObservation,
+        adapters: &AdapterRegistry,
+        execution_registry: &ExecutionRegistry,
+        integrations: &SourceIntegrationRegistry,
+        deadline: &AdapterDeadline,
+    ) -> Result<(Self, bool), ProvisioningResolutionError> {
+        let mut existing: Vec<(LogicalAgentId, SecurityCandidateRound)> = Vec::new();
+        let mut new_agent: Option<SecurityCandidateRound> = None;
+        let mut identities: Vec<SecurityCandidateIdentity> = Vec::new();
+        let mut deadline_hit = false;
+
+        for entry in observation.roster() {
+            let (candidates, hit) = enumerate_security_candidates_from_observation(
+                observation,
+                entry.security_mode(),
+                entry.agent_type(),
+                adapters,
+                execution_registry,
+                integrations,
+                deadline,
+            )?;
+            if !candidates.is_empty() {
+                let round = SecurityCandidateRound::new(
+                    SecurityCandidateOwner::ExistingAgent(entry.logical_agent_id().clone()),
+                    candidates,
+                )?;
+                identities.extend(round.identities().iter().cloned());
+                existing.push((entry.logical_agent_id().clone(), round));
+            }
+            if hit {
+                deadline_hit = true;
+                break;
+            }
+        }
+
+        if !deadline_hit {
+            let (candidates, hit) = enumerate_security_candidates_from_observation(
+                observation,
+                observation.pinned_security_mode(),
+                observation.pinned_agent_type(),
+                adapters,
+                execution_registry,
+                integrations,
+                deadline,
+            )?;
+            if hit {
+                deadline_hit = true;
+            }
+            if !candidates.is_empty() {
+                let round = SecurityCandidateRound::new(
+                    SecurityCandidateOwner::NewAgentType(
+                        observation.pinned_agent_type().type_ref.clone(),
+                    ),
+                    candidates,
+                )?;
+                identities.extend(round.identities().iter().cloned());
+                new_agent = Some(round);
+            }
+        }
+
+        let domain = CandidateDomain::from_identities(identities);
+        Ok((
+            Self {
+                observation_digest: observation.digest().to_string(),
+                existing,
+                new_agent,
+                domain,
+                deadline_hit,
+            },
+            deadline_hit,
+        ))
+    }
+
+    /// The digest of the single observation this round was built from. A later
+    /// re-read of the same observation must match it, or the round is stale.
+    pub fn observation_digest(&self) -> &str {
+        &self.observation_digest
+    }
+
+    pub fn existing(&self) -> &[(LogicalAgentId, SecurityCandidateRound)] {
+        &self.existing
+    }
+
+    pub fn new_agent(&self) -> Option<&SecurityCandidateRound> {
+        self.new_agent.as_ref()
+    }
+
+    /// The union domain of every owner's candidates.
+    pub fn domain(&self) -> &CandidateDomain {
+        &self.domain
+    }
+
+    pub fn cost(&self) -> AcquisitionCost {
+        self.domain.acquisition_cost()
+    }
+
+    /// Whether enumeration stopped on the shared probe deadline. The round is
+    /// then a lower bound, not a complete identity set.
+    pub fn is_truncated(&self) -> bool {
+        self.deadline_hit
+    }
+
+    /// The whole-round budget gate. It must pass **before** any candidate is
+    /// qualified or selected; there is no partial-success path.
+    pub fn require_whole_round(&self, budget: AcquisitionBudget) -> Result<(), BudgetExhaustion> {
+        budget.require_whole_round(self.cost())
+    }
+
+    /// Select the first candidate only after the complete round fits the budget.
+    ///
+    /// Existing owners are tried in the B.3 ranked order, then the pinned
+    /// new-agent route, matching the frozen existing-first acquisition order. A
+    /// truncated round cannot be selected from at all: the caller must not turn
+    /// "the probe did not finish" into a winner.
+    pub fn select_first(
+        &self,
+        budget: AcquisitionBudget,
+    ) -> Result<SelectedSecurityCandidate<'_>, RoundSelectionError> {
+        if self.deadline_hit {
+            return Err(RoundSelectionError::Truncated);
+        }
+        self.require_whole_round(budget)
+            .map_err(RoundSelectionError::Budget)?;
+        for (owner, round) in &self.existing {
+            if let Some(candidate) = round.candidates().first() {
+                return Ok(SelectedSecurityCandidate {
+                    owner: SecurityCandidateOwner::ExistingAgent(owner.clone()),
+                    candidate,
+                });
+            }
+        }
+        if let Some(round) = &self.new_agent {
+            if let Some(candidate) = round.candidates().first() {
+                return Ok(SelectedSecurityCandidate {
+                    owner: SecurityCandidateOwner::NewAgentType(candidate.agent_type.clone()),
+                    candidate,
+                });
+            }
+        }
+        Err(RoundSelectionError::NoCandidate)
+    }
+}
+
+/// One candidate selected from a complete round, with the owner it was
+/// enumerated for. It is a borrowed view; the round still owns the candidates.
+#[derive(Clone, Debug)]
+pub struct SelectedSecurityCandidate<'a> {
+    owner: SecurityCandidateOwner,
+    candidate: &'a SourceProvisioningCandidate,
+}
+
+impl<'a> SelectedSecurityCandidate<'a> {
+    pub fn owner(&self) -> &SecurityCandidateOwner {
+        &self.owner
+    }
+
+    pub fn candidate(&self) -> &'a SourceProvisioningCandidate {
+        self.candidate
+    }
+}
+
+/// Why a complete round could not yield a selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundSelectionError {
+    /// The enumeration stopped on the probe deadline, so the round is only a
+    /// lower bound.
+    Truncated,
+    /// The complete round does not fit the fixed acquisition budget.
+    Budget(BudgetExhaustion),
+    /// The complete round contains no eligible candidate.
+    NoCandidate,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HoldProvisionalCause {
     /// A read-only qualification probe exhausted the cycle's shared deadline.
@@ -873,43 +1078,6 @@ pub(crate) fn resolve_source_candidates(
         execution_registry,
         integrations,
         deadline,
-        CandidateMode::Coarse,
-    )
-}
-
-/// Enumerate the complete `SECURITY_V1` candidate set for an admitted typed
-/// Task, evaluating the reusable B.4 conjunct over the **Task pin** AgentType.
-///
-/// This is a pure, authority-free read used by the B5.2-E scheduler hold. It
-/// applies no qualification and consumes no imported profile: the B5.4 secured
-/// path owns those proofs. Its only job is to make the complete candidate
-/// identity set observable before any Attempt/Lease.
-pub(crate) fn resolve_security_source_candidates(
-    kernel: &Kernel,
-    task_id: &TaskId,
-    adapters: &AdapterRegistry,
-    execution_registry: &ExecutionRegistry,
-    integrations: &SourceIntegrationRegistry,
-    deadline: &AdapterDeadline,
-) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
-    let requirement = kernel
-        .get_task_agent_requirement(task_id)?
-        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
-    let (agent_type, _status) = kernel
-        .get_agent_type(&requirement.required_type)?
-        .ok_or_else(|| {
-            ProvisioningResolutionError::AgentTypeMissing(requirement.required_type.clone())
-        })?;
-    enumerate_candidates(
-        kernel,
-        task_id,
-        &requirement,
-        &agent_type,
-        adapters,
-        execution_registry,
-        integrations,
-        deadline,
-        CandidateMode::SecurityV1,
     )
 }
 
@@ -943,53 +1111,7 @@ pub(crate) fn resolve_source_candidates_for_agent(
         execution_registry,
         integrations,
         deadline,
-        CandidateMode::Coarse,
     )
-}
-
-/// [`resolve_source_candidates_for_agent`] for the `SECURITY_V1` path.
-pub(crate) fn resolve_security_source_candidates_for_agent(
-    kernel: &Kernel,
-    task_id: &TaskId,
-    agent_id: &agentype_core::LogicalAgentId,
-    adapters: &AdapterRegistry,
-    execution_registry: &ExecutionRegistry,
-    integrations: &SourceIntegrationRegistry,
-    deadline: &AdapterDeadline,
-) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
-    let requirement = kernel
-        .get_task_agent_requirement(task_id)?
-        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
-    let bound = kernel
-        .get_logical_agent_type_binding(agent_id)?
-        .ok_or(ProvisioningResolutionError::AgentNotBound)?;
-    let (agent_type, _status) = kernel
-        .get_agent_type(&bound)?
-        .ok_or_else(|| ProvisioningResolutionError::AgentTypeMissing(bound.clone()))?;
-    enumerate_candidates(
-        kernel,
-        task_id,
-        &requirement,
-        &agent_type,
-        adapters,
-        execution_registry,
-        integrations,
-        deadline,
-        CandidateMode::SecurityV1,
-    )
-}
-
-/// Which execution contract a candidate set is enumerated for.
-///
-/// The two paths are disjoint by durable mode, not by caller convention: the
-/// coarse path refuses a `SECURITY_V1` AgentType or source, and the security
-/// path refuses a `COARSE_V1` one. This mirrors the acquisition transaction's
-/// re-proof, so an enumeration cannot offer a candidate the durable authority
-/// would reject.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CandidateMode {
-    Coarse,
-    SecurityV1,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1002,27 +1124,17 @@ fn enumerate_candidates(
     execution_registry: &ExecutionRegistry,
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
-    mode: CandidateMode,
 ) -> Result<Vec<SourceProvisioningCandidate>, ProvisioningResolutionError> {
     // Internal enumeration is also used outside the acquisition facade. Reject
     // known unreadiness before any source-private I/O; the final transaction
-    // still re-proves readiness and owns all Attempt/Lease authority. The coarse
-    // gate also rejects `SECURITY_V1`; the security path proves the same
-    // readiness without that coarse-only rejection.
-    match mode {
-        CandidateMode::Coarse => kernel.check_typed_acquisition_readiness(task_id)?,
-        CandidateMode::SecurityV1 => kernel.check_typed_security_readiness(task_id)?,
-    }
-    // M6-B.5 B5.1 gate: the coarse path cannot execute a `SECURITY_V1`
-    // AgentType revision, and the security path cannot execute a `COARSE_V1`
-    // one. This is a candidate-local ineligibility, not a Task failure: the
-    // Task stays QUEUED for the path that owns its mode.
+    // still re-proves readiness and owns all Attempt/Lease authority.
+    kernel.check_typed_acquisition_readiness(task_id)?;
+    // M6-B.5 B5.1 gate: a `SECURITY_V1` AgentType revision is a full-path
+    // identity the coarse path cannot execute. That is a candidate-local
+    // ineligibility, not a Task failure: the Task stays QUEUED for the security
+    // path that owns its mode.
     let agent_mode = kernel.agent_type_security_mode(&agent_type.type_ref)?;
-    let agent_mode_matches = match mode {
-        CandidateMode::Coarse => agent_mode != SecurityContractMode::SecurityV1,
-        CandidateMode::SecurityV1 => agent_mode == SecurityContractMode::SecurityV1,
-    };
-    if !agent_mode_matches {
+    if agent_mode == SecurityContractMode::SecurityV1 {
         return Err(ProvisioningResolutionError::NoEligibleSource);
     }
     let task = kernel.task(task_id)?;
@@ -1046,16 +1158,11 @@ fn enumerate_candidates(
         let source = kernel
             .get_spawn_source(&source_ref)?
             .ok_or_else(|| ProvisioningResolutionError::MissingRevision("spawn_source".into()))?;
-        // M6-B.5 B5.1 gate: the source mode must match the path. A
-        // `SECURITY_V1` source is a full-path source even when it adds no
-        // `P_source` narrowing, and a `COARSE_V1` source cannot provision a
-        // `SECURITY_V1` Task.
+        // M6-B.5 B5.1 gate: a `SECURITY_V1` source is a full-path source even
+        // when it adds no `P_source` narrowing; the coarse path cannot discharge
+        // its contract and must skip it.
         let source_mode = kernel.spawn_source_security_mode(&source_ref)?;
-        let source_mode_matches = match mode {
-            CandidateMode::Coarse => source_mode != SecurityContractMode::SecurityV1,
-            CandidateMode::SecurityV1 => source_mode == SecurityContractMode::SecurityV1,
-        };
-        if !source_mode_matches {
+        if source_mode == SecurityContractMode::SecurityV1 {
             continue;
         }
         let policy = kernel
@@ -1120,28 +1227,15 @@ fn enumerate_candidates(
                 Err(err) if err.is_candidate_ineligible() => continue,
                 Err(err) => return Err(err),
             };
-            // The coarse path keeps the frozen `COARSE_V1` relation; the
-            // security path intersects the reusable B.4 conjunct and adds no
-            // coarse exact-reference claim. Qualification over `P_eff` and the
-            // imported profile is B5.4's, so it is not attempted here.
-            let eligibility = match mode {
-                CandidateMode::Coarse => can_provision_task(
-                    agent_type,
-                    &source,
-                    &config,
-                    &evidence,
-                    &catalog,
-                    &requirement.hard,
-                ),
-                CandidateMode::SecurityV1 => can_provision_task_source_config_reusable(
-                    agent_type,
-                    &source,
-                    &config,
-                    &evidence,
-                    &catalog,
-                    &requirement.hard,
-                ),
-            };
+            // The coarse path keeps the frozen `COARSE_V1` relation.
+            let eligibility = can_provision_task(
+                agent_type,
+                &source,
+                &config,
+                &evidence,
+                &catalog,
+                &requirement.hard,
+            );
             match eligibility {
                 Ok(()) => {}
                 Err(err) => {
@@ -1219,6 +1313,165 @@ fn enumerate_candidates(
         }
     }
     Ok(out)
+}
+
+/// Enumerate the `SECURITY_V1` candidates for one owner from an already-loaded
+/// observation.
+///
+/// Every durable input — the owner's exact `AgentType` revision, the partition,
+/// the capability catalog, the source/policy/mode and every active config
+/// revision — is read from the observation. This function performs no catalog
+/// read at all, so its result is exactly a function of one instant; the only
+/// remaining I/O is the bounded, read-only source-integration attestation.
+///
+/// Returns `(candidates, deadline_hit)`. A deadline hit is not an error: the
+/// shared probe budget was spent, so the returned set is a lower bound and the
+/// caller must report a provisional hold instead of a complete round.
+fn enumerate_security_candidates_from_observation(
+    observation: &SecurityCandidateObservation,
+    owner_security_mode: SecurityContractMode,
+    agent_type: &AgentType,
+    adapters: &AdapterRegistry,
+    execution_registry: &ExecutionRegistry,
+    integrations: &SourceIntegrationRegistry,
+    deadline: &AdapterDeadline,
+) -> Result<(Vec<SourceProvisioningCandidate>, bool), ProvisioningResolutionError> {
+    // The security path cannot execute a `COARSE_V1` AgentType revision. That is
+    // candidate-local ineligibility, not a Task failure.
+    if owner_security_mode != SecurityContractMode::SecurityV1 {
+        return Ok((Vec::new(), false));
+    }
+    let requirement = observation.requirement();
+    let partition = observation.partition();
+    let (target, _profile) = agentype_execution_config::resolve_target_profile(
+        execution_registry,
+        &partition.execution_target,
+        &partition.execution_profile,
+    )
+    .map_err(|err| {
+        ProvisioningResolutionError::Storage(agentype_core::Error::invalid_authority(
+            err.to_string(),
+        ))
+    })?;
+    let required_lifecycle = agentype_agent_contract::required_lifecycle(partition.retention);
+    let required_isolation = agent_type.contract.security.requires_attempt_isolation
+        || requirement.hard.required_attempt_isolation;
+    let catalog = observation.catalog();
+    let mut out: Vec<SourceProvisioningCandidate> = Vec::new();
+    let mut deadline_hit = false;
+    'sources: for observed in observation.sources() {
+        let source_ref = observed.source_ref();
+        let source = observed.source();
+        // M6-B.5 B5.1 gate: a `COARSE_V1` source cannot provision a
+        // `SECURITY_V1` Task.
+        if observed.security_mode() != SecurityContractMode::SecurityV1 {
+            continue;
+        }
+        let policy = observed.policy();
+        // Reject known static ineligibility before any source-private I/O.
+        if policy.status != ConfigStatus::Active || policy.adapter_kind != target.adapter_kind {
+            continue;
+        }
+        let Some(integration) = integrations.resolve(source_ref) else {
+            continue;
+        };
+        let imported = match adapters.resolve_binding_ref(&policy.adapter_kind, &policy.binding_ref)
+        {
+            Ok(imported) => imported,
+            Err(_) => continue,
+        };
+        if imported.provisioning_protocol() != Some(integration.protocol()) {
+            continue;
+        }
+        if agentype_execution_config::validate_attempt_isolation(
+            target.attempt_isolation,
+            required_isolation,
+            imported.safety_envelope().attempt_isolation(),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        for revision in observed.configs() {
+            let config = revision.config().clone();
+            if !config.credential_refs.is_empty()
+                || !config
+                    .effective_lifecycle(source)
+                    .contains(&required_lifecycle)
+            {
+                continue;
+            }
+            let evidence = match produce_evidence(&imported, policy, source, &config) {
+                Ok(evidence) => evidence,
+                Err(err) if err.is_candidate_ineligible() => continue,
+                Err(err) => return Err(err),
+            };
+            let eligibility = can_provision_task_source_config_reusable(
+                agent_type,
+                source,
+                &config,
+                &evidence,
+                catalog,
+                &requirement.hard,
+            );
+            match eligibility {
+                Ok(()) => {}
+                Err(err) => {
+                    let err = ProvisioningResolutionError::Evidence(err);
+                    if err.is_candidate_ineligible() {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+            if deadline.is_expired() {
+                deadline_hit = true;
+                break 'sources;
+            }
+            let attestation = integration.attest(
+                revision,
+                imported.adapter_kind(),
+                imported.adapter_binding_key().as_str(),
+                deadline,
+            );
+            let attestation = match attestation {
+                Ok(value) => value,
+                Err(err) if err.is_candidate_ineligible() => None,
+                Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
+                    deadline_hit = true;
+                    break 'sources;
+                }
+                Err(err) => return Err(err.redact_integration_error()),
+            };
+            if deadline.is_expired() {
+                deadline_hit = true;
+                break 'sources;
+            }
+            let Some(materialization_digest) = attestation else {
+                continue;
+            };
+            let effective_security = evidence.enforceable_safety().clone();
+            out.push(SourceProvisioningCandidate {
+                agent_type: agent_type.type_ref.clone(),
+                spawn_source: source.clone(),
+                source_config: config,
+                adapter_policy: policy.clone(),
+                evidence,
+                required_capabilities: requirement.hard.required_capabilities.clone(),
+                required_workspace: requirement.hard.required_workspace,
+                required_network: requirement.hard.required_network,
+                effective_security,
+                adapter_kind: imported.adapter_kind().to_string(),
+                adapter_binding_key: imported.adapter_binding_key().as_str().to_string(),
+                provisioning_protocol: imported
+                    .provisioning_protocol()
+                    .unwrap_or_default()
+                    .to_string(),
+                attested_materialization_digest: materialization_digest,
+            });
+        }
+    }
+    Ok((out, deadline_hit))
 }
 
 /// Select the single deterministic candidate using the frozen spec 07 order.
@@ -1380,13 +1633,13 @@ pub(crate) struct TypedAcquisitionOutcome {
     pub launch_descriptor: String,
 }
 
-/// Enumerate the `SECURITY_V1` candidate set for a Task and freeze its identity
-/// domain, without creating any authority.
+/// Enumerate the `SECURITY_V1` candidate set for a Task from **one** storage
+/// observation and freeze its identity domain, without creating any authority.
 ///
 /// The round spans every existing bound agent the Task matches (the same
-/// existing-first relation the acquisition uses) and the pinned new-agent route.
-/// Each owner is its own round because the owner is part of the identity; the
-/// hold carries the union of every round's identities. An owner with no
+/// existing-first relation the acquisition uses) and the pinned new-agent route,
+/// but all of them are enumerated from a single observation transaction, so the
+/// reported union is a set that actually existed at one instant. An owner with no
 /// candidate contributes nothing, while a global fault propagates.
 ///
 /// A read-only attestation that exceeds the cycle's absolute deadline does not
@@ -1396,11 +1649,10 @@ pub(crate) struct TypedAcquisitionOutcome {
 /// was slow" and must fail closed.
 ///
 /// Provisional is also the honest answer when the observation itself drifted:
-/// the existing-owner loop and the pinned new-agent route are consecutive reads,
-/// so a concurrent catalog publish or agent-binding change can produce a union
-/// that never existed at one instant. The probe therefore snapshots the active
-/// catalog frontier, the Task's pinned type and the matched roster before and
-/// after enumeration, and reports a provisional hold on any change.
+/// enumeration performs external attestation, so a concurrent catalog publish or
+/// agent-binding change can land while the round is built. The observation digest
+/// is therefore re-read afterwards, and any change reports a provisional hold
+/// instead of presenting the earlier round as complete.
 fn security_hold(
     kernel: &Kernel,
     task_id: &TaskId,
@@ -1409,122 +1661,37 @@ fn security_hold(
     integrations: &SourceIntegrationRegistry,
     deadline: &AdapterDeadline,
 ) -> Result<SecurityHold, ProvisioningResolutionError> {
-    let requirement = kernel
-        .get_task_agent_requirement(task_id)?
-        .ok_or(ProvisioningResolutionError::NotTypedTask)?;
-    let before = hold_probe_snapshot(kernel, task_id, &requirement)?;
-    let mut identities: Vec<SecurityCandidateIdentity> = Vec::new();
-    let mut deadline_hit = false;
-    'round: {
-        for existing in kernel.match_existing_agents_for_task(task_id)? {
-            match resolve_security_source_candidates_for_agent(
-                kernel,
-                task_id,
-                &existing.logical_agent_id,
-                adapters,
-                execution_registry,
-                integrations,
-                deadline,
-            ) {
-                Ok(candidates) => {
-                    let round = SecurityCandidateRound::new(
-                        SecurityCandidateOwner::ExistingAgent(existing.logical_agent_id),
-                        candidates,
-                    )?;
-                    identities.extend(round.identities().iter().cloned());
-                }
-                Err(err) if err.is_candidate_local_for_dispatch() => {}
-                // The deadline is shared by the whole hold probe, so once it is
-                // spent every later attestation would fail for the same reason.
-                // Stop and report what was observed instead of pretending the
-                // remaining routes are empty.
-                Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
-                    deadline_hit = true;
-                    break 'round;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        match resolve_security_source_candidates(
-            kernel,
-            task_id,
-            adapters,
-            execution_registry,
-            integrations,
-            deadline,
-        ) {
-            Ok(candidates) => {
-                let round = SecurityCandidateRound::new(
-                    SecurityCandidateOwner::NewAgentType(requirement.required_type.clone()),
-                    candidates,
-                )?;
-                identities.extend(round.identities().iter().cloned());
-            }
-            Err(err) if err.is_candidate_local_for_dispatch() => {}
-            Err(ProvisioningResolutionError::ProvisioningDeadlineExceeded(_)) => {
-                deadline_hit = true;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    // An aborted probe already reports a lower bound; there is no point spending
-    // another snapshot read on it.
+    // Readiness is a Task-state precondition, not a candidate fact: it grants no
+    // authority, creates nothing and is re-proved by the acquisition
+    // transaction. It runs before the observation so an unready Task is
+    // rejected without paying for a catalog snapshot.
+    kernel.check_typed_security_readiness(task_id)?;
+    let observation = kernel.security_candidate_observation(task_id)?;
+    let (round, deadline_hit) = CompleteSecurityCandidateRound::from_observation(
+        &observation,
+        adapters,
+        execution_registry,
+        integrations,
+        deadline,
+    )?;
+    // Deadline takes precedence: an aborted probe already reports a lower bound,
+    // so there is no point spending another snapshot read on a round that cannot
+    // be called complete anyway.
     let provisional = if deadline_hit {
         Some(HoldProvisionalCause::ProbeDeadline)
-    } else if hold_probe_snapshot(kernel, task_id, &requirement)? != before {
-        Some(HoldProvisionalCause::CatalogDrift)
     } else {
-        None
+        let reobserved = kernel.security_candidate_observation(task_id)?;
+        if reobserved.digest() != round.observation_digest() {
+            Some(HoldProvisionalCause::CatalogDrift)
+        } else {
+            None
+        }
     };
-    let domain = CandidateDomain::from_identities(identities);
-    let cost = domain.acquisition_cost();
+    let cost = round.cost();
     Ok(SecurityHold {
         candidates: cost.candidates(),
-        domain_digest: domain.digest().to_string(),
+        domain_digest: round.domain().digest().to_string(),
         provisional,
-    })
-}
-
-/// The durable facts the hold probe is an observation of: the active
-/// source/config frontier, the Task's exact pinned type, and the matched-agent
-/// roster (identity plus bound `AgentType` revision).
-///
-/// Equality between the value taken before enumeration and the one taken after
-/// it is the coherence fence for the reported round. It is not a transaction and
-/// proves nothing about physical truth; it only makes "this union was observed
-/// across a stable catalog and roster" a checkable claim instead of an assumption.
-#[derive(Debug, PartialEq, Eq)]
-struct HoldProbeSnapshot {
-    catalog_frontier: String,
-    required_type: AgentTypeRef,
-    roster: Vec<(LogicalAgentId, AgentTypeRef)>,
-}
-
-fn hold_probe_snapshot(
-    kernel: &Kernel,
-    task_id: &TaskId,
-    requirement: &agentype_agent_contract::TaskAgentRequirement,
-) -> Result<HoldProbeSnapshot, ProvisioningResolutionError> {
-    let mut roster: Vec<(LogicalAgentId, AgentTypeRef)> = kernel
-        .match_existing_agents_for_task(task_id)?
-        .into_iter()
-        .map(|candidate| {
-            (
-                candidate.logical_agent_id,
-                candidate.agent_type.type_ref.clone(),
-            )
-        })
-        .collect();
-    roster.sort_by(|a, b| {
-        a.0.as_str()
-            .cmp(b.0.as_str())
-            .then_with(|| a.1.id().as_str().cmp(b.1.id().as_str()))
-            .then_with(|| a.1.revision().cmp(&b.1.revision()))
-    });
-    Ok(HoldProbeSnapshot {
-        catalog_frontier: kernel.catalog_frontier_digest()?,
-        required_type: requirement.required_type.clone(),
-        roster,
     })
 }
 
@@ -5241,6 +5408,130 @@ mod tests {
             vec![wrong_type],
         )
         .is_err());
+    }
+
+    /// The B5.2-E hold must build the whole round from **one** observation. This
+    /// pins that the round's identity set is a function of a single storage
+    /// snapshot (its digest) and that the same snapshot re-reads identically
+    /// while nothing changed.
+    #[test]
+    fn a_complete_security_round_is_built_from_one_observation() {
+        let kernel = kernel();
+        let (pin, policy_ref) = publish_security_fixture(&kernel);
+        let task = security_typed_task(&kernel, pin, policy_ref);
+
+        let observation = kernel.security_candidate_observation(&task).unwrap();
+        let (round, deadline_hit) = CompleteSecurityCandidateRound::from_observation(
+            &observation,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+
+        assert!(!deadline_hit);
+        assert!(!round.is_truncated());
+        // The round names the exact observation it was built from, so the hold's
+        // post-enumeration re-read is a comparison of like values.
+        assert_eq!(round.observation_digest(), observation.digest());
+        assert_eq!(round.cost(), AcquisitionCost::new(1, 1));
+        assert!(round.existing().is_empty());
+        assert_eq!(round.new_agent().map(|r| r.candidates().len()), Some(1));
+
+        let selection = round
+            .select_first(AcquisitionBudget::new(1, 1).unwrap())
+            .expect("a complete in-budget round selects");
+        assert!(matches!(
+            selection.owner(),
+            SecurityCandidateOwner::NewAgentType(_)
+        ));
+        assert_eq!(
+            selection.candidate().config_ref(),
+            round.new_agent().unwrap().candidates()[0].config_ref()
+        );
+
+        // Re-reading an unchanged Task yields the same observation identity.
+        let reobserved = kernel.security_candidate_observation(&task).unwrap();
+        assert_eq!(reobserved.digest(), round.observation_digest());
+    }
+
+    /// The whole-round budget is checked **before** any candidate is selected.
+    /// A complete round that exceeds the budget must not yield the candidate
+    /// that happened to be first, and a truncated round must not be selectable
+    /// at all even when its observed candidates would fit.
+    #[test]
+    fn a_complete_security_round_checks_the_budget_before_selecting_a_candidate() {
+        let kernel = kernel();
+        let pin = publish(&kernel);
+        let task = typed_task(&kernel, pin);
+        let candidates = resolve_source_candidates(
+            &kernel,
+            &task,
+            &adapters_with_binding(),
+            &execution_registry(),
+            &si(EchoMaterializer),
+            &deadline(),
+        )
+        .unwrap();
+        let first = candidates.into_iter().next().expect("one candidate");
+        let mut other_config = first.clone();
+        other_config.source_config.config_ref = SourceConfigRef::new(
+            first.source_config.config_ref.source().clone(),
+            "another-config",
+            1,
+        )
+        .unwrap();
+        other_config.source_config.config_digest = ConfigDigest::new("sha256:another").unwrap();
+        let owner = LogicalAgentId::from_string("agent-a");
+        let inner = SecurityCandidateRound::new(
+            SecurityCandidateOwner::ExistingAgent(owner.clone()),
+            vec![first, other_config],
+        )
+        .unwrap();
+        let domain = inner.domain().clone();
+        assert_eq!(inner.cost(), AcquisitionCost::new(2, 2));
+
+        let complete = CompleteSecurityCandidateRound {
+            observation_digest: "sha256:observation".into(),
+            existing: vec![(owner.clone(), inner)],
+            new_agent: None,
+            domain: domain.clone(),
+            deadline_hit: false,
+        };
+        // A budget that fits only one candidate cannot select the first one:
+        // there is no partial-success path.
+        let exhausted = complete
+            .select_first(AcquisitionBudget::new(1, 1).unwrap())
+            .expect_err("an over-budget round has no winner");
+        assert!(matches!(exhausted, RoundSelectionError::Budget(_)));
+        assert!(complete
+            .require_whole_round(AcquisitionBudget::new(2, 1).unwrap())
+            .is_err());
+
+        let selection = complete
+            .select_first(AcquisitionBudget::new(2, 2).unwrap())
+            .expect("the complete round fits");
+        assert_eq!(
+            selection.owner(),
+            &SecurityCandidateOwner::ExistingAgent(owner)
+        );
+
+        // A deadline-truncated round is a lower bound: selection is refused even
+        // though a candidate was observed.
+        let truncated = CompleteSecurityCandidateRound {
+            observation_digest: "sha256:observation".into(),
+            existing: complete.existing().to_vec(),
+            new_agent: None,
+            domain,
+            deadline_hit: true,
+        };
+        assert_eq!(
+            truncated
+                .select_first(AcquisitionBudget::new(8, 8).unwrap())
+                .unwrap_err(),
+            RoundSelectionError::Truncated
+        );
     }
 
     /// Publish one `SECURITY_V1` AgentType and one `SECURITY_V1` source/config
