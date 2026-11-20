@@ -1114,6 +1114,66 @@ impl Kernel {
         })
     }
 
+    /// Register one explicit trusted-importer installation epoch (M6-B.5
+    /// B5.2).
+    ///
+    /// This is the trusted composition root's write path. Registering a new
+    /// epoch for the same importer and resolved physical domain retires the
+    /// previous ACTIVE row at `installed_at`, so a reinstall invalidates older
+    /// attestations. The registration grants no Task authority.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_enforcement_importer_installation(
+        &self,
+        installation_id: &str,
+        importer_id: &str,
+        importer_protocol: &str,
+        adapter_kind: &str,
+        adapter_binding_key: &str,
+        installed_at: agentype_core::UnixTime,
+        recorded_at: agentype_core::UnixTime,
+    ) -> Result<crate::importer_installation::ImporterInstallation, Error> {
+        self.tx(|tx, _| {
+            crate::importer_installation::register_enforcement_importer_installation(
+                tx,
+                installation_id,
+                importer_id,
+                importer_protocol,
+                adapter_kind,
+                adapter_binding_key,
+                installed_at,
+                recorded_at,
+            )
+        })
+    }
+
+    /// Retire one installation epoch. Retirement is final; an absent or
+    /// already-retired row with the same instant is `Ok(false)`.
+    #[cfg(any(test, feature = "runtime-internal"))]
+    pub fn retire_enforcement_importer_installation(
+        &self,
+        installation_id: &str,
+        retired_at: agentype_core::UnixTime,
+    ) -> Result<bool, Error> {
+        self.tx(|tx, _| {
+            crate::importer_installation::retire_enforcement_importer_installation(
+                tx,
+                installation_id,
+                retired_at,
+            )
+        })
+    }
+
+    /// The exact installation epoch, ACTIVE or retired, for diagnostics.
+    pub fn get_enforcement_importer_installation(
+        &self,
+        installation_id: &str,
+    ) -> Result<Option<crate::importer_installation::ImporterInstallation>, Error> {
+        self.tx(|tx, _| {
+            crate::importer_installation::enforcement_importer_installation(tx, installation_id)
+        })
+    }
+
     /// Record one immutable trusted-importer attestation (M6-B.5 B5.2).
     ///
     /// This is the provisioning producer's durable write path. The attestation
@@ -1188,6 +1248,21 @@ impl Kernel {
     /// Deterministic fingerprint of the active source/config candidate frontier.
     pub fn catalog_frontier_digest(&self) -> Result<String, Error> {
         self.tx(|tx, _| crate::provisioning::active_catalog_frontier_digest(tx))
+    }
+
+    /// Every durable input to one `SECURITY_V1` candidate round, loaded in a
+    /// single transaction (M6-B.5 B5.2 single-observation fence).
+    ///
+    /// The returned value is an observation, not authority: it creates no
+    /// Attempt, Lease or ProvisioningBinding. Its digest can be re-read after
+    /// external attestation to detect a catalog or roster change.
+    pub fn security_candidate_observation(
+        &self,
+        task_id: &agentype_core::TaskId,
+    ) -> Result<crate::security_observation::SecurityCandidateObservation, Error> {
+        self.tx(|tx, _| {
+            crate::security_observation::load_security_candidate_observation(tx, task_id)
+        })
     }
 
     /// Active SpawnSource revision refs (M6-B.4 enumeration).

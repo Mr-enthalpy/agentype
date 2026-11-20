@@ -2337,12 +2337,14 @@ fn a_durable_block_rejects_an_invalid_timestamp() {
 }
 
 const ATT_IMPORTER: &str = "test-importer";
+const ATT_INSTALLATION: &str = "test-installation-1";
 const ATT_ISSUED: f64 = 1_000.0;
 const ATT_UNTIL: f64 = 2_000.0;
 
 fn attestation(profile: &ImportedEnforcementProfile) -> EnforcementProfileAttestation {
     EnforcementProfileAttestation::new(
         profile,
+        ATT_INSTALLATION,
         ATT_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         ATT_ISSUED,
@@ -2363,6 +2365,7 @@ fn an_attestation_digest_is_stable_and_recomputable() {
 
     let rebuilt = EnforcementProfileAttestation::from_parts(
         first.profile_digest(),
+        first.installation_id(),
         first.importer_id(),
         first.importer_protocol(),
         first.adapter_kind(),
@@ -2376,6 +2379,7 @@ fn an_attestation_digest_is_stable_and_recomputable() {
 
     let error = EnforcementProfileAttestation::from_parts(
         first.profile_digest(),
+        first.installation_id(),
         first.importer_id(),
         first.importer_protocol(),
         first.adapter_kind(),
@@ -2397,6 +2401,7 @@ fn an_attestation_rejects_blank_identities_and_a_foreign_protocol() {
     for importer in ["", "   "] {
         let error = EnforcementProfileAttestation::new(
             &profile,
+            ATT_INSTALLATION,
             importer,
             ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
             ATT_ISSUED,
@@ -2407,6 +2412,7 @@ fn an_attestation_rejects_blank_identities_and_a_foreign_protocol() {
     }
     let error = EnforcementProfileAttestation::new(
         &profile,
+        ATT_INSTALLATION,
         ATT_IMPORTER,
         "agentype-enforcement-profile-attest/0",
         ATT_ISSUED,
@@ -2425,6 +2431,7 @@ fn an_attestation_rejects_blank_identities_and_a_foreign_protocol() {
     ] {
         let error = EnforcementProfileAttestation::from_parts(
             profile_digest,
+            ATT_INSTALLATION,
             ATT_IMPORTER,
             ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
             kind,
@@ -2452,6 +2459,7 @@ fn an_attestation_rejects_a_non_finite_or_empty_window() {
     ] {
         let error = EnforcementProfileAttestation::new(
             &profile,
+            ATT_INSTALLATION,
             ATT_IMPORTER,
             ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
             issued,
@@ -2468,6 +2476,7 @@ fn an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling() 
     // Exactly at the ceiling is still a legal producer claim.
     EnforcementProfileAttestation::new(
         &profile,
+        ATT_INSTALLATION,
         ATT_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         ATT_ISSUED,
@@ -2479,6 +2488,7 @@ fn an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling() 
     // the physical adapter installation it describes.
     let error = EnforcementProfileAttestation::new(
         &profile,
+        ATT_INSTALLATION,
         ATT_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         ATT_ISSUED,
@@ -2492,6 +2502,7 @@ fn an_attestation_rejects_a_validity_window_longer_than_the_freshness_ceiling() 
     let attestation = attestation(&profile);
     let error = EnforcementProfileAttestation::from_parts(
         attestation.profile_digest(),
+        attestation.installation_id(),
         attestation.importer_id(),
         attestation.importer_protocol(),
         attestation.adapter_kind(),

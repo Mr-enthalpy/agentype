@@ -51,7 +51,7 @@ use std::collections::BTreeSet;
 /// and the durable binding/profile key) are different identities.
 pub const ENFORCEMENT_PROFILE_SCHEMA_VERSION: u32 = 3;
 /// Version tag of the canonical trusted-importer attestation document.
-pub const ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+pub const ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION: u32 = 2;
 /// The attestation protocol this build accepts.
 ///
 /// An attestation is a separate imported fact from the profile it names: the
@@ -600,12 +600,14 @@ fn profile_digest(
 /// same caller that supplies the support matrix, covered subjects and physical
 /// binding key also computes the digest. This record is the missing external
 /// fact. The provisioning producer writes it once, keyed by the exact profile
-/// digest, and binds it to the importer identity, the attestation protocol, the
-/// exact physical domain and a validity window. Acquisition reads it
-/// transactionally and rejects a profile with no matching fresh row, so a caller
-/// cannot widen support, forge subject coverage, replay stale physical-domain
-/// evidence, or move the physical key under a stable alias and still be
-/// accepted.
+/// digest, and binds it to a registered physical installation epoch, the
+/// importer identity, the attestation protocol, the exact physical domain and a
+/// validity window. Acquisition reads it transactionally together with its
+/// installation row, requires the row to be the currently ACTIVE epoch for that
+/// importer and domain, and rejects a profile with no matching fresh row, so a
+/// caller cannot widen support, forge subject coverage, replay stale
+/// physical-domain evidence, survive a reinstall, or move the physical key under
+/// a stable alias and still be accepted.
 ///
 /// The constructor is gated with the profile importer because it is the
 /// producer's write path. [`Self::from_parts`] is the durable read path: it
@@ -617,6 +619,18 @@ fn profile_digest(
 #[derive(Clone, Debug)]
 pub struct EnforcementProfileAttestation {
     profile_digest: String,
+    /// The exact registered physical installation epoch this observation was
+    /// taken against.
+    ///
+    /// The installation is a separate durable fact: the trusted composition
+    /// root binds an `installation_id` to one importer, protocol and resolved
+    /// physical `(adapter_kind, adapter_binding_key)` domain, and that binding is
+    /// either ACTIVE or retired. Acquisition re-reads the installation and
+    /// requires it to be the currently ACTIVE epoch, so re-installing or moving
+    /// the adapter invalidates every older attestation even inside its validity
+    /// window. The identifier is not authority by itself: a caller that knows it
+    /// still cannot write a row without a registered ACTIVE installation.
+    installation_id: String,
     importer_id: String,
     importer_protocol: String,
     adapter_kind: String,
@@ -639,6 +653,7 @@ impl PartialEq for EnforcementProfileAttestation {
     /// write-once idempotence without letting the read path write itself back.
     fn eq(&self, other: &Self) -> bool {
         self.profile_digest == other.profile_digest
+            && self.installation_id == other.installation_id
             && self.importer_id == other.importer_id
             && self.importer_protocol == other.importer_protocol
             && self.adapter_kind == other.adapter_kind
@@ -661,6 +676,7 @@ impl EnforcementProfileAttestation {
     #[cfg(any(test, feature = "provisioning-producer"))]
     pub fn new(
         profile: &ImportedEnforcementProfile,
+        installation_id: impl Into<String>,
         importer_id: impl Into<String>,
         importer_protocol: impl Into<String>,
         issued_at: UnixTime,
@@ -668,6 +684,7 @@ impl EnforcementProfileAttestation {
     ) -> Result<Self, ContractError> {
         Self::validated_parts(
             profile.profile_digest().to_string(),
+            installation_id.into(),
             importer_id.into(),
             importer_protocol.into(),
             profile.adapter_kind().to_string(),
@@ -688,6 +705,7 @@ impl EnforcementProfileAttestation {
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         profile_digest: impl Into<String>,
+        installation_id: impl Into<String>,
         importer_id: impl Into<String>,
         importer_protocol: impl Into<String>,
         adapter_kind: impl Into<String>,
@@ -698,6 +716,7 @@ impl EnforcementProfileAttestation {
     ) -> Result<Self, ContractError> {
         let attestation = Self::validated_parts(
             profile_digest.into(),
+            installation_id.into(),
             importer_id.into(),
             importer_protocol.into(),
             adapter_kind.into(),
@@ -717,6 +736,7 @@ impl EnforcementProfileAttestation {
     #[allow(clippy::too_many_arguments)]
     fn validated_parts(
         profile_digest: String,
+        installation_id: String,
         importer_id: String,
         importer_protocol: String,
         adapter_kind: String,
@@ -728,6 +748,11 @@ impl EnforcementProfileAttestation {
         if profile_digest.trim().is_empty() {
             return Err(ContractError::InvalidRef {
                 reason: "a trusted-importer attestation must name its imported profile".into(),
+            });
+        }
+        if installation_id.trim().is_empty() {
+            return Err(ContractError::InvalidRef {
+                reason: "a trusted-importer attestation must name its installation epoch".into(),
             });
         }
         if importer_id.trim().is_empty() {
@@ -764,6 +789,7 @@ impl EnforcementProfileAttestation {
         }
         let attestation_digest = attestation_digest(
             &profile_digest,
+            &installation_id,
             &importer_id,
             &importer_protocol,
             &adapter_kind,
@@ -773,6 +799,7 @@ impl EnforcementProfileAttestation {
         );
         Ok(Self {
             profile_digest,
+            installation_id,
             importer_id,
             importer_protocol,
             adapter_kind,
@@ -797,6 +824,13 @@ impl EnforcementProfileAttestation {
     /// The exact imported profile digest this attestation covers.
     pub fn profile_digest(&self) -> &str {
         &self.profile_digest
+    }
+
+    /// The exact registered installation epoch this observation was taken
+    /// against. The durable acquisition check requires it to be the currently
+    /// ACTIVE epoch for the same importer and physical domain.
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
     }
 
     /// The trusted importer that observed this physical domain.
@@ -879,8 +913,10 @@ impl EnforcementProfileAttestation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attestation_digest(
     profile_digest: &str,
+    installation_id: &str,
     importer_id: &str,
     importer_protocol: &str,
     adapter_kind: &str,
@@ -892,6 +928,7 @@ fn attestation_digest(
         "kind": "ENFORCEMENT_PROFILE_ATTESTATION",
         "schema": ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION,
         "protocol": importer_protocol,
+        "installation_id": installation_id,
         "importer_id": importer_id,
         "profile_digest": profile_digest,
         "adapter_kind": adapter_kind,

@@ -27,10 +27,16 @@
 /// fixed acquisition budget. Version 11 adds the M6-B.5 B5.2 durable
 /// `enforcement_profile_attestations` rows: immutable trusted-importer evidence
 /// keyed by the exact imported profile digest and physical adapter domain, with
-/// a validity window that acquisition re-checks. Older files are rejected at
+/// a validity window that acquisition re-checks. Version 12 adds the M6-B.5
+/// B5.2 `enforcement_importer_installations` registry: one durable, explicit
+/// physical installation epoch per trusted importer and resolved adapter
+/// domain, with at most one ACTIVE epoch at a time. Every attestation names the
+/// epoch it was taken against, and acquisition re-reads that epoch
+/// transactionally, so reinstalling or moving an adapter invalidates older
+/// observations even inside their validity window. Older files are rejected at
 /// open (fail closed); D-DB-MIGRATE is still unresolved, so there is
 /// deliberately no in-place upgrade.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1362,15 +1368,77 @@ BEGIN
 END;
 
 -- ============================================================================
--- M6-B.5 B5.2 trusted-importer attestations (schema v11)
+-- M6-B.5 B5.2 trusted-importer installations (schema v12)
+--
+-- The durable physical installation epoch. A trusted composition root registers
+-- one importer at one exact resolved adapter domain for one explicit epoch.
+-- Registering a new epoch for the same `(importer_id, adapter_kind,
+-- adapter_binding_key)` retires the previous ACTIVE row, so there is at most one
+-- current installation. Rows are immutable except for the single ACTIVE ->
+-- retired transition and are never deleted. An attestation names the epoch it
+-- was taken against; acquisition re-reads this row and rejects a retired epoch.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS enforcement_importer_installations (
+    installation_id TEXT PRIMARY KEY
+        CHECK (length(trim(installation_id)) > 0),
+    importer_id TEXT NOT NULL CHECK (length(trim(importer_id)) > 0),
+    importer_protocol TEXT NOT NULL
+        CHECK (length(trim(importer_protocol)) > 0),
+    adapter_kind TEXT NOT NULL CHECK (length(trim(adapter_kind)) > 0),
+    adapter_binding_key TEXT NOT NULL
+        CHECK (length(trim(adapter_binding_key)) > 0),
+    installed_at REAL NOT NULL CHECK (installed_at >= 0),
+    retired_at REAL CHECK (retired_at IS NULL OR retired_at >= installed_at),
+    recorded_at REAL NOT NULL CHECK (recorded_at >= 0)
+);
+
+-- At most one ACTIVE epoch per importer and exact physical domain.
+CREATE UNIQUE INDEX IF NOT EXISTS enforcement_importer_installations_one_active
+    ON enforcement_importer_installations(importer_id, adapter_kind, adapter_binding_key)
+    WHERE retired_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS enforcement_importer_installations_by_domain
+    ON enforcement_importer_installations(adapter_kind, adapter_binding_key, retired_at);
+
+-- The installation identity is final. A reinstall is a new row, not an edit of
+-- the old epoch; only the retirement time may move once, from NULL to a value.
+CREATE TRIGGER IF NOT EXISTS enforcement_importer_installations_identity_is_final
+BEFORE UPDATE ON enforcement_importer_installations
+WHEN NEW.installation_id IS NOT OLD.installation_id
+     OR NEW.importer_id IS NOT OLD.importer_id
+     OR NEW.importer_protocol IS NOT OLD.importer_protocol
+     OR NEW.adapter_kind IS NOT OLD.adapter_kind
+     OR NEW.adapter_binding_key IS NOT OLD.adapter_binding_key
+     OR NEW.installed_at IS NOT OLD.installed_at
+     OR NEW.recorded_at IS NOT OLD.recorded_at
+BEGIN
+    SELECT RAISE(ABORT, 'a trusted-importer installation epoch is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS enforcement_importer_installations_retire_once
+BEFORE UPDATE ON enforcement_importer_installations
+WHEN OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at
+BEGIN
+    SELECT RAISE(ABORT, 'a trusted-importer installation retirement is final');
+END;
+
+CREATE TRIGGER IF NOT EXISTS enforcement_importer_installations_no_delete
+BEFORE DELETE ON enforcement_importer_installations
+BEGIN
+    SELECT RAISE(ABORT, 'a trusted-importer installation is durable; retire it instead');
+END;
+
+-- ============================================================================
+-- M6-B.5 B5.2 trusted-importer attestations (schema v11, epoch-bound in v12)
 --
 -- A profile digest proves only that an imported profile document is internally
--- consistent. These rows are the separate external fact: which trusted importer
--- observed that exact physical domain and until when the observation is valid.
--- One immutable row per attestation, indexed by the exact profile digest it
--- covers. Acquisition reads the freshest row valid at its clock and rejects a
--- profile with none. A new window is a new immutable row; nothing is edited or
--- deleted.
+-- consistent. These rows are the separate external fact: which registered
+-- installation epoch observed that exact physical domain, and until when the
+-- observation is valid. One immutable row per attestation, indexed by the exact
+-- profile digest it covers. Acquisition reads the freshest row valid at its
+-- clock together with its still-ACTIVE installation row and rejects a profile
+-- with none. A new window is a new immutable row; nothing is edited or deleted.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS enforcement_profile_attestations (
@@ -1378,6 +1446,8 @@ CREATE TABLE IF NOT EXISTS enforcement_profile_attestations (
         CHECK (length(trim(attestation_digest)) > 0),
     profile_digest TEXT NOT NULL
         CHECK (length(trim(profile_digest)) > 0),
+    installation_id TEXT NOT NULL
+        CHECK (length(trim(installation_id)) > 0),
     importer_id TEXT NOT NULL CHECK (length(trim(importer_id)) > 0),
     importer_protocol TEXT NOT NULL
         CHECK (length(trim(importer_protocol)) > 0),

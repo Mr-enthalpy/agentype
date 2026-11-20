@@ -56,6 +56,32 @@ const TEST_IMPORTER: &str = "test-local-importer";
 const ATTESTATION_ISSUED_AT: f64 = 900.0;
 const ATTESTATION_VALID_UNTIL: f64 = 2_000.0;
 
+/// The registered installation epoch that a fixture attestation names. Each
+/// resolved physical domain gets its own id, so a test that names another
+/// domain's epoch is rejected instead of silently matching.
+fn installation_id(adapter_binding_key: &str) -> String {
+    format!("test-installation-{adapter_binding_key}")
+}
+
+/// Register the fixture installation epoch for one resolved physical domain.
+///
+/// Re-registering the same identity is idempotent, so repeated fixture calls
+/// are a no-op. A dedicated test that needs a *new* epoch uses a later
+/// `installed_at`, which retires this one.
+fn register_installation(kernel: &Kernel, adapter_binding_key: &str, installed_at: f64) {
+    kernel
+        .register_enforcement_importer_installation(
+            &installation_id(adapter_binding_key),
+            TEST_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ADAPTER_KIND,
+            adapter_binding_key,
+            installed_at,
+            installed_at,
+        )
+        .unwrap();
+}
+
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -399,10 +425,13 @@ fn selected(
     subject: EnforcementSubject,
 ) -> SecurityProvisioningSelection {
     // B5.2-C: a profile digest alone is self-consistent input, not trusted
-    // evidence. The shared fixture records the producer's attestation exactly as
-    // the runtime importer would, so each test exercises the acquisition gate.
+    // evidence. The shared fixture registers the producer's installation epoch
+    // and records its attestation exactly as the runtime importer would, so each
+    // test exercises the acquisition gate.
+    register_installation(kernel, profile.adapter_binding_key(), 0.0);
     let attestation = EnforcementProfileAttestation::new(
         &profile,
+        installation_id(profile.adapter_binding_key()),
         TEST_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         ATTESTATION_ISSUED_AT,
@@ -416,6 +445,9 @@ fn selected(
         provisioning,
         profile,
         subject,
+        // B5.2 binds no secured-start plan, so there is nothing to pin. The
+        // transaction still recomputes the plan and would reject a stale digest.
+        expected_plan_digest: None,
     }
 }
 
@@ -1648,6 +1680,9 @@ fn unattested(
         provisioning,
         profile,
         subject,
+        // B5.2 binds no secured-start plan, so there is nothing to pin. The
+        // transaction still recomputes the plan and would reject a stale digest.
+        expected_plan_digest: None,
     }
 }
 
@@ -1657,8 +1692,12 @@ fn record_attestation(
     issued_at: f64,
     valid_until: f64,
 ) {
+    // The fixture installation starts at 0.0 so any positive issue time is
+    // inside the epoch; a test that needs the epoch boundary registers its own.
+    register_installation(kernel, profile.adapter_binding_key(), 0.0);
     let attestation = EnforcementProfileAttestation::new(
         profile,
+        installation_id(profile.adapter_binding_key()),
         TEST_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         issued_at,
@@ -1688,10 +1727,12 @@ fn a_self_consistent_attestation_without_producer_provenance_is_rejected() {
     // The schema tag, protocol, field names and canonical digest function are
     // all public. This is exactly what a caller limited to `from_parts` can
     // compute to produce a self-consistent attestation.
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
     let forged_digest = canonical_json_body_digest(&json!({
         "kind": "ENFORCEMENT_PROFILE_ATTESTATION",
         "schema": ENFORCEMENT_PROFILE_ATTESTATION_SCHEMA_VERSION,
         "protocol": ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        "installation_id": installation_id(imported.adapter_binding_key()),
         "importer_id": TEST_IMPORTER,
         "profile_digest": imported.profile_digest(),
         "adapter_kind": imported.adapter_kind(),
@@ -1701,6 +1742,7 @@ fn a_self_consistent_attestation_without_producer_provenance_is_rejected() {
     }));
     let forged = EnforcementProfileAttestation::from_parts(
         imported.profile_digest(),
+        installation_id(imported.adapter_binding_key()),
         TEST_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         imported.adapter_kind(),
@@ -1917,8 +1959,10 @@ fn a_trusted_importer_attestation_is_write_once_and_tamper_evident() {
         full_support(),
         [EnforcementSubject::ControlledPrimaryProcess],
     );
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
     let attestation = EnforcementProfileAttestation::new(
         &profile,
+        installation_id(ADAPTER_BINDING_KEY),
         TEST_IMPORTER,
         ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
         ATTESTATION_ISSUED_AT,
@@ -1957,9 +2001,10 @@ fn a_trusted_importer_attestation_is_write_once_and_tamper_evident() {
     let moved = raw
         .execute(
             "INSERT INTO enforcement_profile_attestations
-             (attestation_digest, profile_digest, importer_id, importer_protocol,
-              adapter_kind, adapter_binding_key, issued_at, valid_until, recorded_at)
-             VALUES ('sha256:moved', ?1, 'evil', ?2, 'default', 'k2', 900.0, 2000.0, 900.0)",
+             (attestation_digest, profile_digest, installation_id, importer_id,
+              importer_protocol, adapter_kind, adapter_binding_key, issued_at,
+              valid_until, recorded_at)
+             VALUES ('sha256:moved', ?1, 'test-installation-k2', 'evil', ?2, 'default', 'k2', 900.0, 2000.0, 900.0)",
             rusqlite::params![
                 profile.profile_digest(),
                 ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL
@@ -1977,9 +2022,10 @@ fn a_trusted_importer_attestation_is_write_once_and_tamper_evident() {
     // instead of being returned as a trusted fact.
     raw.execute(
         "INSERT INTO enforcement_profile_attestations
-         (attestation_digest, profile_digest, importer_id, importer_protocol,
-          adapter_kind, adapter_binding_key, issued_at, valid_until, recorded_at)
-         VALUES ('sha256:tampered', 'sha256:other-profile', 'evil', ?1, 'default', 'k3', 900.0, 2000.0, 900.0)",
+         (attestation_digest, profile_digest, installation_id, importer_id,
+          importer_protocol, adapter_kind, adapter_binding_key, issued_at,
+          valid_until, recorded_at)
+         VALUES ('sha256:tampered', 'sha256:other-profile', 'test-installation-k3', 'evil', ?1, 'default', 'k3', 900.0, 2000.0, 900.0)",
         rusqlite::params![ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL],
     )
     .unwrap();
@@ -1990,6 +2036,375 @@ fn a_trusted_importer_attestation_is_write_once_and_tamper_evident() {
         error.to_string().contains("does not describe its parts"),
         "{error}"
     );
+}
+
+/// A digest-correct observation still has to name a registered epoch. Knowing
+/// the importer id, protocol, domain and window is not enough to publish.
+#[test]
+fn an_attestation_must_name_a_registered_installation_epoch() {
+    let env = Env::new("installation_unknown");
+    let kernel = &env.kernel;
+    let imported = profile(
+        full_support_profile_ref(),
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    // The domain has a real epoch; this observation names a different one that
+    // was never registered.
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
+    let attestation = EnforcementProfileAttestation::new(
+        &imported,
+        "test-installation-never-registered",
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    let error = kernel
+        .record_enforcement_profile_attestation(&attestation, ATTESTATION_ISSUED_AT)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+    assert!(kernel
+        .get_enforcement_profile_attestation(imported.profile_digest())
+        .unwrap()
+        .is_none());
+}
+
+/// The epoch, not the attestation's settable fields, decides which importer and
+/// physical domain an observation is allowed to describe.
+#[test]
+fn an_attestation_must_match_its_epochs_importer_and_physical_domain() {
+    let env = Env::new("installation_mismatch");
+    let kernel = &env.kernel;
+    let k1 = profile(
+        full_support_profile_ref(),
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let k2 = profile(
+        full_support_profile_ref(),
+        "k2",
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
+
+    // The epoch is for k1; this observation names the k2 physical domain.
+    let cross_domain = EnforcementProfileAttestation::new(
+        &k2,
+        installation_id(ADAPTER_BINDING_KEY),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    let error = kernel
+        .record_enforcement_profile_attestation(&cross_domain, ATTESTATION_ISSUED_AT)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+
+    // The epoch is for `TEST_IMPORTER`; this observation names another importer.
+    let other_importer = EnforcementProfileAttestation::new(
+        &k1,
+        installation_id(ADAPTER_BINDING_KEY),
+        "another-importer",
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    let error = kernel
+        .record_enforcement_profile_attestation(&other_importer, ATTESTATION_ISSUED_AT)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+
+    assert!(kernel
+        .get_enforcement_profile_attestation(k1.profile_digest())
+        .unwrap()
+        .is_none());
+    assert!(kernel
+        .get_enforcement_profile_attestation(k2.profile_digest())
+        .unwrap()
+        .is_none());
+}
+
+/// Reinstalling the adapter retires the old epoch and invalidates every older
+/// observation, even one still inside its one-hour window.
+#[test]
+fn a_retired_installation_epoch_invalidates_every_older_attestation() {
+    let env = Env::new("installation_retired");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "installation_retired", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning = security_catalog(
+        kernel,
+        "installation_retired",
+        Some(&profile_ref),
+        Vec::new(),
+    );
+    let imported = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let candidate = unattested(
+        provisioning,
+        imported.clone(),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    // Epoch 1 observes the domain and records its observation.
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
+    let first = EnforcementProfileAttestation::new(
+        &imported,
+        installation_id(ADAPTER_BINDING_KEY),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&first, ATTESTATION_ISSUED_AT)
+        .unwrap();
+
+    // Reinstalling the same importer and domain at 950 retires epoch 1 at 950.
+    kernel
+        .register_enforcement_importer_installation(
+            "test-installation-k1-v2",
+            TEST_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ADAPTER_KIND,
+            ADAPTER_BINDING_KEY,
+            950.0,
+            950.0,
+        )
+        .unwrap();
+    let retired = kernel
+        .get_enforcement_importer_installation(&installation_id(ADAPTER_BINDING_KEY))
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.retired_at(), Some(950.0));
+
+    // Writing a new observation against the retired epoch is refused even
+    // though the value is producer-sealed.
+    let late = EnforcementProfileAttestation::new(
+        &imported,
+        installation_id(ADAPTER_BINDING_KEY),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        960.0,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    let error = kernel
+        .record_enforcement_profile_attestation(&late, 960.0)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+
+    // The pre-reinstall row is still inside its validity window at the
+    // acquisition clock, but its epoch is retired, so it is not current.
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+
+    // Only an observation against the new ACTIVE epoch authorizes acquisition.
+    let second = EnforcementProfileAttestation::new(
+        &imported,
+        "test-installation-k1-v2",
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        960.0,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&second, 960.0)
+        .unwrap();
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    assert_eq!(acquired.claim.task_id, task);
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Leased);
+}
+
+/// The reverse-authority test: an internal caller that knows every public field
+/// and the exact canonical digest, and can rebuild the old epoch, still cannot
+/// publish a row that acquisition accepts.
+#[test]
+fn knowing_every_field_and_the_old_epoch_cannot_publish_an_acquirable_attestation() {
+    let env = Env::new("old_epoch_reverse");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "old_epoch_reverse", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning =
+        security_catalog(kernel, "old_epoch_reverse", Some(&profile_ref), Vec::new());
+    let imported = profile(
+        profile_ref,
+        ADAPTER_BINDING_KEY,
+        full_support(),
+        [EnforcementSubject::ControlledPrimaryProcess],
+    );
+    let candidate = unattested(
+        provisioning,
+        imported.clone(),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
+    let observed = EnforcementProfileAttestation::new(
+        &imported,
+        installation_id(ADAPTER_BINDING_KEY),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        ATTESTATION_ISSUED_AT,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&observed, ATTESTATION_ISSUED_AT)
+        .unwrap();
+
+    // Every field and the exact digest are public. The caller also reinstalls
+    // the adapter at 950, retiring the epoch that row names.
+    kernel
+        .register_enforcement_importer_installation(
+            "test-installation-k1-v2",
+            TEST_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ADAPTER_KIND,
+            ADAPTER_BINDING_KEY,
+            950.0,
+            950.0,
+        )
+        .unwrap();
+    let rebuilt = EnforcementProfileAttestation::from_parts(
+        observed.profile_digest(),
+        observed.installation_id(),
+        observed.importer_id(),
+        observed.importer_protocol(),
+        observed.adapter_kind(),
+        observed.adapter_binding_key(),
+        observed.issued_at(),
+        observed.valid_until(),
+        observed.attestation_digest(),
+    )
+    .unwrap();
+    assert_eq!(rebuilt, observed);
+    let error = kernel
+        .record_enforcement_profile_attestation(&rebuilt, ATTESTATION_ISSUED_AT)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+
+    // Even a producer-sealed value aimed at the old epoch cannot publish: the
+    // registry, not the settable field, decides which epoch is current.
+    let sealed_old_epoch = EnforcementProfileAttestation::new(
+        &imported,
+        observed.installation_id(),
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        960.0,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    let error = kernel
+        .record_enforcement_profile_attestation(&sealed_old_epoch, 960.0)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidAuthority(_)), "{error}");
+
+    // The old row remains readable as history, but it cannot acquire.
+    assert!(kernel
+        .get_enforcement_profile_attestation(imported.profile_digest())
+        .unwrap()
+        .is_some());
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
+    assert_no_acquisition_side_effects(&env);
+
+    // Only a fresh observation against the currently ACTIVE epoch acquires.
+    let sealed_new_epoch = EnforcementProfileAttestation::new(
+        &imported,
+        "test-installation-k1-v2",
+        TEST_IMPORTER,
+        ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+        960.0,
+        ATTESTATION_VALID_UNTIL,
+    )
+    .unwrap();
+    kernel
+        .record_enforcement_profile_attestation(&sealed_new_epoch, 960.0)
+        .unwrap();
+    let acquired = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap();
+    assert_eq!(acquired.claim.task_id, task);
+}
+
+/// The registry itself is append-only: an installation id cannot be rewritten,
+/// an epoch cannot move backwards, and retirement is final.
+#[test]
+fn an_installation_epoch_is_immutable_and_cannot_move_backwards() {
+    let env = Env::new("installation_invariants");
+    let kernel = &env.kernel;
+    let epoch = installation_id(ADAPTER_BINDING_KEY);
+    register_installation(kernel, ADAPTER_BINDING_KEY, 100.0);
+
+    // The same id cannot describe different importer/domain facts.
+    let error = kernel
+        .register_enforcement_importer_installation(
+            &epoch,
+            TEST_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ADAPTER_KIND,
+            "k9",
+            200.0,
+            200.0,
+        )
+        .unwrap_err();
+    assert!(matches!(error, Error::InvariantViolation(_)), "{error}");
+
+    // A new epoch for the same importer and domain cannot start before the
+    // current one.
+    let error = kernel
+        .register_enforcement_importer_installation(
+            "test-installation-k1-old",
+            TEST_IMPORTER,
+            ENFORCEMENT_PROFILE_ATTESTATION_PROTOCOL,
+            ADAPTER_KIND,
+            ADAPTER_BINDING_KEY,
+            50.0,
+            200.0,
+        )
+        .unwrap_err();
+    assert!(matches!(error, Error::InvariantViolation(_)), "{error}");
+
+    // Retirement is a single final transition.
+    assert!(kernel
+        .retire_enforcement_importer_installation(&epoch, 200.0)
+        .unwrap());
+    assert!(!kernel
+        .retire_enforcement_importer_installation(&epoch, 200.0)
+        .unwrap());
+    let error = kernel
+        .retire_enforcement_importer_installation(&epoch, 300.0)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidTransition(_)), "{error}");
 }
 
 #[test]
@@ -2039,4 +2454,74 @@ fn a_forged_subject_coverage_cannot_borrow_the_attested_profile() {
     assert_candidate_rejection(&error, "no fresh trusted-importer attestation");
     assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
     assert_no_acquisition_side_effects(&env);
+}
+
+/// B5.2-D: a selector that pins the enforcement plan is re-verified inside the
+/// authority transaction. A stale or hand-built digest must be rejected before
+/// any Attempt or Lease, even though every other conjunct is valid.
+#[test]
+fn a_stale_expected_enforcement_plan_digest_is_rejected_before_any_authority() {
+    let env = Env::new("stale_plan_digest");
+    let kernel = &env.kernel;
+    let pin = publish_agent_type(kernel, "pinned");
+    let secure = publish_security_agent_type(kernel, "secure");
+    let task = admit_security_v1_task(kernel, "stale_plan_digest", pin);
+    let profile_ref = full_support_profile_ref();
+    let provisioning =
+        security_catalog(kernel, "stale_plan_digest", Some(&profile_ref), Vec::new());
+    let mut candidate = selected(
+        kernel,
+        provisioning,
+        profile(
+            profile_ref,
+            ADAPTER_BINDING_KEY,
+            full_support(),
+            [EnforcementSubject::ControlledPrimaryProcess],
+        ),
+        EnforcementSubject::ControlledPrimaryProcess,
+    );
+    let agent = security_agent(kernel, &secure);
+    candidate.expected_plan_digest = Some("sha256:stale-plan".into());
+
+    let error = kernel
+        .acquire_security_v1_task_existing(&task, &agent, &candidate, &registry())
+        .unwrap_err();
+    assert_candidate_rejection(&error, "expected enforcement plan digest");
+    assert_eq!(kernel.task(&task).unwrap().state, TaskState::Queued);
+    assert_no_acquisition_side_effects(&env);
+}
+
+/// A new importer protocol version is a new epoch for the same importer and
+/// physical domain. It must retire the previous ACTIVE row (the unique index is
+/// keyed on the domain, not on the protocol) instead of colliding with it, so a
+/// protocol upgrade is a real invalidation.
+#[test]
+fn a_protocol_upgrade_retires_the_previous_epoch_for_the_same_domain() {
+    let env = Env::new("installation_protocol_upgrade");
+    let kernel = &env.kernel;
+    register_installation(kernel, ADAPTER_BINDING_KEY, 0.0);
+
+    let upgraded = kernel
+        .register_enforcement_importer_installation(
+            "test-installation-k1-v2",
+            TEST_IMPORTER,
+            "agentype-enforcement-profile-attest/2",
+            ADAPTER_KIND,
+            ADAPTER_BINDING_KEY,
+            500.0,
+            500.0,
+        )
+        .unwrap();
+    assert_eq!(
+        upgraded.importer_protocol(),
+        "agentype-enforcement-profile-attest/2"
+    );
+
+    let previous = kernel
+        .get_enforcement_importer_installation(&installation_id(ADAPTER_BINDING_KEY))
+        .unwrap()
+        .unwrap();
+    assert_eq!(previous.retired_at(), Some(500.0));
+    assert!(!previous.is_active());
+    assert!(upgraded.is_active());
 }

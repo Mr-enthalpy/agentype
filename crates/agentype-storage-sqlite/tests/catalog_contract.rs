@@ -256,9 +256,9 @@ fn corrupt_json_only(path: &Path, table: &str, where_clause: &str, suffix: &str)
 }
 
 #[test]
-fn schema_version_is_eleven() {
-    assert_eq!(SCHEMA_VERSION, 11);
-    assert_eq!(memory_kernel().schema_version().unwrap(), 11);
+fn schema_version_is_twelve() {
+    assert_eq!(SCHEMA_VERSION, 12);
+    assert_eq!(memory_kernel().schema_version().unwrap(), 12);
 }
 
 #[test]
